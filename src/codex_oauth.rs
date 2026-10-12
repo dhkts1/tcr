@@ -199,24 +199,36 @@ pub struct IdClaims {
     pub email: Option<String>,
     pub chatgpt_account_id: Option<String>,
     pub chatgpt_plan_type: Option<String>,
+    /// `chatgpt_account_is_fedramp`, under `https://api.openai.com/auth`: the login belongs to a
+    /// FedRAMP workspace, and codex sends its requests with `X-OpenAI-Fedramp: true`
+    /// (`openai/codex` f82e365, `login/src/token_data.rs:39-40,98`;
+    /// `model-provider/src/bearer_auth_provider.rs:43-45`). `false` when the claim is absent.
+    pub chatgpt_account_is_fedramp: bool,
 }
 
-/// The identity claims of a Codex id token or access token (`token_data.rs:77-96`).
+/// The identity claims of a Codex id token or access token (`openai/codex`
+/// `login/src/token_data.rs`, `IdClaims`, at commit 0c329ad).
+///
+/// `email` is read where Codex reads it: the top-level claim first, then the one under
+/// `https://api.openai.com/profile` (`openai/codex` `login/src/token_data.rs:71-85,174-178` at
+/// commit 0c329ad), so an id token that names its email only in that namespace still has one.
 pub fn id_claims(jwt: &str) -> Option<IdClaims> {
     let payload = jwt_payload(jwt)?;
     let auth = payload.get("https://api.openai.com/auth");
+    let profile = payload.get("https://api.openai.com/profile");
     let s = |v: Option<&serde_json::Value>, k: &str| {
         v.and_then(|o| o.get(k))
             .and_then(|x| x.as_str())
             .map(str::to_string)
     };
     Some(IdClaims {
-        email: payload
-            .get("email")
-            .and_then(|e| e.as_str())
-            .map(str::to_string),
+        email: s(Some(&payload), "email").or_else(|| s(profile, "email")),
         chatgpt_account_id: s(auth, "chatgpt_account_id"),
         chatgpt_plan_type: s(auth, "chatgpt_plan_type"),
+        chatgpt_account_is_fedramp: auth
+            .and_then(|o| o.get("chatgpt_account_is_fedramp"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -349,6 +361,45 @@ mod tests {
         assert_eq!(
             access.chatgpt_account_id.as_deref(),
             Some("11111111-1111-4111-8111-111111111111")
+        );
+    }
+
+    /// An id token may carry its email under `https://api.openai.com/profile` instead of at the
+    /// top level, and Codex reads it there (`login/src/token_data.rs:174-178` at commit 0c329ad);
+    /// a top-level email still wins when both are present, Codex's order. The payloads are
+    /// `{"https://api.openai.com/profile":{"email":"alice@example.com"}}` and
+    /// `{"email":"alice@example.com","https://api.openai.com/profile":{"email":"bob@example.com"}}`.
+    #[test]
+    fn an_email_only_in_the_profile_claim_is_read_and_a_top_level_one_wins() {
+        const PROFILE_ONLY_PAYLOAD: &str =
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSJ9fQ";
+        const BOTH_EMAILS_PAYLOAD: &str = "eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9wcm9maWxlIjp7ImVtYWlsIjoiYm9iQGV4YW1wbGUuY29tIn19";
+        let profile_only = id_claims(&format!("{JWT_HEADER}.{PROFILE_ONLY_PAYLOAD}.sig")).unwrap();
+        assert_eq!(profile_only.email.as_deref(), Some("alice@example.com"));
+        let both = id_claims(&format!("{JWT_HEADER}.{BOTH_EMAILS_PAYLOAD}.sig")).unwrap();
+        assert_eq!(both.email.as_deref(), Some("alice@example.com"));
+    }
+
+    /// A FedRAMP workspace's token carries `chatgpt_account_is_fedramp: true` under
+    /// `https://api.openai.com/auth`, the claim codex sends `X-OpenAI-Fedramp` on (`openai/codex`
+    /// f82e365, `login/src/token_data.rs:39-40,98`). A token without the claim, or with it false,
+    /// is not one. The payloads are `{"exp":1800000000,"email":"alice@example.com",
+    /// "https://api.openai.com/auth":{"chatgpt_account_id":"11111111-1111-4111-8111-111111111111",
+    /// "chatgpt_plan_type":"enterprise","chatgpt_account_is_fedramp":true}}` and
+    /// `{"https://api.openai.com/auth":{"chatgpt_account_is_fedramp":false}}`.
+    #[test]
+    fn the_fedramp_claim_is_read_from_the_openai_auth_namespace() {
+        const FEDRAMP_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJlbnRlcnByaXNlIiwiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOnRydWV9fQ";
+        const NOT_FEDRAMP_PAYLOAD: &str =
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOmZhbHNlfX0";
+        let fedramp = id_claims(&format!("{JWT_HEADER}.{FEDRAMP_PAYLOAD}.sig")).unwrap();
+        assert!(fedramp.chatgpt_account_is_fedramp, "{fedramp:?}");
+        assert_eq!(fedramp.chatgpt_plan_type.as_deref(), Some("enterprise"));
+        let not_fedramp = id_claims(&format!("{JWT_HEADER}.{NOT_FEDRAMP_PAYLOAD}.sig")).unwrap();
+        assert!(!not_fedramp.chatgpt_account_is_fedramp, "{not_fedramp:?}");
+        assert!(
+            !id_claims(&id_jwt()).unwrap().chatgpt_account_is_fedramp,
+            "a token without the claim is not FedRAMP"
         );
     }
 

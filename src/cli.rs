@@ -1326,7 +1326,7 @@ async fn post_set_disabled(
 /// already serializes to the exact wire shape
 /// [`crate::proxy::ADD_ACCOUNT_PATH`] expects (see that route's
 /// `AddAccountRequest` doc-comment), so a caller builds the credential once —
-/// for a real login, or [`crate::oauth::probe_add_capability`]'s deliberately
+/// for a real login, or `crate::oauth::probe_add_route`'s deliberately
 /// blank probe — and this function never re-lists its fields.
 ///
 /// Reuses [`LiveControlError`] rather than a parallel enum, extended with one
@@ -1339,6 +1339,37 @@ async fn post_set_disabled(
 pub(crate) async fn post_add_account(
     config: &Config,
     account: &Account,
+) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
+    post_add_account_with_providers(config, account).await.0
+}
+
+/// [`post_add_account`], plus the providers the answering server advertised in
+/// [`crate::proxy::PROVIDERS_HEADER`] — read off the SAME response, so a caller
+/// that must know whether the server can store a non-Anthropic account learns it
+/// from the probe it already sends, with no second round trip.
+///
+/// The list is read only from an answer the route STAMPED: an unstamped one (an
+/// older tcr's catch-all, the gate's refusal, something that is not tcr at all) is
+/// no proof of anything, and neither is a request that never got an answer. Both
+/// come back as an empty list, which is how "this server never said" reads.
+pub(crate) async fn post_add_account_with_providers(
+    config: &Config,
+    account: &Account,
+) -> (
+    Result<crate::proxy::AddAccountResponse, LiveControlError>,
+    Vec<crate::provider::Provider>,
+) {
+    let mut providers = Vec::new();
+    let result = post_add_account_reading(config, account, &mut providers).await;
+    (result, providers)
+}
+
+/// The request [`post_add_account_with_providers`] makes, with `providers` filled
+/// from a stamped answer's [`crate::proxy::PROVIDERS_HEADER`].
+async fn post_add_account_reading(
+    config: &Config,
+    account: &Account,
+    providers: &mut Vec<crate::provider::Provider>,
 ) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1382,6 +1413,15 @@ pub(crate) async fn post_add_account(
         .get(crate::proxy::ENDPOINT_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
+    if from_route {
+        if let Some(advertised) = response
+            .headers()
+            .get(crate::proxy::PROVIDERS_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            *providers = crate::proxy::providers_in_header(advertised);
+        }
+    }
     let body = response.text().await.unwrap_or_default();
 
     if status.is_success() {
@@ -1398,7 +1438,7 @@ pub(crate) async fn post_add_account(
         return Err(LiveControlError::NoRoute);
     }
     // 400: the route's own request validation (blank name/token) — the
-    // positive capability signal `probe_add_capability` looks for. 409: the
+    // positive capability signal `oauth::probe_add_route` looks for. 409: the
     // submitted identity matched more than one live account.
     if from_route && matches!(status.as_u16(), 400 | 409) {
         return Err(LiveControlError::Rejected(
@@ -4623,6 +4663,54 @@ mod tests {
         assert!(
             matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("required")),
             "a stamped 400 is a structural Rejected, not a guess from status alone: {err:?}"
+        );
+    }
+
+    /// The providers a STAMPED answer names come back beside it, read off the very probe
+    /// `oauth::probe_add_route` already sends. The same header on an UNSTAMPED answer — an older
+    /// tcr's catch-all, anything that is not this route — is no proof of anything and is not read.
+    #[tokio::test]
+    async fn post_add_account_with_providers_reads_them_off_a_stamped_answer_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = add_route_config(port);
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
+        assert!(
+            matches!(answer, Err(LiveControlError::Rejected(_))),
+            "the blank probe is still the route's own stamped 400: {answer:?}"
+        );
+        assert_eq!(
+            providers,
+            vec![
+                crate::provider::Provider::Anthropic,
+                crate::provider::Provider::Codex
+            ]
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let unstamped = axum::Router::new().fallback(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    [(crate::proxy::PROVIDERS_HEADER, "anthropic,codex")],
+                    "",
+                )
+            });
+            let _ = axum::serve(listener, unstamped).await;
+        });
+        let config = add_route_config(port);
+        let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
+        assert!(
+            matches!(answer, Err(LiveControlError::NoRoute)),
+            "{answer:?}"
+        );
+        assert!(
+            providers.is_empty(),
+            "an unstamped answer names no providers, whatever its headers say: {providers:?}"
         );
     }
 

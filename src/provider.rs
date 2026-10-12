@@ -64,6 +64,20 @@ pub const CODEX_SESSION_HEADER: &str = "session-id";
 pub const CODEX_USAGE_PATH: &str = "/backend-api/wham/usage";
 
 impl Provider {
+    /// Every provider, in declaration order: what a server built from this source can store,
+    /// and therefore what it advertises on its account-add route (`proxy::PROVIDERS_HEADER`).
+    /// `all_holds_every_provider_exactly_once` checks it against the variant list serde's derive
+    /// writes from the enum itself, so a variant that is not listed here fails that test.
+    pub const ALL: [Self; 2] = [Self::Anthropic, Self::Codex];
+
+    /// The provider whose [`Self::as_str`] is exactly `name`; `None` for a name this build does
+    /// not know. The inverse of `as_str` over [`Self::ALL`], so the two cannot disagree.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.as_str() == name)
+    }
+
     /// Which provider a request path belongs to. `path` is the query-stripped path `handle`
     /// already derives.
     pub fn of_path(path: &str) -> Self {
@@ -155,5 +169,74 @@ mod tests {
         assert_eq!(Provider::default(), Provider::Anthropic);
         assert!(Provider::Anthropic.is_anthropic());
         assert!(!Provider::Codex.is_anthropic());
+    }
+
+    /// The variant names serde's derive wrote for [`Provider`], in declaration order: the
+    /// `variants` it hands `deserialize_enum`, recorded by a deserializer that reads nothing.
+    fn serde_variant_names() -> &'static [&'static str] {
+        use serde::de::{Error as _, Visitor};
+
+        struct Recorder(std::cell::Cell<&'static [&'static str]>);
+
+        impl<'de> serde::Deserializer<'de> for &Recorder {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_enum<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                variants: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0.set(variants);
+                Err(Self::Error::custom("recorded the variant names"))
+            }
+
+            fn deserialize_any<V: Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(Self::Error::custom("Provider deserializes as an enum"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+                struct identifier ignored_any
+            }
+        }
+
+        let recorder = Recorder(std::cell::Cell::new(&[]));
+        assert!(<Provider as serde::Deserialize>::deserialize(&recorder).is_err());
+        recorder.0.get()
+    }
+
+    /// [`Provider::ALL`] holds every variant exactly once, in declaration order, which is what
+    /// keeps a server from forgetting to advertise a provider it can store. The variants are read
+    /// from serde's derive, the one list of them the compiler writes from the enum itself, so a
+    /// variant added to the enum and not to `ALL` fails here. Neither a `match` nor a `const`
+    /// can count them on stable Rust: a `match` sees only the values it is handed, and
+    /// `std::mem::variant_count` is unstable. Comparing names also ties [`Provider::as_str`] to
+    /// the name on disk for every variant, a future one included.
+    ///
+    /// Watched red: a temporary third variant, given an arm in every `match` but left out of
+    /// `ALL`, fails the first assertion; a fixed count of two passed it.
+    #[test]
+    fn all_holds_every_provider_exactly_once() {
+        let listed: Vec<&str> = Provider::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            listed,
+            serde_variant_names(),
+            "Provider::ALL must list every variant once, in declaration order"
+        );
+        for provider in Provider::ALL {
+            assert_eq!(serde_json::to_value(provider).unwrap(), provider.as_str());
+            assert_eq!(Provider::from_name(provider.as_str()), Some(provider));
+        }
+        assert_eq!(
+            Provider::from_name("Codex"),
+            None,
+            "case-sensitive, like serde"
+        );
+        assert_eq!(Provider::from_name("openai"), None);
     }
 }

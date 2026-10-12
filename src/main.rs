@@ -1290,6 +1290,21 @@ struct LoginArgs {
     /// the explicit redo (after `tcr remove`, or onto a second config).
     #[arg(long, conflicts_with = "token")]
     from_claude_code: bool,
+    /// Import the login the `codex` CLI already holds (`$CODEX_HOME/auth.json`,
+    /// default `~/.codex/auth.json`; `TCR_CODEX_AUTH` names a file to read
+    /// instead) as a Codex account — no value here. The account is named by the
+    /// login's email, or `<email>/codex` when another account holds that name;
+    /// with `--account <email>`, the login must carry that email or nothing is
+    /// written. The cost, printed on import: Codex refresh tokens are single-use
+    /// too, so the first time tcr refreshes this one, `codex` asks you to log in
+    /// again once. A second account: `mkdir -p <dir>` and
+    /// `CODEX_HOME=<dir> codex login`, then this with `--codex-home <dir>`.
+    #[arg(long, conflicts_with_all = ["token", "from_claude_code"])]
+    from_codex: bool,
+    /// Read `<DIR>/auth.json` instead of `$CODEX_HOME` / `~/.codex` (for a second login made
+    /// with `mkdir -p <DIR>` and `CODEX_HOME=<DIR> codex login`).
+    #[arg(long, requires = "from_codex", value_name = "DIR")]
+    codex_home: Option<PathBuf>,
     /// Drive the login from another program instead of a terminal: stdin is
     /// never read, the browser is never opened here, and progress goes to
     /// stdout as one JSON object per line — `{"event":"browser","url":…}`,
@@ -6290,6 +6305,19 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         println!("Logged in as '{name}'.");
         return Ok(());
     }
+    if args.from_codex {
+        let name = oauth::login_from_codex(
+            &config_path,
+            args.force,
+            args.name.as_deref(),
+            args.account.as_deref(),
+            args.codex_home.as_deref(),
+        )
+        .await
+        .context("importing the Codex login failed")?;
+        println!("Logged in as '{name}'.");
+        return Ok(());
+    }
     if args.token {
         let name = oauth::login_with_token(
             &config_path,
@@ -7385,6 +7413,67 @@ mod tests {
             vec!["tcr", "login", "--from-claude-code", "--account", "work"],
             vec!["tcr", "login", "--from-claude-code", "--name", "work"],
             vec!["tcr", "login", "--from-claude-code", "--force"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+        }
+    }
+
+    /// `--from-codex` is a third credential from a third place; asking for it
+    /// with either of the other two is a contradiction clap must reject by name,
+    /// exactly as it rejects `--token` with `--from-claude-code`.
+    #[test]
+    fn from_codex_with_token_or_from_claude_code_is_a_usage_error() {
+        for other in ["--token", "--from-claude-code"] {
+            let Err(err) = Cli::try_parse_from(["tcr", "login", "--from-codex", other]) else {
+                panic!("--from-codex with {other} must not parse");
+            };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "it must fail as a conflict, not as some other parse error: {err}"
+            );
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("--from-codex") && rendered.contains(other),
+                "the message must name BOTH flags so the operator knows what to remove: {rendered}"
+            );
+        }
+    }
+
+    /// `--codex-home` means something only to the Codex import. Accepted alone,
+    /// every other login would ignore it in silence, so clap refuses it.
+    #[test]
+    fn codex_home_without_from_codex_is_a_usage_error() {
+        let Err(err) = Cli::try_parse_from(["tcr", "login", "--codex-home", "/tmp/x"]) else {
+            panic!("--codex-home without --from-codex must not parse");
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "it must fail as the missing --from-codex: {err}"
+        );
+    }
+
+    #[test]
+    fn from_codex_parses_alone_and_with_codex_home_name_and_account() {
+        for args in [
+            vec!["tcr", "login", "--from-codex"],
+            vec![
+                "tcr",
+                "login",
+                "--from-codex",
+                "--codex-home",
+                "/tmp/x",
+                "--name",
+                "alice",
+            ],
+            vec![
+                "tcr",
+                "login",
+                "--from-codex",
+                "--account",
+                "alice@example.com",
+            ],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
         }

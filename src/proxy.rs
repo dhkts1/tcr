@@ -959,6 +959,45 @@ pub const ADD_ACCOUNT_PATH: &str = "/_tcr/accounts";
 /// answered — the same structural discriminator [`ENDPOINT_HEADER`] documents.
 pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 
+/// Response header naming, comma-separated, every provider whose accounts this
+/// server can store: [`crate::provider::Provider::as_str`] over
+/// [`crate::provider::Provider::ALL`], so `anthropic,codex`. Set by
+/// `stamp_add_endpoint`, so it rides on every answer the account-add route
+/// stamps — the blank-probe 400 `oauth::probe_add_route` provokes, a 405, a
+/// 409, a 200 — and never on the unstamped gate refusal, which must not confirm
+/// the route exists to a caller that failed the gate.
+///
+/// It exists because a tcr built before accounts had a `provider` drops that key
+/// from a Codex add and stores the credential as a Claude account; from then on
+/// the OpenAI tokens go to Anthropic. So a client adding an account of any other
+/// provider must see that provider named here before it posts. An Anthropic add
+/// needs no such proof, and the header's absence changes nothing for one.
+///
+/// A SECOND header, deliberately, never a new value of [`ENDPOINT_HEADER`]:
+/// `cli::post_add_account` recognises the route by that stamp's exact value, and
+/// every older CLI (TcrBar's bundled one included) would read a changed stamp as
+/// "no such route" and refuse every Anthropic login.
+pub const PROVIDERS_HEADER: &str = "x-tcr-providers";
+
+/// [`PROVIDERS_HEADER`]'s value: every provider this build can store.
+fn advertised_providers() -> String {
+    crate::provider::Provider::ALL
+        .iter()
+        .map(|provider| provider.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The providers a [`PROVIDERS_HEADER`] value names. A name this build does not
+/// know is skipped (a newer server may store more), so an absent or unreadable
+/// header is no proof of anything, never a provider.
+pub fn providers_in_header(value: &str) -> Vec<crate::provider::Provider> {
+    value
+        .split(',')
+        .filter_map(|name| crate::provider::Provider::from_name(name.trim()))
+        .collect()
+}
+
 /// Path of the control-account endpoint [`set_control_handler`] serves — `POST`
 /// only, the third route on this process that MUTATES rotation state.
 ///
@@ -1741,9 +1780,15 @@ fn stamp_endpoint(response: Response) -> Response {
     stamp_endpoint_as(response, DISABLED_ENDPOINT)
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response the account-add route produced.
+/// Add [`ENDPOINT_HEADER`] to a response the account-add route produced, and
+/// [`PROVIDERS_HEADER`] beside it: the one place both are set, so no stamped
+/// answer can carry the stamp without the providers.
 fn stamp_add_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, ADD_ACCOUNT_ENDPOINT)
+    let mut response = stamp_endpoint_as(response, ADD_ACCOUNT_ENDPOINT);
+    if let Ok(providers) = HeaderValue::from_str(&advertised_providers()) {
+        response.headers_mut().insert(PROVIDERS_HEADER, providers);
+    }
+    response
 }
 
 /// Deserialize `bytes` into `T`, but ONLY from a JSON object — `None` for
@@ -2128,6 +2173,16 @@ struct AddAccountRequest {
     rate_limit_tier: Option<String>,
     #[serde(default)]
     seat_tier: Option<String>,
+    /// The upstream the credential belongs to. Absent is Anthropic: every body
+    /// posted before this field existed, and every Anthropic row, which
+    /// `config::Account` serializes with no `provider` key. A Codex import
+    /// (`oauth::login_from_codex`) posts `"provider": "codex"`. Without this
+    /// field the route dropped it, filed that credential as an Anthropic account
+    /// and resolved it onto any Anthropic row sharing its name or id, overwriting
+    /// that row's own single-use refresh token.
+    /// `add_account_request_carries_the_provider` pins it.
+    #[serde(default)]
+    provider: crate::provider::Provider,
 }
 
 /// The 200 body of [`ADD_ACCOUNT_PATH`]. Deserializable too — unit 3's CLI
@@ -2139,7 +2194,7 @@ struct AddAccountRequest {
 /// field below carries `#[serde(default)]` so a field a NEWER server has
 /// renamed or dropped does not fail the whole deserialize: `cli::post_add_account`
 /// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
-/// `oauth::probe_add_capability` reads that as `AddCapability::Unusable` — a
+/// `oauth::probe_add_route` reads that as `AddCapability::Unusable` — a
 /// *successful* live add would then look indistinguishable from a wedged or
 /// route-less proxy, and `login_route` REFUSES outright (bridge item D)
 /// instead of silently falling back to the file beside a server that just
@@ -2178,6 +2233,14 @@ pub struct AddAccountResponse {
     /// both apply, or `null`.
     #[serde(default)]
     pub warning: Option<String>,
+    /// The provider of the row the server STORED, read back from the live
+    /// rotation rather than echoed from the request, so a client can confirm a
+    /// Codex login was stored as one. `None` means the server predates this
+    /// field — and a server that predates the field may predate `provider`
+    /// itself, which stores every account as a Claude account (see
+    /// [`PROVIDERS_HEADER`]).
+    #[serde(default)]
+    pub provider: Option<crate::provider::Provider>,
 }
 
 /// Shown when the submitted account carries no refresh token: it will serve
@@ -2208,6 +2271,7 @@ fn add_account_response(
     index: usize,
     persist: AddPersist,
     warning: Option<String>,
+    provider: Option<crate::provider::Provider>,
 ) -> Response {
     let payload = AddAccountResponse {
         name,
@@ -2215,6 +2279,7 @@ fn add_account_response(
         index,
         persisted: matches!(persist, AddPersist::Persisted),
         warning,
+        provider,
     };
     let Ok(body) = serde_json::to_string(&payload) else {
         return stamp_add_endpoint(error_response(
@@ -2282,7 +2347,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             None,
         ));
     };
-    // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_capability` deliberately
+    // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_route` deliberately
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
     // or answering without `stamp_add_endpoint`, silently turns that read into
@@ -2317,7 +2382,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     let account = config::Account {
         name,
         account_type: parsed.account_type.unwrap_or_else(|| "oauth".to_string()),
-        provider: Default::default(),
+        provider: parsed.provider,
         account_uuid: parsed.account_uuid,
         org_uuid: parsed.org_uuid,
         org_name: parsed.org_name,
@@ -2346,13 +2411,15 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             &crate::cli::ambiguous_query_message(&query_name, &names),
             None,
         )),
+        // The provider comes off the stored row, not the request: the echo is the
+        // server's account of what it holds, which is what a client checks.
         AddAccountOutcome::Added { idx, name, persist } => {
             let warning = combine_warnings(persist.warning(), no_refresh_token_warning);
-            add_account_response(name, true, idx, persist, warning)
+            add_account_response(name, true, idx, persist, warning, manager.provider(idx))
         }
         AddAccountOutcome::Updated { idx, name, persist } => {
             let warning = combine_warnings(persist.warning(), no_refresh_token_warning);
-            add_account_response(name, false, idx, persist, warning)
+            add_account_response(name, false, idx, persist, warning, manager.provider(idx))
         }
     }
 }
@@ -5169,14 +5236,14 @@ pub(crate) fn codex_pool_unavailable_body(wait_secs: u64, wait_measured: bool) -
 /// `{"error": {...}}` envelope, but a `type`/`code` other than `usage_limit_reached` (the type
 /// codex's `map_api_error` reads as a usage limit with a reset), and no reset fields. codex's
 /// `map_api_error` turns a 429 of any other type into its generic retry-limit error and does
-/// not print this message. The message, which names the cause, is for a person reading the raw
+/// not print this message. The message, which names the fix, is for a person reading the raw
 /// body; the operator learns the cause from the warn line in [`exhausted_response`].
 pub(crate) fn codex_no_account_body() -> String {
     serde_json::json!({
         "error": {
             "type": "no_codex_account",
             "code": "no_codex_account",
-            "message": "No Codex account is configured in tcr."
+            "message": "No Codex account is configured in tcr; run `tcr login --from-codex` to add one."
         }
     })
     .to_string()
@@ -6683,11 +6750,11 @@ async fn exhausted_or_fallback(
 /// ([`Manager::provider_account_count`]), the only accounts that could have
 /// served it, so the Anthropic message's "All N accounts" never counts a Codex
 /// account. At zero, a Codex client gets [`codex_no_account_body`], whose message
-/// says no Codex account is configured, instead of a `pool_unavailable` 429
-/// telling it to retry in 60 seconds, which codex obeys up to five times though
-/// no wait adds an account; that answer carries no `retry-after`, because waiting
-/// changes nothing. codex shows that 429 only as its generic retry-limit error,
-/// so the warn line below is what names the cause.
+/// says no Codex account is configured and how to add one, instead of a
+/// `pool_unavailable` 429 telling it to retry in 60 seconds, which codex obeys up
+/// to five times though no wait adds an account; that answer carries no
+/// `retry-after`, because waiting changes nothing. codex shows that 429 only as
+/// its generic retry-limit error, so the warn line below is what names the cause.
 fn exhausted_response(
     manager: &Manager,
     now: OffsetDateTime,
@@ -7278,6 +7345,48 @@ mod tests {
         let parsed: AddAccountRequest =
             serde_json::from_str(&older).expect("a body with no plan keys must still parse");
         assert_eq!(parsed.organization_type, None);
+    }
+
+    /// The server login route carries the provider, for the plan fields' SEAM
+    /// reason above: a Codex import posts a serialized `Account` carrying
+    /// `"provider": "codex"`, and a request struct without the field drops it
+    /// while the route still answers 200, filing a Codex credential as an
+    /// Anthropic account. An Anthropic row serializes no `provider` key at all,
+    /// and still parses as Anthropic.
+    #[test]
+    fn add_account_request_carries_the_provider() {
+        let mut account = Account {
+            name: "alice@example.com/codex".to_string(),
+            account_type: "oauth".to_string(),
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-codex".to_string(),
+            refresh_token: Some("rt-codex".to_string()),
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: Some("pro".to_string()),
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_string(&account).expect("serialize the account an import sends");
+        let parsed: AddAccountRequest =
+            serde_json::from_str(&body).expect("the route must accept the body an import sends");
+        assert_eq!(parsed.provider, crate::provider::Provider::Codex);
+
+        account.provider = crate::provider::Provider::Anthropic;
+        let body = serde_json::to_string(&account).expect("serialize an Anthropic account");
+        assert!(!body.contains("provider"), "{body}");
+        let parsed: AddAccountRequest =
+            serde_json::from_str(&body).expect("a body with no provider key must still parse");
+        assert_eq!(parsed.provider, crate::provider::Provider::Anthropic);
     }
 
     fn dummy_config(api_key: Option<&str>, upstream: &str) -> Config {
@@ -11302,7 +11411,155 @@ mod tests {
         }
     }
 
-    /// SEAM TEST. `oauth::probe_add_capability` (unit 3, `oauth.rs:901-932`)
+    /// Every answer the account-add route STAMPS also names the providers this
+    /// server can store — the blank-probe 400 `oauth::probe_add_route` reads it
+    /// from, a 405, a 409 and a 200 — and the gate's unstamped refusal names
+    /// neither, so a caller that failed the gate learns nothing about the route.
+    /// The stamp's own value is pinned literally: every older CLI recognises the
+    /// route by that exact string, so the providers had to be a second header.
+    #[tokio::test]
+    async fn the_add_route_names_its_providers_on_every_stamped_answer() {
+        assert_eq!(
+            ADD_ACCOUNT_ENDPOINT, "accounts-add",
+            "older CLIs (TcrBar's bundled one included) match this exact value"
+        );
+        let names_providers = |label: &str, headers: &HeaderMap| {
+            assert_eq!(
+                headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+                Some(ADD_ACCOUNT_ENDPOINT),
+                "{label}: stamped"
+            );
+            assert_eq!(
+                headers.get(PROVIDERS_HEADER).and_then(|v| v.to_str().ok()),
+                Some("anthropic,codex"),
+                "{label}: the providers ride on the stamped answer"
+            );
+        };
+
+        // The blank probe's 400.
+        let (manager, path) = control_manager("add-providers-400", None);
+        let (status, headers, _) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"","accessToken":""}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        names_providers("the blank probe's 400", &headers);
+        std::fs::remove_file(&path).ok();
+
+        // A 200.
+        let (manager, path) = control_manager("add-providers-200", None);
+        let (status, headers, _) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","accessToken":"at-carol","refreshToken":"rt-carol"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        names_providers("a 200", &headers);
+        std::fs::remove_file(&path).ok();
+
+        // A 409.
+        let path = control_config_path("add-providers-409");
+        let mut config = two_account_config(None);
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        let (status, headers, _) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"alice@example.com","accessToken":"at-new"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        names_providers("a 409", &headers);
+        std::fs::remove_file(&path).ok();
+
+        // A 405.
+        {
+            use tower::ServiceExt as _;
+            let (manager, path) = control_manager("add-providers-405", None);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(ADD_ACCOUNT_PATH)
+                .body(Body::empty())
+                .expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback_peer()));
+            let response = app(manager).oneshot(req).await.expect("router response");
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            names_providers("a 405", response.headers());
+            std::fs::remove_file(&path).ok();
+        }
+
+        // The gate's refusal is unstamped, and names no providers either.
+        let (manager, path) = control_manager("add-providers-gate", None);
+        let (status, headers, _) = add_request(
+            Arc::clone(&manager),
+            Some(remote_peer()),
+            None,
+            r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            headers.get(ENDPOINT_HEADER).is_none() && headers.get(PROVIDERS_HEADER).is_none(),
+            "a refusal must not confirm the route exists: {headers:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The 200's `provider` is the stored row's, read back from the live rotation, on
+    /// both of the route's arms: a Codex add comes back `codex`, an Anthropic one
+    /// `anthropic`, and so does an update of an existing row. This is what
+    /// `oauth::finish_login_account` checks a Codex import against.
+    #[tokio::test]
+    async fn the_add_route_echoes_the_provider_it_stored() {
+        let (manager, path) = control_manager("add-echo", None);
+        for (body, want, added) in [
+            (
+                r#"{"name":"bob@example.com/codex","provider":"codex","accessToken":"at-codex",
+                    "accountUuid":"22222222-2222-4222-8222-222222222222"}"#,
+                crate::provider::Provider::Codex,
+                true,
+            ),
+            (
+                r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+                crate::provider::Provider::Anthropic,
+                true,
+            ),
+            (
+                r#"{"name":"bob@example.com/codex","provider":"codex","accessToken":"at-codex-2",
+                    "accountUuid":"22222222-2222-4222-8222-222222222222"}"#,
+                crate::provider::Provider::Codex,
+                false,
+            ),
+        ] {
+            let (status, _headers, bytes) =
+                add_request(Arc::clone(&manager), Some(loopback_peer()), None, body).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let payload: AddAccountResponse =
+                serde_json::from_slice(&bytes).expect("an account-add payload");
+            assert_eq!(payload.added, added, "{}: which arm answered", payload.name);
+            assert_eq!(payload.provider, Some(want), "{}", payload.name);
+            assert_eq!(
+                manager.provider(payload.index),
+                Some(want),
+                "the echo is the stored row's provider"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SEAM TEST. `oauth::probe_add_route` (unit 3)
     /// decides whether `tcr login` takes the LIVE route by POSTing this exact
     /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
     /// `cli::post_add_account` and reading whether the reply is a STAMPED
@@ -11340,7 +11597,7 @@ mod tests {
             .no_proxy()
             .build()
             .expect("build client");
-        // The EXACT `Account` `probe_add_capability` builds (oauth.rs:902-915):
+        // The EXACT `Account` `oauth::probe_add_route` builds:
         // a blank name, a blank access token, everything else absent.
         // DERIVED, not a restated literal — a future edit to the probe's body
         // (oauth.rs, out of this route's reach) changes this test's request
@@ -19704,9 +19961,10 @@ mod tests {
     }
 
     /// **A fleet with no Codex account answers a Codex request by saying so**,
-    /// instead of a `pool_unavailable` 429 whose 60-second retry no wait will
-    /// satisfy. Still a 429 in the `{"error": {...}}` envelope, with no
-    /// `retry-after`: waiting changes nothing. Neither origin is asked.
+    /// and names the fix, instead of a `pool_unavailable` 429 whose 60-second
+    /// retry no wait will satisfy. Still a 429 in the `{"error": {...}}`
+    /// envelope, with no `retry-after`: waiting changes nothing. Neither origin
+    /// is asked.
     ///
     /// Watched red: drop the zero-account branch from `exhausted_response` and
     /// the body is `pool_unavailable` with `resets_in_seconds: 60` and a
@@ -19741,7 +19999,8 @@ mod tests {
         assert_eq!(body["error"]["code"], "no_codex_account", "{body}");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("No Codex account is configured"),
+            message.contains("No Codex account is configured")
+                && message.contains("tcr login --from-codex"),
             "{message}"
         );
         assert!(body["error"].get("resets_in_seconds").is_none(), "{body}");
