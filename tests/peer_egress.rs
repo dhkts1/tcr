@@ -1528,7 +1528,11 @@ fn capture() -> (Collector, tracing::subscriber::DefaultGuard) {
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: teamclaude_rs::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in egress tests".into())) })
     }
 }

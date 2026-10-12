@@ -6,6 +6,10 @@
 //! `400/401/403` means the refresh token itself is dead (the account must drop
 //! out of rotation until re-login), whereas a `5xx`/network failure is transient
 //! (keep the current token and fail this one request over to another account).
+//! A Codex account refreshes against `auth.openai.com` instead
+//! ([`crate::codex_oauth`], dispatched by [`LiveRefresher`]), where only a `401`, or a
+//! `400` naming one of its dead-token codes, means that; every other status there, a
+//! `403` included, is transient.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +27,10 @@ pub const EXPIRING_SOON_MS: i64 = 5 * 60 * 1000;
 
 const MAX_RETRIES: u32 = 2;
 const BASE_DELAY_MS: u64 = 500;
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// The bound on one refresh POST, whichever provider's endpoint it goes to: the manager holds an
+/// account's refresh lock across the call, so a POST that never answered would stall every
+/// request on that account. `pub(crate)` so [`crate::codex_oauth`] applies the same bound.
+pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Freshly-minted OAuth credentials returned by a refresh.
 #[derive(Debug, Clone)]
@@ -37,6 +44,9 @@ pub struct Tokens {
     /// return `None`, and [`refresh_access_token_at`] falls back to the
     /// refresh token it was just called with when the endpoint omits a
     /// rotated one. See that fallback's doc comment before touching either.
+    /// The Codex refresher, [`crate::codex_oauth::refresh_access_token_at`], is
+    /// bound by the same invariant and keeps the old token the same way, an
+    /// empty rotated one included.
     pub refresh_token: Option<String>,
     /// Epoch **milliseconds** at which `access_token` expires.
     pub expires_at_ms: i64,
@@ -221,14 +231,22 @@ pub type RefreshFuture = Pin<Box<dyn Future<Output = Result<Tokens, OAuthError>>
 
 /// Abstraction over "turn a refresh token into fresh tokens", so the manager can
 /// be exercised in tests without hitting the network.
+///
+/// `provider` is the provider of the account the token belongs to: a refresh
+/// token is only good at the endpoint that issued it, so the live refresher
+/// sends each one to its own provider's.
 pub trait TokenRefresher: Send + Sync {
-    fn refresh(&self, refresh_token: String) -> RefreshFuture;
+    fn refresh(&self, provider: crate::provider::Provider, refresh_token: String) -> RefreshFuture;
 }
 
-/// The production refresher: a real HTTPS call to Anthropic's OAuth endpoint.
+/// The production refresher: a real HTTPS call to the OAuth endpoint of the
+/// account's provider — Anthropic's, or Codex's ([`crate::codex_oauth`]).
 pub struct LiveRefresher {
     client: reqwest::Client,
     endpoint: String,
+    /// Where Codex refreshes go: [`crate::codex_oauth::TOKEN_ENDPOINT`] unless a
+    /// test pointed it elsewhere with [`Self::with_codex_endpoint`].
+    codex_endpoint: String,
 }
 
 impl LiveRefresher {
@@ -240,13 +258,23 @@ impl LiveRefresher {
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
             // proxy — routing our own upstream through an ambient proxy (e.g. a
             // teamclaude on :3456) loops us through the very thing we replace and fails
-            // as "upstream unreachable". Always reach Anthropic directly.
+            // as "upstream unreachable". Always reach the token endpoint directly,
+            // Anthropic's and Codex's alike.
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
                 .expect("build reqwest client"),
             endpoint: TOKEN_ENDPOINT.to_string(),
+            codex_endpoint: crate::codex_oauth::TOKEN_ENDPOINT.to_string(),
         }
+    }
+
+    /// Send Codex refreshes to `endpoint` instead of
+    /// [`crate::codex_oauth::TOKEN_ENDPOINT`]. A test seam: a stub endpoint is
+    /// the only way to watch a refresh without spending a real single-use token.
+    pub fn with_codex_endpoint(mut self, endpoint: String) -> Self {
+        self.codex_endpoint = endpoint;
+        self
     }
 }
 
@@ -257,10 +285,23 @@ impl Default for LiveRefresher {
 }
 
 impl TokenRefresher for LiveRefresher {
-    fn refresh(&self, refresh_token: String) -> RefreshFuture {
+    fn refresh(&self, provider: crate::provider::Provider, refresh_token: String) -> RefreshFuture {
         let client = self.client.clone();
-        let endpoint = self.endpoint.clone();
-        Box::pin(async move { refresh_access_token_at(&client, &refresh_token, &endpoint).await })
+        match provider {
+            crate::provider::Provider::Anthropic => {
+                let endpoint = self.endpoint.clone();
+                Box::pin(async move {
+                    refresh_access_token_at(&client, &refresh_token, &endpoint).await
+                })
+            }
+            crate::provider::Provider::Codex => {
+                let endpoint = self.codex_endpoint.clone();
+                Box::pin(async move {
+                    crate::codex_oauth::refresh_access_token_at(&client, &refresh_token, &endpoint)
+                        .await
+                })
+            }
+        }
     }
 }
 
@@ -279,7 +320,11 @@ pub const NO_REFRESH_MESSAGE: &str = "offline snapshot never refreshes — token
 pub struct NoRefresh;
 
 impl TokenRefresher for NoRefresh {
-    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+    fn refresh(
+        &self,
+        _provider: crate::provider::Provider,
+        _refresh_token: String,
+    ) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient(NO_REFRESH_MESSAGE.to_string())) })
     }
 }
@@ -980,7 +1025,11 @@ pub fn upsert_account(
     let account_uuid = profile.account_uuid.clone();
     let org_uuid = profile.org_uuid.clone();
     let org_name = profile.org_name.clone();
+    // An Anthropic login, so an Anthropic probe: it never resolves to a Codex row
+    // that shares its name (`identity::same_identity`), and the row it appends below
+    // is Anthropic too.
     let probe = crate::identity::probe(
+        crate::provider::Provider::Anthropic,
         name,
         account_uuid.clone(),
         org_uuid.clone(),
@@ -1405,13 +1454,15 @@ pub async fn login(
 
     // Resolve --account early, ONLY to compute the login_hint (ergonomics —
     // see build_login_flow's doc-comment). Fail fast here on a typo'd or
-    // ambiguous name rather than after a full browser round trip. The SAME
-    // resolution runs again below, against a freshly loaded config, where it
-    // is load-bearing rather than a convenience.
+    // ambiguous name, and on a row this sign-in can never confirm (a Codex
+    // account, `refuse_a_non_claude_row`), rather than after a full browser
+    // round trip. The SAME resolution runs again below, against a freshly
+    // loaded config, where it is load-bearing rather than a convenience.
     let hint = match account {
         Some(query) => {
             let probe_config = load_or_default(config_path)?;
             let idx = crate::cli::resolve_account(&probe_config.accounts, query)?;
+            refuse_a_non_claude_row(&probe_config.accounts[idx])?;
             let email = crate::identity::email_of(&probe_config.accounts[idx].name);
             // Only ever send something address-shaped: a non-email display
             // name (e.g. an account named "work") produces `login_hint=work`
@@ -1900,6 +1951,28 @@ async fn import_claude_code_login(
     .await
 }
 
+/// What `tcr login --account` says to a row that is not a Claude account, before it does
+/// anything else ([`refuse_a_non_claude_row`]): the row, why `tcr login` cannot sign it in, and
+/// that nothing was changed.
+fn codex_account_login_refusal(name: &str) -> String {
+    format!(
+        "'{name}' is a Codex account; `tcr login` signs in Claude accounts only. Nothing was \
+         changed."
+    )
+}
+
+/// Refuse a `--account` row that a Claude sign-in can never confirm: anything but a Claude
+/// account. Both a browser login and a Claude Code import come back with an Anthropic identity,
+/// which no Codex row matches ([`assert_requested_identity`]'s probe), so going on would end in
+/// a mismatch that tells the user to sign out and retry the same command. Called before the
+/// browser opens, and again by the identity check itself.
+fn refuse_a_non_claude_row(account: &Account) -> anyhow::Result<()> {
+    match account.provider {
+        crate::provider::Provider::Anthropic => Ok(()),
+        crate::provider::Provider::Codex => bail!("{}", codex_account_login_refusal(&account.name)),
+    }
+}
+
 /// Whether `s` is plausibly an email address — no whitespace, and exactly one
 /// `@` with at least one character on each side. Deliberately not a full RFC
 /// 5322 validator: this only ever gates whether a value is safe to hand to
@@ -1958,7 +2031,8 @@ async fn finish_login_checked(
 ///
 /// Called strictly BEFORE any write path
 /// ([`finish_login`]/[`persist_via_file`]/[`persist_via_account`]): on
-/// mismatch, on an unresolvable/ambiguous requested account, or on a profile
+/// mismatch, on an unresolvable/ambiguous requested account, on a requested
+/// row that is not a Claude account ([`refuse_a_non_claude_row`]), or on a profile
 /// that carries neither an email nor a uuid (`fetch_profile`'s all-`None`
 /// failure return, `src/oauth.rs:649-654` — an assertion that cannot be
 /// evaluated must fail closed, not pass by default), nothing is written.
@@ -1969,6 +2043,7 @@ fn assert_requested_identity(
 ) -> anyhow::Result<()> {
     let idx = crate::cli::resolve_account(&config.accounts, query)?;
     let requested = &config.accounts[idx];
+    refuse_a_non_claude_row(requested)?;
 
     if profile.email.is_none() && profile.account_uuid.is_none() {
         bail!(
@@ -1988,7 +2063,10 @@ fn assert_requested_identity(
     // browser returned Personal, because it never looks at whether that
     // identity actually belongs to a DIFFERENT row.
     let probe_name = profile.email.as_deref().unwrap_or(&requested.name);
+    // The browser just authenticated an ANTHROPIC account, so this probe is one: a
+    // requested Codex row is never confirmed by it (`identity::same_identity`).
     let probe = crate::identity::probe(
+        crate::provider::Provider::Anthropic,
         probe_name,
         profile.account_uuid.clone(),
         profile.org_uuid.clone(),
@@ -2799,6 +2877,84 @@ mod tests {
         );
     }
 
+    /// `LiveRefresher` sends each provider's refresh token to that provider's
+    /// own endpoint, in that provider's grant. A refresh token is only good
+    /// where it was issued, so a Codex token posted to Anthropic is not a slow
+    /// refresh but a rejected one — and a rejection sidelines the account as
+    /// dead until it is logged in again.
+    ///
+    /// Both endpoints point at one loopback stub — the Anthropic one by setting
+    /// the private field, since it has no builder seam — so a broken dispatch
+    /// fails here instead of posting a fake token to a real token endpoint. The
+    /// client ids pin the pairing of grant to endpoint as well as the route.
+    #[tokio::test]
+    async fn live_refresher_sends_each_provider_to_its_own_token_endpoint() {
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>;
+        let seen: Seen = Seen::default();
+        let recorder = |route: &'static str, seen: Seen| {
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((route, body));
+                    axum::Json(serde_json::json!({
+                        "access_token": format!("at-from-{route}"),
+                        "refresh_token": "rt-rotated",
+                        "expires_in": 3600
+                    }))
+                }
+            }
+        };
+        let app = axum::Router::new()
+            .route(
+                "/anthropic",
+                axum::routing::post(recorder("anthropic", seen.clone())),
+            )
+            .route(
+                "/codex",
+                axum::routing::post(recorder("codex", seen.clone())),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut refresher =
+            LiveRefresher::new().with_codex_endpoint(format!("http://{addr}/codex"));
+        refresher.endpoint = format!("http://{addr}/anthropic");
+
+        let codex = refresher
+            .refresh(crate::provider::Provider::Codex, "rt-codex".to_string())
+            .await
+            .expect("the Codex refresh must succeed against the stub");
+        let anthropic = refresher
+            .refresh(
+                crate::provider::Provider::Anthropic,
+                "rt-anthropic".to_string(),
+            )
+            .await
+            .expect("the Anthropic refresh must succeed against the stub");
+
+        assert_eq!(
+            codex.access_token, "at-from-codex",
+            "a Codex refresh must reach the Codex token endpoint"
+        );
+        assert_eq!(
+            anthropic.access_token, "at-from-anthropic",
+            "an Anthropic refresh must reach the Anthropic token endpoint"
+        );
+        let seen = seen.lock().unwrap();
+        let body_at = |route: &str| {
+            let (_, body) = seen
+                .iter()
+                .find(|(hit, _)| *hit == route)
+                .unwrap_or_else(|| panic!("the {route} endpoint was never called: {seen:?}"));
+            body.clone()
+        };
+        assert_eq!(body_at("codex")["client_id"], crate::codex_oauth::CLIENT_ID);
+        assert_eq!(body_at("codex")["refresh_token"], "rt-codex");
+        assert_eq!(body_at("anthropic")["client_id"], CLIENT_ID);
+        assert_eq!(body_at("anthropic")["refresh_token"], "rt-anthropic");
+    }
+
     #[test]
     fn resolve_callback_accepts_matching_state() {
         let code = resolve_callback_code(
@@ -3217,7 +3373,10 @@ mod tests {
         // server can never rotate/revoke its single-use refresh token. Transient,
         // never AuthRejected — it must NOT falsely mark the credential dead.
         let err = NoRefresh
-            .refresh("rt-should-never-be-sent".to_string())
+            .refresh(
+                crate::provider::Provider::Anthropic,
+                "rt-should-never-be-sent".to_string(),
+            )
             .await
             .expect_err("NoRefresh must always fail — it never contacts the endpoint");
         assert!(matches!(err, OAuthError::Transient(_)));
@@ -4079,6 +4238,91 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A fleet of one Claude row and one Codex row, `bob@example.com/codex`, whose proxy is on
+    /// a port nothing listens on, written to a fresh tempdir.
+    async fn claude_and_codex_rows() -> (tempfile::TempDir, std::path::PathBuf) {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                    {{ "name": "alice@example.com", "accessToken": "at-alice" }},
+                    {{ "name": "bob@example.com/codex", "provider": "codex",
+                       "accessToken": "at-bob" }}
+                ] }}"#
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// `tcr login --account` on a Codex row is refused before the browser sign-in starts,
+    /// naming the row, and nothing is written. The sign-in is Anthropic's, and the identity it
+    /// returns can never confirm a Codex row, so going on ended in "sign out and retry" with
+    /// the same command, every time.
+    ///
+    /// Watched red: without the refusal, `login` starts the sign-in and waits for its callback
+    /// until the timeout below fires.
+    #[tokio::test]
+    async fn a_relogin_of_a_codex_row_is_refused_before_the_browser_opens() {
+        let (_dir, path) = claude_and_codex_rows().await;
+        let before = std::fs::read(&path).unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            login(
+                &path,
+                false,
+                Some("bob@example.com/codex"),
+                None,
+                LoginUi::Machine,
+            ),
+        )
+        .await
+        .expect("refused before the sign-in, which would wait for its callback")
+        .expect_err("`tcr login` cannot sign in a Codex row");
+        let text = err.to_string();
+        assert!(
+            text.contains("'bob@example.com/codex' is a Codex account")
+                && text.contains("`tcr login` signs in Claude accounts only")
+                && text.contains("Nothing was changed"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+    }
+
+    /// The identity check refuses a Codex row by name too, for `--from-claude-code --account`,
+    /// which reaches it with a credential already in hand: a Codex row is not an account whose
+    /// browser signed in as someone else.
+    ///
+    /// Watched red: without the refusal, the error is the mismatch, "requested re-login for …,
+    /// but the browser authenticated as …".
+    #[tokio::test]
+    async fn the_identity_check_refuses_a_codex_row_by_name() {
+        let (_dir, path) = claude_and_codex_rows().await;
+        let config = load_or_default(&path).unwrap();
+
+        let err = assert_requested_identity(
+            &config,
+            "bob@example.com/codex",
+            &profile_named("bob@example.com"),
+        )
+        .expect_err("a Codex row is never confirmed by an Anthropic identity");
+        let text = err.to_string();
+        assert!(
+            text.contains("'bob@example.com/codex' is a Codex account")
+                && text.contains("`tcr login` signs in Claude accounts only"),
+            "{text}"
+        );
     }
 
     /// The mirror of the canonical failure: the SAME uuid AND the SAME org

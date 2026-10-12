@@ -2105,12 +2105,14 @@ impl Manager {
         // is logged into two orgs (finding #9). With all identity fields None
         // (today's config) same_identity falls back to name equality — unchanged.
         //
-        // The provider rides along so the probe is the account it was built from,
-        // like every other config-write probe in this module. Unlike theirs, the
-        // matching here (`identity::resolve` below, then `save_tokens_for`'s merge)
-        // reads identity alone today, so it decides nothing yet.
-        let mut probe = crate::identity::probe(name, account_uuid, org_uuid, org_name);
-        probe.provider = provider;
+        // The provider rides on the probe, as on every probe, and here it decides:
+        // `identity::same_identity` never matches a row of another provider, so only
+        // rows of this one are candidates, both in the `resolve` below and in the
+        // pairing `save_tokens_for`'s merge makes. An Anthropic row and a Codex row
+        // may share a name, and when either lacks an account UUID the name fallback
+        // alone calls them one account — a tie that would refuse to persist this
+        // rotation, or a pairing that would stamp it onto the other provider's row.
+        let probe = crate::identity::probe(provider, name, account_uuid, org_uuid, org_name);
         // INV1 — the modify and the save must be ONE atomic step against the file.
         // Without that, two concurrent refreshes race: a stale save clobbers the
         // other account's just-rotated refresh token, which then 400s
@@ -2418,6 +2420,7 @@ impl Manager {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             for account in accounts.iter_mut() {
                 let probe = crate::identity::probe(
+                    account.provider,
                     &account.name,
                     account.account_uuid.clone(),
                     account.org_uuid.clone(),
@@ -2464,6 +2467,7 @@ impl Manager {
             for candidate in &fresh.accounts {
                 let already_known = accounts.iter().any(|existing| {
                     let probe = crate::identity::probe(
+                        existing.provider,
                         &existing.name,
                         existing.account_uuid.clone(),
                         existing.org_uuid.clone(),
@@ -2537,10 +2541,12 @@ impl Manager {
             Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
-            // Resolved by identity, exactly as `persist_tokens` and `save_disabled`
-            // resolve, so all three land on the same record. An unbreakable tie
-            // writes nothing: `save_disabled` refuses one too, and memory must not
-            // drift onto a record the file was not allowed to touch.
+            // Resolved by identity, through the one `identity::resolve` that
+            // `persist_tokens` and `save_disabled` resolve through, with the provider
+            // riding on `target` (`set_disabled` builds it from the row), so all three
+            // land on the same record and never on a row of another provider. An
+            // unbreakable tie writes nothing: `save_disabled` refuses one too, and
+            // memory must not drift onto a record the file was not allowed to touch.
             if let crate::identity::Resolved::One(position) =
                 crate::identity::resolve(config.accounts.iter().enumerate(), target)
             {
@@ -2638,17 +2644,16 @@ impl Manager {
                 account.rate_limited_until_ms = None;
             }
             // `save_disabled` locates the row by this probe, and
-            // `config::locate_account_entry` never matches a row of the other
-            // provider: a probe left at the default (Anthropic) addresses no
-            // Codex row, so a Codex account's bench would never reach disk.
-            let mut probe = crate::identity::probe(
+            // `identity::same_identity` never matches a row of the other provider:
+            // a probe built with the wrong provider (Anthropic) addresses no Codex
+            // row, so a Codex account's bench would never reach disk.
+            crate::identity::probe(
+                account.provider,
                 &account.name,
                 account.account_uuid.clone(),
                 account.org_uuid.clone(),
                 account.org_name.clone(),
-            );
-            probe.provider = account.provider;
-            probe
+            )
         };
         self.persist_disabled(idx, &target, disabled)
     }
@@ -2864,14 +2869,13 @@ impl Manager {
                     // Carries the account's provider for the reason
                     // `set_disabled`'s probe does: `save_control_account`
                     // checks the row through `config::locate_account_entry`.
-                    let mut probe = crate::identity::probe(
+                    crate::identity::probe(
+                        a.provider,
                         &a.name,
                         a.account_uuid.clone(),
                         a.org_uuid.clone(),
                         a.org_name.clone(),
-                    );
-                    probe.provider = a.provider;
-                    probe
+                    )
                 })
         });
         {
@@ -3039,7 +3043,11 @@ impl Manager {
     /// loop inside the function body for why at most one retry is ever
     /// needed and why it cannot reopen the TOCTOU above.
     pub fn add_or_update_account(&self, mut account: config::Account) -> AddAccountOutcome {
+        // The submission's provider rides on the probe, so a Codex submission never
+        // resolves to an Anthropic row that shares its name, live or on disk
+        // (`identity::same_identity`): it is added beside it, never stamped onto it.
         let target = crate::identity::probe(
+            account.provider,
             &account.name,
             account.account_uuid.clone(),
             account.org_uuid.clone(),
@@ -3097,6 +3105,7 @@ impl Manager {
                         (
                             i,
                             crate::identity::probe(
+                                a.provider,
                                 &a.name,
                                 a.account_uuid.clone(),
                                 a.org_uuid.clone(),
@@ -3119,6 +3128,7 @@ impl Manager {
                                     crate::identity::same_identity(
                                         &target,
                                         &crate::identity::probe(
+                                            a.provider,
                                             &a.name,
                                             a.account_uuid.clone(),
                                             a.org_uuid.clone(),
@@ -3666,7 +3676,11 @@ mod tests {
     }
 
     impl TokenRefresher for CountingRefresher {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             let calls = self.calls.clone();
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -3692,7 +3706,11 @@ mod tests {
     }
 
     impl TokenRefresher for TransientThenOkRefresher {
-        fn refresh(&self, refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            refresh_token: String,
+        ) -> RefreshFuture {
             let calls = self.calls.clone();
             let tokens_seen = self.tokens_seen.clone();
             Box::pin(async move {
@@ -3777,7 +3795,11 @@ mod tests {
     async fn permanently_rejected_account_never_recovers_and_its_backoff_grows() {
         struct AlwaysRejects;
         impl TokenRefresher for AlwaysRejects {
-            fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _refresh_token: String,
+            ) -> RefreshFuture {
                 Box::pin(async { Err(OAuthError::AuthRejected { status: 400 }) })
             }
         }
@@ -4185,6 +4207,80 @@ mod tests {
             serde_json::json!("rt-b-relogin"),
             "rotating acct-a reverted acct-b's re-auth; that token is single-use \
              and acct-b is now dead until `tcr login`"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A rotated Codex credential is persisted onto the Codex row, and the Anthropic
+    /// row that shares its name keeps its own.
+    ///
+    /// Neither row carries an account UUID, so identity alone falls back to the name
+    /// and calls the two rows one account; only the provider tells them apart. Both
+    /// halves of the write depend on it: provider-blind, `persist_tokens`' own
+    /// placement ties and refuses, and so does the merge that pairs on-disk entries
+    /// with loaded accounts — either way the rotated single-use refresh token never
+    /// reaches the file, and the Codex account is dead after the next restart.
+    #[test]
+    fn a_rotated_codex_token_persists_onto_the_codex_row_beside_a_same_named_anthropic_row() {
+        let path = tmp_config_path("codex-beside-anthropic");
+        let mut anthropic = account("alice@example.com", 0);
+        anthropic.access_token = "at-anthropic".to_string();
+        anthropic.refresh_token = Some("rt-anthropic".to_string());
+        let mut codex = account("alice@example.com", 1);
+        codex.provider = crate::provider::Provider::Codex;
+        codex.access_token = "at-codex".to_string();
+        codex.refresh_token = Some("rt-codex".to_string());
+        let manager = build_manager_with_path(config_with(vec![anthropic, codex]), path.clone());
+
+        // Establish the file from the manager's own snapshot, so an unchanged row
+        // below cannot just mean nothing ever writes here.
+        manager.persist_now();
+
+        manager.persist_tokens(
+            "alice@example.com",
+            None,
+            None,
+            None,
+            crate::provider::Provider::Codex,
+            &Tokens {
+                access_token: "at-codex-rotated".to_string(),
+                refresh_token: Some("rt-codex-rotated".to_string()),
+                expires_at_ms: crate::now_ms() + 3_600_000,
+            },
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("the config stays valid JSON");
+        let row_of = |provider: Option<&str>| {
+            value["accounts"]
+                .as_array()
+                .expect("an accounts array")
+                .iter()
+                .find(|row| row.get("provider").and_then(serde_json::Value::as_str) == provider)
+                .unwrap_or_else(|| panic!("no row with provider {provider:?}: {value}"))
+                .clone()
+        };
+        let anthropic_row = row_of(None);
+        assert_eq!(
+            anthropic_row["refreshToken"],
+            serde_json::json!("rt-anthropic"),
+            "a Codex rotation must leave the Anthropic row's own credential alone: {value}"
+        );
+        assert_eq!(
+            anthropic_row["accessToken"],
+            serde_json::json!("at-anthropic")
+        );
+        let codex_row = row_of(Some("codex"));
+        assert_eq!(
+            codex_row["refreshToken"],
+            serde_json::json!("rt-codex-rotated"),
+            "the rotated Codex token must reach the Codex row: {value}"
+        );
+        assert_eq!(
+            codex_row["accessToken"],
+            serde_json::json!("at-codex-rotated")
         );
 
         std::fs::remove_file(&path).ok();
@@ -5427,6 +5523,62 @@ mod tests {
             "the newly admitted account must be selectable, not just counted: got {idx:?}"
         );
         drop(accounts);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A Codex row the file names while the proxy runs is ADMITTED by the reload
+    /// even when the running fleet holds an Anthropic row of the same name with no
+    /// uuid, and that Anthropic row keeps its own groups. Provider-blind, the name
+    /// fallback called the Codex row already known through the Anthropic row, so it
+    /// was never admitted, and the group carry handed the Codex row's groups to the
+    /// Anthropic one. The Codex row carries a uuid, as a real one does (the ChatGPT
+    /// account id): it does not help, because the Anthropic side has none.
+    ///
+    /// Watched red: drop the provider guard from `identity::same_identity` and the
+    /// Codex row is never admitted, while the Anthropic row takes its groups.
+    #[test]
+    fn reload_admits_a_codex_row_named_like_a_running_anthropic_row() {
+        let path = tmp_config_path("reload-codex-beside-anthropic");
+        let boot = config_with(vec![account_in_groups(
+            "alice@example.com",
+            0,
+            &["anthropic-team"],
+        )]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account_in_groups("alice@example.com", 1, &["codex-team"])
+        };
+        config::save(&path, &config_with(vec![codex])).expect("write reload config");
+        manager.reload_groups_if_changed();
+
+        let rows: Vec<(String, crate::provider::Provider, Vec<String>)> = manager
+            .accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .map(|a| (a.name.clone(), a.provider, a.groups.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "alice@example.com".to_string(),
+                    crate::provider::Provider::Anthropic,
+                    vec!["anthropic-team".to_string()]
+                ),
+                (
+                    "alice@example.com".to_string(),
+                    crate::provider::Provider::Codex,
+                    vec!["codex-team".to_string()]
+                ),
+            ],
+            "the Codex row is admitted beside the Anthropic row, each with its own groups"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -7155,7 +7307,11 @@ mod tests {
     }
 
     impl TokenRefresher for BlockingRefresher {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             let started = self.started.clone();
             let release = self.release.clone();
             Box::pin(async move {
@@ -7264,6 +7420,67 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.access_token(0).as_deref(), Some("fresh-access"));
+    }
+
+    /// A refresher that records the provider each refresh was asked for, then mints a
+    /// fresh token so the refresh applies.
+    struct ProviderRecordingRefresher {
+        providers: Arc<Mutex<Vec<crate::provider::Provider>>>,
+    }
+
+    impl TokenRefresher for ProviderRecordingRefresher {
+        fn refresh(
+            &self,
+            provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
+            self.providers
+                .lock()
+                .expect("providers lock poisoned")
+                .push(provider);
+            Box::pin(async {
+                Ok::<Tokens, OAuthError>(Tokens {
+                    access_token: "fresh-access".to_string(),
+                    refresh_token: Some("fresh-refresh".to_string()),
+                    expires_at_ms: crate::now_ms() + 3_600_000,
+                })
+            })
+        }
+    }
+
+    /// The manager asks for each account's refresh under that account's own provider,
+    /// because the live refresher sends the token to that provider's endpoint: a Codex
+    /// refresh token posted to Anthropic is rejected, and a rejection marks a healthy
+    /// account `Error`.
+    #[tokio::test]
+    async fn a_refresh_is_requested_for_the_accounts_own_provider() {
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let mut codex = account("codex-row", 1);
+        codex.provider = crate::provider::Provider::Codex;
+        let manager = build_manager(
+            config_with(vec![account("anthropic-row", 0), codex]),
+            Arc::new(ProviderRecordingRefresher {
+                providers: providers.clone(),
+            }),
+        );
+
+        assert!(
+            manager.ensure_fresh_force(1).await,
+            "precondition: the Codex row's refresh must apply"
+        );
+        assert!(
+            manager.ensure_fresh_force(0).await,
+            "precondition: the Anthropic row's refresh must apply"
+        );
+
+        assert_eq!(
+            *providers.lock().expect("providers lock poisoned"),
+            vec![
+                crate::provider::Provider::Codex,
+                crate::provider::Provider::Anthropic
+            ],
+            "each refresh must be requested under its own account's provider"
+        );
     }
 
     /// The refresh coalescing lock now lives on `AccountRuntime` itself rather than
@@ -11123,12 +11340,13 @@ mod tests {
 
     /// A Codex account's bench reaches ITS row. `config::locate_account_entry`
     /// never matches a row of the other provider, so the probe `set_disabled`
-    /// locates the row by must carry the runtime account's provider: built with
-    /// the default (Anthropic) it addresses nothing, and the bench silently does
-    /// not survive a restart.
+    /// locates the row by must carry the runtime account's provider: built as
+    /// Anthropic it addresses nothing, and the bench silently does not survive a
+    /// restart.
     ///
-    /// Watched red: drop `probe.provider = account.provider` in `set_disabled`
-    /// and the outcome is `NoEntry`, with the Codex row unflagged.
+    /// Watched red: build `set_disabled`'s probe with `Provider::Anthropic` in
+    /// place of `account.provider` and the outcome is `NoEntry`, with the Codex
+    /// row unflagged.
     #[test]
     fn set_disabled_on_a_codex_account_persists_to_its_codex_row() {
         let codex = Account {

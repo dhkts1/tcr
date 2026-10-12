@@ -385,6 +385,7 @@ impl Manager {
                         account_uuid: account.account_uuid.clone(),
                         org_uuid: account.org_uuid.clone(),
                         org_name: account.org_name.clone(),
+                        provider: account.provider,
                     },
                     minted_at_ms,
                 ))
@@ -413,6 +414,7 @@ impl Manager {
                 .iter()
                 .map(|a| {
                     identity::probe(
+                        a.provider,
                         &a.name,
                         a.account_uuid.clone(),
                         a.org_uuid.clone(),
@@ -443,7 +445,13 @@ mod tests {
     use crate::manager::AccountRuntime;
 
     fn account(name: &str, uuid: &str) -> Account {
-        let mut account = identity::probe(name, Some(uuid.to_string()), Some("org-1".into()), None);
+        let mut account = identity::probe(
+            crate::provider::Provider::Anthropic,
+            name,
+            Some(uuid.to_string()),
+            Some("org-1".into()),
+            None,
+        );
         account.access_token = format!("at-{name}");
         account.refresh_token = Some(format!("rt-{name}"));
         account.expires_at = Some(crate::now_ms() + 3_600_000);
@@ -585,6 +593,64 @@ mod tests {
         assert!(manager
             .bound_token_account(&tokens(&["sig_fake_fresh"]))
             .is_some());
+    }
+
+    /// A Codex account's bound token comes back to the Codex row after a restart, beside an
+    /// Anthropic row of the same name. Neither row carries a uuid, so the name fallback alone
+    /// calls them one account and only the provider the record stored tells them apart. The
+    /// Anthropic row's own token, written beside it with no provider key at all, comes back to
+    /// the Anthropic row: a record written before the field existed reads as Anthropic.
+    ///
+    /// Watched red, twice: drop the provider guard from `identity::same_identity` and both
+    /// tokens tie and are dropped as ambiguous; read the stored provider back as Anthropic and
+    /// the Codex token lands on the Anthropic row.
+    #[test]
+    fn a_codex_bound_token_restores_to_the_codex_row_beside_a_same_named_anthropic_row() {
+        let path = tmp("codex-beside-anthropic");
+        let named = |provider| Account {
+            provider,
+            account_uuid: None,
+            org_uuid: None,
+            ..account("alice@example.com", "unused")
+        };
+        let anthropic = named(crate::provider::Provider::Anthropic);
+        let codex = named(crate::provider::Provider::Codex);
+        let now = crate::now_ms();
+
+        let first = manager_over(&[anthropic.clone(), codex.clone()]);
+        first.record_bound_tokens(&sig("sig_fake_anthropic"), 0, now);
+        first.record_bound_tokens(&sig("sig_fake_codex"), 1, now);
+        assert_eq!(first.flush_bound_tokens(&path).expect("flush"), 2);
+        let raw = std::fs::read_to_string(&path).expect("read the token file");
+        assert_eq!(
+            raw.matches(r#""provider":"codex""#).count(),
+            1,
+            "the Codex record is written with its provider: {raw}"
+        );
+        assert_eq!(
+            raw.matches("provider").count(),
+            1,
+            "and the Anthropic record with none, as before this field existed: {raw}"
+        );
+
+        // Next boot, the two rows in the other order.
+        let second = manager_over(&[codex, anthropic]);
+        let report = second.restore_bound_tokens(&path, BOUND_TOKEN_TTL_MS);
+        assert_eq!(
+            (report.degraded, report.unresolved, report.ambiguous),
+            (None, 0, 0),
+            "both tokens resolve to exactly one row"
+        );
+        assert_eq!(
+            second.bound_token_account(&tokens(&["sig_fake_codex"])),
+            Some((0, BoundTokenKind::ThinkingSignature)),
+            "the Codex token follows the Codex row to position 0"
+        );
+        assert_eq!(
+            second.bound_token_account(&tokens(&["sig_fake_anthropic"])),
+            Some((1, BoundTokenKind::ThinkingSignature)),
+            "the Anthropic token follows the Anthropic row to position 1"
+        );
     }
 
     /// The persistence bridge's own half: indices out to identities on save, identities back to

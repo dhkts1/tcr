@@ -125,7 +125,7 @@ impl Manager {
         };
 
         tracing::info!(account = %name, "refreshing OAuth token");
-        match self.refresher.refresh(refresh_token).await {
+        match self.refresher.refresh(provider, refresh_token).await {
             Ok(tokens) => {
                 // A *forced* success re-arms the refresh cooldown, collapsing a herd
                 // of concurrent 401-driven force-refreshes to ONE rotation instead of

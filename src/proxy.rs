@@ -8023,7 +8023,11 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -11670,7 +11674,11 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -13937,7 +13945,11 @@ mod tests {
         // ensure_fresh_force returns false (identical to a cooldown-suppressed force).
         struct AlwaysTransient;
         impl crate::oauth::TokenRefresher for AlwaysTransient {
-            fn refresh(&self, _refresh_token: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _refresh_token: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
                     Err(crate::oauth::OAuthError::Transient("simulated blip".into()))
                 })
@@ -14006,7 +14018,11 @@ mod tests {
     async fn single_401_on_account_without_refresh_token_marks_error() {
         struct NeverCalled;
         impl crate::oauth::TokenRefresher for NeverCalled {
-            fn refresh(&self, _refresh_token: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _refresh_token: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
                     panic!("a refresh must never be attempted for an account with no refresh token")
                 })
@@ -14081,7 +14097,11 @@ mod tests {
         // the 2nd-401 path under test.
         struct AlwaysRefreshes;
         impl crate::oauth::TokenRefresher for AlwaysRefreshes {
-            fn refresh(&self, _refresh_token: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _refresh_token: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
                     Ok(crate::oauth::Tokens {
                         access_token: "fresh-access".into(),
@@ -14959,7 +14979,11 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -15073,7 +15097,11 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -15386,7 +15414,11 @@ mod tests {
     ) -> Arc<Manager> {
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _t: String,
+            ) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }

@@ -1402,8 +1402,10 @@ pub fn default_path() -> PathBuf {
 /// to tell an old plaintext shape from a new one. Bumped only when the
 /// on-disk SHAPE of `accessToken`/`refreshToken` changes — never for an
 /// unrelated `Account` field — so a reader can always tell which shape it is
-/// holding before trying to interpret it. `1` is the only shape that has ever
-/// existed: today's plaintext `accessToken`/`refreshToken` strings.
+/// holding before trying to interpret it. `1` is the only token shape that has
+/// ever existed: today's plaintext `accessToken`/`refreshToken` strings. A Codex
+/// row has that same shape, and is written at [`CODEX_CREDENTIAL_VERSION`] (see
+/// there).
 ///
 /// Deliberately NOT an `Account` struct field: `Account` is constructed as a
 /// literal at several dozen call sites across the crate (tests, `oauth.rs`,
@@ -1417,6 +1419,64 @@ pub fn default_path() -> PathBuf {
 /// `Account`'s flattened `extra` map, which already exists to carry any key
 /// this crate does not model, and round-trips untouched like any other.
 const CREDENTIAL_VERSION: u64 = 1;
+
+/// The `credentialVersion` a CODEX row is written at, and the highest [`load`]
+/// accepts on one: 1, the same as [`CREDENTIAL_VERSION`].
+///
+/// A Codex row has version 1's token shape. This build must not serve a Codex row
+/// another build wrote at a higher version: its usage probe, keep-warm and plan
+/// backfill still send every row's bearer to Anthropic. Holding the version at 1
+/// makes [`load`] refuse such a row, the whole file and loudly, the way it refuses
+/// any version it does not understand. At 1, the raise [`needs_credential_stamp`]
+/// describes and the stamp [`with_codex_credential_versions`] applies change
+/// nothing.
+const CODEX_CREDENTIAL_VERSION: u64 = 1;
+
+/// The `credentialVersion` a row of `provider` is written at, and the highest
+/// [`load`] accepts on one. One exhaustive `match`, so a third provider cannot be
+/// stamped by default.
+fn credential_version_for(provider: crate::provider::Provider) -> u64 {
+    match provider {
+        crate::provider::Provider::Anthropic => CREDENTIAL_VERSION,
+        crate::provider::Provider::Codex => CODEX_CREDENTIAL_VERSION,
+    }
+}
+
+/// Whether [`stamp_credential_version`] would change `entry`, one account row
+/// (on disk, or an `Account`'s `extra` in memory).
+///
+/// An absent key always needs its provider's version, as it always did. A row
+/// whose provider is written above [`CREDENTIAL_VERSION`] (none, in this build) also
+/// needs it when it carries a SMALLER number: a row an earlier build wrote at 1,
+/// or one copied by hand from an Anthropic row (every saved row carries 1), is
+/// exactly the row an older build would serve. Anything else already present is
+/// left alone: an Anthropic row's value, so an Anthropic-only file never changes;
+/// a number above the provider's, so the refusal [`load`] performs on an unknown
+/// future version can never be papered over; and a value that is not a version
+/// number at all, which [`load`] refuses too.
+fn needs_credential_stamp(entry: &Map<String, Value>, provider: crate::provider::Provider) -> bool {
+    let version = credential_version_for(provider);
+    match entry.get("credentialVersion") {
+        None => true,
+        Some(Value::Number(n)) => {
+            version > CREDENTIAL_VERSION && n.as_u64().is_some_and(|v| v < version)
+        }
+        Some(_) => false,
+    }
+}
+
+/// Stamp `provider`'s credential version on `entry` where
+/// [`needs_credential_stamp`] says it is missing or too old. Every writer of a row
+/// calls this, so a Codex row reaches disk at [`CODEX_CREDENTIAL_VERSION`] whichever
+/// path wrote it.
+fn stamp_credential_version(entry: &mut Map<String, Value>, provider: crate::provider::Provider) {
+    if needs_credential_stamp(entry, provider) {
+        entry.insert(
+            "credentialVersion".to_string(),
+            Value::Number(credential_version_for(provider).into()),
+        );
+    }
+}
 
 /// `entry`'s `credentialVersion` key, read directly off the raw JSON so
 /// [`load`] can decide before anything is handed to `serde` for typed
@@ -1467,9 +1527,10 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 /// Load and parse the config at `path`.
 ///
 /// Checks every account's `credentialVersion` before anything else touches
-/// the entry — see [`CREDENTIAL_VERSION`] — backfilling an absent key to `1`
-/// in the document and refusing the whole file on a version number this
-/// build does not understand.
+/// the entry — see [`CREDENTIAL_VERSION`] — backfilling an absent key in the
+/// document (`1`, a Codex row's `CODEX_CREDENTIAL_VERSION` included) and
+/// refusing the whole file on a version number this build does not understand
+/// for that row's provider.
 ///
 /// Deserializes leniently at the account boundary: an `accounts[]` entry that
 /// cannot yield a usable credential ([`unusable_account`]) is dropped, with a
@@ -1574,10 +1635,17 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     // Credential-envelope version check, ahead of everything else that reads
     // an account entry: refuse the whole file rather than silently
     // reinterpreting a shape a future `tcr` wrote and this build has never
-    // seen. A missing key backfills to version 1 in the document itself, so
-    // the very next `save` writes it explicitly and no migration step is
-    // needed today — see [`CREDENTIAL_VERSION`]'s doc-comment for why this
-    // lives here rather than on `Account`.
+    // seen. A missing key backfills in the document itself, so the very next
+    // `save` writes it explicitly and no migration step is needed today — see
+    // [`CREDENTIAL_VERSION`]'s doc-comment for why this lives here rather than
+    // on `Account`.
+    //
+    // What this build understands is per ROW, its provider's version: up to 1
+    // on every row, a Codex row included ([`CODEX_CREDENTIAL_VERSION`] says
+    // why), with the row's provider read the way every matcher over the raw
+    // document reads it. A provider this build does not know gets the Anthropic
+    // ceiling and no stamp: the typed parse below refuses the file over that
+    // provider anyway.
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
         for entry in accounts.iter_mut() {
             let name = entry
@@ -1585,25 +1653,23 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
                 .and_then(Value::as_str)
                 .unwrap_or("<unnamed>")
                 .to_string();
+            let provider = entry.as_object().and_then(provider_of_entry);
+            let understood = provider.map_or(CREDENTIAL_VERSION, credential_version_for);
             match credential_version_of(entry) {
-                Ok(None) => {
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.insert(
-                            "credentialVersion".to_string(),
-                            Value::Number(CREDENTIAL_VERSION.into()),
-                        );
-                    }
-                }
-                Ok(Some(v)) if v > CREDENTIAL_VERSION => {
+                Ok(Some(v)) if v > understood => {
                     return Err(ConfigError::Parse(
                         <serde_json::Error as serde::de::Error>::custom(format!(
                             "account \"{name}\" carries credentialVersion {v}, which this build \
-                             only understands up to {CREDENTIAL_VERSION}; refusing to load rather \
+                             only understands up to {understood}; refusing to load rather \
                              than silently reinterpret its credential shape"
                         )),
                     ));
                 }
-                Ok(Some(_)) => {}
+                Ok(_) => {
+                    if let (Some(obj), Some(provider)) = (entry.as_object_mut(), provider) {
+                        stamp_credential_version(obj, provider);
+                    }
+                }
                 Err(()) => {
                     return Err(ConfigError::Parse(
                         <serde_json::Error as serde::de::Error>::custom(format!(
@@ -1871,8 +1937,47 @@ fn save_renames(
 ///
 /// Same-directory temp + rename keeps the swap atomic (rename is atomic within a
 /// filesystem); a crash mid-write leaves the original intact.
+///
+/// A Codex account is written at `CODEX_CREDENTIAL_VERSION` even when the
+/// snapshot carries no version for it (`with_codex_credential_versions`); an
+/// Anthropic-only config serializes exactly as it always has.
 pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
-    write_atomic(path, &serde_json::to_string_pretty(config)?)
+    write_atomic(
+        path,
+        &serde_json::to_string_pretty(with_codex_credential_versions(config).as_ref())?,
+    )
+}
+
+/// `config` with the `credentialVersion` of every account whose provider is
+/// written above [`CREDENTIAL_VERSION`] stamped (see [`stamp_credential_version`];
+/// no provider is, in this build: see [`CODEX_CREDENTIAL_VERSION`]), for the two
+/// writers that serialize the whole snapshot, [`save`] and [`save_settings`].
+/// Borrowed unchanged when no account needs a stamp, which is every config in
+/// this build: a row written from memory keeps whatever its `extra` held.
+///
+/// The merge writers stamp the rows they touch; these two serialize accounts
+/// straight from memory, where a Codex row can carry no version at all — one the
+/// server added live through `POST /_tcr/accounts`, or the single row of a
+/// first login's fresh file. Unstamped, that row reaches disk in a shape every
+/// older proxy loads as a Claude account: through the server's whole-file
+/// fallback ([`save_tokens_for`] on a file it cannot read), or a first import.
+fn with_codex_credential_versions(config: &Config) -> std::borrow::Cow<'_, Config> {
+    let quarantined =
+        |account: &Account| credential_version_for(account.provider) > CREDENTIAL_VERSION;
+    if !config.accounts.iter().any(|account| {
+        quarantined(account) && needs_credential_stamp(&account.extra, account.provider)
+    }) {
+        return std::borrow::Cow::Borrowed(config);
+    }
+    let mut stamped = config.clone();
+    for account in stamped
+        .accounts
+        .iter_mut()
+        .filter(|account| quarantined(account))
+    {
+        stamp_credential_version(&mut account.extra, account.provider);
+    }
+    std::borrow::Cow::Owned(stamped)
 }
 
 /// [`load`], except that a config file which does not exist yet is CREATED on
@@ -2150,7 +2255,9 @@ pub fn save_settings(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let Ok(disk) = read_document(path) else {
         return save(path, config);
     };
-    let Ok(Value::Object(mut doc)) = serde_json::to_value(config) else {
+    let Ok(Value::Object(mut doc)) =
+        serde_json::to_value(with_codex_credential_versions(config).as_ref())
+    else {
         // `Config` is a struct, so this is the total-function tail rather than a
         // reachable outcome. Falling back rather than failing keeps a verb that
         // would have worked before working.
@@ -2557,15 +2664,13 @@ fn merge_tokens(
         object.extend(fields);
         // Stamp the version on every entry this write actually touches, since
         // nothing else in the live path does — see [`CREDENTIAL_VERSION`]'s
-        // doc-comment. Backfill only: an entry that already carries the key
-        // (whatever it says) is left alone, so this can never paper over the
-        // refusal `load` performs on an unknown future version.
-        if !object.contains_key("credentialVersion") {
-            object.insert(
-                "credentialVersion".to_string(),
-                Value::Number(CREDENTIAL_VERSION.into()),
-            );
-        }
+        // doc-comment — at the version of the account's own provider: the
+        // pairing above never crosses providers, so it is the entry's too.
+        // Backfill only: no provider is written above 1 in this build, so
+        // [`needs_credential_stamp`] raises nothing. A number above the
+        // provider's is never touched, so this can never paper over the refusal
+        // `load` performs on an unknown future version.
+        stamp_credential_version(object, fresh.provider);
         if let Some(seen) = placed.get_mut(position) {
             *seen = true;
         }
@@ -2618,6 +2723,16 @@ enum EntryPlan {
 ///
 /// Whatever is still unpaired when the fixed point is reached is reported, never
 /// guessed.
+///
+/// Every pairing is confined to ONE provider: each entry's probe carries the entry's
+/// provider and [`crate::identity::same_identity`] never pairs records of two
+/// providers, so an entry is only ever weighed against loaded accounts of its own
+/// provider, and an account only against entries of its own. An Anthropic row and a
+/// Codex row may share a name, and when either side lacks an account UUID the name
+/// fallback alone calls them one account — so, provider-blind, the two rows would tie
+/// and neither rotation would be persisted, or an entry left with only the OTHER
+/// provider's account would take that account's credential, a token the entry's
+/// upstream will never accept.
 fn plan_merge(entries: &[Value], memory: &[Account]) -> Vec<(Option<String>, EntryPlan)> {
     // Parse each entry's identity once. A `None` probe is an entry no match can
     // reach, and its plan is already final — so `plan[i].is_some()` is exactly
@@ -2645,7 +2760,17 @@ fn plan_merge(entries: &[Value], memory: &[Account]) -> Vec<(Option<String>, Ent
             plan.push(Some(EntryPlan::Skip(SkipReason::NoIdentity)));
             continue;
         };
+        // A provider this build does not know matches nothing. No loaded account can
+        // carry one (`load` refuses the value), so this is the no-match case. A known
+        // one rides on the probe, and `identity::same_identity` never pairs it with an
+        // account of another provider, in any of the resolves below.
+        let Some(provider) = provider_of_entry(object) else {
+            probes.push(None);
+            plan.push(Some(EntryPlan::Skip(SkipReason::NoMemoryMatch)));
+            continue;
+        };
         probes.push(Some(crate::identity::probe(
+            provider,
             &stored.name,
             stored.account_uuid,
             stored.org_uuid,
@@ -2665,7 +2790,7 @@ fn plan_merge(entries: &[Value], memory: &[Account]) -> Vec<(Option<String>, Ent
             let Some(probe) = probes[index].as_ref().filter(|_| plan[index].is_none()) else {
                 continue;
             };
-            // Which unclaimed account does this entry point at?
+            // Which unclaimed account of its provider does this entry point at?
             let crate::identity::Resolved::One(position) = crate::identity::resolve(
                 memory
                     .iter()
@@ -2676,7 +2801,8 @@ fn plan_merge(entries: &[Value], memory: &[Account]) -> Vec<(Option<String>, Ent
                 continue;
             };
             // …and does that account point back at this entry alone? Any other
-            // unsettled entry with the same identity makes the write a coin flip.
+            // unsettled entry of its provider with the same identity makes the write a
+            // coin flip.
             let mutual = crate::identity::resolve(
                 probes
                     .iter()
@@ -3549,26 +3675,21 @@ fn locate_account_entry(doc: &Map<String, Value>, target: &Account) -> EntryMatc
             // Rows of different providers are never the same account, whatever their
             // names and ids say: an Anthropic row and a Codex row for the same person
             // legitimately share an email, and the name fallback and the org-unknown
-            // tolerance below would otherwise let a Codex import overwrite the Anthropic
-            // credential. Absent means Anthropic, as everywhere else. A present value is
-            // read through `Provider`'s own serde spelling, the one `load` uses, so a
-            // value this build does not know (a hand-edit typo, a later provider) matches
+            // tolerance would otherwise let a Codex import overwrite the Anthropic
+            // credential. The entry's provider rides on its probe, and
+            // `identity::same_identity` refuses every pair of different providers.
+            // Absent means Anthropic, as everywhere else. A present value is read
+            // through `Provider`'s own serde spelling, the one `load` uses, so a value
+            // this build does not know (a hand-edit typo, a later provider) matches
             // NOTHING: read as Anthropic, it would take an Anthropic credential and then
             // lose its key to `merge_account`'s provider stamp, a silent relabel.
-            let entry_provider = match object.get("provider") {
-                None => crate::provider::Provider::Anthropic,
-                Some(value) => {
-                    serde_json::from_value::<crate::provider::Provider>(value.clone()).ok()?
-                }
-            };
-            if entry_provider != target.provider {
-                return None;
-            }
+            let entry_provider = provider_of_entry(object)?;
             let stored =
                 serde_json::from_value::<DiskIdentity>(Value::Object(object.clone())).ok()?;
             Some((
                 index,
                 crate::identity::probe(
+                    entry_provider,
                     &stored.name,
                     stored.account_uuid,
                     stored.org_uuid,
@@ -3581,6 +3702,21 @@ fn locate_account_entry(doc: &Map<String, Value>, target: &Account) -> EntryMatc
         crate::identity::Resolved::One(index) => EntryMatch::One(index),
         crate::identity::Resolved::None => EntryMatch::None,
         crate::identity::Resolved::Many => EntryMatch::Many,
+    }
+}
+
+/// The provider an on-disk account entry belongs to, read the way `load` reads it:
+/// an absent key is Anthropic, and a present one goes through [`Provider`]'s own
+/// serde spelling. `None` for a value this build does not know, which every caller
+/// treats as matching NOTHING — see [`locate_account_entry`] for why it must never
+/// read as Anthropic. One reading for every matcher over the raw document
+/// ([`locate_account_entry`], [`plan_merge`]), so they cannot drift on it.
+///
+/// [`Provider`]: crate::provider::Provider
+fn provider_of_entry(entry: &Map<String, Value>) -> Option<crate::provider::Provider> {
+    match entry.get("provider") {
+        None => Some(crate::provider::Provider::Anthropic),
+        Some(value) => serde_json::from_value(value.clone()).ok(),
     }
 }
 
@@ -3722,14 +3858,10 @@ fn merge_account(
                 if let Value::Object(fields) = serde_json::to_value(&credentials)? {
                     entry.extend(fields);
                 }
-                // Same backfill as `merge_tokens`: this entry just received a
-                // real credential, so stamp the version if nothing already did.
-                if !entry.contains_key("credentialVersion") {
-                    entry.insert(
-                        "credentialVersion".to_string(),
-                        Value::Number(CREDENTIAL_VERSION.into()),
-                    );
-                }
+                // Same stamp as `merge_tokens`: this entry just received a real
+                // credential, so it carries its provider's version from here on
+                // (`locate_account_entry` matched it within `account`'s provider).
+                stamp_credential_version(entry, account.provider);
                 // `type` always wins — `save_account` is only ever called with a
                 // real credential, so a stale stored type (e.g. an API-key row
                 // re-added as OAuth) is corrected here; leaving it wrong is a
@@ -3844,12 +3976,13 @@ fn merge_account(
             }
             // `Account` deliberately carries no `credentialVersion` field (see
             // [`CREDENTIAL_VERSION`]'s doc-comment), so a freshly serialized
-            // entry never has the key — stamp it here rather than leave a
-            // brand-new account the one entry the read path has to backfill.
+            // entry has the key only when its `extra` carried one — stamp it
+            // here, at its provider's version, rather than leave a brand-new
+            // account the one entry the read path has to backfill. A new Codex
+            // row is therefore at [`CODEX_CREDENTIAL_VERSION`] from its first
+            // write.
             if let Value::Object(fields) = &mut new_entry {
-                fields
-                    .entry("credentialVersion".to_string())
-                    .or_insert_with(|| Value::Number(CREDENTIAL_VERSION.into()));
+                stamp_credential_version(fields, account.provider);
             }
             entries.push(new_entry);
             Ok(AccountWrite::Added)
@@ -4064,6 +4197,36 @@ mod tests {
         assert!(
             err.to_string().contains("acct-a"),
             "error should name the account: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    // --- credentialVersion: a Codex row is held at 1 -------------------------
+
+    /// A Codex row at `credentialVersion` 2 is refused like any version this build
+    /// does not understand: the whole file, naming the row and the version. This
+    /// build must not serve one, because its usage probe, keep-warm and plan
+    /// backfill would send the row's bearer to Anthropic.
+    #[test]
+    fn a_codex_row_at_credential_version_2_is_refused() {
+        let path = tmp_path("cred-version-codex-2-refused");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "alice@example.com", "provider": "codex", "accessToken": "at-a",
+                   "accountUuid": "11111111-1111-4111-8111-111111111111", "credentialVersion": 2 }
+               ] }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("a Codex row at credentialVersion 2 must refuse to load");
+        let message = err.to_string();
+        assert!(
+            message.contains("alice@example.com")
+                && message.contains("credentialVersion 2")
+                && message.contains("up to 1"),
+            "error should name the Codex row, its version and what it may carry: {message}"
         );
 
         fs::remove_file(&path).ok();
@@ -5711,7 +5874,7 @@ mod tests {
     /// An identity probe in the legacy (no-uuid) shape every real config uses,
     /// where `same_identity` reduces to name equality.
     fn by_name(name: &str) -> Account {
-        crate::identity::probe(name, None, None, None)
+        crate::identity::probe(crate::provider::Provider::Anthropic, name, None, None, None)
     }
 
     /// Disabling writes `"disabled": true` onto the right entry and changes
@@ -5963,6 +6126,7 @@ mod tests {
         )
         .unwrap();
         let target = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
             "dup@example.com",
             Some("33333333-3333-3333-3333-333333333333".to_string()),
             Some("22222222-2222-2222-2222-222222222222".to_string()),
@@ -6087,6 +6251,7 @@ mod tests {
         .unwrap();
 
         let target = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
             "me@example.com",
             Some("uuid-person".to_string()),
             Some("org-b".to_string()),
@@ -6183,6 +6348,7 @@ mod tests {
         .unwrap();
 
         let target = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
             "me@example.com",
             Some("uuid-person".to_string()),
             Some("org-a".to_string()),
@@ -6221,6 +6387,7 @@ mod tests {
         // The org-carrying row: both entries match it loosely, one matches exactly.
         fs::write(&path, file).unwrap();
         let with_org = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
             "me@example.com",
             Some("uuid-person".to_string()),
             Some("org-a".to_string()),
@@ -6242,6 +6409,7 @@ mod tests {
         // entry that likewise has none.
         fs::write(&path, file).unwrap();
         let pre_org = crate::identity::probe(
+            crate::provider::Provider::Anthropic,
             "me@example.com",
             Some("uuid-person".to_string()),
             None,
@@ -6934,6 +7102,106 @@ mod tests {
         );
     }
 
+    /// The token merge never pairs an entry with another provider's account. The
+    /// Anthropic entry below is the only one named like the loaded Codex account and
+    /// carries no `accountUuid`, so identity alone pairs them — stamping the Codex
+    /// account's rotated credential over the Anthropic row's own single-use refresh
+    /// token, with a token Anthropic will never accept. It is reported as matching
+    /// nothing instead, which is also what lets the warning name it as a possible
+    /// rename rather than an ambiguity.
+    ///
+    /// The Anthropic memory is the control: the same entry still takes a rotated
+    /// credential from an account of its own provider.
+    #[test]
+    fn a_token_merge_never_writes_a_codex_credential_onto_an_anthropic_entry() {
+        let disk = r#"{ "accounts": [
+            { "name": "alice@example.com", "accessToken": "at-anthropic", "refreshToken": "rt-anthropic" } ] }"#;
+        let codex_memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "alice@example.com", "provider": "codex",
+                     "accessToken": "at-codex-rotated", "refreshToken": "rt-codex-rotated" } ] }"#,
+        )
+        .unwrap();
+
+        let mut doc: Map<String, Value> = serde_json::from_str(disk).unwrap();
+        let report = merge_tokens(&mut doc, &codex_memory, CredentialScope::All).unwrap();
+        assert_eq!(
+            doc["accounts"][0]["refreshToken"],
+            json!("rt-anthropic"),
+            "a Codex credential landed on an Anthropic entry: {doc:?}"
+        );
+        assert_eq!(doc["accounts"][0]["accessToken"], json!("at-anthropic"));
+        assert_eq!(
+            report.skipped,
+            vec![SkippedEntry {
+                index: 0,
+                name: Some("alice@example.com".to_string()),
+                reason: SkipReason::NoMemoryMatch,
+            }],
+            "an entry with no account of its own provider matches nothing"
+        );
+
+        let anthropic_memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "alice@example.com",
+                     "accessToken": "at-anthropic-rotated", "refreshToken": "rt-anthropic-rotated" } ] }"#,
+        )
+        .unwrap();
+        let mut doc: Map<String, Value> = serde_json::from_str(disk).unwrap();
+        merge_tokens(&mut doc, &anthropic_memory, CredentialScope::All).unwrap();
+        assert_eq!(
+            doc["accounts"][0]["refreshToken"],
+            json!("rt-anthropic-rotated"),
+            "control: an account of the entry's own provider must still be written"
+        );
+    }
+
+    /// An entry whose `provider` this build does not know matches nothing in the token
+    /// merge either, by the same reading `locate_account_entry` uses: read as
+    /// Anthropic, the hand-typed `"Codex"` row below would take the Anthropic
+    /// account's rotated credential.
+    ///
+    /// The second document is the control: the identical row, spelled the way
+    /// `Provider` serialises, takes it.
+    #[test]
+    fn a_token_merge_matches_nothing_to_an_entry_with_an_unrecognised_provider() {
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "alice@example.com", "accessToken": "at-rotated", "refreshToken": "rt-rotated" } ] }"#,
+        )
+        .unwrap();
+
+        let mut typo: Map<String, Value> = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "alice@example.com", "provider": "Codex",
+                     "accessToken": "at-old", "refreshToken": "rt-old" } ] }"#,
+        )
+        .unwrap();
+        let report = merge_tokens(&mut typo, &memory, CredentialScope::All).unwrap();
+        assert_eq!(
+            typo["accounts"][0]["refreshToken"],
+            json!("rt-old"),
+            "an unrecognised provider must not read as Anthropic: {typo:?}"
+        );
+        assert_eq!(
+            report.skipped,
+            vec![SkippedEntry {
+                index: 0,
+                name: Some("alice@example.com".to_string()),
+                reason: SkipReason::NoMemoryMatch,
+            }]
+        );
+
+        let mut control: Map<String, Value> = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "alice@example.com", "provider": "anthropic",
+                     "accessToken": "at-old", "refreshToken": "rt-old" } ] }"#,
+        )
+        .unwrap();
+        merge_tokens(&mut control, &memory, CredentialScope::All).unwrap();
+        assert_eq!(control["accounts"][0]["refreshToken"], json!("rt-rotated"));
+    }
+
     /// The Updated arm's provider stamp spells Anthropic as the ABSENT key: a row
     /// that says `"provider": "anthropic"` out loud loses the key on the next
     /// in-place save, the same file a fresh Anthropic row would have produced.
@@ -7454,6 +7722,60 @@ mod tests {
             json!("rt-b-rotated"),
             "a settings edit reverted a rotated refresh token"
         );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// A settings edit over a same-named Anthropic and Codex pair keeps each row's
+    /// OWN credential from disk. Neither row carries a uuid, so the name fallback
+    /// alone calls both of them either loaded account; only the provider tells them
+    /// apart. Provider-blind, the planner refused both pairings as ambiguous and the
+    /// write kept the snapshot's stale credentials for BOTH rows: two single-use
+    /// refresh tokens reverted in one edit.
+    ///
+    /// Watched red: drop the provider guard from `identity::same_identity` and both
+    /// rows are written with the stale snapshot's credentials.
+    #[test]
+    fn a_settings_edit_keeps_each_row_of_a_same_named_cross_provider_pair_on_its_own_credential() {
+        let path = tmp_path("settings-edit-cross-provider");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a-disk", "refreshToken": "rt-a-disk" },
+                { "name": "alice@example.com", "provider": "codex",
+                  "accessToken": "at-c-disk", "refreshToken": "rt-c-disk" }
+            ] }"#,
+        )
+        .unwrap();
+        // The editor's snapshot predates both rotations. Built directly, not through
+        // `load`, which would rename the second row.
+        let mut stale: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a-stale", "refreshToken": "rt-a-stale" },
+                { "name": "alice@example.com", "provider": "codex",
+                  "accessToken": "at-c-stale", "refreshToken": "rt-c-stale" }
+            ] }"#,
+        )
+        .unwrap();
+        stale.accounts[0].priority = Some(9);
+
+        save_settings(&path, &stale).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["priority"],
+            json!(9),
+            "the edit must land"
+        );
+        assert_eq!(
+            (
+                &value["accounts"][0]["refreshToken"],
+                &value["accounts"][1]["refreshToken"]
+            ),
+            (&json!("rt-a-disk"), &json!("rt-c-disk")),
+            "each row keeps its own credential from disk: {value}"
+        );
+        assert_eq!(value["accounts"][1]["provider"], json!("codex"));
 
         fs::remove_file(&path).ok();
     }

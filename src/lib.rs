@@ -21,6 +21,7 @@ pub mod build_info;
 pub mod cache_ttl;
 pub mod claude_code_login;
 pub mod cli;
+pub mod codex_oauth;
 pub mod config;
 pub mod control_identity;
 pub mod demo;

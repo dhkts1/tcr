@@ -5661,7 +5661,11 @@ mod tests {
         calls: Arc<AtomicU64>,
     }
     impl TokenRefresher for RecordingRefresher {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(OAuthError::Transient(
