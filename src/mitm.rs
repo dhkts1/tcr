@@ -70,9 +70,24 @@ pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"]
 /// `www.example.org` probe). This is also the REQUIRED coverage set: a
 /// persisted leaf whose sidecar (see [`load_tls_in`]) does not match this
 /// exactly is treated as stale and re-minted.
+///
+/// That makes adding a host here, as `chatgpt.com` was in 2026-10, the whole
+/// upgrade path for an install serving a leaf tcr minted: its sidecar stops
+/// matching, so on the next start [`load_tls_in`] takes its "persisted leaf
+/// SAN coverage is stale" branch and [`remint_leaf_under_persisted_ca`] signs
+/// a fresh leaf under the CA key persisted beside it. The CA its clients
+/// already trust stays valid, so nobody re-trusts anything. (A chain minted
+/// before `tcr-ca.key` existed rotates its CA once instead; see
+/// [`MintedPaths::ca_key`].)
+///
+/// `chatgpt.com` is here ahead of [`ALLOWED_HOSTS`], which does not list it:
+/// [`handle_connect`] blind-tunnels a host the policy does not list, whatever
+/// the leaf covers, so covering it changes nothing a client sees until the
+/// policy names it.
 const FALLBACK_LEAF_SANS: &[&str] = &[
     "api.anthropic.com",
     "platform.claude.com",
+    "chatgpt.com",
     "www.example.org",
 ];
 
@@ -1075,6 +1090,25 @@ mod tests {
         assert!(!host_allowed(""));
     }
 
+    /// [`FALLBACK_LEAF_SANS`] is "the policy allowlist + the JS test host", so
+    /// every [`ALLOWED_HOSTS`] entry must be one of its SANs. A host that is
+    /// policy-allowed but absent from the leaf tcr mints (a typo such as
+    /// `chatgtp.com` in one of the two lists) is never terminated:
+    /// [`handle_connect`]'s coverage check blind-tunnels it, correctly and
+    /// silently, so nothing else would ever notice. Asked the way production
+    /// asks it: [`leaf_covers`] over the coverage branches B, C and D report.
+    #[test]
+    fn every_policy_host_is_covered_by_the_leaf_tcr_mints() {
+        let covered = fallback_hosts_vec();
+        for host in ALLOWED_HOSTS {
+            assert!(
+                leaf_covers(&covered, host),
+                "{host} is policy-allowed but the leaf tcr mints would not cover it, so it \
+                 would be blind-tunneled forever: {covered:?}"
+            );
+        }
+    }
+
     /// The load-bearing property: `platform.claude.com` is policy-allowed AND
     /// covered by a freshly-minted leaf (branch C, [`FALLBACK_LEAF_SANS`]), so
     /// it is intercepted.
@@ -1179,6 +1213,31 @@ mod tests {
         assert!(leaf_covers(&third.covered_hosts, "platform.claude.com"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The upgrade path for every existing install: a sidecar written before
+    /// `chatgpt.com` joined [`FALLBACK_LEAF_SANS`] must read as stale. Branch B
+    /// of [`load_tls_in`] reports `FALLBACK_LEAF_SANS` itself as the reused
+    /// leaf's coverage, so a pre-Codex sidecar that still matched would claim
+    /// `chatgpt.com` for a leaf that cannot present it, and once tcr intercepts
+    /// `chatgpt.com`, every Codex handshake it terminates would fail. The
+    /// mismatch is what re-mints the leaf instead.
+    #[test]
+    fn a_sidecar_from_before_codex_is_stale_and_forces_a_remint() {
+        let before: Vec<String> = [
+            "api.anthropic.com",
+            "platform.claude.com",
+            "www.example.org",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(
+            !sans_match(&before, FALLBACK_LEAF_SANS),
+            "the pre-Codex SAN set must read as stale"
+        );
+        let now: Vec<String> = FALLBACK_LEAF_SANS.iter().map(|s| s.to_string()).collect();
+        assert!(sans_match(&now, FALLBACK_LEAF_SANS));
     }
 
     /// A persisted leaf whose sidecar MATCHES the required coverage is reused

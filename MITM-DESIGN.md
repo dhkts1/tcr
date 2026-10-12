@@ -23,13 +23,29 @@ api.anthropic.com over our own TLS client → stream back).
   `NODE_EXTRA_CA_CERTS=~/.config/tcr-ca.pem` for the user to trust. (Primary path is reuse.)
 
 ## Security (what shipped — this section was written as a plan and the plan changed)
-- **Three hosts are MITM-terminated**, not one: `api.anthropic.com`, `console.anthropic.com` and
-  `platform.anthropic.com` (`ALLOWED_HOSTS`, `src/mitm.rs:49-53`). The OAuth hosts are on the
-  allowlist unconditionally, not "if needed". Which of the three completes a handshake depends on
-  the leaf: the reused `teamclaude-leaf.pem` has a SAN for `api.anthropic.com` only
-  (`src/mitm.rs:45-48`), so on the reuse path that is the one host in practice; the rcgen fallback
-  leaf minted on a fresh install carries SANs for all three plus the JS test host `www.example.org`
-  (`src/mitm.rs:57-62`), and terminates all three.
+- **Two hosts are on the MITM policy list**, not one (`ALLOWED_HOSTS`, `src/mitm.rs:66`):
+  `api.anthropic.com` and `platform.claude.com` (Claude Code's own OAuth refresh,
+  `POST /v1/oauth/token`). `chatgpt.com` (Codex, since 2026-10) is in the leaf tcr mints but not on
+  the list, so it is blind-tunneled like any unlisted host. This bullet used to name
+  `console.anthropic.com` and `platform.anthropic.com`; both were removed in 2026-08 as dead, with
+  `platform.claude.com` added in their place (the evidence is on `ALLOWED_HOSTS`). Being listed is
+  necessary, not sufficient: `handle_connect` terminates a listed host only when the leaf loaded for
+  this process also covers it, and blind-tunnels one it does not cover rather than present a
+  certificate that fails the handshake (`src/mitm.rs:788-797`). The reused `teamclaude-leaf.pem`'s
+  SANs cannot be read without an x509 parser, so on that path tcr claims `api.anthropic.com` only
+  (`src/mitm.rs:360`) and tunnels the other two; the leaf tcr mints itself covers all three plus the
+  JS test host `www.example.org` (`FALLBACK_LEAF_SANS`, `src/mitm.rs:94-99`). Adding a host to that
+  list makes the `tcr-leaf.sans` sidecar of every leaf tcr minted earlier stale, so the next start
+  re-mints that leaf under the persisted CA key and no client has to re-trust anything. Two routes
+  rotate the CA instead. One is a chain minted before `tcr-ca.key` existed: with no CA key to sign
+  under, it rotates its CA once (`MintedPaths::ca_key`, `src/mitm.rs:221-227`; the early `None` at
+  `:429-431`). The other is any read/sign failure inside the re-mint (reading the CA key, signing
+  the leaf, writing it out or loading it back), which also answers `None` (`:458-461`). Either way
+  `load_tls_in` falls through to `generate_and_persist` (`src/mitm.rs:417`), which mints and
+  persists a new CA.
+- **`auth.openai.com` is deliberately not on the list.** It is where the Codex client refreshes its
+  own token, and that exchange must reach the real host untouched, so it is blind-tunneled like
+  every other unlisted host (next bullet).
 - **Every other `CONNECT` target is blind-tunneled** — a raw TCP byte-pipe to `<host>:<port>` with
   TLS left untouched, so we decrypt nothing and inject nothing (`src/mitm.rs:445-451`, `tunnel` at
   `:475-501`). This section originally specified `403` and close, and refusing to replicate the JS

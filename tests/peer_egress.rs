@@ -3989,11 +3989,12 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
 
 /// G-new-1: the peer gateway's origin allow-list must be the SAME list the
 /// local proxy enforces, `src/mitm.rs`'s `ALLOWED_HOSTS`, not a second
-/// literal that merely agrees today. `PEER_EGRESS_HOSTS` is now defined as
-/// `crate::mitm::ALLOWED_HOSTS` directly, so this test is a pointer-equal
-/// check on top of the value check: watch it fail by reverting
-/// `PEER_EGRESS_HOSTS` to its own literal array of the same two hosts, which
-/// passes the value assertion below and fails the pointer one.
+/// literal that merely agrees today. The value check catches two lists that
+/// already differ; the source check catches the copy before it can drift.
+///
+/// Source text, not pointer equality: rustc merges identical constant data,
+/// so a second literal array of the same hosts can share the original's
+/// address and a pointer comparison passes it.
 #[test]
 fn peer_egress_hosts_is_the_local_proxys_allow_list_not_a_second_copy() {
     assert_eq!(
@@ -4001,12 +4002,16 @@ fn peer_egress_hosts_is_the_local_proxys_allow_list_not_a_second_copy() {
         teamclaude_rs::mitm::ALLOWED_HOSTS,
         "the two origin allow-lists drifted"
     );
+    let source = include_str!("../src/peer/egress.rs");
+    let definition = source
+        .lines()
+        .find(|line| line.starts_with("pub const PEER_EGRESS_HOSTS"))
+        .expect("src/peer/egress.rs defines PEER_EGRESS_HOSTS");
     assert!(
-        std::ptr::eq(
-            teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS.as_ptr(),
-            teamclaude_rs::mitm::ALLOWED_HOSTS.as_ptr(),
-        ),
+        definition
+            .trim_end()
+            .ends_with("= crate::mitm::ALLOWED_HOSTS;"),
         "PEER_EGRESS_HOSTS must be defined AS mitm::ALLOWED_HOSTS, not a second literal that \
-         merely equals it today"
+         merely equals it today: {definition}"
     );
 }
