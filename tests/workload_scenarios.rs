@@ -104,6 +104,7 @@ fn account(name: &str, priority: i64) -> Account {
     Account {
         name: name.to_string(),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
         org_name: None,
@@ -220,6 +221,7 @@ impl Fleet {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: SWITCH_THRESHOLD,
             fable_weekly_threshold: None,
             pacing,

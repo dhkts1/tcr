@@ -1563,6 +1563,7 @@ fn fake_account() -> Account {
     Account {
         name: "alice@example.com".to_string(),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
         org_uuid: None,
         org_name: None,
@@ -1616,6 +1617,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
         rename_write_error: None,
         proxy: ProxyConfig::default(),
         upstream: upstream.to_string(),
+        codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.95,
         fable_weekly_threshold: None,
         pacing: PacingConfig {

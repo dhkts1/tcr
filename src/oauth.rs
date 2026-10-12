@@ -1033,6 +1033,7 @@ pub fn upsert_account(
             config.accounts.push(Account {
                 name: name.to_string(),
                 account_type: "oauth".to_string(),
+                provider: Default::default(),
                 account_uuid,
                 org_uuid,
                 org_name,
@@ -1217,6 +1218,7 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
     let probe = Account {
         name: String::new(),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
         org_name: None,
@@ -2082,6 +2084,7 @@ fn persist_via_file(
     let account = Account {
         name: name.to_string(),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: profile.account_uuid,
         org_uuid: profile.org_uuid,
         org_name: profile.org_name,
@@ -2236,6 +2239,7 @@ async fn finish_login(
             let account = Account {
                 name: name.to_string(),
                 account_type: "oauth".to_string(),
+                provider: Default::default(),
                 account_uuid: profile.account_uuid.clone(),
                 org_uuid: profile.org_uuid.clone(),
                 org_name: profile.org_name.clone(),
@@ -4274,6 +4278,7 @@ mod tests {
         let rotated_bob = Account {
             name: "bob@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4481,6 +4486,7 @@ mod tests {
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4584,6 +4590,7 @@ mod tests {
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4772,6 +4779,7 @@ mod tests {
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5210,6 +5218,7 @@ mod tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,

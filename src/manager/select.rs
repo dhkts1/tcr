@@ -3108,6 +3108,7 @@ mod revalidation_sticky_tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3135,6 +3136,7 @@ mod revalidation_sticky_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3264,6 +3266,7 @@ mod sticky_divert_replay_tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3291,6 +3294,7 @@ mod sticky_divert_replay_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3434,6 +3438,7 @@ mod strict_group_door_tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3461,6 +3466,7 @@ mod strict_group_door_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3928,6 +3934,7 @@ mod reserved_gate_agreement_tests {
             &Account {
                 name: "probe".to_string(),
                 account_type: "oauth".to_string(),
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -4096,6 +4103,7 @@ mod group_miss_tests {
             &Account {
                 name: name.to_string(),
                 account_type: "oauth".to_string(),
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -4243,6 +4251,7 @@ mod reset_urgency_tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4270,6 +4279,7 @@ mod reset_urgency_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -4498,6 +4508,7 @@ mod fable_last_resort_tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4525,6 +4536,7 @@ mod fable_last_resort_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -4877,6 +4889,7 @@ mod stale_pin_load_tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4910,6 +4923,7 @@ mod stale_pin_load_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),

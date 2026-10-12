@@ -4538,6 +4538,7 @@ mod tests {
         Account {
             name: String::new(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4633,6 +4634,7 @@ mod tests {
         let account = Account {
             name: "new@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4689,6 +4691,7 @@ mod tests {
         let account = Account {
             name: "dup@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,

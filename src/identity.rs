@@ -312,6 +312,7 @@ pub fn probe(
     Account {
         name: name.to_string(),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid,
         org_uuid,
         org_name,

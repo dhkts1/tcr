@@ -1360,6 +1360,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
             upstream: "http://127.0.0.1:1".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: crate::config::PacingConfig::default(),
@@ -1375,6 +1376,7 @@ mod tests {
             accounts: vec![crate::config::Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,

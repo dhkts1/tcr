@@ -7833,6 +7833,7 @@ mod tests {
         config::Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,

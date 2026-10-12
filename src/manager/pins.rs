@@ -222,6 +222,7 @@ mod tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some("org-1".to_string()),
             org_name: None,

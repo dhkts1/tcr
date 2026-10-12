@@ -32,6 +32,14 @@ fn default_port() -> u16 {
 pub(crate) fn default_upstream() -> String {
     "https://api.anthropic.com".to_string()
 }
+/// Default [`Config::codex_upstream`].
+pub(crate) fn default_codex_upstream() -> String {
+    crate::provider::CODEX_UPSTREAM.to_string()
+}
+/// `skip_serializing_if` for [`Config::codex_upstream`].
+fn is_default_codex_upstream(value: &str) -> bool {
+    value == crate::provider::CODEX_UPSTREAM
+}
 fn default_switch_threshold() -> f64 {
     0.95
 }
@@ -181,6 +189,15 @@ pub struct Account {
     pub name: String,
     #[serde(rename = "type", default = "default_account_type")]
     pub account_type: String,
+    /// Which upstream this credential belongs to. Absent means Anthropic, which is what every
+    /// account was before this key existed. Skipped on save when Anthropic for the same reason
+    /// `egress` is skipped when local: a save rewrites every row, and an upgrade's first save
+    /// must not stamp `"provider": "anthropic"` onto a file a human reads and edits.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider::Provider::is_anthropic"
+    )]
+    pub provider: crate::provider::Provider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_uuid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -996,6 +1013,15 @@ pub struct Config {
     pub proxy: ProxyConfig,
     #[serde(default = "default_upstream")]
     pub upstream: String,
+    /// Where Codex accounts' requests go. Separate from `upstream` because the two providers are
+    /// different hosts and tests point each at its own stub. Written to disk only when the user
+    /// changed it (see `is_default_codex_upstream`): an upgraded Anthropic-only file gains no
+    /// `codexUpstream` key.
+    #[serde(
+        default = "default_codex_upstream",
+        skip_serializing_if = "is_default_codex_upstream"
+    )]
+    pub codex_upstream: String,
     #[serde(default = "default_switch_threshold")]
     pub switch_threshold: f64,
     /// Override for the Fable weekly bucket (`7d_oi`) alone. `None` (absent from
@@ -3488,6 +3514,7 @@ fn merge_control_account(doc: &mut Map<String, Value>, target: Option<&Account>)
 /// the whole array can be scanned immutably (counting matches) before any mutable
 /// borrow is taken; a single mutable pass cannot both count and hand back a
 /// reference.
+#[derive(Debug, PartialEq)]
 enum EntryMatch {
     /// Exactly one entry matches, at this index of the `accounts` array.
     One(usize),
@@ -3519,6 +3546,24 @@ fn locate_account_entry(doc: &Map<String, Value>, target: &Account) -> EntryMatc
         .enumerate()
         .filter_map(|(index, entry)| {
             let object = entry.as_object()?;
+            // Rows of different providers are never the same account, whatever their
+            // names and ids say: an Anthropic row and a Codex row for the same person
+            // legitimately share an email, and the name fallback and the org-unknown
+            // tolerance below would otherwise let a Codex import overwrite the Anthropic
+            // credential. Absent means Anthropic, as everywhere else. A present value is
+            // read through `Provider`'s own serde spelling, the one `load` uses, so a
+            // value this build does not know (a hand-edit typo, a later provider) matches
+            // NOTHING: read as Anthropic, it would take an Anthropic credential and then
+            // lose its key to `merge_account`'s provider stamp, a silent relabel.
+            let entry_provider = match object.get("provider") {
+                None => crate::provider::Provider::Anthropic,
+                Some(value) => {
+                    serde_json::from_value::<crate::provider::Provider>(value.clone()).ok()?
+                }
+            };
+            if entry_provider != target.provider {
+                return None;
+            }
             let stored =
                 serde_json::from_value::<DiskIdentity>(Value::Object(object.clone())).ok()?;
             Some((
@@ -3592,7 +3637,8 @@ pub enum AccountWrite {
     Added,
     /// Exactly one entry carried this identity — its CREDENTIAL fields
     /// (`accessToken` / `refreshToken` / `expiresAt`) were updated in place,
-    /// `type` was stamped to `account.account_type` unconditionally, and any
+    /// `type` was stamped to `account.account_type` unconditionally (and
+    /// `provider` with it, Anthropic written as the absent key), and any
     /// of `accountUuid` / `orgUuid` / `orgName` the entry was MISSING got
     /// backfilled from `account` (never overwriting a value already present —
     /// this is what permanently stops a legacy no-org entry from loosely
@@ -3703,6 +3749,21 @@ fn merge_account(
                     "type".to_string(),
                     Value::String(account.account_type.clone()),
                 );
+                // `provider` is stamped beside `type`, with Anthropic spelled as
+                // the ABSENT key — the same rule `skip_serializing_if` gives the
+                // Added arm below, so this rewrite never writes
+                // `"provider": "anthropic"` onto a row.
+                match account.provider {
+                    crate::provider::Provider::Anthropic => {
+                        entry.remove("provider");
+                    }
+                    other => {
+                        entry.insert(
+                            "provider".to_string(),
+                            Value::String(other.as_str().to_string()),
+                        );
+                    }
+                }
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
                 if !present(entry, "accountUuid") {
                     if let Some(uuid) = &account.account_uuid {
@@ -6453,6 +6514,7 @@ mod tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -6662,6 +6724,270 @@ mod tests {
             "an unwritable shape is left untouched"
         );
         fs::remove_file(&path).ok();
+    }
+
+    // --- provider: which upstream an account belongs to ---------------------
+
+    /// A complete Anthropic OAuth record for the provider tests below, so each
+    /// test spells out only the fields it is about.
+    fn account_fixture(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            provider: Default::default(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-fixture".to_string(),
+            refresh_token: Some("rt-fixture".to_string()),
+            expires_at: Some(1_800_000_000_000),
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: Egress::Local,
+            egress_strict: false,
+            extra: Map::new(),
+        }
+    }
+
+    /// An absent `provider` is Anthropic, which is what every row on disk was
+    /// before the key existed; `"codex"` reads as Codex; and `codexUpstream`
+    /// takes its default when the file never names it.
+    #[test]
+    fn account_provider_defaults_to_anthropic_and_reads_codex() {
+        let doc = r#"{ "accounts": [
+            { "name": "alice@example.com", "accessToken": "at-a" },
+            { "name": "bob@example.com", "provider": "codex", "accessToken": "at-b",
+              "accountUuid": "22222222-2222-4222-8222-222222222222" }
+        ] }"#;
+        let config: Config = serde_json::from_str(doc).expect("parses");
+        assert_eq!(
+            config.accounts[0].provider,
+            crate::provider::Provider::Anthropic
+        );
+        assert_eq!(
+            config.accounts[1].provider,
+            crate::provider::Provider::Codex
+        );
+        assert_eq!(config.codex_upstream, "https://chatgpt.com");
+    }
+
+    /// An upgraded Anthropic-only file gains neither a `provider` key on its row
+    /// nor a top-level `codexUpstream`, whether it is saved back through
+    /// `save_account`'s in-place update or through `save_settings`, the
+    /// whole-config writer every mutating `tcr account` verb uses.
+    ///
+    /// The second save is the one that pins the two `skip_serializing_if`s:
+    /// `save_account`'s update path edits the row key by key and never
+    /// serializes `Account` or `Config`. Watched red by dropping either skip:
+    /// the file then carries `"provider": "anthropic"` or
+    /// `"codexUpstream": "https://chatgpt.com"`.
+    ///
+    /// What it pins is "no new keys", not bytes, and bytes could not be pinned:
+    /// serde_json is built without `preserve_order`, so every write sorts keys;
+    /// the Updated arm stamps `credentialVersion`; and `save_settings` writes
+    /// defaults that have no skip, such as `switchThreshold`.
+    #[test]
+    fn anthropic_only_config_resaves_without_provider_or_codex_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        let original = r#"{
+  "proxy": {
+    "port": 3999
+  },
+  "upstream": "https://api.anthropic.com",
+  "accounts": [
+    {
+      "name": "alice@example.com",
+      "type": "oauth",
+      "accessToken": "at-a",
+      "refreshToken": "rt-a",
+      "expiresAt": 1789000000000
+    }
+  ]
+}"#;
+        std::fs::write(&path, original).unwrap();
+        let (config, _) = load_or_init(&path).expect("loads"); // the loader the server boot uses
+        let account = config.accounts[0].clone();
+        save_account(&path, &account).expect("saves"); // unchanged row: an in-place Updated
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("provider"),
+            "an Anthropic row must write no provider key:\n{after}"
+        );
+        assert!(
+            !after.contains("codexUpstream"),
+            "an untouched default must not be materialised:\n{after}"
+        );
+        // `save_account` above never serializes the struct; the whole-config
+        // writer is where either skip is actually exercised.
+        save_settings(&path, &config).expect("saves the whole config");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("provider"),
+            "a whole-config save must write no provider key for an Anthropic row:\n{after}"
+        );
+        assert!(
+            !after.contains("codexUpstream"),
+            "a whole-config save must not materialise the default codexUpstream:\n{after}"
+        );
+    }
+
+    /// A Codex import for someone who already has an Anthropic row is ADDED
+    /// beside it, carrying its provider, and the Anthropic credential is left
+    /// exactly as it was.
+    #[test]
+    fn a_codex_row_is_saved_with_its_provider_and_never_matches_an_anthropic_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(&path, r#"{ "accounts": [
+            { "name": "alice@example.com", "accessToken": "at-anthropic", "refreshToken": "rt-anthropic" }
+        ] }"#).unwrap();
+        let mut codex = account_fixture("alice@example.com/codex");
+        codex.provider = crate::provider::Provider::Codex;
+        codex.account_uuid = Some("11111111-1111-4111-8111-111111111111".to_string());
+        codex.access_token = "at-codex".to_string();
+        codex.refresh_token = Some("rt-codex".to_string());
+        let write = save_account(&path, &codex).expect("saves");
+        assert!(
+            matches!(write, AccountWrite::Added),
+            "a Codex row must be ADDED beside the Anthropic row, got {write:?}"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rows = after["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["accessToken"], "at-anthropic",
+            "the Anthropic row's credential must be untouched"
+        );
+        assert_eq!(rows[1]["provider"], "codex");
+    }
+
+    /// The provider guard in `locate_account_entry`, on the one shape where
+    /// nothing else separates the two rows: the same name, and no `accountUuid`
+    /// on the stored row, so `same_identity` falls back to name equality and
+    /// calls them one account. Only the provider can say otherwise.
+    ///
+    /// The Anthropic target is the control: the row still resolves for the
+    /// provider it belongs to, so a `None` above is the guard and not a row the
+    /// matcher could never see.
+    #[test]
+    fn locate_account_entry_never_matches_across_providers() {
+        let doc: Map<String, Value> = serde_json::from_str(
+            r#"{ "accounts": [ { "name": "alice@example.com", "accessToken": "at-a" } ] }"#,
+        )
+        .unwrap();
+
+        let mut codex = account_fixture("alice@example.com");
+        codex.provider = crate::provider::Provider::Codex;
+        codex.account_uuid = Some("11111111-1111-4111-8111-111111111111".to_string());
+        assert_eq!(
+            locate_account_entry(&doc, &codex),
+            EntryMatch::None,
+            "a Codex target must never resolve to an Anthropic row, whatever the names say"
+        );
+
+        let anthropic = account_fixture("alice@example.com");
+        assert_eq!(
+            locate_account_entry(&doc, &anthropic),
+            EntryMatch::One(0),
+            "the same row must still resolve for an Anthropic target"
+        );
+    }
+
+    /// A `provider` value this build does not know matches NO target. Were it
+    /// read as Anthropic, the hand-typed `"Codex"` row below would take the
+    /// Anthropic credential and then lose its key to the Updated arm's stamp,
+    /// turning a loud load failure into a silent relabel.
+    ///
+    /// The second document is the control: the identical row, spelled the way
+    /// `Provider` serialises, still resolves.
+    #[test]
+    fn locate_account_entry_matches_nothing_for_an_unrecognised_provider() {
+        let typo: Map<String, Value> = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "provider": "Codex", "accessToken": "at-a" }
+            ] }"#,
+        )
+        .unwrap();
+        let control: Map<String, Value> = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "provider": "anthropic", "accessToken": "at-a" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let anthropic = account_fixture("alice@example.com");
+        assert_eq!(
+            locate_account_entry(&typo, &anthropic),
+            EntryMatch::None,
+            "an unrecognised provider must not read as Anthropic"
+        );
+        assert_eq!(
+            locate_account_entry(&control, &anthropic),
+            EntryMatch::One(0)
+        );
+    }
+
+    /// The Updated arm's provider stamp spells Anthropic as the ABSENT key: a row
+    /// that says `"provider": "anthropic"` out loud loses the key on the next
+    /// in-place save, the same file a fresh Anthropic row would have produced.
+    /// Watched red by deleting the stamp's `remove`.
+    #[test]
+    fn save_account_update_drops_an_explicit_anthropic_provider_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "provider": "anthropic", "type": "oauth",
+                  "accessToken": "at-old", "refreshToken": "rt-old" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let write = save_account(&path, &account_fixture("alice@example.com")).expect("saves");
+        assert_eq!(write, AccountWrite::Updated);
+        let after = read_json(&path);
+        let row = &after["accounts"][0];
+        assert_eq!(
+            row["accessToken"], "at-fixture",
+            "the update must have landed on this row"
+        );
+        assert!(
+            row.get("provider").is_none(),
+            "an Anthropic row must carry no provider key after an update: {row}"
+        );
+    }
+
+    /// The other half of "written only when set": a `codexUpstream` the user DID
+    /// change survives the whole-config writer, so pointing Codex at a stub or a
+    /// regional host is not silently reverted by the next `tcr account` verb.
+    #[test]
+    fn a_non_default_codex_upstream_survives_save_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            r#"{ "codexUpstream": "https://codex-stub.example.com", "accounts": [] }"#,
+        )
+        .unwrap();
+        let (config, _) = load_or_init(&path).expect("loads");
+        assert_eq!(config.codex_upstream, "https://codex-stub.example.com");
+
+        save_settings(&path, &config).expect("saves the whole config");
+        assert_eq!(
+            read_json(&path)["codexUpstream"],
+            "https://codex-stub.example.com",
+            "a user-set codexUpstream must be written back"
+        );
+        let (reloaded, _) = load_or_init(&path).expect("reloads");
+        assert_eq!(reloaded.codex_upstream, "https://codex-stub.example.com");
     }
 
     #[test]

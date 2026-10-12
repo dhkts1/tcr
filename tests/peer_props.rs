@@ -249,6 +249,7 @@ fn fake_account(index: usize) -> Account {
     Account {
         name: format!("acct{index}@example.com"),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: Some(format!("1111111{index}-1111-1111-1111-111111111111")),
         org_uuid: None,
         org_name: None,
@@ -280,6 +281,7 @@ fn fleet(accounts: Vec<Account>) -> Arc<Manager> {
         rename_write_error: None,
         proxy: ProxyConfig::default(),
         upstream: "http://127.0.0.1:1".to_string(),
+        codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: SWITCH_THRESHOLD,
         fable_weekly_threshold: None,
         pacing: PacingConfig {

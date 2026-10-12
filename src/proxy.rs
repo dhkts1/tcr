@@ -2180,6 +2180,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     let account = config::Account {
         name,
         account_type: parsed.account_type.unwrap_or_else(|| "oauth".to_string()),
+        provider: Default::default(),
         account_uuid: parsed.account_uuid,
         org_uuid: parsed.org_uuid,
         org_name: parsed.org_name,
@@ -6342,6 +6343,7 @@ mod tests {
         let mut account = Account {
             name: "alice@example.com".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -6390,6 +6392,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: crate::config::PacingConfig::default(),
@@ -6405,6 +6408,7 @@ mod tests {
             accounts: vec![Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -8272,6 +8276,7 @@ mod tests {
         let account = |name: &str, org: &str, uuid: &str, priority: i64| Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some(format!("11111111-1111-1111-1111-{org}")),
             org_name: Some(format!("Org {org}")),
@@ -10068,6 +10073,7 @@ mod tests {
         let probe_body = Account {
             name: String::new(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,

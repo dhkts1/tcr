@@ -120,6 +120,7 @@ fn account(i: usize) -> Account {
     Account {
         name: format!("acct{i}"),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: Some(fake_uuid(i)),
         org_uuid: (i > 0).then(|| fake_org_uuid(i)),
         org_name: None,
@@ -172,6 +173,7 @@ fn config(
             extra: serde_json::Map::new(),
         },
         upstream: upstream.to_string(),
+        codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.98,
         fable_weekly_threshold: None,
         pacing: PacingConfig::default(),

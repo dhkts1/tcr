@@ -3071,6 +3071,7 @@ impl Manager {
                         let target = config::Account {
                             name: row.name.clone(),
                             account_type: row.account_type.clone(),
+                            provider: Default::default(),
                             account_uuid: row.account_uuid.clone(),
                             org_uuid: row.org_uuid.clone(),
                             org_name: row.org_name.clone(),
@@ -3434,6 +3435,7 @@ mod tests {
         Account {
             name: name.to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3470,6 +3472,7 @@ mod tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),

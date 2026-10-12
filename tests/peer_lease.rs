@@ -1840,6 +1840,7 @@ mod fleet {
         Account {
             name: "lender-fake".to_string(),
             account_type: "oauth".to_string(),
+            provider: Default::default(),
             account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             // One org, so every borrowed request lands in ONE per-org GCRA
             // bucket: which is the bucket the pacing gate measures.
@@ -1873,6 +1874,7 @@ mod fleet {
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),
+            codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: 0.98,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
