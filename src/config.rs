@@ -97,26 +97,37 @@ fn default_pacing() -> PacingConfig {
 /// Default PER-ORGANIZATION outbound throttle: ON. Absent `accountThrottle` key →
 /// these values; `"accountThrottle": {}` → off (escape hatch).
 ///
-/// **This loosens instantaneous per-identity burst. Say so plainly.** Sustained
-/// rate is unchanged — 350ms is the interval a single identity was already held
-/// to, so an organization still sends at most one request per 350ms in the steady
-/// state. But `burst` rises 4 → 8, which means a burst CONCENTRATED on one
-/// organization now admits 8 instantly where it admitted 4. An 8-wide burst on
-/// one org cost `(8-4)*350 = 1400ms` before this change and costs 0 after.
+/// **The burst is sized for an agent wave, not for one turn.** The sustained rate
+/// is unchanged: one send per 350ms per organization. `burst` went 4 → 8 so that
+/// one Claude Code turn (inference + `count_tokens` + a telemetry batch, roughly
+/// 4-6 requests) passes untaxed, then 8 → 24 on 2026-10-12 because 8 still taxed
+/// fan-out: a wave of subagents pinned to one account, or a batch of new sessions
+/// whose startup calls (`/api/claude_code/settings`, `policy_limits`) all go to the
+/// control account. Replaying 575k logged sends (five days, 18 accounts) through
+/// this GCRA: at `burst: 8`, 0.4% of `/v1/messages` sends waited, the worst a
+/// 25-wide wave on one account whose last send waited at least 4.1s. At
+/// `burst: 24`, with the fleet ceiling at 32, none did. The replay works from
+/// completion timestamps, which are smoother than arrivals, so its waits are
+/// lower bounds.
 ///
-/// That is a deliberate trade, not an oversight: one Claude Code turn fires
-/// roughly 4-6 requests (inference + `count_tokens` + a telemetry batch), and at
-/// `burst: 4` the tail of a single turn paid a 350ms tax. It is on the record in
-/// `tests/throttle_exempt.rs::shipped_tuning_passes_one_turn_untaxed`, which
-/// fails if anyone reverts the burst without meaning to.
+/// **Why the looser burst is not expected to draw 429s.** Over the same five days
+/// Anthropic returned 55 "would exceed your account's rate limit" 429s, all on
+/// `/v1/messages`. In the 60s before each one, that account had sent a median of
+/// 39 requests, against the ~179 a minute this bucket allows; and one account ran
+/// at the full 350ms rate for a minute (187 sends) with no 429. Whatever trips
+/// those 429s, it is not request count.
 ///
-/// The FAN-OUT speedup does not come from this. It comes from the bucket being
-/// per-org rather than shared, so capacity scales *with* the account pool instead
-/// of being divided across it — a spread burst is free at `burst: 4` too.
+/// `tests/throttle_exempt.rs::shipped_tuning_passes_an_agent_wave_untaxed` holds
+/// the 24, and `shipped_tuning_still_paces_beyond_one_wave` proves the bucket
+/// still paces past it. Both read this function's values, not a copy.
+///
+/// The speedup for a burst SPREAD across accounts does not come from this. It
+/// comes from the bucket being per-org rather than shared, so capacity grows with
+/// the account pool; a spread burst is free at any of these sizes.
 fn default_account_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(350),
-        burst: Some(8),
+        burst: Some(24),
     }
 }
 
@@ -129,22 +140,25 @@ fn default_account_throttle() -> ThrottleConfig {
 /// genuinely unknown — see [`ThrottleConfig`]'s note on what the evidence does and
 /// does not show.
 ///
-/// **It is tuned so it can actually fire.** An earlier draft set `burst: 24`,
-/// ~14x above observed traffic, which made it unable to engage under any load the
-/// fleet realistically produces — insurance priced never to pay out is not
-/// insurance. `burst: 16` still leaves a 12-wide agent fan-out completely untaxed
-/// (the case this whole change exists to fix) while engaging on a genuine runaway,
-/// which is also the shape a shared-source abuse detector would key on. Sustained
-/// headroom is unchanged and large: measured 2026-08-26 the fleet sustained
-/// 0.69 req/s across 13 accounts, against this ceiling's 10 req/s.
+/// **It is tuned so it can actually fire.** Insurance priced never to pay out is
+/// not insurance, so the burst sits near the fleet's real peaks rather than far
+/// above them. It shipped at 16 and went to 32 on 2026-10-12 for a structural
+/// reason: the ceiling has to sit ABOVE the per-org burst
+/// ([`default_account_throttle`], 24), or a one-account wave that the per-org
+/// bucket admits gets held here instead. In the replay described there, per-org 24
+/// under a ceiling of 16 still held 92 inference sends. At 32 the ceiling still
+/// fires on real traffic: the same replay held 4 sends in five days, and the
+/// fleet's busiest 1s and 2.8s windows reached 36 and 49 sends. Sustained
+/// headroom is unchanged and large: the fleet averaged 1.5 req/s over those five
+/// days, against this ceiling's 10 req/s.
 ///
 /// `tests/throttle_exempt.rs::shipped_fleet_ceiling_can_actually_fire` is the
-/// guard: it drives a 24-wide runaway and asserts the ceiling engages. A ceiling
+/// guard: it drives a 48-wide runaway and asserts the ceiling engages. A ceiling
 /// never observed firing is indistinguishable from an absent one.
 fn default_fleet_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(100),
-        burst: Some(16),
+        burst: Some(32),
     }
 }
 fn default_account_type() -> String {
@@ -1018,13 +1032,13 @@ pub struct Config {
     #[serde(default = "default_pacing")]
     pub pacing: PacingConfig,
     /// Per-ORGANIZATION outbound throttle — the primary limiter. Absent →
-    /// [`default_account_throttle`] (ON: `minSpacingMs: 350, burst: 8`). Set
+    /// [`default_account_throttle`] (ON: `minSpacingMs: 350, burst: 24`). Set
     /// `"accountThrottle": {}` to disable it (all knobs `None`). Read at boot.
     #[serde(default = "default_account_throttle")]
     pub account_throttle: ThrottleConfig,
     /// Fleet-wide ceiling across every organization — insurance, not the primary
     /// limiter. Absent → [`default_fleet_throttle`] (ON: `minSpacingMs: 100,
-    /// burst: 16`). Set `"fleetThrottle": {}` to disable it. Read at boot.
+    /// burst: 32`). Set `"fleetThrottle": {}` to disable it. Read at boot.
     ///
     /// Disabling BOTH is what the old `"throttle": {}` escape hatch used to mean.
     /// Neither key on its own leaves the proxy unthrottled — that asymmetry is why
@@ -4166,7 +4180,7 @@ mod tests {
         assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
         assert_eq!(config.account_throttle.effective_burst(), 4);
         assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
-        assert_eq!(config.fleet_throttle.effective_burst(), 16);
+        assert_eq!(config.fleet_throttle.effective_burst(), 32);
 
         fs::remove_file(&path).ok();
     }
@@ -4695,10 +4709,18 @@ mod tests {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
         assert!(config.account_throttle.is_active());
         assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
-        assert_eq!(config.account_throttle.effective_burst(), 8);
+        assert_eq!(config.account_throttle.effective_burst(), 24);
         assert!(config.fleet_throttle.is_active());
         assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
-        assert_eq!(config.fleet_throttle.effective_burst(), 16);
+        assert_eq!(config.fleet_throttle.effective_burst(), 32);
+        // The ceiling must admit at least one full per-org burst, or a one-account
+        // wave the per-org bucket lets through is held by the fleet bucket instead.
+        assert!(
+            config.fleet_throttle.effective_burst() > config.account_throttle.effective_burst(),
+            "fleet burst {} must exceed per-org burst {}",
+            config.fleet_throttle.effective_burst(),
+            config.account_throttle.effective_burst()
+        );
     }
 
     #[test]

@@ -423,26 +423,36 @@ fn spread_uids(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("user_burst_{i}")).collect()
 }
 
+/// `n` requests cycling over `sessions` distinct sessions: spread across accounts
+/// like [`spread_uids`], but with only `sessions` serial warmups in front of the
+/// timed burst instead of `n`.
+fn cycled_uids(n: usize, sessions: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("user_burst_{}", i % sessions))
+        .collect()
+}
+
 /// `n` requests from ONE session — all pinned to a single account, so they all
 /// contend for the same per-org bucket.
 fn same_uids(n: usize) -> Vec<String> {
     vec!["user_solo".to_string(); n]
 }
 
+/// A config with neither throttle key, so both buckets take the values the
+/// proxy actually ships with. Read from the real defaults rather than copied
+/// here: a copy kept passing while `default_*_throttle` moved underneath it.
+fn shipped_config() -> Config {
+    serde_json::from_str(r#"{ "accounts": [] }"#).expect("an empty account list parses")
+}
+
 /// The tuning this actually SHIPS with (`default_account_throttle`).
 fn account_throttle_shipped() -> ThrottleConfig {
-    ThrottleConfig {
-        min_spacing_ms: Some(350),
-        burst: Some(8),
-    }
+    shipped_config().account_throttle
 }
 
 /// The ceiling this actually SHIPS with (`default_fleet_throttle`).
 fn fleet_throttle_shipped() -> ThrottleConfig {
-    ThrottleConfig {
-        min_spacing_ms: Some(100),
-        burst: Some(16),
-    }
+    shipped_config().fleet_throttle
 }
 
 const BURST: usize = 8;
@@ -714,20 +724,25 @@ async fn both_buckets_off_is_unpaced() {
 // runs in production is never exercised. These close that gap.
 // ---------------------------------------------------------------------------
 
-/// Honest documentation, in executable form, of what shipping `burst: 8` does to
-/// a burst concentrated on ONE organization: it passes untaxed.
+/// The widest burst on ONE organization the shipped tuning must pass untaxed: an
+/// agent wave. A constant, not read from the default, so lowering the default
+/// fails `shipped_tuning_passes_an_agent_wave_untaxed` instead of quietly
+/// shrinking the wave it checks.
+const AGENT_WAVE: usize = 24;
+
+/// Honest documentation, in executable form, of what the shipped `burst: 24`
+/// does to a burst concentrated on ONE organization: it passes untaxed.
 ///
-/// This is a REAL loosening of instantaneous per-identity burst, 4 -> 8. Under
-/// the pre-split fleet-wide bucket this same 8-wide burst paid
-/// `(8-4)*350 = 1400ms`. Sustained per-identity rate is unchanged (one send per
-/// 350ms either way) — only the burst budget grew, deliberately, so a single
-/// Claude Code turn (inference + `count_tokens` + telemetry, ~4-6 requests) is
-/// never taxed mid-turn.
+/// The burst went 4 → 8 so one Claude Code turn (inference + `count_tokens` +
+/// telemetry, ~4-6 requests) is never taxed mid-turn, then 8 → 24 so a wave of
+/// agents pinned to one account is not either: at 8, a logged 25-wide wave paid
+/// at least 4.1s on its last send. Sustained per-identity rate is unchanged (one
+/// send per 350ms). The evidence is in `default_account_throttle`'s doc-comment.
 ///
-/// If someone later reverts the burst to 4, this test SHOULD fail. That is the
-/// point: the loosening is a decision on the record, not an accident.
+/// If someone later lowers the burst, this test SHOULD fail. That is the point:
+/// the loosening is a decision on the record, not an accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shipped_tuning_passes_one_turn_untaxed() {
+async fn shipped_tuning_passes_an_agent_wave_untaxed() {
     let (upstream, _hits, served) = spawn_json_upstream_recording().await;
     let mgr = manager(
         &upstream,
@@ -737,28 +752,30 @@ async fn shipped_tuning_passes_one_turn_untaxed() {
     );
     let proxy = spawn_proxy(mgr).await;
 
-    let last = burst_last_elapsed_uids(&proxy, "/v1/messages", &same_uids(BURST)).await;
+    let last = burst_last_elapsed_uids(&proxy, "/v1/messages", &same_uids(AGENT_WAVE)).await;
 
     let distinct = distinct_accounts_since(&served, 0);
     assert_eq!(distinct, 1, "premise: this burst must land on one org");
 
     assert!(
         last <= EXEMPT_CEILING,
-        "at the SHIPPED burst of 8, an {BURST}-wide burst on one org is untaxed \
-         (it cost 1400ms before the split). Last request completed in {last:?}, \
-         expected <= {EXEMPT_CEILING:?}"
+        "at the SHIPPED tuning, an {AGENT_WAVE}-wide burst on one org is untaxed \
+         (at burst 8 it cost (24-8)*350 = 5600ms). Last request completed in \
+         {last:?}, expected <= {EXEMPT_CEILING:?}"
     );
 }
 
-/// ...and beyond one turn's worth, the shipped per-org bucket still paces.
+/// ...and beyond one wave's worth, the shipped per-org bucket still paces.
 ///
 /// This is the regression guard that `concentrated_burst_on_one_org_is_still_paced`
 /// cannot be: that one dials burst back to 4 to reproduce the old closed form, so
 /// it proves the MECHANISM paces without proving the SHIPPED tuning does. This
-/// runs the real numbers: 12 concurrent on one org must pay `(12-8)*350 = 1400ms`.
+/// runs the real numbers: 28 concurrent on one org must pay `(28-24)*350 = 1400ms`.
+/// 28 stays under the fleet ceiling's 32, so the per-org bucket is the only thing
+/// that can pace it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shipped_tuning_still_paces_beyond_one_turn() {
-    const WIDE: usize = 12;
+async fn shipped_tuning_still_paces_beyond_one_wave() {
+    const WIDE: usize = 28;
     let (upstream, _hits, served) = spawn_json_upstream_recording().await;
     let mgr = manager(
         &upstream,
@@ -776,7 +793,7 @@ async fn shipped_tuning_still_paces_beyond_one_turn() {
     assert!(
         last >= THROTTLED_FLOOR,
         "at the SHIPPED tuning a {WIDE}-wide burst on ONE org must still pay \
-         (12-8)*350 = 1400ms — per-identity pacing is loosened, not removed. \
+         (28-24)*350 = 1400ms; per-identity pacing is loosened, not removed. \
          Last request completed in {last:?}, expected >= {THROTTLED_FLOOR:?}"
     );
 }
@@ -786,23 +803,30 @@ async fn shipped_tuning_still_paces_beyond_one_turn() {
 /// never bind is decoration, not insurance.
 ///
 /// Per-org is off so only the ceiling can pace this, and the burst is spread so no
-/// single org bucket would bind anyway. At `burst: 16` a 32-wide runaway must pay
-/// `(32-16)*100 = 1600ms`.
+/// single org bucket would bind anyway. At `burst: 32` a 48-wide runaway must pay
+/// `(48-32)*100 = 1600ms`.
 ///
 /// **The floor is set to discriminate, not merely to be exceeded.** An earlier
-/// version fired 24 wide and asserted `>= 500ms`, which passed at `burst: 24` too
-/// — i.e. it would have gone green with the ceiling that CANNOT fire, measuring
-/// concurrency overhead rather than pacing. 32 wide against a 1600ms closed form
-/// leaves the old value (`(32-24)*100 = 800ms`) below the floor, so the two are
-/// actually distinguishable.
+/// version fired 24 wide and asserted `>= 500ms`, which passed at a ceiling too
+/// loose to fire, measuring concurrency overhead rather than pacing. 48 wide
+/// against a 1600ms closed form leaves a ceiling of 40 (`(48-40)*100 = 800ms`)
+/// below the 1200ms floor, so the shipped value and a looser one are
+/// distinguishable.
+///
+/// **The runaway cycles 8 sessions rather than opening 48.** The helper warms
+/// every DISTINCT session serially before the timed burst, and each warmup spends
+/// a fleet slot. 48 distinct sessions left the bucket ~2s in debt after the 2s
+/// idle, so a ceiling of 40 paid the same ~2.8s as 32 and passed this floor
+/// (watched, 2026-10-12). Eight sessions warm in 800ms of slots, which the idle
+/// fully refills, so the timed burst starts from a full bucket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shipped_fleet_ceiling_can_actually_fire() {
-    const RUNAWAY: usize = 32;
+    const RUNAWAY: usize = 48;
     let (upstream, _hits, served) = spawn_json_upstream_recording().await;
     let mgr = manager(&upstream, throttle_off(), fleet_throttle_shipped(), false);
     let proxy = spawn_proxy(mgr).await;
 
-    let last = burst_last_elapsed_uids(&proxy, "/v1/messages", &spread_uids(RUNAWAY)).await;
+    let last = burst_last_elapsed_uids(&proxy, "/v1/messages", &cycled_uids(RUNAWAY, 8)).await;
 
     let distinct = distinct_accounts_since(&served, 0);
     assert!(
@@ -813,8 +837,8 @@ async fn shipped_fleet_ceiling_can_actually_fire() {
 
     assert!(
         last >= Duration::from_millis(1_200),
-        "the shipped fleet ceiling must engage on a {RUNAWAY}-wide runaway — \
-         (32-16)*100 = 1600ms. A ceiling that cannot fire is indistinguishable \
+        "the shipped fleet ceiling must engage on a {RUNAWAY}-wide runaway: \
+         (48-32)*100 = 1600ms. A ceiling that cannot fire is indistinguishable \
          from an absent one. Last request completed in {last:?}"
     );
 }
