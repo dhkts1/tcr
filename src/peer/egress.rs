@@ -8,11 +8,17 @@
 //! this path gets its own constant, [`PEER_EGRESS_HOSTS`], deny by default, and
 //! a test that proves the refusal.
 //!
-//! The list is the one the local proxy already enforces (`ALLOWED_HOSTS`,
-//! `src/mitm.rs:66`): `api.anthropic.com` and `platform.claude.com`. The second
-//! is not an extra, it is the host Claude Code's own OAuth refresh targets, so
-//! carrying it is what lets a machine with no internet refresh its own tokens
-//! through a peer and stop dying at the 29-day wall. Reused, not reinvented.
+//! The list is the one the local proxy already enforces (`ALLOWED_HOSTS` in
+//! `src/mitm.rs`): `api.anthropic.com`, `platform.claude.com` and
+//! `chatgpt.com`. The second is not an extra, it is the host Claude Code's own
+//! OAuth refresh targets, so carrying it is what lets a machine with no
+//! internet refresh its own tokens through a peer and stop dying at the 29-day
+//! wall. The third is Codex's host: it joined the local list with the Codex
+//! provider and is carried by construction, as blind as the other two. Reused,
+//! not reinvented. Carried is not sent: the requester never sends a Codex
+//! request through a peer in this version (`pinned_egress`'s Codex arm
+//! refuses a Codex account's exit pin, and `src/proxy.rs` offers the blind
+//! carry to Anthropic requests only).
 //!
 //! # The splice socket, specified, because an unspecified one is a free proxy
 //! for every process on the box
@@ -489,9 +495,12 @@ pub async fn accept_once_splice(
     port: u16,
 ) -> Result<PeerSplice> {
     if !host_allowed(host, port) {
+        // Named from the constants, not spelled out: a hand-written copy of the
+        // list here went on naming two hosts after the list held three.
+        let carried = PEER_EGRESS_HOSTS.join(", ");
         return Err(anyhow!(
             "peer egress: {host}:{port} is not an origin this mesh carries, so nothing was \
-             dialled (the list is api.anthropic.com and platform.claude.com on 443)"
+             dialled (the list is {carried} on {PEER_EGRESS_PORT})"
         ));
     }
 
@@ -1041,6 +1050,19 @@ pub enum PinnedEgressError {
         /// The pinned Mac, in its short display form.
         peer: String,
     },
+    /// The account is a Codex account, and no Codex request leaves through a
+    /// peer in this version: see the Codex arm of [`pinned_egress`].
+    #[error(
+        "account `{account}` is locked to leave from {peer}, and a Codex account does not \
+         leave through a peer in this version, so the pin cannot be honoured. The request was \
+         NOT sent: `egressStrict` is on for this account."
+    )]
+    CodexNotCarried {
+        /// The account, as `tcr status` names it.
+        account: String,
+        /// The pinned Mac, in its short display form.
+        peer: String,
+    },
 }
 
 impl PinnedEgressError {
@@ -1049,12 +1071,14 @@ impl PinnedEgressError {
     ///
     /// The whole of [`PinnedPeerGap::request_may_have_left`], carried on the
     /// error so the caller does not have to re-derive it from a sentence. The
-    /// other two variants are decided before a socket exists, so they are
+    /// other three variants are decided before a socket exists, so they are
     /// `false` by construction rather than by omission.
     pub fn request_may_have_left(&self) -> bool {
         match self {
             Self::PeerUnreachable { delivered, .. } => *delivered,
-            Self::HostNotCarried { .. } | Self::NoNodeKey { .. } => false,
+            Self::HostNotCarried { .. } | Self::NoNodeKey { .. } | Self::CodexNotCarried { .. } => {
+                false
+            }
         }
     }
 
@@ -1259,6 +1283,32 @@ pub async fn pinned_egress(attempt: PinnedAttempt<'_>) -> PinnedEgress {
         .manager
         .account_name(attempt.account_idx)
         .unwrap_or_default();
+
+    // **A CODEX ACCOUNT IS NEVER CARRIED IN THIS VERSION.** Codex stays off the
+    // mesh (it is neither carried nor lent), and nothing below is Codex's:
+    // the URL is built on the ANTHROPIC upstream and `pinned_carry` splices an
+    // Anthropic body, so a pinned Codex account's request went through its Mac to
+    // `api.anthropic.com` carrying a ChatGPT bearer. Its pin is one this Mac
+    // cannot honour, and it is answered exactly like one, before the pacing gate
+    // so the direct path keeps the slot: refused by name when `egressStrict` is
+    // on, one warn line and the direct path otherwise.
+    if attempt.manager.provider(attempt.account_idx) == Some(crate::provider::Provider::Codex) {
+        let err = PinnedEgressError::CodexNotCarried {
+            account: account.clone(),
+            peer: peer.display(),
+        };
+        if pin.strict {
+            return PinnedEgress::Answered(err.into_response());
+        }
+        tracing::warn!(
+            account = %account,
+            peer = %peer.display(),
+            "account egress: a Codex account does not leave through a peer in this version; \
+             sending it from this Mac instead"
+        );
+        return PinnedEgress::TakeTheDirectPath { paced: false };
+    }
+
     let url = format!("{}{}", attempt.manager.upstream(), attempt.path_and_query);
 
     // **THE PACING GATE, HERE, BECAUSE A CARRIED REQUEST IS A SEND.** The

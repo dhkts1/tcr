@@ -4015,3 +4015,104 @@ fn peer_egress_hosts_is_the_local_proxys_allow_list_not_a_second_copy() {
          merely equals it today: {definition}"
     );
 }
+
+/// **A Codex account is never carried, pinned or not, in this version** (Codex
+/// stays off the mesh). `pinned_egress` builds its URL
+/// from the ANTHROPIC upstream and splices an Anthropic body, so a pinned Codex
+/// account's request went through its Mac to `api.anthropic.com` wearing a
+/// ChatGPT bearer. Its pin is one this Mac cannot honour, answered exactly like
+/// one: refused by name on a strict account, one warn line and the direct path
+/// on a loose one, and the pacing slot left unspent for the direct path to take.
+///
+/// The gateway here is live and grants the carry, so the origin's counter is
+/// the proof: a carry that happened would show up there.
+///
+/// Watched red by deleting the Codex arm in `pinned_egress`: both requests are
+/// carried to the origin through the gateway.
+#[tokio::test]
+async fn codex_pinned_account_is_never_carried() {
+    let dir = scratch("pinned-codex");
+    let peers = dir.join("tcr-peers.json");
+    let requester = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir)
+        .expect("mint this node's keypair in the scratch dir");
+    let gateway = node();
+
+    let origin = loopback().await;
+    let origin_addr = origin.local_addr().expect("the origin address");
+    let arrived = origin_exit(origin);
+
+    let gateway_listener = loopback().await;
+    let gateway_addr = gateway_listener.local_addr().expect("the gateway address");
+    let gateway_task = gateway_serving(
+        gateway_listener,
+        gateway.secret,
+        vec![row(&requester.id(), "requester", Vec::new(), true)],
+        origin_addr,
+        1024 * 1024,
+        2,
+    );
+
+    let mut file = PeerFile::default();
+    file.peers.push(row(
+        &gateway.id,
+        "gateway",
+        vec![gateway_addr.to_string()],
+        false,
+    ));
+    file.peers[0].allow.carry = true;
+    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+
+    let (collector, _guard) = capture();
+    for strict in [true, false] {
+        let manager = fleet_with(
+            &format!("https://{ORIGIN}"),
+            vec![Account {
+                provider: teamclaude_rs::provider::Provider::Codex,
+                ..pinned_account(&gateway.id, strict)
+            }],
+        );
+        let answer = egress::pinned_egress(egress::PinnedAttempt {
+            path_and_query: teamclaude_rs::provider::CODEX_RESPONSES_PATH,
+            ..attempt(&manager, &axum::http::Method::POST, &peers)
+        })
+        .await;
+        match (strict, answer) {
+            (true, egress::PinnedEgress::Answered(response)) => {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("the refusal body reads");
+                let body = String::from_utf8_lossy(&body);
+                assert!(
+                    body.contains("alice@example.com") && body.contains("Codex"),
+                    "the refusal names the account and why its pin cannot be honoured: {body}"
+                );
+            }
+            (false, egress::PinnedEgress::TakeTheDirectPath { paced }) => assert!(
+                !paced,
+                "nothing was paced inside the exit lock, so the direct path takes the slot"
+            ),
+            (strict, _) => panic!(
+                "a Codex account's pin is refused when strict and falls back when loose \
+                 (strict: {strict}); it is never carried"
+            ),
+        }
+    }
+    assert_eq!(
+        count(&arrived),
+        0,
+        "a Codex request must never leave through the pinned Mac"
+    );
+    let lines = collector.matching("does not leave through a peer");
+    assert_eq!(
+        lines.len(),
+        1,
+        "the loose account says so exactly once: {:?}",
+        collector.messages()
+    );
+    assert_eq!(
+        lines[0].fields.get("account").map(String::as_str),
+        Some("alice@example.com")
+    );
+    gateway_task.abort();
+}

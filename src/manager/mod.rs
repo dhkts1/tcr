@@ -1681,9 +1681,16 @@ impl Manager {
     /// A `retry-after` hint (seconds) for a synthetic 429 when every account is
     /// exhausted: the soonest instant at which SOME account genuinely re-enters
     /// rotation, clamped to at least 1s, defaulting to 60s when nothing is known.
-    /// The seconds half of [`Self::exhaustion_hint`]; see it for the derivation.
-    pub fn retry_after_hint(&self, now: OffsetDateTime, is_fable: bool) -> i64 {
-        self.exhaustion_hint(now, is_fable, None).retry_after
+    /// The seconds half of [`Self::exhaustion_hint`]; see it for the derivation, and for why
+    /// it folds only `provider`'s accounts.
+    pub fn retry_after_hint(
+        &self,
+        now: OffsetDateTime,
+        is_fable: bool,
+        provider: crate::provider::Provider,
+    ) -> i64 {
+        self.exhaustion_hint(now, is_fable, provider, None)
+            .retry_after
     }
 
     /// [`Self::retry_after_hint`], scoped to the members of one group.
@@ -1704,9 +1711,11 @@ impl Manager {
         &self,
         now: OffsetDateTime,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: &str,
     ) -> i64 {
-        self.exhaustion_hint(now, is_fable, Some(group)).retry_after
+        self.exhaustion_hint(now, is_fable, provider, Some(group))
+            .retry_after
     }
 
     /// Everything a synthetic exhausted 429 can honestly tell the client, derived
@@ -1748,13 +1757,21 @@ impl Manager {
     /// reserved-blocked by its own group ([`Self::reserved_blocks`]). `None` is
     /// the "unrequested traffic" view [`Self::snapshot`] reports — a promise this
     /// hint makes must hold for the traffic that would actually hit the 429.
+    ///
+    /// `provider` narrows the fold to the request's own provider's accounts, before
+    /// anything else is asked of them. An account of the other provider can never
+    /// serve this request (`eligible` refuses it first), so its reset says nothing
+    /// about when this one can be served: folding it in let a Codex account freeing
+    /// in two seconds time a Claude client's wait, and its gate inflate the count of
+    /// accounts "out", while every Anthropic account stayed out for an hour.
     pub fn exhaustion_hint(
         &self,
         now: OffsetDateTime,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: Option<&str>,
     ) -> ExhaustionHint {
-        self.exhaustion_hint_over(now, is_fable, group, None)
+        self.exhaustion_hint_over(now, is_fable, Some(provider), group, None)
     }
 
     /// [`Self::exhaustion_hint`] for a request that ONE account alone may serve.
@@ -1773,15 +1790,18 @@ impl Manager {
         is_fable: bool,
         idx: usize,
     ) -> ExhaustionHint {
-        self.exhaustion_hint_over(now, is_fable, None, Some(idx))
+        self.exhaustion_hint_over(now, is_fable, None, None, Some(idx))
     }
 
-    /// The one derivation behind both hint forms: `group` narrows to a group's members, `only`
-    /// to a single account index.
+    /// The one derivation behind both hint forms: `provider` narrows to one provider's
+    /// accounts, `group` to a group's members, `only` to a single account index. The
+    /// single-account form passes no provider: the one account it names is the request's
+    /// bound account, which `proxy::handle` only ever takes from the request's own provider.
     fn exhaustion_hint_over(
         &self,
         now: OffsetDateTime,
         is_fable: bool,
+        provider: Option<crate::provider::Provider>,
         group: Option<&str>,
         only: Option<usize>,
     ) -> ExhaustionHint {
@@ -1795,6 +1815,7 @@ impl Manager {
             .iter()
             .enumerate()
             .filter(|&(idx, _)| only.is_none_or(|only| only == idx))
+            .filter(|(_, account)| provider.is_none_or(|p| account.provider == p))
             .filter(|(_, account)| group.is_none_or(|g| account.groups.iter().any(|m| m == g)))
         {
             let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
@@ -4735,8 +4756,13 @@ mod tests {
                                           // `<= 60` control on CI (#189) with nothing wrong in the code.
         let now = OffsetDateTime::now_utc();
 
-        let fleet = manager.retry_after_hint(now, false);
-        let scoped = manager.retry_after_hint_for_group(now, false, "codereview");
+        let fleet = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
+        let scoped = manager.retry_after_hint_for_group(
+            now,
+            false,
+            crate::provider::Provider::Anthropic,
+            "codereview",
+        );
 
         // Control: the fleet-wide hint really is won by the outsider, so the
         // assertion below is measuring the group scoping and not a tautology.
@@ -9980,7 +10006,7 @@ mod tests {
         // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
         // bucket, so it is what makes that window drive the hint. A non-Fable
         // request ignores 7d_oi entirely and falls through to the 60s default.
-        let hint = manager.retry_after_hint(now, true);
+        let hint = manager.retry_after_hint(now, true, crate::provider::Provider::Anthropic);
         assert!(
             hint > 60,
             "the 7d_oi reset must drive the hint past the 60s default, got {hint}"
@@ -9994,7 +10020,7 @@ mod tests {
         // no other gate the hint falls back to the 60s default — proof the
         // `is_fable` scoping is honoured, not hard-coded.
         assert_eq!(
-            manager.retry_after_hint(now, false),
+            manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic),
             60,
             "a non-Fable request ignores the 7d_oi bucket"
         );
@@ -10256,7 +10282,7 @@ mod tests {
 
         // retry_after_hint must now reflect the real 600s, not the 8s Hold.
         let manager = Manager::from_runtimes(vec![a]);
-        let hint = manager.retry_after_hint(now, false);
+        let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
         let expected = ((odt_to_ms(reset) - now_ms + 999) / 1000).max(1);
         assert_eq!(hint, expected, "hint must be the 600s reset, got {hint}");
         assert!(hint > 500, "must not report the 8s hold, got {hint}");
@@ -10645,7 +10671,7 @@ mod tests {
         c.quota.five_hour = Some(window(0.99, Some(at(900))));
 
         let manager = Manager::from_runtimes(vec![a, b, c]);
-        let hint = manager.retry_after_hint(now, false);
+        let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
 
         // Correct = C's 900s reset. The pre-fix raw-min over every window's reset
         // returned ~100s: it counted B's reset (an Error account that never returns)
@@ -10680,7 +10706,7 @@ mod tests {
         c.quota.five_hour = Some(window(0.99, Some(at(900))));
 
         let manager = Manager::from_runtimes(vec![a, b, c]);
-        let hint = manager.exhaustion_hint(now, false, None);
+        let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
         assert_eq!(
             hint.binding,
             Some(GateReason::FiveHour),
@@ -10693,7 +10719,7 @@ mod tests {
         );
         assert_eq!(
             hint.retry_after,
-            manager.retry_after_hint(now, false),
+            manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic),
             "the seconds half is byte-identical to retry_after_hint"
         );
         let counts: Vec<(GateReason, usize)> = hint.gated.iter().map(|(r, n)| (*r, *n)).collect();
@@ -10718,7 +10744,7 @@ mod tests {
         a.switch_threshold = Some(0.90);
         a.quota.seven_day = Some(window(0.99, None));
         let manager = Manager::from_runtimes(vec![a]);
-        let hint = manager.exhaustion_hint(now, false, None);
+        let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
         assert_eq!(hint.retry_after, 60);
         assert_eq!(hint.free_at, None);
         assert_eq!(hint.binding, None);
@@ -10740,7 +10766,9 @@ mod tests {
         // exactly that many whole seconds.
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.exhaustion_hint(now, false, None).retry_after,
+            manager
+                .exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None)
+                .retry_after,
             2,
             "the control: fleet-wide, the sooner account wins"
         );
@@ -10755,6 +10783,56 @@ mod tests {
             Some(&1),
             "only the one account is counted: {hint:?}"
         );
+    }
+
+    /// **A 429's wait is timed on the request's own provider.** An account of the
+    /// other provider can never serve the request, so its reset says nothing about when this
+    /// one can be served: a Claude fleet out for seven seconds is not "back in two" because
+    /// a Codex account is, nor the reverse. Both orders, every entry point (the fleet hint,
+    /// its seconds half, and the group form a strict request uses), and the gate count names
+    /// only the provider's own account.
+    ///
+    /// Watched red: drop the provider filter in `exhaustion_hint_over` and the sooner account
+    /// wins for both providers.
+    #[test]
+    fn codex_exhaustion_hint_folds_only_the_requests_own_provider() {
+        use crate::provider::Provider;
+        for (anthropic_hold, codex_hold) in [(7, 2), (2, 7)] {
+            let mut codex = AccountRuntime::from_config(&account_in_groups("b", 0, &["g"]), false);
+            codex.provider = Provider::Codex;
+            let manager = Manager::from_runtimes(vec![
+                AccountRuntime::from_config(&account_in_groups("a", 0, &["g"]), false),
+                codex,
+            ]);
+            manager.mark_rate_limited(0, anthropic_hold);
+            manager.mark_rate_limited(1, codex_hold);
+            // Read AFTER the marks, so each hold rounds up to exactly its own length.
+            let now = OffsetDateTime::now_utc();
+            for (provider, hold) in [
+                (Provider::Anthropic, anthropic_hold),
+                (Provider::Codex, codex_hold),
+            ] {
+                let hint = manager.exhaustion_hint(now, false, provider, None);
+                assert_eq!(
+                    hint.retry_after,
+                    hold,
+                    "{} is timed on its own account: {hint:?}",
+                    provider.as_str()
+                );
+                assert_eq!(
+                    hint.gated.get(&GateReason::Hold),
+                    Some(&1),
+                    "only {}'s own account is counted: {hint:?}",
+                    provider.as_str()
+                );
+                assert_eq!(manager.retry_after_hint(now, false, provider), hold);
+                assert_eq!(
+                    manager.retry_after_hint_for_group(now, false, provider, "g"),
+                    hold,
+                    "the group form folds the provider too"
+                );
+            }
+        }
     }
 
     /// `next_session_key` hands out strictly-increasing, unique u64s starting at 1.

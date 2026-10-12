@@ -23,10 +23,9 @@ api.anthropic.com over our own TLS client → stream back).
   `NODE_EXTRA_CA_CERTS=~/.config/tcr-ca.pem` for the user to trust. (Primary path is reuse.)
 
 ## Security (what shipped — this section was written as a plan and the plan changed)
-- **Two hosts are on the MITM policy list**, not one (`ALLOWED_HOSTS`, `src/mitm.rs:66`):
-  `api.anthropic.com` and `platform.claude.com` (Claude Code's own OAuth refresh,
-  `POST /v1/oauth/token`). `chatgpt.com` (Codex, since 2026-10) is in the leaf tcr mints but not on
-  the list, so it is blind-tunneled like any unlisted host. This bullet used to name
+- **Three hosts are on the MITM policy list**, not one (`ALLOWED_HOSTS`, `src/mitm.rs:78`):
+  `api.anthropic.com`, `platform.claude.com` (Claude Code's own OAuth refresh,
+  `POST /v1/oauth/token`) and `chatgpt.com` (Codex, since 2026-10). This bullet used to name
   `console.anthropic.com` and `platform.anthropic.com`; both were removed in 2026-08 as dead, with
   `platform.claude.com` added in their place (the evidence is on `ALLOWED_HOSTS`). Being listed is
   necessary, not sufficient: `handle_connect` terminates a listed host only when the leaf loaded for

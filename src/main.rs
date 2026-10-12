@@ -6187,12 +6187,20 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
 /// The proxy vars are set in BOTH cases deliberately: clients disagree about
 /// which spelling they read, and one that reads only the one we skipped would go
 /// direct — bypassing rotation entirely, silently.
+///
+/// `CODEX_CA_CERTIFICATE` names the same CA for the `codex` a Claude tool or
+/// plugin may start inside this session. That process inherits the proxy vars.
+/// While the pool holds no Codex account, tcr blind-tunnels `chatgpt.com` and
+/// that codex runs on its own login; once the pool holds one, tcr terminates
+/// `chatgpt.com`, and with the CA the nested codex is pooled (without it, its
+/// TLS handshake fails). Claude ignores it.
 fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
     let proxy = format!("http://127.0.0.1:{port}");
     cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
     cmd.env("HTTPS_PROXY", &proxy);
     cmd.env("https_proxy", &proxy);
     cmd.env("NODE_EXTRA_CA_CERTS", ca);
+    cmd.env("CODEX_CA_CERTIFICATE", ca);
     // Unnecessary here — we ARE first-party in this mode, so nothing gates them
     // off — but harmless, and they keep the session whole if it ever falls back.
     apply_capability_defaults(cmd);
@@ -7064,6 +7072,37 @@ mod tests {
             withheld_api_key_notice(true, true),
             None,
             "a key the caller exported is their choice — we neither replace it nor comment"
+        );
+    }
+
+    /// Claude's see-through env names its CA for codex too. A `codex` that a
+    /// Claude tool or plugin starts inherits this `HTTPS_PROXY`, and while the
+    /// pool holds a Codex account tcr terminates `chatgpt.com` as well as
+    /// `api.anthropic.com`, so without `CODEX_CA_CERTIFICATE` its TLS handshake
+    /// fails. It is the CA node is told to trust: the one that signs the leaf tcr
+    /// presents.
+    #[test]
+    fn see_through_env_lets_a_nested_codex_trust_the_leaf() {
+        let mut cmd = std::process::Command::new("true");
+        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"));
+        let set = |name: &str| {
+            cmd.get_envs()
+                .find_map(|(k, v)| (k == name).then(|| v.map(|v| v.to_string_lossy().into_owned())))
+        };
+        assert_eq!(
+            set("CODEX_CA_CERTIFICATE"),
+            Some(Some("/tmp/ca.pem".to_string())),
+            "a nested codex must be told which CA signs the leaf"
+        );
+        assert_eq!(
+            set("NODE_EXTRA_CA_CERTS"),
+            Some(Some("/tmp/ca.pem".to_string())),
+            "the same CA claude trusts"
+        );
+        assert_eq!(
+            set("HTTPS_PROXY"),
+            Some(Some("http://127.0.0.1:3999".to_string())),
+            "the proxy a nested codex inherits"
         );
     }
 

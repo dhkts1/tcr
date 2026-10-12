@@ -156,6 +156,52 @@ impl Manager {
         self.accounts.read().expect("accounts lock poisoned").len()
     }
 
+    /// How many accounts belong to `provider`, in any state (disabled, held, rejected): every
+    /// account that could ever serve a request of that provider, since `eligible` refuses the
+    /// other provider's first. The proxy asks its "is the rotation spent" and "how many accounts
+    /// are exhausted" questions of this and not of the fleet-wide [`Self::account_count`], so a
+    /// mixed fleet answers an Anthropic request exactly as its Anthropic half alone would.
+    pub fn provider_account_count(&self, provider: crate::provider::Provider) -> usize {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .filter(|a| a.provider == provider)
+            .count()
+    }
+
+    /// Account `idx`'s `last_selected_seq`, the tick a selection stamps on the account it
+    /// picks (`0` = never picked). Test-only: it is how a test proves a request was answered
+    /// without any account being SELECTED, which `requests` (a count of SERVED requests)
+    /// cannot tell apart from an account picked and then never sent to.
+    #[cfg(test)]
+    pub(crate) fn last_selected_seq(&self, idx: usize) -> Option<u64> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.last_selected_seq)
+    }
+
+    /// Edit account `idx`'s quota in place. Test-only: it is how a test puts an account behind
+    /// a window or a refusal without speaking its provider's header dialect, which is a
+    /// different parser for each provider.
+    #[cfg(test)]
+    pub(crate) fn edit_quota_for_test(
+        &self,
+        idx: usize,
+        edit: impl FnOnce(&mut crate::quota::Quota),
+    ) {
+        if let Some(account) = self
+            .accounts
+            .write()
+            .expect("accounts lock poisoned")
+            .get_mut(idx)
+        {
+            edit(&mut account.quota);
+        }
+    }
+
     /// The Anthropic origin. A request's own origin, which depends on its provider, is
     /// [`Self::upstream_for`].
     pub fn upstream(&self) -> &str {

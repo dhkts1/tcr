@@ -136,6 +136,13 @@ use crate::proxy::{
 ///
 /// Reads `CLIENT_CREDENTIAL_PREFIXES` and `CLIENT_TOKEN_REFRESH_PATH` from
 /// `src/proxy.rs` through `path_is_under`, and holds no list of its own.
+///
+/// Refuses every **Codex** path too, by the one classifier the request path
+/// uses (`crate::provider::Provider::of_path`). Codex is not lent over the mesh
+/// in this version: a lease is sized on the lender's Anthropic windows, and the
+/// lender's picker would serve the request on a Codex account no lease accounts
+/// for. Both halves ask this function, so the borrower's seam builds no `Ask`
+/// for a Codex request and a lender closes on a frame that names one.
 pub fn serve_is_allowed_for_path(path: &str) -> bool {
     // FIRST, and before any prefix compare below can mean anything: a path the
     // upstream URL parser would read differently than these compares do. See
@@ -143,6 +150,9 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
     // HERE rather than at each of this function's four call sites, so a fifth
     // caller cannot be the one that forgets.
     if !relay_path_is_routable(path) {
+        return false;
+    }
+    if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
         return false;
     }
     if CLIENT_CREDENTIAL_PREFIXES
@@ -170,6 +180,27 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
     // the same way, so `/v1/oauth/token/` cannot fall through the way it once
     // fell through an exact compare.
     !path_is_under(path, CLIENT_TOKEN_REFRESH_PATH)
+}
+
+/// What a path [`serve_is_allowed_for_path`] refused IS, for the log line that
+/// names the refusal, asked in that function's own order so the label names the
+/// refusal that actually fired: an unroutable path ([`relay_path_is_routable`]),
+/// refused first whatever else it is, because the upstream URL parser would read
+/// it differently than it is spelled; then a Codex path, refused because Codex is
+/// not lent over the mesh in this version; else a client-credential or
+/// local-control path. Both refusal sites read it, the lender's backstop in
+/// [`handle_serve_on`] and the borrower's `PeerLeaseProvider::try_serve`, so
+/// neither blames a credential for the Codex refusal or for a path the parser
+/// would have rewritten.
+pub fn refused_path_kind(path: &str) -> &'static str {
+    if !relay_path_is_routable(path) {
+        "an unroutable path (one the upstream URL parser would read differently than it is \
+         spelled)"
+    } else if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
+        "a Codex path (Codex is not lent over the mesh in this version)"
+    } else {
+        "a client-credential or local-control path"
+    }
 }
 
 /// **May a relayed path be built into a URL at all?** The review's H1, and the
@@ -1248,10 +1279,10 @@ where
     // backstop is for.
     if !serve_is_allowed_for_path(&request.path) {
         bail!(
-            "peer serve: {} refused for path {}, a relayed request may never carry a \
-             client-credential or local-control path",
+            "peer serve: {} refused for path {}, a relayed request may never carry {}",
             session.peer.display(),
-            request.path
+            request.path,
+            refused_path_kind(&request.path)
         );
     }
     // The method is HONOURED, which for this build means exactly one method is
@@ -3691,5 +3722,66 @@ mod tests {
             "a locator the fetch did NOT write must stay excluded, not swept in by a blanket \
              clear or by dial_order's own cooling-fallback: {order:?}"
         );
+    }
+
+    /// A refused Codex path is logged as the Codex refusal, never as a
+    /// credential one, at both sites that log it (the lender's backstop in
+    /// `handle_serve_on` and the borrower's `PeerLeaseProvider::try_serve`);
+    /// every other refused path keeps the credential wording.
+    ///
+    /// Watched red: drop the Codex arm from `refused_path_kind` and the Codex
+    /// path is described as a client-credential path.
+    #[test]
+    fn refused_path_kind_names_the_codex_refusal_for_a_codex_path() {
+        let codex = crate::provider::CODEX_RESPONSES_PATH;
+        assert!(!serve_is_allowed_for_path(codex), "precondition: refused");
+        let kind = refused_path_kind(codex);
+        assert!(
+            kind.contains("Codex") && !kind.contains("client-credential"),
+            "{kind}"
+        );
+
+        let credential = "/v1/sessions";
+        assert!(
+            !serve_is_allowed_for_path(credential),
+            "precondition: refused"
+        );
+        assert_eq!(
+            refused_path_kind(credential),
+            "a client-credential or local-control path"
+        );
+    }
+
+    /// A path refused FIRST for being unroutable is logged as that refusal, at
+    /// both sites, in the order `serve_is_allowed_for_path` asks: never as the
+    /// credential refusal, and never as the Codex one even under the Codex
+    /// prefix. The three are a dot-segment escape onto this Mac's own control
+    /// surface, an authority smuggled in as userinfo, and a Codex-prefixed path
+    /// that is unroutable too.
+    ///
+    /// Watched red: drop the unroutable arm from `refused_path_kind` and the
+    /// dot-segment escape is described as a client-credential path.
+    #[test]
+    fn refused_path_kind_names_the_unroutable_refusal_before_any_other() {
+        for path in [
+            "/x/../_tcr/accounts/control",
+            "@169.254.169.254/latest/meta-data",
+            "/backend-api/codex/../../_tcr/accounts/control",
+        ] {
+            assert!(
+                !relay_path_is_routable(path),
+                "precondition: {path} is unroutable"
+            );
+            assert!(
+                !serve_is_allowed_for_path(path),
+                "precondition: {path} is refused"
+            );
+            assert_eq!(
+                refused_path_kind(path),
+                "an unroutable path (one the upstream URL parser would read differently than \
+                 it is spelled)",
+                "{path}"
+            );
+        }
     }
 }

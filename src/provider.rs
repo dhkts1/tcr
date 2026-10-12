@@ -12,7 +12,12 @@
 //! `model-provider-info/src/lib.rs:80`, `CHATGPT_CODEX_BASE_URL`), and nothing Anthropic sends
 //! does. Resolving by path works identically in MITM mode (where the CONNECT host is
 //! `chatgpt.com`) and in the origin-form requests this crate's in-process tests send, which carry
-//! no meaningful host. The host guard in `proxy.rs` stays the consistency check it already is.
+//! no meaningful host. The host only has to agree. Inside a tunnel tcr terminated, the CONNECT
+//! host is the request's host: `proxy.rs`'s host guard refuses a request that declares any other
+//! host, a loopback one included, or a `Host` it cannot read, and one whose host and path name
+//! different providers, so `chatgpt.com` is served only under `/backend-api/` and the Anthropic
+//! hosts never are. Only a base-URL request, which comes through no tunnel, is judged by the host
+//! it names, and one naming a loopback host, or none, keeps its path's provider.
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +50,14 @@ pub const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
 /// `codex-rs/model-provider/src/bearer_auth_provider.rs`, `BearerAuthProvider::add_auth_headers`,
 /// read at f82e365). tcr replaces it with the serving account's.
 pub const CODEX_ACCOUNT_HEADER: &str = "chatgpt-account-id";
+/// The request headers by which a ChatGPT workspace that is not served as a pooled account is
+/// routed: a `us` or `us_cr` data residency's override, and FedRAMP's marker, sent `true` when
+/// the login's `chatgpt_account_is_fedramp` claim is set (`openai/codex` f82e365,
+/// `model-provider/src/workspace_routing.rs:12,39-77`,
+/// `model-provider/src/bearer_auth_provider.rs:43-45`). A Codex request carrying either is
+/// relayed on the client's own credential and never pooled (`proxy::names_codex_routing`).
+pub const CODEX_ROUTING_HEADERS: [&str; 2] =
+    ["x-openai-account-routing-override", "x-openai-fedramp"];
 /// Sent by Codex on every turn (`codex-api/src/requests/headers.rs:8`); the session-affinity key.
 pub const CODEX_SESSION_HEADER: &str = "session-id";
 /// The quota probe (`backend-client/src/client/rate_limit_resets.rs:127`). No inference, no cost.

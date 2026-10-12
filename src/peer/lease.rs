@@ -3156,7 +3156,8 @@ impl FallbackProvider for PeerLeaseProvider {
             if !serve::serve_is_allowed_for_path(ask.path) {
                 tracing::debug!(
                     path = ask.path,
-                    "not relaying a client-credential path, falling back to the local path"
+                    "not relaying {}, falling back to the local path",
+                    serve::refused_path_kind(ask.path)
                 );
                 return None;
             }

@@ -40,7 +40,7 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, USER_AGENT};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use bytes::Bytes;
@@ -657,6 +657,14 @@ pub struct ClientAddr(pub SocketAddr);
 #[derive(Clone, Copy)]
 pub struct SessionKey(pub u64);
 
+/// The host of the `CONNECT` tunnel a request came through, injected into request extensions by
+/// the hybrid server (`crate::mitm::serve_http`) on every request it decrypts from a tunnel it
+/// terminated, and never on a base-URL request. A client cannot set an extension, so its
+/// presence means the request came through a tunnel to this host, whatever `Host` the request
+/// declares, and `handle`'s host guard holds the request to it.
+#[derive(Clone)]
+pub struct InterceptedHost(pub String);
+
 /// A deterministic hash of `prefix` + `value`, used to derive a stable affinity
 /// key. What this needs to hold is DETERMINISM ACROSS PROCESSES, not just
 /// within one — pins now persist to disk and are restored at boot (see
@@ -1197,6 +1205,68 @@ pub fn host_is_loopback(host: &str) -> bool {
         || host.eq_ignore_ascii_case("localhost")
 }
 
+/// The provider whose requests each host tcr intercepts carries: every host on
+/// [`crate::mitm::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
+/// pins both directions). `platform.claude.com` is Anthropic's: Claude Code refreshes its own
+/// login there.
+const INTERCEPTED_HOST_PROVIDERS: [(&str, crate::provider::Provider); 3] = [
+    ("api.anthropic.com", crate::provider::Provider::Anthropic),
+    ("platform.claude.com", crate::provider::Provider::Anthropic),
+    (
+        crate::provider::CODEX_HOST,
+        crate::provider::Provider::Codex,
+    ),
+];
+
+/// The provider an intercepted `host` (no port) belongs to, compared as
+/// [`crate::mitm::host_allowed`] compares it; `None` for any other host, loopback included.
+fn intercepted_host_provider(host: &str) -> Option<crate::provider::Provider> {
+    INTERCEPTED_HOST_PROVIDERS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(host))
+        .map(|&(_, provider)| provider)
+}
+
+/// The refusal `handle` answers when an intercepted `host` and the `path` (whose provider is
+/// `path_provider`) name different providers. It names both, so the client's error says
+/// which request was refused and why.
+fn host_path_disagreement(
+    host: &str,
+    path: &str,
+    path_provider: crate::provider::Provider,
+) -> String {
+    fn kind(provider: crate::provider::Provider) -> &'static str {
+        match provider {
+            crate::provider::Provider::Anthropic => "an Anthropic",
+            crate::provider::Provider::Codex => "a Codex",
+        }
+    }
+    match intercepted_host_provider(host) {
+        Some(host_provider) => format!(
+            "Refusing {host}{path}: {host} is {} host but this is {} path (Codex paths are the \
+             ones under {}/), and tcr never forwards a request, or the credential on it, to the \
+             other provider.",
+            kind(host_provider),
+            kind(path_provider),
+            crate::provider::CODEX_PATH_PREFIX,
+        ),
+        None => format!(
+            "Refusing {host}{path}: tcr intercepts {host} but knows no provider for it, so it \
+             forwards nothing there."
+        ),
+    }
+}
+
+/// The refusal `handle` answers when a request that came through a tunnel to `tunnel` names some
+/// other host, or a `Host` it cannot read. It names the tunnel's host and the path, like
+/// [`host_path_disagreement`], and does not echo the host the request named.
+fn tunnel_host_disagreement(tunnel: &str, path: &str) -> String {
+    format!(
+        "Refusing {tunnel}{path}: the request came through a tunnel to {tunnel} but names another \
+         host, and tcr serves a tunnel only for the host it was opened to."
+    )
+}
+
 /// Is this `content-type` `application/json`?
 ///
 /// The mutating local route's whole browser defence, and the reason it is a
@@ -1270,13 +1340,23 @@ fn is_cross_site_request(headers: &HeaderMap) -> bool {
 /// person. The prefix list above stays for two reasons this rule does not cover:
 /// a client with no bearer at all, and the peer borrower's refusal
 /// (`src/peer/serve.rs`), which is path-only.
+///
+/// A Codex path (`crate::provider::Provider::of_path`) other than the one
+/// inference path is relayed with or without a bearer: Codex has no bookkeeping
+/// call a pooled account may answer, so nothing under `/backend-api/` but
+/// `/backend-api/codex/responses` ever reaches the rotation.
 fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayMode> {
     if *method == Method::POST && path_is_under(path, CLIENT_TOKEN_REFRESH_PATH) {
         return Some(RelayMode::Raw);
     }
+    let provider = crate::provider::Provider::of_path(path);
     if CLIENT_CREDENTIAL_PREFIXES
         .iter()
         .any(|base| path_is_under(path, base))
+        // Every Codex path but the inference one is identity-bound (usage display, memories,
+        // threads, plugins) and is relayed with the CLIENT's own bearer, never
+        // re-credentialled.
+        || (provider == crate::provider::Provider::Codex && !provider.is_inference_path(path))
     {
         return Some(RelayMode::ClientCredential);
     }
@@ -1286,11 +1366,17 @@ fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayM
     None
 }
 
-/// The two paths that spend quota and therefore ALWAYS take the pooled path,
-/// whatever credential the client sent. Exact match, mirroring
-/// `manager::select::classify_request`.
+/// The paths that spend quota and therefore ALWAYS take the pooled path,
+/// whatever credential the client sent: Anthropic's `/v1/messages` and
+/// `/v1/messages/count_tokens`, and Codex's `/backend-api/codex/responses`.
+/// Exact match, and one list: [`crate::provider::Provider::is_inference_path`],
+/// which `manager::select::classify_request` reads too.
+///
+/// One exception, decided by `handle` rather than here: a Codex request that names a
+/// workspace routing of its own ([`names_codex_routing`]) is relayed on its own
+/// credential, inference included, and never pooled.
 fn is_inference_path(path: &str) -> bool {
-    path == "/v1/messages" || path == "/v1/messages/count_tokens"
+    crate::provider::Provider::of_path(path).is_inference_path(path)
 }
 
 /// The client's own OAuth bearer, if the request carries one. `Bearer` is
@@ -1305,11 +1391,19 @@ fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
 /// The `controlIdentity` check — see [`crate::control_identity`]. `Some` is the
 /// refusal to return; `None` means the request proceeds.
 ///
-/// Runs on every request that carries a client bearer, relayed or pooled: a
-/// session on the wrong account must fail at its FIRST request, which is a
-/// bootstrap call, not at the first turn. Inert without a control account, in
-/// mode `off`, and for a request with no bearer. Fail-open on `Unknown` — a
-/// profile fetch that failed is logged at debug and the request is served.
+/// Runs on every ANTHROPIC request that carries a client bearer, relayed or
+/// pooled: a session on the wrong account must fail at its FIRST request, which
+/// is a bootstrap call, not at the first turn. Inert without a control account,
+/// in mode `off`, for a request with no bearer, and for every Codex request: the
+/// check resolves the bearer through Anthropic's `/api/oauth/profile`, so asking
+/// it about a ChatGPT token would hand that token to Anthropic (the call site in
+/// `handle` says so). The operator-facing consequence: under
+/// `controlIdentity: refuse`, Codex clients are never identity-checked; whatever
+/// ChatGPT login a Codex client runs under, its inference is served from the
+/// pool unless it names a workspace routing of its own ([`names_codex_routing`]),
+/// and its other paths, and such a routed request, are relayed under its own
+/// bearer. Fail-open on `Unknown` — a profile fetch that failed is logged at
+/// debug and the request is served.
 async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Response> {
     use crate::config::ControlIdentityMode;
     use crate::control_identity::{verdict, Verdict};
@@ -2273,6 +2367,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // on. Matching them against `path_and_query` would let a query string decide
     // routing, and a path is what these rules are actually about.
     let path = parts.uri.path().to_string();
+    // Which upstream this request belongs to, decided by its PATH (see
+    // `crate::provider`'s module doc for why not by host): anything under
+    // `/backend-api/` is Codex, everything else is Anthropic, which is what every
+    // path meant before Codex existed. Constant for the whole request.
+    let provider = crate::provider::Provider::of_path(&path);
     // And the query on its own, for the one consumer that needs the two apart:
     // a request handed to a fallback provider is rebuilt on another Mac, and it
     // used to be rebuilt from the path alone. See `fallback::Ask::query`.
@@ -2343,9 +2442,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     }
 
     // 1c. Host guard: tcr is a credential-injecting reverse proxy for
-    //     api.anthropic.com, NOT an open forward proxy. Every request is rewritten
-    //     to `manager.upstream()` with the pooled OAuth Bearer, DISCARDING its
-    //     target host. A plain-HTTP forward-proxy request aimed at a DIFFERENT host
+    //     api.anthropic.com and chatgpt.com, NOT an open forward proxy. Every request
+    //     is rewritten to its provider's origin (`manager.upstream_for(provider)`),
+    //     DISCARDING its target host: a pooled request with the pooled OAuth Bearer,
+    //     a relayed one (every Codex path but inference among them) with the client's
+    //     own credential. A plain-HTTP forward-proxy request aimed at a DIFFERENT host
     //     — e.g. an AWS SDK's IMDS probe to 169.254.169.254 that leaked in via a
     //     tool's `HTTP_PROXY` — would otherwise be silently misrouted to Anthropic
     //     (404-flooding the log/TUI, with Gil's Bearer attached). Reject such a
@@ -2358,10 +2459,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //
     //     Target host = the request-target's authority (absolute-form / forward-
     //     proxy requests carry it) else the `Host` header minus any `:port`. When
-    //     BOTH are absent (an origin-form base-URL request with no Host, e.g. the
-    //     direct-axum test harness) the guard is skipped — fail OPEN for the
-    //     ambiguous local case, closed only for a host we can positively identify
-    //     as neither loopback nor Anthropic.
+    //     BOTH are absent (an origin-form request with no Host, e.g. the direct-axum
+    //     test harness) this misroute check is skipped — fail OPEN for the ambiguous
+    //     local case, closed only for a host we can positively identify as neither
+    //     loopback nor on the MITM policy list (Anthropic or Codex). The provider
+    //     check after it skips no request that came through a tunnel.
     let target = target_host(&parts.uri, &req_headers);
     if let Some(host) = target {
         // [`host_is_loopback`] (base-URL mode) reuses the `IpAddr::is_loopback`
@@ -2373,10 +2475,74 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             return error_response(
                 StatusCode::MISDIRECTED_REQUEST,
                 "invalid_request_error",
-                "This proxy only serves api.anthropic.com; refusing to forward a request for a different host.",
+                "This proxy only serves its configured upstream hosts (Anthropic and Codex); refusing to forward a request for a different host.",
                 None,
             );
         }
+    }
+    // And the host a request is for must name the same provider as its path. The path decides
+    // `provider` and the upstream follows it, so without this a `chatgpt.com` request with a
+    // path outside `/backend-api/` goes to Anthropic's origin, on a relayed path with the
+    // CLIENT's bearer, which there is a ChatGPT token; and an `api.anthropic.com` or
+    // `platform.claude.com` request with a `/backend-api/` path carries a Claude token to
+    // Codex's. No client tcr serves sends either, so the disagreement is refused and nothing is
+    // forwarded. An allowlisted host that names no provider is refused too (fail closed).
+    //
+    // Inside a tunnel tcr terminated, the CONNECT host decides ([`InterceptedHost`]): a request
+    // that names no host is still a request for the tunnel's host. One that names any other host,
+    // a loopback one included, or a `Host` too garbled to read, is refused as well, because tcr
+    // serves a tunnel only for the host it was opened to. Only a base-URL request, which comes
+    // through no tunnel, is judged by the host it names, and one naming a loopback host, or none,
+    // keeps the path's provider.
+    let refusal = match parts.extensions.get::<InterceptedHost>() {
+        Some(InterceptedHost(tunnel)) => {
+            let names_another_host = match target {
+                Some(host) => !host.eq_ignore_ascii_case(tunnel),
+                // No host named, or a `Host` that cannot be read: only an absent one names none.
+                None => req_headers.contains_key(HOST),
+            };
+            if names_another_host {
+                Some(tunnel_host_disagreement(tunnel, &path))
+            } else if intercepted_host_provider(tunnel) != Some(provider) {
+                Some(host_path_disagreement(tunnel, &path, provider))
+            } else {
+                None
+            }
+        }
+        None => target
+            .filter(|host| {
+                !host_is_loopback(host) && intercepted_host_provider(host) != Some(provider)
+            })
+            .map(|host| host_path_disagreement(host, &path, provider)),
+    };
+    if let Some(message) = refusal {
+        return error_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid_request_error",
+            &message,
+            None,
+        );
+    }
+
+    // 1c'. A WebSocket upgrade on the Codex inference path is answered here, never forwarded.
+    //      Codex opens its stream over a WebSocket by default. A 426
+    //      (`upgrade_required_response`) moves it to SSE at once, for the rest of the session,
+    //      while any other answer costs retries first, or ends the turn if codex does not retry
+    //      it. Forwarding the upgrade would strip `upgrade` (hop-by-hop) and hand the backend a
+    //      bare GET it answers with something Codex treats as an error.
+    //
+    //      Before the relays and before any account is selected, so an upgrade spends no slot,
+    //      no throttle token and no identity lookup. And never forwarded as an upgrade either:
+    //      the real backend answers one with 101 (measured 2026-10-12), so through tcr it is this
+    //      426 that moves the client onto the transport tcr relays.
+    if provider == crate::provider::Provider::Codex
+        && path == crate::provider::CODEX_RESPONSES_PATH
+        && wants_websocket_upgrade(&req_headers)
+    {
+        tracing::debug!(
+            "answered a Codex WebSocket upgrade with 426 so the client falls back to SSE"
+        );
+        return upgrade_required_response();
     }
 
     // 1d. Rotation-bypassing relays. A request bound to the CLIENT's identity
@@ -2395,14 +2561,39 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     Before either: the `controlIdentity` check, on the client's own bearer.
     //     It sits here rather than inside the relay because a wrong-account
     //     session must be refused on its bookkeeping calls AND its inference.
+    //
+    //     Anthropic requests only. The check resolves the bearer through
+    //     `/api/oauth/profile` on the ANTHROPIC upstream, and a Codex client's
+    //     bearer is a ChatGPT token: asking would hand that token to Anthropic on
+    //     every Codex request, and the control account is an Anthropic account
+    //     whose identity a ChatGPT login can never match anyway.
     let client_bearer = client_bearer_of(&req_headers);
-    if let Some(bearer) = client_bearer {
-        if let Some(refusal) = refuse_foreign_client(&manager, bearer).await {
-            return refusal;
+    if provider == crate::provider::Provider::Anthropic {
+        if let Some(bearer) = client_bearer {
+            if let Some(refusal) = refuse_foreign_client(&manager, bearer).await {
+                return refusal;
+            }
         }
     }
-    if let Some(mode) = relay_mode(&method, &path, client_bearer.is_some()) {
-        return relay_upstream(&manager, mode, method, &path_and_query, &req_headers, body).await;
+    //     A Codex request that names a workspace routing of its own
+    //     ([`names_codex_routing`]) is relayed too, whatever its path, inference
+    //     included: its workspace is served by another backend, or under a routing no
+    //     pooled account shares, so no pooled bearer may stand in for it.
+    let relay = relay_mode(&method, &path, client_bearer.is_some()).or_else(|| {
+        (provider == crate::provider::Provider::Codex && names_codex_routing(&req_headers))
+            .then_some(RelayMode::ClientCredential)
+    });
+    if let Some(mode) = relay {
+        return relay_upstream(
+            &manager,
+            mode,
+            provider,
+            method,
+            &path_and_query,
+            &req_headers,
+            body,
+        )
+        .await;
     }
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
@@ -2420,7 +2611,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // the ledger's 5m/1h split and the upstream request all see the body as sent.
     // A longer body is fine: `build_upstream_headers` strips content-length.
     // `None` means nothing to change and the client's bytes go out untouched.
-    let body_bytes = if manager.cache_ttl_rewrite_enabled() {
+    //
+    // Anthropic only. The 1-hour window is an Anthropic prompt-cache fact, and a
+    // Codex body is forwarded byte for byte: it is usually zstd, and an
+    // uncompressed one carrying a `cache_control` key in `tools` would otherwise be
+    // re-serialized here.
+    let body_bytes = if provider == crate::provider::Provider::Anthropic
+        && manager.cache_ttl_rewrite_enabled()
+    {
         match crate::cache_ttl::extend_all_ttls(&body_bytes) {
             Some(rewritten) => {
                 tracing::debug!(
@@ -2527,9 +2725,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // selection uses (`select.rs`). Threaded into every fleet-exhausted 429 so the
     // `retry-after` hint reflects the Fable-scoped weekly gate for a Fable request
     // and ignores it otherwise.
-    let request_is_fable = request_model
-        .as_deref()
-        .is_some_and(crate::model::is_fable_model);
+    //
+    // Gated on the provider exactly as `select.rs` gates its own two: the Fable
+    // weekly bucket is an Anthropic fact, so a Codex request whose model id merely
+    // contains "fable" never consults it, here (the bound hold, `select_bound`,
+    // every 429 hint) any more than in selection.
+    let request_is_fable = provider == crate::provider::Provider::Anthropic
+        && request_model
+            .as_deref()
+            .is_some_and(crate::model::is_fable_model);
 
     // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
     // constant across the rotation loop — same shape as `request_model` above.
@@ -2605,6 +2809,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
     // 3. Selection + rotation loop.
     let account_count = manager.account_count();
+    // The accounts that could ever serve THIS request: its own provider's, since `eligible`
+    // refuses the other provider's first. "Is the rotation spent" (the blind carry below) and
+    // "how many accounts are exhausted" (the 429's text) are asked of this, never of the
+    // fleet-wide count: in a mixed fleet the other provider's accounts are never tried for
+    // this request, so counting them would read a spent Anthropic rotation as unspent.
+    let provider_account_count = manager.provider_account_count(provider);
     let mut tried: HashSet<usize> = HashSet::new();
     // THE BORROWED-REQUEST PATH, and nothing else reaches it: a lease's
     // account-set scope, as the header the lender's own serving leg wrote onto
@@ -2736,6 +2946,24 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         }
         (None, _) => None,
     };
+    // A bound or pinned account of the OTHER provider can never serve this request: its
+    // credential belongs to the other upstream. Held there, every account of this request's
+    // provider was benched below and `Manager::select_bound`, which checks no provider, then
+    // served the request on that account's bearer against this request's origin. Dropped
+    // instead, so the request takes the ordinary pick, whose provider check diverts it off
+    // such a pin without re-keying the session (`select_with_group`).
+    let bound_candidate = bound_candidate.filter(|&(bound_idx, via)| {
+        let same_provider = manager.provider(bound_idx) == Some(provider);
+        if !same_provider {
+            tracing::debug!(
+                account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+                kind = via,
+                provider = provider.as_str(),
+                "bound history names an account of the other provider; not holding the request there"
+            );
+        }
+        same_provider
+    });
     let mut bound_to: Option<usize> = None;
     // The accounts the hold benched, and only those, so a release mid-request can re-admit
     // them without re-admitting what another rule benched: `tried` already carries the
@@ -3096,10 +3324,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             // sooner, spending this request's one-shot soft-wait on
                             // a recovery it cannot use and 429-ing while its own
                             // member was still seconds away.
-                            (None, Some(group)) => {
-                                manager.retry_after_hint_for_group(now, request_is_fable, group)
+                            //
+                            // Both arms fold only this request's PROVIDER's accounts,
+                            // for the same reason: an account of the other provider
+                            // freeing sooner is a recovery this request cannot use.
+                            (None, Some(group)) => manager.retry_after_hint_for_group(
+                                now,
+                                request_is_fable,
+                                provider,
+                                group,
+                            ),
+                            (None, None) => {
+                                manager.retry_after_hint(now, request_is_fable, provider)
                             }
-                            (None, None) => manager.retry_after_hint(now, request_is_fable),
                         },
                         soft_waited_exhaustion,
                     ) {
@@ -3176,8 +3413,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                 return exhausted_or_fallback(
                                     &manager,
                                     now,
-                                    account_count,
+                                    provider_account_count,
                                     request_is_fable,
+                                    provider,
                                     strict_group,
                                     bound_to,
                                     fallback_ask.as_ref(),
@@ -3303,8 +3541,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     return exhausted_or_fallback(
                                         &manager,
                                         now,
-                                        account_count,
+                                        provider_account_count,
                                         request_is_fable,
+                                        provider,
                                         strict_group,
                                         bound_to,
                                         fallback_ask.as_ref(),
@@ -3338,6 +3577,21 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             tried.insert(idx);
             continue;
         };
+        // The upstream headers for THIS account, built once and handed to every route this
+        // attempt can take (the exit lock below, the direct send, the blind carry), so the
+        // three can never disagree about whose credential and whose identity travel together.
+        // Codex: the pooled bearer plus the serving account's `chatgpt-account-id`, replacing
+        // the client's. codex sends its bearer with its own account's id (`openai/codex`
+        // f82e365, `model-provider/src/bearer_auth_provider.rs:31-47`), so tcr keeps the two
+        // one account's pair; what the backend makes of a mismatched pair is unmeasured.
+        // `account_uuid` holds that id for a Codex row.
+        let upstream_headers = match provider {
+            crate::provider::Provider::Anthropic => build_upstream_headers(&req_headers, &token),
+            crate::provider::Provider::Codex => {
+                let id = manager.account_uuid(idx);
+                build_codex_upstream_headers(&req_headers, &token, id.as_deref())
+            }
+        };
         // **The exit lock, before the direct attempt and not inside its failure
         // arm.** An account the operator locked to one Mac leaves from that Mac
         // on EVERY request, working direct path or not: the whole point is that
@@ -3361,7 +3615,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 account_idx: idx,
                 method: &method,
                 path_and_query: &path_and_query,
-                headers: build_upstream_headers(&req_headers, &token),
+                headers: upstream_headers.clone(),
                 body: body_bytes.clone(),
                 peers_path: &crate::peer::egress::peers_path(),
                 session_key,
@@ -3394,10 +3648,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
         // Build the upstream request: clone headers minus hop-by-hop / auth /
         // encoding, then set OUR bearer (the client's authorization was dropped).
-        let url = format!("{}{}", manager.upstream(), path_and_query);
+        // The origin is the request's provider's: a Codex request never reaches
+        // the Anthropic upstream, whichever account served it.
+        let url = format!("{}{}", manager.upstream_for(provider), path_and_query);
         let mut builder = http
             .request(method.clone(), &url)
-            .headers(build_upstream_headers(&req_headers, &token));
+            .headers(upstream_headers.clone());
         if method != Method::GET && method != Method::HEAD {
             // Rewrite the body's metadata.user_id.account_uuid to the serving
             // account's own UUID (rotation changes the account each attempt, so
@@ -3410,14 +3666,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // already owns a fresh Vec). `body_bytes` is immutable and re-read
             // pristine each rotation attempt, so cloning the handle is correct, and
             // reqwest's `Body: From<Bytes>` is O(1) — no full-body copy per request.
-            let out_body: bytes::Bytes = match manager.account_uuid(idx) {
-                Some(uuid) if uuid.len() == 36 => {
-                    match crate::account_uuid::patch_account_uuid(&body_bytes, &uuid) {
-                        std::borrow::Cow::Owned(v) => v.into(),
-                        std::borrow::Cow::Borrowed(_) => body_bytes.clone(),
+            let out_body: bytes::Bytes = match provider {
+                // Anthropic: the existing metadata.user_id.account_uuid splice, unchanged.
+                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
+                    Some(uuid) if uuid.len() == 36 => {
+                        match crate::account_uuid::patch_account_uuid(&body_bytes, &uuid) {
+                            std::borrow::Cow::Owned(v) => v.into(),
+                            std::borrow::Cow::Borrowed(_) => body_bytes.clone(),
+                        }
                     }
-                }
-                _ => body_bytes.clone(),
+                    _ => body_bytes.clone(),
+                },
+                // Codex: the identity is the header set above; the body is opaque (usually zstd).
+                crate::provider::Provider::Codex => body_bytes.clone(),
             };
             builder = builder.body(out_body);
         }
@@ -3497,12 +3758,35 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     && every_attempt_transport_failed(transport_failures, upstream_responses);
                 // `tried` never contains `idx` yet (it is inserted on the way
                 // out of this arm), so this account plus the benched ones is
-                // the whole fleet exactly when the ladder is out of moves. A
-                // request narrowed by the account-set scope header counts its
-                // own benched accounts here too, which is right: they are not
-                // rotatable for this request either.
-                let rotation_is_spent = machine_level || tried.len() + 1 >= account_count;
-                if !peer_egress_tried && nothing_ever_left_this_box && rotation_is_spent {
+                // the whole of this request's provider's accounts exactly when
+                // the ladder is out of moves. A request narrowed by the
+                // account-set scope header counts its own benched accounts here
+                // too, which is right: they are not rotatable for this request
+                // either.
+                //
+                // Both sides count only the REQUEST's provider: the other
+                // provider's accounts are never rotatable for it, so with the
+                // fleet-wide count a mixed fleet read one Anthropic ladder short
+                // of spent per Codex account, and an Anthropic request was never
+                // offered the carry it gets on the same fleet without them. They
+                // are filtered out of `tried` too, because the scope header
+                // benches every account outside its set, whatever its provider.
+                let tried_of_provider = tried
+                    .iter()
+                    .filter(|&&i| manager.provider(i) == Some(provider))
+                    .count();
+                let rotation_is_spent =
+                    machine_level || tried_of_provider + 1 >= provider_account_count;
+                // Anthropic only: Codex stays off the peer mesh in this version (it is
+                // neither lent nor carried), and a carry offers the request to a
+                // peer's gateway as surely as a lease does. A Codex request keeps the
+                // answer it had before the mesh existed.
+                let rides_the_mesh = provider == crate::provider::Provider::Anthropic;
+                if !peer_egress_tried
+                    && nothing_ever_left_this_box
+                    && rotation_is_spent
+                    && rides_the_mesh
+                {
                     peer_egress_tried = true;
                     // The body is rebuilt here rather than shared with the
                     // direct attempt's `out_body` above, because the two hunks
@@ -3532,7 +3816,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         crate::peer::egress::CarriedRequest {
                             url: &url,
                             method: &method,
-                            headers: build_upstream_headers(&req_headers, &token),
+                            headers: upstream_headers.clone(),
                             body: carried_body,
                             peers_path: &peers_path,
                         },
@@ -4445,8 +4729,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         exhausted_response(
             &manager,
             OffsetDateTime::now_utc(),
-            account_count,
+            provider_account_count,
             request_is_fable,
+            provider,
             // The MIRROR of the refusal arm above, and the same fix: a
             // strict ask is `reserved || !spill`, so this terminal's own
             // scoping has to ask the same question the picker did.
@@ -4582,6 +4867,217 @@ fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
     out
 }
 
+/// Does this request ask to become a WebSocket? Codex opens its Responses stream over a
+/// WebSocket by default (`openai/codex` f82e365, `model-provider-info/src/lib.rs:561`); tcr
+/// relays HTTP only.
+pub(crate) fn wants_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("websocket"))
+}
+
+/// The answer that moves Codex to SSE AT ONCE, for the rest of the session: a 426. At
+/// `openai/codex` f82e365, `core/src/client.rs:2010-2014` matches `StatusCode::UPGRADE_REQUIRED`
+/// exactly and returns `WebsocketStreamOutcome::FallbackToHttp`. Any other answer costs retries
+/// first: codex falls back too once a WebSocket that keeps failing has spent its stream retry
+/// budget (`core/src/responses_retry.rs:120-138`), and ends the turn on an error it does not
+/// retry. Answered locally, before any account is selected, so an upgrade never costs a slot.
+///
+/// Built QUIETLY ([`quiet_error_response`]): every Codex session opens with an upgrade, so a
+/// warn here would be one false alarm per session. `handle` logs it at debug.
+pub(crate) fn upgrade_required_response() -> Response {
+    quiet_error_response(
+        StatusCode::UPGRADE_REQUIRED,
+        "upgrade_required",
+        "tcr relays Codex over HTTP streaming only; the client falls back to SSE for this session.",
+        None,
+    )
+}
+
+/// Does this Codex request name a workspace routing of its own
+/// ([`crate::provider::CODEX_ROUTING_HEADERS`])? Such a request comes from a ChatGPT login whose
+/// workspace is served by another backend origin, or under a residency or FedRAMP routing that
+/// no pooled account shares, so `handle` relays it on the client's own credential and never
+/// pools it. Present is enough, whatever the value: codex adds the override only for a `us` or
+/// `us_cr` residency and the marker only for a FedRAMP login (`openai/codex` f82e365,
+/// `model-provider/src/workspace_routing.rs:12,39-77`,
+/// `model-provider/src/bearer_auth_provider.rs:31-47`), so a workspace served at `chatgpt.com`
+/// sends neither. Pure — unit-tested through `handle`.
+fn names_codex_routing(headers: &HeaderMap) -> bool {
+    crate::provider::CODEX_ROUTING_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// [`build_upstream_headers`] plus the Codex identity swap. codex sends its bearer with its own
+/// account's id in `chatgpt-account-id` (`openai/codex` f82e365,
+/// `model-provider/src/bearer_auth_provider.rs:31-47`), so the client's header names ITS
+/// account; tcr replaces it with the serving account's, so a pooled bearer always travels with
+/// its own account's id. What the backend answers a bearer paired with another account's id is
+/// unmeasured. The body is NOT touched — it is usually zstd-compressed
+/// (`core/src/client.rs:1704-1711`) and the identity lives in this header, not in a
+/// `metadata.user_id` field.
+///
+/// The client's routing headers ([`crate::provider::CODEX_ROUTING_HEADERS`]) are dropped too: a
+/// request carrying one is relayed before it reaches the pool ([`names_codex_routing`]), and a
+/// pooled bearer must never travel under another workspace's routing even if one slipped by.
+///
+/// The client's `x-codex-turn-state`, codex's sticky-routing token, is forwarded as it came, on
+/// every attempt. codex takes it from a turn's first response, replays it on every later request
+/// of that turn and clears it when its auth owner changes (`openai/codex` f82e365,
+/// `core/src/client.rs:11-13,163,282-309,1661-1665,2046-2047,2420-2436`), so after a rotation
+/// inside one request (on a 429, a 403, a second 401 or a transport failure) the account serving
+/// the retry receives a token minted for another account. How the backend treats that is
+/// unmeasured, so the header is not stripped on that ground; if the backend is ever seen refusing
+/// one, strip it whenever the serving account is not the one the session is pinned to.
+pub(crate) fn build_codex_upstream_headers(
+    req_headers: &HeaderMap,
+    token: &str,
+    account_id: Option<&str>,
+) -> HeaderMap {
+    let mut out = build_upstream_headers(req_headers, token);
+    out.remove(crate::provider::CODEX_ACCOUNT_HEADER);
+    for name in crate::provider::CODEX_ROUTING_HEADERS {
+        out.remove(name);
+    }
+    if let Some(id) = account_id {
+        if let Ok(value) = HeaderValue::from_str(id) {
+            out.insert(
+                HeaderName::from_static(crate::provider::CODEX_ACCOUNT_HEADER),
+                value,
+            );
+        }
+    }
+    out
+}
+
+/// The 429 body a Codex client gets when the pool is out on a quota
+/// ([`codex_limit_is_quota`]: the gate that times the wait is a five-hour or weekly window or a
+/// refusal, or, with no gate timing it, every account out is out on one of those), which is the
+/// honest message then: a usage limit, with when it ends if any account reported that. A pool
+/// out on anything else gets [`codex_pool_unavailable_body`].
+///
+/// Read against openai/codex f82e365. Codex does not retry a 429 at the transport layer
+/// (`retry_429: false`, set in `ModelProviderInfo::to_api_provider`,
+/// `codex-rs/model-provider-info/src/lib.rs:67,454-460`), but its turn loop retries any other
+/// 429 after its `Retry-After`, up to five times (`core/src/responses_retry.rs:140-166`), and
+/// it ends the turn on this one (`core/src/session/turn.rs:1694-1699`). It parses this body in
+/// `map_api_error` (`codex-rs/codex-api/src/api_bridge.rs`): an `error.type` of
+/// `usage_limit_reached` becomes its usage-limit error, and `error.resets_at`,
+/// absolute Unix seconds, is the reset it prints ("Try again at 3:45 PM"; without it, "Try
+/// again later"). So `resets_at` is written only when `reset_measured`, that is when some
+/// account reported when it frees, and it is then `now` plus the wait, the instant
+/// `resets_in_seconds` counts down to. Without a measured reset the wait is the 60-second
+/// fallback, which codex would print as a time nobody measured, and the message says so. No
+/// codex code reads `resets_in_seconds` at that commit; it stays for a person reading the body.
+/// `plan_type` stays null: a pool can mix plans, and codex words its advice by plan.
+pub(crate) fn codex_exhausted_body(
+    now: OffsetDateTime,
+    resets_in_seconds: u64,
+    reset_measured: bool,
+) -> String {
+    let message = if reset_measured {
+        format!(
+            "Every pooled Codex account is at its limit; the earliest window resets in {resets_in_seconds} seconds."
+        )
+    } else {
+        format!(
+            "Every pooled Codex account is unavailable, and none reports when it frees; retry in {resets_in_seconds} seconds."
+        )
+    };
+    let mut error = serde_json::json!({
+        "type": "usage_limit_reached",
+        "code": "usage_limit_reached",
+        "message": message,
+        "resets_in_seconds": resets_in_seconds,
+        "plan_type": serde_json::Value::Null
+    });
+    if reset_measured {
+        error["resets_at"] = now
+            .unix_timestamp()
+            .saturating_add(i64::try_from(resets_in_seconds).unwrap_or(i64::MAX))
+            .into();
+    }
+    serde_json::json!({ "error": error }).to_string()
+}
+
+/// Is the pool out on a QUOTA, so that its 429 may tell a Codex client its usage limit is
+/// reached ([`codex_exhausted_body`])? Yes when the gate that times the wait is a five-hour or
+/// weekly window or the backend's own refusal (`FiveHour`, `SevenDay`, `Rejected`), or, with no
+/// gate timing it, when every account out is out on one of those. Anything else (a hold on an
+/// upstream `retry-after`, a dead login, an account disabled, parked or reserved) is a wait or
+/// an operator's matter, not the user's limit, and gets [`codex_pool_unavailable_body`]: codex
+/// ends its turn on `usage_limit_reached` but retries any other 429 after its `retry-after`.
+///
+/// `gated` must be non-empty. The 60-second sentinel can come with nothing in it, and "every
+/// reason is a quota" holds vacuously of nothing. Pure — unit-tested.
+fn codex_limit_is_quota(hint: &ExhaustionHint) -> bool {
+    let quota = |reason: &GateReason| {
+        matches!(
+            reason,
+            GateReason::FiveHour | GateReason::SevenDay | GateReason::Rejected
+        )
+    };
+    match hint.binding {
+        Some(binding) => quota(&binding),
+        None => !hint.gated.is_empty() && hint.gated.keys().all(quota),
+    }
+}
+
+/// The 429 body a Codex client gets when the pool is out on anything else
+/// ([`codex_limit_is_quota`] is false): the Anthropic arm's plain 429, in codex's envelope.
+/// The same status and `{"error": {...}}` as [`codex_exhausted_body`], under a tcr `type` and
+/// `code`, `pool_unavailable`, that is none of the three codex reads as a limit
+/// (`usage_limit_reached`, `usage_not_included`, `insufficient_quota`), and with no `resets_at`
+/// or `plan_type`: the wait is tcr's, not a window for codex to print. codex's turn loop
+/// retries such a 429 after its `retry-after`, up to five times
+/// (`core/src/responses_retry.rs:140-166`, `protocol/src/error.rs:427-429` at openai/codex
+/// f82e365), which `exhausted_response` sets as it does for a Claude client.
+/// `resets_in_seconds` is `wait_secs`, the uncapped wait, as the usage-limit body carries it:
+/// no codex code reads it, and it is there for a person or a script reading the body.
+/// `wait_measured` is whether some account reports when it frees, without which the wait is the
+/// 60-second fallback and the message says so.
+pub(crate) fn codex_pool_unavailable_body(wait_secs: u64, wait_measured: bool) -> String {
+    let message = if wait_measured {
+        format!(
+            "No pooled Codex account can serve this request right now; the soonest frees in {wait_secs} seconds."
+        )
+    } else {
+        format!(
+            "No pooled Codex account can serve this request right now, and none reports when it frees; retry in {wait_secs} seconds."
+        )
+    };
+    serde_json::json!({
+        "error": {
+            "type": "pool_unavailable",
+            "code": "pool_unavailable",
+            "message": message,
+            "resets_in_seconds": wait_secs
+        }
+    })
+    .to_string()
+}
+
+/// The 429 body a Codex client gets when the fleet has NO Codex account at all, which
+/// [`codex_pool_unavailable_body`] would answer as a pool that frees in 60 seconds
+/// (`pool_unavailable`, `retry-after: 60`), a wait no account will end. The same status and
+/// `{"error": {...}}` envelope, but a `type`/`code` other than `usage_limit_reached` (the type
+/// codex's `map_api_error` reads as a usage limit with a reset), and no reset fields. codex's
+/// `map_api_error` turns a 429 of any other type into its generic retry-limit error and does
+/// not print this message. The message, which names the cause, is for a person reading the raw
+/// body; the operator learns the cause from the warn line in [`exhausted_response`].
+pub(crate) fn codex_no_account_body() -> String {
+    serde_json::json!({
+        "error": {
+            "type": "no_codex_account",
+            "code": "no_codex_account",
+            "message": "No Codex account is configured in tcr."
+        }
+    })
+    .to_string()
+}
+
 /// `hand` mode, and the ONLY bearer on this request path that is
 /// not this Mac's own: the owner of a leased account handed this node a
 /// short-lived access token over an `IK`-authenticated CONTROL session, and a
@@ -4709,9 +5205,16 @@ fn relay_client() -> Option<&'static reqwest::Client> {
 /// client sees it), a raw response is buffered under the same cap as every other
 /// body this file reads. Response headers go through the shared [`build_response`],
 /// which drops the framing headers a relayed body would mis-frame with.
+///
+/// `provider` is the request's own, derived by [`handle`] from the query-stripped
+/// path, and picks the origin: a Codex relay (`/backend-api/wham/usage`, every
+/// other non-inference Codex path, and a request that names a workspace routing of
+/// its own, inference included) reaches the Codex upstream with the client's own
+/// bearer, never Anthropic's.
 async fn relay_upstream(
     manager: &Manager,
     mode: RelayMode,
+    provider: crate::provider::Provider,
     method: Method,
     path_and_query: &str,
     req_headers: &HeaderMap,
@@ -4740,7 +5243,7 @@ async fn relay_upstream(
         }
         RelayMode::Raw => build_raw_relay_headers(req_headers),
     };
-    let url = format!("{}{}", manager.upstream(), path_and_query);
+    let url = format!("{}{}", manager.upstream_for(provider), path_and_query);
     let mut builder = client.request(method.clone(), &url).headers(headers);
     // A GET/HEAD carries no body, and an empty body is sent as no body at all —
     // both mirror the JS relays, and the latter keeps a bodyless POST from
@@ -5695,6 +6198,9 @@ fn block_index(event: &Value) -> Option<u64> {
 /// count considered, the gate that bound the hint, and so on) still hit this
 /// line too — a second, low-detail line is cheap; a refusal with NO line at
 /// all is the bug this exists to close.
+///
+/// The one exception is [`quiet_error_response`], for an answer that is
+/// EXPECTED on a healthy path; its caller logs it at the level it deserves.
 fn error_response(
     status: StatusCode,
     err_type: &str,
@@ -5707,6 +6213,20 @@ fn error_response(
         error.message = message,
         "proxy-generated error response"
     );
+    quiet_error_response(status, err_type, message, retry_after)
+}
+
+/// [`error_response`]'s envelope without its warn line. Only for an answer a
+/// healthy session produces as a matter of course, where a warn per occurrence
+/// would read as a fault: the Codex 426 ([`upgrade_required_response`]), one
+/// per Codex session. The caller logs it itself, so the refusal is never
+/// line-less (the bug [`error_response`] exists to close).
+fn quiet_error_response(
+    status: StatusCode,
+    err_type: &str,
+    message: &str,
+    retry_after: Option<i64>,
+) -> Response {
     let payload = serde_json::json!({
         "type": "error",
         "error": { "type": err_type, "message": message },
@@ -5724,6 +6244,10 @@ fn error_response(
     response
 }
 
+// The lint allow sits ABOVE the doc block, not between it and the signature:
+// `tests/peer_egress.rs` (`the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead`)
+// reads the run of `///` lines directly above `async fn exhausted_or_fallback(`.
+#[allow(clippy::too_many_arguments)]
 /// The dry-fleet terminal: consult the fallback ladder once, then answer with
 /// exactly what this handler answered before it existed.
 ///
@@ -5766,11 +6290,17 @@ fn error_response(
 /// this function yet. It is a different question ("we walked the fleet and ran
 /// out of tries") and whether a lease should be spent there is the lease
 /// phase's call, with a re-send hazard to weigh rather than a line to copy.
+///
+/// A **Codex** request never reaches one either: the seam builds no `Ask` for a
+/// Codex path (`peer::serve::serve_is_allowed_for_path`), because Codex is not
+/// lent over the mesh in this version. Its 429 is Codex-shaped; see
+/// [`exhausted_response`].
 async fn exhausted_or_fallback(
     manager: &Manager,
     now: OffsetDateTime,
-    account_count: usize,
+    provider_account_count: usize,
     is_fable: bool,
+    provider: crate::provider::Provider,
     strict_group: Option<&str>,
     bound_to: Option<usize>,
     ask: Option<&fallback::Ask<'_>>,
@@ -5804,8 +6334,9 @@ async fn exhausted_or_fallback(
     exhausted_response(
         manager,
         now,
-        account_count,
+        provider_account_count,
         is_fable,
+        provider,
         strict_group,
         bound_to,
     )
@@ -5843,21 +6374,88 @@ async fn exhausted_or_fallback(
 /// figure capped at [`CLIENT_RETRY_AFTER_MAX_SECS`] (see
 /// [`advertised_retry_after`]): the client refuses a longer one outright. The
 /// body keeps the uncapped figure and the real instant for a human reader.
+///
+/// `provider` is the request's own. The hint folds only that provider's accounts
+/// ([`Manager::exhaustion_hint`]), since no other account could have served the
+/// request, and a **Codex** client gets a Codex body instead of the Anthropic
+/// envelope, which it would print as an opaque error. Which body follows the
+/// Anthropic arm's principle, that a quota is the user's limit and a hold is not:
+/// a pool out on a quota ([`codex_limit_is_quota`], which counts the backend's
+/// refusal as one) gets [`codex_exhausted_body`], which codex renders as a
+/// usage-limit line and which ends its turn, and anything else gets
+/// [`codex_pool_unavailable_body`], a plain 429 codex retries after the
+/// `retry-after`. Either way that header is the same capped one, so the Anthropic
+/// half below is untouched. The usage-limit body's `resets_in_seconds` is the same
+/// live figure the Anthropic message prints, uncapped, and its `resets_at`, the
+/// instant that figure ends (`now` plus it), is there only when some Codex account
+/// reports when it frees: the 60-second fallback is no time, and codex would print
+/// it as one.
+///
+/// `provider_account_count` is how many accounts the request's provider has
+/// ([`Manager::provider_account_count`]), the only accounts that could have
+/// served it, so the Anthropic message's "All N accounts" never counts a Codex
+/// account. At zero, a Codex client gets [`codex_no_account_body`], whose message
+/// says no Codex account is configured, instead of a `pool_unavailable` 429
+/// telling it to retry in 60 seconds, which codex obeys up to five times though
+/// no wait adds an account; that answer carries no `retry-after`, because waiting
+/// changes nothing. codex shows that 429 only as its generic retry-limit error,
+/// so the warn line below is what names the cause.
 fn exhausted_response(
     manager: &Manager,
     now: OffsetDateTime,
-    account_count: usize,
+    provider_account_count: usize,
     is_fable: bool,
+    provider: crate::provider::Provider,
     strict_group: Option<&str>,
     bound_to: Option<usize>,
 ) -> Response {
+    if provider == crate::provider::Provider::Codex && provider_account_count == 0 {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "returning 429 to a Codex client: no Codex account is configured"
+        );
+        let mut response = Response::new(Body::from(codex_no_account_body()));
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return response;
+    }
     // Bound history is the narrowest scope there is — one account — so it wins over a group.
     let hint = match bound_to {
         Some(idx) => manager.exhaustion_hint_for_account(now, is_fable, idx),
-        None => manager.exhaustion_hint(now, is_fable, strict_group),
+        None => manager.exhaustion_hint(now, is_fable, provider, strict_group),
     };
     let retry_after = hint.retry_after;
     let advertised_retry_after = advertised_retry_after(&hint);
+    if provider == crate::provider::Provider::Codex {
+        let usage_limit = codex_limit_is_quota(&hint);
+        tracing::warn!(
+            provider = provider.as_str(),
+            retry_after,
+            advertised_retry_after,
+            binding = ?hint.binding,
+            usage_limit,
+            group = strict_group.unwrap_or("-"),
+            "returning exhausted 429 to client"
+        );
+        // `retry_after` is at least 1 by construction (`Manager::exhaustion_hint`).
+        let real_wait_secs = u64::try_from(retry_after).unwrap_or(1);
+        let body = if usage_limit {
+            codex_exhausted_body(now, real_wait_secs, hint.free_at.is_some())
+        } else {
+            codex_pool_unavailable_body(real_wait_secs, hint.free_at.is_some())
+        };
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Ok(value) = HeaderValue::from_str(&advertised_retry_after.to_string()) {
+            response.headers_mut().insert("retry-after", value);
+        }
+        return response;
+    }
     let causes = describe_gates(&hint.gated);
     let when = match hint.free_at {
         Some(at) => format!(
@@ -5879,10 +6477,10 @@ fn exhausted_response(
             "No account in reserved group '{group}' is available, and a reserved \
              group never serves from outside itself{causes}. {when}"
         ),
-        (None, None) => format!("All {account_count} accounts exhausted{causes}. {when}"),
+        (None, None) => format!("All {provider_account_count} accounts exhausted{causes}. {when}"),
     };
     tracing::warn!(
-        account_count,
+        account_count = provider_account_count,
         retry_after,
         advertised_retry_after,
         binding = ?hint.binding,
@@ -11647,14 +12245,30 @@ mod tests {
                 .map(str::to_string)
         };
 
-        let fleet = exhausted_response(&manager, now, 2, false, None, None);
+        let fleet = exhausted_response(
+            &manager,
+            now,
+            2,
+            false,
+            crate::provider::Provider::Anthropic,
+            None,
+            None,
+        );
         assert_eq!(
             claim(&fleet).as_deref(),
             Some("five_hour"),
             "control: with no history held, the fleet's 429 names the window"
         );
 
-        let held = exhausted_response(&manager, now, 2, false, None, Some(0));
+        let held = exhausted_response(
+            &manager,
+            now,
+            2,
+            false,
+            crate::provider::Provider::Anthropic,
+            None,
+            Some(0),
+        );
         assert_eq!(held.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(claim(&held), None, "a held 429 names no window");
         assert!(
@@ -15672,7 +16286,12 @@ mod tests {
         for idx in 0..2 {
             manager.mark_rate_limited(idx, 3_600);
         }
-        let hint = manager.exhaustion_hint(OffsetDateTime::now_utc(), false, None);
+        let hint = manager.exhaustion_hint(
+            OffsetDateTime::now_utc(),
+            false,
+            crate::provider::Provider::Anthropic,
+            None,
+        );
         assert!(
             hint.retry_after > 3_500 && hint.free_at.is_some(),
             "fixture must be a MEASURED wait far above the cap: {hint:?}"
@@ -16381,5 +17000,1472 @@ mod tests {
             status, 503,
             "an ordinary path still reaches the rotation loop (dead upstream → 503)"
         );
+    }
+
+    // --- Codex: the 426, the identity swap, the exhausted body --------------
+    //
+    // Every value below is a fixture: `11111111-…` is the serving account's id,
+    // `99999999-…` the CLIENT's, and no token is real. This repository is public.
+
+    /// `upgrade: websocket` is how Codex asks for its default transport
+    /// (`openai/codex` f82e365, `model-provider-info/src/lib.rs:561`); `h2c` is an
+    /// upgrade too and must not be read as one.
+    #[test]
+    fn wants_websocket_upgrade_reads_the_upgrade_header_case_insensitively() {
+        let mut h = HeaderMap::new();
+        assert!(!wants_websocket_upgrade(&h));
+        h.insert("upgrade", HeaderValue::from_static("WebSocket"));
+        assert!(wants_websocket_upgrade(&h));
+        h.insert("upgrade", HeaderValue::from_static("h2c"));
+        assert!(!wants_websocket_upgrade(&h));
+    }
+
+    /// The pooled bearer travels with ITS account's id, never with the id of the
+    /// account the client is logged in as; everything else the client sent goes
+    /// through as it came, compressed body framing included.
+    #[test]
+    fn codex_upstream_headers_swap_the_account_id_and_the_bearer_and_keep_the_rest() {
+        let mut req = HeaderMap::new();
+        req.insert(AUTHORIZATION, HeaderValue::from_static("Bearer client-own"));
+        req.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("99999999-9999-4999-8999-999999999999"),
+        );
+        req.insert("session-id", HeaderValue::from_static("s-1"));
+        req.insert("x-codex-turn-state", HeaderValue::from_static("opaque"));
+        req.insert("content-encoding", HeaderValue::from_static("zstd"));
+        req.insert("accept-encoding", HeaderValue::from_static("gzip"));
+        let out = build_codex_upstream_headers(
+            &req,
+            "pooled-token",
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        assert_eq!(out.get(AUTHORIZATION).unwrap(), "Bearer pooled-token");
+        assert_eq!(
+            out.get("chatgpt-account-id").unwrap(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(out.get("session-id").unwrap(), "s-1");
+        assert_eq!(
+            out.get("x-codex-turn-state").unwrap(),
+            "opaque",
+            "the client's own sticky-routing token is forwarded verbatim"
+        );
+        assert_eq!(
+            out.get("content-encoding").unwrap(),
+            "zstd",
+            "a compressed body keeps its encoding"
+        );
+        assert!(
+            out.get("accept-encoding").is_none(),
+            "we negotiate identity responses, as for Anthropic"
+        );
+    }
+
+    /// A client that sent no account id still gets the serving account's.
+    #[test]
+    fn codex_upstream_headers_insert_the_account_id_when_the_client_sent_none() {
+        let mut req = HeaderMap::new();
+        req.insert(AUTHORIZATION, HeaderValue::from_static("Bearer client-own"));
+        let out = build_codex_upstream_headers(
+            &req,
+            "pooled-token",
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        assert_eq!(
+            out.get("chatgpt-account-id").unwrap(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    /// No id to offer is no id at all: the client's own may not ride along with
+    /// a bearer that belongs to someone else.
+    #[test]
+    fn codex_upstream_headers_drop_the_clients_account_id_when_we_have_none_to_offer() {
+        let mut req = HeaderMap::new();
+        req.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("99999999-9999-4999-8999-999999999999"),
+        );
+        let out = build_codex_upstream_headers(&req, "pooled-token", None);
+        assert!(
+            out.get("chatgpt-account-id").is_none(),
+            "never forward another account's identity with our bearer"
+        );
+    }
+
+    /// The one error shape Codex renders as a usage limit (`map_api_error`,
+    /// `codex-rs/codex-api/src/api_bridge.rs` at openai/codex f82e365).
+    #[test]
+    fn codex_exhausted_body_is_the_shape_codex_renders() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("a valid instant");
+        let body: serde_json::Value =
+            serde_json::from_str(&codex_exhausted_body(now, 1234, true)).unwrap();
+        assert_eq!(body["error"]["type"], "usage_limit_reached");
+        assert_eq!(body["error"]["code"], "usage_limit_reached");
+        assert_eq!(body["error"]["resets_in_seconds"], 1234);
+        assert!(body["error"]["message"].as_str().unwrap().contains("1234"));
+    }
+
+    /// **Only a quota is a Codex usage limit.** codex ends its turn on `usage_limit_reached`
+    /// and retries any other 429 after its `retry-after`, so the claim is made when the gate
+    /// that times the wait is a five-hour or weekly window or the backend's own refusal, or,
+    /// with no gate timing it, when every account out is out on one of those. A hold, a dead
+    /// login, an operator's disable, park or reservation, and an empty `gated` (which an
+    /// "every reason" test would pass vacuously) are not.
+    #[test]
+    fn only_a_quota_gate_is_a_codex_usage_limit() {
+        let hint = |binding: Option<GateReason>, gated: &[(GateReason, usize)]| ExhaustionHint {
+            retry_after: 60,
+            free_at: None,
+            binding,
+            gated: gated.iter().copied().collect(),
+        };
+        for quota in [
+            GateReason::FiveHour,
+            GateReason::SevenDay,
+            GateReason::Rejected,
+        ] {
+            assert!(
+                codex_limit_is_quota(&hint(Some(quota), &[(quota, 1), (GateReason::Hold, 1)])),
+                "{quota:?} times the wait"
+            );
+            assert!(
+                codex_limit_is_quota(&hint(None, &[(quota, 2)])),
+                "every account is out on {quota:?}"
+            );
+        }
+        assert!(
+            codex_limit_is_quota(&hint(
+                None,
+                &[(GateReason::SevenDay, 1), (GateReason::Rejected, 1)]
+            )),
+            "every account is out on a quota, two different ones"
+        );
+        for other in [
+            GateReason::Ok,
+            GateReason::Hold,
+            GateReason::Standard,
+            GateReason::Login,
+            GateReason::Disabled,
+            GateReason::Reserved,
+            GateReason::Parked,
+            GateReason::FableWeekly,
+        ] {
+            assert!(
+                !codex_limit_is_quota(&hint(Some(other), &[(other, 1), (GateReason::SevenDay, 1)])),
+                "{other:?} times the wait"
+            );
+            assert!(
+                !codex_limit_is_quota(&hint(None, &[(GateReason::SevenDay, 1), (other, 1)])),
+                "one account is out on {other:?}"
+            );
+        }
+        assert!(
+            !codex_limit_is_quota(&hint(None, &[])),
+            "no gate at all is no evidence of a quota"
+        );
+    }
+
+    /// The 429 body for a Codex pool that is out for any reason but a quota: the envelope
+    /// codex parses, under a type that is none of the three it reads as a limit
+    /// (`usage_limit_reached`, `usage_not_included`, `insufficient_quota`), with no reset for
+    /// it to print. The wait is in `resets_in_seconds` and the message, for a person; a
+    /// 60-second fallback is not printed as if it had been measured.
+    #[test]
+    fn codex_pool_unavailable_body_claims_no_limit() {
+        for (wait_secs, measured) in [(45, true), (60, false)] {
+            let body: serde_json::Value =
+                serde_json::from_str(&codex_pool_unavailable_body(wait_secs, measured))
+                    .expect("a JSON body");
+            assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
+            assert_eq!(body["error"]["code"], "pool_unavailable", "{body}");
+            for field in ["resets_at", "plan_type"] {
+                assert!(body["error"].get(field).is_none(), "{field}: {body}");
+            }
+            assert_eq!(body["error"]["resets_in_seconds"], wait_secs, "{body}");
+            let message = body["error"]["message"].as_str().expect("a message");
+            assert!(
+                message.contains(&format!("{wait_secs} seconds")),
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("none reports when it frees"),
+                !measured,
+                "{message}"
+            );
+        }
+    }
+
+    // --- Codex through the handler: two origins, one mixed fleet ------------
+
+    /// The serving Codex account's ChatGPT account id, and the one the CLIENT
+    /// says it is. Both are fixtures.
+    const CODEX_SERVING_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const CODEX_CLIENT_ID: &str = "99999999-9999-4999-8999-999999999999";
+
+    /// One request a [`CapturingUpstream`] received, as it arrived on the wire.
+    /// The body is kept as BYTES: a Codex body is usually zstd, and a lossy string would
+    /// make "forwarded byte for byte" unfalsifiable.
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl SeenRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// How many times `name` arrived. One identity header, never two.
+        fn header_count(&self, name: &str) -> usize {
+            self.headers.iter().filter(|(n, _)| n == name).count()
+        }
+    }
+
+    /// A fake origin that RECORDS every request it receives and answers `200 {}`.
+    ///
+    /// [`spawn_echo_upstream`] reports what it saw inside its own response, which
+    /// works only for the one origin a request reached. The Codex tests run two
+    /// origins side by side, Anthropic's and Codex's, and the assertion that
+    /// matters is as often "this one saw NOTHING" as "this one saw X", so each
+    /// origin keeps its own record and its own count.
+    struct CapturingUpstream {
+        url: String,
+        seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+    }
+
+    impl CapturingUpstream {
+        async fn spawn() -> Self {
+            let seen: Arc<std::sync::Mutex<Vec<SeenRequest>>> = Arc::default();
+            let recorder = Arc::clone(&seen);
+            let upstream = Router::new().fallback(move |req: Request| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let bytes = to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default();
+                    recorder
+                        .lock()
+                        .expect("upstream recorder poisoned")
+                        .push(SeenRequest {
+                            path: parts
+                                .uri
+                                .path_and_query()
+                                .map(|pq| pq.as_str().to_string())
+                                .unwrap_or_default(),
+                            headers: parts
+                                .headers
+                                .iter()
+                                .map(|(n, v)| {
+                                    (n.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                                })
+                                .collect(),
+                            body: bytes.to_vec(),
+                        });
+                    ([(CONTENT_TYPE, "application/json")], "{}")
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind capturing upstream");
+            let addr = listener.local_addr().expect("capturing upstream addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, upstream).await;
+            });
+            Self {
+                url: format!("http://{addr}"),
+                seen,
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.seen.lock().expect("upstream recorder poisoned").len()
+        }
+
+        fn last_request(&self) -> SeenRequest {
+            self.seen
+                .lock()
+                .expect("upstream recorder poisoned")
+                .last()
+                .cloned()
+                .expect("this origin saw no request at all")
+        }
+    }
+
+    /// A mixed fleet: `alice@example.com` on Anthropic (index 0) and
+    /// `bob@example.com/codex` on Codex (index 1), each provider on its own
+    /// origin. alice carries no account uuid, so nothing is spliced into an
+    /// Anthropic body in these tests.
+    fn codex_fleet(anthropic: &str, codex: &str) -> Config {
+        let base = dummy_config(None, anthropic);
+        let alice = Account {
+            name: "alice@example.com".to_string(),
+            access_token: "at-alice".to_string(),
+            refresh_token: Some("rt-alice".to_string()),
+            ..base.accounts[0].clone()
+        };
+        let bob = Account {
+            name: "bob@example.com/codex".to_string(),
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some(CODEX_SERVING_ID.to_string()),
+            access_token: "at-bob".to_string(),
+            refresh_token: Some("rt-bob".to_string()),
+            ..base.accounts[0].clone()
+        };
+        Config {
+            accounts: vec![alice, bob],
+            codex_upstream: codex.to_string(),
+            ..base
+        }
+    }
+
+    /// [`drive_full`] with a raw byte body, for a body that is not UTF-8.
+    async fn drive_bytes(
+        manager: Arc<Manager>,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (StatusCode, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder.body(Body::from(body)).expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, bytes)
+    }
+
+    /// **A WebSocket upgrade on the Codex inference path is answered 426 HERE**,
+    /// with a pooled Codex account free to serve it, and neither origin sees a
+    /// byte. A 426 is the status that moves Codex to SSE at once, for the rest of
+    /// the session; the real backend answers the upgrade 101 (measured
+    /// 2026-10-12), so forwarding it can never be the right move. No account is
+    /// spent on it either: none is even SELECTED, which is what the last
+    /// assertion reads (`last_selected_seq` is stamped by every pick, whereas
+    /// `requests` counts only serves and stays 0 for a pick answered 426).
+    ///
+    /// Watched red: comment out step 1c' in `handle` and the upgrade goes out as
+    /// a bare GET on bob's credential: 200, and the Codex origin counts 1. Move
+    /// the 426 below the pick instead and only the selection assertion fails.
+    #[tokio::test]
+    async fn codex_upgrade_is_answered_426_and_never_forwarded() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        let resp = drive_full(
+            Arc::clone(&manager),
+            Method::GET,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("upgrade", "websocket"),
+                ("connection", "Upgrade"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+                ("authorization", "Bearer client-own"),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UPGRADE_REQUIRED,
+            "the Codex origin saw {} request(s)",
+            codex_echo.request_count()
+        );
+        assert_eq!(
+            codex_echo.request_count(),
+            0,
+            "the upstream must see nothing"
+        );
+        assert_eq!(anthropic_echo.request_count(), 0);
+        for idx in 0..manager.account_count() {
+            assert_eq!(
+                manager.last_selected_seq(idx),
+                Some(0),
+                "an upgrade is answered before any account is selected (account {idx})"
+            );
+        }
+    }
+
+    /// The 426 is the Codex inference path's alone: a `/v1/messages` request
+    /// carrying a stray `upgrade: websocket` still reaches the rotation and is
+    /// served.
+    ///
+    /// Watched red: drop the provider and path conjuncts from step 1c' and this
+    /// request is answered 426.
+    #[tokio::test]
+    async fn an_anthropic_request_with_an_upgrade_header_still_reaches_the_rotation() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let manager = Manager::with_live_refresher(
+            codex_fleet(&anthropic_echo.url, "http://127.0.0.1:9"),
+            None,
+        );
+        let resp = drive_full(
+            manager,
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[
+                ("upgrade", "websocket"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(anthropic_echo.request_count(), 1, "served by the rotation");
+    }
+
+    /// The inference path carries the POOLED bearer and the serving account's
+    /// own id, exactly one of each, never the client's.
+    ///
+    /// Watched red: build the Codex request's headers with `build_upstream_headers`
+    /// alone (no swap) and the client's id reaches the origin with our bearer.
+    /// Dropping `out.remove(...)` does NOT turn this red: `HeaderMap::insert`
+    /// already replaces every earlier value, so that line guards only the case
+    /// with no id to offer (`codex_upstream_headers_drop_the_clients_account_id_…`).
+    #[tokio::test]
+    async fn codex_inference_swaps_account_header_and_bearer() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        let (status, body) = drive(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("chatgpt-account-id", CODEX_CLIENT_ID),
+                ("session-id", "s-1"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let seen = codex_echo.last_request();
+        assert_eq!(seen.path, crate::provider::CODEX_RESPONSES_PATH);
+        assert_eq!(seen.header("authorization"), Some("Bearer at-bob"));
+        assert_eq!(seen.header("chatgpt-account-id"), Some(CODEX_SERVING_ID));
+        assert_eq!(
+            seen.header_count("chatgpt-account-id"),
+            1,
+            "one identity travels with the bearer, never the client's beside it"
+        );
+        assert_eq!(seen.header("session-id"), Some("s-1"));
+        assert_eq!(
+            anthropic_echo.request_count(),
+            0,
+            "a Codex request never reaches the Anthropic origin"
+        );
+    }
+
+    /// A Codex inference request that names a routing of its own, a data-residency override or
+    /// FedRAMP (`openai/codex` f82e365, `model-provider/src/workspace_routing.rs:12,39-77`,
+    /// `model-provider/src/bearer_auth_provider.rs:43-45`), comes from a workspace that is not
+    /// served as a pooled account is. It is relayed on the client's OWN credential, with its own
+    /// account id and its routing intact, and never pooled: no account is selected, and no pooled
+    /// bearer goes anywhere.
+    ///
+    /// Watched red: without the routing relay, the request is pooled and carries `Bearer at-bob`.
+    #[tokio::test]
+    async fn a_codex_inference_request_naming_its_routing_keeps_the_client_credential() {
+        for (name, value) in [
+            ("x-openai-account-routing-override", "us"),
+            ("x-openai-fedramp", "true"),
+        ] {
+            let anthropic_echo = CapturingUpstream::spawn().await;
+            let codex_echo = CapturingUpstream::spawn().await;
+            let manager = Manager::with_live_refresher(
+                codex_fleet(&anthropic_echo.url, &codex_echo.url),
+                None,
+            );
+            let (status, body) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("chatgpt-account-id", CODEX_CLIENT_ID),
+                    (name, value),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let seen = codex_echo.last_request();
+            assert_eq!(
+                seen.header("authorization"),
+                Some("Bearer client-own"),
+                "{name}: the client's own bearer, never a pooled one"
+            );
+            assert_eq!(seen.header("chatgpt-account-id"), Some(CODEX_CLIENT_ID));
+            assert_eq!(
+                seen.header(name),
+                Some(value),
+                "its routing travels with it"
+            );
+            for idx in 0..manager.account_count() {
+                assert_eq!(
+                    manager.last_selected_seq(idx),
+                    Some(0),
+                    "{name}: no account is selected (account {idx})"
+                );
+            }
+            assert_eq!(anthropic_echo.request_count(), 0);
+        }
+    }
+
+    /// No pooled request carries the client's routing: [`build_codex_upstream_headers`] drops
+    /// both routing headers whatever the client sent, so a pooled bearer is never routed by the
+    /// client's workspace. A backstop to the relay above.
+    ///
+    /// Watched red: drop the strip and both headers reach the origin beside the pooled bearer.
+    #[test]
+    fn pooled_codex_headers_never_carry_the_clients_routing() {
+        let mut client = HeaderMap::new();
+        client.insert(AUTHORIZATION, HeaderValue::from_static("Bearer client-own"));
+        client.insert(
+            "x-openai-account-routing-override",
+            HeaderValue::from_static("us"),
+        );
+        client.insert("x-openai-fedramp", HeaderValue::from_static("true"));
+        client.insert("session-id", HeaderValue::from_static("s-1"));
+        let out = build_codex_upstream_headers(&client, "at-bob", Some(CODEX_SERVING_ID));
+        assert_eq!(out.get("x-openai-account-routing-override"), None);
+        assert_eq!(out.get("x-openai-fedramp"), None);
+        assert_eq!(
+            out.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            Some("Bearer at-bob")
+        );
+        assert_eq!(
+            out.get("session-id").and_then(|v| v.to_str().ok()),
+            Some("s-1"),
+            "every other header still rides along"
+        );
+    }
+
+    /// A client that names no account still reaches the origin naming ours.
+    #[tokio::test]
+    async fn codex_inference_inserts_account_header_when_client_sent_none() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        let (status, body) = drive(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("session-id", "s-1"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let seen = codex_echo.last_request();
+        assert_eq!(seen.header("authorization"), Some("Bearer at-bob"));
+        assert_eq!(seen.header("chatgpt-account-id"), Some(CODEX_SERVING_ID));
+        assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// The zstd body Codex usually sends is forwarded as it came, encoding header
+    /// and all: nothing here can read it, so nothing here may touch it.
+    #[tokio::test]
+    async fn codex_body_is_forwarded_byte_identical() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        // zstd magic + junk: not JSON
+        let body: Vec<u8> = vec![
+            0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x58, 0x41, 0x00, 0x00, 0x7b, 0x7d,
+        ];
+        let (status, answer) = drive_bytes(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+                ("content-encoding", "zstd"),
+            ],
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        let seen = codex_echo.last_request();
+        assert_eq!(seen.body, body);
+        assert_eq!(seen.header("content-encoding"), Some("zstd"));
+        assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// An UNCOMPRESSED JSON body is the case where a rewrite could actually
+    /// change bytes, so it is the one that gives "never parsed, never spliced"
+    /// its teeth: this body carries both things the Anthropic path rewrites, a
+    /// `metadata.user_id` with an embedded account uuid (the splice) and a
+    /// `cache_control` breakpoint in `tools` (the 1-hour rewrite, on by default
+    /// for an all-OAuth fleet). Both are Anthropic facts; the Codex body goes out
+    /// byte for byte.
+    ///
+    /// Watched red, twice: give the Codex arm the Anthropic splice and the
+    /// client's uuid is replaced by bob's; drop `provider == Anthropic` from the
+    /// cache-ttl rewrite's gate and the body is re-serialized with `"ttl":"1h"`.
+    #[tokio::test]
+    async fn codex_json_body_is_neither_spliced_nor_rewritten() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        assert!(
+            manager.cache_ttl_rewrite_enabled(),
+            "precondition: the 1-hour rewrite is on for this fleet"
+        );
+        let body = format!(
+            r#"{{"model":"gpt-5","metadata":{{"user_id":"{{\"account_uuid\":\"{CODEX_CLIENT_ID}\",\"session_id\":\"s-1\"}}"}},"tools":[{{"type":"function","name":"f","cache_control":{{"type":"ephemeral"}}}}],"input":[]}}"#
+        );
+        assert!(
+            matches!(
+                crate::account_uuid::patch_account_uuid(body.as_bytes(), CODEX_SERVING_ID),
+                std::borrow::Cow::Owned(_)
+            ),
+            "precondition: the Anthropic splice WOULD rewrite this body"
+        );
+        assert!(
+            crate::cache_ttl::extend_all_ttls(body.as_bytes()).is_some(),
+            "precondition: the 1-hour rewrite WOULD rewrite this body"
+        );
+        let (status, answer) = drive(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&codex_echo.last_request().body),
+            body,
+            "a Codex body is forwarded byte for byte"
+        );
+    }
+
+    /// Every Codex path but the inference one is the CLIENT's business (usage
+    /// display, memories, threads, plugins) and goes up under the client's own
+    /// bearer, to the Codex origin. With no bearer it goes up with none: a
+    /// pooled one is never put on it.
+    #[tokio::test]
+    async fn codex_non_inference_paths_relay_the_clients_own_bearer() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        let (status, _) = drive(
+            Arc::clone(&manager),
+            Method::GET,
+            crate::provider::CODEX_USAGE_PATH,
+            Some(loopback_peer()),
+            &[("authorization", "Bearer client-own")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = codex_echo.last_request();
+        assert_eq!(seen.path, crate::provider::CODEX_USAGE_PATH);
+        assert_eq!(seen.header("authorization"), Some("Bearer client-own"));
+        assert_ne!(seen.header("authorization"), Some("Bearer at-bob"));
+
+        let (status, _) = drive(
+            Arc::clone(&manager),
+            Method::GET,
+            crate::provider::CODEX_USAGE_PATH,
+            Some(loopback_peer()),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            codex_echo.last_request().header("authorization"),
+            None,
+            "no bearer in, no bearer out: a pooled one is never put on a Codex relay"
+        );
+        assert_eq!(codex_echo.request_count(), 2);
+        assert_eq!(
+            anthropic_echo.request_count(),
+            0,
+            "a Codex relay goes to the Codex origin"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[1].requests,
+            0,
+            "a relay spends nothing the rotation owns"
+        );
+    }
+
+    /// Every host tcr intercepts names the provider whose requests it carries, and no
+    /// other host does. A host added to [`crate::mitm::ALLOWED_HOSTS`] without a provider
+    /// here would be refused outright by `handle`'s host-and-path check (it fails closed),
+    /// so this fails first, at the table. Loopback names no provider: base-URL mode keeps
+    /// the path's.
+    ///
+    /// Watched red: drop the `platform.claude.com` row and the first loop names it.
+    #[test]
+    fn every_intercepted_host_names_its_provider() {
+        use crate::provider::Provider;
+        for host in crate::mitm::ALLOWED_HOSTS {
+            assert!(
+                intercepted_host_provider(host).is_some(),
+                "{host} is intercepted but names no provider"
+            );
+        }
+        for (host, _) in INTERCEPTED_HOST_PROVIDERS {
+            assert!(
+                crate::mitm::host_allowed(host),
+                "{host} names a provider but is not intercepted"
+            );
+        }
+        assert_eq!(
+            intercepted_host_provider("chatgpt.com"),
+            Some(Provider::Codex)
+        );
+        assert_eq!(
+            intercepted_host_provider("api.anthropic.com"),
+            Some(Provider::Anthropic)
+        );
+        assert_eq!(
+            intercepted_host_provider("platform.claude.com"),
+            Some(Provider::Anthropic)
+        );
+        assert_eq!(
+            intercepted_host_provider("ChatGPT.COM"),
+            Some(Provider::Codex),
+            "case-insensitive, like the allowlist"
+        );
+        for other in [
+            "127.0.0.1",
+            "localhost",
+            "auth.openai.com",
+            "chatgpt.com.evil",
+        ] {
+            assert_eq!(intercepted_host_provider(other), None, "{other}");
+        }
+    }
+
+    /// **An intercepted `chatgpt.com` request outside `/backend-api/` is refused, and
+    /// reaches no origin.** Its path alone would classify it Anthropic, and the host guard
+    /// lets chatgpt.com through, so before this refusal it was rewritten to Anthropic's
+    /// origin: measured on the code without it, `GET /api/oauth/profile` with `Host:
+    /// chatgpt.com` and a ChatGPT bearer was relayed to the Anthropic origin carrying that
+    /// bearer (200), and `POST /v1/messages` was served by the Anthropic pool on alice's
+    /// token. Now both are answered 421, naming the host and the path; neither origin sees
+    /// a byte and no account is selected.
+    ///
+    /// Watched red: drop the host-and-path check from `handle` and the first request is
+    /// relayed (200, not 421).
+    #[tokio::test]
+    async fn a_chatgpt_com_request_outside_backend_api_is_refused_and_reaches_no_origin() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        // The second spelling carries a port and capitals: the host is compared as the
+        // allowlist compares it, port stripped and case ignored.
+        for (method, host, path, headers) in [
+            (
+                Method::GET,
+                "chatgpt.com",
+                "/api/oauth/profile",
+                vec![("authorization", "Bearer chatgpt-client-token")],
+            ),
+            (
+                Method::POST,
+                "CHATGPT.com:443",
+                "/v1/messages",
+                vec![("content-type", "application/json")],
+            ),
+        ] {
+            let mut headers = headers;
+            headers.push(("host", host));
+            let (status, bytes) = drive(
+                Arc::clone(&manager),
+                method,
+                path,
+                Some(loopback_peer()),
+                &headers,
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}{path}");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON error");
+            let message = body["error"]["message"].as_str().expect("a message");
+            assert!(
+                message.contains(&format!("{}{path}", strip_port(host))),
+                "the refusal names the host and the path: {message}"
+            );
+        }
+        assert_eq!(
+            anthropic_echo.request_count(),
+            0,
+            "nothing reached Anthropic"
+        );
+        assert_eq!(codex_echo.request_count(), 0, "nor Codex");
+        for idx in 0..manager.account_count() {
+            assert_eq!(
+                manager.last_selected_seq(idx),
+                Some(0),
+                "refused before any account is selected (account {idx})"
+            );
+        }
+    }
+
+    /// **The mirror: an Anthropic host with a `/backend-api/` path is refused too.** The path
+    /// alone would classify it Codex, so before this refusal `GET /backend-api/wham/usage`
+    /// with `Host: api.anthropic.com` and a Claude bearer was relayed to the Codex origin
+    /// carrying that bearer (measured on the code without it), and a
+    /// `platform.claude.com` inference call was served by the Codex pool. Both are answered
+    /// 421 now, and neither origin sees a byte.
+    ///
+    /// Watched red: drop the host-and-path check from `handle` and the first request is
+    /// relayed to Codex (200, not 421).
+    #[tokio::test]
+    async fn an_anthropic_host_with_a_backend_api_path_is_refused_and_reaches_no_origin() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        for (method, host, path, headers) in [
+            (
+                Method::GET,
+                "api.anthropic.com",
+                crate::provider::CODEX_USAGE_PATH,
+                vec![("authorization", "Bearer claude-client-token")],
+            ),
+            (
+                Method::POST,
+                "platform.claude.com",
+                crate::provider::CODEX_RESPONSES_PATH,
+                vec![("content-type", "application/json")],
+            ),
+        ] {
+            let mut headers = headers;
+            headers.push(("host", host));
+            let (status, bytes) = drive(
+                Arc::clone(&manager),
+                method,
+                path,
+                Some(loopback_peer()),
+                &headers,
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}{path}");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON error");
+            let message = body["error"]["message"].as_str().expect("a message");
+            assert!(
+                message.contains(&format!("{host}{path}")),
+                "the refusal names the host and the path: {message}"
+            );
+        }
+        assert_eq!(codex_echo.request_count(), 0, "nothing reached Codex");
+        assert_eq!(anthropic_echo.request_count(), 0, "nor Anthropic");
+        for idx in 0..manager.account_count() {
+            assert_eq!(
+                manager.last_selected_seq(idx),
+                Some(0),
+                "refused before any account is selected (account {idx})"
+            );
+        }
+    }
+
+    /// A request with no intercepted host keeps the path's provider: a loopback `Host`
+    /// (base-URL mode), or none at all. `/backend-api/wham/usage` still reaches the Codex
+    /// origin and `/v1/messages` the Anthropic one, so the refusal above is about
+    /// intercepted hosts only.
+    ///
+    /// Watched red: drop `!host_is_loopback(host)` from the host-and-path check and the
+    /// first loopback request is answered 421.
+    #[tokio::test]
+    async fn a_loopback_or_hostless_request_keeps_its_paths_provider() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        for host in [
+            Some("127.0.0.1:3456"),
+            Some("localhost"),
+            Some("[::1]:3456"),
+            None,
+        ] {
+            let mut headers = vec![("authorization", "Bearer client-own")];
+            headers.extend(host.map(|host| ("host", host)));
+            let (status, _) = drive(
+                Arc::clone(&manager),
+                Method::GET,
+                crate::provider::CODEX_USAGE_PATH,
+                Some(loopback_peer()),
+                &headers,
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{host:?}");
+            let mut headers = vec![("content-type", "application/json")];
+            headers.extend(host.map(|host| ("host", host)));
+            let (status, _) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                "/v1/messages",
+                Some(loopback_peer()),
+                &headers,
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{host:?}");
+        }
+        assert_eq!(
+            codex_echo.request_count(),
+            4,
+            "every usage call reached Codex"
+        );
+        assert_eq!(
+            anthropic_echo.request_count(),
+            4,
+            "every /v1/messages reached Anthropic"
+        );
+    }
+
+    /// No pooled Codex account can serve, the backend having refused the only one
+    /// at its limit and tcr holding it out: the client gets the 429 shape Codex
+    /// renders as a usage limit, and no origin is asked.
+    #[tokio::test]
+    async fn codex_exhausted_pool_answers_a_codex_shaped_429() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let config = codex_fleet(&anthropic_echo.url, &codex_echo.url);
+        let manager = Manager::with_live_refresher(config, None);
+        manager.edit_quota_for_test(1, |quota| quota.status = Some("rejected".to_string()));
+        manager.mark_rate_limited(1, 3_600);
+        let resp = drive_full(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key("retry-after"),
+            "the retry-after logic is kept"
+        );
+        let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "usage_limit_reached");
+        assert_eq!(body["error"]["code"], "usage_limit_reached");
+        assert_eq!(codex_echo.request_count(), 0);
+        assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// **History bound to an account of the OTHER provider never holds a
+    /// request there.** The hold benches every other account and
+    /// `Manager::select_bound` checks no provider, so a Claude conversation whose
+    /// signature was minted on a Codex account was served on the Codex account's
+    /// bearer, against the Anthropic origin. Dropped, the request takes the
+    /// ordinary pick. Both directions.
+    ///
+    /// Watched red: drop the provider filter on `bound_candidate` and the
+    /// Anthropic origin sees `Bearer at-bob`.
+    #[tokio::test]
+    async fn codex_bound_history_never_holds_a_request_on_the_other_providers_account() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        // One token minted on each account, each naming the OTHER provider's.
+        manager.record_bound_tokens(
+            &[(
+                BoundTokenKind::ThinkingSignature,
+                "sig_fake_bob".to_string(),
+            )],
+            1,
+            crate::now_ms(),
+        );
+        manager.record_bound_tokens(
+            &[(
+                BoundTokenKind::ThinkingSignature,
+                "sig_fake_alice".to_string(),
+            )],
+            0,
+            crate::now_ms(),
+        );
+
+        // A Claude conversation carrying the Codex account's token.
+        let (status, body) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-cross", &["sig_fake_bob"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            anthropic_echo.last_request().header("authorization"),
+            Some("Bearer at-alice"),
+            "a Claude request is served by the Anthropic account, never on a Codex bearer"
+        );
+        assert_eq!(codex_echo.request_count(), 0);
+
+        // A Codex request carrying the Anthropic account's token.
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            &thinking_turn_body("sess-cross-codex", &["sig_fake_alice"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            codex_echo.last_request().header("authorization"),
+            Some("Bearer at-bob"),
+            "a Codex request is served by the Codex account, never on an Anthropic bearer"
+        );
+        assert_eq!(anthropic_echo.request_count(), 1);
+    }
+
+    /// **The Fable weekly bucket is an Anthropic fact** (this is the third
+    /// `is_fable`, after `select.rs`'s two): a Codex request whose model id
+    /// merely contains "fable" is never timed against it. Here the Codex account
+    /// is out for ten minutes AND carries a Fable-weekly rejection set by hand (no
+    /// Codex account has one in production, since tcr reads no model-scoped
+    /// window from Codex; it is the only way to observe the gate). The 429 says
+    /// ten minutes, not the week.
+    ///
+    /// Watched red: drop `provider == Anthropic` from `request_is_fable` and
+    /// `resets_in_seconds` reads about 604800.
+    #[tokio::test]
+    async fn codex_request_never_reads_the_fable_weekly_bucket() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        manager.mark_model_weekly_rejected(1, &HeaderMap::new());
+        manager.mark_rate_limited(1, 600);
+        let resp = drive_full(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            r#"{"model":"gpt-6-fable"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let resets = body["error"]["resets_in_seconds"]
+            .as_u64()
+            .expect("a number of seconds");
+        assert!(
+            (590..=600).contains(&resets),
+            "the hold times this Codex 429, not the Fable weekly window: {resets}"
+        );
+        assert_eq!(codex_echo.request_count(), 0);
+    }
+
+    /// **A Codex client's bearer is never sent to Anthropic.** The
+    /// `controlIdentity` check resolves a client bearer through
+    /// `/api/oauth/profile` on the ANTHROPIC upstream; on a Codex request that
+    /// bearer is a ChatGPT token, so the check is an Anthropic-only question and
+    /// a Codex request never asks it. The control is an Anthropic bookkeeping
+    /// call on the same manager, which does ask: without it, the zero below
+    /// would pass on a manager whose check never runs at all.
+    ///
+    /// Watched red: drop the `provider == Anthropic` gate on the check and the
+    /// Anthropic origin receives `/api/oauth/profile` with `Bearer client-own`.
+    #[tokio::test]
+    async fn codex_bearer_never_reaches_the_anthropic_identity_check() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let mut config = codex_fleet(&anthropic_echo.url, &codex_echo.url);
+        config.control_account = Some(crate::config::ControlAccountRef::Name(
+            "alice@example.com".to_string(),
+        ));
+        config.control_pooled = true;
+        let manager = Manager::with_live_refresher(config, None);
+        for (method, path, body) in [
+            (Method::GET, crate::provider::CODEX_USAGE_PATH, ""),
+            (Method::POST, crate::provider::CODEX_RESPONSES_PATH, "{}"),
+        ] {
+            let (status, answer) = drive(
+                Arc::clone(&manager),
+                method,
+                path,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                ],
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+        assert_eq!(
+            anthropic_echo.request_count(),
+            0,
+            "a ChatGPT bearer must never reach the Anthropic profile endpoint"
+        );
+        assert_eq!(codex_echo.request_count(), 2);
+
+        // The control: an Anthropic bookkeeping call resolves the bearer first.
+        let (status, _) = drive(
+            Arc::clone(&manager),
+            Method::GET,
+            "/api/claude_cli/bootstrap",
+            Some(loopback_peer()),
+            &[("authorization", "Bearer client-own")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let paths: Vec<String> = anthropic_echo
+            .seen
+            .lock()
+            .expect("upstream recorder poisoned")
+            .iter()
+            .map(|seen| seen.path.clone())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path == "/api/oauth/profile"),
+            "control: the check is live for an Anthropic request: {paths:?}"
+        );
+    }
+
+    /// **Each provider's exhausted 429 is timed on that provider's accounts
+    /// alone**, and only a Codex client gets the Codex body. Both orders:
+    /// whichever provider's account frees sooner, the other provider's client is
+    /// never told to come back then.
+    ///
+    /// Watched red: hand `exhausted_response`'s fleet hint every account again and
+    /// the sooner hold answers both clients.
+    #[tokio::test]
+    async fn codex_exhausted_429s_are_timed_on_the_requests_own_provider() {
+        use crate::provider::Provider;
+        let retry_after = |response: &Response| {
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        for (alice_hold, bob_hold) in [(7_i64, 2_i64), (2, 7)] {
+            let manager = Manager::with_live_refresher(
+                codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9"),
+                None,
+            );
+            manager.mark_rate_limited(0, alice_hold);
+            manager.mark_rate_limited(1, bob_hold);
+            // Read AFTER the marks, so each hold rounds up to exactly its own length.
+            let now = OffsetDateTime::now_utc();
+
+            let anthropic =
+                exhausted_response(&manager, now, 2, false, Provider::Anthropic, None, None);
+            assert_eq!(anthropic.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                retry_after(&anthropic),
+                Some(alice_hold),
+                "a Claude client waits for the Anthropic account"
+            );
+            let bytes = to_bytes(anthropic.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("read body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"]["type"], "rate_limit_error",
+                "the Anthropic body is the one it always was"
+            );
+
+            let codex = exhausted_response(&manager, now, 2, false, Provider::Codex, None, None);
+            assert_eq!(codex.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                retry_after(&codex),
+                Some(bob_hold),
+                "a Codex client waits for the Codex account"
+            );
+            let bytes = to_bytes(codex.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("read body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"]["type"], "pool_unavailable",
+                "a pool that is only held is no usage limit: {body}"
+            );
+            assert_eq!(body["error"]["resets_in_seconds"], bob_hold);
+        }
+    }
+
+    /// **The exhausted-pool 429 says WHEN in the field codex reads, when a reset was
+    /// measured.** codex parses an HTTP 429 in `map_api_error` (openai/codex f82e365,
+    /// `codex-rs/codex-api/src/api_bridge.rs`): a `usage_limit_reached` body becomes its
+    /// usage-limit error, whose reset time is `error.resets_at` in absolute Unix seconds,
+    /// printed as "Try again at <time>"; without it codex prints "Try again later". Nothing in
+    /// codex reads `resets_in_seconds` at that commit. For a full weekly window both fields
+    /// come from one instant, its reset, so `resets_at` is the 429's `now` plus
+    /// `resets_in_seconds`. The 60-second fallback, when no account reports a reset (one the
+    /// backend refused, with no window to wait on), is a wait and not a measured time: it
+    /// carries no `resets_at`, and its message says no account reports one. A pool out on
+    /// anything but a quota, a disabled account here, claims no limit at all.
+    ///
+    /// Watched red: leave `resets_at` out of [`codex_exhausted_body`] and the first
+    /// assertion reads null; write it for the fallback too and the fallback's reads a time.
+    #[tokio::test]
+    async fn codex_exhausted_429_carries_resets_at_and_it_agrees_with_resets_in_seconds() {
+        use crate::provider::Provider;
+        let body_of = |response: Response| async move {
+            let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("read body");
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("a JSON body")
+        };
+
+        // The one Codex account's weekly window is full, and resets in 300 seconds.
+        let manager = Manager::with_live_refresher(
+            codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9"),
+            None,
+        );
+        let now = OffsetDateTime::now_utc();
+        manager.edit_quota_for_test(1, |quota| {
+            quota.seven_day = Some(crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + time::Duration::seconds(300)),
+            });
+        });
+        let body = body_of(exhausted_response(
+            &manager,
+            now,
+            1,
+            false,
+            Provider::Codex,
+            None,
+            None,
+        ))
+        .await;
+        assert_eq!(body["error"]["type"], "usage_limit_reached", "{body}");
+        let resets_at = body["error"]["resets_at"].as_i64();
+        assert_eq!(
+            resets_at,
+            Some(now.unix_timestamp() + 300),
+            "resets_at is the instant the window resets, in Unix seconds: {body}"
+        );
+        assert_eq!(body["error"]["resets_in_seconds"], 300, "{body}");
+        assert!(
+            body["error"]["plan_type"].is_null(),
+            "a pool can mix plans, so no plan is claimed: {body}"
+        );
+
+        // The backend refused the one Codex account, which has no window to wait on: the
+        // 60-second fallback is a wait, so no time is claimed.
+        let manager = Manager::with_live_refresher(
+            codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9"),
+            None,
+        );
+        manager.edit_quota_for_test(1, |quota| quota.status = Some("rejected".to_string()));
+        let now = OffsetDateTime::now_utc();
+        let body = body_of(exhausted_response(
+            &manager,
+            now,
+            1,
+            false,
+            Provider::Codex,
+            None,
+            None,
+        ))
+        .await;
+        assert_eq!(body["error"]["type"], "usage_limit_reached", "{body}");
+        assert_eq!(body["error"]["resets_in_seconds"], 60, "{body}");
+        assert!(
+            body["error"].get("resets_at").is_none(),
+            "no reset was measured, so codex is given no time to print: {body}"
+        );
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("none reports when it frees"),
+            "the message does not print the 60 as if it were measured: {message}"
+        );
+
+        // A disabled account is no quota: the plain shape, with the Anthropic arm's
+        // `retry-after`, and still no time.
+        let mut config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
+        config.accounts[1].disabled = Some(true);
+        let manager = Manager::with_live_refresher(config, None);
+        let now = OffsetDateTime::now_utc();
+        let response = exhausted_response(&manager, now, 1, false, Provider::Codex, None, None);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+        let body = body_of(response).await;
+        assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
+        assert_eq!(body["error"]["resets_in_seconds"], 60, "{body}");
+        assert!(body["error"].get("resets_at").is_none(), "{body}");
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("none reports when it frees"),
+            "the message does not print the 60 as if it were measured: {message}"
+        );
+    }
+
+    /// **A fleet with no Codex account answers a Codex request by saying so**,
+    /// instead of a `pool_unavailable` 429 whose 60-second retry no wait will
+    /// satisfy. Still a 429 in the `{"error": {...}}` envelope, with no
+    /// `retry-after`: waiting changes nothing. Neither origin is asked.
+    ///
+    /// Watched red: drop the zero-account branch from `exhausted_response` and
+    /// the body is `pool_unavailable` with `resets_in_seconds: 60` and a
+    /// `retry-after: 60`, which tells codex to wait for an account no wait will
+    /// add.
+    #[tokio::test]
+    async fn a_fleet_with_no_codex_account_says_so_to_a_codex_client() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let mut config = codex_fleet(&anthropic_echo.url, &codex_echo.url);
+        config.accounts.remove(1);
+        let manager = Manager::with_live_refresher(config, None);
+        let resp = drive_full(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = resp.headers().get("retry-after").cloned();
+        let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "no_codex_account", "{body}");
+        assert_eq!(body["error"]["code"], "no_codex_account", "{body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("No Codex account is configured"),
+            "{message}"
+        );
+        assert!(body["error"].get("resets_in_seconds").is_none(), "{body}");
+        assert_eq!(retry_after, None, "no wait fixes a missing account");
+        assert_eq!(codex_echo.request_count(), 0);
+        assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// **The Anthropic 429 counts the Anthropic accounts.** "All N accounts
+    /// exhausted" names the accounts that could have served the request; a Codex
+    /// account in the same fleet is never one of the N.
+    ///
+    /// Watched red: hand the exhausted terminals the fleet-wide `account_count`
+    /// again and the message reads "All 3 accounts exhausted".
+    #[tokio::test]
+    async fn the_anthropic_exhausted_429_counts_only_anthropic_accounts() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
+        let manager = fleet_configured(up_addr, &["a", "b", "c"], |config| {
+            config.accounts[2].provider = crate::provider::Provider::Codex;
+            // A revalidation serve has nothing to serve on held accounts anyway;
+            // off so the 429 below is the only possible answer.
+            config
+                .extra
+                .insert("revalidationServe".to_string(), serde_json::json!(false));
+        });
+        manager.mark_rate_limited(0, 600);
+        manager.mark_rate_limited(1, 600);
+        let (status, _, body) = post_one_full(manager).await;
+        assert_eq!(status, 429, "{body}");
+        assert!(
+            body.contains("All 2 accounts exhausted"),
+            "only the two Anthropic accounts are counted: {body}"
+        );
+    }
+
+    /// The 426 over a REAL socket, request written byte for byte: hyper parses the
+    /// upgrade request itself (an `Upgrade` + `Connection: Upgrade` pair is the one
+    /// request shape hyper treats specially), and `Host: chatgpt.com` takes the host
+    /// guard's allow-listed branch rather than the guard-skipped one `oneshot` gets.
+    /// The fleet has no Codex account at all, so a request that slipped past step 1c'
+    /// would be answered 429 by the exhausted pool, never forwarded anywhere.
+    #[tokio::test]
+    async fn codex_upgrade_over_a_real_socket_is_answered_426() {
+        let addr = spawn_dead_upstream_proxy().await;
+        let status = raw_request_status(
+            addr,
+            "GET /backend-api/codex/responses HTTP/1.1\r\n\
+             Host: chatgpt.com\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 426, "the upgrade is answered here, over the wire");
     }
 }

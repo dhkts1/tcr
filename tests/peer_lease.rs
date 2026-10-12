@@ -1906,6 +1906,29 @@ mod fleet {
         )
     }
 
+    /// [`lending_manager`] whose one account is a CODEX account, with the Codex
+    /// origin pointed at `upstream` too: a lender that HAS an account a Codex
+    /// path could be served on, so a refusal of one is a decision and not an
+    /// accident of an Anthropic-only fleet.
+    pub fn codex_lending_manager(upstream: &str) -> Arc<Manager> {
+        let mut config = config(
+            upstream,
+            vec![Account {
+                provider: teamclaude_rs::provider::Provider::Codex,
+                ..account()
+            }],
+            ThrottleConfig::default(),
+        );
+        config.codex_upstream = upstream.to_string();
+        Manager::new(
+            config,
+            Arc::new(NeverRefreshes),
+            Arc::new(NeverProbes),
+            Arc::new(NeverWarms),
+            None,
+        )
+    }
+
     /// A fake upstream whose answer is `bytes` long: more than one relayed
     /// frame carries, which is any long completion.
     pub async fn spawn_huge_upstream(bytes: usize) -> (String, Arc<AtomicUsize>) {
@@ -8424,5 +8447,94 @@ async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
         1,
         "and the request really was served upstream, so the 200 above is a serve rather \
          than something short-circuited before the picker"
+    );
+}
+
+/// **No Codex path is relayed over the mesh, from either side** (Codex is not
+/// lent in this version). A lease is sized on the lender's
+/// Anthropic windows, and its picker would serve a Codex request on a Codex
+/// account no lease accounts for. Every Codex path, inference or not, is
+/// refused by the one predicate both halves ask: the borrower's seam builds no
+/// `Ask`, and the frame builder builds no frame.
+///
+/// The controls: the predicate still allows the ordinary Anthropic inference
+/// path, and `/backend-apix/…` is NOT Codex (`Provider::of_path` matches whole
+/// segments), so the refusal is the provider's classification and not a bare
+/// prefix.
+///
+/// Watch it fail by deleting the Codex arm of `serve_is_allowed_for_path`.
+#[test]
+fn codex_paths_never_open_a_relay() {
+    for path in [
+        "/backend-api/codex/responses",
+        "/backend-api/wham/usage",
+        "/backend-api",
+    ] {
+        assert!(
+            !serve::serve_is_allowed_for_path(path),
+            "{path} is a Codex path and must never be relayed"
+        );
+        let ask = ask_for(path);
+        assert!(
+            serve::serve_request_from(&ask, &HeaderMap::new(), LEASE, REQUEST).is_err(),
+            "{path} must not even build a frame"
+        );
+    }
+    assert!(serve::serve_is_allowed_for_path("/v1/messages"));
+    assert!(serve::serve_is_allowed_for_path("/backend-apix/evil"));
+}
+
+/// **A lender refuses a Codex path IN A FRAME, even with a Codex account to
+/// serve it on.** The borrower's refusal is the one that matters; this is the
+/// backstop against an older or a malicious borrower, which here hand-builds a
+/// frame naming the Codex inference path. The lender's own fleet is one CODEX
+/// account over the fake upstream, so a lender that took the frame would serve
+/// it there and the hit count would read 1.
+///
+/// Watch it fail by deleting the Codex arm of `serve_is_allowed_for_path`: the
+/// lender acks, serves the frame on its Codex account, and the upstream counts
+/// the hit.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_path_in_a_frame_is_refused_by_the_lender() {
+    let (upstream, hits, _served) = fleet::spawn_upstream().await;
+    let lender_proxy = fleet::spawn_proxy(fleet::codex_lending_manager(&upstream)).await;
+
+    let pair = hostile_pair();
+    let peer_addr = mesh::spawn_lender(
+        pair.key_dir.clone(),
+        pair.peers_path.clone(),
+        pair.ledger.clone(),
+        lender_proxy,
+        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        fleet::dry_manager(),
+    )
+    .await;
+
+    let answered = hostile_serve(
+        peer_addr,
+        &pair.lender_key,
+        &pair.borrower_key,
+        serve::ServeRequest {
+            lease_id: LEASE,
+            request_id: 1,
+            method: "POST".to_string(),
+            path: teamclaude_rs::provider::CODEX_RESPONSES_PATH.to_string(),
+            query: None,
+            headers: Vec::new(),
+            body_bytes: 2,
+            proto: tcr_peer_wire::PROTO_VERSION,
+            flow: serve::SERVE_FLOW,
+        },
+    )
+    .await;
+
+    assert!(
+        answered.is_err(),
+        "the lender closes on a Codex path rather than serving it: {answered:?}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was served on the lender's Codex account"
     );
 }

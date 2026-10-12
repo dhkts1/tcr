@@ -6,10 +6,12 @@
 //! How a request flows (mirrors `teamclaude/src/mitm.js`, reusing `tcr`'s
 //! account-selection + token-injection instead of reimplementing the forward):
 //!   1. A client sends `CONNECT <host>:<port>`. We peek the request line.
-//!   2. `api.anthropic.com` and `platform.claude.com` (Claude Code's own OAuth
-//!      refresh host, `POST /v1/oauth/token`) are MITM-terminated **only when
-//!      the leaf certificate actually loaded for this process covers that
-//!      host** — see [`host_allowed`] (policy) and
+//!   2. `api.anthropic.com`, `platform.claude.com` (Claude Code's own OAuth
+//!      refresh host, `POST /v1/oauth/token`) and `chatgpt.com` (Codex's
+//!      inference and backend host, while the pool holds a Codex account:
+//!      `host_intercepted`) are MITM-terminated **only when the leaf
+//!      certificate actually loaded for this process covers that host** —
+//!      see [`host_allowed`] (policy) and
 //!      [`host_covered_by_loaded_leaf`] (SAN truthfulness) below, both of which
 //!      must agree. When they do: we reply `200 Connection Established`,
 //!      TLS-accept with our leaf (a cert the client already trusts via its
@@ -17,7 +19,8 @@
 //!      as base-URL mode — authenticate, select an account, inject the pooled
 //!      `Bearer`, forward to the real upstream.
 //!   3. Every OTHER host — and any policy-allowed host the loaded leaf does
-//!      NOT cover — is **blind-tunneled**: a raw TCP byte-pipe to
+//!      NOT cover, and `chatgpt.com` while the pool holds no Codex account —
+//!      is **blind-tunneled**: a raw TCP byte-pipe to
 //!      `<host>:<port>` with TLS left untouched (we never see plaintext and
 //!      inject nothing). This matches the JS proxy's open tunnel for
 //!      everything else Claude Code needs (its bridge, telemetry) through the
@@ -63,7 +66,24 @@ use crate::manager::Manager;
 /// (`POST /v1/oauth/token`) targets — 2 occurrences in the same binary — and
 /// `src/proxy.rs`'s `RelayMode::Raw` handling for that path was unreachable in
 /// MITM mode without it.
-pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
+///
+/// `chatgpt.com` was added 2026-10 for Codex, whose inference and backend
+/// calls go there by default (`openai/codex` `model-provider-info/src/lib.rs:80`,
+/// `CHATGPT_CODEX_BASE_URL`). It is intercepted only while the pool holds a
+/// Codex account (`host_intercepted`), so a codex with none to serve it keeps
+/// its own login. A login whose workspace is routed to another backend origin
+/// sends its calls there instead, to a host not on this list; tcr pools no such
+/// workspace, and relays a request that names a routing of its own on the
+/// client's credential (`crate::provider::CODEX_ROUTING_HEADERS`).
+/// `auth.openai.com` is deliberately NOT here: it is where the Codex client
+/// refreshes its OWN token, and that exchange must reach the real host
+/// untouched — tcr has nothing to inject into it, and Codex refresh tokens are
+/// single-use, so a refresh tcr mishandled would cost the client its login.
+/// Off this list it is blind-tunneled.
+///
+/// [`crate::peer::egress::PEER_EGRESS_HOSTS`] is defined AS this slice, so a
+/// host added here is also one a LAN peer gateway will carry.
+pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com", "chatgpt.com"];
 
 /// SAN list for the rcgen fallback leaf (the policy allowlist + the JS test
 /// host, kept so a regenerated chain still answers the credential-free
@@ -79,11 +99,6 @@ pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"]
 /// already trust stays valid, so nobody re-trusts anything. (A chain minted
 /// before `tcr-ca.key` existed rotates its CA once instead; see
 /// [`MintedPaths::ca_key`].)
-///
-/// `chatgpt.com` is here ahead of [`ALLOWED_HOSTS`], which does not list it:
-/// [`handle_connect`] blind-tunnels a host the policy does not list, whatever
-/// the leaf covers, so covering it changes nothing a client sees until the
-/// policy names it.
 const FALLBACK_LEAF_SANS: &[&str] = &[
     "api.anthropic.com",
     "platform.claude.com",
@@ -98,12 +113,12 @@ const FALLBACK_LEAF_SANS: &[&str] = &[
 /// `serve`/`serve_with_shutdown`/`handle_conn`/`handle_connect` carries just
 /// the acceptor, not the `TlsAssets` it came from — so [`handle_connect`],
 /// which has no other way to reach the coverage of the leaf it is about to
-/// present, reads it here via [`host_covered_by_loaded_leaf`]. Tests do NOT
-/// rely on this global: they read [`TlsAssets::covered_hosts`] directly off
-/// the value `load_tls_in` returns, so they stay deterministic under parallel
-/// test execution in the same binary. Starts empty — "nothing loaded yet" —
-/// which is the safe default: under-claiming coverage means blind-tunnel,
-/// never a broken handshake.
+/// present, reads it here via [`host_covered_by_loaded_leaf`]. The lib tests
+/// read `TlsAssets::covered_hosts` off the returned value instead; a test that
+/// opens a tunnel does rely on this global, which is why
+/// `tests/intercepted_host.rs` is its own binary. Starts empty — "nothing
+/// loaded yet" — which is the safe default: under-claiming coverage means
+/// blind-tunnel, never a broken handshake.
 static COVERED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn set_covered_hosts(hosts: &[String]) {
@@ -168,6 +183,30 @@ pub struct TlsAssets {
 /// exists at all.
 pub fn host_allowed(host: &str) -> bool {
     ALLOWED_HOSTS.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Is `host` one [`handle_connect`] intercepts NOW, by policy? [`host_allowed`], plus one
+/// condition that belongs to `chatgpt.com` ([`crate::provider::CODEX_HOST`]) alone: it is
+/// intercepted only while the pool holds a Codex account (`codex_accounts`, which
+/// [`Manager::provider_account_count`] counts in any state). With none, a codex that reached tcr
+/// could only be answered `no_codex_account`; blind-tunneled, it runs on its own login, as it
+/// did before tcr pooled Codex, with no CA to trust and its WebSocket intact. Asked on every
+/// CONNECT, so an account imported into a running server takes effect on the next tunnel.
+///
+/// Coverage is the separate question [`host_covered_by_loaded_leaf`] answers. Pure, with
+/// [`host_allowed`]'s host matching — unit-tested.
+fn host_intercepted(host: &str, codex_accounts: usize) -> bool {
+    host_allowed(host)
+        && (codex_accounts > 0 || !host.eq_ignore_ascii_case(crate::provider::CODEX_HOST))
+}
+
+/// [`host_intercepted`] against `manager`'s Codex accounts, counted on every call and never
+/// cached: [`handle_connect`] asks it once per CONNECT.
+fn intercepts_now(manager: &Manager, host: &str) -> bool {
+    host_intercepted(
+        host,
+        manager.provider_account_count(crate::provider::Provider::Codex),
+    )
 }
 
 /// Parse the target of a `CONNECT host:port HTTP/1.1` request line. Returns the
@@ -301,7 +340,15 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
     load_tls_in(&config_dir())
 }
 
-/// [`load_tls`] against an explicit config dir (for tests).
+/// [`load_tls`] against an explicit config dir: for tests, the integration tests that run the
+/// real listener over a leaf in a temp dir among them.
+///
+/// Every successful call also replaces the process-wide coverage (`COVERED_HOSTS`) that
+/// `handle_connect` reads for every listener in this process, whatever acceptor that listener
+/// was given. Loading the JS leaf narrows it to `api.anthropic.com`, so a concurrent
+/// `chatgpt.com` or `platform.claude.com` tunnel in the same process is blind-tunnelled to the
+/// real host. A test that opens tunnels must not share a binary with one that loads the JS leaf
+/// (see `tests/intercepted_host.rs`).
 ///
 /// Three branches, in order, and this is the function that makes the whole
 /// module SAN-truthful — every return path sets `covered_hosts` to what the
@@ -317,7 +364,7 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
 ///   outage. Asymmetric costs, so the conservative side is the only side.
 /// - **B: our own previously-minted chain.** Reused ONLY when a sidecar file
 ///   beside it (`tcr-leaf.sans`, one host per line, written by every mint)
-///   matches [`FALLBACK_LEAF_SANS`] exactly. A leaf minted before this SAN set
+///   matches `FALLBACK_LEAF_SANS` exactly. A leaf minted before this SAN set
 ///   changed carries the OLD coverage — reusing it unconditionally is exactly
 ///   the bug this change exists to fix (see the module doc comment): it is
 ///   what let a "just add the host to a const" change silently break the
@@ -332,7 +379,7 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
 ///   than one.
 /// - **C: mint fresh.** `covered_hosts` is `FALLBACK_LEAF_SANS`, known by
 ///   construction.
-fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
+pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
     ensure_crypto_provider();
     let leaf_cert = dir.join("teamclaude-leaf.pem");
     let leaf_key = dir.join("teamclaude-leaf.key");
@@ -716,8 +763,8 @@ async fn handle_conn(
     } else {
         // Base-URL mode: cleartext straight through the router. `serve_http`
         // auto-negotiates, so an h2-prior-knowledge client is served as h2 here
-        // and everything else stays h1.
-        serve_http(stream, peer, manager).await;
+        // and everything else stays h1. No tunnel, so no intercepted host.
+        serve_http(stream, peer, manager, None).await;
         Ok(())
     }
 }
@@ -778,7 +825,12 @@ async fn handle_connect(
     // host it cannot cover fails the client's TLS handshake outright; blind-
     // tunneling it is strictly safer, and it is exactly today's behavior for
     // an uncovered host, not a new failure mode.
-    if !host_allowed(&host) {
+    //
+    // And `chatgpt.com` is blind-tunneled while the pool holds no Codex account
+    // ([`intercepts_now`]): there is no pooled account to serve a codex, and it
+    // keeps its own login. Counted on every CONNECT, never cached, so an import
+    // takes effect on the next tunnel.
+    if !intercepts_now(&manager, &host) {
         return tunnel(stream, &host, port).await;
     }
     if !host_covered_by_loaded_leaf(&host) {
@@ -806,7 +858,7 @@ async fn handle_connect(
             return Ok(());
         }
     };
-    serve_http(tls_stream, peer, manager).await;
+    serve_http(tls_stream, peer, manager, Some(host)).await;
     Ok(())
 }
 
@@ -870,7 +922,13 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
 /// CONNECT traffic stays h1 because the rustls `ServerConfig` built in
 /// [`build_acceptor`] advertises no ALPN protocols, so `h2` is never offered on
 /// that handshake.
-async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>)
+///
+/// `intercepted` is the host of the `CONNECT` tunnel `io` was decrypted from:
+/// [`handle_connect`] passes it, and base-URL mode has none. Every request on the
+/// connection carries it as a [`crate::proxy::InterceptedHost`], which no client can
+/// forge, so `proxy::handle` holds each request to the host the tunnel was opened
+/// to, not to the one the request declares.
+async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>, intercepted: Option<String>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -898,6 +956,11 @@ where
             // Tag the request with the client's address so the auth layer can exempt
             // loopback clients from the api-key gate (see proxy::ClientAddr).
             req.extensions_mut().insert(crate::proxy::ClientAddr(peer));
+            // A request decrypted from a tunnel carries the tunnel's host (see above).
+            if let Some(host) = &intercepted {
+                req.extensions_mut()
+                    .insert(crate::proxy::InterceptedHost(host.clone()));
+            }
             // When affinity is on, tag every request on this connection with the
             // connection's session key so selection pins to one account.
             if let Some(key) = session_key {
@@ -1088,6 +1151,105 @@ mod tests {
         assert!(!host_allowed("evil.api.anthropic.com.attacker.net"));
         assert!(!host_allowed("localhost"));
         assert!(!host_allowed(""));
+    }
+
+    /// `chatgpt.com`, Codex's inference and backend host, is policy-allowed
+    /// case-insensitively; a lookalike that merely contains the name is not.
+    /// `auth.openai.com`, where the Codex client refreshes its OWN token, is
+    /// not allowed either: that exchange has to reach the real host untouched,
+    /// so it must keep taking the blind tunnel.
+    #[test]
+    fn chatgpt_com_is_policy_allowed_and_lookalikes_are_not() {
+        assert!(host_allowed("chatgpt.com"));
+        assert!(host_allowed("CHATGPT.COM"));
+        assert!(!host_allowed("evil.chatgpt.com.attacker.net"));
+        assert!(
+            !host_allowed("auth.openai.com"),
+            "the client's own refresh stays a blind tunnel"
+        );
+        assert!(!host_allowed("api.openai.com"));
+    }
+
+    /// With no Codex account in the pool, `chatgpt.com` is blind-tunneled, so a codex that
+    /// reaches tcr runs on its own login instead of being answered `no_codex_account`; with one,
+    /// it is intercepted.
+    #[test]
+    fn chatgpt_com_is_intercepted_only_while_the_pool_holds_a_codex_account() {
+        for host in ["chatgpt.com", "CHATGPT.COM", "ChatGPT.com"] {
+            assert!(
+                !host_intercepted(host, 0),
+                "{host}: no Codex account, so the tunnel must be blind"
+            );
+            assert!(host_intercepted(host, 1), "{host}: one Codex account");
+            assert!(host_intercepted(host, 3), "{host}: three Codex accounts");
+        }
+    }
+
+    /// The Codex condition is `chatgpt.com`'s alone: the Anthropic hosts are intercepted whatever
+    /// the pool's Codex count, and a host off the policy list never is, whatever it is.
+    #[test]
+    fn only_chatgpt_com_waits_for_a_codex_account() {
+        for codex_accounts in [0, 1] {
+            for host in ["api.anthropic.com", "platform.claude.com"] {
+                assert!(
+                    host_intercepted(host, codex_accounts),
+                    "{host} with {codex_accounts} Codex account(s)"
+                );
+            }
+            for host in [
+                "auth.openai.com",
+                "api.openai.com",
+                "evil.chatgpt.com.attacker.net",
+                "chatgpt.com.",
+                "example.com",
+                "",
+            ] {
+                assert!(
+                    !host_intercepted(host, codex_accounts),
+                    "{host:?} with {codex_accounts} Codex account(s)"
+                );
+            }
+        }
+    }
+
+    /// The count [`handle_connect`] decides on is the pool's Codex accounts, read at each
+    /// CONNECT: a Claude-only pool blind-tunnels `chatgpt.com` and intercepts its own hosts, and
+    /// a Codex account added to the running pool, disabled even (an account counts in any
+    /// state), turns `chatgpt.com` on for the next tunnel.
+    #[test]
+    fn a_claude_only_pool_tunnels_chatgpt_com_until_a_codex_account_is_added() {
+        let m = dummy_manager();
+        assert!(
+            !intercepts_now(&m, "chatgpt.com"),
+            "a Claude-only pool must blind-tunnel chatgpt.com"
+        );
+        assert!(intercepts_now(&m, "api.anthropic.com"));
+
+        m.add_account(crate::config::Account {
+            name: "bob@example.com/codex".to_string(),
+            account_type: "oauth".to_string(),
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-fake-codex".to_string(),
+            refresh_token: Some("rt-fake-codex".to_string()),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: Some(true),
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
+            extra: serde_json::Map::new(),
+        });
+        assert!(
+            intercepts_now(&m, "chatgpt.com"),
+            "an import takes effect on the next CONNECT"
+        );
     }
 
     /// [`FALLBACK_LEAF_SANS`] is "the policy allowlist + the JS test host", so
