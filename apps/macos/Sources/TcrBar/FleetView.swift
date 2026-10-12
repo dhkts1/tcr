@@ -4119,8 +4119,8 @@ struct AccountRow: View {
     /// one, even though `disabled` itself reads false), and the third —
     /// `select.rs:809-822` also excludes an account whose `quota.status ==
     /// Some("rejected")`, Anthropic's own verdict — while the snapshot
-    /// `status` this app decodes stays `"active"` (`snapshot.rs:142-153` only
-    /// ever rewrites `Throttled`).
+    /// `status` this app decodes stays `"active"` (`Manager::snapshot` in
+    /// `src/manager/snapshot.rs` only ever rewrites `Throttled`).
     ///
     /// That third gate is read from the wire's `gate` field
     /// (``Account/isRejected``), which the server has emitted since the status

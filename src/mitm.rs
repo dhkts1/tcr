@@ -169,6 +169,46 @@ pub struct TlsAssets {
     /// decision SAN-truthful: [`host_covered_by_loaded_leaf`] reads a
     /// process-wide snapshot of it.
     pub covered_hosts: Vec<String>,
+    /// Which `load_tls_in` branch produced [`Self::acceptor`]'s leaf. The
+    /// coverage above says WHAT is intercepted; this says WHY, which is the
+    /// half `tcr run --codex` needs when `chatgpt.com` is missing: a restart
+    /// re-mints a stale minted leaf, and never changes the JS one.
+    pub leaf: LeafSource,
+}
+
+/// Where a loaded leaf came from, one variant per kind of `load_tls_in`
+/// branch. Carried to clients on the status wire as
+/// [`crate::status::MitmStatus::leaf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafSource {
+    /// Branch A: the JS proxy's `teamclaude-leaf.pem`. Its coverage is pinned
+    /// to `api.anthropic.com` (unknowable without an x509 parser) and tcr
+    /// never re-mints it, so no restart widens what it intercepts.
+    Js,
+    /// Branches B, C and D: a chain tcr minted under `tcr-ca.pem`
+    /// ([`minted_ca_path`]), covering `FALLBACK_LEAF_SANS` by construction
+    /// and re-minted at boot whenever that set changes.
+    Minted,
+}
+
+impl TlsAssets {
+    /// The hosts `handle_connect` can terminate with this leaf: every
+    /// [`ALLOWED_HOSTS`] entry the leaf covers. That is
+    /// `host_allowed && host_covered_by_loaded_leaf`, evaluated over every host
+    /// the policy names, read off this value rather than the process-wide
+    /// `COVERED_HOSTS`. `handle_connect` asks one thing more of `chatgpt.com`, a
+    /// Codex account in the pool (`host_intercepted`), which is a fact about the
+    /// pool, counted on every CONNECT, and not about this leaf; so `chatgpt.com`
+    /// is listed here whether or not the pool holds one. Raw
+    /// [`Self::covered_hosts`] would over-report: a minted leaf also carries
+    /// `www.example.org`, which is never intercepted.
+    pub fn intercepted_hosts(&self) -> Vec<String> {
+        ALLOWED_HOSTS
+            .iter()
+            .filter(|host| leaf_covers(&self.covered_hosts, host))
+            .map(|host| (*host).to_string())
+            .collect()
+    }
 }
 
 /// Is `host` one we intend to MITM-terminate, by POLICY? Case-insensitive.
@@ -234,6 +274,18 @@ fn config_dir() -> PathBuf {
     crate::config::default_path()
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Where tcr's own CA lives (`~/.config/tcr-ca.pem`): the CA every
+/// [`LeafSource::Minted`] leaf chains to, and one that stays put across leaf
+/// re-mints now that its key is persisted beside it (branch D).
+///
+/// A path, not a load: no IO at all. A CLIENT names the running proxy's CA
+/// with this, never with [`load_tls`], which re-mints a stale leaf on disk
+/// while the proxy keeps serving the leaf it loaded at boot (nothing reloads
+/// it) and so reports coverage that proxy does not have.
+pub fn minted_ca_path() -> PathBuf {
+    MintedPaths::in_dir(&config_dir()).ca
 }
 
 /// Ensure a process-wide rustls crypto provider is installed before building a
@@ -409,6 +461,7 @@ pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
                     acceptor,
                     ca_path,
                     covered_hosts,
+                    leaf: LeafSource::Js,
                 });
             }
             Err(err) => {
@@ -436,6 +489,7 @@ pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
                         acceptor,
                         ca_path: Some(minted.ca),
                         covered_hosts,
+                        leaf: LeafSource::Minted,
                     });
                 }
                 Err(err) => {
@@ -491,6 +545,7 @@ fn remint_leaf_under_persisted_ca(minted: &MintedPaths) -> Option<TlsAssets> {
             acceptor,
             ca_path: Some(minted.ca.clone()),
             covered_hosts,
+            leaf: LeafSource::Minted,
         })
     })();
     match result {
@@ -568,6 +623,7 @@ fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
         acceptor,
         ca_path: Some(minted.ca),
         covered_hosts,
+        leaf: LeafSource::Minted,
     })
 }
 
@@ -1055,6 +1111,77 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each [`load_tls_in`] branch names the leaf it loaded, and what that leaf
+    /// lets the listener intercept is [`ALLOWED_HOSTS`] ∩ its coverage: the two
+    /// facts a running proxy reports on its status wire
+    /// ([`crate::status::MitmStatus`]) and `tcr run --codex` pools on, with the
+    /// account rows. A minted leaf (C, then B, then D) lets it intercept every
+    /// policy host, `chatgpt.com` included (terminated only while the pool
+    /// holds a Codex account), and never `www.example.org`, which it carries
+    /// for the JS probe but [`handle_connect`] blind-tunnels.
+    /// The JS leaf (A) wins even over a minted chain that covers more, and
+    /// intercepts `api.anthropic.com` alone: the one state no restart fixes.
+    #[test]
+    fn each_load_branch_reports_its_leaf_and_what_it_intercepts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let minted = crate::status::MitmStatus {
+            intercepted_hosts: vec![
+                "api.anthropic.com".to_string(),
+                "platform.claude.com".to_string(),
+                "chatgpt.com".to_string(),
+            ],
+            leaf: "minted".to_string(),
+        };
+
+        let fresh = load_tls_in(dir.path()).expect("C: mint a chain");
+        assert_eq!(fresh.leaf, LeafSource::Minted, "C: a fresh mint");
+        assert_eq!(crate::status::MitmStatus::of(Some(&fresh)), minted, "C");
+
+        let reused = load_tls_in(dir.path()).expect("B: reuse it");
+        assert_eq!(reused.leaf, LeafSource::Minted, "B: a reused mint");
+        assert_eq!(crate::status::MitmStatus::of(Some(&reused)), minted, "B");
+
+        write_sans_sidecar(&dir.path().join("tcr-leaf.sans"), &["api.anthropic.com"])
+            .expect("drift the sidecar");
+        let reminted = load_tls_in(dir.path()).expect("D: re-mint under the same CA");
+        assert_eq!(reminted.leaf, LeafSource::Minted, "D: a re-mint");
+        assert_eq!(crate::status::MitmStatus::of(Some(&reminted)), minted, "D");
+
+        let (_ca, leaf, key, _ca_key) =
+            generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS leaf");
+        write_file(
+            &dir.path().join("teamclaude-leaf.pem"),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .expect("write leaf");
+        write_file(
+            &dir.path().join("teamclaude-leaf.key"),
+            key.as_bytes(),
+            0o600,
+        )
+        .expect("write key");
+        let js = load_tls_in(dir.path()).expect("A: the JS leaf");
+        assert_eq!(js.leaf, LeafSource::Js, "A: the JS pair wins");
+        assert_eq!(
+            crate::status::MitmStatus::of(Some(&js)),
+            crate::status::MitmStatus {
+                intercepted_hosts: vec!["api.anthropic.com".to_string()],
+                leaf: "js".to_string(),
+            },
+            "A"
+        );
+
+        assert_eq!(
+            crate::status::MitmStatus::of(None),
+            crate::status::MitmStatus {
+                intercepted_hosts: Vec::new(),
+                leaf: "none".to_string(),
+            },
+            "no TLS material: MITM off"
+        );
     }
 
     /// The pre-existing JS leaf still wins over our own minted chain, and with no

@@ -210,6 +210,90 @@ pub struct StatusPayload {
     /// fabricated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peers_error: Option<String>,
+    /// What the SERVING process's MITM listener can terminate, decided once at
+    /// boot from its policy and the TLS material it loaded
+    /// ([`MitmStatus::intercepted_hosts`] says what `chatgpt.com` there means).
+    /// Nothing reloads that material, so a client reading the leaf off disk can
+    /// disagree with the running process; this field is the running process's
+    /// own answer. `tcr run --codex` pools a session only when it names
+    /// `chatgpt.com` and the account rows hold a Codex account.
+    ///
+    /// Tri-state on purpose, and the states mean different things: `None` is
+    /// an OLD server, one that predates the key and so cannot say what it
+    /// intercepts, while a server that has the key ALWAYS sends `Some`, MITM
+    /// off included (`leaf: "none"`). A `#[serde(default)]` struct or
+    /// list would make "old server" and "MITM off" read the same, and only the
+    /// first is fixed by restarting on a current build. `from_snapshot` leaves
+    /// it `None` and the serving process fills it, as with [`Self::peers`].
+    ///
+    /// `#[serde(default, skip_serializing_if)]` and, per this struct's `build`
+    /// doc-comment on when a bump is and is not warranted, NOT a
+    /// [`STATUS_KIND`] bump: an OLD client skips the unknown key, and a NEW
+    /// client reading an OLD server reads `None`, which is the truth ("that
+    /// server reports no interception").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitm: Option<MitmStatus>,
+}
+
+/// What a running proxy's MITM listener can intercept, by its policy and loaded
+/// leaf: [`StatusPayload::mitm`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MitmStatus {
+    /// The hosts the listener can terminate, [`crate::mitm::ALLOWED_HOSTS`]
+    /// intersected with the loaded leaf's coverage
+    /// ([`crate::mitm::TlsAssets::intercepted_hosts`]). Empty when MITM is off.
+    /// `chatgpt.com` here says the leaf allows it, not that it is terminated:
+    /// the listener does that only while the pool holds a Codex account, counted
+    /// on every CONNECT, and the payload's account rows say whether it does.
+    #[serde(default)]
+    pub intercepted_hosts: Vec<String>,
+    /// Which leaf the listener presents: [`Self::LEAF_JS`],
+    /// [`Self::LEAF_MINTED`] or [`Self::LEAF_NONE`]. A string rather than an
+    /// enum because a closed enum here would make an OLDER client fail the
+    /// whole payload parse on the day a value is added, and fall back to the
+    /// offline snapshot; an unknown string costs only this one decision.
+    #[serde(default)]
+    pub leaf: String,
+}
+
+impl MitmStatus {
+    /// The JS proxy's `teamclaude-leaf.pem`: covers `api.anthropic.com` only
+    /// and is never re-minted, so a restart does not change what it intercepts.
+    pub const LEAF_JS: &'static str = "js";
+    /// A leaf tcr minted under `tcr-ca.pem` ([`crate::mitm::minted_ca_path`]).
+    pub const LEAF_MINTED: &'static str = "minted";
+    /// No TLS material loaded: the boot-time load failed, or this process
+    /// never loaded any. MITM is off and every `CONNECT` is blind-tunnelled.
+    pub const LEAF_NONE: &'static str = "none";
+
+    /// The status of a listener that loaded `assets`, or of one that loaded
+    /// nothing (`None`).
+    pub fn of(assets: Option<&crate::mitm::TlsAssets>) -> Self {
+        let Some(assets) = assets else {
+            return Self {
+                intercepted_hosts: Vec::new(),
+                leaf: Self::LEAF_NONE.to_string(),
+            };
+        };
+        let leaf = match assets.leaf {
+            crate::mitm::LeafSource::Js => Self::LEAF_JS,
+            crate::mitm::LeafSource::Minted => Self::LEAF_MINTED,
+        };
+        Self {
+            intercepted_hosts: assets.intercepted_hosts(),
+            leaf: leaf.to_string(),
+        }
+    }
+
+    /// Does the listener's leaf and policy let it terminate `host`?
+    /// Case-insensitive, as the listener's own check is. For `chatgpt.com` the
+    /// pool must also hold a Codex account, which the account rows answer.
+    pub fn intercepts(&self, host: &str) -> bool {
+        self.intercepted_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+    }
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -311,6 +395,27 @@ pub struct AccountStatus {
     /// predates the opt-in omits it entirely.
     #[serde(default)]
     pub control_allowed_groups: Vec<String>,
+    /// Which upstream this account belongs to — see [`AccountSnapshot::provider`].
+    /// On this wire for the same reason as the plan fields below: only the server
+    /// has it, and the CLI needs it to name a Codex row's plan and to put
+    /// `provider` on `tcr status --json`.
+    ///
+    /// Skipped when Anthropic, so an Anthropic-only fleet's payload is exactly
+    /// what it was before the field existed, and an absent key reads as
+    /// Anthropic, which is how an older server treats every account. Neither
+    /// skew direction is MISREAD, so, per [`StatusPayload::build`]'s doc-comment,
+    /// this must NOT bump [`STATUS_KIND`].
+    ///
+    /// The enum is closed on this wire, though, as `GateReason`, `ProbeStatus`
+    /// and `QuotaState` are: a variant added later makes an OLDER CLI fail the
+    /// whole payload parse and fall back to the offline snapshot (the hazard
+    /// [`StatusPayload::build`]'s doc-comment describes), so a new provider needs
+    /// a plan for older clients, not just a new arm.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider::Provider::is_anthropic"
+    )]
+    pub provider: crate::provider::Provider,
     /// The account's plan as the profile endpoint reported it, verbatim, and the
     /// two fields that refine it — mirroring [`AccountSnapshot`]'s three.
     ///
@@ -423,6 +528,7 @@ impl StatusPayload {
                 reserved_groups: a.reserved_groups.clone(),
                 parked_groups: a.parked_groups.clone(),
                 control_allowed_groups: a.control_allowed_groups.clone(),
+                provider: a.provider,
                 organization_type: a.organization_type.clone(),
                 rate_limit_tier: a.rate_limit_tier.clone(),
                 seat_tier: a.seat_tier.clone(),
@@ -452,6 +558,10 @@ impl StatusPayload {
             // caller (the CLI's own round-trip tests, `into_snapshot`).
             peers: Vec::new(),
             peers_error: None,
+            // `None` here for the same reason as `peers`: what the listener's policy
+            // and leaf allow is boot state of the serving process, not a fact in a
+            // `StatsSnapshot`. The serving process assigns `Some`.
+            mitm: None,
         }
     }
 
@@ -474,6 +584,7 @@ impl StatusPayload {
                 thresholds.push(a.threshold);
                 AccountSnapshot {
                     name: a.name,
+                    provider: a.provider,
                     organization_type: a.organization_type,
                     rate_limit_tier: a.rate_limit_tier,
                     seat_tier: a.seat_tier,
@@ -1714,6 +1825,7 @@ mod tests {
         StatsSnapshot {
             accounts: vec![AccountSnapshot {
                 name: "alice@example.com".to_string(),
+                provider: crate::provider::Provider::Anthropic,
                 organization_type: Some("claude_team".to_string()),
                 rate_limit_tier: Some("default_raven".to_string()),
                 seat_tier: Some("team_standard".to_string()),
@@ -2250,6 +2362,80 @@ mod tests {
             !wire.contains("\"control\""),
             "an absent control account must not serialize a null: {wire}"
         );
+    }
+
+    /// `provider` crosses this wire for Codex rows only. An Anthropic row carries
+    /// no key, so an Anthropic-only fleet's payload is exactly what it was before
+    /// the field existed (its doc's claim), and a Codex row comes back as
+    /// `Provider::Codex`.
+    #[test]
+    fn provider_crosses_for_a_codex_row_and_is_absent_on_an_anthropic_one() {
+        let anthropic = StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&anthropic).expect("serialize");
+        assert!(
+            !wire.contains("\"provider\""),
+            "an Anthropic row carries no provider key: {wire}"
+        );
+
+        let mut snapshot = snapshot_with_counters();
+        snapshot.accounts[0].provider = crate::provider::Provider::Codex;
+        let codex =
+            StatusPayload::from_snapshot(&snapshot, &[0.85], false, None, Default::default());
+        let wire = serde_json::to_string(&codex).expect("serialize");
+        assert!(wire.contains("\"provider\":\"codex\""), "{wire}");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(back.accounts[0].provider, crate::provider::Provider::Codex);
+    }
+
+    /// `mitm` is tri-state on the wire. A payload `from_snapshot` builds carries
+    /// no key at all, because only the serving process knows what its listener
+    /// intercepts and it always fills the key in; a payload without the key, an
+    /// older server's, reads as `None`; and a reported status crosses in
+    /// camelCase and round-trips intact, MITM off included.
+    #[test]
+    fn mitm_is_absent_until_the_serving_process_reports_it() {
+        let mut payload = StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            !wire.contains("\"mitm\""),
+            "no key until it is reported: {wire}"
+        );
+        let old: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[]}"#).expect("parse");
+        assert_eq!(old.mitm, None, "an older server reports no interception");
+
+        for reported in [
+            MitmStatus {
+                intercepted_hosts: vec!["api.anthropic.com".to_string(), "chatgpt.com".to_string()],
+                leaf: MitmStatus::LEAF_MINTED.to_string(),
+            },
+            MitmStatus::of(None),
+        ] {
+            payload.mitm = Some(reported.clone());
+            let wire = serde_json::to_value(&payload).expect("serialize");
+            assert_eq!(
+                wire["mitm"],
+                serde_json::json!({
+                    "interceptedHosts": reported.intercepted_hosts,
+                    "leaf": reported.leaf,
+                }),
+                "{wire}"
+            );
+            let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
+            assert_eq!(back.mitm, Some(reported));
+        }
     }
 
     /// The `kind` discriminator is what stops an older server's upstream-forwarded

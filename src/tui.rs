@@ -41,6 +41,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use crate::manager::Manager;
 use crate::probe::ProbeStatus;
+use crate::provider::Provider;
 use crate::stats::{
     AccountSnapshot, GateReason, QuotaState, SessionKind, SessionSnapshot, StatsSnapshot,
 };
@@ -632,6 +633,15 @@ const FULL_COLUMNS: [&str; 14] = [
 /// * `Err` (4) — the decayed in-band SSE error count, or `-`.
 const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 22, 27, 15, 6, 8, 7, 8, 6, 4];
 
+/// The Account column's width: the Full layout's first column, which the
+/// Compact layout reuses, so a name cell can be fitted to it once — see
+/// [`account_name_text`].
+const ACCOUNT_COLUMN_WIDTH: u16 = FULL_COLUMN_WIDTHS[0];
+
+/// Appended to a Codex account's name in the Account column — see
+/// [`account_name_text`].
+const CODEX_TAG: &str = " [codex]";
+
 /// The narrowest terminal width that still fits the full 14-column table without
 /// the constraint solver clipping a column. Kept a literal with the arithmetic
 /// shown so a future column edit must update it *consciously* rather than
@@ -661,6 +671,25 @@ fn accounts_layout(width: u16) -> AccountsLayout {
         AccountsLayout::Full
     } else {
         AccountsLayout::Compact
+    }
+}
+
+/// The Account cell's text ahead of the dim plan: the selection marker, the name
+/// and, on a Codex account, [`CODEX_TAG`].
+///
+/// The tag is how a Codex row is told from an Anthropic one at a glance, and
+/// ratatui clips a cell at its column's edge, so when marker, name and tag
+/// overflow [`ACCOUNT_COLUMN_WIDTH`] it is the NAME that is shortened
+/// ([`truncate`] marks the cut), never the tag: `bob@example.com/codex` alone is
+/// 21 characters. An Anthropic name is left exactly as it was.
+fn account_name_text(marker: &str, account: &AccountSnapshot) -> String {
+    match account.provider {
+        Provider::Anthropic => format!("{marker}{}", account.name),
+        Provider::Codex => {
+            let room = usize::from(ACCOUNT_COLUMN_WIDTH)
+                .saturating_sub(marker.chars().count() + CODEX_TAG.chars().count());
+            format!("{marker}{}{CODEX_TAG}", truncate(&account.name, room))
+        }
     }
 }
 
@@ -710,20 +739,19 @@ fn render_accounts(
             // identically-named rows apart — and a column would cost width on
             // every row to say nothing about the fifteen that share a plan.
             // Absent (not "unknown") for an account that has never been
-            // profiled, matching the plain-text renderer's omitted `plan=`.
-            let name = match tcr_status_wire::plan_label(
-                account.organization_type.as_deref(),
-                account.rate_limit_tier.as_deref(),
-                account.seat_tier.as_deref(),
-            ) {
+            // profiled, matching the plain-text renderer's omitted `plan=`. A
+            // Codex row's `[codex]` tag sits between the name and the plan, in
+            // both arms: see `account_name_text`.
+            let name_text = account_name_text(marker, account);
+            let name = match account.plan_label() {
                 Some(plan) => Cell::from(Line::from(vec![
-                    Span::raw(format!("{marker}{}", account.name)),
+                    Span::raw(name_text),
                     Span::styled(
                         format!(" {plan}"),
                         Style::default().add_modifier(Modifier::DIM),
                     ),
                 ])),
-                None => Cell::from(format!("{marker}{}", account.name)),
+                None => Cell::from(name_text),
             };
             let priority = Cell::from(account.priority.to_string());
             let status = Cell::from(account.status.clone()).style(status_style(&account.status));
@@ -824,7 +852,7 @@ fn render_accounts(
         // collapse to bare percentages and Probe/Cache are gone. The stream-error
         // column stays Full-only — Compact is already the narrow-terminal squeeze.
         AccountsLayout::Compact => vec![
-            Constraint::Length(18),
+            Constraint::Length(ACCOUNT_COLUMN_WIDTH),
             Constraint::Length(3),
             Constraint::Length(9),
             Constraint::Length(15),
@@ -2024,6 +2052,7 @@ mod tests {
     fn snap_gate(name: &str, gate: GateReason, free_at: Option<OffsetDateTime>) -> AccountSnapshot {
         AccountSnapshot {
             name: name.to_string(),
+            provider: Provider::Anthropic,
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
@@ -2416,6 +2445,59 @@ mod tests {
         assert!(text.contains("full"), "compact keeps the 7d quota label");
         assert!(!text.contains("Probe"), "compact drops the Probe column");
         assert!(!text.contains("Cache"), "compact drops the Cache column");
+    }
+
+    /// A Codex account is tagged `[codex]` after its name, in both layouts and in
+    /// both arms of the name cell — with a plan beside it and without one — and the
+    /// tag reaches the screen whole: `bob@example.com/codex` alone is 21 characters,
+    /// wider than the 18-cell Account column, and ratatui clips a cell at its
+    /// column's edge, so it is the NAME that gives way (`truncate`'s `…`). An
+    /// Anthropic row beside it keeps its untagged, unshortened name.
+    #[test]
+    fn a_codex_row_is_tagged_and_its_name_gives_way_to_the_tag() {
+        let anthropic = snap_gate("alice@example.com", GateReason::Ok, None);
+        let mut planned = snap_gate("bob@example.com/codex", GateReason::Ok, None);
+        planned.provider = Provider::Codex;
+        planned.organization_type = Some("pro".to_string());
+        let mut unplanned = snap_gate("carol@example.com/codex", GateReason::Ok, None);
+        unplanned.provider = Provider::Codex;
+        let snapshot = StatsSnapshot {
+            accounts: vec![anthropic, planned, unplanned],
+            current: None,
+            recent: vec![],
+            sessions: vec![],
+            wire_sessions: vec![],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+        };
+
+        for width in [FULL_LAYOUT_MIN_WIDTH, FULL_LAYOUT_MIN_WIDTH - 1] {
+            let backend = TestBackend::new(width, 8);
+            let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
+                .expect("render succeeds");
+            let rows = buffer_rows(terminal.backend().buffer());
+            let row_of = |start: &str| {
+                rows.iter()
+                    .find(|row| row.starts_with(start))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no row starts {start:?} at width {width}:\n{}",
+                            rows.join("\n")
+                        )
+                    })
+            };
+            // The border, the 2-cell marker, the shortened name and the whole tag
+            // fill the 18-cell column exactly; the space after it is the gap
+            // before the Pri column, so nothing of the tag was clipped.
+            row_of("│  bob@exa… [codex] ");
+            row_of("│  carol@e… [codex] ");
+            let alice = row_of("│  alice@example.co");
+            assert!(
+                !alice.contains("[codex]"),
+                "an Anthropic row is untagged: {alice}"
+            );
+        }
     }
 
     /// The person who pressed `d` must find out the write failed WITHOUT reading a

@@ -711,6 +711,7 @@ mod tests {
             sessions_summary: Default::default(),
             peers: Vec::new(),
             peers_error: None,
+            mitm: None,
         }
     }
 

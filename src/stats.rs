@@ -9,6 +9,7 @@
 use time::OffsetDateTime;
 
 use crate::probe::ProbeStatus;
+use crate::provider::Provider;
 
 /// One row of the recent-request ring buffer.
 #[derive(Debug, Clone)]
@@ -120,12 +121,19 @@ pub enum GateReason {
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
     pub name: String,
+    /// Which upstream this account belongs to, carried from
+    /// [`crate::manager::AccountRuntime::provider`]. It decides which vocabulary
+    /// the plan fields below speak, and so which function labels them — see
+    /// [`Self::plan_label`].
+    pub provider: Provider,
     /// The account's plan as the profile endpoint reported it, verbatim, plus
     /// the two fields that refine it — carried straight from
-    /// [`crate::manager::AccountRuntime`]. The customer-facing LABEL is derived
-    /// from these by [`tcr_status_wire::plan_label`] one layer out, so this
-    /// snapshot stays the provider's own word and exactly one place turns it
-    /// into English. `None` means never profiled.
+    /// [`crate::manager::AccountRuntime`]. On a Codex account the first is the
+    /// ChatGPT plan from the login's `chatgpt_plan_type` claim and the other two
+    /// are `None`. The customer-facing LABEL is derived from these by
+    /// [`Self::plan_label`] one layer out, so this snapshot stays the provider's
+    /// own word and exactly one place turns it into English. `None` means never
+    /// profiled.
     pub organization_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub seat_tier: Option<String>,
@@ -239,6 +247,26 @@ pub struct AccountSnapshot {
     /// honest-null discipline `cacheHitRatio` follows: an unmeasured zero read
     /// as a measurement is how a real prompt-cache catastrophe went unseen.
     pub usage: Option<tcr_status_wire::UsageRow>,
+}
+
+impl AccountSnapshot {
+    /// The customer-facing plan label every surface shows: the `plan` key of
+    /// `tcr status --json`, the `plan=` token of its text form and the TUI's dim
+    /// suffix, so the three cannot disagree. An Anthropic account is labelled from
+    /// its three profile fields by [`tcr_status_wire::plan_label`], a Codex account
+    /// from its ChatGPT plan alone by [`tcr_status_wire::codex_plan_label`]. The
+    /// two vocabularies do not overlap: `plan_label` has never met `pro` and would
+    /// pass it through as the bare raw word.
+    pub fn plan_label(&self) -> Option<String> {
+        match self.provider {
+            Provider::Anthropic => tcr_status_wire::plan_label(
+                self.organization_type.as_deref(),
+                self.rate_limit_tier.as_deref(),
+                self.seat_tier.as_deref(),
+            ),
+            Provider::Codex => tcr_status_wire::codex_plan_label(self.organization_type.as_deref()),
+        }
+    }
 }
 
 /// Whether a live session was keyed on a stable client identity (a Codex

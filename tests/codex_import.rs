@@ -443,3 +443,21 @@ fn from_codex_reads_the_login_under_codex_home_from_the_environment() {
     assert_eq!(accounts[0]["provider"], "codex");
     assert_no_token_in(&out);
 }
+
+/// The success line names the plan the way `tcr status` does (`ChatGPT Pro`, through
+/// `tcr_status_wire::codex_plan_label`), never as the raw `chatgpt_plan_type` claim (`pro`).
+#[test]
+fn from_codex_names_the_plan_the_way_status_does() {
+    let (home, config) = scratch_home("[]");
+    let auth = home.path().join("codex-auth.json");
+    std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
+
+    let out = login_from_codex(home.path(), &config, Some(&auth), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("[tcr] imported as 'alice@example.com' (ChatGPT Pro);"),
+        "stderr: {stderr}"
+    );
+    assert_no_token_in(&out);
+}

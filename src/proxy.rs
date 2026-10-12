@@ -1731,6 +1731,9 @@ async fn status_handler(
         &crate::peer::egress::peers_path(),
         (now.unix_timestamp_nanos() / 1_000_000) as i64,
     );
+    // ALWAYS `Some`, MITM off included: on the wire, a missing key is what
+    // marks a server older than this field (see `StatusPayload::mitm`).
+    payload.mitm = Some(manager.mitm_status());
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -9381,6 +9384,35 @@ mod tests {
     /// A routable, definitely-not-loopback peer (TEST-NET-3, RFC 5737).
     fn remote_peer() -> SocketAddr {
         SocketAddr::from(([203, 0, 113, 7], 44_444))
+    }
+
+    /// The endpoint ALWAYS says what this process's MITM listener can intercept,
+    /// MITM off included, because on the wire the key's absence is what marks a
+    /// server older than it (`StatusPayload::mitm`), and `tcr run --codex` tells
+    /// only that server to restart. What it reports is what `serve` recorded at
+    /// its TLS load, never a re-read of the leaf on disk.
+    #[tokio::test]
+    async fn status_endpoint_always_reports_what_the_listener_intercepts() {
+        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+        let (status, _, body) =
+            status_request(manager.clone(), Method::GET, Some(loopback_peer()), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let wire: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            wire["mitm"],
+            serde_json::json!({"interceptedHosts": [], "leaf": "none"}),
+            "nothing recorded: MITM off, reported rather than left out"
+        );
+
+        let recorded = crate::status::MitmStatus {
+            intercepted_hosts: vec!["api.anthropic.com".to_string(), "chatgpt.com".to_string()],
+            leaf: crate::status::MitmStatus::LEAF_MINTED.to_string(),
+        };
+        manager.record_mitm_status(recorded.clone());
+        let (_, _, body) = status_request(manager, Method::GET, Some(loopback_peer()), None).await;
+        let payload: crate::status::StatusPayload =
+            serde_json::from_slice(&body).expect("a tcr status payload");
+        assert_eq!(payload.mitm, Some(recorded));
     }
 
     /// THE BITING TEST for the whole change: the endpoint reports the counters of

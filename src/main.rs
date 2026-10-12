@@ -1358,7 +1358,8 @@ struct RunArgs {
     /// Launch `codex` instead of `claude`, routed through the proxy's Codex accounts.
     #[arg(long)]
     codex: bool,
-    /// Args passed verbatim to `claude`, or to `codex` with `--codex` (e.g. `tcr run -- -p "hi"`).
+    /// Args passed verbatim to `claude`, or to `codex` with `--codex` (e.g. `tcr run -- -p "hi"`,
+    /// or `tcr run --codex -- exec "hi"`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -1400,7 +1401,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
-        Some(Command::Run(args)) => run_harness(args),
+        Some(Command::Run(args)) => run_harness(args).await,
         Some(Command::Login(args)) => run_login(args).await,
         Some(Command::Mint(args)) => run_mint(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
@@ -5915,10 +5916,11 @@ fn codex_command() -> std::process::Command {
 /// listening we launch `claude` untouched, so a stopped proxy never breaks the
 /// shell alias.
 ///
-/// `codex` is routed in see-through mode or not at all: it has no
-/// base-URL fallback, so a launch this function does not route through the
-/// pool is announced on stderr with the reason, never a silent bypass.
-fn run_harness(args: RunArgs) -> anyhow::Result<()> {
+/// `codex` is routed in see-through mode or not at all: tcr has no base-URL
+/// route for `codex` yet, so a launch this function does not route through the
+/// pool is announced on stderr with the reason, never a silent bypass. Which of
+/// the two it gets is the RUNNING proxy's answer — see [`codex_launch`].
+async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let (config, _) = load_config(&config_path)?;
     let port = config.proxy.port;
@@ -5929,35 +5931,15 @@ fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         let mut cmd = codex_command();
         cmd.args(&args.args);
         mark_run_active(&mut cmd);
-        if cli::proxy_is_up(port) {
-            match mitm::load_tls() {
-                Ok(assets)
-                    if assets
-                        .covered_hosts
-                        .iter()
-                        .any(|h| h.eq_ignore_ascii_case(mitm_codex_host())) =>
-                {
-                    match assets.ca_path.filter(|p| p.is_file()) {
-                        Some(ca) => apply_codex_see_through_env(&mut cmd, port, &ca),
-                        None => eprintln!(
-                            "[tcr] no readable CA for the MITM leaf — launching codex directly \
-                             (not pooled)"
-                        ),
-                    }
-                }
-                Ok(_) => eprintln!(
-                    "[tcr] the proxy's TLS leaf does not cover chatgpt.com yet (it is re-minted \
-                     on the next server start) — launching codex directly (not pooled). Restart \
-                     the proxy at a quiet moment, then retry."
-                ),
-                Err(err) => eprintln!(
-                    "[tcr] MITM TLS material unavailable ({err}) — launching codex directly \
-                     (not pooled)"
-                ),
-            }
-        } else {
-            eprintln!("[tcr] proxy not listening on :{port} — launching codex directly");
-        }
+        // ONE read of the running proxy answers both "is it listening" and "does
+        // it intercept chatgpt.com", so the two cannot disagree. The CA is named,
+        // never loaded: loading it here could re-mint a leaf the proxy never reads.
+        let live = cli::fetch_live_status(&config).await;
+        let ca = mitm::minted_ca_path();
+        let launch = codex_launch(&args, port, &live, &ca, ca.is_file(), &|var| {
+            std::env::var(var).ok()
+        })?;
+        apply_codex_launch(&mut cmd, port, &launch);
         let status = cmd
             .status()
             .context("failed to launch `codex` — is it on PATH?")?;
@@ -6043,6 +6025,312 @@ fn refuse_group_with_codex(args: &RunArgs) -> anyhow::Result<()> {
         anyhow::bail!("--group is not supported with --codex yet; run without --group");
     }
     Ok(())
+}
+
+/// How `tcr run --codex` launches `codex`: [`codex_launch`]'s decision, which
+/// [`apply_codex_launch`] carries out.
+#[derive(Debug, PartialEq, Eq)]
+enum CodexLaunch {
+    /// Pooled: see-through via this tcr, trusting `ca` for the leaf it presents.
+    SeeThrough {
+        ca: PathBuf,
+        /// The inherited `NO_PROXY` spellings that exempt `chatgpt.com`, and
+        /// what codex gets instead ([`no_proxy_rewrites`]).
+        no_proxy: Vec<NoProxyRewrite>,
+    },
+    /// Not pooled: `codex` goes direct, and the notice says why.
+    Direct {
+        /// The reason, as the notice words it.
+        reason: String,
+        /// Inherited proxy variables that point at this tcr, removed from
+        /// codex's environment ([`proxy_vars_at`]).
+        unset: Vec<&'static str>,
+    },
+}
+
+impl CodexLaunch {
+    /// The `[tcr]` lines this launch prints, besides the see-through banner
+    /// [`apply_codex_see_through_env`] prints itself.
+    fn notices(&self, port: u16) -> Vec<String> {
+        match self {
+            Self::SeeThrough { no_proxy, .. } => no_proxy
+                .iter()
+                .map(|rewrite| {
+                    format!(
+                        "[tcr] dropped {} from {} for codex: {} {} from the proxy, and the \
+                         session would bypass tcr",
+                        rewrite.dropped.join(", "),
+                        rewrite.var,
+                        if rewrite.dropped.len() == 1 {
+                            "it exempts"
+                        } else {
+                            "they exempt"
+                        },
+                        mitm_codex_host(),
+                    )
+                })
+                .collect(),
+            Self::Direct { reason, unset } => {
+                let mut lines = vec![format!(
+                    "[tcr] launching codex directly (not pooled): {reason}"
+                )];
+                if !unset.is_empty() {
+                    lines.push(format!(
+                        "[tcr] removed {} from codex's environment: {} at tcr on :{port}, which \
+                         this launch bypasses",
+                        unset.join(", "),
+                        if unset.len() == 1 {
+                            "it points"
+                        } else {
+                            "they point"
+                        },
+                    ));
+                }
+                lines
+            }
+        }
+    }
+}
+
+/// Decide how `tcr run --codex` launches `codex`. Pure: every row is a table
+/// test, and nothing here loads, mints or writes anything.
+///
+/// # The running proxy decides
+///
+/// The proxy loads its MITM leaf once, at boot, and nothing reloads it. This
+/// used to be decided by a load in THIS process instead (`mitm::load_tls`),
+/// which re-mints a stale leaf on disk and reports coverage the running proxy
+/// does not have. So with an older proxy running, or a current one whose TLS
+/// load failed at boot, it printed the see-through banner over a session
+/// whose `chatgpt.com` traffic the proxy blind-tunnelled: silently un-pooled.
+/// The inputs are now the running proxy's own account (`status`, one read of
+/// its status endpoint), whether tcr's CA is on disk at `ca`, and the
+/// inherited environment (`inherited`).
+///
+/// # Rows
+///
+/// * `--group` is refused before anything launches (`refuse_group_with_codex`).
+/// * Pooled only when the proxy reports a tcr-minted leaf that intercepts
+///   `chatgpt.com`, lists a Codex account, and its CA is on disk. The proxy
+///   terminates `chatgpt.com` only while its pool holds a Codex account, so
+///   without one listed (in any state, as the proxy counts them) the launch is
+///   direct, and codex keeps its own login.
+/// * Direct otherwise, saying why. Only a proxy that predates the status key
+///   is told to restart: a JS leaf, or MITM off, survives any restart.
+///
+/// Every direct launch also drops the inherited proxy variables that point at
+/// this tcr ([`proxy_vars_at`]), so a tcr that is down, or not intercepting,
+/// cannot capture the launch that goes around it. A dead tcr behind an
+/// exported `HTTPS_PROXY` refuses the connection instead.
+fn codex_launch(
+    args: &RunArgs,
+    port: u16,
+    status: &Result<status::StatusPayload, cli::LiveStatusError>,
+    ca: &Path,
+    ca_is_file: bool,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<CodexLaunch> {
+    refuse_group_with_codex(args)?;
+    let host = mitm_codex_host();
+    let reason = match status {
+        Err(cli::LiveStatusError::NoServer) => format!("proxy not listening on :{port}"),
+        Err(err) => format!("could not read the running proxy's status ({})", err.why()),
+        Ok(payload) => match &payload.mitm {
+            None => format!(
+                "the proxy on :{port} (build {}) predates Codex interception — restart it on \
+                 this build at a quiet moment",
+                payload.build.sha
+            ),
+            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_JS => format!(
+                "the proxy on :{port} is serving the JS teamclaude leaf, which covers \
+                 api.anthropic.com only and is never re-minted — a restart will not change \
+                 this; see docs/troubleshooting.md"
+            ),
+            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_NONE => format!(
+                "the proxy on :{port} is running without MITM: its TLS material failed to load \
+                 at boot — see its log"
+            ),
+            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_MINTED && mitm.intercepts(host) => {
+                // The proxy terminates `chatgpt.com` only while its pool holds a Codex account,
+                // in any state (`mitm::handle_connect`), so with none listed it blind-tunnels
+                // the launch whatever its leaf covers.
+                if !payload
+                    .accounts
+                    .iter()
+                    .any(|row| row.provider == teamclaude_rs::provider::Provider::Codex)
+                {
+                    format!(
+                        "the proxy on :{port} holds no Codex account, so it blind-tunnels {host} \
+                         and codex keeps its own login — add one with `tcr login --from-codex`"
+                    )
+                } else if ca_is_file {
+                    return Ok(CodexLaunch::SeeThrough {
+                        ca: ca.to_path_buf(),
+                        no_proxy: no_proxy_rewrites(host, inherited),
+                    });
+                } else {
+                    format!("no readable CA at {}", ca.display())
+                }
+            }
+            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_MINTED => format!(
+                "the proxy on :{port} serves a leaf it minted but does not intercept {host} (it \
+                 intercepts [{}])",
+                mitm.intercepted_hosts.join(", ")
+            ),
+            // A leaf kind this build does not know is a different build's, and nothing it
+            // reports can be read as tcr's own minted leaf: launched direct, saying so.
+            Some(mitm) => format!(
+                "the proxy on :{port} (build {}) reports a leaf this build does not know ({:?}) \
+                 — run tcr run --codex from the same build as the proxy",
+                payload.build.sha, mitm.leaf
+            ),
+        },
+    };
+    Ok(CodexLaunch::Direct {
+        reason,
+        unset: proxy_vars_at(port, inherited),
+    })
+}
+
+/// Carry out [`codex_launch`]'s decision on `cmd`, and print its notices.
+fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &CodexLaunch) {
+    match launch {
+        CodexLaunch::SeeThrough { ca, no_proxy } => {
+            apply_codex_see_through_env(cmd, port, ca);
+            for rewrite in no_proxy {
+                cmd.env(rewrite.var, &rewrite.kept);
+            }
+        }
+        CodexLaunch::Direct { unset, .. } => {
+            for var in unset {
+                cmd.env_remove(var);
+            }
+        }
+    }
+    for line in launch.notices(port) {
+        eprintln!("{line}");
+    }
+}
+
+/// Every spelling of a proxy variable `codex`'s HTTP stack reads for an
+/// `https://` request: `HTTPS_PROXY` first, then `ALL_PROXY`, either case. The
+/// `HTTP_PROXY` pair is not consulted for `https://`, but a codex child process
+/// may read it, and it is just as stale when it names this tcr.
+const CODEX_PROXY_VARS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// The inherited [`CODEX_PROXY_VARS`] that point at THIS tcr ([`points_at_tcr`]),
+/// and so must not reach a `codex` launched around it.
+///
+/// Only those, never all six: a corporate egress proxy, or a loopback px or
+/// cntlm on another port, may be how this machine reaches the internet at all.
+/// Removing it would turn an un-pooled launch that works into one that fails.
+fn proxy_vars_at(port: u16, inherited: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    CODEX_PROXY_VARS
+        .into_iter()
+        .filter(|var| inherited(var).is_some_and(|value| points_at_tcr(&value, port)))
+        .collect()
+}
+
+/// Does a proxy variable's value name tcr on `port`: host `127.0.0.1`,
+/// `localhost` or `[::1]`, and that port (the scheme's default when none is
+/// written)? The scheme is optional, as it is to codex's HTTP stack, which
+/// reads a bare `host:port` as `http://host:port`. A value that does not
+/// parse names nothing.
+fn points_at_tcr(value: &str, port: u16) -> bool {
+    let value = value.trim();
+    let parsed = if value.contains("://") {
+        reqwest::Url::parse(value)
+    } else {
+        reqwest::Url::parse(&format!("http://{value}"))
+    };
+    let Ok(url) = parsed else {
+        return false;
+    };
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]"
+    });
+    loopback && url.port_or_known_default() == Some(port)
+}
+
+/// One inherited `NO_PROXY` spelling, rewritten for a see-through launch.
+#[derive(Debug, PartialEq, Eq)]
+struct NoProxyRewrite {
+    var: &'static str,
+    /// What codex gets: the inherited entries minus [`Self::dropped`], in
+    /// their order. Empty when nothing else was listed; see
+    /// [`no_proxy_rewrites`] for why the variable stays set then.
+    kept: String,
+    /// The entries that exempted the host, trimmed.
+    dropped: Vec<String>,
+}
+
+/// Each inherited `NO_PROXY`/`no_proxy`, without the entries that exempt
+/// `host`, for the ones that had any.
+///
+/// Such an entry (`chatgpt.com`, `.com`, `*`) sends codex around the proxy,
+/// so the session is un-pooled while the see-through banner says otherwise.
+/// The user asked for a pooled session, so those entries are dropped, and
+/// said so, rather than the launch going direct; every other entry keeps
+/// exempting what it did. A variable left empty stays SET, as `""`: codex
+/// reads the first of the two spellings that is set, so unsetting one would
+/// hand that choice to the other.
+fn no_proxy_rewrites(
+    host: &str,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> Vec<NoProxyRewrite> {
+    ["NO_PROXY", "no_proxy"]
+        .into_iter()
+        .filter_map(|var| {
+            let value = inherited(var)?;
+            let (dropped, kept): (Vec<&str>, Vec<&str>) = value
+                .split(',')
+                .partition(|entry| no_proxy_entry_exempts(entry, host));
+            (!dropped.is_empty()).then(|| NoProxyRewrite {
+                var,
+                kept: kept.join(","),
+                dropped: dropped
+                    .iter()
+                    .map(|entry| entry.trim().to_string())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Does one `NO_PROXY` entry exempt the domain `host` from the proxy?
+///
+/// The rules of the matcher codex's HTTP stack applies (`hyper-util` 0.1.20,
+/// `src/client/proxy/matcher.rs:445-535`, the version `openai/codex` pins),
+/// for a domain host: an entry exempts it when, trimmed and with one leading
+/// `.` removed, it equals `host` or a parent domain of it at a label boundary,
+/// ignoring ASCII case; or when it is `*`. An IP or CIDR entry never exempts a
+/// domain.
+fn no_proxy_entry_exempts(entry: &str, host: &str) -> bool {
+    let entry = entry.trim();
+    if entry.is_empty() || entry.contains('/') || entry.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    if entry == "*" {
+        return true;
+    }
+    let domain = entry.strip_prefix('.').unwrap_or(entry);
+    if domain.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    let Some(dot) = host.len().checked_sub(domain.len() + 1) else {
+        return false;
+    };
+    host.as_bytes()[dot] == b'.'
+        && host
+            .get(dot + 1..)
+            .is_some_and(|parent| parent.eq_ignore_ascii_case(domain))
 }
 
 /// The oldest Claude Code that forwards `ANTHROPIC_CUSTOM_HEADERS` as a real
@@ -7649,6 +7937,462 @@ mod tests {
             Err(e) => panic!("{e}"),
         };
         assert!(refuse_group_with_codex(&run_args_of(args)).is_err());
+    }
+
+    /// `tcr run --codex -- exec hi`, as the launch-decision tests run it.
+    const CODEX_RUN: &[&str] = &["tcr", "run", "--codex", "--", "exec", "hi"];
+
+    /// A parsed `tcr run …`'s [`RunArgs`].
+    fn run_args(argv: &[&str]) -> RunArgs {
+        run_args_of(
+            Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}")),
+        )
+    }
+
+    /// The running proxy's status as `cli::fetch_live_status` hands it over:
+    /// parsed from the wire, so the tri-state `mitm` key is read the way a real
+    /// answer is. `None` leaves the key out, as a server older than it does.
+    /// Its pool holds one Codex account, without which the proxy intercepts no
+    /// `chatgpt.com` tunnel at all.
+    fn live_status(
+        mitm: Option<serde_json::Value>,
+    ) -> Result<status::StatusPayload, cli::LiveStatusError> {
+        let mut wire = serde_json::json!({
+            "kind": status::STATUS_KIND,
+            "accounts": [{
+                "name": "bob@example.com/codex", "provider": "codex", "priority": 0,
+                "status": "active", "disabled": false, "requests": 0, "inputTokens": 0,
+                "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+                "probeStatus": "ok", "quotaState": "normal", "gate": "ok", "threshold": 0.9,
+            }],
+            "build": {"sha": "abc1234"},
+        });
+        if let Some(mitm) = mitm {
+            wire["mitm"] = mitm;
+        }
+        Ok(serde_json::from_value(wire).expect("a status payload"))
+    }
+
+    /// An inherited environment holding exactly `vars`.
+    fn inherited(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    /// What `cmd` will set (`Some`) or remove (`None`) in the child's environment.
+    fn env_changes(
+        cmd: &std::process::Command,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// Every row of `tcr run --codex`'s launch decision ([`codex_launch`]): the
+    /// launch it picks, and the exact notice it prints. Each row inherits an
+    /// `HTTPS_PROXY` aimed at this tcr, so every direct row must drop it, the
+    /// "not listening" one included: a dead tcr behind that variable refuses the
+    /// connection rather than launching anything.
+    ///
+    /// Only the "key absent" row may tell the user to restart. A JS leaf and MITM
+    /// off both survive any restart, and saying otherwise sends the user to pay a
+    /// cold prompt cache for nothing.
+    ///
+    /// Mismatches are collected rather than asserted one at a time, so a
+    /// regression names every row it breaks.
+    #[test]
+    fn codex_launch_follows_what_the_running_proxy_reports() {
+        const PORT: u16 = 3999;
+        const AT_TCR: &[(&str, &str)] = &[("HTTPS_PROXY", "http://127.0.0.1:3999")];
+        let ca = Path::new("/tmp/tcr-run-test/tcr-ca.pem");
+        let pooling = || {
+            live_status(Some(serde_json::json!({
+                "interceptedHosts": ["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+                "leaf": "minted",
+            })))
+        };
+        let direct = |reason: &str| {
+            Ok((
+                CodexLaunch::Direct {
+                    reason: reason.to_string(),
+                    unset: vec!["HTTPS_PROXY"],
+                },
+                vec![
+                    format!("[tcr] launching codex directly (not pooled): {reason}"),
+                    "[tcr] removed HTTPS_PROXY from codex's environment: it points at tcr on \
+                     :3999, which this launch bypasses"
+                        .to_string(),
+                ],
+            ))
+        };
+        // (label, argv, the status read, whether the CA is on disk, the launch and
+        // notices wanted — or the refusal's text).
+        type Live = Result<status::StatusPayload, cli::LiveStatusError>;
+        type Want = Result<(CodexLaunch, Vec<String>), &'static str>;
+        let rows: Vec<(&str, &[&str], Live, bool, Want)> = vec![
+            (
+                "--group is refused before anything launches",
+                &["tcr", "run", "--codex", "--group", "g", "--", "exec", "hi"],
+                pooling(),
+                true,
+                Err("--group is not supported with --codex"),
+            ),
+            (
+                "not listening",
+                CODEX_RUN,
+                Err(cli::LiveStatusError::NoServer),
+                true,
+                direct("proxy not listening on :3999"),
+            ),
+            (
+                "no answer",
+                CODEX_RUN,
+                Err(cli::LiveStatusError::NoAnswer(
+                    "the server did not answer within 5s".to_string(),
+                )),
+                true,
+                direct(
+                    "could not read the running proxy's status (the server did not answer \
+                     within 5s)",
+                ),
+            ),
+            (
+                "an answer that is not a usable status",
+                CODEX_RUN,
+                Err(cli::LiveStatusError::Unusable(
+                    "HTTP 401 Unauthorized — the proxy api-key in the config was rejected"
+                        .to_string(),
+                )),
+                true,
+                direct(
+                    "could not read the running proxy's status (HTTP 401 Unauthorized — the \
+                     proxy api-key in the config was rejected)",
+                ),
+            ),
+            (
+                "key absent: a proxy older than the key",
+                CODEX_RUN,
+                live_status(None),
+                true,
+                direct(
+                    "the proxy on :3999 (build abc1234) predates Codex interception — restart \
+                     it on this build at a quiet moment",
+                ),
+            ),
+            (
+                "the JS leaf",
+                CODEX_RUN,
+                live_status(Some(serde_json::json!({
+                    "interceptedHosts": ["api.anthropic.com"],
+                    "leaf": "js",
+                }))),
+                true,
+                direct(
+                    "the proxy on :3999 is serving the JS teamclaude leaf, which covers \
+                     api.anthropic.com only and is never re-minted — a restart will not change \
+                     this; see docs/troubleshooting.md",
+                ),
+            ),
+            (
+                "MITM off",
+                CODEX_RUN,
+                live_status(Some(
+                    serde_json::json!({"interceptedHosts": [], "leaf": "none"}),
+                )),
+                true,
+                direct(
+                    "the proxy on :3999 is running without MITM: its TLS material failed to \
+                     load at boot — see its log",
+                ),
+            ),
+            (
+                "pooled",
+                CODEX_RUN,
+                pooling(),
+                true,
+                Ok((
+                    CodexLaunch::SeeThrough {
+                        ca: ca.to_path_buf(),
+                        no_proxy: Vec::new(),
+                    },
+                    Vec::new(),
+                )),
+            ),
+            (
+                "chatgpt.com intercepted, but no CA on disk",
+                CODEX_RUN,
+                pooling(),
+                false,
+                direct("no readable CA at /tmp/tcr-run-test/tcr-ca.pem"),
+            ),
+            (
+                "a leaf that covers chatgpt.com, but no Codex account in the pool",
+                CODEX_RUN,
+                pooling().map(|mut payload| {
+                    payload
+                        .accounts
+                        .retain(|row| row.provider != teamclaude_rs::provider::Provider::Codex);
+                    payload
+                }),
+                true,
+                direct(
+                    "the proxy on :3999 holds no Codex account, so it blind-tunnels chatgpt.com \
+                     and codex keeps its own login — add one with `tcr login --from-codex`",
+                ),
+            ),
+            (
+                "a minted leaf that does not cover chatgpt.com",
+                CODEX_RUN,
+                live_status(Some(serde_json::json!({
+                    "interceptedHosts": ["api.anthropic.com", "platform.claude.com"],
+                    "leaf": "minted",
+                }))),
+                true,
+                direct(
+                    "the proxy on :3999 serves a leaf it minted but does not intercept \
+                     chatgpt.com (it intercepts [api.anthropic.com, platform.claude.com])",
+                ),
+            ),
+            (
+                "a leaf this build does not know, whose CA it cannot name",
+                CODEX_RUN,
+                live_status(Some(serde_json::json!({
+                    "interceptedHosts": ["chatgpt.com"],
+                    "leaf": "future",
+                }))),
+                true,
+                direct(
+                    "the proxy on :3999 (build abc1234) reports a leaf this build does not know \
+                     (\"future\") — run tcr run --codex from the same build as the proxy",
+                ),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, argv, live, ca_is_file, want) in rows {
+            let got = codex_launch(
+                &run_args(argv),
+                PORT,
+                &live,
+                ca,
+                ca_is_file,
+                &inherited(AT_TCR),
+            )
+            .map(|launch| {
+                let notices = launch.notices(PORT);
+                (launch, notices)
+            })
+            .map_err(|err| err.to_string());
+            let right = match (&got, &want) {
+                (Ok(got), Ok(want)) => got == want,
+                (Err(got), Err(want)) => got.contains(want),
+                _ => false,
+            };
+            if !right {
+                wrong.push(format!("{label}:\n  got  {got:?}\n  want {want:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} row(s) wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// A direct launch drops only the proxy variables that point at THIS tcr
+    /// (loopback host, the configured port, scheme optional) and keeps every
+    /// other proxy: one on another port (a local px or cntlm) or on another host
+    /// (a corporate egress) may be how this machine reaches the internet at all,
+    /// and removing it would break a launch that only had to go un-pooled.
+    #[test]
+    fn a_direct_codex_launch_drops_only_the_proxy_variables_aimed_at_this_tcr() {
+        let env = inherited(&[
+            ("HTTPS_PROXY", "http://127.0.0.1:3999"),
+            ("https_proxy", "localhost:3999"),
+            ("HTTP_PROXY", "http://[::1]:3999/"),
+            ("http_proxy", "http://127.0.0.1:8080"),
+            ("ALL_PROXY", "http://proxy.corp.example:3999"),
+            ("all_proxy", "socks5://127.0.0.1:1080"),
+        ]);
+        let launch = codex_launch(
+            &run_args(CODEX_RUN),
+            3999,
+            &Err(cli::LiveStatusError::NoServer),
+            Path::new("/tmp/ca.pem"),
+            false,
+            &env,
+        )
+        .expect("a direct launch");
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(&mut cmd, 3999, &launch);
+        assert_eq!(
+            env_changes(&cmd),
+            [
+                ("HTTPS_PROXY".to_string(), None),
+                ("HTTP_PROXY".to_string(), None),
+                ("https_proxy".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+            "exactly the three aimed at tcr are removed, and nothing is set"
+        );
+        assert_eq!(
+            launch.notices(3999).get(1).map(String::as_str),
+            Some(
+                "[tcr] removed HTTPS_PROXY, https_proxy, HTTP_PROXY from codex's environment: \
+                 they point at tcr on :3999, which this launch bypasses"
+            )
+        );
+
+        for (value, aimed_at_tcr) in [
+            ("http://127.0.0.1:3999", true),
+            ("HTTP://LOCALHOST:3999/", true),
+            ("https://[::1]:3999", true),
+            ("127.0.0.1:3999", true),
+            (" http://127.0.0.1:3999 ", true),
+            ("socks5h://localhost:3999", true),
+            ("http://127.0.0.1", false),
+            ("http://127.0.0.1:39990", false),
+            ("http://127.0.0.2:3999", false),
+            ("http://proxy.corp.example:3999", false),
+            ("", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(points_at_tcr(value, 3999), aimed_at_tcr, "{value:?}");
+        }
+    }
+
+    /// A pooled launch drops only the `NO_PROXY` entries that would exempt chatgpt.com,
+    /// keeps the rest in order, keeps an emptied variable SET (codex reads the first
+    /// spelling that is set), and says what it dropped, so the banner it prints is true.
+    #[test]
+    fn a_pooled_codex_launch_drops_only_the_no_proxy_entries_that_exempt_chatgpt_com() {
+        let env = inherited(&[
+            ("NO_PROXY", "localhost,.chatgpt.com, 10.0.0.0/8"),
+            ("no_proxy", "*"),
+        ]);
+        let live = live_status(Some(serde_json::json!({
+            "interceptedHosts": ["chatgpt.com"],
+            "leaf": "minted",
+        })));
+        let launch = codex_launch(
+            &run_args(CODEX_RUN),
+            3999,
+            &live,
+            Path::new("/tmp/ca.pem"),
+            true,
+            &env,
+        )
+        .expect("a pooled launch");
+        assert_eq!(
+            launch,
+            CodexLaunch::SeeThrough {
+                ca: PathBuf::from("/tmp/ca.pem"),
+                no_proxy: vec![
+                    NoProxyRewrite {
+                        var: "NO_PROXY",
+                        kept: "localhost, 10.0.0.0/8".to_string(),
+                        dropped: vec![".chatgpt.com".to_string()],
+                    },
+                    NoProxyRewrite {
+                        var: "no_proxy",
+                        kept: String::new(),
+                        dropped: vec!["*".to_string()],
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            launch.notices(3999),
+            [
+                "[tcr] dropped .chatgpt.com from NO_PROXY for codex: it exempts chatgpt.com from \
+                 the proxy, and the session would bypass tcr",
+                "[tcr] dropped * from no_proxy for codex: it exempts chatgpt.com from the proxy, \
+                 and the session would bypass tcr",
+            ]
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(&mut cmd, 3999, &launch);
+        let env = env_changes(&cmd);
+        assert_eq!(
+            env.get("NO_PROXY"),
+            Some(&Some("localhost, 10.0.0.0/8".to_string()))
+        );
+        assert_eq!(
+            env.get("no_proxy"),
+            Some(&Some(String::new())),
+            "emptied, and still set"
+        );
+        assert_eq!(
+            env.get("HTTPS_PROXY"),
+            Some(&Some("http://127.0.0.1:3999".to_string()))
+        );
+        assert_eq!(
+            env.get("CODEX_CA_CERTIFICATE"),
+            Some(&Some("/tmp/ca.pem".to_string()))
+        );
+    }
+
+    /// [`no_proxy_entry_exempts`] against the matcher codex's HTTP stack runs:
+    /// hyper-util's, which reqwest builds its environment proxy from (reqwest
+    /// enables hyper-util's `client-proxy` feature for it; this tree and
+    /// `openai/codex` both lock hyper-util 0.1.20). An entry exempts chatgpt.com
+    /// exactly when that matcher sends `https://chatgpt.com/…` direct. The
+    /// expected column documents the rules; the matcher is the authority.
+    #[test]
+    fn no_proxy_matching_agrees_with_the_matcher_codex_uses() {
+        use hyper_util::client::proxy::matcher::Matcher;
+        let target: hyper::Uri = "https://chatgpt.com/backend-api/codex/responses"
+            .parse()
+            .expect("a uri");
+        let proxied = |no_proxy: &str| {
+            Matcher::builder()
+                .https("http://127.0.0.1:3999")
+                .no(no_proxy)
+                .build()
+                .intercept(&target)
+                .is_some()
+        };
+        assert!(
+            proxied(""),
+            "control: with no NO_PROXY the request is proxied"
+        );
+        for (entry, exempts) in [
+            ("chatgpt.com", true),
+            ("CHATGPT.COM", true),
+            (".chatgpt.com", true),
+            (" chatgpt.com ", true),
+            ("com", true),
+            (".com", true),
+            ("*", true),
+            ("api.chatgpt.com", false),
+            ("gpt.com", false),
+            ("chatgpt.com.example", false),
+            ("openai.com", false),
+            ("*.chatgpt.com", false),
+            (".", false),
+            ("", false),
+            ("10.0.0.0/8", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+        ] {
+            assert_eq!(
+                no_proxy_entry_exempts(entry, "chatgpt.com"),
+                exempts,
+                "{entry:?}"
+            );
+            assert_eq!(!proxied(entry), exempts, "the matcher on {entry:?}");
+        }
     }
 
     /// Each flag alone still parses — the deprecated one is accepted, as promised

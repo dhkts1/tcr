@@ -1954,10 +1954,11 @@ pub async fn login_from_codex(
     };
     let plan = login.plan_type.clone();
     let saved = import_codex_login(config_path, force, name, account, login).await?;
+    // The plan as `tcr status` names it (`ChatGPT Pro`), not the raw claim (`pro`).
     eprintln!(
         "[tcr] imported as '{saved}'{}; {CODEX_IMPORT_CONSEQUENCE} {CODEX_IMPORT_OLDER_PROXY}",
-        plan.filter(|p| !p.trim().is_empty())
-            .map_or_else(String::new, |p| format!(" (ChatGPT {p})"))
+        tcr_status_wire::codex_plan_label(plan.as_deref())
+            .map_or_else(String::new, |label| format!(" ({label})"))
     );
     Ok(saved)
 }

@@ -405,10 +405,16 @@ pub struct AccountStatusRow {
     /// [`UsageRow`]'s doc-comment: absent is "not measured", never zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageRow>,
+    /// `"codex"` for a Codex account; absent for Anthropic, so a client that predates the field
+    /// (every TcrBar build before this change) decodes the row exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// The organization's plan as the profile endpoint reported it, VERBATIM
     /// (`claude_max`, `claude_team`, `claude_pro`, `claude_enterprise`) — for a
     /// script that wants the provider's own word rather than our label. `None`
-    /// when this account has never been profiled.
+    /// when this account has never been profiled. On a Codex row it is the
+    /// ChatGPT plan instead (`pro`, `plus`, …), the login's `chatgpt_plan_type`
+    /// claim, equally verbatim.
     #[serde(default)]
     pub organization_type: Option<String>,
     /// The organization's rate-limit tier, verbatim
@@ -424,9 +430,10 @@ pub struct AccountStatusRow {
     #[serde(default)]
     pub seat_tier: Option<String>,
     /// The customer-facing plan label ("Max 20x", "Team Premium", ...) derived
-    /// from the three raw fields above by [`plan_label`] — the ONE place that mapping
-    /// exists, so the CLI's plain text, the TUI and the macOS panel cannot
-    /// disagree about what a row's plan is called.
+    /// from the three raw fields above by [`plan_label`] — or, on a Codex row,
+    /// from `organizationType` alone by [`codex_plan_label`] ("ChatGPT Pro") —
+    /// the ONE place each mapping exists, so the CLI's plain text, the TUI and
+    /// the macOS panel cannot disagree about what a row's plan is called.
     ///
     /// `None` when nothing is known, and that is load-bearing: a fabricated
     /// label is worse than a blank, because the whole point of this field is
@@ -537,6 +544,25 @@ pub fn plan_label(
             Some(seat) => format!("{plan} {}", seat_words(seat)),
             None => plan.to_string(),
         },
+    })
+}
+
+/// The customer-facing name of a ChatGPT plan, from the raw `chatgpt_plan_type` claim stored
+/// verbatim in `organizationType` for Codex rows. Unknown values pass through, as `plan_label`
+/// does, so a plan we have not met shows what the provider said rather than nothing.
+pub fn codex_plan_label(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(match raw.to_ascii_lowercase().as_str() {
+        "free" => "ChatGPT Free".to_string(),
+        "plus" => "ChatGPT Plus".to_string(),
+        "pro" => "ChatGPT Pro".to_string(),
+        "team" => "ChatGPT Team".to_string(),
+        "business" => "ChatGPT Business".to_string(),
+        "enterprise" => "ChatGPT Enterprise".to_string(),
+        _ => raw.to_string(),
     })
 }
 
@@ -685,6 +711,76 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&row).expect("serializes"))
                 .expect("round trip decodes");
         assert_eq!(again.cache_ttl_secs, Some(3600));
+    }
+
+    #[test]
+    fn codex_plan_label_names_the_chatgpt_plans_and_passes_unknowns_through() {
+        assert_eq!(
+            codex_plan_label(Some("pro")).as_deref(),
+            Some("ChatGPT Pro")
+        );
+        assert_eq!(
+            codex_plan_label(Some("plus")).as_deref(),
+            Some("ChatGPT Plus")
+        );
+        assert_eq!(
+            codex_plan_label(Some("team")).as_deref(),
+            Some("ChatGPT Team")
+        );
+        assert_eq!(
+            codex_plan_label(Some("business")).as_deref(),
+            Some("ChatGPT Business")
+        );
+        assert_eq!(
+            codex_plan_label(Some("enterprise")).as_deref(),
+            Some("ChatGPT Enterprise")
+        );
+        assert_eq!(
+            codex_plan_label(Some("free")).as_deref(),
+            Some("ChatGPT Free")
+        );
+        assert_eq!(
+            codex_plan_label(Some("edu")).as_deref(),
+            Some("edu"),
+            "unknown values survive verbatim, like plan_label"
+        );
+        assert_eq!(codex_plan_label(None), None);
+        assert_eq!(codex_plan_label(Some("  ")), None);
+        assert_eq!(
+            codex_plan_label(Some("Pro")).as_deref(),
+            Some("ChatGPT Pro")
+        );
+    }
+
+    /// An Anthropic account's row exactly as the status path renders it: the first row of the
+    /// committed contract fixture, decoded one row at a time as `tests/round_trip.rs` decodes
+    /// every row. This crate has no other way to build a whole row.
+    fn committed_anthropic_row() -> AccountStatusRow {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/status-contract.json");
+        let committed =
+            std::fs::read_to_string(path).expect("committed contract fixture is readable");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&committed).expect("fixture is a bare JSON array");
+        let first = rows.into_iter().next().expect("fixture carries a row");
+        assert!(
+            first.get("provider").is_none(),
+            "the fixture's first row is an Anthropic account: {first}"
+        );
+        AccountStatusRow::from_value(first).expect("fixture row decodes")
+    }
+
+    #[test]
+    fn provider_is_absent_on_the_wire_for_anthropic_rows_and_present_for_codex() {
+        let mut row = committed_anthropic_row();
+        assert!(!serde_json::to_string(&row)
+            .unwrap()
+            .contains("\"provider\""));
+        row.provider = Some("codex".to_string());
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("\"provider\":\"codex\""));
+        let back: AccountStatusRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provider.as_deref(), Some("codex"));
     }
 }
 

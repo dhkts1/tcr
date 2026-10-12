@@ -96,6 +96,27 @@ impl Manager {
         self.config.lock().expect("config lock poisoned").http1_only
     }
 
+    /// What this process's MITM listener can intercept by its policy and leaf — see
+    /// [`crate::status::MitmStatus`]. Server-wide boot state, exposed for the
+    /// reason [`Self::http1_only`] is: a client must not re-derive it, here
+    /// from the leaf on disk, which a client-side load can re-mint while this
+    /// process keeps serving the leaf it loaded at boot. A manager that never
+    /// had TLS material recorded reports MITM off (`leaf: "none"`), which is
+    /// the truth for it.
+    pub fn mitm_status(&self) -> crate::status::MitmStatus {
+        self.mitm
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::status::MitmStatus::of(None))
+    }
+
+    /// Record [`Self::mitm_status`]. Called once, by `server::serve`, right
+    /// after its TLS load; a later call is ignored, because the listener's
+    /// leaf is never reloaded and so what it can intercept never changes.
+    pub fn record_mitm_status(&self, status: crate::status::MitmStatus) {
+        let _ = self.mitm.set(status);
+    }
+
     /// Every group on the fleet mapped to its resolved color — hot-reloaded
     /// from `groupSettings` on the same cadence [`Self::snapshot`] and
     /// selection reload (see [`Self::reload_groups_if_changed`]'s doc); a
@@ -192,6 +213,7 @@ impl Manager {
                 control_allowed_groups.sort();
                 AccountSnapshot {
                     name: a.name.clone(),
+                    provider: a.provider,
                     organization_type: a.organization_type.clone(),
                     rate_limit_tier: a.rate_limit_tier.clone(),
                     seat_tier: a.seat_tier.clone(),

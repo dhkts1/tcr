@@ -30,6 +30,7 @@ use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, UsageProber};
+use crate::provider::Provider;
 use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
 use crate::status::{StatusPayload, STATUS_KIND};
 
@@ -2052,17 +2053,14 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         } else {
             format!(" parked_groups={}", a.parked_groups.join(","))
         };
-        // The account's plan, greppable via `plan=Max 20x` and named by the one
-        // function that names it anywhere (`tcr_status_wire::plan_label`).
-        // Omitted entirely — never `plan=unknown` — for an account that has
-        // never been profiled, matching the `fable=`/`groups=` "nothing to say"
-        // idiom. This is the only token that tells two rows sharing an email
-        // apart, so a fabricated value here would be worse than silence.
-        let plan = match tcr_status_wire::plan_label(
-            a.organization_type.as_deref(),
-            a.rate_limit_tier.as_deref(),
-            a.seat_tier.as_deref(),
-        ) {
+        // The account's plan, greppable via `plan=Max 20x` (`plan=ChatGPT Pro`
+        // on a Codex row) and named by the one method that names it anywhere
+        // (`AccountSnapshot::plan_label`). Omitted entirely — never
+        // `plan=unknown` — for an account that has never been profiled,
+        // matching the `fable=`/`groups=` "nothing to say" idiom. This is the
+        // only token that tells two rows sharing an email apart, so a
+        // fabricated value here would be worse than silence.
+        let plan = match a.plan_label() {
             Some(label) => format!(" plan={label}"),
             None => String::new(),
         };
@@ -2427,6 +2425,13 @@ fn render_accounts_json(
                     StatusSource::Offline => None,
                     StatusSource::Live => a.usage.clone(),
                 },
+                // Which upstream the account belongs to: `"codex"` on a Codex
+                // row and NO KEY AT ALL on an Anthropic one, never `null`, so
+                // every row a panel built before this key could decode is the
+                // same bytes it always was (the contract fixture pins both).
+                // A config fact, real on both paths like `groups`.
+                provider: (a.provider != Provider::Anthropic)
+                    .then(|| a.provider.as_str().to_string()),
                 // The plan, three raw fields and one label. Real on BOTH paths
                 // like `groups`/`control` above: this is a config fact read
                 // from disk, not a serving counter, so the offline path knows
@@ -2440,17 +2445,15 @@ fn render_accounts_json(
                 organization_type: a.organization_type.clone(),
                 rate_limit_tier: a.rate_limit_tier.clone(),
                 seat_tier: a.seat_tier.clone(),
-                // Derived HERE, once, from `tcr_status_wire::plan_label` — the
-                // same function the TUI and the plain-text renderer call, so
+                // Derived HERE, once, by `AccountSnapshot::plan_label` — the
+                // same method the TUI and the plain-text renderer call, so
                 // three surfaces cannot disagree about what one row's plan is
-                // named. `null` for an account that has never been profiled: a
-                // fabricated label would defeat the entire point of a field
-                // whose job is telling two identically-named rows apart.
-                plan: tcr_status_wire::plan_label(
-                    a.organization_type.as_deref(),
-                    a.rate_limit_tier.as_deref(),
-                    a.seat_tier.as_deref(),
-                ),
+                // named, and the one place an Anthropic row goes to
+                // `tcr_status_wire::plan_label` and a Codex row to
+                // `codex_plan_label`. `null` for an account that has never been
+                // profiled: a fabricated label would defeat the entire point of
+                // a field whose job is telling two identically-named rows apart.
+                plan: a.plan_label(),
                 // The org, so a client can SHOW which one this row belongs to.
                 // It is not how the row is addressed — the name is. Real on
                 // both paths, like `groups`.
@@ -2502,11 +2505,15 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
 /// Why a live status read did not produce a payload.
 ///
 /// The three variants are not interchangeable, and collapsing them is what made
-/// a wedged proxy unrecoverable: [`incumbent_liveness`] turns them into
+/// a wedged proxy unrecoverable: [`probe_incumbent`] turns them into
 /// "is anything actually serving on this port", and that answer is the
 /// difference between "leave a working proxy alone" and "this process is holding
 /// the socket and answering nothing".
-enum LiveStatusError {
+///
+/// Public for `tcr run --codex`, which pools a session only on what the
+/// RUNNING proxy reports, and says which of these stopped it when it cannot.
+#[derive(Debug)]
+pub enum LiveStatusError {
     /// Nothing is listening on the configured port — the ORDINARY case (`tcr
     /// status` with no server running). Falling back is expected, so it is
     /// reported by the `offline` label alone rather than by a warning.
@@ -2535,7 +2542,8 @@ impl LiveStatusError {
         matches!(self, LiveStatusError::Unusable(_))
     }
 
-    fn why(&self) -> String {
+    /// The failure in a few words, for an operator-facing line.
+    pub fn why(&self) -> String {
         match self {
             LiveStatusError::NoServer => "nothing is listening".to_string(),
             LiveStatusError::NoAnswer(why) | LiveStatusError::Unusable(why) => why.clone(),
@@ -2566,7 +2574,7 @@ pub enum Liveness {
 /// the exact [`STATUS_KIND`] is accepted — a tcr built before the endpoint
 /// existed has no such route, so it forwards this path UPSTREAM and hands back
 /// Anthropic's own error JSON, which must never be rendered as a fleet status.
-async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusError> {
+pub async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusError> {
     parse_live_status(&fetch_live_status_body(config).await?)
 }
 
@@ -5373,6 +5381,80 @@ mod tests {
         }
     }
 
+    /// A Codex account reads as one on both `tcr status` surfaces, through the LIVE
+    /// path the TcrBar panel polls: its JSON row carries `provider: "codex"` and the
+    /// ChatGPT plan label, and its text line names the same plan. The Anthropic row
+    /// beside it carries no `provider` key at all — what keeps a panel that predates
+    /// the key decoding it unchanged — and keeps its Anthropic label.
+    ///
+    /// Through a real socket from a running server, not from a hand-built snapshot:
+    /// the provider has to survive `Manager::snapshot`, the server's `StatusPayload`
+    /// and the client's `into_snapshot` before a renderer sees it, and the contract
+    /// fixture renders a snapshot directly, so it sees none of those three hops.
+    /// Binds port 0, never the config's 3456.
+    #[tokio::test]
+    async fn live_status_shows_a_codex_accounts_provider_and_chatgpt_plan() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = load_from(
+            r#"{
+              "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "expiresAt": 1893456000000, "priority": 0,
+                  "organizationType": "claude_max", "rateLimitTier": "default_claude_max_20x" },
+                { "name": "alice@example.com/codex", "type": "oauth", "provider": "codex",
+                  "accountUuid": "11111111-1111-4111-8111-111111111111",
+                  "organizationType": "pro", "accessToken": "at-c", "refreshToken": "rt-c",
+                  "expiresAt": 1893456000000, "priority": 1 }
+              ]
+            }"#,
+        );
+        config.proxy.port = port;
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let payload = match fetch_live_status(&config).await {
+            Ok(p) => p,
+            Err(LiveStatusError::NoServer) => panic!("the spawned server did not answer"),
+            Err(err) => panic!("live status unusable: {}", err.why()),
+        };
+        let (snapshot, thresholds) = payload.into_snapshot();
+
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let (claude, codex) = (&rows[0], &rows[1]);
+        assert_eq!(codex["provider"], "codex", "{codex}");
+        assert_eq!(codex["plan"], "ChatGPT Pro", "{codex}");
+        assert_eq!(
+            codex["organizationType"], "pro",
+            "the raw claim still rides beside the label: {codex}"
+        );
+        assert!(
+            claude.get("provider").is_none(),
+            "an Anthropic row carries no provider key, not even null: {claude}"
+        );
+        assert_eq!(claude["plan"], "Max 20x", "{claude}");
+
+        let text = render_accounts(&snapshot, StatusSource::Live);
+        let line_for = |name: &str| {
+            text.lines()
+                .find(|l| l.starts_with(&format!("account {name} ")))
+                .unwrap_or_else(|| panic!("no line for {name}:\n{text}"))
+        };
+        let codex_line = line_for("alice@example.com/codex");
+        assert!(codex_line.contains("plan=ChatGPT Pro"), "{codex_line}");
+        let claude_line = line_for("alice@example.com");
+        assert!(claude_line.contains("plan=Max 20x"), "{claude_line}");
+    }
+
     /// The offline path has no serving process, so `serverSha` is `null` — the
     /// same "not measured" idiom as `cacheHitRatio`, and never this CLI's own sha
     /// standing in for a server's.
@@ -6302,6 +6384,9 @@ mod tests {
     ) -> AccountSnapshot {
         AccountSnapshot {
             name: name.to_string(),
+            // Anthropic unless the sample says otherwise: its one Codex row
+            // overrides this after construction, as row 2 does `free_at`.
+            provider: Provider::Anthropic,
             organization_type: plan.0.map(str::to_string),
             rate_limit_tier: plan.1.map(str::to_string),
             seat_tier: plan.2.map(str::to_string),
@@ -6470,6 +6555,23 @@ mod tests {
         }
     }
 
+    /// A fixture row's `usage` for an account that has served nothing: what the
+    /// usage tracker reports for one, every bucket a MEASURED zero (`costUsd:
+    /// 0.0`, never the `null` that means "could not be priced") and no `window`,
+    /// because no five-hour reset was ever learned to name the window's start.
+    fn contract_idle_usage() -> tcr_status_wire::UsageRow {
+        let idle = tcr_status_wire::UsageTotals {
+            cost_usd: Some(0.0),
+            ..Default::default()
+        };
+        tcr_status_wire::UsageRow {
+            today: idle,
+            window: None,
+            last_hour: idle,
+            today_by_model: std::collections::BTreeMap::new(),
+        }
+    }
+
     /// A fixed instant in the PAST, so the two clock-derived fields render
     /// deterministically.
     ///
@@ -6621,6 +6723,35 @@ mod tests {
                 (None, None, None),
                 (None, None),
             ),
+            // A Codex account, under the name the import gives a ChatGPT login
+            // whose email an Anthropic row already holds (`<email>/codex`). Its
+            // plan is the raw `chatgpt_plan_type` claim, labelled `ChatGPT
+            // Pro`, with no rate-limit tier, no seat and no org: a ChatGPT
+            // workspace is named by its account id alone. Probed, with a
+            // WEEKLY reading only, which is all the Codex backend reports, and
+            // idle, so its usage is the measured zero. Disabled, so it adds
+            // nothing to the capacity counts a panel derives from this sample:
+            // a panel that predates `provider` would count an enabled Codex row
+            // as Claude capacity, and the Swift suite pins those counts.
+            contract_account(
+                "bob@example.com/codex",
+                4,
+                "active",
+                true,
+                None,
+                None,
+                Some(0.10),
+                Some(seven_day_reset),
+                None,
+                None,
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                Some(contract_idle_usage()),
+                (Some("pro"), None, None),
+                (None, None),
+            ),
         ];
         let mut accounts = accounts;
         // `freeAtMs` and `rateLimitedUntilMs` must be pinned as *numbers*
@@ -6630,6 +6761,9 @@ mod tests {
         // and the render stays deterministic.
         accounts[2].free_at = Some(fixture_instant(1_767_312_000_000));
         accounts[2].rate_limited_until = Some(fixture_instant(1_767_225_600_000));
+        // The sample's one non-Anthropic row, so it pins both shapes of the
+        // `provider` key: absent on the four rows above, `"codex"` here.
+        accounts[4].provider = Provider::Codex;
 
         let thresholds = vec![0.9; accounts.len()];
         (
@@ -6740,7 +6874,7 @@ mod tests {
             .expect("committed contract fixture is readable");
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&committed).expect("fixture is a bare JSON array");
-        assert_eq!(rows.len(), 4, "one row per covered shape");
+        assert_eq!(rows.len(), 5, "one row per covered shape");
 
         let states: Vec<&str> = rows
             .iter()
@@ -6849,8 +6983,9 @@ mod tests {
         );
         for row in &rows {
             let name = row["name"].as_str().expect("name is a string");
+            let email = name.strip_suffix("/codex").unwrap_or(name);
             assert!(
-                name.ends_with("@example.com"),
+                email.ends_with("@example.com"),
                 "every fixture account is obviously fake: {name}"
             );
         }
@@ -7157,6 +7292,7 @@ mod tests {
     fn reserved_groups_snapshot() -> (StatsSnapshot, Vec<f64>) {
         let base = AccountSnapshot {
             name: String::new(),
+            provider: Provider::Anthropic,
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,

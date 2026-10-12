@@ -1091,6 +1091,14 @@ pub struct Manager {
     /// `BTreeMap` for deterministic wire order, matching
     /// [`config::Config::group_colors`]'s own return type.
     group_colors: RwLock<BTreeMap<String, String>>,
+    /// What this process's MITM listener can intercept by its policy and leaf,
+    /// recorded once by `server::serve` from its boot-time TLS load
+    /// ([`Self::record_mitm_status`]). `OnceLock` because the listener's leaf
+    /// is loaded once and never reloaded (whether it terminates `chatgpt.com`
+    /// also depends on the Codex accounts, counted on every CONNECT); unset
+    /// means this process loaded no TLS material, which [`Self::mitm_status`]
+    /// reports as MITM off.
+    mitm: std::sync::OnceLock<crate::status::MitmStatus>,
     /// The config file's mtime as of the last successful (or unmodified-since)
     /// [`Self::reload_groups_if_changed`] check. `None` before the first check.
     /// Guarded by `config_write` at every access — see that lock's doc and
@@ -1569,6 +1577,7 @@ impl Manager {
             control_allowed_groups: RwLock::new(control_allowed_groups),
             spill_groups: RwLock::new(spill_groups),
             group_colors: RwLock::new(group_colors),
+            mitm: std::sync::OnceLock::new(),
             groups_reload_mtime: Mutex::new(None),
             pacing,
             account_throttle,
