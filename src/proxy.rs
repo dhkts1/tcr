@@ -4517,10 +4517,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 });
                 let SseParse {
                     usage: parsed,
+                    model: response_model,
                     stream_error,
                     tool_uses: response_tool_uses,
                     bound_tokens,
-                } = parse_sse_usage(byte_stream).await;
+                } = parse_sse_usage(byte_stream, provider).await;
                 // Who minted the account-bound tokens in this turn. Recorded before anything
                 // else the parse learned, because it is the only one of them that changes how a
                 // LATER request is routed: every following turn of this conversation echoes
@@ -4536,9 +4537,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     &response_tool_uses,
                 );
                 if parsed.input_total > 0 || parsed.output > 0 {
+                    // The REQUEST's model whenever its body named one. `response_model` is set
+                    // only on a Codex stream, so an Anthropic record is exactly what it was; a
+                    // Codex body is usually zstd and then does not parse, so its turn is filed
+                    // under the model its own terminal event named instead of under "unknown".
                     let record = usage_record(
                         &parsed,
-                        request_model_for_usage.clone(),
+                        request_model_for_usage.or(response_model),
                         session_key,
                         || extended_ttl_for_usage,
                     );
@@ -4549,7 +4554,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     tracing::info!(
                         account = account_name_for_log.as_deref().unwrap_or("?"),
                         session = ?session_key,
-                        model = request_model_for_usage.as_deref().unwrap_or("?"),
+                        model = record.model.as_deref().unwrap_or("?"),
                         cache_read_tokens = parsed.cache_read,
                         cache_creation_tokens = parsed.cache_creation,
                         cache_creation_1h_tokens = record.cache_1h,
@@ -4753,23 +4758,36 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 OffsetDateTime::now_utc(),
                 &response_tool_uses_from_json(&bytes),
             );
-            // Non-streamed twin of the mint record on the SSE arm above.
-            manager.record_bound_tokens(
-                &response_bound_tokens_from_json(&bytes),
-                idx,
-                crate::now_ms(),
-            );
-            let parsed = usage_from_json(&bytes);
+            // Non-streamed twin of the mint record on the SSE arm above, and Anthropic only,
+            // as that arm is: every token it collects is an Anthropic one, and a Codex body's
+            // own `id` is a `resp_…` that no later request names as a message id, so recording
+            // it would only take room in the map.
+            if provider == crate::provider::Provider::Anthropic {
+                manager.record_bound_tokens(
+                    &response_bound_tokens_from_json(&bytes),
+                    idx,
+                    crate::now_ms(),
+                );
+            }
+            let JsonParse {
+                usage: parsed,
+                model: response_model,
+            } = usage_from_json(&bytes, provider);
             if parsed.input_total > 0 || parsed.output > 0 {
-                let record = usage_record(&parsed, request_model.clone(), session_key, || {
-                    extended_ttl.get()
-                });
+                // As on the streaming arm: the REQUEST's model whenever its body named one,
+                // else, for a Codex body only, the model its Responses object names.
+                let record = usage_record(
+                    &parsed,
+                    request_model.clone().or(response_model),
+                    session_key,
+                    || extended_ttl.get(),
+                );
                 // One line per terminal (non-streamed) request — see the
                 // matching log line on the streaming arm above.
                 tracing::info!(
                     account = account_name.as_deref().unwrap_or("?"),
                     session = ?session_key,
-                    model = request_model.as_deref().unwrap_or("?"),
+                    model = record.model.as_deref().unwrap_or("?"),
                     cache_read_tokens = parsed.cache_read,
                     cache_creation_tokens = parsed.cache_creation,
                     cache_creation_1h_tokens = record.cache_1h,
@@ -5713,7 +5731,11 @@ impl ExtendedTtlOnce {
 /// **The model comes from the REQUEST, not the response.** It is parsed once per
 /// request (`parse_request_model`) and is the same on both arms; the response's
 /// own `model` field can differ from what was asked for, and the ask is what the
-/// operator reasons about.
+/// operator reasons about. One exception, and only when the request named no model: a
+/// Codex body is usually zstd and then does not parse, so each arm passes the model its
+/// response named, the stream's terminal event's ([`SseParse::model`]) for a streamed turn and
+/// the Responses object's top-level `model` ([`JsonParse::model`]) otherwise, rather than file
+/// the turn under "unknown".
 ///
 /// **The 5m/1h split falls back to the request's `cache_control` ttl, and only
 /// then.** When the response REPORTED
@@ -5763,14 +5785,34 @@ fn usage_record(
     )
 }
 
-/// Parse the token breakdown from a non-streamed JSON messages body.
+/// What [`usage_from_json`] reads off a non-streamed body: the JSON twin of [`SseParse`]'s
+/// `usage` and `model`. Its own type, not a field of [`ParsedUsage`], for the reason
+/// [`SseParse`] is one: [`ParsedUsage`] stays `Copy`.
+#[derive(Debug, Default)]
+struct JsonParse {
+    usage: ParsedUsage,
+    /// Set only for a Codex body, from the Responses object's top-level `model`; see
+    /// [`usage_from_json`]. `None` for every Anthropic body, so an Anthropic turn is filed
+    /// under its request's model exactly as before.
+    model: Option<String>,
+}
+
+/// Parse the token breakdown from a non-streamed JSON body: a Messages body, or, for
+/// `provider` Codex, a bare Responses object. The two name their `usage` fields differently,
+/// so a Codex body's `usage` is read by [`codex_parsed_usage`], the reader its streamed
+/// terminal event goes through too.
+///
+/// A Codex body also yields its top-level `model`, the non-streamed twin of the model
+/// [`codex_terminal_usage`] reads off a stream's terminal event: a Codex request body is
+/// usually zstd and cannot be peeked for one, so the response is where tcr reads a Codex
+/// turn's model, and the caller files the turn under it when the request named none.
 ///
 /// A body that is not JSON is logged once, at warn: it means this turn's tokens
 /// are missing from the ledger, which is exactly the kind of silent undercount
 /// the usage ledger's own write-failure policy exists to make visible. Only the
 /// serde error and the body LENGTH are logged, never any body content, because a
 /// request body carries the user's prompt and this repository is public.
-fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
+fn usage_from_json(bytes: &[u8], provider: crate::provider::Provider) -> JsonParse {
     let value = match serde_json::from_slice::<Value>(bytes) {
         Ok(value) => value,
         Err(err) => {
@@ -5780,25 +5822,114 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
                 "a non-streamed 200 body did not parse as JSON, so this turn's tokens are \
                  NOT in the usage ledger; totals for this window are an undercount"
             );
-            return ParsedUsage::default();
+            return JsonParse::default();
         }
     };
     let Some(usage) = value.get("usage") else {
         // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
-        return ParsedUsage::default();
+        return JsonParse::default();
     };
+    if provider == crate::provider::Provider::Codex {
+        return JsonParse {
+            usage: codex_parsed_usage(usage),
+            model: value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+    }
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let (cache_read, cache_creation, cache_creation_1h) = cache_breakdown(usage);
-    ParsedUsage {
-        input_total: sum_input_tokens(usage),
-        output,
-        cache_read,
-        cache_creation,
-        cache_creation_1h,
+    JsonParse {
+        usage: ParsedUsage {
+            input_total: sum_input_tokens(usage),
+            output,
+            cache_read,
+            cache_creation,
+            cache_creation_1h,
+        },
+        model: None,
     }
+}
+
+/// What [`codex_terminal_usage`] reads off a Codex stream's terminal event: the turn's usage,
+/// in the same shape the Anthropic parse produces, and the model that served it.
+struct CodexSseParse {
+    usage: ParsedUsage,
+    model: Option<String>,
+}
+
+/// A Codex `usage` object in the ledger's shape. `input_tokens` INCLUDES both cache parts,
+/// `input_tokens_details.cached_tokens` (read from the cache) and
+/// `input_tokens_details.cache_write_tokens` (written to it), and `output_tokens` includes
+/// reasoning (`openai/codex` `codex-api/src/sse/responses.rs:105-160`). The one reader for
+/// both places a Codex turn reports its usage, a stream's terminal event
+/// ([`codex_terminal_usage`]) and a non-streamed Responses object ([`usage_from_json`]), so
+/// the two cannot disagree.
+fn codex_parsed_usage(usage: &Value) -> ParsedUsage {
+    let get = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let details = usage.get("input_tokens_details");
+    ParsedUsage {
+        input_total: get(usage, "input_tokens"),
+        output: get(usage, "output_tokens"),
+        cache_read: details.map_or(0, |d| get(d, "cached_tokens")),
+        cache_creation: details.map_or(0, |d| get(d, "cache_write_tokens")),
+        // `Some(0)`, not `None`: the 1h figure is Anthropic's extended-TTL cache write, and
+        // nothing a Codex turn writes is one. `None` means "no split reported" and hands
+        // the question to `usage_record`'s fallback, which reads the REQUEST's Anthropic
+        // `cache_control` ttl, and that is no evidence about a Codex body.
+        cache_creation_1h: Some(0),
+    }
+}
+
+/// One Codex SSE event's usage, if it is a terminal event that spent tokens. A Codex Responses
+/// turn that runs to its end closes on `response.completed`, or on `response.incomplete` when
+/// the backend cut it short, and both carry `response.usage` ([`codex_parsed_usage`];
+/// `openai/codex` `codex-api/src/sse/responses.rs:418-440`). A turn that fails closes on
+/// `response.failed` instead, which [`parse_sse_usage`] records as a stream error, never as
+/// usage. The model is read from the same object: a Codex request body is usually zstd and then
+/// cannot be peeked for one, so this is where tcr reads a streamed Codex turn's model.
+///
+/// `None` for every other event (a delta; `response.created`, which names the model but has no
+/// usage yet; `response.failed`, whatever it carries) and for a terminal event whose `usage`
+/// is null or absent, so [`parse_sse_usage`] leaves its totals as they were rather than
+/// zeroing them.
+fn codex_terminal_usage(event: &Value) -> Option<CodexSseParse> {
+    let kind = event.get("type")?.as_str()?;
+    if kind != "response.completed" && kind != "response.incomplete" {
+        return None;
+    }
+    let response = event.get("response")?;
+    let usage = response.get("usage").filter(|u| !u.is_null())?;
+    Some(CodexSseParse {
+        usage: codex_parsed_usage(usage),
+        model: response
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// [`codex_terminal_usage`] over one event's raw bytes, the form the tests hold their fixtures
+/// in; `None` for bytes that are not JSON. [`parse_sse_usage`] parses each event once, itself.
+#[cfg(test)]
+fn codex_usage_from_event(data: &[u8]) -> Option<CodexSseParse> {
+    codex_terminal_usage(&serde_json::from_slice(data).ok()?)
+}
+
+/// The kind a failed Codex turn is recorded under: the `code` of its error object
+/// (`response.error` on a `response.failed` event, the nested `error` on an `error` event),
+/// such as `rate_limit_exceeded`, `context_length_exceeded`, `insufficient_quota`,
+/// `server_is_overloaded` or `cyber_policy`; `"unknown"` without one, as on the Anthropic arm.
+fn codex_error_kind(error: Option<&Value>) -> String {
+    error
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Parse the `tool_use` blocks out of a non-streamed messages body — the JSON-path twin of
@@ -5946,7 +6077,24 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 /// was seen (truncated mid-turn) OR nothing was ever seen (severed before the
 /// first event) — and stays silent only when events arrived that affirmatively
 /// were not `message_start`.
-async fn parse_sse_usage<S, B, E>(stream: S) -> SseParse
+///
+/// `provider` picks the event vocabulary and nothing else: the framing is shared, so a Codex
+/// event split across chunks is reassembled exactly like an Anthropic one. A Codex event is
+/// parsed once, in its own branch, and never reaches the Anthropic arms, not even one typed
+/// `error`, whose shape is OpenAI's. A Codex stream's usage is its terminal
+/// `response.completed` / `response.incomplete` event alone, read by [`codex_terminal_usage`],
+/// which also yields the model: a Codex request body is usually zstd, and the stream is the
+/// place tcr reads a Codex turn's model. Its failures are classified by the same
+/// rules as Anthropic's, in Codex's vocabulary. A `response.failed` event is recorded under its
+/// `response.error.code` and an `error` event under its nested `error.code`
+/// ([`codex_error_kind`]), the first one winning; `response.incomplete` is not a failure here,
+/// because the turn's tokens were spent and are counted. A Codex turn ends in
+/// `response.completed`, `response.incomplete` or `response.failed`, and a stream that ends
+/// without one, including one severed before its first event, gets the same
+/// [`TRUNCATED_STREAM_ERROR_KIND`] verdict as an Anthropic stream without `message_stop`. It
+/// needs no `message_start` to count as a turn: the one Codex path the pool serves is the
+/// Responses endpoint ([`relay_mode`]), so every Codex stream teed here is a turn.
+async fn parse_sse_usage<S, B, E>(stream: S, provider: crate::provider::Provider) -> SseParse
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -5955,10 +6103,14 @@ where
     futures::pin_mut!(events);
 
     let mut parsed = ParsedUsage::default();
+    // Set only on a Codex stream, from its terminal event; see `SseParse::model`.
+    let mut model: Option<String> = None;
     let mut stream_error: Option<String> = None;
     let mut saw_any_event = false;
     let mut saw_message_start = false;
     let mut saw_message_stop = false;
+    // A Codex turn's end: `response.completed`, `response.incomplete` or `response.failed`.
+    let mut saw_codex_end = false;
     // `tool_use` blocks under construction, keyed by the stream's own block index. A block
     // arrives as a `content_block_start` (id + name), then its `input` object one
     // `input_json_delta` fragment at a time, then `content_block_stop` — so nothing is a
@@ -5983,6 +6135,33 @@ where
             continue;
         }
         saw_any_event = true;
+        if provider == crate::provider::Provider::Codex {
+            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            // What the turn spent: only a `response.completed` / `response.incomplete` says.
+            if let Some(terminal) = codex_terminal_usage(&value) {
+                parsed = terminal.usage;
+                model = terminal.model;
+            }
+            // How it ended. First failure wins, as on the Anthropic arm below.
+            match value.get("type").and_then(Value::as_str) {
+                Some("response.completed" | "response.incomplete") => saw_codex_end = true,
+                Some("response.failed") => {
+                    saw_codex_end = true;
+                    if stream_error.is_none() {
+                        stream_error = Some(codex_error_kind(
+                            value.get("response").and_then(|r| r.get("error")),
+                        ));
+                    }
+                }
+                Some("error") if stream_error.is_none() => {
+                    stream_error = Some(codex_error_kind(value.get("error")));
+                }
+                _ => {}
+            }
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
             continue;
         };
@@ -6190,14 +6369,19 @@ where
     // so it gets the same verdict rather than a silent pass). The one case
     // that stays silent is events having arrived that affirmatively were not
     // `message_start` — that is the actual proof this was never a Messages
-    // turn (see the doc comment above).
-    if !saw_message_stop && stream_error.is_none() && (saw_message_start || !saw_any_event) {
+    // turn (see the doc comment above). A Codex stream folds in with its own
+    // terminator, and counts as a turn without any `message_start` (every
+    // Codex stream teed here is one, per the doc comment).
+    let saw_turn_end = saw_message_stop || saw_codex_end;
+    let confirmed_turn = saw_message_start || provider == crate::provider::Provider::Codex;
+    if !saw_turn_end && stream_error.is_none() && (confirmed_turn || !saw_any_event) {
         stream_error = Some(TRUNCATED_STREAM_ERROR_KIND.to_string());
     }
     // Blocks still open here never reached `content_block_stop` — the turn was cut off before
     // the tool call was complete, so the client never ran it and it is not "running".
     SseParse {
         usage: parsed,
+        model,
         stream_error,
         tool_uses,
         bound_tokens,
@@ -6253,8 +6437,15 @@ const SIGNATURE_CAP: usize = 16 * 1024;
 /// misbinding impossible to write.
 struct SseParse {
     usage: ParsedUsage,
-    /// The FIRST in-band `error` event's `error.type`, or the fixed
-    /// [`TRUNCATED_STREAM_ERROR_KIND`] when the turn's end was never observed.
+    /// The model the stream itself named, set only on a Codex stream, from its terminal event
+    /// ([`codex_terminal_usage`]): a Codex request body is usually zstd and then cannot be
+    /// peeked for one. Always `None` on an Anthropic stream, whose ledger model is the
+    /// REQUEST's (see [`usage_record`]).
+    model: Option<String>,
+    /// The FIRST in-band failure's kind (an Anthropic `error` event's `error.type`; a Codex
+    /// `response.failed` or `error` event's code, see [`codex_error_kind`]), or the fixed
+    /// [`TRUNCATED_STREAM_ERROR_KIND`] when the turn's end (`message_stop`; a Codex terminal
+    /// event) was never observed.
     stream_error: Option<String>,
     /// Every COMPLETED client-side `tool_use` block — what the Tools tab's RUNNING NOW is built
     /// from.
@@ -7935,7 +8126,11 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(futures::stream::iter(chunks)).await;
+        } = parse_sse_usage(
+            futures::stream::iter(chunks),
+            crate::provider::Provider::Anthropic,
+        )
+        .await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -7970,7 +8165,7 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -8002,7 +8197,7 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error, None,
@@ -8031,7 +8226,7 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error.as_deref(),
@@ -8071,7 +8266,11 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(futures::stream::iter(chunks)).await;
+        } = parse_sse_usage(
+            futures::stream::iter(chunks),
+            crate::provider::Provider::Anthropic,
+        )
+        .await;
         assert_eq!(
             parsed.input_total, 5,
             "usage from message_start is retained even though the stream ends malformed"
@@ -8111,7 +8310,7 @@ mod tests {
             stream_error,
             tool_uses,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(stream_error, None);
         assert_eq!(tool_uses.len(), 1, "one completed tool_use block");
         assert_eq!(tool_uses[0].id, "toolu_1");
@@ -8145,7 +8344,7 @@ mod tests {
             stream_error,
             tool_uses,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(
             stream_error.as_deref(),
             Some(TRUNCATED_STREAM_ERROR_KIND),
@@ -8177,7 +8376,8 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let SseParse { tool_uses, .. } = parse_sse_usage(stream).await;
+        let SseParse { tool_uses, .. } =
+            parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         let heads: Vec<(&str, Option<&str>)> = tool_uses
             .iter()
             .map(|t| (t.id.as_str(), t.command_head.as_deref()))
@@ -8219,7 +8419,7 @@ mod tests {
             tool_uses,
             bound_tokens,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(
             bound_tokens,
             vec![(BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string())]
@@ -8258,7 +8458,7 @@ mod tests {
             tool_uses,
             bound_tokens,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(
             bound_tokens,
             vec![
@@ -8295,7 +8495,7 @@ mod tests {
             stream_error,
             bound_tokens,
             ..
-        } = parse_sse_usage(stream).await;
+        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
         assert_eq!(stream_error.as_deref(), Some(TRUNCATED_STREAM_ERROR_KIND));
         assert_eq!(
             bound_tokens,
@@ -8304,6 +8504,219 @@ mod tests {
                 (BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string()),
             ]
         );
+    }
+
+    /// A Codex Responses stream's terminal event, in the shape `openai/codex` reads it
+    /// (`codex-api/src/sse/responses.rs:105-160,418-440`): `input_tokens` already counts the
+    /// cached part, and `output_tokens` already counts reasoning.
+    const CODEX_COMPLETED: &[u8] = br#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-6-astra","status":"completed","usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1000},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":10},"total_tokens":1240}}}"#;
+
+    /// Codex's usage lands in the ledger's own shape: the input total INCLUDES cached tokens
+    /// (the same total Anthropic's `message_start` sum produces), the cached part is surfaced as
+    /// cache read, and reasoning stays inside output. The model comes off the same event,
+    /// because a Codex request body is usually zstd and then cannot be peeked for it.
+    #[test]
+    fn codex_completed_event_yields_usage_and_model() {
+        let parsed = codex_usage_from_event(CODEX_COMPLETED).expect("a completed event has usage");
+        assert_eq!(
+            parsed.usage.input_total, 1200,
+            "input_tokens includes cached, like message_start"
+        );
+        assert_eq!(parsed.usage.cache_read, 1000);
+        assert_eq!(
+            parsed.usage.output, 40,
+            "output includes reasoning tokens; they are billed output"
+        );
+        assert_eq!(parsed.usage.cache_creation, 0);
+        assert_eq!(
+            parsed.usage.cache_creation_1h,
+            Some(0),
+            "nothing a Codex turn writes is Anthropic's 1h cache: the split is known, not \
+             missing, so usage_record never reads a request's cache_control ttl for it"
+        );
+        assert_eq!(parsed.model.as_deref(), Some("gpt-6-astra"));
+    }
+
+    /// A turn the backend ended early (`response.incomplete`) still spent its tokens, so it
+    /// counts exactly like a completed one. Every other event yields nothing — a delta, the
+    /// opening `response.created` (which names the model but carries no usage yet), anything
+    /// not JSON — so the tee never overwrites a terminal event's totals.
+    #[test]
+    fn codex_incomplete_event_counts_too_and_other_events_do_not() {
+        let incomplete = CODEX_COMPLETED.to_vec();
+        let incomplete = String::from_utf8(incomplete)
+            .unwrap()
+            .replace("response.completed", "response.incomplete");
+        assert!(codex_usage_from_event(incomplete.as_bytes()).is_some());
+        assert!(
+            codex_usage_from_event(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
+                .is_none()
+        );
+        assert!(codex_usage_from_event(
+            br#"{"type":"response.created","response":{"id":"r","model":"gpt-6-astra"}}"#
+        )
+        .is_none());
+        assert!(codex_usage_from_event(b"not json").is_none());
+    }
+
+    /// Through the tee's own parser, end to end: the SSE framing is the one every Anthropic test
+    /// above exercises, and only the per-event dispatch differs. What comes out is the terminal
+    /// event's usage and model; the events before it contribute nothing.
+    #[tokio::test]
+    async fn a_codex_sse_stream_is_tee_d_into_the_ledger_shape() {
+        let stream_text = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-opening\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\",\"usage\":{\"input_tokens\":1200,\"input_tokens_details\":{\"cached_tokens\":1000},\"output_tokens\":40,\"total_tokens\":1240}}}\n\n",
+        );
+        // The same adapter every Anthropic SSE test above feeds the parser with.
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(stream_text))]);
+        let parsed = parse_sse_usage(stream, crate::provider::Provider::Codex).await;
+        assert_eq!(parsed.usage.input_total, 1200);
+        assert_eq!(parsed.usage.cache_read, 1000);
+        assert_eq!(parsed.usage.output, 40);
+        assert_eq!(parsed.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(
+            parsed.stream_error, None,
+            "a Codex stream that reached its terminal event is not truncated"
+        );
+    }
+
+    /// [`parse_sse_usage`] over one Codex stream, delivered in a single chunk.
+    async fn parse_codex_stream(text: impl Into<Bytes>) -> SseParse {
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(text.into())]);
+        parse_sse_usage(stream, crate::provider::Provider::Codex).await
+    }
+
+    /// **The terminal-type gate.** A `response.failed` event is no usage, whatever it carries:
+    /// this one is [`CODEX_COMPLETED`] with nothing changed but its type, usage block and all,
+    /// so only the gate in [`codex_terminal_usage`] keeps it out of the ledger.
+    #[test]
+    fn a_failed_codex_event_yields_no_usage_even_with_a_usage_block() {
+        let failed = String::from_utf8(CODEX_COMPLETED.to_vec())
+            .unwrap()
+            .replace("response.completed", "response.failed");
+        assert!(codex_usage_from_event(failed.as_bytes()).is_none());
+    }
+
+    /// Upstream's own fixture (`parses_cache_write_token_usage`): the tokens written to the
+    /// cache (`cache_write_tokens`) are cache CREATION and the ones read from it
+    /// (`cached_tokens`) cache READ, both inside `input_tokens`. So the ledger record's base
+    /// input is what is left of the 100, zero, with nothing floored, and a request asking for
+    /// Anthropic's 1h cache cannot move a Codex write there.
+    #[test]
+    fn codex_cache_writes_are_cache_creation_and_cache_hits_are_cache_reads() {
+        let event = br#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-6-astra","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":60},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":110}}}"#;
+        let parsed = codex_usage_from_event(event)
+            .expect("a completed event has usage")
+            .usage;
+        assert_eq!(
+            (
+                parsed.input_total,
+                parsed.cache_read,
+                parsed.cache_creation,
+                parsed.output
+            ),
+            (100, 40, 60, 10),
+            "(input total, cache read, cache creation, output)"
+        );
+        let record = usage_record(&parsed, Some("gpt-6-astra".to_string()), None, || true);
+        assert_eq!(
+            (
+                record.input,
+                record.cache_5m,
+                record.cache_1h,
+                record.cache_read
+            ),
+            (0, 60, 0, 40),
+            "(base input, 5m write, 1h write, cache read)"
+        );
+    }
+
+    /// A terminal event whose `usage` is null reports no usage at all, rather than a turn that
+    /// spent zero: [`parse_sse_usage`] then keeps the totals it had.
+    #[test]
+    fn a_codex_terminal_event_with_a_null_usage_yields_none() {
+        assert!(codex_usage_from_event(
+            br#"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"#
+        )
+        .is_none());
+    }
+
+    /// **A failed Codex turn is a stream error, recorded under its code**, as a failed
+    /// Anthropic turn is under its `error.type`. `response.failed` names the failure in
+    /// `response.error.code`, next to a null `usage` (upstream's own fixture,
+    /// `codex-api/src/sse/responses.rs:1047`); an `error` event names it in a nested `error`
+    /// object. The first one wins: a `response.failed` after an `error` event still ends the
+    /// turn, but does not rename its failure.
+    #[tokio::test]
+    async fn a_failed_codex_turn_is_a_stream_error_named_by_its_code() {
+        let failed = parse_codex_stream(concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached\"},\"usage\":null}}\n\n",
+        ))
+        .await;
+        assert_eq!(failed.stream_error.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(
+            failed.usage,
+            ParsedUsage::default(),
+            "a failed turn reports no usage"
+        );
+
+        let error_first = parse_codex_stream(concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"flex_unavailable\",\"message\":\"Flex is unavailable\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Overloaded\"},\"usage\":null}}\n\n",
+        ))
+        .await;
+        assert_eq!(
+            error_first.stream_error.as_deref(),
+            Some("flex_unavailable"),
+            "the first failure names the turn's"
+        );
+    }
+
+    /// **A Codex stream that ends before its terminal event is truncated**, exactly as an
+    /// Anthropic one that ends before `message_stop` is: events arrived, and the turn never
+    /// closed. A `response.incomplete` closes it (its spent tokens still count), and so does a
+    /// `response.completed` that reports no usage.
+    #[tokio::test]
+    async fn a_codex_stream_cut_off_before_its_terminal_event_is_truncated() {
+        const OPENING: &str = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        );
+        let cut = parse_codex_stream(OPENING).await;
+        assert_eq!(
+            cut.stream_error.as_deref(),
+            Some(TRUNCATED_STREAM_ERROR_KIND)
+        );
+
+        let incomplete = parse_codex_stream(format!(
+            "{OPENING}event: response.incomplete\ndata: {}\n\n",
+            r#"{"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-6-astra","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1200,"output_tokens":40}}}"#
+        ))
+        .await;
+        assert_eq!(incomplete.stream_error, None);
+        assert_eq!(
+            incomplete.usage.input_total, 1200,
+            "an incomplete turn's tokens were spent"
+        );
+
+        let completed_without_usage = parse_codex_stream(format!(
+            "{OPENING}event: response.completed\ndata: {}\n\n",
+            r#"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"#
+        ))
+        .await;
+        assert_eq!(completed_without_usage.stream_error, None);
     }
 
     /// The non-streamed twin of the token scan, including the body's own message id.
@@ -8416,7 +8829,11 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(cap.clone());
 
         let parsed_bad = tracing::subscriber::with_default(subscriber, || {
-            usage_from_json(b"this is not json at all")
+            usage_from_json(
+                b"this is not json at all",
+                crate::provider::Provider::Anthropic,
+            )
+            .usage
         });
         assert_eq!(
             parsed_bad,
@@ -8437,7 +8854,11 @@ mod tests {
         let cap2 = Capture::default();
         let subscriber2 = tracing_subscriber::registry().with(cap2.clone());
         let parsed_no_usage = tracing::subscriber::with_default(subscriber2, || {
-            usage_from_json(br#"{"id":"msg_1","type":"message"}"#)
+            usage_from_json(
+                br#"{"id":"msg_1","type":"message"}"#,
+                crate::provider::Provider::Anthropic,
+            )
+            .usage
         });
         assert_eq!(
             parsed_no_usage,
@@ -8468,7 +8889,7 @@ mod tests {
     #[test]
     fn json_usage_sums_cache_tokens() {
         let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
-        let parsed = usage_from_json(body);
+        let parsed = usage_from_json(body, crate::provider::Provider::Anthropic).usage;
         // R1: 7 + 3 + 90 = 100, the quota sum, unchanged.
         assert_eq!(parsed.input_total, 100);
         assert_eq!(parsed.output, 11);
@@ -8500,7 +8921,7 @@ mod tests {
         let body = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_creation":{"ephemeral_5m_input_tokens":200000,"ephemeral_1h_input_tokens":0},
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(body);
+        let parsed = usage_from_json(body, crate::provider::Provider::Anthropic).usage;
         assert_eq!(
             parsed.cache_creation_1h,
             Some(0),
@@ -8522,7 +8943,7 @@ mod tests {
         // this must not break: no nested object, so the request's ttl decides.
         let no_split = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(no_split);
+        let parsed = usage_from_json(no_split, crate::provider::Provider::Anthropic).usage;
         assert_eq!(parsed.cache_creation_1h, None, "control: nothing reported");
         let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || true);
         assert_eq!(
@@ -8542,7 +8963,7 @@ mod tests {
             br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_creation":{"ephemeral_5m_input_tokens":200000},
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(five_minute_only);
+        let parsed = usage_from_json(five_minute_only, crate::provider::Provider::Anthropic).usage;
         assert_eq!(
             parsed.cache_creation_1h,
             Some(0),
@@ -8559,7 +8980,7 @@ mod tests {
         // request's own ttl is then the only evidence there is.
         let no_object = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(no_object);
+        let parsed = usage_from_json(no_object, crate::provider::Provider::Anthropic).usage;
         assert_eq!(parsed.cache_creation_1h, None, "absent is absent");
         let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || true);
         assert_eq!(record.cache_1h, 200_000);
@@ -18210,6 +18631,216 @@ mod tests {
         assert_eq!(body["error"]["code"], "usage_limit_reached");
         assert_eq!(codex_echo.request_count(), 0);
         assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// A fake origin that answers every request `200`, with `body` as `content_type`.
+    async fn spawn_fixed_origin(content_type: &'static str, body: &'static str) -> String {
+        let origin =
+            Router::new().fallback(move || async move { ([(CONTENT_TYPE, content_type)], body) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixed origin");
+        let addr = listener.local_addr().expect("fixed origin addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// **A streamed turn is filed under the model its REQUEST named, and a Codex turn whose
+    /// request named none under the one its stream's terminal event named**
+    /// (`request_model_for_usage.or(response_model)` in `handle`), as each account's own usage
+    /// row reads it back. A Codex body with no model in it (a zstd body cannot be peeked for
+    /// one) lands under `response.completed`'s model: not under `"unknown"`, and not under the
+    /// model `response.created` named. A Codex body naming one keeps it, whatever the stream
+    /// says, and so does an Anthropic turn, whatever its `message_start` says.
+    #[tokio::test]
+    async fn a_streamed_codex_turn_with_no_request_model_is_filed_under_the_streams() {
+        let codex_url = spawn_fixed_origin(
+            "text/event-stream",
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-opening\"}}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+            ),
+        )
+        .await;
+        let anthropic_url = spawn_fixed_origin(
+            "text/event-stream",
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-served-5\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+        )
+        .await;
+        let manager = Manager::with_live_refresher(codex_fleet(&anthropic_url, &codex_url), None);
+        let codex = [
+            ("authorization", "Bearer client-own"),
+            ("content-type", "application/json"),
+        ];
+        let anthropic = [("content-type", "application/json")];
+        for (path, headers, body) in [
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                &codex[..],
+                r#"{"input":[]}"#,
+            ),
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                &codex[..],
+                r#"{"model":"gpt-6-requested","input":[]}"#,
+            ),
+            (
+                "/v1/messages",
+                &anthropic[..],
+                r#"{"model":"claude-opus-5","messages":[]}"#,
+            ),
+        ] {
+            let (status, bytes) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                path,
+                Some(loopback_peer()),
+                headers,
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        // Booked by the tee's detached task, which can finish after the client reads EOF.
+        let models = |idx: usize| -> Vec<String> {
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[idx]
+                .usage
+                .as_ref()
+                .map(|row| row.today_by_model.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let mut polls = 0u32;
+        while (models(0).is_empty() || models(1).len() < 2) && polls < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            polls += 1;
+        }
+        assert_eq!(
+            models(1),
+            ["gpt-6-astra", "gpt-6-requested"],
+            "bob's two Codex turns (polls: {polls})"
+        );
+        assert_eq!(
+            models(0),
+            ["claude-opus-5"],
+            "alice's Anthropic turn (polls: {polls})"
+        );
+    }
+
+    /// **A non-streamed Codex turn is booked with Codex's own field names.** Its body is a bare
+    /// Responses object, with no `response.completed` wrapper, and it used to be read with the
+    /// Anthropic names, which a Responses `usage` does not carry, so its cache reads were booked
+    /// as zero. The numbers are upstream's own fixture (`parses_cache_write_token_usage`): 40 of
+    /// the 100 input tokens read from the cache and 60 written to it.
+    #[tokio::test]
+    async fn a_non_streamed_codex_turn_books_its_cache_reads_and_writes() {
+        let codex_url = spawn_fixed_origin(
+            "application/json",
+            r#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-6-astra","output":[],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":60},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":110}}"#,
+        )
+        .await;
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        // Booked inline on this path, before the response is built: nothing to wait for.
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let bob = &snapshot.accounts[1];
+        assert_eq!(
+            (
+                bob.input_tokens,
+                bob.cache_read_tokens,
+                bob.cache_creation_tokens,
+                bob.output_tokens
+            ),
+            (100, 40, 60, 10),
+            "(input total, cache read, cache creation, output)"
+        );
+    }
+
+    /// **A non-streamed Codex turn whose request named no model is filed under the model its
+    /// Responses object names, and it mints no bound token.** The non-streamed twin of
+    /// `a_streamed_codex_turn_with_no_request_model_is_filed_under_the_streams`: a zstd request
+    /// body cannot be peeked for a model, so the response is the one place it is named. The
+    /// body's `resp_…` id is not an Anthropic message id, and no later request looks one up.
+    ///
+    /// Watched red, twice: file the turn under the request's model alone and it lands under
+    /// `"unknown"`; record the body's bound tokens for every provider again and `resp_1` is
+    /// recorded as a message id.
+    #[tokio::test]
+    async fn a_non_streamed_codex_turn_is_filed_under_its_responses_model_and_binds_nothing() {
+        let codex_url = spawn_fixed_origin(
+            "application/json",
+            r#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-6-astra","output":[],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}"#,
+        )
+        .await;
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
+        // zstd magic + junk: not JSON, so the request names no model tcr can read
+        let body: Vec<u8> = vec![
+            0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x58, 0x41, 0x00, 0x00, 0x7b, 0x7d,
+        ];
+        let (status, answer) = drive_bytes(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+                ("content-encoding", "zstd"),
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        // Booked inline on this path, before the response is built: nothing to wait for.
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let models: Vec<String> = snapshot.accounts[1]
+            .usage
+            .as_ref()
+            .map(|row| row.today_by_model.keys().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            models,
+            ["gpt-6-astra"],
+            "bob's Codex turn is filed under the model its Responses object names"
+        );
+        let bound = manager.bound_token_snapshot();
+        assert!(
+            bound.is_empty(),
+            "a Codex body's resp_ id is not a bound token: {bound:?}"
+        );
     }
 
     /// A Codex origin that refuses the FIRST request it sees, whoever's bearer it carries,

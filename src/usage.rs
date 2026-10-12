@@ -169,7 +169,9 @@ static QUOTA_INPUT_UNDERFLOWED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageRecord {
     pub ts_ms: i64,
-    /// `None` when the request body carried no `model` — buckets file it under
+    /// `None` when the request body carried no `model` and, for a Codex turn, neither did its
+    /// response, which is where tcr reads a zstd body's model: the stream's terminal event for a
+    /// streamed turn, the Responses object's top-level `model` otherwise — buckets file it under
     /// `"unknown"` and it prices as unpriced, never as free.
     pub model: Option<String>,
     pub session: Option<u64>,

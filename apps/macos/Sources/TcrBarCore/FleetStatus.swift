@@ -3423,7 +3423,7 @@ public struct Fleet: Equatable, Sendable {
     ///
     /// `nil` when no row was measured at all — the whole line is absent then.
     /// Also `nil` for a shape this build has no words for: an hour with no
-    /// price and no unpriced requests, which `src/usage.rs:293` cannot produce
+    /// price and no unpriced requests, which `Totals::to_wire` in `src/usage.rs` cannot produce
     /// (a null cost means `unpriced_requests >= requests > 0`).
     public var burnRateSegment: String? {
         guard hasUsage else { return nil }
