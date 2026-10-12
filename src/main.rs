@@ -44,7 +44,8 @@ struct Cli {
 enum Command {
     /// Run the proxy server (the default when no subcommand is given).
     Server(ServerArgs),
-    /// Run Claude Code through the proxy (launches it directly if we're not up).
+    /// Run Claude Code, or `codex` with `--codex`, through the proxy (launches it
+    /// directly if we're not up).
     Run(RunArgs),
     /// Authenticate a Claude account via the browser and add it to the config.
     Login(LoginArgs),
@@ -1354,7 +1355,10 @@ struct RunArgs {
     /// existing pin is Phase 2).
     #[arg(long)]
     group: Option<String>,
-    /// Args passed verbatim to `claude` (e.g. `tcr run -- -p "hi"`).
+    /// Launch `codex` instead of `claude`, routed through the proxy's Codex accounts.
+    #[arg(long)]
+    codex: bool,
+    /// Args passed verbatim to `claude`, or to `codex` with `--codex` (e.g. `tcr run -- -p "hi"`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -1396,7 +1400,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
-        Some(Command::Run(args)) => run_claude(args),
+        Some(Command::Run(args)) => run_harness(args),
         Some(Command::Login(args)) => run_login(args).await,
         Some(Command::Mint(args)) => run_mint(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
@@ -5842,12 +5846,12 @@ const TCR_CLAUDE_BIN_ENV: &str = "TCR_CLAUDE_BIN";
 /// See [`TCR_CLAUDE_BIN_ENV`].
 const CLAUDE_BIN_ENV: &str = "CLAUDE_BIN";
 
-/// Resolves which `claude` binary to launch, through the ordered pair of env
-/// keys documented at [`TCR_CLAUDE_BIN_ENV`]. Named generally — "harness",
-/// not "claude" — because a second external harness binary will need this
-/// exact resolution order later; that second binary is not built here, but
-/// the helper already takes its own key names and default so adding it is a
-/// new pair of constants and a one-line call, not a rewrite of this function.
+/// Resolves which harness binary to launch, through an ordered pair of env
+/// keys: the pair documented at [`TCR_CLAUDE_BIN_ENV`] for `claude`, and the
+/// one at [`TCR_CODEX_BIN_ENV`] for `codex`. Named generally — "harness",
+/// not "claude" — because both binaries need this exact resolution order, so
+/// each is a pair of constants and a one-line call rather than a copy of this
+/// function.
 fn resolve_harness_bin(specific_key: &str, legacy_key: &str, default: &str) -> String {
     resolve_harness_bin_from(
         std::env::var(specific_key).ok(),
@@ -5885,15 +5889,80 @@ fn claude_command() -> std::process::Command {
     std::process::Command::new(claude_bin())
 }
 
-/// `tcr run [-- args…]` — launch Claude Code already pointed at this proxy.
+/// `TCR_CODEX_BIN` overrides which `codex` binary `tcr run --codex` launches,
+/// taking priority over `CODEX_BIN`; neither set falls back to `codex` on
+/// `PATH`. The precedence and the empty-value-counts-as-unset rule are
+/// [`TCR_CLAUDE_BIN_ENV`]'s, through the same [`resolve_harness_bin`].
+const TCR_CODEX_BIN_ENV: &str = "TCR_CODEX_BIN";
+/// See [`TCR_CODEX_BIN_ENV`].
+const CODEX_BIN_ENV: &str = "CODEX_BIN";
+
+/// A fresh [`std::process::Command`] for the `codex` binary
+/// [`TCR_CODEX_BIN_ENV`] resolves to: [`claude_command`]'s twin for
+/// `tcr run --codex`.
+fn codex_command() -> std::process::Command {
+    std::process::Command::new(resolve_harness_bin(
+        TCR_CODEX_BIN_ENV,
+        CODEX_BIN_ENV,
+        "codex",
+    ))
+}
+
+/// `tcr run [--codex] [-- args…]` — launch Claude Code, or `codex` with
+/// `--codex`, already pointed at this proxy.
 ///
 /// Mirrors the JS `teamclaude run` passthrough contract: if the proxy is not
 /// listening we launch `claude` untouched, so a stopped proxy never breaks the
 /// shell alias.
-fn run_claude(args: RunArgs) -> anyhow::Result<()> {
+///
+/// `codex` is routed in see-through mode or not at all: it has no
+/// base-URL fallback, so a launch this function does not route through the
+/// pool is announced on stderr with the reason, never a silent bypass.
+fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let (config, _) = load_config(&config_path)?;
     let port = config.proxy.port;
+
+    // Ahead of everything below that can spawn a process, `claude --version` included.
+    refuse_group_with_codex(&args)?;
+    if args.codex {
+        let mut cmd = codex_command();
+        cmd.args(&args.args);
+        mark_run_active(&mut cmd);
+        if cli::proxy_is_up(port) {
+            match mitm::load_tls() {
+                Ok(assets)
+                    if assets
+                        .covered_hosts
+                        .iter()
+                        .any(|h| h.eq_ignore_ascii_case(mitm_codex_host())) =>
+                {
+                    match assets.ca_path.filter(|p| p.is_file()) {
+                        Some(ca) => apply_codex_see_through_env(&mut cmd, port, &ca),
+                        None => eprintln!(
+                            "[tcr] no readable CA for the MITM leaf — launching codex directly \
+                             (not pooled)"
+                        ),
+                    }
+                }
+                Ok(_) => eprintln!(
+                    "[tcr] the proxy's TLS leaf does not cover chatgpt.com yet (it is re-minted \
+                     on the next server start) — launching codex directly (not pooled). Restart \
+                     the proxy at a quiet moment, then retry."
+                ),
+                Err(err) => eprintln!(
+                    "[tcr] MITM TLS material unavailable ({err}) — launching codex directly \
+                     (not pooled)"
+                ),
+            }
+        } else {
+            eprintln!("[tcr] proxy not listening on :{port} — launching codex directly");
+        }
+        let status = cmd
+            .status()
+            .context("failed to launch `codex` — is it on PATH?")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     // `--group`: validate the name and the claude version BEFORE spawning
     // anything, in this order — a. name, b. version — so a typo or too-old
@@ -5964,6 +6033,16 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `--group` is a Claude Code mechanism (`ANTHROPIC_CUSTOM_HEADERS`); Codex has no custom-header
+/// env, so until the `[model_providers]` route lands this is refused rather than silently
+/// routing the session to the whole Codex pool.
+fn refuse_group_with_codex(args: &RunArgs) -> anyhow::Result<()> {
+    if args.codex && args.group.is_some() {
+        anyhow::bail!("--group is not supported with --codex yet; run without --group");
+    }
+    Ok(())
 }
 
 /// The oldest Claude Code that forwards `ANTHROPIC_CUSTOM_HEADERS` as a real
@@ -6226,6 +6305,39 @@ fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) 
         "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
         ca.display()
     );
+}
+
+/// SEE-THROUGH mode for `codex`, the only mode tcr routes it in. `codex` keeps
+/// its own backend URL, the real `https://chatgpt.com` for a login served there,
+/// and reaches it through us as a CONNECT proxy; while the pool holds a Codex
+/// account we MITM-terminate `chatgpt.com` with a leaf our CA signed, and
+/// `CODEX_CA_CERTIFICATE` is what makes `codex` trust that leaf. A login whose
+/// workspace is routed elsewhere (FedRAMP, data residency) is never pooled: tcr
+/// blind-tunnels another origin, and relays a request that names its routing on
+/// the client's own credential. Both proxy spellings for the reason
+/// [`apply_see_through_env`] gives. Nothing of Claude's is set: no
+/// `ANTHROPIC_BASE_URL`, no `NODE_EXTRA_CA_CERTS`, no capability defaults.
+fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
+    let proxy = format!("http://127.0.0.1:{port}");
+    cmd.env("HTTPS_PROXY", &proxy);
+    cmd.env("https_proxy", &proxy);
+    // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
+    // NODE_EXTRA_CA_CERTS means nothing to it.
+    cmd.env("CODEX_CA_CERTIFICATE", ca);
+    eprintln!(
+        "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {proxy}; a \
+         FedRAMP or residency-routed login runs on its own credential, unpooled"
+    );
+    eprintln!(
+        "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
+        ca.display()
+    );
+}
+
+/// The host the MITM leaf must cover for `tcr run --codex` to route `codex`
+/// through the pool.
+fn mitm_codex_host() -> &'static str {
+    teamclaude_rs::provider::CODEX_HOST
 }
 
 /// BASE-URL mode — the fallback, used when see-through material is unavailable.
@@ -7160,6 +7272,41 @@ mod tests {
         }
     }
 
+    /// `codex`'s see-through env: both proxy spellings, because a client that reads only the
+    /// one we skipped would go direct and bypass the pool in silence, and the CA in the one
+    /// variable Codex reads it from. Nothing of Claude's: `NODE_EXTRA_CA_CERTS` means nothing to
+    /// `codex`, and `ANTHROPIC_BASE_URL` has no business in its environment.
+    #[test]
+    fn codex_see_through_env_sets_proxy_and_ca_and_nothing_anthropic() {
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_see_through_env(&mut cmd, 3999, std::path::Path::new("/tmp/ca.pem"));
+        let env: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:3999")
+        );
+        assert_eq!(
+            env.get("https_proxy").map(String::as_str),
+            Some("http://127.0.0.1:3999")
+        );
+        assert_eq!(
+            env.get("CODEX_CA_CERTIFICATE").map(String::as_str),
+            Some("/tmp/ca.pem")
+        );
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!env.contains_key("NODE_EXTRA_CA_CERTS"));
+    }
+
     /// The re-entry marker must reach the child, and must not be named such that
     /// the wrapper it informs deletes it on the way.
     ///
@@ -7477,6 +7624,31 @@ mod tests {
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
         }
+    }
+
+    /// The [`RunArgs`] of a parsed `tcr run …`. `let … else` rather than a match arm that
+    /// formats the other variant: neither `Cli` nor `Command` implements Debug.
+    fn run_args_of(cli: Cli) -> RunArgs {
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected the parsed command to be `tcr run`");
+        };
+        args
+    }
+
+    /// `--group` works by setting `ANTHROPIC_CUSTOM_HEADERS`, which Claude Code turns into a
+    /// request header and `codex` ignores, so with `--codex` the session would quietly route to
+    /// the whole Codex pool. clap accepts the pair; the launcher has to refuse it before
+    /// anything is spawned.
+    #[test]
+    fn run_codex_with_group_is_a_usage_error() {
+        let err =
+            Cli::try_parse_from(["tcr", "run", "--codex", "--group", "g", "--", "exec", "hi"]);
+        // Parsing succeeds (clap cannot know), but run_harness must refuse before launching:
+        let args = match err {
+            Ok(cli) => cli,
+            Err(e) => panic!("{e}"),
+        };
+        assert!(refuse_group_with_codex(&run_args_of(args)).is_err());
     }
 
     /// Each flag alone still parses — the deprecated one is accepted, as promised
