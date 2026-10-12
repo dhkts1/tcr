@@ -1818,7 +1818,7 @@ mod fleet {
     }
     struct NeverProbes;
     impl UsageProber for NeverProbes {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: teamclaude_rs::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(ProbeError {
                     status: None,

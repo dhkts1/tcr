@@ -1403,9 +1403,10 @@ pub fn default_path() -> PathBuf {
 /// on-disk SHAPE of `accessToken`/`refreshToken` changes — never for an
 /// unrelated `Account` field — so a reader can always tell which shape it is
 /// holding before trying to interpret it. `1` is the only token shape that has
-/// ever existed: today's plaintext `accessToken`/`refreshToken` strings. A Codex
-/// row has that same shape, and is written at [`CODEX_CREDENTIAL_VERSION`] (see
-/// there).
+/// ever existed: today's plaintext `accessToken`/`refreshToken` strings. The one
+/// exception to "bumped only for a new shape" is a Codex row, written at
+/// [`CODEX_CREDENTIAL_VERSION`] with this same shape, so that a build that cannot
+/// tell providers apart refuses it instead of serving it (see there).
 ///
 /// Deliberately NOT an `Account` struct field: `Account` is constructed as a
 /// literal at several dozen call sites across the crate (tests, `oauth.rs`,
@@ -1420,17 +1421,32 @@ pub fn default_path() -> PathBuf {
 /// this crate does not model, and round-trips untouched like any other.
 const CREDENTIAL_VERSION: u64 = 1;
 
-/// The `credentialVersion` a CODEX row is written at, and the highest [`load`]
-/// accepts on one: 1, the same as [`CREDENTIAL_VERSION`].
+/// The `credentialVersion` a CODEX row is written at, and the one version above
+/// [`CREDENTIAL_VERSION`] that [`load`] accepts — on a Codex row only.
 ///
-/// A Codex row has version 1's token shape. This build must not serve a Codex row
-/// another build wrote at a higher version: its usage probe, keep-warm and plan
-/// backfill still send every row's bearer to Anthropic. Holding the version at 1
-/// makes [`load`] refuse such a row, the whole file and loudly, the way it refuses
-/// any version it does not understand. At 1, the raise [`needs_credential_stamp`]
-/// describes and the stamp [`with_codex_credential_versions`] applies change
-/// nothing.
-const CODEX_CREDENTIAL_VERSION: u64 = 1;
+/// A Codex row's token shape is version 1's (plaintext `accessToken` /
+/// `refreshToken`). What it needs is to be REFUSED, not served, by any build that
+/// cannot tell providers apart. Such a build — `main` before Codex accounts
+/// existed, and the `tcr` TcrBar bundles and supervises — has no `provider` field,
+/// so it reads a Codex row as a Claude account: from then on the OpenAI access
+/// token goes to api.anthropic.com on Claude traffic and to Anthropic's usage
+/// probe and warmer, and the OpenAI refresh token goes to Anthropic's token
+/// endpoint. The row is durable, too: a later restart on a newer build does not
+/// heal it, because that build also reads a row with no `provider` key as
+/// Anthropic. A build that has this version check (0.2.46 onward) refuses the
+/// WHOLE file on a version it does not understand, so its server refuses to
+/// start (`load_config` in `src/main.rs`) and leaves the file as it is: loud, and
+/// no token goes anywhere. This lane exists for exactly "a newer shape this build
+/// does not understand", so a Codex row carries 2. A build from before the check
+/// (0.2.45 and older) never reads the key and still serves the row as a Claude
+/// account; nothing in the file can stop it, which is why the import asks for
+/// every tcr that may start on the config to be updated first.
+///
+/// Anthropic rows keep [`CREDENTIAL_VERSION`], so an Anthropic-only file gains no
+/// new key and no new value, and every older build still loads it. The price is
+/// that importing a Codex login makes a pre-Codex proxy with the check refuse to
+/// start on the config until it is upgraded, which the import says.
+const CODEX_CREDENTIAL_VERSION: u64 = 2;
 
 /// The `credentialVersion` a row of `provider` is written at, and the highest
 /// [`load`] accepts on one. One exhaustive `match`, so a third provider cannot be
@@ -1446,7 +1462,7 @@ fn credential_version_for(provider: crate::provider::Provider) -> u64 {
 /// (on disk, or an `Account`'s `extra` in memory).
 ///
 /// An absent key always needs its provider's version, as it always did. A row
-/// whose provider is written above [`CREDENTIAL_VERSION`] (none, in this build) also
+/// whose provider is written above [`CREDENTIAL_VERSION`] (a Codex row) also
 /// needs it when it carries a SMALLER number: a row an earlier build wrote at 1,
 /// or one copied by hand from an Anthropic row (every saved row carries 1), is
 /// exactly the row an older build would serve. Anything else already present is
@@ -1528,7 +1544,7 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 ///
 /// Checks every account's `credentialVersion` before anything else touches
 /// the entry — see [`CREDENTIAL_VERSION`] — backfilling an absent key in the
-/// document (`1`, a Codex row's `CODEX_CREDENTIAL_VERSION` included) and
+/// document (`1`, or `2` on a Codex row: `CODEX_CREDENTIAL_VERSION`) and
 /// refusing the whole file on a version number this build does not understand
 /// for that row's provider.
 ///
@@ -1640,10 +1656,11 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     // [`CREDENTIAL_VERSION`]'s doc-comment for why this lives here rather than
     // on `Account`.
     //
-    // What this build understands is per ROW, its provider's version: up to 1
-    // on every row, a Codex row included ([`CODEX_CREDENTIAL_VERSION`] says
-    // why), with the row's provider read the way every matcher over the raw
-    // document reads it. A provider this build does not know gets the Anthropic
+    // What this build understands is per ROW: up to 2 on a Codex row, up to 1
+    // on every other ([`CODEX_CREDENTIAL_VERSION`] says why), with the row's
+    // provider read the way every matcher over the raw document reads it. A
+    // Codex row below 2 is raised to it here, as the stamp every writer applies
+    // would raise it. A provider this build does not know gets the Anthropic
     // ceiling and no stamp: the typed parse below refuses the file over that
     // provider anyway.
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
@@ -1948,12 +1965,11 @@ pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     )
 }
 
-/// `config` with the `credentialVersion` of every account whose provider is
-/// written above [`CREDENTIAL_VERSION`] stamped (see [`stamp_credential_version`];
-/// no provider is, in this build: see [`CODEX_CREDENTIAL_VERSION`]), for the two
-/// writers that serialize the whole snapshot, [`save`] and [`save_settings`].
-/// Borrowed unchanged when no account needs a stamp, which is every config in
-/// this build: a row written from memory keeps whatever its `extra` held.
+/// `config` with every Codex account's `credentialVersion` stamped (see
+/// [`stamp_credential_version`]), for the two writers that serialize the whole
+/// snapshot, [`save`] and [`save_settings`]. Borrowed unchanged when no Codex
+/// account needs a stamp, which is every Anthropic-only config: an Anthropic row
+/// written from memory keeps whatever its `extra` held, as before.
 ///
 /// The merge writers stamp the rows they touch; these two serialize accounts
 /// straight from memory, where a Codex row can carry no version at all — one the
@@ -2666,10 +2682,10 @@ fn merge_tokens(
         // nothing else in the live path does — see [`CREDENTIAL_VERSION`]'s
         // doc-comment — at the version of the account's own provider: the
         // pairing above never crosses providers, so it is the entry's too.
-        // Backfill only: no provider is written above 1 in this build, so
-        // [`needs_credential_stamp`] raises nothing. A number above the
-        // provider's is never touched, so this can never paper over the refusal
-        // `load` performs on an unknown future version.
+        // Backfill only, except that a Codex entry below its version is raised
+        // (see [`needs_credential_stamp`]); a number above the provider's is
+        // never touched, so this can never paper over the refusal `load`
+        // performs on an unknown future version.
         stamp_credential_version(object, fresh.provider);
         if let Some(seen) = placed.get_mut(position) {
             *seen = true;
@@ -3980,7 +3996,7 @@ fn merge_account(
             // here, at its provider's version, rather than leave a brand-new
             // account the one entry the read path has to backfill. A new Codex
             // row is therefore at [`CODEX_CREDENTIAL_VERSION`] from its first
-            // write.
+            // write, which is what keeps an older proxy from ever serving it.
             if let Value::Object(fields) = &mut new_entry {
                 stamp_credential_version(fields, account.provider);
             }
@@ -4202,15 +4218,13 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    // --- credentialVersion: a Codex row is held at 1 -------------------------
+    // --- credentialVersion 2: a Codex row is refused by every older build ----
 
-    /// A Codex row at `credentialVersion` 2 is refused like any version this build
-    /// does not understand: the whole file, naming the row and the version. This
-    /// build must not serve one, because its usage probe, keep-warm and plan
-    /// backfill would send the row's bearer to Anthropic.
+    /// A Codex row at `credentialVersion` 2, which every Codex row is written at,
+    /// loads, and a whole-file save keeps it at 2.
     #[test]
-    fn a_codex_row_at_credential_version_2_is_refused() {
-        let path = tmp_path("cred-version-codex-2-refused");
+    fn a_codex_row_at_credential_version_2_loads() {
+        let path = tmp_path("cred-version-codex-2");
         fs::write(
             &path,
             r#"{ "accounts": [
@@ -4220,16 +4234,270 @@ mod tests {
         )
         .unwrap();
 
-        let err = load(&path).expect_err("a Codex row at credentialVersion 2 must refuse to load");
+        let config = load(&path).expect("a Codex row at credentialVersion 2 must load");
+        assert_eq!(
+            config.accounts[0].provider,
+            crate::provider::Provider::Codex
+        );
+        let saved = tmp_path("cred-version-codex-2-saved");
+        save(&saved, &config).unwrap();
+        assert_eq!(
+            read_json(&saved)["accounts"][0]["credentialVersion"],
+            json!(2)
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&saved).ok();
+    }
+
+    /// 2 is a Codex row's version, not a general "newer" one: an Anthropic row
+    /// carrying it is refused exactly as before, even in a file where the Codex
+    /// row beside it legitimately carries 2.
+    #[test]
+    fn a_version_2_anthropic_row_is_refused_even_beside_a_codex_row() {
+        let path = tmp_path("cred-version-anthropic-2");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "bob@example.com", "provider": "codex", "accessToken": "at-b",
+                   "credentialVersion": 2 },
+                 { "name": "alice@example.com", "accessToken": "at-a", "credentialVersion": 2 }
+               ] }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("an Anthropic row at credentialVersion 2 must refuse");
         let message = err.to_string();
         assert!(
             message.contains("alice@example.com")
                 && message.contains("credentialVersion 2")
                 && message.contains("up to 1"),
-            "error should name the Codex row, its version and what it may carry: {message}"
+            "error should name the Anthropic row, its version and what it may carry: {message}"
         );
 
         fs::remove_file(&path).ok();
+    }
+
+    /// Above 2 is refused on a Codex row too: 2 is the newest shape this build
+    /// understands for any row.
+    #[test]
+    fn credential_version_3_is_refused_on_a_codex_row() {
+        let path = tmp_path("cred-version-codex-3");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "alice@example.com", "provider": "codex", "accessToken": "at-a",
+                   "credentialVersion": 3 }
+               ] }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("credentialVersion 3 must refuse even on a Codex row");
+        let message = err.to_string();
+        assert!(
+            message.contains("alice@example.com") && message.contains("credentialVersion 3"),
+            "error should name the account and the unknown version: {message}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `save_account` writes a Codex row at 2 on both of its arms: the Added arm (a
+    /// first import) and the Updated arm (a re-import over a row that carries no
+    /// version). The Anthropic row it does not touch gains nothing.
+    #[test]
+    fn save_account_writes_a_codex_row_at_credential_version_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-anthropic" },
+                { "name": "bob@example.com", "provider": "codex", "accessToken": "at-old",
+                  "accountUuid": "22222222-2222-4222-8222-222222222222" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let mut bob = account_fixture("bob@example.com");
+        bob.provider = crate::provider::Provider::Codex;
+        bob.account_uuid = Some("22222222-2222-4222-8222-222222222222".to_string());
+        assert_eq!(save_account(&path, &bob).unwrap(), AccountWrite::Updated);
+
+        let mut carol = account_fixture("carol@example.com");
+        carol.provider = crate::provider::Provider::Codex;
+        carol.account_uuid = Some("11111111-1111-4111-8111-111111111111".to_string());
+        assert_eq!(save_account(&path, &carol).unwrap(), AccountWrite::Added);
+
+        let after = read_json(&path);
+        assert_eq!(
+            after["accounts"][1]["credentialVersion"],
+            json!(2),
+            "the Updated arm writes a Codex row at 2: {after}"
+        );
+        assert_eq!(
+            after["accounts"][2]["credentialVersion"],
+            json!(2),
+            "the Added arm writes a Codex row at 2: {after}"
+        );
+        assert!(
+            after["accounts"][0].get("credentialVersion").is_none(),
+            "an Anthropic row neither write touched gains nothing: {after}"
+        );
+    }
+
+    /// The live persist path — `merge_tokens`, under every token rotation — stamps a
+    /// Codex entry it writes at 2, and an Anthropic entry at 1 as it always did.
+    #[test]
+    fn a_token_persist_stamps_a_codex_entry_at_credential_version_2() {
+        let path = tmp_path("persist-credential-version-codex");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "alice@example.com", "accessToken": "at-a-old" },
+                   { "name": "bob@example.com", "provider": "codex", "accessToken": "at-b-old" } ] }"#,
+        )
+        .unwrap();
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "alice@example.com", "accessToken": "at-a-new" },
+                   { "name": "bob@example.com", "provider": "codex", "accessToken": "at-b-new" } ] }"#,
+        )
+        .unwrap();
+
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(value["accounts"][1]["accessToken"], json!("at-b-new"));
+        assert_eq!(
+            value["accounts"][1]["credentialVersion"],
+            json!(2),
+            "a persisted Codex entry must carry 2: {value}"
+        );
+        assert_eq!(
+            value["accounts"][0]["credentialVersion"],
+            json!(1),
+            "an Anthropic entry is stamped 1, as before: {value}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A Codex row loaded with no version key is backfilled to 2, not 1, so the
+    /// next whole-file save writes the version older builds refuse.
+    #[test]
+    fn a_loaded_codex_row_with_no_version_is_backfilled_to_2() {
+        let path = tmp_path("cred-version-codex-missing");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "alice@example.com", "provider": "codex", "accessToken": "at-a" },
+                 { "name": "bob@example.com", "accessToken": "at-b" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(
+            config.accounts[0].extra.get("credentialVersion"),
+            Some(&json!(2)),
+            "a Codex row is backfilled to 2"
+        );
+        assert_eq!(
+            config.accounts[1].extra.get("credentialVersion"),
+            Some(&json!(1)),
+            "an Anthropic row is backfilled to 1, as before"
+        );
+        let saved = tmp_path("cred-version-codex-missing-saved");
+        save(&saved, &config).unwrap();
+        assert_eq!(
+            read_json(&saved)["accounts"][0]["credentialVersion"],
+            json!(2)
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&saved).ok();
+    }
+
+    /// A Codex row at 1 — written before Codex rows carried 2, or copied by hand
+    /// from an Anthropic row, which every saved file stamps 1 — is raised to 2, by
+    /// the load and by the first token persist that touches it. Left at 1 it is
+    /// exactly the row an older build serves as a Claude account. The Anthropic row
+    /// beside it keeps its 1.
+    #[test]
+    fn a_codex_row_at_credential_version_1_is_raised_to_2() {
+        let path = tmp_path("cred-version-codex-1");
+        let file = r#"{ "accounts": [
+                 { "name": "alice@example.com", "provider": "codex", "accessToken": "at-a",
+                   "credentialVersion": 1 },
+                 { "name": "bob@example.com", "accessToken": "at-b", "credentialVersion": 1 }
+               ] }"#;
+        fs::write(&path, file).unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(
+            config.accounts[0].extra.get("credentialVersion"),
+            Some(&json!(2)),
+            "the load raises a Codex row to 2"
+        );
+        assert_eq!(
+            config.accounts[1].extra.get("credentialVersion"),
+            Some(&json!(1))
+        );
+
+        // The disk still says 1 until a write touches the row: a rotation does.
+        save_tokens(&path, &config).unwrap();
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["credentialVersion"],
+            json!(2),
+            "a persist raises a Codex entry to 2: {value}"
+        );
+        assert_eq!(value["accounts"][1]["credentialVersion"], json!(1));
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// The two writers that serialize the whole snapshot stamp a Codex account
+    /// whose `extra` carries no version — a row the server added live, or a first
+    /// login's fresh file — and leave an Anthropic account exactly as before (no
+    /// key added).
+    #[test]
+    fn whole_file_writers_stamp_a_codex_account_built_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Config = serde_json::from_str("{}").unwrap();
+        config.accounts.push(account_fixture("alice@example.com"));
+        let mut bob = account_fixture("bob@example.com");
+        bob.provider = crate::provider::Provider::Codex;
+        config.accounts.push(bob);
+
+        let saved = dir.path().join("saved.json");
+        save(&saved, &config).unwrap();
+        let value = read_json(&saved);
+        assert_eq!(
+            value["accounts"][1]["credentialVersion"],
+            json!(2),
+            "save writes the Codex account at 2: {value}"
+        );
+        assert!(
+            value["accounts"][0].get("credentialVersion").is_none(),
+            "save leaves the Anthropic account as it always was: {value}"
+        );
+
+        // `save_settings` falls back to `save` when there is no file to read, so
+        // give it one: this pins its own serialization, not the fallback.
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, r#"{ "accounts": [] }"#).unwrap();
+        save_settings(&settings, &config).unwrap();
+        let value = read_json(&settings);
+        assert_eq!(
+            value["accounts"][1]["credentialVersion"],
+            json!(2),
+            "save_settings writes the Codex account at 2: {value}"
+        );
+        assert!(
+            value["accounts"][0].get("credentialVersion").is_none(),
+            "save_settings leaves the Anthropic account as it always was: {value}"
+        );
     }
 
     // --- load: skip unusable accounts, keep the rest -------------------------

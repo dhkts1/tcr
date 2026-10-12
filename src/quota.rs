@@ -678,11 +678,12 @@ impl Quota {
     /// equivalent of. A 2xx that carried a window, from either slot, means this account is
     /// being served (`allowed`). A 429 carrying `x-codex-rate-limit-reached-type`
     /// ([`is_codex_quota_refusal`]) means it is not (`rejected`, which `select()` treats as a
-    /// hard fail, so no 2xx follows to clear it). Nothing clears a Codex `rejected` yet: no
-    /// Codex usage probe exists in this build, so it stands until the process restarts. Once
-    /// one does, `drop_rejection_if_a_window_rolled` lifts it when a probe sees the window
-    /// roll, as it does for Anthropic. Anything else, a 429 without that header included,
-    /// leaves `status` as it was.
+    /// hard fail, so no 2xx follows to clear it). The Codex usage probe
+    /// ([`crate::codex_probe`]) is what clears it, as the Anthropic probe clears an Anthropic
+    /// rejection: its reading is folded through [`Self::apply_usage`], and
+    /// `drop_rejection_if_a_window_rolled` drops the `rejected` once a probed window's
+    /// utilization falls below the one stored, which is the window rolling. Anything else, a
+    /// 429 without that header included, leaves `status` as it was.
     ///
     /// The headers are READ here and then stripped, as Anthropic's are: `proxy::build_response`
     /// drops [`CODEX_QUOTA_HEADERS`] from a pooled serve (`proxy::is_account_scoped`), since
@@ -1862,8 +1863,8 @@ mod tests {
         assert!(q2.five_hour.is_none());
     }
 
-    /// The shape the real backend sends, measured 2026-10-12 on a Pro plan with the
-    /// login exhausted and again at 0%: ONLY the weekly window, in the PRIMARY slot,
+    /// The shape the real backend sends, measured 2026-10-12 on two Pro logins, one
+    /// exhausted and one idle: ONLY the weekly window, in the PRIMARY slot,
     /// and no secondary at all. Length mapping lands it in `seven_day` (by position
     /// it would have filled `five_hour` with a weekly number and a weekly reset); no
     /// five-hour window was read, so the method answers `false`; and the status still

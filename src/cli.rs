@@ -2450,13 +2450,8 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
     let config = load_config(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
     warn_if_no_accounts(&config);
-    let snapshot = snapshot_offline(
-        config,
-        Arc::new(NoRefresh),
-        Arc::new(LiveUsageProber::new()),
-        probe,
-    )
-    .await;
+    let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
+    let snapshot = snapshot_offline(config, Arc::new(NoRefresh), Arc::new(prober), probe).await;
     // `tcr accounts` is the offline verb by construction — it builds its own
     // Manager and never asks the server — so its serving counters are structurally
     // zero and must render as unmeasured, not as a measurement.
@@ -2861,13 +2856,9 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                     .as_ref()
                     .map(|c| c.name().to_string());
                 let group_colors = config.group_colors();
-                let snapshot = snapshot_offline(
-                    config,
-                    Arc::new(NoRefresh),
-                    Arc::new(LiveUsageProber::new()),
-                    true,
-                )
-                .await;
+                let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
+                let snapshot =
+                    snapshot_offline(config, Arc::new(NoRefresh), Arc::new(prober), true).await;
                 (
                     StatusSource::Offline,
                     None,
@@ -4849,7 +4840,7 @@ mod tests {
         util: f64,
     }
     impl UsageProber for FixedProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let util = self.util;
             Box::pin(async move {
                 Ok(Usage {
@@ -5641,7 +5632,7 @@ mod tests {
     /// [`NoRefresh`] has declined to refresh it.
     struct RejectingProber;
     impl UsageProber for RejectingProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(crate::probe::ProbeError {
                     status: Some(401),
@@ -5833,10 +5824,10 @@ mod tests {
     /// 7d threshold, each with a future reset — so both windows read as held.
     struct WindowProber;
     impl UsageProber for WindowProber {
-        fn probe(&self, access_token: String) -> ProbeFuture {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let now = crate::now_ms();
             Box::pin(async move {
-                if access_token == "at-a" {
+                if credential.access_token == "at-a" {
                     Ok(Usage {
                         five_hour: Some(UsageBucket {
                             utilization: Some(0.95),
@@ -5930,10 +5921,10 @@ mod tests {
     /// invisible case).
     struct BelowThresholdWindowProber;
     impl UsageProber for BelowThresholdWindowProber {
-        fn probe(&self, access_token: String) -> ProbeFuture {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let now = crate::now_ms();
             Box::pin(async move {
-                if access_token == "at-a" {
+                if credential.access_token == "at-a" {
                     Ok(Usage {
                         five_hour: Some(UsageBucket {
                             utilization: Some(0.3),
@@ -6141,7 +6132,7 @@ mod tests {
     /// exhaustion line, with a future reset — so the window binds and reads `spent`.
     struct ExhaustedProber;
     impl UsageProber for ExhaustedProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let now = crate::now_ms();
             Box::pin(async move {
                 Ok(Usage {

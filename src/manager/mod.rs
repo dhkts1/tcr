@@ -1617,10 +1617,11 @@ impl Manager {
     /// Convenience constructor for the real binary (live OAuth refresher + live
     /// usage prober).
     pub fn with_live_refresher(config: Config, config_path: Option<PathBuf>) -> Arc<Self> {
+        let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
         Self::new(
             config,
             Arc::new(LiveRefresher::new()),
-            Arc::new(LiveUsageProber::new()),
+            Arc::new(prober),
             Arc::new(LiveWarmer::new()),
             config_path,
         )
@@ -1634,10 +1635,11 @@ impl Manager {
     pub fn from_runtimes(accounts: Vec<AccountRuntime>) -> Arc<Self> {
         let config: Config = serde_json::from_str("{}")
             .expect("an empty JSON object is always a valid default config");
+        let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
         Self::assemble(
             config,
             Arc::new(LiveRefresher::new()),
-            Arc::new(LiveUsageProber::new()),
+            Arc::new(prober),
             Arc::new(LiveWarmer::new()),
             None,
             accounts,
@@ -3843,7 +3845,7 @@ mod tests {
 
     struct NoProber;
     impl UsageProber for NoProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(ProbeError {
                     status: None,
@@ -3860,8 +3862,8 @@ mod tests {
         ok_token: String,
     }
     impl UsageProber for ScriptedProber {
-        fn probe(&self, access_token: String) -> ProbeFuture {
-            let ok = access_token == self.ok_token;
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            let ok = credential.access_token == self.ok_token;
             Box::pin(async move {
                 if ok {
                     Ok(Usage {
@@ -3896,7 +3898,7 @@ mod tests {
     }
 
     impl UsageProber for RetryAfterProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(ProbeError {
@@ -3908,7 +3910,7 @@ mod tests {
         }
     }
     impl UsageProber for FirstOkThen429Prober {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if n == 0 {
@@ -3940,7 +3942,7 @@ mod tests {
     /// `five_hour.is_some()` would leave such an account warm-INELIGIBLE forever.
     struct ColdOkProber;
     impl UsageProber for ColdOkProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Ok(Usage {
                     five_hour: None,
@@ -4465,6 +4467,311 @@ mod tests {
         manager.probe_account(0).await;
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A prober that records the credential of every probe and answers an empty
+    /// success, so a test reads exactly what [`Manager::probe_account`] built.
+    struct RecordingProber {
+        seen: Arc<Mutex<Vec<crate::probe::ProbeCredential>>>,
+    }
+
+    impl UsageProber for RecordingProber {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            self.seen
+                .lock()
+                .expect("seen lock poisoned")
+                .push(credential);
+            Box::pin(async { Ok(Usage::default()) })
+        }
+    }
+
+    /// **A probe names the account it is for, not just the bearer it pays with.** The
+    /// provider picks the usage endpoint, and a Codex probe must also send its ChatGPT
+    /// account id in `chatgpt-account-id`, which is the row's `account_uuid`. An Anthropic
+    /// row and a Codex row are probed, so each provider's credential is pinned beside the
+    /// other's.
+    ///
+    /// Watched red: build the credential with `account_id: None` and the Codex row's
+    /// account id is missing.
+    #[tokio::test]
+    async fn a_probe_credential_names_the_accounts_provider_and_account_uuid() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let anthropic = Account {
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com", 1)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![anthropic, codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RecordingProber {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        // The Anthropic row's plan backfill would otherwise ask the live profile endpoint.
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        manager.probe_account(0).await;
+        manager.probe_account(1).await;
+
+        let seen: Vec<_> = seen
+            .lock()
+            .expect("seen lock poisoned")
+            .iter()
+            .map(|c| (c.provider, c.access_token.clone(), c.account_id.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    crate::provider::Provider::Anthropic,
+                    "at-alice@example.com".to_string(),
+                    Some("11111111-1111-4111-8111-111111111111".to_string()),
+                ),
+                (
+                    crate::provider::Provider::Codex,
+                    "at-bob@example.com".to_string(),
+                    Some("22222222-2222-4222-8222-222222222222".to_string()),
+                ),
+            ],
+            "each probe carries its own row's provider, bearer and account id"
+        );
+    }
+
+    /// **A row that is gone yields no credential, never an Anthropic one.** The provider
+    /// picks the usage endpoint, so a credential built on the default provider would send the
+    /// bearer to Anthropic's, whichever provider issued it. No row can vanish today, so this
+    /// pins the fallback rather than a path: an index past the end builds nothing, and
+    /// `probe_account` stands down on that (read, not driven: its token read already returns
+    /// early for such an index). The row that is there is the control.
+    ///
+    /// Watched red: fall back to `Provider::default()` and the index past the end gets an
+    /// Anthropic credential.
+    #[test]
+    fn a_row_that_is_gone_yields_no_probe_credential() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager(config_with(vec![codex]), lock_refresher());
+        let gone = manager.probe_credential(1, "at-bob@example.com".to_string());
+        assert!(
+            gone.is_none(),
+            "an index past the end has no provider to pick an endpoint by: {gone:?}"
+        );
+        let control = manager
+            .probe_credential(0, "at-bob@example.com".to_string())
+            .expect("control: the row that is there yields its credential");
+        assert_eq!(control.provider, crate::provider::Provider::Codex);
+        assert_eq!(
+            control.account_id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+    }
+
+    /// **A Codex account is never asked the Anthropic profile endpoint for its plan.** That
+    /// endpoint is the backfill's only source, so asking it for a Codex row hands an OpenAI
+    /// bearer to the wrong provider; and since no plan ever comes back, the once-per-account
+    /// gate never closes and it would be asked again on every probe. The Anthropic row in
+    /// the same fleet is still asked, so the skip is the provider and not a backfill that
+    /// stopped running.
+    ///
+    /// Watched red: drop the Codex early return in `backfill_plan_if_unknown` and the plan
+    /// prober is asked for the Codex row.
+    #[tokio::test]
+    async fn a_codex_account_is_never_asked_the_anthropic_profile_for_its_plan() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 1)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(NoProber),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::clone(&calls),
+        }));
+
+        manager.probe_account(1).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the Codex row must never reach the Anthropic profile endpoint"
+        );
+
+        manager.probe_account(0).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "control: the Anthropic row is still asked"
+        );
+    }
+
+    /// **A Codex `rejected` is lifted by a probe that sees its window roll**, the path an
+    /// Anthropic rejection already takes ([`crate::quota::Quota::apply_usage`]). A Codex
+    /// quota refusal, a 429 carrying `x-codex-rate-limit-reached-type`, marks the account
+    /// `rejected`; `select()` treats that as terminal, so no served response comes back to
+    /// clear it, and before the Codex probe it stood until the process restarted.
+    ///
+    /// End to end from the production constructor: `with_live_refresher` points the live
+    /// prober at the configured `codexUpstream` (a local stub here), the Codex arm sends the
+    /// row's bearer and `chatgpt-account-id`, and the measured weekly-only payload (the
+    /// weekly window in the PRIMARY slot, at 2% once it has rolled) lands in `seven_day`,
+    /// the window the refusal left at 100%.
+    ///
+    /// The prober's Codex base is checked before anything probes, so a regressed wiring
+    /// fails here, offline, instead of sending the fixture bearer to the real backend.
+    ///
+    /// Watched red, one break at a time: drop the `with_codex_base` chain from
+    /// `with_live_refresher` and the prober's base is the real backend's, caught before any
+    /// probe; map the payload by position and the 2% lands in `five_hour`, the stored weekly
+    /// 100% never falls, and the account stays rejected.
+    #[tokio::test]
+    async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let usage_endpoint = axum::Router::new().route(
+            crate::provider::CODEX_USAGE_PATH,
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    recorder
+                        .lock()
+                        .expect("recorder lock poisoned")
+                        .push((header("authorization"), header("chatgpt-account-id")));
+                    axum::Json(serde_json::json!({
+                        "plan_type": "pro",
+                        "rate_limit": {
+                            "allowed": true,
+                            "limit_reached": false,
+                            "primary_window": {
+                                "used_percent": 2,
+                                "limit_window_seconds": 604_800,
+                                "reset_after_seconds": 604_000,
+                                "reset_at": now + 604_000,
+                            },
+                            "secondary_window": null,
+                        },
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the usage stub");
+        let codex_upstream = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, usage_endpoint).await;
+        });
+
+        let mut config = config_with(vec![Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com", 0)
+        }]);
+        config.codex_upstream = codex_upstream.clone();
+        let manager = Manager::with_live_refresher(config, None);
+        assert_eq!(
+            manager.prober.codex_base(),
+            Some(codex_upstream.as_str()),
+            "the live prober must probe Codex at the configured codexUpstream"
+        );
+        // The backfill skips a Codex row; should that ever break, this keeps the live
+        // profile endpoint out of the test.
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let codex_request = || {
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                crate::provider::CODEX_RESPONSES_PATH,
+                None,
+            )
+        };
+
+        // The refusal: the weekly window spent, reported in the primary slot.
+        let mut refusal = reqwest::header::HeaderMap::new();
+        refusal.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        refusal.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        refusal.insert(
+            "x-codex-primary-reset-at",
+            (now + 3600).to_string().parse().unwrap(),
+        );
+        refusal.insert(
+            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            "primary".parse().unwrap(),
+        );
+        manager.update_quota(0, &refusal, 429);
+        assert_eq!(
+            manager.accounts.read().expect("accounts lock poisoned")[0]
+                .quota
+                .status
+                .as_deref(),
+            Some("rejected"),
+            "precondition: the refusal marked the account rejected"
+        );
+        assert_eq!(
+            codex_request(),
+            None,
+            "precondition: a rejected account serves nothing"
+        );
+
+        manager.probe_account(0).await;
+
+        assert_eq!(
+            seen.lock().expect("recorder lock poisoned").clone(),
+            vec![(
+                Some("Bearer at-bob@example.com".to_string()),
+                Some("22222222-2222-4222-8222-222222222222".to_string()),
+            )],
+            "one probe, at the configured upstream, with the row's bearer and account id"
+        );
+        let account = manager.accounts.read().expect("accounts lock poisoned")[0].clone();
+        assert_eq!(
+            account.quota.status, None,
+            "the weekly window rolled, so the rejection recorded against it is stale"
+        );
+        assert_eq!(
+            codex_request(),
+            Some(0),
+            "and the account is back in rotation"
+        );
+        let weekly = account.quota.seven_day.expect("the probe's weekly reading");
+        assert!(
+            (weekly.utilization - 0.02).abs() < 1e-9,
+            "the probe's 2% replaced the refusal's 100%, got {}",
+            weekly.utilization
+        );
+        assert!(
+            account.quota.five_hour.is_none(),
+            "the payload carried no five-hour window, so none may be invented"
+        );
     }
 
     /// A unique temp path per test — the suite runs tests in parallel threads of
@@ -7936,7 +8243,7 @@ mod tests {
         status: u16,
     }
     impl UsageProber for AlwaysStatusProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let status = self.status;
             Box::pin(async move {
                 Err(ProbeError {
@@ -8035,7 +8342,7 @@ mod tests {
             state: Arc<std::sync::Mutex<usize>>,
         }
         impl UsageProber for FlakyProber {
-            fn probe(&self, _access_token: String) -> ProbeFuture {
+            fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
                 let mut n = self.state.lock().expect("lock poisoned");
                 *n += 1;
                 // 5xx, 5xx, OK, 5xx, 5xx — never THREE in a row.
@@ -8133,7 +8440,7 @@ mod tests {
     async fn probe_transport_failure_is_visible_error() {
         struct NetFailProber;
         impl UsageProber for NetFailProber {
-            fn probe(&self, _access_token: String) -> ProbeFuture {
+            fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
                 Box::pin(async {
                     Err(ProbeError {
                         status: None,
@@ -12555,6 +12862,46 @@ mod tests {
             manager.warm_targets(),
             vec![1],
             "an at/over-threshold account is not a warm target"
+        );
+    }
+
+    /// **A Codex account is never a keep-warm target.** A warm is an Anthropic inference
+    /// request: `warm_account` POSTs `/v1/messages` to the Anthropic `upstream` with the
+    /// row's bearer, so warming a Codex row would hand its OpenAI bearer to Anthropic, and
+    /// on the right host would spend a real Codex turn. The Codex row here is otherwise an
+    /// ideal target (probed, cold, idle) and the Anthropic row in the same state is warmed,
+    /// so the exclusion is the provider and nothing else.
+    ///
+    /// Watched red: drop the provider filter in `warm_targets` and the Codex row is listed
+    /// and its bearer warmed.
+    #[tokio::test]
+    async fn warm_targets_never_lists_a_codex_account() {
+        let warmed = Arc::new(Mutex::new(Vec::new()));
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager_with_warmer(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RecordingWarmer {
+                warmed: Arc::clone(&warmed),
+            }),
+        );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "only the Anthropic row is a keep-warm target"
+        );
+        manager.warm_all().await;
+        assert_eq!(
+            warmed.lock().expect("warmed lock poisoned").clone(),
+            vec!["at-alice@example.com".to_string()],
+            "no warm request ever carries the Codex row's bearer"
         );
     }
 

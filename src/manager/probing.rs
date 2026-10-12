@@ -204,14 +204,20 @@ impl Manager {
         let Some(token) = self.access_token(idx) else {
             return;
         };
+        let Some(credential) = self.probe_credential(idx, token) else {
+            return;
+        };
 
-        let result = self.prober.probe(token).await;
+        let result = self.prober.probe(credential).await;
         let result = match result {
             Err(err) if err.status == Some(401) => {
                 // Token rejected: force a refresh and retry once with the new one.
                 self.ensure_fresh_force(idx).await;
-                match self.access_token(idx) {
-                    Some(fresh) => self.prober.probe(fresh).await,
+                match self
+                    .access_token(idx)
+                    .and_then(|fresh| self.probe_credential(idx, fresh))
+                {
+                    Some(credential) => self.prober.probe(credential).await,
                     None => Err(err),
                 }
             }
@@ -271,6 +277,26 @@ impl Manager {
         }
     }
 
+    /// What [`Self::probe_account`] hands the prober for account `idx`: `access_token`, plus
+    /// the provider that picks the usage endpoint and the account id a Codex probe sends as
+    /// its `chatgpt-account-id`.
+    ///
+    /// `None` for a row that no longer exists, and the probe stands down. Without the row there
+    /// is no provider to pick the endpoint by, and the default one, Anthropic, would receive
+    /// the bearer whichever provider issued it. No row can vanish today (nothing shrinks the
+    /// account vector), so this closes a path rather than fixing one.
+    pub(super) fn probe_credential(
+        &self,
+        idx: usize,
+        access_token: String,
+    ) -> Option<crate::probe::ProbeCredential> {
+        Some(crate::probe::ProbeCredential {
+            provider: self.provider(idx)?,
+            access_token,
+            account_id: self.account_uuid(idx),
+        })
+    }
+
     /// Learn account `idx`'s plan ONCE, from the profile endpoint, using the
     /// token the probe loop already has in hand — then record it on the runtime
     /// row and persist it through [`config::save_plan`].
@@ -305,6 +331,12 @@ impl Manager {
     ///    process's lifetime, so the panel shows it now and the write is retried
     ///    on the next restart.
     async fn backfill_plan_if_unknown(&self, idx: usize) {
+        // A Codex account's plan is a claim in its id token, read when the codex CLI's login is
+        // imported. The profile endpoint asked below is Anthropic's and has no Codex twin:
+        // asking it would only hand a Codex bearer to the wrong provider.
+        if self.provider(idx) == Some(crate::provider::Provider::Codex) {
+            return;
+        }
         let (already_known, token) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             let Some(account) = accounts.get(idx) else {
