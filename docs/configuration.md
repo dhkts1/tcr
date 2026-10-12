@@ -41,8 +41,8 @@ section below.
 | `upstream` | string | `"https://api.anthropic.com"` | no | API base URL every rotated request is sent to |
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account |
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
-| `accountThrottle` | object | `{minSpacingMs: 350, burst: 8}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
-| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 16}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
+| `accountThrottle` | object | `{minSpacingMs: 350, burst: 24}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
+| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 32}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
 | `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"warn"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
@@ -248,17 +248,18 @@ There are two throttle buckets, and they are keyed on different things.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `accountThrottle.minSpacingMs` | u64 | **`350`** with the key absent | no | steady-state emission interval **per organization** |
-| `accountThrottle.burst` | u32 | **`8`** with the key absent | no | sends admitted instantly after that org has been idle |
+| `accountThrottle.burst` | u32 | **`24`** with the key absent | no | sends admitted instantly after that org has been idle |
 | `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across **every** org combined |
-| `fleetThrottle.burst` | u32 | **`16`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
+| `fleetThrottle.burst` | u32 | **`32`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
 
 `accountThrottle` is the real limiter. Anthropic sets rate limits at the **organization**
 level, so pacing per org is what matches the thing actually being limited, and total capacity
 scales *with* the size of your account pool rather than being divided across it.
 
 `fleetThrottle` is insurance. It exists only in case something shared — an IP, a client id —
-is also limited, which nobody here has measured. It is set far above observed traffic so it
-does not bind in normal use.
+is also limited, which nobody here has measured. Its burst sits above the per-organization
+burst, so it never holds back a wave that bucket lets through, and near the fleet's real peaks,
+so it still engages on a runaway.
 
 > **This replaced a single fleet-wide `throttle` key.** A config still carrying `throttle` is
 > **migrated automatically at load** — the file self-heals the first time the server boots
@@ -284,7 +285,7 @@ These are the keys in the file where leaving one out and writing an empty object
 *opposite* things, and it surprises everyone:
 
 - `accountThrottle` **absent** → `default_account_throttle()` → **ON** at
-  `minSpacingMs: 350, burst: 8`. Same for `fleetThrottle` → `100` / `16`.
+  `minSpacingMs: 350, burst: 24`. Same for `fleetThrottle` → `100` / `32`.
 - `"accountThrottle": {}` **present and empty** → every knob deserializes to `None` →
   `is_active()` is false → that bucket is **OFF**.
 
