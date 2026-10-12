@@ -37,6 +37,7 @@ pub mod oauth;
 pub mod peer;
 pub mod pricing;
 pub mod probe;
+pub mod provider;
 pub mod proxy;
 pub mod quota;
 pub mod schedule;
