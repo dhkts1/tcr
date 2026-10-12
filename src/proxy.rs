@@ -715,7 +715,7 @@ struct UserIdMeta {
 ///
 /// Hashes the RAW bytes of each field via `RawValue::get()` — never
 /// canonicalized — namespaced under `"pfx:"` so this input space cannot collide
-/// with the `"key:"` / `"uid:"` tiers. `system` and `tools` are hashed as
+/// with the `"sid:"` / `"key:"` / `"uid:"` tiers. `system` and `tools` are hashed as
 /// `Option<&str>` (not concatenated into one string) so presence/absence of
 /// each field is part of the hash input and a `(None, Some("ab"))` pair can
 /// never collide with a `(Some("ab"), None)` pair; `str`'s own `Hash` impl
@@ -749,6 +749,20 @@ fn prefix_session_key(
 
 /// Derive a STABLE affinity key from the client's most durable identity, so a
 /// session survives reconnects on one account (warm prompt cache). Priority:
+///
+///   0. for a CODEX request only (decided by `path`, see
+///      [`crate::provider::Provider::of_path`]), the `session-id` header
+///      ([`crate::provider::CODEX_SESSION_HEADER`]) Codex sends on every turn.
+///      It names one conversation, which is exactly the grain a pin wants, and
+///      it is readable where the body is not: a Codex body is usually
+///      zstd-compressed, which tiers 2 and 3 cannot parse. It outranks tier 1
+///      for a loopback AND a remote client — an `x-api-key` names at best one
+///      client, never one conversation, and one key shared by N sessions must
+///      not collapse them onto one account (the reason tier 2 outranks tier 1
+///      on loopback). A missing, non-ASCII, empty or whitespace-only header
+///      falls through to the tiers below unchanged, and an Anthropic request
+///      never reads it: a stray `session-id` on `/v1/messages` keys nothing
+///      (the `openai/codex` citations are in the function body). Else
 ///   1. the `x-api-key` header (distinct team keys → distinct accounts) — but
 ///      SKIPPED when it equals the configured proxy key, since the shared proxy
 ///      secret is not a per-client identity (every remote client sends it), and
@@ -810,6 +824,26 @@ fn stable_session_key(
     path: &str,
     client_is_loopback: bool,
 ) -> Option<(u64, SessionKind)> {
+    // Tier 0 (Codex only): the `session-id` header Codex sends on every turn
+    // (`openai/codex` `codex-api/src/requests/headers.rs:8`). It is per conversation, which is
+    // exactly what a pin wants, and it is readable where the body may not be: the body is
+    // usually zstd-compressed (`core/src/client.rs:1704-1711`), and then tier 2 cannot parse
+    // it. (Tier 3 never applies to a Codex path at all: its exact `/v1/messages` check below
+    // excludes it.) It outranks tier 1's `x-api-key` for a loopback AND a remote client. Tier 1
+    // already discards the shared proxy secret; any other key names at best one client, never
+    // one conversation, and one key shared by N sessions must not collapse them onto one
+    // account, the same reason `metadata.user_id` outranks it on loopback.
+    if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
+        if let Some(sid) = headers
+            .get(crate::provider::CODEX_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some((stable_hash("sid:", sid), SessionKind::Stable));
+        }
+    }
+
     // The shared proxy secret is not a client identity — skip it so remote
     // clients don't all collapse onto one account.
     let api_key = headers
@@ -2748,7 +2782,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
     // rotation) by default. When on, key on the most STABLE client identity —
-    // x-api-key, then body `metadata.user_id`, then (for a loopback
+    // for a Codex request its `session-id` header (tier 0, Codex paths only),
+    // then x-api-key, then body `metadata.user_id`, then (for a loopback
     // `POST /v1/messages` with neither) a hash of the body's cacheable prefix
     // (`system` + `tools`, see [`stable_session_key`] and [`prefix_session_key`])
     // — so a client that drops and reconnects (new connection key) still maps
@@ -7604,6 +7639,109 @@ mod tests {
             None,
             "a non-loopback caller must not pin on the cacheable prefix"
         );
+    }
+
+    #[test]
+    fn codex_session_id_header_keys_the_session() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "session-id",
+            HeaderValue::from_static("0f0f0f0f-aaaa-4bbb-8ccc-dddddddddddd"),
+        );
+        let body = b"\x28\xb5\x2f\xfd not json"; // a compressed body: the peek must never be needed
+        let key = stable_session_key(
+            &h,
+            body,
+            None,
+            &Method::POST,
+            "/backend-api/codex/responses",
+            true,
+        );
+        assert_eq!(
+            key,
+            Some((
+                stable_hash("sid:", "0f0f0f0f-aaaa-4bbb-8ccc-dddddddddddd"),
+                SessionKind::Stable
+            ))
+        );
+        // A second request from the same session, different body, same key.
+        let again = stable_session_key(
+            &h,
+            b"other",
+            None,
+            &Method::POST,
+            "/backend-api/codex/responses",
+            true,
+        );
+        assert_eq!(key, again);
+    }
+
+    #[test]
+    fn codex_session_id_outranks_a_shared_api_key_on_loopback_and_remote() {
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", HeaderValue::from_static("shared-by-everyone"));
+        h.insert("session-id", HeaderValue::from_static("s-1"));
+        let loopback = stable_session_key(
+            &h,
+            b"{}",
+            None,
+            &Method::POST,
+            "/backend-api/codex/responses",
+            true,
+        );
+        let remote = stable_session_key(
+            &h,
+            b"{}",
+            None,
+            &Method::POST,
+            "/backend-api/codex/responses",
+            false,
+        );
+        assert_eq!(
+            loopback,
+            Some((stable_hash("sid:", "s-1"), SessionKind::Stable))
+        );
+        assert_eq!(
+            remote, loopback,
+            "the session id is per conversation; the key is per box"
+        );
+    }
+
+    #[test]
+    fn anthropic_requests_ignore_a_stray_session_id_header() {
+        let mut h = HeaderMap::new();
+        h.insert("session-id", HeaderValue::from_static("s-1"));
+        let key = stable_session_key(&h, b"{}", None, &Method::POST, "/v1/messages", true);
+        assert_eq!(key, None);
+    }
+
+    /// An empty or whitespace-only `session-id` is no session id: a Codex request
+    /// carrying one falls through to the tiers below, here tier 1's `x-api-key`
+    /// for a remote client, rather than keying every such session onto the one
+    /// `sid:` hash of an empty string, which would pin them all together.
+    ///
+    /// Watched red: drop the `.filter(|s| !s.is_empty())` from tier 0 and both
+    /// blank headers key on `stable_hash("sid:", "")`.
+    #[test]
+    fn a_blank_codex_session_id_falls_through_to_the_other_tiers() {
+        for blank in ["", "   "] {
+            let mut h = HeaderMap::new();
+            h.insert("x-api-key", HeaderValue::from_static("client-own-key"));
+            h.insert("session-id", HeaderValue::from_static(blank));
+            let key = stable_session_key(
+                &h,
+                b"{}",
+                None,
+                &Method::POST,
+                "/backend-api/codex/responses",
+                false,
+            );
+            assert_eq!(
+                key,
+                Some((stable_hash("key:", "client-own-key"), SessionKind::Stable)),
+                "session-id {blank:?} must fall through to the x-api-key tier"
+            );
+        }
     }
 
     /// End-to-end through the REAL router (`app()`, not the unit-tested

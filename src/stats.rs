@@ -241,7 +241,8 @@ pub struct AccountSnapshot {
     pub usage: Option<tcr_status_wire::UsageRow>,
 }
 
-/// Whether a live session was keyed on a stable client identity (x-api-key /
+/// Whether a live session was keyed on a stable client identity (a Codex
+/// request's `session-id` header, tier 0 and Codex paths only; x-api-key /
 /// metadata.user_id), on a hash of its cacheable prefix (`system` + `tools`)
 /// because it had no stronger identity, or had neither and served unpinned.
 /// DISPLAY-only — never a routing input.
