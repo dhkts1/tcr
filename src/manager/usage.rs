@@ -9,21 +9,27 @@ impl Manager {
     /// a client request that was retried across accounts (bug #4). Request counting
     /// happens once, in [`Manager::record_served`].
     ///
-    /// A response that CARRIED the unified 5h header also latches
+    /// The account's PROVIDER picks the parser, never the headers: Anthropic's
+    /// [`crate::quota::Quota::update_from_headers`] or Codex's
+    /// [`crate::quota::Quota::update_from_codex_headers`]. A `match`, so a third provider
+    /// decides here instead of inheriting either. `status` is the response's HTTP status,
+    /// which the Codex parser reads in place of Anthropic's `unified-status` header (a 2xx
+    /// is `allowed`, a refusal 429 `rejected`); the Anthropic parser ignores it.
+    ///
+    /// A response that CARRIED the 5h window also latches
     /// [`AccountRuntime::quota_known`], on the same terms and for the same reason
     /// [`Self::apply_usage`] does: those headers are a first-hand read of this
     /// account's session window, so an account serving live traffic must not go on
     /// reading as "we have never seen this account's quota" — it plainly is not
     /// true, and keep-warm's gate is asking exactly that question. A response
-    /// WITHOUT the header latches nothing: an error page or a non-Anthropic
-    /// upstream tells us nothing about the window, and silence must never be
-    /// mistaken for evidence.
+    /// WITHOUT it latches nothing: an error page tells us nothing about the window,
+    /// and silence must never be mistaken for evidence.
     ///
     /// `probe_status` is deliberately still untouched here — that field is about
     /// probe HEALTH, which a served response says nothing about.
     ///
     /// Returns whether THIS response's headers carried the 5h window — the same
-    /// signal [`crate::quota::Quota::update_from_headers`] returns, passed through
+    /// signal either parser returns, passed through
     /// so a caller like [`Manager::warm_account`] can tell "evidence read" apart
     /// from "silence" on this specific response, not just the account's
     /// once-ever `quota_known` latch. Deliberately NOT `#[must_use]`: most
@@ -31,12 +37,24 @@ impl Manager {
     /// only care about the side effect of folding the headers in, and forcing
     /// every one of them to consume the bool would be pure churn unrelated to
     /// this fix.
-    pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) -> bool {
+    pub fn update_quota(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+    ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
-                    let read_five_hour = account.quota.update_from_headers(headers);
+                    let read_five_hour = match account.provider {
+                        crate::provider::Provider::Anthropic => {
+                            account.quota.update_from_headers(headers)
+                        }
+                        crate::provider::Provider::Codex => {
+                            account.quota.update_from_codex_headers(headers, status)
+                        }
+                    };
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
                     // Any response that DOES carry the 5h window is proof this

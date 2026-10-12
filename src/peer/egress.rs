@@ -1709,7 +1709,7 @@ async fn record_the_hold_the_ladder_would(
 
 pub async fn record_carried(manager: &crate::manager::Manager, record: CarriedRecord<'_>) {
     let served_at = time::OffsetDateTime::now_utc();
-    manager.update_quota(record.account_idx, record.upstream_headers);
+    manager.update_quota(record.account_idx, record.upstream_headers, record.status);
     record_the_hold_the_ladder_would(
         manager,
         record.account_idx,

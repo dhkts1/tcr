@@ -357,7 +357,7 @@ proptest! {
                 "anthropic-ratelimit-unified-5h-reset",
                 reset.to_string().parse().expect("a header value"),
             );
-            manager.update_quota(idx, &headers);
+            manager.update_quota(idx, &headers, 200);
         }
 
         let f_scope = manager.lendable_fraction(&scope, tcr_peer_wire::Window::FiveHour, now);

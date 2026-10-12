@@ -3165,6 +3165,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // runs out; re-admitting any of the others would re-send this request to an
     // account that already failed it, in a loop. An account leaves this set the
     // moment it is re-admitted, so membership always means "currently parked".
+    // A Codex 429 that is not a quota refusal parks the same way: its hold is a
+    // timer on the 429's own `retry-after` (the Codex arm below).
     let mut parked_transient: HashSet<usize> = HashSet::new();
     // Same-account transport retries this request has spent, per account. The
     // failing resource in a transport error is the CONNECTION, not the account:
@@ -4030,7 +4032,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         );
         let up_headers = resp.headers().clone();
         let rejections = quota_rejections(&up_headers);
-        manager.update_quota(idx, &up_headers);
+        manager.update_quota(idx, &up_headers, status.as_u16());
         // Any non-429 is live proof a rate-limit hold no longer binds.
         if status.as_u16() != 429 {
             manager.clear_rate_limited(idx);
@@ -4161,7 +4163,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // the account for it is wrong and rotating is wasted, so it is forwarded
             // as-is and every account stays in rotation. See
             // [`is_request_scoped_429`] for the measurements that draw this line.
-            if is_request_scoped_429(&path_and_query, &up_headers, !rejections.is_empty()) {
+            // Those measurements are Anthropic's (`?beta=true`, `unified-status`), and no
+            // Codex request or 429 carries either, so a Codex 429 never takes this branch:
+            // it would forward every one with no account held. Codex's arm is below.
+            if provider == crate::provider::Provider::Anthropic
+                && is_request_scoped_429(&path_and_query, &up_headers, !rejections.is_empty())
+            {
                 tracing::warn!(
                     account = account_name.as_deref().unwrap_or("?"),
                     account_index = idx,
@@ -4197,6 +4204,49 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     ),
                 }
                 let retry_after = retry_after_raw.unwrap_or(60);
+                // A Codex 429 is ACCOUNT-scoped, like an Anthropic quota rejection: hold the
+                // account and rotate. How long depends on what the 429 says it is:
+                //
+                //  - a QUOTA refusal, one carrying `x-codex-rate-limit-reached-type`
+                //    (`quota::is_codex_quota_refusal`; the quota fold above has already marked
+                //    it `rejected`), holds to its windows' reset: the latest reset among the
+                //    full windows, else the fullest window's (`codex_hold_seconds`), else
+                //    `retry-after`, else the same 60s default;
+                //  - any other 429 holds on `retry-after`, else that default, whatever window
+                //    headers it carries. Its windows say how full the account is, not why
+                //    this request was refused, and holding to their reset would bench an
+                //    account for up to an hour over a refusal that clears in seconds.
+                //
+                // Jittered at the ceiling for the same lockstep reason as Anthropic's (see
+                // `jittered_quota_hold`), and logged as ARMED, after that clamp: a weekly
+                // reset days away arms at most the ceiling, and the log says what was armed.
+                if provider == crate::provider::Provider::Codex {
+                    let quota_refusal = crate::quota::is_codex_quota_refusal(&up_headers);
+                    let hold = quota_refusal
+                        .then(|| {
+                            crate::quota::codex_hold_seconds(&up_headers, OffsetDateTime::now_utc())
+                        })
+                        .flatten()
+                        .unwrap_or(retry_after);
+                    let armed = jittered_quota_hold(hold, now.nanosecond());
+                    tracing::info!(
+                        account = account_name.as_deref().unwrap_or("?"),
+                        account_index = idx,
+                        reached_type = header_str(crate::quota::CODEX_REACHED_TYPE_HEADER),
+                        quota_refusal,
+                        hold_seconds = armed,
+                        "Codex 429: holding the account and rotating"
+                    );
+                    manager.mark_rate_limited(idx, armed);
+                    tried.insert(idx);
+                    // A hold that is not a quota refusal is a timer, like the no-guidance
+                    // Park below: the soft-wait may take the account back once it expires.
+                    // A quota refusal is not: its account stays `rejected` past any hold.
+                    if !quota_refusal {
+                        parked_transient.insert(idx);
+                    }
+                    continue;
+                }
                 if !rejections.is_empty() {
                     // A model-scoped rejection is recorded in the window the selector
                     // already gates that model class on, NOT as an account-wide hold:
@@ -4236,7 +4286,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         manager.mark_rate_limited(idx, wait);
                         tried.insert(idx);
                         // Record WHY this entry is in `tried`: a timer that expires on
-                        // its own, so the soft-wait above may take it back. Every other
+                        // its own, so the soft-wait above may take it back. The Codex
+                        // arm above records its non-quota hold the same way; every other
                         // `tried.insert` in this loop deliberately omits this.
                         parked_transient.insert(idx);
                         continue;
@@ -5420,6 +5471,11 @@ const RESPONSE_SKIP: [&str; 10] = [
 /// whichever one Anthropic adds next. Header names from a [`HeaderMap`] are
 /// already lowercased.
 ///
+/// Codex's per-account headers are the opposite case and are matched by EXPLICIT
+/// name, the eleven in [`crate::quota::CODEX_QUOTA_HEADERS`], never by the `x-codex-`
+/// prefix: `x-codex-turn-state` shares that prefix, and it is the client's own
+/// sticky-routing token, which must reach the client.
+///
 /// `request-id` is deliberately absent: it identifies a REQUEST, not an account,
 /// and it is the one id that makes a single failed call debuggable end-to-end.
 ///
@@ -5429,7 +5485,9 @@ const RESPONSE_SKIP: [&str; 10] = [
 /// may the caller see", and it would drift the first time Anthropic adds a
 /// header. The other reader is `crate::peer::egress`'s `axum_response_from`.
 pub(crate) fn is_account_scoped(name: &str) -> bool {
-    name.starts_with("anthropic-ratelimit-") || name == "anthropic-organization-id"
+    name.starts_with("anthropic-ratelimit-")
+        || name == "anthropic-organization-id"
+        || crate::quota::CODEX_QUOTA_HEADERS.contains(&name)
 }
 
 /// Whose account produced the response being assembled — the one thing that
@@ -5458,6 +5516,10 @@ enum ServedBy {
 /// contradicts it. None of those numbers describe the pool the client is actually
 /// talking to. `anthropic-organization-id` is stripped with them — it leaks a
 /// distinct org identity per pooled account.
+///
+/// Codex's quota headers go for the same reason (the Codex client shows the serving
+/// account's usage from them), by explicit name: `x-codex-turn-state` is the client's
+/// own and passes. See [`is_account_scoped`].
 ///
 /// This is the CLIENT boundary, and the strip belongs here and nowhere earlier:
 /// the proxy's own quota model is built from these same headers upstream of this
@@ -6678,8 +6740,12 @@ fn switch_warning(
         return None;
     }
     let hint = manager.exhaustion_hint_for_account(now, is_fable, bound_idx);
-    // `binding` is only the gate that TIMES a wait; a terminal one (rejected, disabled, a dead
-    // login) has no clear instant and leaves it `None`. Over one account, `gated` holds that
+    // `binding` is only the gate that TIMES a wait. A terminal gate (rejected, disabled, a dead
+    // login) has no clear instant of its own, so it leaves `binding` `None`, an Anthropic
+    // `rejected` included. A rejected CODEX account is the one exception, through the
+    // all-rejected fold (`Manager::exhaustion_hint`): it comes back `Some(Rejected)` with a
+    // `free_at`, the latest live reset among its windows at or over threshold, else its hold's
+    // expiry, and stays `None` only when neither is known. Over one account, `gated` holds that
     // account's own reason either way.
     let why = hint
         .binding
@@ -12289,7 +12355,7 @@ mod tests {
             "anthropic-ratelimit-unified-status",
             HeaderValue::from_static("allowed_warning"),
         );
-        manager.update_quota(0, &over);
+        manager.update_quota(0, &over, 200);
 
         // Three turns back to back, all inside one 2 s revalidation window.
         for turn in 1..=3 {
@@ -12372,8 +12438,8 @@ mod tests {
             "anthropic-ratelimit-unified-status",
             HeaderValue::from_static("allowed_warning"),
         );
-        manager.update_quota(0, &over);
-        manager.update_quota(1, &over);
+        manager.update_quota(0, &over, 200);
+        manager.update_quota(1, &over, 200);
         let now = OffsetDateTime::now_utc();
         let claim = |response: &Response| {
             response
@@ -12711,7 +12777,7 @@ mod tests {
             HeaderValue::from_str(&(crate::now_ms() / 1000 + 259_200).to_string())
                 .expect("reset header"),
         );
-        manager.update_quota(0, &fable_out);
+        manager.update_quota(0, &fable_out, 200);
         let body = with_body_field(
             &thinking_turn_body("sess-fable", &["sig_held"]),
             "model",
@@ -15533,7 +15599,7 @@ mod tests {
             "anthropic-ratelimit-unified-status",
             HeaderValue::from_static("allowed_warning"),
         );
-        manager.update_quota(2, &over);
+        manager.update_quota(2, &over, 200);
 
         let status = post_one(manager.clone()).await;
         assert_eq!(
@@ -16365,7 +16431,7 @@ mod tests {
         );
         for idx in 0..2 {
             assert!(
-                manager.update_quota(idx, &spent),
+                manager.update_quota(idx, &spent, 200),
                 "fixture must land a 5h window"
             );
         }
@@ -18144,6 +18210,469 @@ mod tests {
         assert_eq!(body["error"]["code"], "usage_limit_reached");
         assert_eq!(codex_echo.request_count(), 0);
         assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// A Codex origin that refuses the FIRST request it sees, whoever's bearer it carries,
+    /// with the refusal shape of `codex-api/src/rate_limits.rs` (both windows, the
+    /// five-hour one listed first at 30% and the weekly one full) plus, when given,
+    /// `x-codex-rate-limit-reached-type` and a `retry-after`. Every later request is served
+    /// `200 {}`. Returns the origin, the bearer it refused, and the bearer of every request
+    /// it served, in order, so a test reads who served the retry off the origin itself.
+    async fn spawn_codex_origin_refusing_the_first(
+        reached_type: Option<&'static str>,
+        retry_after: Option<&'static str>,
+        five_hour_reset: i64,
+        weekly_reset: i64,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Option<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let refused: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let served: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (refused_by, served_by) = (Arc::clone(&refused), Arc::clone(&served));
+        let origin = Router::new().fallback(move |req: Request| {
+            let (refused_by, served_by) = (Arc::clone(&refused_by), Arc::clone(&served_by));
+            async move {
+                let bearer = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                {
+                    let mut first = refused_by.lock().expect("refusal record poisoned");
+                    if first.is_none() {
+                        *first = Some(bearer);
+                        let mut refusal = Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("x-codex-primary-used-percent", "30")
+                            .header("x-codex-primary-window-minutes", "300")
+                            .header("x-codex-primary-reset-at", five_hour_reset.to_string())
+                            .header("x-codex-secondary-used-percent", "100")
+                            .header("x-codex-secondary-window-minutes", "10080")
+                            .header("x-codex-secondary-reset-at", weekly_reset.to_string());
+                        if let Some(kind) = reached_type {
+                            refusal = refusal.header("x-codex-rate-limit-reached-type", kind);
+                        }
+                        if let Some(secs) = retry_after {
+                            refusal = refusal.header("retry-after", secs);
+                        }
+                        return refusal
+                            .body(Body::from(
+                                r#"{"error":{"type":"usage_limit_reached","message":"out"}}"#,
+                            ))
+                            .expect("429 response");
+                    }
+                }
+                served_by
+                    .lock()
+                    .expect("served record poisoned")
+                    .push(bearer);
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("200 response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Codex origin");
+        let addr = listener.local_addr().expect("Codex origin addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        (format!("http://{addr}"), refused, served)
+    }
+
+    /// [`codex_fleet`] plus a second Codex account: alice on Anthropic (0), bob (1) and
+    /// carol (2) on Codex, so a Codex 429 has somewhere to rotate to.
+    fn codex_fleet_with_carol(anthropic: &str, codex: &str) -> Config {
+        let mut config = codex_fleet(anthropic, codex);
+        let carol = Account {
+            name: "carol@example.com/codex".to_string(),
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            access_token: "at-carol".to_string(),
+            refresh_token: Some("rt-carol".to_string()),
+            ..config.accounts[1].clone()
+        };
+        config.accounts.push(carol);
+        config
+    }
+
+    /// The fleet index of a bearer [`codex_fleet_with_carol`] issued, as an origin saw it.
+    fn codex_index_of(bearer: &str) -> usize {
+        match bearer {
+            "Bearer at-bob" => 1,
+            "Bearer at-carol" => 2,
+            other => panic!("a Codex origin saw an unexpected bearer: {other}"),
+        }
+    }
+
+    /// **A Codex 429 is the ACCOUNT's, never the request's.** The account that answered it
+    /// is held until the reset of its FULL window (the weekly one here: not the five-hour
+    /// window listed first, and not the 429's own `retry-after`), its quota reads rejected,
+    /// and the rotation moves on, so a second Codex account serves the same request. With
+    /// and without a `retry-after`, because each fails differently without the Codex arm:
+    /// `is_request_scoped_429` reads Anthropic's guidance (`?beta=true`, `unified-status`),
+    /// which no Codex request carries, so a guidance-free Codex 429 was forwarded with no
+    /// account held, and one with `retry-after: 60` parked its account for 60 seconds. The
+    /// account that served the retry is the one the origin RECORDED serving, never inferred
+    /// from which one is held.
+    ///
+    /// Watched red: drop `provider == Anthropic` from the request-scoped gate, then put
+    /// `retry-after` ahead of the window in the Codex hold.
+    #[tokio::test]
+    async fn a_codex_429_holds_its_account_to_the_full_windows_reset_and_rotates() {
+        for retry_after in [None, Some("60")] {
+            let anthropic_echo = CapturingUpstream::spawn().await;
+            let secs = OffsetDateTime::now_utc().unix_timestamp();
+            let (five_hour_reset, weekly_reset) = (secs + 600, secs + 1800);
+            let (codex_url, refused, served) = spawn_codex_origin_refusing_the_first(
+                Some("secondary"),
+                retry_after,
+                five_hour_reset,
+                weekly_reset,
+            )
+            .await;
+            let manager = Manager::with_live_refresher(
+                codex_fleet_with_carol(&anthropic_echo.url, &codex_url),
+                None,
+            );
+
+            let (status, answer) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "retry-after {retry_after:?}: the other Codex account serves the request: {}",
+                String::from_utf8_lossy(&answer)
+            );
+            let served_bearers = served.lock().expect("served record poisoned").clone();
+            assert_eq!(
+                served_bearers.len(),
+                1,
+                "served exactly once: {served_bearers:?}"
+            );
+            assert_eq!(
+                anthropic_echo.request_count(),
+                0,
+                "rotation never leaves Codex"
+            );
+
+            let refused_bearer = refused
+                .lock()
+                .expect("refusal record poisoned")
+                .clone()
+                .expect("one account was refused");
+            let held_idx = codex_index_of(&refused_bearer);
+            let served_idx = codex_index_of(&served_bearers[0]);
+            assert_ne!(
+                served_idx, held_idx,
+                "retry-after {retry_after:?}: the retry was served by the OTHER Codex account"
+            );
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            let held = &snapshot.accounts[held_idx];
+            let until = held
+                .rate_limited_until
+                .unwrap_or_else(|| {
+                    panic!("retry-after {retry_after:?}: the refused account is held")
+                })
+                .unix_timestamp();
+            assert!(
+                (until - weekly_reset).abs() <= 1,
+                "retry-after {retry_after:?}: held until the full weekly window's reset \
+                 ({weekly_reset}), not the five-hour one ({five_hour_reset}) nor retry-after; \
+                 held until {until}"
+            );
+            assert_eq!(
+                held.gate,
+                GateReason::Rejected,
+                "a refusal carrying x-codex-rate-limit-reached-type reads as rejected"
+            );
+            assert_eq!(held.seven_day, Some(1.0), "the weekly window was learned");
+            let other = &snapshot.accounts[served_idx];
+            assert_eq!(
+                other.rate_limited_until, None,
+                "the serving account is not held"
+            );
+            assert_eq!(other.gate, GateReason::Ok);
+        }
+    }
+
+    /// **A Codex 429 that is NOT a quota refusal holds on `retry-after`, never on a
+    /// window.** It carries no `x-codex-rate-limit-reached-type`, so its window headers
+    /// (the weekly one full, half an hour out) say how full the account is, not why this
+    /// request was refused: the account is held for the 429's own `retry-after`, or the
+    /// 60-second default without one, its quota is NOT marked rejected, and the rotation
+    /// still moves on to the other Codex account.
+    ///
+    /// Watched red: let `codex_hold_seconds` answer every Codex 429 again and both runs
+    /// hold the account to the weekly reset instead.
+    #[tokio::test]
+    async fn a_codex_429_without_a_reached_type_holds_on_retry_after_not_the_window() {
+        for (retry_after, expected_hold) in [(Some("30"), 30_i64), (None, 60)] {
+            let anthropic_echo = CapturingUpstream::spawn().await;
+            let secs = OffsetDateTime::now_utc().unix_timestamp();
+            let weekly_reset = secs + 1800;
+            let (codex_url, refused, served) =
+                spawn_codex_origin_refusing_the_first(None, retry_after, secs + 600, weekly_reset)
+                    .await;
+            let manager = Manager::with_live_refresher(
+                codex_fleet_with_carol(&anthropic_echo.url, &codex_url),
+                None,
+            );
+
+            let before = OffsetDateTime::now_utc().unix_timestamp();
+            let (status, answer) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "retry-after {retry_after:?}: the other Codex account serves the request: {}",
+                String::from_utf8_lossy(&answer)
+            );
+            let served_bearers = served.lock().expect("served record poisoned").clone();
+            assert_eq!(
+                served_bearers.len(),
+                1,
+                "served exactly once: {served_bearers:?}"
+            );
+
+            let refused_bearer = refused
+                .lock()
+                .expect("refusal record poisoned")
+                .clone()
+                .expect("one account was refused");
+            let held_idx = codex_index_of(&refused_bearer);
+            assert_ne!(codex_index_of(&served_bearers[0]), held_idx);
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            let held = &snapshot.accounts[held_idx];
+            let until = held
+                .rate_limited_until
+                .unwrap_or_else(|| {
+                    panic!("retry-after {retry_after:?}: the refused account is held")
+                })
+                .unix_timestamp();
+            assert!(
+                (until - (before + expected_hold)).abs() <= 2,
+                "retry-after {retry_after:?}: held {expected_hold}s from {before}, not to the \
+                 weekly reset ({weekly_reset}); held until {until}"
+            );
+            assert_ne!(
+                held.gate,
+                GateReason::Rejected,
+                "a 429 without x-codex-rate-limit-reached-type is not a quota refusal"
+            );
+        }
+    }
+
+    /// **A Codex pool held only by a short 429 that is not a quota refusal is waited out,
+    /// not refused.** The hold such a 429 arms is a timer that expires on its own, as an
+    /// Anthropic no-guidance park is, so the soft-wait must be able to take the account back
+    /// (`parked_transient`). The one Codex account answers a 429 with `retry-after: 1` and no
+    /// `x-codex-rate-limit-reached-type` or window headers, then 200: the client gets the
+    /// 200, after exactly two sends. The origin is its own: the refusing one above reports a
+    /// full weekly window, which keeps the soft-wait from firing at all.
+    ///
+    /// Watched red: drop the `parked_transient` insert from the Codex arm, and the soft-wait
+    /// sleeps out the hold, re-admits nothing and answers 429 after one send.
+    #[tokio::test]
+    async fn a_codex_account_held_by_a_short_non_quota_429_serves_the_retry() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&sends);
+        let origin = Router::new().fallback(move || {
+            let counted = Arc::clone(&counted);
+            async move {
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("retry-after", "1")
+                        .body(Body::from(r#"{"error":{"message":"slow down"}}"#))
+                        .expect("429 response");
+                }
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("200 response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Codex origin");
+        let codex_url = format!(
+            "http://{}",
+            listener.local_addr().expect("Codex origin addr")
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
+
+        let (status, answer) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        let sent = sends.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the soft-wait takes the held account back ({sent} send(s)): {}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(sent, 2, "one refused send, then the one that served");
+        assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    /// **The eleven per-account Codex headers are stripped from a POOLED response and kept
+    /// on a RELAYED one**, by name, while `x-codex-turn-state`, which shares their prefix,
+    /// reaches the client either way. A pooled response describes whichever account served
+    /// it, so its quota picture and credit balance would change from request to request; a
+    /// relayed one describes the client's own account.
+    ///
+    /// The fixture names all eleven itself, so each is pinned by what reaches the client,
+    /// not by the list's contents: the precondition asks only that the fixture cover every
+    /// name in [`crate::quota::CODEX_QUOTA_HEADERS`].
+    ///
+    /// Watched red: drop the Codex names from `is_account_scoped` and the pooled response
+    /// carries all seven quota headers; strip the whole `x-codex-` prefix instead and it
+    /// loses the turn state; remove `x-codex-credits-balance` from the list and the pooled
+    /// response carries the serving account's balance.
+    #[tokio::test]
+    async fn codex_quota_headers_are_stripped_from_a_pooled_response_and_kept_on_a_relayed_one() {
+        let secs = OffsetDateTime::now_utc().unix_timestamp();
+        let quota_headers: Vec<(&'static str, String)> = vec![
+            ("x-codex-primary-used-percent", "25".to_string()),
+            ("x-codex-primary-window-minutes", "300".to_string()),
+            ("x-codex-primary-reset-at", (secs + 3600).to_string()),
+            ("x-codex-secondary-used-percent", "3".to_string()),
+            ("x-codex-secondary-window-minutes", "10080".to_string()),
+            ("x-codex-secondary-reset-at", (secs + 86_400).to_string()),
+            ("x-codex-rate-limit-reached-type", "primary".to_string()),
+            ("x-codex-credits-has-credits", "true".to_string()),
+            ("x-codex-credits-unlimited", "false".to_string()),
+            ("x-codex-credits-balance", "12.50".to_string()),
+            ("x-codex-promo-message", "fixture promo".to_string()),
+        ];
+        for name in crate::quota::CODEX_QUOTA_HEADERS {
+            assert!(
+                quota_headers.iter().any(|(sent, _)| *sent == name),
+                "precondition: the fixture sends every name in the strip list, {name} included"
+            );
+        }
+        let answer_with = quota_headers.clone();
+        let origin = Router::new().fallback(move || {
+            let answer_with = answer_with.clone();
+            async move {
+                let mut response = Response::builder().header(CONTENT_TYPE, "application/json");
+                for (name, value) in &answer_with {
+                    response = response.header(*name, value.as_str());
+                }
+                response
+                    .header("x-codex-turn-state", "opaque")
+                    .body(Body::from("{}"))
+                    .expect("Codex response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Codex origin");
+        let codex_url = format!(
+            "http://{}",
+            listener.local_addr().expect("Codex origin addr")
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        let manager =
+            Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
+        let header = |response: &Response, name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let pooled = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(pooled.status(), StatusCode::OK);
+        for (name, _) in &quota_headers {
+            assert_eq!(
+                header(&pooled, name),
+                None,
+                "{name} leaked from a pooled serve"
+            );
+        }
+        assert_eq!(
+            header(&pooled, "x-codex-turn-state").as_deref(),
+            Some("opaque"),
+            "the turn state is the client's own and must reach it"
+        );
+
+        let relayed = drive_full(
+            manager,
+            Method::GET,
+            "/backend-api/wham/usage",
+            Some(loopback_peer()),
+            &[("authorization", "Bearer client-own")],
+            "",
+        )
+        .await;
+        assert_eq!(relayed.status(), StatusCode::OK);
+        for (name, value) in &quota_headers {
+            assert_eq!(
+                header(&relayed, name).as_deref(),
+                Some(value.as_str()),
+                "{name} describes the client's own account on a relay and must reach it"
+            );
+        }
+        assert_eq!(
+            header(&relayed, "x-codex-turn-state").as_deref(),
+            Some("opaque")
+        );
     }
 
     /// **History bound to an account of the OTHER provider never holds a

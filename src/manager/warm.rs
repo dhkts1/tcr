@@ -155,7 +155,8 @@ impl Manager {
             Ok(headers) => {
                 // Fold the now-live 5h window into the account's quota so the next
                 // sweep sees it as already warm (REQUIRED — suppresses re-warm).
-                if self.update_quota(idx, &headers) {
+                // The warmer yields headers only for a 2xx (`warmer.rs`).
+                if self.update_quota(idx, &headers, reqwest::StatusCode::OK.as_u16()) {
                     tracing::info!(account = %name, index = idx, "keep-warm: started 5h window");
                 } else {
                     let gave_up = self.record_warm_without_evidence(idx);

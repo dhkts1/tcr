@@ -1764,6 +1764,19 @@ impl Manager {
     /// about when this one can be served: folding it in let a Codex account freeing
     /// in two seconds time a Claude client's wait, and its gate inflate the count of
     /// accounts "out", while every Anthropic account stayed out for an hour.
+    ///
+    /// **An all-rejected Codex fleet** is the one place a terminal gate contributes.
+    /// `rejected` has no clear-instant (`Self::account_terminal_gate`), so a Codex
+    /// fleet whose every account answered a quota refusal used to report the 60-second
+    /// sentinel, which the Codex client renders as "resets in 60 seconds" for a window
+    /// days away. When EVERY account folded is `rejected`, each Codex one contributes
+    /// when it can be expected back (`Self::rejected_codex_free_at_ms`): the latest
+    /// live reset among its windows at or over its threshold, which the refusal's own
+    /// headers stored, and only with no such window its rate-limit hold's expiry (a hold
+    /// is clamped to an hour, so it is the worse answer whenever a window is known). An
+    /// Anthropic `rejected` still contributes nothing, so Anthropic's hint is unchanged:
+    /// it is upstream's verdict, which need not belong to any window this account stores
+    /// (see `rejected_account_reports_a_rejected_gate`).
     pub fn exhaustion_hint(
         &self,
         now: OffsetDateTime,
@@ -1811,6 +1824,11 @@ impl Manager {
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
         let mut soonest: Option<(i64, GateReason)> = None;
+        // The all-rejected Codex fold (see `exhaustion_hint`): whether every account
+        // folded is `rejected`, and the soonest instant a rejected Codex one is expected
+        // back. Used only when the first is still true after the loop.
+        let mut every_one_rejected = true;
+        let mut rejected_codex_soonest: Option<i64> = None;
         for (_, account) in accounts
             .iter()
             .enumerate()
@@ -1830,6 +1848,16 @@ impl Manager {
                 &reserved_groups,
                 &parked_groups,
             );
+            if reason == GateReason::Rejected {
+                if account.provider == crate::provider::Provider::Codex {
+                    if let Some(at) = Self::rejected_codex_free_at_ms(account, threshold, now) {
+                        rejected_codex_soonest =
+                            Some(rejected_codex_soonest.map_or(at, |best| best.min(at)));
+                    }
+                }
+            } else {
+                every_one_rejected = false;
+            }
             if reason != GateReason::Ok {
                 *gated.entry(reason).or_insert(0) += 1;
             }
@@ -1838,6 +1866,11 @@ impl Manager {
             };
             if soonest.is_none_or(|(best, _)| at < best) {
                 soonest = Some((at, reason));
+            }
+        }
+        if every_one_rejected {
+            if let Some(at) = rejected_codex_soonest {
+                soonest = Some((at, GateReason::Rejected));
             }
         }
         match soonest {
@@ -1854,6 +1887,32 @@ impl Manager {
                 gated,
             },
         }
+    }
+
+    /// When a `rejected` CODEX account can be expected back, for the exhaustion hint
+    /// alone (see [`Self::exhaustion_hint`]), in epoch ms and only while still ahead of
+    /// `now`: the latest live reset among its windows at or over `threshold` (every one
+    /// of them has to roll before it can serve), else its rate-limit hold's expiry. `None`
+    /// when neither is known.
+    ///
+    /// The windows come first because the hold is clamped to an hour
+    /// (`MAX_RATE_LIMIT_HOLD_SECONDS`): a weekly refusal holds for at most that, while
+    /// the account stays rejected until the window it stored actually rolls.
+    fn rejected_codex_free_at_ms(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+    ) -> Option<i64> {
+        let now_ms = odt_to_ms(now);
+        [account.quota.five_hour, account.quota.seven_day]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.effective(now) >= threshold)
+            .filter_map(|window| window.live_reset(now))
+            .max()
+            .map(odt_to_ms)
+            .or(account.rate_limited_until_ms)
+            .filter(|&at| at > now_ms)
     }
 
     /// Mark account `idx` as serving one more in-flight request: bump its
@@ -4334,7 +4393,7 @@ mod tests {
             "anthropic-ratelimit-unified-5h-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(idx, &h);
+        manager.update_quota(idx, &h, 200);
     }
 
     /// Set account `idx`'s weekly (`7d`) window near/over threshold with a future
@@ -4351,7 +4410,7 @@ mod tests {
             "anthropic-ratelimit-unified-7d-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(idx, &h);
+        manager.update_quota(idx, &h, 200);
     }
 
     /// Build a config carrying an unmodelled top-level `warmupSeconds` value.
@@ -6947,7 +7006,7 @@ mod tests {
             "anthropic-ratelimit-unified-5h-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(0, &headers);
+        manager.update_quota(0, &headers, 200);
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(1)
@@ -7909,7 +7968,7 @@ mod tests {
                 "anthropic-ratelimit-unified-7d-reset",
                 reset.to_string().parse().unwrap(),
             );
-            manager.update_quota(idx, &h);
+            manager.update_quota(idx, &h, 200);
         };
         set_7d(0, "0.95"); // over the 0.90 threshold, under 100% → NearLimit
         set_7d(1, "1.20"); // over 100% → Exhausted
@@ -7964,7 +8023,7 @@ mod tests {
                 "anthropic-ratelimit-unified-7d-reset",
                 reset.to_string().parse().unwrap(),
             );
-            manager.update_quota(idx, &h);
+            manager.update_quota(idx, &h, 200);
         };
         set_7d(0, "0.92"); // under the 0.95 default → real headroom, Normal
         set_7d(1, "0.96"); // over 0.95, under 100% → NearLimit
@@ -8041,8 +8100,8 @@ mod tests {
         // Simulate two upstream responses for a single client request (e.g. a
         // 429 that recorded a spent bucket, then the retry's 200).
         let headers = reqwest::header::HeaderMap::new();
-        manager.update_quota(0, &headers);
-        manager.update_quota(0, &headers);
+        manager.update_quota(0, &headers, 429);
+        manager.update_quota(0, &headers, 200);
         // Exactly one terminal serve.
         manager.record_served(0, now, None, SessionKind::Fallback);
 
@@ -8289,7 +8348,7 @@ mod tests {
             "anthropic-ratelimit-unified-7d_oi-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(idx, &h);
+        manager.update_quota(idx, &h, 200);
     }
 
     /// HEADLINE per-model routing: a Fable request SKIPS an account whose `7d_oi`
@@ -10833,6 +10892,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A Codex 429's wait is the earliest Codex window reset**, not the 60-second
+    /// placeholder: once `x-codex-*` headers fill a Codex account's weekly window, the
+    /// provider-scoped hint folds it like any other window over threshold. Driven through
+    /// `update_quota` with the shape the real backend sends (only the weekly window, in the
+    /// primary slot), so it is the dispatch that fills the window: an Anthropic account
+    /// handed the SAME headers learns nothing from them and times nothing.
+    ///
+    /// Watched red, one arm of the dispatch in `update_quota` at a time: the Codex arm given
+    /// the Anthropic parser leaves the Codex hint at the 60-second placeholder, and the
+    /// Anthropic arm given the Codex parser times the Anthropic hint on a Codex window.
+    #[test]
+    fn codex_headers_time_the_codex_hint_and_never_the_anthropic_one() {
+        use crate::provider::Provider;
+        let mut codex = AccountRuntime::from_config(&account("b", 0), false);
+        codex.provider = Provider::Codex;
+        let manager = Manager::from_runtimes(vec![
+            AccountRuntime::from_config(&account("a", 0), false),
+            codex,
+        ]);
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 1800;
+        let mut weekly_full = reqwest::header::HeaderMap::new();
+        weekly_full.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        weekly_full.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        weekly_full.insert(
+            "x-codex-primary-reset-at",
+            reset.to_string().parse().unwrap(),
+        );
+        for idx in [0, 1] {
+            assert!(
+                !manager.update_quota(idx, &weekly_full, 200),
+                "a weekly window alone is no five-hour read, for either parser"
+            );
+        }
+        let now = OffsetDateTime::now_utc();
+
+        let codex_hint = manager.exhaustion_hint(now, false, Provider::Codex, None);
+        assert_eq!(
+            codex_hint.binding,
+            Some(GateReason::SevenDay),
+            "the Codex account is out on its weekly window: {codex_hint:?}"
+        );
+        assert!(
+            (1795..=1800).contains(&codex_hint.retry_after),
+            "the Codex wait is the window's reset, not the 60s placeholder: {codex_hint:?}"
+        );
+        assert_eq!(
+            codex_hint.free_at.map(OffsetDateTime::unix_timestamp),
+            Some(reset)
+        );
+
+        let anthropic_hint = manager.exhaustion_hint(now, false, Provider::Anthropic, None);
+        assert_eq!(
+            (anthropic_hint.binding, anthropic_hint.free_at),
+            (None, None),
+            "the Anthropic account read nothing from Codex headers: {anthropic_hint:?}"
+        );
+    }
+
+    /// **An all-rejected Codex fleet is timed on the windows it stored, then on its
+    /// holds**, never on the 60-second sentinel. `rejected` is a terminal gate with no
+    /// clear-instant, so with every Codex account refused the hint used to say "60" for
+    /// a weekly window days away. Each refused account here is out on its weekly window
+    /// and held at the one-hour ceiling: the hint names the SOONER stored weekly reset,
+    /// not the hour-long hold. With no window stored, the hold's expiry answers.
+    ///
+    /// The two controls pin the fold's edges: a fleet that is not ALL rejected keeps the
+    /// ordinary fold (its held account frees first), and an all-rejected ANTHROPIC fleet
+    /// is untouched, still the sentinel.
+    ///
+    /// Watched red: drop the fold after the loop and the first two answer 60; prefer the
+    /// hold over the stored window and the first answers the hour.
+    #[test]
+    fn an_all_rejected_codex_fleet_is_timed_on_its_stored_windows_then_its_holds() {
+        use crate::provider::Provider;
+        let now = OffsetDateTime::now_utc();
+        let rejected = |name: &str, provider: Provider, weekly_reset_in: Option<i64>| {
+            let mut account = AccountRuntime::from_config(&account(name, 0), false);
+            account.provider = provider;
+            account.quota.status = Some("rejected".to_string());
+            account.quota.seven_day = weekly_reset_in.map(|secs| crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::seconds(secs)),
+            });
+            account
+        };
+
+        let fleet = Manager::from_runtimes(vec![
+            rejected("a", Provider::Codex, Some(3 * 86_400)),
+            rejected("b", Provider::Codex, Some(2 * 86_400)),
+        ]);
+        fleet.mark_rate_limited(0, 3600);
+        fleet.mark_rate_limited(1, 3600);
+        let hint = fleet.exhaustion_hint(now, false, Provider::Codex, None);
+        assert_eq!(
+            hint.free_at.map(OffsetDateTime::unix_timestamp),
+            Some((now + Duration::seconds(2 * 86_400)).unix_timestamp()),
+            "the sooner stored weekly reset, not the 60s sentinel nor the hour-long hold: {hint:?}"
+        );
+        assert_eq!(hint.binding, Some(GateReason::Rejected));
+        assert_eq!(hint.gated.get(&GateReason::Rejected), Some(&2));
+
+        let no_window = Manager::from_runtimes(vec![rejected("a", Provider::Codex, None)]);
+        no_window.mark_rate_limited(0, 300);
+        let hint =
+            no_window.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Codex, None);
+        assert!(
+            (299..=300).contains(&hint.retry_after) && hint.free_at.is_some(),
+            "with no window stored, the hold's expiry: {hint:?}"
+        );
+
+        let mixed =
+            Manager::from_runtimes(vec![rejected("a", Provider::Codex, Some(2 * 86_400)), {
+                let mut held = AccountRuntime::from_config(&account("b", 0), false);
+                held.provider = Provider::Codex;
+                held
+            }]);
+        mixed.mark_rate_limited(1, 30);
+        let hint = mixed.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Codex, None);
+        assert_eq!(
+            hint.binding,
+            Some(GateReason::Hold),
+            "control: not every account is rejected, so the ordinary fold answers: {hint:?}"
+        );
+        assert!((29..=30).contains(&hint.retry_after), "{hint:?}");
+
+        let anthropic =
+            Manager::from_runtimes(vec![rejected("a", Provider::Anthropic, Some(2 * 86_400))]);
+        anthropic.mark_rate_limited(0, 300);
+        let hint = anthropic.exhaustion_hint(now, false, Provider::Anthropic, None);
+        assert_eq!(
+            (hint.retry_after, hint.free_at, hint.binding),
+            (60, None, None),
+            "control: an all-rejected Anthropic fleet keeps the sentinel: {hint:?}"
+        );
     }
 
     /// `next_session_key` hands out strictly-increasing, unique u64s starting at 1.

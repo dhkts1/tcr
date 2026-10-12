@@ -7826,7 +7826,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
         "anthropic-ratelimit-unified-7d-utilization",
         "0.10".parse().expect("a header value"),
     );
-    manager.update_quota(0, &measured);
+    manager.update_quota(0, &measured, 200);
     let owner_proxy = fleet::spawn_proxy(manager.clone()).await;
 
     let lender_home = tempfile::tempdir().expect("the lender's temp home");
