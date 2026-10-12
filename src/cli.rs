@@ -1498,6 +1498,17 @@ fn write_control_account(
         None => None,
         Some(q) => Some(config.accounts[resolve_account(&config.accounts, q)?].clone()),
     };
+    // The live route's refusal, offline: boot ignores a `controlAccount` naming a Codex
+    // account, so writing one would persist a setting the next start throws away.
+    if let Some(account) = &target {
+        match account.provider {
+            crate::provider::Provider::Anthropic => {}
+            crate::provider::Provider::Codex => bail!(
+                "{} Nothing was changed.",
+                crate::manager::codex_control_refusal(&account.name)
+            ),
+        }
+    }
     let name = target.as_ref().map(|a| a.name.clone());
     let outcome = config::save_control_account(config_path, target.as_ref())
         .with_context(|| format!("save config at {}", config_path.display()))?;
@@ -4086,6 +4097,55 @@ mod tests {
         assert!(
             control_account_group_notice(&config, "worker@example.com", "dev").is_none(),
             "an ordinary account must not be warned about"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The offline half of `tcr control` (no server, or one too old for the live route)
+    /// refuses a Codex account the way the live route does, so `tcr control` cannot
+    /// persist a `controlAccount` the next boot would ignore. The file is left as it was.
+    ///
+    /// The config names a port nothing listens on ([`dead_port`]): an edit asks whether a
+    /// server is running on the config's port, and without one that is 3456, where a live
+    /// tcr may be serving.
+    ///
+    /// Watched red: drop the provider check from `write_control_account` and the file
+    /// names the Codex row.
+    #[tokio::test]
+    async fn write_control_account_refuses_a_codex_account_and_writes_nothing() {
+        let port = dead_port().await;
+        let path = write_config(
+            "control-codex",
+            &serde_json::json!({
+                "proxy": { "port": port },
+                "accounts": [
+                    { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                      "expiresAt": 1_893_456_000_000_i64, "priority": 0 },
+                    { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+                      "accountUuid": "11111111-1111-4111-8111-111111111111", "accessToken": "at-b",
+                      "refreshToken": "rt-b", "expiresAt": 1_893_456_000_000_i64, "priority": 0 }
+                ]
+            })
+            .to_string(),
+        );
+        let before = fs::read_to_string(&path).unwrap();
+        let err = write_control_account(&path, Some("bob@example.com/codex"))
+            .expect_err("a Codex account cannot be the control account");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("bob@example.com/codex")
+                && message.contains(crate::manager::CODEX_HAS_NO_CONTROL_ACCOUNT),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing was written"
+        );
+        assert_eq!(
+            write_control_account(&path, Some("alice@example.com")).unwrap(),
+            Some("alice@example.com".to_string()),
+            "control: the Anthropic row is set"
         );
         fs::remove_file(&path).ok();
     }

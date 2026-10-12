@@ -156,8 +156,19 @@ impl Manager {
         self.accounts.read().expect("accounts lock poisoned").len()
     }
 
+    /// The Anthropic origin. A request's own origin, which depends on its provider, is
+    /// [`Self::upstream_for`].
     pub fn upstream(&self) -> &str {
         &self.upstream
+    }
+
+    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
+    /// accessor its existing callers (profile fetch, control identity) mean.
+    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
+        match provider {
+            crate::provider::Provider::Anthropic => &self.upstream,
+            crate::provider::Provider::Codex => &self.codex_upstream,
+        }
     }
 
     pub fn proxy_api_key(&self) -> Option<&str> {
@@ -236,6 +247,15 @@ impl Manager {
             .expect("accounts lock poisoned")
             .get(idx)
             .and_then(|a| a.account_uuid.clone())
+    }
+
+    /// `None` only for an index that no longer exists.
+    pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.provider)
     }
 }
 

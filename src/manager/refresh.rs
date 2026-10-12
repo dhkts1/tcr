@@ -110,7 +110,7 @@ impl Manager {
                 }
             }
         }
-        let (name, account_uuid, org_uuid, org_name) = {
+        let (name, account_uuid, org_uuid, org_name, provider) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             match accounts.get(idx) {
                 Some(a) => (
@@ -118,6 +118,7 @@ impl Manager {
                     a.account_uuid.clone(),
                     a.org_uuid.clone(),
                     a.org_name.clone(),
+                    a.provider,
                 ),
                 None => return false,
             }
@@ -135,7 +136,7 @@ impl Manager {
                 // write lives in apply_refresh.
                 let cooldown_after = force.then(Self::cooldown_deadline);
                 self.apply_refresh(idx, &tokens, cooldown_after);
-                self.persist_tokens(&name, account_uuid, org_uuid, org_name, &tokens);
+                self.persist_tokens(&name, account_uuid, org_uuid, org_name, provider, &tokens);
                 tracing::info!(account = %name, "token refreshed");
                 true
             }

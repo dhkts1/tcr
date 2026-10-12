@@ -273,6 +273,10 @@ impl AccountStatus {
 pub struct AccountRuntime {
     pub name: String,
     pub account_type: String,
+    /// Which upstream this credential belongs to; copied from `config::Account::provider` at
+    /// boot and never changed afterwards. Selection filters on it FIRST (`select::eligible`):
+    /// a Claude request and a Codex account have nothing to say to each other.
+    pub provider: crate::provider::Provider,
     /// The pooled account's own UUID, injected into the outbound request body's
     /// `metadata.user_id.account_uuid` so it matches the token we serve with
     /// (see [`crate::account_uuid`]). `None` leaves the body unchanged.
@@ -656,6 +660,7 @@ impl AccountRuntime {
         Self {
             name: account.name.clone(),
             account_type: account.account_type.clone(),
+            provider: account.provider,
             account_uuid: account.account_uuid.clone(),
             org_uuid: account.org_uuid.clone(),
             org_name: account.org_name.clone(),
@@ -788,6 +793,27 @@ pub enum SetControlOutcome {
     /// past the loader's rename migration. Listed so the caller can tell the
     /// user which rows to go fix.
     Ambiguous(Vec<String>),
+    /// The query named a Codex account, which cannot be the control account
+    /// ([`codex_control_refusal`]); carries its name. Nothing was changed: the
+    /// boot path ignores such a `controlAccount`, so accepting it here would
+    /// persist a setting the next start throws away.
+    CodexAccount(String),
+}
+
+/// Why a Codex account cannot be the control account, in the words both places
+/// that meet one use: boot, which ignores a `controlAccount` naming one, and
+/// `tcr control`, which refuses to set one. The control account is an Anthropic
+/// identity (its bootstrap calls, its probe, its `controlIdentity` check), and
+/// Codex has no counterpart yet.
+pub const CODEX_HAS_NO_CONTROL_ACCOUNT: &str = "Codex has no control-account semantics yet";
+
+/// `tcr control`'s refusal of the Codex account `name`, live
+/// ([`SetControlOutcome::CodexAccount`]) and offline alike.
+pub fn codex_control_refusal(name: &str) -> String {
+    format!(
+        "'{name}' is a Codex account, and {CODEX_HAS_NO_CONTROL_ACCOUNT}, so it cannot be the \
+         control account."
+    )
 }
 
 /// What [`Manager::set_control`] achieved about DURABILITY — whether the
@@ -1015,6 +1041,9 @@ pub struct Manager {
     /// a flag a future caller can unset by mistake.
     mutation_released: AtomicBool,
     upstream: String,
+    /// Where a Codex account's requests go ([`config::Config::codex_upstream`]). Read
+    /// through [`Self::upstream_for`]; `upstream` above stays the Anthropic origin.
+    codex_upstream: String,
     proxy_api_key: Option<String>,
     global_threshold: f64,
     /// Override for the Fable weekly bucket alone — see
@@ -1419,6 +1448,7 @@ impl Manager {
         accounts: Vec<AccountRuntime>,
     ) -> Arc<Self> {
         let upstream = config.upstream.clone();
+        let codex_upstream = config.codex_upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let fable_weekly_threshold = config.fable_weekly_threshold;
@@ -1492,6 +1522,23 @@ impl Manager {
                 }
             }
         });
+        // The control account is an Anthropic identity: the one Claude Code's
+        // bootstrap calls resolve to, probed and `controlIdentity`-checked as one.
+        // Codex has no counterpart in this version, so a Codex row named here is
+        // warned about and ignored rather than half-honoured. A `match`,
+        // so a third provider decides this here instead of inheriting an answer.
+        let control_idx = control_idx.filter(|&idx| {
+            accounts.get(idx).is_none_or(|account| match account.provider {
+                crate::provider::Provider::Anthropic => true,
+                crate::provider::Provider::Codex => {
+                    tracing::warn!(
+                        account = %account.name,
+                        "controlAccount names a Codex account; {CODEX_HAS_NO_CONTROL_ACCOUNT}, ignoring it"
+                    );
+                    false
+                }
+            })
+        });
 
         let usage = crate::usage::UsageTracker::new(
             accounts.len(),
@@ -1513,6 +1560,7 @@ impl Manager {
             config_path,
             mutation_released: AtomicBool::new(false),
             upstream,
+            codex_upstream,
             proxy_api_key,
             global_threshold,
             fable_weekly_threshold,
@@ -1959,6 +2007,7 @@ impl Manager {
         account_uuid: Option<String>,
         org_uuid: Option<String>,
         org_name: Option<String>,
+        provider: crate::provider::Provider,
         tokens: &Tokens,
     ) {
         // Defence in depth: `refresh_plan` already refuses to produce a refresh
@@ -1975,7 +2024,13 @@ impl Manager {
         // alone, so a rotated token lands on the RIGHT entry when the same email
         // is logged into two orgs (finding #9). With all identity fields None
         // (today's config) same_identity falls back to name equality — unchanged.
-        let probe = crate::identity::probe(name, account_uuid, org_uuid, org_name);
+        //
+        // The provider rides along so the probe is the account it was built from,
+        // like every other config-write probe in this module. Unlike theirs, the
+        // matching here (`identity::resolve` below, then `save_tokens_for`'s merge)
+        // reads identity alone today, so it decides nothing yet.
+        let mut probe = crate::identity::probe(name, account_uuid, org_uuid, org_name);
+        probe.provider = provider;
         // INV1 — the modify and the save must be ONE atomic step against the file.
         // Without that, two concurrent refreshes race: a stale save clobbers the
         // other account's just-rotated refresh token, which then 400s
@@ -2502,12 +2557,18 @@ impl Manager {
                 account.status = AccountStatus::Active;
                 account.rate_limited_until_ms = None;
             }
-            crate::identity::probe(
+            // `save_disabled` locates the row by this probe, and
+            // `config::locate_account_entry` never matches a row of the other
+            // provider: a probe left at the default (Anthropic) addresses no
+            // Codex row, so a Codex account's bench would never reach disk.
+            let mut probe = crate::identity::probe(
                 &account.name,
                 account.account_uuid.clone(),
                 account.org_uuid.clone(),
                 account.org_name.clone(),
-            )
+            );
+            probe.provider = account.provider;
+            probe
         };
         self.persist_disabled(idx, &target, disabled)
     }
@@ -2720,12 +2781,17 @@ impl Manager {
                 .expect("accounts lock poisoned")
                 .get(i)
                 .map(|a| {
-                    crate::identity::probe(
+                    // Carries the account's provider for the reason
+                    // `set_disabled`'s probe does: `save_control_account`
+                    // checks the row through `config::locate_account_entry`.
+                    let mut probe = crate::identity::probe(
                         &a.name,
                         a.account_uuid.clone(),
                         a.org_uuid.clone(),
                         a.org_name.clone(),
-                    )
+                    );
+                    probe.provider = a.provider;
+                    probe
                 })
         });
         {
@@ -2752,7 +2818,14 @@ impl Manager {
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             match crate::identity::match_one(&accounts[..], query) {
-                crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
+                // Refused here as boot ignores it (see `assemble`): a `match`, so a third
+                // provider decides this too instead of inheriting an answer.
+                crate::identity::Match::One(idx) => match accounts[idx].provider {
+                    crate::provider::Provider::Anthropic => (idx, accounts[idx].name.clone()),
+                    crate::provider::Provider::Codex => {
+                        return SetControlOutcome::CodexAccount(accounts[idx].name.clone())
+                    }
+                },
                 crate::identity::Match::None => return SetControlOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
                     return SetControlOutcome::Ambiguous(names)
@@ -3071,7 +3144,13 @@ impl Manager {
                         let target = config::Account {
                             name: row.name.clone(),
                             account_type: row.account_type.clone(),
-                            provider: Default::default(),
+                            // The SUBMISSION's provider: `persist_replaced`
+                            // writes through `config::locate_account_entry`,
+                            // which never matches a row of the other provider,
+                            // so a default (Anthropic) here would append an
+                            // Anthropic row carrying a Codex credential instead
+                            // of updating the Codex row in place.
+                            provider: account.provider,
                             account_uuid: row.account_uuid.clone(),
                             org_uuid: row.org_uuid.clone(),
                             org_name: row.org_name.clone(),
@@ -4005,6 +4084,7 @@ mod tests {
             None,
             None,
             None,
+            crate::provider::Provider::Anthropic,
             &Tokens {
                 access_token: "at-a-rotated".to_string(),
                 refresh_token: Some("rt-a-rotated".to_string()),
@@ -5572,6 +5652,97 @@ mod tests {
         assert_eq!(unmatched.control(), None);
     }
 
+    /// A `controlAccount` naming a Codex account is warned about and ignored:
+    /// the control account is an Anthropic identity (its bootstrap calls, its
+    /// probe, its `controlIdentity` check), and Codex has no counterpart in this
+    /// version. The same name resolves when the row is Anthropic,
+    /// so the `None` below is the provider and not a name that never matched.
+    ///
+    /// Watched red: drop the provider filter after `assemble`'s control
+    /// resolution and the Codex row resolves (`Some(1)`).
+    #[test]
+    fn assemble_ignores_a_codex_control_account() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager(
+            config_with_control(
+                vec![account("alice@example.com", 0), codex],
+                "bob@example.com",
+            ),
+            lock_refresher(),
+        );
+        assert_eq!(
+            manager.control(),
+            None,
+            "a Codex control account must be ignored at boot"
+        );
+
+        let anthropic = build_manager(
+            config_with_control(
+                vec![
+                    account("alice@example.com", 0),
+                    account("bob@example.com", 0),
+                ],
+                "bob@example.com",
+            ),
+            lock_refresher(),
+        );
+        assert_eq!(
+            anthropic.control(),
+            Some(1),
+            "the control: an Anthropic row resolves"
+        );
+    }
+
+    #[test]
+    fn upstream_for_routes_each_provider_to_its_own_host() {
+        // Built the way the other tests here build a manager, from a Config whose `upstream` and
+        // `codex_upstream` name two different hosts.
+        let mut config = config_with(vec![account("alice@example.com", 0)]);
+        config.upstream = "http://anthropic.test".to_string();
+        config.codex_upstream = "http://codex.test".to_string();
+        let manager = build_manager(config, lock_refresher());
+        assert_eq!(
+            manager.upstream_for(crate::provider::Provider::Anthropic),
+            "http://anthropic.test"
+        );
+        assert_eq!(
+            manager.upstream_for(crate::provider::Provider::Codex),
+            "http://codex.test"
+        );
+        assert_eq!(
+            manager.upstream(),
+            "http://anthropic.test",
+            "the Anthropic-only accessor is unchanged"
+        );
+    }
+
+    /// `Manager::provider` reads each runtime row's own provider, which
+    /// `AccountRuntime::from_config` copied from the config row, and `None`
+    /// only past the end.
+    ///
+    /// Watched red: have the accessor answer the default for every row and the
+    /// Codex row reads as Anthropic.
+    #[test]
+    fn provider_reads_each_rows_own_provider() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            lock_refresher(),
+        );
+        assert_eq!(
+            manager.provider(0),
+            Some(crate::provider::Provider::Anthropic)
+        );
+        assert_eq!(manager.provider(1), Some(crate::provider::Provider::Codex));
+        assert_eq!(manager.provider(2), None, "an index past the end");
+    }
+
     /// The exact bug this unit fixes: a legacy bare-string `controlAccount`
     /// that names a DUPLICATED email must not silently bind to whichever row
     /// sorts first (the old `position(...)` behaviour) — it must refuse and run
@@ -6294,6 +6465,48 @@ mod tests {
         assert_eq!(manager.control(), None);
     }
 
+    /// `tcr control` naming a Codex account is refused at runtime, as boot ignores one
+    /// (`assemble_ignores_a_codex_control_account`): nothing is set, so nothing is
+    /// persisted, and a control account already in place stays. The Anthropic row of
+    /// the same fleet is set, so the refusal is the provider's and not a name that
+    /// never matched.
+    ///
+    /// Watched red: drop the provider check from `set_control_by_query` and the Codex
+    /// row is applied.
+    #[test]
+    fn set_control_by_query_refuses_a_codex_account() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com/codex", 0)
+        };
+        let manager = build_manager(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            lock_refresher(),
+        );
+        let refused = SetControlOutcome::CodexAccount("bob@example.com/codex".to_string());
+        assert_eq!(
+            manager.set_control_by_query(Some("bob@example.com/codex")),
+            refused
+        );
+        assert_eq!(manager.control(), None, "nothing is set");
+
+        manager.set_control_by_query(Some("alice@example.com"));
+        assert_eq!(
+            manager.control(),
+            Some(0),
+            "control: the Anthropic row is set"
+        );
+        assert_eq!(
+            manager.set_control_by_query(Some("bob@example.com/codex")),
+            refused
+        );
+        assert_eq!(
+            manager.control(),
+            Some(0),
+            "the control account already in place stays"
+        );
+    }
+
     #[test]
     fn set_control_by_query_no_match_and_ambiguous() {
         let manager = build_manager(
@@ -6415,6 +6628,7 @@ mod tests {
                 now,
                 now_ms,
                 false,
+                crate::provider::Provider::Anthropic,
                 None,
                 None,
                 &HashSet::new(),
@@ -6434,6 +6648,7 @@ mod tests {
                 later,
                 later_ms,
                 false,
+                crate::provider::Provider::Anthropic,
                 None,
                 None,
                 &HashSet::new(),
@@ -6617,6 +6832,7 @@ mod tests {
                 now,
                 now_ms,
                 false,
+                crate::provider::Provider::Anthropic,
                 None,
                 None,
                 &HashSet::new(),
@@ -6813,6 +7029,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        crate::provider::Provider::Anthropic,
                         &Tokens {
                             access_token: format!("new-at-{i}"),
                             refresh_token: Some(format!("new-rt-{i}")),
@@ -8835,7 +9052,13 @@ mod tests {
             "every account is over the soft threshold → normal select benches all"
         );
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                Some(key),
+                "/v1/messages"
+            ),
             Some(other),
             "the revalidation serve routes the Fable request to an account that can \
              answer it"
@@ -10625,6 +10848,40 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A Codex account's bench reaches ITS row. `config::locate_account_entry`
+    /// never matches a row of the other provider, so the probe `set_disabled`
+    /// locates the row by must carry the runtime account's provider: built with
+    /// the default (Anthropic) it addresses nothing, and the bench silently does
+    /// not survive a restart.
+    ///
+    /// Watched red: drop `probe.provider = account.provider` in `set_disabled`
+    /// and the outcome is `NoEntry`, with the Codex row unflagged.
+    #[test]
+    fn set_disabled_on_a_codex_account_persists_to_its_codex_row() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            "codex-disable",
+        );
+
+        assert_eq!(
+            manager.set_disabled(1, true),
+            DisablePersist::Persisted,
+            "the Codex account's bench must reach its own row"
+        );
+        let after = read_config_json(&path);
+        assert_eq!(after["accounts"][1]["disabled"], serde_json::json!(true));
+        assert_eq!(after["accounts"][1]["provider"], serde_json::json!("codex"));
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "the Anthropic row must be untouched: {after}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     /// A manager with NO `config_path` — every test here, `tcr demo`, and
     /// `tcr status --probe` — must write nothing at all. The demo drives
     /// `set_disabled` on rows that have no config file behind them.
@@ -11602,6 +11859,57 @@ mod tests {
         );
         assert_eq!(reloaded.accounts[0].org_name.as_deref(), Some("Corp"));
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Re-adding a Codex account replaces the credential on ITS row. The
+    /// Updated arm hands `persist_replaced` a target it builds itself, and
+    /// `config::locate_account_entry` never matches a row of the other
+    /// provider: a target that defaulted to Anthropic found no row and APPENDED
+    /// one, an Anthropic row carrying the Codex credential, which the next boot
+    /// would send to the Anthropic upstream.
+    ///
+    /// Watched red: give the Updated target `provider: Default::default()` and
+    /// the file grows a second row with no `provider` key.
+    #[test]
+    fn re_adding_a_codex_account_updates_its_row_and_appends_no_anthropic_duplicate() {
+        let stored = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            ..account("bob@example.com", 0)
+        };
+        let (manager, path) =
+            build_manager_with_disk(config_with(vec![stored.clone()]), "codex-readd");
+
+        let submission = Account {
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..stored
+        };
+        let outcome = manager.add_or_update_account(submission);
+        assert!(
+            matches!(
+                outcome,
+                AddAccountOutcome::Updated {
+                    idx: 0,
+                    persist: AddPersist::Persisted,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let after = read_config_json(&path);
+        let rows = after["accounts"].as_array().expect("an accounts array");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a Codex re-add must update its own row, never append a duplicate: {after}"
+        );
+        assert_eq!(rows[0]["provider"], serde_json::json!("codex"));
+        assert_eq!(rows[0]["refreshToken"], serde_json::json!("rt-fresh"));
         std::fs::remove_file(&path).ok();
     }
 
@@ -12615,7 +12923,7 @@ mod tests {
             "every account is over the soft threshold → normal select benches all"
         );
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(1),
             "revalidation serves the least-utilized allowed account"
         );
@@ -12644,14 +12952,14 @@ mod tests {
         }
 
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            manager.select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages"),
             Some(2),
             "pin-honor serves the session's warm pinned account, NOT the least-utilized other"
         );
         // The pin-honor path must NOT have burned the fallback throttle window: an
         // unaffiliated (no-pin) fallback serve still succeeds immediately.
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(0),
             "pin-honor does not consume the fallback anti-storm window"
         );
@@ -12670,7 +12978,7 @@ mod tests {
             pins.insert(key, (2, odt_to_ms(now)));
         }
         assert_eq!(
-            manager2.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            manager2.select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages"),
             Some(0),
             "a rejected pin falls back to the least-utilized survivor"
         );
@@ -12721,7 +13029,7 @@ mod tests {
         // not rejected, no hold. It clears every ACCOUNT-level hard gate.
         let tried = HashSet::from([2usize]);
         assert_eq!(
-            manager.select_revalidation(&tried, now, None, Some(key)),
+            manager.select_revalidation(&tried, now, None, Some(key), "/v1/messages"),
             Some(0),
             "a tried pin cannot serve THIS request → the least-utilized survivor does"
         );
@@ -12772,7 +13080,7 @@ mod tests {
         set_over_threshold(&rejected, 2, 0.999, "rejected");
         pin_session(&rejected, 2);
         assert_eq!(
-            rejected.select_revalidation(&tried, now, None, Some(key)),
+            rejected.select_revalidation(&tried, now, None, Some(key), "/v1/messages"),
             Some(0),
             "a rejected pin is skipped; the least-utilized survivor serves"
         );
@@ -12797,7 +13105,7 @@ mod tests {
         }
         pin_session(&held, 2);
         assert_eq!(
-            held.select_revalidation(&tried, now, None, Some(key)),
+            held.select_revalidation(&tried, now, None, Some(key), "/v1/messages"),
             Some(0),
             "a pin held past its cache lifetime is skipped; the survivor serves"
         );
@@ -12821,7 +13129,7 @@ mod tests {
 
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(1),
             "the least-utilized account is rejected → skip it, serve the allowed one"
         );
@@ -12836,7 +13144,7 @@ mod tests {
         set_over_threshold(&manager2, 0, 0.960, "rejected");
         set_over_threshold(&manager2, 1, 0.990, "rejected");
         assert_eq!(
-            manager2.select_revalidation(&HashSet::new(), now, None, None),
+            manager2.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             None,
             "all accounts rejected → no revalidation target, honest 429"
         );
@@ -12857,7 +13165,7 @@ mod tests {
         }
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(1),
             "a live-held account is a HARD block — skipped even as least-utilized"
         );
@@ -12875,12 +13183,12 @@ mod tests {
         set_over_threshold(&manager, 1, 0.990, "allowed_warning");
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(0),
             "first call serves"
         );
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             None,
             "a second call within the spacing window is throttled to None"
         );
@@ -12925,7 +13233,13 @@ mod tests {
         // Fable request: account 0's Fable weekly is a hard reject → skip → serve 1.
         let (manager, now) = build();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), None),
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                None,
+                "/v1/messages"
+            ),
             Some(1),
             "a Fable request skips the Fable-exhausted account even when least-utilized"
         );
@@ -12934,7 +13248,13 @@ mod tests {
         // gates Fable traffic only; on shared dims account 0 is least-utilized).
         let (manager, now) = build();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, Some("claude-opus-4-6"), None),
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages"
+            ),
             Some(0),
             "a non-Fable request still serves the Fable-exhausted account"
         );

@@ -1907,6 +1907,15 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
             &crate::cli::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
             None,
         )),
+        // 409, like the tie above: every `tcr control` client reads a stamped 404 or 409
+        // from this route as a refusal of the query and writes nothing, where any other
+        // status would send it to the file instead.
+        SetControlOutcome::CodexAccount(name) => stamp_control_endpoint(error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &crate::manager::codex_control_refusal(&name),
+            None,
+        )),
         SetControlOutcome::Applied { name, persist } => {
             let payload = SetControlResponse {
                 name,
@@ -3283,6 +3292,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                         now,
                                         request_model.as_deref(),
                                         session_key,
+                                        &path,
                                     )
                                 }
                                 None => None,
@@ -9097,6 +9107,46 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("ambiguous") && text.matches("alice@example.com").count() >= 2);
         assert_eq!(manager.control(), None, "an unbreakable tie sets nothing");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **`tcr control` naming a Codex account is refused on the live route, and changes
+    /// nothing.** Boot ignores a `controlAccount` that names a Codex account, so accepting
+    /// one here would persist a setting the next start throws away. 409 and stamped, so
+    /// every `tcr control` client reports the refusal and writes nothing; the message
+    /// carries the boot warning's reason.
+    ///
+    /// Watched red: drop the provider check from `Manager::set_control_by_query` and the
+    /// route answers 200 and writes the Codex row's name to the file.
+    #[tokio::test]
+    async fn control_account_endpoint_refuses_a_codex_account_and_changes_nothing() {
+        let path = control_config_path("control-codex");
+        let mut config = two_account_config(None);
+        config.accounts[1].provider = crate::provider::Provider::Codex;
+        let codex = config.accounts[1].name.clone();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+
+        let (status, headers, body) = control_account_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            &format!(r#"{{"query":"{codex}"}}"#),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(CONTROL_ENDPOINT)
+        );
+        assert!(
+            text.contains(&codex) && text.contains(crate::manager::CODEX_HAS_NO_CONTROL_ACCOUNT),
+            "the refusal names the account and the reason boot gives: {text}"
+        );
+        assert_eq!(manager.control(), None, "nothing is set in memory");
+        assert_eq!(control_account_in_file(&path), None, "nor on disk");
         std::fs::remove_file(&path).ok();
     }
 

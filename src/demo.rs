@@ -43,6 +43,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
     AccountRuntime {
         name: name.to_string(),
         account_type: "oauth".to_string(),
+        provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
         org_name: Some("Demo Org".to_string()),

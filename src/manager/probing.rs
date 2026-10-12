@@ -357,13 +357,17 @@ impl Manager {
             // The identity probe `save_plan` locates the on-disk row by. Built
             // from the row's own stored identity, exactly like
             // `Manager::persist_replaced` does, so the two orgs of one email
-            // resolve to different entries rather than tying.
-            crate::identity::probe(
+            // resolve to different entries rather than tying. It carries the
+            // row's provider too: `config::locate_account_entry` never matches a
+            // row of the other provider.
+            let mut probe = crate::identity::probe(
                 &account.name,
                 account.account_uuid.clone(),
                 account.org_uuid.clone(),
                 account.org_name.clone(),
-            )
+            );
+            probe.provider = account.provider;
+            probe
         };
 
         let Some(path) = self.config_path.as_ref() else {
