@@ -171,6 +171,7 @@ fn base(name: &str) -> AccountStatusRow {
         cache_read_tokens: Some(0),
         cache_hit_ratio: None,
         last_probe_ms: None,
+        quota_updated_at_ms: None,
         probe_status: "ok".into(),
         probe_error: None,
         stream_error_count: Some(0),
