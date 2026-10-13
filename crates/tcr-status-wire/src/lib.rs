@@ -339,9 +339,10 @@ pub struct AccountStatusRow {
     pub quota: Option<f64>,
     /// `"ok"`, `"near"`, or `"spent"` — see `quota_state_token`.
     pub quota_state: String,
-    /// Kebab-case `GateReason` token: `"ok"`, `"hold"`, `"five-hour"`,
-    /// `"seven-day"`, `"fable-weekly"`, `"standard"`, `"login"`, `"rejected"`,
-    /// `"disabled"`, `"reserved"`, or `"parked"`.
+    /// Kebab-case `GateReason` token: `"ok"`, `"hold"`, `"refused"`,
+    /// `"five-hour"`, `"seven-day"`, `"fable-weekly"`, `"standard"`, `"login"`,
+    /// `"rejected"`, `"disabled"`, `"reserved"`, or `"parked"`. `"refused"` is the
+    /// short hold an upstream 403 arms; it self-frees like `"hold"`.
     pub gate: String,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,

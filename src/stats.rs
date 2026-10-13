@@ -75,6 +75,9 @@ pub enum GateReason {
     Ok,
     /// A rate-limit hold (429 `retry-after`) that has not yet lifted.
     Hold,
+    /// Upstream answered 403, refusing our credential, and the short hold it
+    /// arms has not yet lifted. Self-frees at the hold's end, like [`Self::Hold`].
+    Refused,
     /// The shared 5-hour bucket is at/over threshold.
     FiveHour,
     /// The shared weekly bucket is at/over threshold.
