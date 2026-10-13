@@ -4713,7 +4713,7 @@ mod tests {
     fn blank_account() -> Account {
         Account {
             name: String::new(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4808,7 +4808,7 @@ mod tests {
 
         let account = Account {
             name: "new@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4864,7 +4864,7 @@ mod tests {
 
         let account = Account {
             name: "dup@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

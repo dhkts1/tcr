@@ -204,7 +204,7 @@ impl Manager {
         }
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account = accounts.get(idx)?;
-        if account.account_type != "oauth" {
+        if !account.account_type.is_oauth() {
             return None;
         }
         let refresh_token = account.refresh_token.clone()?;

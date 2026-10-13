@@ -1562,7 +1562,7 @@ impl AccountWarmer for NeverWarms {
 fn fake_account() -> Account {
     Account {
         name: "alice@example.com".to_string(),
-        account_type: "oauth".to_string(),
+        account_type: teamclaude_rs::config::AccountType::OAuth,
         account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
         org_uuid: None,
         org_name: None,

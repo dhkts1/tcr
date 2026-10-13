@@ -1064,7 +1064,7 @@ pub fn upsert_account(
     match crate::identity::resolve(config.accounts.iter().enumerate(), &probe) {
         crate::identity::Resolved::One(index) => {
             let account = &mut config.accounts[index];
-            account.account_type = "oauth".to_string();
+            account.account_type = crate::config::AccountType::OAuth;
             account.access_token = tokens.access_token.clone();
             account.refresh_token = tokens.refresh_token.clone();
             account.expires_at = Some(tokens.expires_at_ms);
@@ -1106,7 +1106,7 @@ pub fn upsert_account(
 
             config.accounts.push(Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid,
                 org_uuid,
                 org_name,
@@ -1290,7 +1290,7 @@ enum AddCapability {
 async fn probe_add_capability(config: &Config) -> AddCapability {
     let probe = Account {
         name: String::new(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         account_uuid: None,
         org_uuid: None,
         org_name: None,
@@ -2206,7 +2206,7 @@ fn persist_via_file(
 ) -> anyhow::Result<String> {
     let account = Account {
         name: name.to_string(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         account_uuid: profile.account_uuid,
         org_uuid: profile.org_uuid,
         org_name: profile.org_name,
@@ -2360,7 +2360,7 @@ async fn finish_login(
         LoginRoute::Live => {
             let account = Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid: profile.account_uuid.clone(),
                 org_uuid: profile.org_uuid.clone(),
                 org_name: profile.org_name.clone(),
@@ -3180,7 +3180,7 @@ mod tests {
         assert_eq!(config.accounts.len(), 1);
         let account = &config.accounts[0];
         assert_eq!(account.name, "new@example.com");
-        assert_eq!(account.account_type, "oauth");
+        assert_eq!(account.account_type, crate::config::AccountType::OAuth);
         assert_eq!(account.access_token, "at1");
         assert_eq!(account.refresh_token.as_deref(), Some("rt1"));
         assert_eq!(account.expires_at, Some(111));
@@ -4478,7 +4478,7 @@ mod tests {
         // exactly the race `login()`'s doc-comment describes.
         let rotated_bob = Account {
             name: "bob@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4685,7 +4685,7 @@ mod tests {
         // silent in this scenario and cannot carry a real round-trip.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4788,7 +4788,7 @@ mod tests {
         // is silent for the whole test and cannot carry a real round-trip.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4976,7 +4976,7 @@ mod tests {
         // as every sibling clobber test in this file.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5414,7 +5414,7 @@ mod tests {
     fn named_account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

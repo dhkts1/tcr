@@ -161,8 +161,73 @@ fn default_fleet_throttle() -> ThrottleConfig {
         burst: Some(32),
     }
 }
-fn default_account_type() -> String {
-    "oauth".to_string()
+/// What kind of credential an account row holds: its `type` key, parsed once
+/// here at the serde boundary. No other code spells the strings.
+///
+/// An absent `type` is [`AccountType::OAuth`], as it always was. A string
+/// tcr does not know is kept VERBATIM in [`AccountType::Unrecognized`]: the
+/// row loads exactly as it did when `type` was a plain `String` (served with
+/// its `accessToken`, never refreshed, probed or warmed, because only OAuth
+/// rows are), and a save writes the same string back, so a value another tool
+/// wrote survives tcr touching the file. A `type` that is not a string at all
+/// is quarantined at load ([`Unusable::UnreadableType`]) rather than failing
+/// the whole file.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "AccountTypeWire", into = "AccountTypeWire")]
+pub enum AccountType {
+    /// A Claude subscription login: an OAuth access token, usually with a
+    /// refresh token.
+    #[default]
+    OAuth,
+    /// A console API key. tcr does not serve these: a file row of this type is
+    /// quarantined at load ([`Unusable::ApiKeyAccount`]) and the live-add
+    /// route refuses one.
+    ApiKey,
+    /// Any other string, held as written.
+    Unrecognized(String),
+}
+
+impl AccountType {
+    /// Only OAuth rows are refreshed, probed and warmed.
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuth)
+    }
+}
+
+/// The on-disk spelling of [`AccountType`]: a known name, or any other string.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum AccountTypeWire {
+    Known(KnownAccountType),
+    Unrecognized(String),
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum KnownAccountType {
+    #[serde(rename = "oauth")]
+    OAuth,
+    #[serde(rename = "apikey")]
+    ApiKey,
+}
+
+impl From<AccountTypeWire> for AccountType {
+    fn from(wire: AccountTypeWire) -> Self {
+        match wire {
+            AccountTypeWire::Known(KnownAccountType::OAuth) => Self::OAuth,
+            AccountTypeWire::Known(KnownAccountType::ApiKey) => Self::ApiKey,
+            AccountTypeWire::Unrecognized(raw) => Self::Unrecognized(raw),
+        }
+    }
+}
+
+impl From<AccountType> for AccountTypeWire {
+    fn from(kind: AccountType) -> Self {
+        match kind {
+            AccountType::OAuth => Self::Known(KnownAccountType::OAuth),
+            AccountType::ApiKey => Self::Known(KnownAccountType::ApiKey),
+            AccountType::Unrecognized(raw) => Self::Unrecognized(raw),
+        }
+    }
 }
 
 /// Proxy-level settings (`proxy` object in the file).
@@ -193,8 +258,8 @@ impl Default for ProxyConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub name: String,
-    #[serde(rename = "type", default = "default_account_type")]
-    pub account_type: String,
+    #[serde(rename = "type", default)]
+    pub account_type: AccountType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_uuid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1429,9 +1494,17 @@ fn credential_version_of(entry: &Value) -> Result<Option<u64>, ()> {
 /// Why [`unusable_account`] refused an `accounts[]` entry.
 #[derive(Debug, PartialEq)]
 enum Unusable {
-    /// The credential key the entry's type needs (`apiKey` or `accessToken`)
-    /// is absent or empty.
-    MissingCredential(&'static str),
+    /// `accessToken` is absent or empty.
+    MissingAccessToken,
+    /// The entry's `type` is [`AccountType::ApiKey`]. tcr does not serve
+    /// API-key accounts (it would send the key as a Bearer token, which the
+    /// API refuses), so the row is set aside however it is filled in. Before
+    /// this variant, such a row written in the shape it asks for (`apiKey`, no
+    /// `accessToken`) failed the WHOLE load with `missing field accessToken`.
+    ApiKeyAccount,
+    /// The entry's `type` is present but not a string, so it cannot be an
+    /// [`AccountType`]. Holds the raw value, for the warning.
+    UnreadableType(String),
     /// The entry carries its own `upstream` (the teamclaude row shape for a
     /// third-party vendor) whose host is neither Anthropic's API nor the host
     /// this config forwards to. tcr ignores a per-account `upstream` and sends
@@ -1477,10 +1550,20 @@ fn unusable_account(entry: &Value, own_upstream_host: Option<&str>) -> Option<(S
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty())
     };
-    let is_apikey = entry.get("type").and_then(Value::as_str) == Some("apikey");
-    let credential = if is_apikey { "apiKey" } else { "accessToken" };
-    if !has_nonempty(credential) {
-        return Some((name, Unusable::MissingCredential(credential)));
+    // Parsed through `AccountType`'s own serde, so the type names are spelled
+    // in exactly one place.
+    let account_type = match entry.get("type") {
+        None => AccountType::default(),
+        Some(raw) => match AccountType::deserialize(raw) {
+            Ok(account_type) => account_type,
+            Err(_) => return Some((name, Unusable::UnreadableType(raw.to_string()))),
+        },
+    };
+    if matches!(account_type, AccountType::ApiKey) {
+        return Some((name, Unusable::ApiKeyAccount));
+    }
+    if !has_nonempty("accessToken") {
+        return Some((name, Unusable::MissingAccessToken));
     }
     if let Some(upstream) = entry.get("upstream") {
         let host = upstream.as_str().and_then(upstream_host);
@@ -1520,7 +1603,10 @@ fn unusable_account(entry: &Value, own_upstream_host: Option<&str>) -> Option<(S
 ///
 /// The same quarantine covers an entry whose own `upstream` names a
 /// third-party host ([`Unusable::ForeignUpstream`]): its token is that
-/// vendor's key, and tcr would send it to its one configured upstream.
+/// vendor's key, and tcr would send it to its one configured upstream. It
+/// also covers an API-key row ([`Unusable::ApiKeyAccount`]), which tcr does
+/// not serve, and a row whose `type` is not a string
+/// ([`Unusable::UnreadableType`]).
 ///
 /// If every account entry is unusable, that is still an error (an empty fleet
 /// booting silently is its own bug) — reported through the same
@@ -1680,8 +1766,25 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
                 file_index.push(index);
                 true
             }
-            Some((name, Unusable::MissingCredential(reason))) => {
-                tracing::warn!(account = %name, missing = reason, "No token for \"{name}\", skipping");
+            Some((name, Unusable::MissingAccessToken)) => {
+                tracing::warn!(account = %name, missing = "accessToken", "No token for \"{name}\", skipping");
+                quarantined.push(name);
+                false
+            }
+            Some((name, Unusable::ApiKeyAccount)) => {
+                tracing::warn!(
+                    account = %name,
+                    "Account \"{name}\" is an API-key account; tcr does not serve API-key accounts, skipping"
+                );
+                quarantined.push(name);
+                false
+            }
+            Some((name, Unusable::UnreadableType(raw))) => {
+                tracing::warn!(
+                    account = %name,
+                    account_type = %raw,
+                    "Account \"{name}\" has a \"type\" that is not a string ({raw}); skipping"
+                );
                 quarantined.push(name);
                 false
             }
@@ -1698,7 +1801,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         if had_accounts && accounts.is_empty() {
             return Err(ConfigError::Parse(
                 <serde_json::Error as serde::de::Error>::custom(format!(
-                    "no usable accounts remain after skipping {} (no credential, or a non-Anthropic upstream): {}",
+                    "no usable accounts remain after skipping {} (no credential, an API-key account, an unreadable type, or a non-Anthropic upstream): {}",
                     quarantined.len(),
                     quarantined.join(", ")
                 )),
@@ -3783,7 +3886,7 @@ fn merge_account(
                 // for this one write.
                 entry.insert(
                     "type".to_string(),
-                    Value::String(account.account_type.clone()),
+                    serde_json::to_value(&account.account_type)?,
                 );
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
                 if !present(entry, "accountUuid") {
@@ -4116,8 +4219,8 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// An `apikey` account with no `apiKey` is unusable by the same rule an
-    /// `oauth` account with no `accessToken` is — skipped, not fatal.
+    /// An `apikey` account with no `apiKey` at all is skipped, not fatal: tcr
+    /// sets aside every API-key row, filled in or not.
     #[test]
     fn load_skips_apikey_account_missing_api_key() {
         let path = tmp_path("load-skip-apikey");
@@ -4188,6 +4291,108 @@ mod tests {
         let config = load(&path).unwrap();
         assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
         fs::remove_file(&path).ok();
+    }
+
+    /// An `apikey` row in the shape the loader itself asks for (`apiKey`, no
+    /// `accessToken`) used to fail the WHOLE load with `missing field
+    /// accessToken`, taking every other account down with it. tcr does not
+    /// serve API-key accounts, so the row is quarantined like any other
+    /// unusable row and the rest of the config loads.
+    #[test]
+    fn load_quarantines_an_api_key_account() {
+        let path = tmp_path("load-quarantine-apikey");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","apiKey":"sk-ant-api-fake"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("one API-key row must not fail the whole load");
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
+        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// An `apikey` row is set aside even when it also carries an
+    /// `accessToken`: tcr would send that value as a Bearer, which is not how
+    /// an API key authenticates.
+    #[test]
+    fn load_quarantines_an_api_key_account_that_also_has_an_access_token() {
+        let path = tmp_path("load-quarantine-apikey-token");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","accessToken":"sk-ant-api-fake"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"]);
+        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A `type` that is not a string cannot be an `AccountType`. It used to
+    /// fail the whole load; now only that row is set aside.
+    #[test]
+    fn load_quarantines_an_account_whose_type_is_not_a_string() {
+        let path = tmp_path("load-quarantine-type-number");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"odd","type":5,"accessToken":"b"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"]);
+        assert_eq!(config.quarantined_accounts, vec!["odd".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The type names parse to their variants, an absent `type` is OAuth, and
+    /// a string tcr does not know loads as it did when the field was a plain
+    /// `String` and is written back exactly as the user wrote it, so a value
+    /// another tool wrote survives a tcr save.
+    #[test]
+    fn account_type_parses_known_names_and_round_trips_an_unknown_one() {
+        let path = tmp_path("load-account-type-round-trip");
+        fs::write(
+            &path,
+            r#"{"accounts":[
+                 {"name":"plain","accessToken":"a"},
+                 {"name":"named","type":"oauth","accessToken":"b"},
+                 {"name":"other","type":"OAuth-Legacy","accessToken":"c"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(config.quarantined_accounts.is_empty());
+        let types: Vec<&AccountType> = config.accounts.iter().map(|a| &a.account_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                &AccountType::OAuth,
+                &AccountType::OAuth,
+                &AccountType::Unrecognized("OAuth-Legacy".to_string()),
+            ]
+        );
+        assert!(config.accounts[0].account_type.is_oauth());
+        assert!(!config.accounts[2].account_type.is_oauth());
+
+        let out = tmp_path("load-account-type-round-trip-out");
+        save(&out, &config).unwrap();
+        let value = read_json(&out);
+        assert_eq!(value["accounts"][1]["type"], "oauth");
+        assert_eq!(value["accounts"][2]["type"], "OAuth-Legacy");
+        assert_eq!(
+            serde_json::to_value(AccountType::ApiKey).unwrap(),
+            serde_json::json!("apikey")
+        );
+        fs::remove_file(&path).ok();
+        fs::remove_file(&out).ok();
     }
 
     /// A teamclaude-style row whose `upstream` names a third-party host
@@ -6602,7 +6807,7 @@ mod tests {
     fn full_account(name: &str, access_token: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

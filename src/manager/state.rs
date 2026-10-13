@@ -112,7 +112,7 @@ impl Manager {
             .and_then(|v| v.as_bool())
         {
             Some(explicit) => explicit,
-            None => config.accounts.iter().all(|a| a.account_type == "oauth"),
+            None => config.accounts.iter().all(|a| a.account_type.is_oauth()),
         }
     }
 

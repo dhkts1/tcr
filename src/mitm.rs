@@ -1374,7 +1374,7 @@ mod tests {
             http1_only: false,
             accounts: vec![crate::config::Account {
                 name: "dummy".to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
