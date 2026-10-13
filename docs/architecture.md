@@ -1,7 +1,7 @@
 # How `tcr` works
 
-The request path, the two entry modes, how an account gets picked, and how quota is kept
-fresh. Every tunable named here has its type, default and source citation in
+The request path, the two entry modes, how an account gets picked, how quota is kept
+fresh, and the files it keeps, how to check a download and how to remove it. Every tunable named here has its type, default and source citation in
 [`configuration.md`](configuration.md); this document describes the mechanism rather than
 the values.
 
@@ -129,3 +129,100 @@ until some account frees, which is what the body text always claimed would happe
 
 Raising the cap above 60 would restore the immediate death. Lowering it only costs extra
 round trips.
+
+## Files on disk
+
+`tcr` keeps two directories. The config directory is always `$HOME/.config`: it does not
+follow `XDG_CONFIG_HOME`, because the Node teamclaude proxy uses that path and `tcr` drops in
+for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable is set, and
+`~/.cache/teamclaude` otherwise.
+
+| Path | What it holds | Mode |
+|---|---|---|
+| `~/.config/teamclaude.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one | `0600` |
+| `~/.config/.teamclaude.json.tcr-*.tmp` | Left behind when a config write is killed halfway. Same contents as the config, and nothing removes them for you | `0600` |
+| `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem` | `0644`, `0600` |
+| `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts, its key, and the host list it was made for | `0644`, `0600`, `0644` |
+| `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
+| `~/.config/tcr-node.key`, `tcr-node.pub` | Peers only: this Mac's peer identity key pair | `0600`, `0644` |
+| `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater | |
+| `<cache>/session-affinity.json` | Which session is pinned to which account | `0600` |
+| `<cache>/session-wire.json` | The Sessions and Tools lists, including up to 120 characters of each slow or running tool call's command | `0600` |
+| `<cache>/peer-state.json` | Peers only: what the proxy has learned about other Macs | `0600` |
+| `<cache>/usage/<UTC-date>.jsonl` | The usage ledger behind `tcr wrap` and the spend figures, one line per request, 90 days by default | directory `0700`, files `0600` |
+| `<cache>/logs/teamclaude-rs.log.<date>` | The server log, which names accounts by email. Five daily files are kept | directory `0700` |
+| `$TMPDIR/teamclaude-rs.log` | The single log file older builds wrote. Newer builds leave it where it was | |
+
+If you also run the Node teamclaude proxy, its `teamclaude-leaf.pem`, `teamclaude-leaf.key` and
+`teamclaude-ca.pem` in `~/.config` belong to it. `tcr` reuses them when they are there and
+never writes them.
+
+TcrBar adds three things of its own: `/Applications/TcrBar.app`, which carries its own copy
+of `tcr` and prefers it over the one on your `PATH`; its preferences, in the
+`io.github.dhkts1.tcrbar` defaults domain; and a login item, if you turned on launch at
+login. The proxy it runs uses the same config and cache files as the CLI.
+
+## Verifying a download
+
+Get `tcr` from this repository only: its
+[release page](https://github.com/dhkts1/teamclaude-rs/releases) or `install.sh` from `main`,
+which downloads from that page. A copy repackaged anywhere else has not been checked by
+anyone here, and it is a program you are about to hand your account tokens to.
+
+**The CLI archives.** Every `.tar.xz` on a release has a `.sha256` file beside it, and
+`sha256.sum` lists them all. With both files in one directory:
+
+```sh
+shasum -a 256 -c teamclaude-rs-aarch64-apple-darwin.tar.xz.sha256
+# expect: teamclaude-rs-aarch64-apple-darwin.tar.xz: OK
+```
+
+The file ends in a blank line, so `shasum` also warns that one line is improperly formatted;
+that warning is harmless. The installer script carries the same hashes and checks the
+archive it downloads, but only when `sha256sum` is on the machine; without it, it prints that
+it skipped the check and carries on. The checksums come from the same release as the
+archives, so they catch a corrupted or substituted download, not a release that was itself
+tampered with. The release publishes no signatures and no build attestations for the CLI.
+
+**TcrBar.** The `.dmg` has no checksum file. Instead the app is signed with a Developer ID
+certificate, and the disk image is notarized by Apple and stapled. With the `.dmg` downloaded
+and opened:
+
+```sh
+xcrun stapler validate ~/Downloads/TcrBar-<version>.dmg
+spctl -a -vvv -t install "/Volumes/TcrBar <version>/TcrBar.app"
+# expect: accepted / source=Notarized Developer ID
+```
+
+[`RELEASING.md`](RELEASING.md#verifying-a-release-actually-installs) has these checks with the
+signature details to expect. Updates installed through the app are checked against the
+Sparkle EdDSA key built into your copy before they run.
+
+## Uninstalling
+
+Nothing below runs for you; there is no uninstall command for the CLI.
+
+1. **Stop the proxy.** Press `q` in its terminal dashboard, or quit TcrBar if TcrBar is
+   running it.
+2. **Remove the binary.** Both `install.sh` and the cargo-dist installer put it at
+   `$CARGO_HOME/bin/tcr`, which is `~/.cargo/bin/tcr` when `CARGO_HOME` is unset.
+   `scripts/install-cli.sh` puts it at `~/.local/bin/tcr` unless you gave it a destination.
+   The cargo-dist installer may also have added a line to your shell's startup files that
+   loads `~/.cargo/env`; Rust's own installer uses the same file, so leave it if you use Rust.
+3. **Remove TcrBar,** on macOS. From a checkout of this repository,
+   `apps/macos/scripts/uninstall.sh` quits TcrBar, which also stops any proxy it was running,
+   unregisters the login item and deletes `/Applications/TcrBar.app`. It keeps TcrBar's
+   preferences; `defaults delete io.github.dhkts1.tcrbar` clears them.
+4. **Delete the config.** `~/.config/teamclaude.json` holds working credentials for every
+   account in the pool, and they stay valid after `tcr` is gone. Delete it, any
+   `.teamclaude.json.tcr-*.tmp` beside it, and the other `~/.config` files in the table above.
+5. **Delete the cache:** `~/.cache/teamclaude/` (or `$XDG_CACHE_HOME/teamclaude/`). Its logs
+   name your accounts, and `session-wire.json` holds fragments of commands your sessions ran.
+6. **Undo what points at the proxy:** any `ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or
+   `NODE_EXTRA_CA_CERTS` you exported, in your shell or in the `env` block of a Claude Code
+   settings file. `tcr run` sets these only on the session it launches, so it leaves nothing
+   behind.
+
+`tcr` never writes Claude Code's own stored login; it only reads it, to import it. If `tcr`
+refreshed an imported login, that login's old refresh token no longer works, and `claude`
+asks you to log in through the browser once.
