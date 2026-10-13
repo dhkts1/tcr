@@ -454,6 +454,92 @@ mod tests {
         assert_eq!(schedule.next_due_ms(), Some(100));
     }
 
+    /// A near-limit account is probed sooner than a routine one at the same
+    /// cadence, and its interval is still a jittered draw rather than a fixed
+    /// period. The routine draw must be exactly today's `jittered_interval_secs`,
+    /// so accounts in normal rotation see no change at all.
+    #[test]
+    fn near_limit_account_is_probed_sooner_than_a_routine_one() {
+        let mut rng = Rng::new(0xA11CE);
+        let cadence = 300;
+        let mut near_seen = std::collections::HashSet::new();
+        let mut near_max = 0;
+        let mut routine_min = u64::MAX;
+        for _ in 0..500 {
+            let draw = rng.next_u64();
+            let near = probe_interval_secs(cadence, ProbeUrgency::NearLimit, draw);
+            let routine = probe_interval_secs(cadence, ProbeUrgency::Routine, draw);
+            assert_eq!(
+                routine,
+                jittered_interval_secs(cadence, draw),
+                "a routine account's interval must be today's draw, unchanged"
+            );
+            assert!(
+                near < routine,
+                "near-limit interval {near}s is not shorter than routine {routine}s"
+            );
+            near_seen.insert(near);
+            near_max = near_max.max(near);
+            routine_min = routine_min.min(routine);
+        }
+        assert!(
+            near_max < routine_min,
+            "the near-limit band (max {near_max}s) overlaps the routine band (min {routine_min}s)"
+        );
+        assert!(
+            near_seen.len() > 50,
+            "only {} distinct near-limit intervals in 500 draws: the jitter was lost",
+            near_seen.len()
+        );
+    }
+
+    /// Driving one account for three simulated hours on the SHORTEST interval
+    /// the draw can produce (a 1s cadence, near-limit) never puts more than
+    /// [`PROBE_CAP_PER_HOUR`] probes in any trailing 60 minutes, including when
+    /// the account drops out of eligibility and comes back (which re-draws a
+    /// fresh initial offset). The last assertion is the positive control: the
+    /// cap must actually be reached, or the first one passes vacuously.
+    #[test]
+    fn no_account_exceeds_the_hourly_cap_in_any_trailing_hour() {
+        const HOUR_MS: i64 = 3_600_000;
+        let mut rng = Rng::new(0xCA9);
+        let mut schedule = FleetSchedule::capped(PROBE_CAP_PER_HOUR);
+        let cadence = 1;
+        let start = 1_700_000_000_000_i64;
+        let end = start + 3 * HOUR_MS;
+        let mut fires: Vec<i64> = Vec::new();
+        schedule.sync(start, &[0], cadence, &mut rng);
+        loop {
+            let now = schedule
+                .next_due_ms()
+                .expect("account 0 is eligible and must stay scheduled");
+            if now >= end {
+                break;
+            }
+            for idx in schedule.due(now) {
+                fires.push(now);
+                schedule.reschedule(idx, now, cadence, ProbeUrgency::NearLimit, &mut rng);
+                if fires.len() % 7 == 0 {
+                    schedule.sync(now, &[], cadence, &mut rng);
+                    schedule.sync(now, &[0], cadence, &mut rng);
+                }
+            }
+        }
+        for &t in &fires {
+            let in_window = fires.iter().filter(|&&f| f > t - HOUR_MS && f <= t).count();
+            assert!(
+                in_window <= PROBE_CAP_PER_HOUR,
+                "{in_window} probes in the hour ending at +{}s, cap is {PROBE_CAP_PER_HOUR}",
+                (t - start) / 1000
+            );
+        }
+        assert!(
+            fires.len() >= 3 * PROBE_CAP_PER_HOUR,
+            "only {} probes in three hours: the cap was never reached, so this test proves nothing",
+            fires.len()
+        );
+    }
+
     /// The loop's sleep is clamped, so neither a far-future schedule nor a pile
     /// of overdue accounts changes its shape.
     #[test]
