@@ -5,8 +5,7 @@ Every subcommand and flag the `tcr` binary accepts, with the behaviour behind it
 [configuration.md](configuration.md).
 
 All argument parsing lives in one file, `src/main.rs`; `src/cli.rs` is the *implementation*
-of the account subcommands, not the definitions. There are twelve subcommands plus the bare
-`tcr` form, and twenty-five flags between them. No flag has a single-dash short form, an
+of the account subcommands, not the definitions. No flag has a single-dash short form, an
 alias, an environment-variable binding or a clap-level default value; every default below is
 either a Rust default (`false`, `None`, empty vector) or a fallback applied after parsing,
 and each one was derived from the source, so start from `src/main.rs` to check any of them.
@@ -773,6 +772,64 @@ nowhere to live in an array, which is why this is a separate verb rather than a 
 
 The build-skew warning goes to **stderr** in both modes, as `status`'s does, so `--json`'s stdout
 stays a single JSON object a script can pipe into `jq`.
+
+---
+
+## `tcr list`
+
+`tcr list --json` prints every configured account as one JSON object in claude-swap's list schema
+v1, the document [CodexBar](https://github.com/steipete/CodexBar)'s "Read accounts from
+claude-swap" setting parses. It exists so CodexBar can show tcr's accounts with no change on its
+side. The projection and its rules live in `crates/tcr-status-wire/src/cswap_v1.rs`; the committed
+example is `tests/fixtures/cswap-list-v1.json`.
+
+```
+tcr list --json | jq -c '{v: .schemaVersion, n: (.accounts|length)}'
+```
+
+What each field carries:
+
+| field | value |
+|---|---|
+| `schemaVersion` | `1` |
+| `activeAccountNumber` | `null`: tcr pins per session and has no one active account |
+| `supportsAccountSwitching` | `false`: tcr routes per request, so CodexBar hides Switch |
+| `accounts[].number` | the account's 1-based position in the config file's `accounts` list |
+| `accounts[].active` | `false` on every row |
+| `accounts[].email` | the account name before any `/org` suffix |
+| `accounts[].organizationName` | the org's name, or `""` |
+| `accounts[].usageStatus` | `relogin_required` when the account needs a login; `ok` when the live server's last quota probe succeeded; `unavailable` otherwise, including every row when no server answers and any gate this build does not know |
+| `accounts[].usage.fiveHour`, `.sevenDay` | `{pct, resetsAt}`: percent used (0 to 100) and the reset in ISO-8601 UTC; omitted when unknown |
+| `accounts[].usage.scoped` | the Fable weekly window as `{"name": "Fable", ...}`; omitted when unknown |
+| `accounts[].usageFetchedAt` | when the quota was last probed |
+| `accounts[].disabled` | `true` when the account is disabled or in a parked group |
+
+Not sent: `alias`, `usage.spend` (tcr's cost is a list-price equivalent with no limit) and
+`lastGoodUsage` (tcr keeps no quota reading on disk). An API-key account reads `unavailable`,
+because the status row does not say which kind of account it is.
+
+**It never probes.** CodexBar runs this on every refresh, so it reads the running proxy and
+nothing else. With no proxy answering it still lists every configured account, each as
+`unavailable`, where `tcr status` would fall back to probing every account over the network.
+A slot follows the config file even when the running proxy holds its accounts in another order
+(the file was reordered after it started); an account the proxy still serves but the file no
+longer lists is placed after the file's accounts.
+
+A handled failure (a config file that cannot be parsed) prints
+`{"schemaVersion":1,"error":{"type":"config_unreadable","message":"..."}}` on **stdout** and exits
+1, because CodexBar reads stdout whatever the exit code. Bare `tcr list` without `--json` is a
+usage error, exit 2, pointing at `tcr status` for the readable view.
+
+CodexBar runs its configured path as `<path> --list --json` and `<path> --version`, with no
+shell, so point it at a shim that forwards both:
+
+```sh
+#!/bin/sh
+case "$1" in --version) exec tcr --version ;; *) exec tcr list --json ;; esac
+```
+
+Save it as an executable file (`chmod +x`) and set it as CodexBar's claude-swap path. The cards
+are labelled "claude-swap" until CodexBar learns about tcr as a source of its own.
 
 ---
 
