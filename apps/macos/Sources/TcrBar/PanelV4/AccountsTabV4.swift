@@ -53,6 +53,10 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// (unit H3), by ``Account/id``: every line of that account draws `.hov`'s
     /// fill, as a hovered line does, and no hover card opens.
     var litAccount: String? = nil
+    /// The accounts whose card the operator keeps open ("Keep Card Open" in
+    /// the row's right-click menu): each draws its hover card's content in
+    /// its own place in its box, and opens no floating card.
+    var keptOpen = KeptOpenCards()
     /// The pointer entering (`true`) or leaving a line, by row identity.
     var onHoverLine: (String, Bool) -> Void = { _, _ in }
     /// The row's own actions, as a context menu — the SECOND route to them,
@@ -90,11 +94,14 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// order this view draws its rows, from the same sections, caps and forms.
     static func strip(
         fleet: Fleet, controlName: String?, expandedGroups: Set<String>,
-        lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit], now: Date
+        lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit],
+        keptOpen: KeptOpenCards, now: Date
     ) -> FleetStrip {
+        // A kept-open card is drawn in its line's own place, so only the tall
+        // card moves a row to the end of its section.
         let rows = fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
             .rowsInDrawOrder(expandedGroups: expandedGroups, parkedCap: parkedVisibleRows) {
-                form($0, lentTo: lentTo, exits: exits) == .card
+                form($0, lentTo: lentTo, exits: exits, keptOpen: keptOpen) == .card
             }
         return FleetStrip(drawnRows: rows, now: now)
     }
@@ -133,7 +140,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 BandHeading(section: section, now: now)
             }
             if !lines.isEmpty {
-                lineBox(
+                lineRuns(
                     lines, band: section.band, grouped: false,
                     marginBottom: V4.lineBoxMarginBottom)
             }
@@ -145,6 +152,48 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         // The first block under the tab strip collapses its margin into the
         // strip's, as a card there always has.
         .padding(.top, first ? V4.marginAfterStrip(V4.cardGap) : .zero)
+    }
+
+    /// The one-line rows of a section, with each kept-open account's card in
+    /// its own place among them (``Swift/Array/lineRuns(isKeptOpen:)``): the
+    /// lines before it close their box, the card follows at the box's width,
+    /// and the lines after it open a new box. The stretches stand apart by the
+    /// gap the boxes and cards already keep where they sit, and the last one
+    /// takes `marginBottom`. With nothing kept open this is the one box, as
+    /// before.
+    private func lineRuns(
+        _ rows: [FleetSectionRow], band: FleetBand, grouped: Bool, marginBottom: CGFloat
+    ) -> some View {
+        let runs = rows.lineRuns { form($0) == .keptOpenCard }
+        let gap = grouped ? V4.groupCardGap : V4.lineBoxMarginBottom
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(runs.enumerated()), id: \.element.id) { index, run in
+                let bottom = index == runs.count - 1 ? marginBottom : gap
+                switch run {
+                case .lines(let lines):
+                    lineBox(lines, band: band, grouped: grouped, marginBottom: bottom)
+                case .keptOpen(let row):
+                    keptOpenCard(row, grouped: grouped)
+                        .padding(.bottom, bottom)
+                }
+            }
+        }
+    }
+
+    /// A kept-open account: its hover card's content, from the same view the
+    /// floating card draws (``AccountHoverCardContent``), so the two cannot
+    /// drift. It publishes no hover anchor, so pointing at it opens no
+    /// floating copy of itself; pointing at its strip segment lights it the
+    /// way a line is lit, in `.hov`'s fill.
+    private func keptOpenCard(_ row: FleetSectionRow, grouped: Bool) -> some View {
+        AccountHoverCardContent(
+            row: row, shape: grouped ? .compact : .full, now: now, snapshotMode: snapshotMode,
+            lit: litAccount == row.account.id
+        ) {
+            actions(row.account)
+        } menu: {
+            menu(row.account)
+        }
     }
 
     /// One box of one-line rows, the same box on the tab and inside a group:
@@ -184,9 +233,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 .hoverableLine(
                     row, hovered: lit(row), bleed: V4.waitBoxPaddingH
                 ) { onHoverLine(row.id, $0) }
-            case .card:
-                // Never reached: both callers pass only rows whose form is a
-                // line, and draw the cards themselves.
+            case .card, .keptOpenCard:
+                // Never reached: the callers pass only rows whose form is a
+                // line, and draw the cards themselves (``lineRuns``).
                 EmptyView()
             }
         }
@@ -223,17 +272,28 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// Which form this row takes, from what only this view knows: whether the
     /// account carries a lease line or an exit row.
     private func form(_ row: FleetSectionRow) -> AccountRowForm {
-        Self.form(row, lentTo: lentTo, exits: exits)
+        Self.form(row, lentTo: lentTo, exits: exits, keptOpen: keptOpen)
     }
 
     private static func form(
         _ row: FleetSectionRow, lentTo: [String: [PeerLentToEntry]],
-        exits: [String: AccountExit]
+        exits: [String: AccountExit], keptOpen: KeptOpenCards
     ) -> AccountRowForm {
         row.form(
             carriesLease: !PeerLease.leases(forAccountLabel: row.account.name, in: lentTo)
                 .isEmpty,
-            carriesExit: PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil)
+            carriesExit: PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil,
+            keptOpen: keptOpen)
+    }
+
+    /// Whether `account` draws the tall card whatever the operator chooses
+    /// (a lease line or an exit row), so its menu offers no "Keep Card Open":
+    /// that card is open already.
+    static func keepsTallCard(
+        _ account: Account, lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit]
+    ) -> Bool {
+        !PeerLease.leases(forAccountLabel: account.name, in: lentTo).isEmpty
+            || PeerLease.exit(forAccountLabel: account.name, in: exits) != nil
     }
 
     /// Whether a line draws `.hov`'s fill: its own hover card is showing, or
@@ -338,7 +398,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 let cards = visible.filter { form($0) == .card }
                 let closes = !isCollapsible(section)
                 if !lines.isEmpty {
-                    lineBox(
+                    lineRuns(
                         lines, band: section.band, grouped: true,
                         marginBottom: cards.isEmpty && closes ? V4.groupCardGap : 0
                     )

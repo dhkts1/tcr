@@ -170,6 +170,88 @@ final class AccountLineTests: XCTestCase {
             XCTAssertEqual(row.form(carriesLease: false, carriesExit: true), .card, "\(group)")
         }
     }
+
+    // MARK: - Keep Card Open
+
+    /// A kept-open account draws its hover card in place of its line, live or
+    /// waiting, in a group or out of one; an account not in the set keeps its
+    /// line; and a lease or an exit still takes the tall card.
+    func testAKeptOpenRowTakesTheInlineCardAndLeaseOrExitStillTakeTheCard() {
+        let keptOpen = KeptOpenCards(["bob@example.com", "frank@example.com"])
+        for group in [FleetGroupKey.named("dev"), .ungrouped] {
+            let live = FleetSectionRow(
+                account: lineAccount("bob@example.com"), group: group, band: .live,
+                isControl: false)
+            let waiting = FleetSectionRow(
+                account: lineAccount("frank@example.com", quotaState: .spent, fiveHour: 1.0),
+                group: group, band: .outOfTokens, isControl: false)
+            let other = FleetSectionRow(
+                account: lineAccount("carol@example.com"), group: group, band: .live,
+                isControl: false)
+            XCTAssertEqual(
+                live.form(carriesLease: false, carriesExit: false, keptOpen: keptOpen),
+                .keptOpenCard, "\(group)")
+            XCTAssertEqual(
+                waiting.form(carriesLease: false, carriesExit: false, keptOpen: keptOpen),
+                .keptOpenCard, "\(group)")
+            XCTAssertEqual(
+                other.form(carriesLease: false, carriesExit: false, keptOpen: keptOpen),
+                .liveLine, "\(group)")
+            XCTAssertEqual(
+                live.form(carriesLease: true, carriesExit: false, keptOpen: keptOpen), .card,
+                "\(group)")
+            XCTAssertEqual(
+                waiting.form(carriesLease: false, carriesExit: true, keptOpen: keptOpen), .card,
+                "\(group)")
+        }
+    }
+
+    /// One account in two groups is kept open in both: the set is keyed by
+    /// the account, not by the row.
+    func testAnAccountInTwoGroupsIsKeptOpenInBoth() {
+        let fleet = Fleet(accounts: [
+            lineAccount("bob@example.com", groups: ["dev", "ops"]),
+            lineAccount("carol@example.com"),
+        ])
+        let keptOpen = KeptOpenCards(["bob@example.com"])
+        let bobRows = fleet.sectionsInDisplayOrder().flatMap(\.rows).filter {
+            $0.account.name == "bob@example.com"
+        }
+        XCTAssertEqual(bobRows.count, 2)
+        for row in bobRows {
+            XCTAssertEqual(
+                row.form(carriesLease: false, carriesExit: false, keptOpen: keptOpen),
+                .keptOpenCard, row.id)
+        }
+    }
+
+    /// Toggling twice returns the line, and an account that left the fleet is
+    /// pruned rather than kept as a ghost.
+    func testToggleAndPrune() {
+        var keptOpen = KeptOpenCards()
+        keptOpen.toggle("bob@example.com")
+        keptOpen.toggle("gone@example.com")
+        XCTAssertTrue(keptOpen.contains("bob@example.com"))
+        let pruned = keptOpen.pruned(to: [lineAccount("bob@example.com")])
+        XCTAssertEqual(pruned.ids, ["bob@example.com"])
+        keptOpen.toggle("bob@example.com")
+        XCTAssertFalse(keptOpen.contains("bob@example.com"))
+        XCTAssertEqual(keptOpen.ids, ["gone@example.com"])
+    }
+
+    /// A kept-open row cuts the box in its own place; no kept-open row leaves
+    /// one run, the box exactly as before.
+    func testLineRunsCutAtEachKeptOpenRow() {
+        let rows = ["a", "b", "c", "d"].map {
+            FleetSectionRow(
+                account: lineAccount("\($0)@example.com"), group: .ungrouped, band: .live,
+                isControl: false)
+        }
+        XCTAssertEqual(rows.lineRuns { _ in false }, [.lines(rows)])
+        let cut = rows.lineRuns { $0.account.name == "b@example.com" }
+        XCTAssertEqual(cut, [.lines([rows[0]]), .keptOpen(rows[1]), .lines([rows[2], rows[3]])])
+        XCTAssertEqual(rows.lineRuns { $0.account.name == "a@example.com" }.first, .keptOpen(rows[0]))
+    }
 }
 
 private func hold(_ window: String, _ resetAtMs: Int64) -> HeldWindow {

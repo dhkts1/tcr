@@ -69,6 +69,8 @@ struct AccountCard<Actions: View>: View {
     var snapshotMode: Bool = false
     var onChooseExit: (AccountExit.Route) -> Void = { _ in }
     var onToggleExitMust: (Bool) -> Void = { _ in }
+    /// Lit from the strip (``V4Card/lit``): only a kept-open card is.
+    var lit: Bool = false
     /// The card's visible per-account controls — the actions menu, and the
     /// re-login button on a broken account. A closure so ``AccountCard`` stays
     /// free of the controllers those controls are wired to: they are built from
@@ -77,7 +79,7 @@ struct AccountCard<Actions: View>: View {
     @ViewBuilder var actions: () -> Actions
 
     var body: some View {
-        V4Card {
+        V4Card(lit: lit) {
             HStack(spacing: V4.pillGap) {
                 // The informational half of the header is ONE accessibility
                 // element. VoiceOver walked roughly eight stops per card before

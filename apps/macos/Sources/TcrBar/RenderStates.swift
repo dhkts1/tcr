@@ -91,6 +91,11 @@ enum RenderStates {
             // the segment ringed and spent-3's line lit, and no hover card.
             // Held to the same with-and-without size check as 02b.
             ("02d-mixed-thirteen-segment-hover", .loaded(fleet(mixedJSON)), false, nil),
+            // "Keep Card Open" (Gil, 2026-10-14) on one live account, ok-2, and
+            // one out-of-tokens account, spent-2, pinned by
+            // ``keptOpenFixture(for:)``: each draws its hover card's content in
+            // its own place in the list, splitting its box around it.
+            ("02e-mixed-thirteen-kept-open", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
             ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false, nil),
@@ -314,6 +319,17 @@ enum RenderStates {
         case "15c-parked-group-hover":
             return FleetSectionRow.id(group: .named("dev"), accountID: "carol@example.com")
         default: return nil
+        }
+    }
+
+    /// The accounts (``Account/id``) a scene keeps open. Every scene gets a
+    /// set, empty for all but one, so the operator's own choice in
+    /// `UserDefaults` never reaches a render.
+    private static func keptOpenFixture(for sceneName: String) -> KeptOpenCards {
+        switch sceneName {
+        case "02e-mixed-thirteen-kept-open":
+            return KeptOpenCards(["ok-2@example.com", "spent-2@example.com"])
+        default: return KeptOpenCards()
         }
     }
 
@@ -662,7 +678,8 @@ enum RenderStates {
                 initialClaudeRoute: scene.name == "22-no-requests-banner"
                     ? noRequestsBannerRoute : nil,
                 initialHoverCard: hoverCard,
-                initialLitAccount: litAccount
+                initialLitAccount: litAccount,
+                initialKeptOpen: keptOpenFixture(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -740,7 +757,8 @@ enum RenderStates {
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: .accounts,
-                initialSessionFiles: [:]
+                initialSessionFiles: [:],
+                initialKeptOpen: KeptOpenCards()
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             .fixedSize()

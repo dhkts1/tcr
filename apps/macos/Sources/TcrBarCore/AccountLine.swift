@@ -33,6 +33,10 @@ public enum AccountRowForm: Equatable, Sendable {
     case waitingLine
     /// The account's card, in the list itself.
     case card
+    /// The account's hover card, drawn in the list in place of its line,
+    /// because the operator chose "Keep Card Open" from its right-click menu
+    /// (Gil, 2026-10-14). See ``KeptOpenCards``.
+    case keptOpenCard
 }
 
 extension FleetSectionRow {
@@ -50,9 +54,89 @@ extension FleetSectionRow {
     /// traffic, which is not something to show only on hover, and the exit
     /// picker is a control, which cannot live in a hover card that vanishes
     /// when the pointer moves.
-    public func form(carriesLease: Bool, carriesExit: Bool) -> AccountRowForm {
+    ///
+    /// An account in `keptOpen` draws its hover card in place of its line,
+    /// live or waiting, in a group or out of one. The lease and exit rule
+    /// still wins: that card is already open, and taller.
+    public func form(
+        carriesLease: Bool, carriesExit: Bool, keptOpen: KeptOpenCards = KeptOpenCards()
+    ) -> AccountRowForm {
         if carriesLease || carriesExit { return .card }
+        if keptOpen.contains(account.id) { return .keptOpenCard }
         return band == .live ? .liveLine : .waitingLine
+    }
+}
+
+/// The accounts whose card the operator keeps open in the Accounts tab, by
+/// ``Account/id`` (Gil, 2026-10-14: "The row's right-click menu gains 'Keep
+/// card open' / 'Close card'").
+///
+/// Keyed by the account, never by ``FleetSectionRow/id``: an account in two
+/// groups draws two rows, and keeping it open keeps it open in both. Stored by
+/// TcrBar in its own `UserDefaults`, so the choice belongs to this Mac and
+/// never reaches the `tcr` config file.
+public struct KeptOpenCards: Equatable, Sendable {
+    /// The account ids, sorted, the form `UserDefaults` stores.
+    public private(set) var ids: [String]
+
+    public init(_ ids: [String] = []) {
+        self.ids = Array(Set(ids)).sorted()
+    }
+
+    public func contains(_ accountID: String) -> Bool {
+        ids.contains(accountID)
+    }
+
+    /// Opens a closed card or closes an open one.
+    public mutating func toggle(_ accountID: String) {
+        if contains(accountID) {
+            ids.removeAll { $0 == accountID }
+        } else {
+            ids = (ids + [accountID]).sorted()
+        }
+    }
+
+    /// The set less every account no longer in `accounts`, so an account that
+    /// left the fleet is dropped on the next poll rather than kept as a ghost
+    /// that would reopen if a different account ever took its name.
+    public func pruned(to accounts: [Account]) -> KeptOpenCards {
+        let present = Set(accounts.map(\.id))
+        return KeptOpenCards(ids.filter(present.contains))
+    }
+}
+
+/// One stretch of an account box: a run of one-line rows that share a box, or
+/// one kept-open card that sits between two such runs at the box's width.
+public enum AccountLineRun: Identifiable, Equatable, Sendable {
+    case lines([FleetSectionRow])
+    case keptOpen(FleetSectionRow)
+
+    public var id: String {
+        switch self {
+        case .lines(let rows): return "lines:" + (rows.first?.id ?? "")
+        case .keptOpen(let row): return "card:" + row.id
+        }
+    }
+}
+
+extension Array where Element == FleetSectionRow {
+    /// These rows, in order, cut into runs at every kept-open one, so each
+    /// kept-open card is drawn in its own place in the list. Rows with no
+    /// kept-open card among them come back as ONE run, the box as before.
+    public func lineRuns(isKeptOpen: (FleetSectionRow) -> Bool) -> [AccountLineRun] {
+        var runs: [AccountLineRun] = []
+        var pending: [FleetSectionRow] = []
+        for row in self {
+            if isKeptOpen(row) {
+                if !pending.isEmpty { runs.append(.lines(pending)) }
+                pending = []
+                runs.append(.keptOpen(row))
+            } else {
+                pending.append(row)
+            }
+        }
+        if !pending.isEmpty { runs.append(.lines(pending)) }
+        return runs
     }
 }
 
