@@ -2971,7 +2971,8 @@ pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
         }
     };
 
-    let report = crate::doctor::inspect(config.proxy.port, served_recently);
+    let report =
+        crate::doctor::inspect(config.proxy.port, served_recently).with_config_keys(&config);
     if json {
         println!("{}", serde_json::to_string_pretty(&report.to_json())?);
     } else {

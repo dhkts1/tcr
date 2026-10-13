@@ -21,7 +21,8 @@ use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::peer;
 use teamclaude_rs::proxy::GROUP_HEADER_NAME;
 use teamclaude_rs::{
-    affinity, build_info, demo, mint, mitm, oauth, server, singleton, status, tui, update,
+    affinity, build_info, config_keys, demo, mint, mitm, oauth, server, singleton, status, tui,
+    update,
 };
 
 #[derive(Parser)]
@@ -6418,6 +6419,15 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     };
 
     init_tracing(args.headless);
+
+    // A misspelled key is kept in the file and has no effect, so say so once
+    // at boot. Never fatal: the file is shared with teamclaude and its
+    // unmodelled keys are kept on purpose (see `config_keys`).
+    if let Some(line) = config_keys::boot_line(&config_keys::unknown_keys(
+        &serde_json::Value::Object(config.extra.clone()),
+    )) {
+        tracing::warn!("{line}");
+    }
 
     // Auto-migrating `throttle` in memory (see `config::load`) is only half the
     // fix Gil asked for — "our code should auto migrate" means the file itself
