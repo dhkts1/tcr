@@ -38,12 +38,13 @@ section below.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `proxy` | object | `{}` (all sub-defaults) | no | listener settings, see below |
-| `upstream` | string | `"https://api.anthropic.com"` | no | API base URL every rotated request is sent to |
+| `upstream` | string | `"https://api.anthropic.com"` | no | Anthropic API base URL every rotated Claude request is sent to (Codex requests go to `codexUpstream`) |
+| `codexUpstream` | string | `"https://chatgpt.com"` | no | where Codex accounts' requests are sent, where their quota probe goes, where `tcr login --from-codex` checks a login's workspace before importing it, and where every other request under `/backend-api/` is relayed, under the client's own bearer when it sent one; written to the file only when it differs from the default. Their token refresh goes to `https://auth.openai.com` whatever this says |
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account |
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
 | `accountThrottle` | object | `{minSpacingMs: 350, burst: 8}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
 | `fleetThrottle` | object | `{minSpacingMs: 100, burst: 16}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
-| `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
+| `lockAccount` | string | absent → normal routing | no | pin ALL of one provider's pooled traffic to one account by `name`; the other provider's pooled requests get a 429, see below |
 | `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"warn"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
@@ -146,21 +147,24 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
-| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; anything else is a static-key account |
-| `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token |
+| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and, on Anthropic, kept warm; anything else is a static-key account |
+| `provider` | `"anthropic"` \| `"codex"` | `"anthropic"` | no | which upstream this credential belongs to. Absent means Anthropic, and the key is never written for an Anthropic row. A Codex row (`tcr login --from-codex` writes one) is refreshed against `auth.openai.com`, probed at `/backend-api/wham/usage`, never kept warm, and serves only Codex inference, `/backend-api/codex/responses`: a Claude request never reaches it, and a Codex request never reaches a Claude row |
+| `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token. For a Codex row it is the ChatGPT account id, sent as the `chatgpt-account-id` header instead of being spliced into the body |
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
 | `orgName` | string | absent | no | organization display name; also what a duplicated `name` is renamed from (`Henry Token` → `henry-token`) |
+| `organizationType` | string | absent | no | the plan, verbatim as the provider names it, from which `tcr status` derives its `plan` label: `claude_max`, `claude_team`, `claude_pro`, … from Anthropic's profile endpoint, written at login and backfilled by the quota probe on a row that lacks it. For a Codex row it is the raw `chatgpt_plan_type` claim (`pro`, `plus`, `team`, …), read from the login at import and never backfilled |
 | `accessToken` | string | n/a | **yes** | the OAuth access token |
 | `refreshToken` | string | absent | no | used to mint a new access token before expiry — absent means the account cannot refresh itself, see below |
 | `expiresAt` | i64 | absent | no | access-token expiry as **epoch milliseconds** |
 | `priority` | i64 | absent → `0` | no | rotation order, **lower value = preferred** |
 | `switchThreshold` | float | absent → the global value | no | per-account override of the top-level threshold |
 | `disabled` | bool | absent → `false` | no | held out of rotation; this is the key `tcr disable` writes |
-| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Local to this file, never sent over the wire |
+| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Not on a Codex account in this version: its pin is treated as a peer that cannot be reached, see `egressStrict`. Local to this file, never sent over the wire |
 | `egressStrict` | bool | `false` | no | what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
+| `credentialVersion` | u64 | absent → backfilled on the next save | no | written by `tcr`, not by hand: `1` on an Anthropic row, `2` on a Codex row. A build refuses the whole file when a row carries a version above what it understands for that row's provider. Upgrade every `tcr` that may boot on the file before importing a Codex login: what an older one does with a Codex row is in [troubleshooting](troubleshooting.md#after-a-codex-import-an-older-proxy-refuses-to-load-the-config) |
 
-`type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
-keep-warm; any other value is treated as a static key.
+`type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and, on
+Anthropic, keep-warm; any other value is treated as a static key.
 
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
@@ -415,8 +419,12 @@ than the warming requests do.
 
 ## `lockAccount`: read this before setting it
 
-`lockAccount` pins **all** traffic to the single account whose `name` it names. LRU
-rotation, session affinity and load-balancing migration are all bypassed.
+`lockAccount` pins **all** pooled traffic of its account's provider to the single account whose
+`name` it names. LRU rotation, session affinity and load-balancing migration are all bypassed.
+A lock never crosses providers: while it holds, a pooled request of the other provider has no
+account it may use and gets the 429 an exhausted pool gives. So a lock on a Claude account
+leaves every `codex` turn unserved, and the other way round; calls relayed under the client's
+own credential never ask for an account and are unaffected.
 
 The part that bites: a locked account has **no failover**. If it is throttled, disabled or
 down, requests fail: the proxy does not rotate away from it, because rotating away is the
@@ -554,8 +562,9 @@ reads. Set `"controlIdentity": "refuse"` on an install where a wrong-account ses
 fail loudly; the intent is to make that the default once a release of warnings has been
 read.
 
-Inert without a `controlAccount`, and for a request that carries no `Authorization:
-Bearer` (an API-key client). Fail-open on anything that is not a verified mismatch: a
+Inert without a `controlAccount`, for a request that carries no `Authorization: Bearer`
+(an API-key client), and for every Codex request: under `refuse`, a Codex client is served
+whatever ChatGPT login it runs under. Fail-open on anything that is not a verified mismatch: a
 profile fetch that fails, or answers with neither email nor uuid, is served and is not
 cached, so a transient upstream failure neither blocks traffic nor pins a wrong answer. A
 bearer the profile endpoint refuses outright (401/403 — an expired or revoked token) is
@@ -564,11 +573,11 @@ a profile round trip before every request. A control account whose name is not a
 and whose row has no `accountUuid` cannot be verified against anything and is never
 refused.
 
-"Pooled" means exactly two paths: `/v1/messages` and `/v1/messages/count_tokens`. Any
-other path a client sends with its own bearer — including one that merely starts with
-`/v1/messages`, such as a batches endpoint — is the client's own call and is relayed
-under the client's own credential and quota, the same split `RequestClass` draws for
-bearer-less traffic.
+For a Claude request, "pooled" means exactly two paths: `/v1/messages` and
+`/v1/messages/count_tokens`. Any other path a client sends with its own bearer — including
+one that merely starts with `/v1/messages`, such as a batches endpoint — is the client's own
+call and is relayed under the client's own credential and quota, the same split
+`RequestClass` draws for bearer-less traffic.
 
 Measured before this existed (2026-09-22): a Claude Code keychain login that silently
 flipped to another account produced two hours of wrong-org 401/403/404 answers on every
@@ -604,8 +613,10 @@ alternatives cost less if they fit:
 
 - **`tcr group allow-control <label>`** — same access, scoped to sessions that explicitly ask
   with `tcr run --group <label>`. The blast radius is one group instead of all traffic.
-- **`tcr control <some-idle-account>`** — move the designation onto an account you were not
-  going to spend anyway. Nothing is sacrificed and no flag is needed.
+- **`tcr control <some-idle-account>`** — move the designation onto a Claude account you were
+  not going to spend anyway (a Codex account cannot be the control account: `tcr control`
+  refuses one, and boot ignores one written by hand). Nothing is sacrificed and no flag is
+  needed.
 - **`tcr control --clear`** — no control account at all. Bookkeeping calls rotate with
   everything else, which is how the proxy behaved before the control account existed.
 
@@ -634,20 +645,27 @@ off. Check `tcr status` (`http1Only=` on the `source=` line, `http1Only` per row
 
 ## Environment overrides
 
-Two keys are not part of the config file; they are read from the process environment by
+Four keys are not part of the config file; they are read from the process environment by
 `tcr run` (and by `--group`'s version check, which also launches `claude`) to decide which
-`claude` binary to run. Neither exists in the file above because neither is a setting a
-config edit can change without a rebuild of the session's shell environment anyway.
+`claude` binary to run, or, with `--codex`, which `codex` binary. None of them exists in the
+file above because none is a setting a config edit can change without a rebuild of the
+session's shell environment anyway.
 
 | env var | default | what it does |
 |---|---|---|
 | `TCR_CLAUDE_BIN` | absent | path or name of the `claude` binary to launch, outranking `CLAUDE_BIN` |
 | `CLAUDE_BIN` | absent | same, as a fallback when `TCR_CLAUDE_BIN` is unset; kept for whatever already sets it outside `tcr` |
+| `TCR_CODEX_BIN` | absent | path or name of the `codex` binary `tcr run --codex` launches, outranking `CODEX_BIN` |
+| `CODEX_BIN` | absent | same, as a fallback when `TCR_CODEX_BIN` is unset |
 
-Neither set falls back to `claude` resolved from `PATH`, today's only behaviour. **An empty
-value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does not
-silently win over a real `CLAUDE_BIN`, and two empty values fall all the way through to the
-`PATH` default.
+With neither of a pair set, the bare name, `claude` or `codex`, is resolved from `PATH`.
+**An empty value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does
+not silently win over a real `CLAUDE_BIN`, and two empty values fall all the way through to
+the `PATH` default.
+
+`tcr login --from-codex` reads two more, `CODEX_HOME` and `TCR_CODEX_AUTH`, to find the login
+it imports; they are documented with it in
+[cli.md](cli.md#--from-codex-importing-the-login-codex-already-has).
 
 ## File permissions and secrecy
 

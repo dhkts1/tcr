@@ -134,6 +134,9 @@ accounts, by the sanitized label `tcr status` prints, never an email or a uuid. 
 `--revoke` and `--relend` take; this is the same list the panel's per-Mac sheet shows as
 **Lend from**.
 
+Codex accounts stay off the mesh in this version: no scope ever lends one, and a `codex`
+request is never borrowed from a peer or carried through one.
+
 A lease can also be time-bounded: `--for 2h` (or `--until 18:00`) stops renewing it at that
 time, after which the peer's row shows "ended"; the default is no end. An ended lease stays in
 the list, greyed, so it can be re-lent with `--relend <lease-id>` instead of typed again from

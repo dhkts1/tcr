@@ -9,6 +9,10 @@ Symptoms, in the order people hit them. Flag-level detail lives in
 The running proxy can be several commits behind your checkout. `tcr status --json` reports
 the SHA of the build that is actually serving; check it before concluding a change is live.
 
+A restart does not always close the gap. When TcrBar runs the proxy, it runs the `tcr` bundled
+inside the app ahead of the one on your `PATH`, so restarting it on the old app brings the old
+build back: update TcrBar first.
+
 ## Where the logs are
 
 `tcr server --headless` writes to stdout *and* to a daily-rotating file under the cache
@@ -66,6 +70,100 @@ behaviour this refusal exists to prevent — reach for it last, not first.
 
 If the pid named belongs to TcrBar, quit the application rather than killing the pid: killing
 it skips shutdown and loses the session pin map.
+
+## `tcr login --from-codex` says the proxy predates Codex accounts
+
+```
+the proxy on :3456 (pid 4242) predates Codex accounts and would store this login as a Claude account and send its token to Anthropic — nothing was written. Restart the proxy on this build (update TcrBar first if it supervises the proxy), then re-run `tcr login --from-codex`. --force does not get past this: it never trades a confirmed live route for a file write, and that proxy would refuse the file at its next start, or read it the same way if it is older still.
+```
+
+Nothing was written. The running proxy answered the import's probe without naming `codex`
+among the providers it can store, which is how every proxy built before Codex accounts
+answers. Why tcr refuses rather than hand it the login, and why `--force` does not get past the
+refusal, is in [`cli.md`](cli.md#--from-codex-importing-the-login-codex-already-has). Restart
+the proxy on this build at a quiet moment, then run `tcr login --from-codex` again. If TcrBar
+runs the proxy, [update TcrBar first](#the-fix-is-in-main-and-the-fix-is-in-the-process-serving-traffic-are-different-facts).
+
+If the import instead fails saying the proxy stored the login as a Claude account, or did not
+say how it stored it, the row is already live, and on disk, as a Claude account, and its token
+may already have reached Anthropic: run the `tcr remove` the message names at once, then
+`codex login` again.
+
+## After a Codex import an older proxy refuses to load the config
+
+Every Codex row is written at `credentialVersion: 2`. A `tcr` that has the `credentialVersion`
+check but predates Codex accounts (0.2.46 onward, up to the release that adds them)
+understands version 1 only. Rather than read the Codex row as a Claude account, it refuses the
+whole file, and its server refuses to start:
+
+```
+config at /Users/example/.config/teamclaude.json is unreadable/corrupt: config parse error: account "alice@example.com" carries credentialVersion 2, which this build only understands up to 1; refusing to load rather than silently reinterpret its credential shape — refusing to start rather than serve an empty fleet; fix the file and restart
+```
+
+The file is intact, whatever the message says, so do not edit it: lowering the version by
+hand is exactly what would let that build serve the Codex login as a Claude account. Upgrade
+that `tcr`, the one TcrBar bundles included, and start it again. If you have to go back to the
+older build, remove the Codex account with the current one first (`tcr remove '<name>'`): the
+rows left are Anthropic rows at version 1, which it reads.
+
+`tcr` 0.2.45 and older predate the `credentialVersion` check and refuse nothing: they would
+load the Codex row as a Claude account and send its OpenAI tokens to Anthropic. That is why
+every `tcr` that may boot on this config has to be upgraded before a Codex login is imported,
+not after.
+
+## `tcr run --codex` says it is launching codex directly (not pooled)
+
+```
+[tcr] launching codex directly (not pooled): <reason>
+```
+
+`codex` is running on its own login, around the pool: `tcr run --codex` pools a session only
+when the running proxy reports a leaf it minted that intercepts `chatgpt.com`, lists a Codex
+account, and that leaf's CA is on disk. Each `<reason>`, verbatim, and its fix are in
+[`cli.md`](cli.md#--codex-launching-codex-through-the-pool).
+
+One reason sends you here, because a restart does not fix it: `the proxy on :<port> is
+serving the JS teamclaude leaf …`. That proxy found the JS teamclaude proxy's
+`teamclaude-leaf.pem` and `teamclaude-leaf.key` in `~/.config` and loads them at every boot,
+whenever both are there and load. It cannot read which hosts that leaf names, so it claims
+`api.anthropic.com` alone and tunnels `chatgpt.com` untouched, and it never re-mints a leaf it
+did not mint. To pool `codex`, move both files out of `~/.config` and restart the proxy at a
+quiet moment: its next boot reuses or mints `~/.config/tcr-ca.pem` and a leaf under it, and
+every client that trusted only `teamclaude-ca.pem` then has to trust `~/.config/tcr-ca.pem`
+instead (`tcr run` points the sessions it launches at the right one by itself).
+
+## Codex works but `tcr status` shows no Codex traffic
+
+Then `codex` is running on its own login, around the pool. A session started with
+`tcr run --codex` said so when it launched: look for the
+`[tcr] launching codex directly (not pooled): …` line in that terminal, and
+[`cli.md`](cli.md#--codex-launching-codex-through-the-pool) has each reason and its fix. A
+`codex` you start yourself is pooled only when the proxy variable it reads for `https://` aims
+at this proxy (`HTTPS_PROXY`, else `ALL_PROXY`, in either case), it trusts tcr's CA (through
+`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`, or the system store), no `NO_PROXY` entry exempts
+`chatgpt.com`, and the proxy intercepts `chatgpt.com`, which it does only while its pool holds
+a Codex account; `tcr run --codex` checks and arranges all of that. A login whose ChatGPT
+workspace is FedRAMP, or routed to a data residency or to a backend of its own, never shows
+here: `codex` sends that workspace's requests to its own backend, or marks them with its
+routing, and tcr tunnels the one untouched and relays the other on the login's own credential,
+never pooled. `tcr login --from-codex` refuses to import such a login, saying why.
+
+## A corporate `SSL_CERT_FILE` is ignored under `tcr run` and `tcr run --codex`
+
+`codex` takes one extra CA bundle: `CODEX_CA_CERTIFICATE` when it is set, and `SSL_CERT_FILE`
+only when it is not (`openai/codex@f82e365`, `codex-rs/http-client/src/custom_ca.rs:393-411`).
+A pooled `tcr run --codex` sets `CODEX_CA_CERTIFICATE` to tcr's CA, and so does a plain
+`tcr run` in see-through mode, so a `codex` that a Claude Code tool or plugin runs inside that
+session inherits it. Either way it replaces any value you exported, so a corporate CA that
+reached `codex` through `SSL_CERT_FILE` no longer does. For `chatgpt.com`, while tcr decrypts
+it, `codex` only ever sees tcr's leaf. The hosts tcr tunnels untouched still present whatever
+certificate your network presents, `auth.openai.com` among them, where `codex` refreshes its
+own login, and `chatgpt.com` itself while the pool holds no Codex account, so behind a
+TLS-inspecting proxy whose CA reaches `codex` only through `SSL_CERT_FILE` those connections
+fail. This is a known limitation of `tcr run --codex`, and of a `codex` started inside a
+`tcr run` session, and no tcr setting changes it. `codex` itself accepts a PEM file holding
+several certificates, so a `codex` you route through tcr by hand can be pointed at one bundle
+holding both CAs.
 
 ## `tcr ui` or a TcrBar update will not replace the app
 

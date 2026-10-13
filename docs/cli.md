@@ -5,8 +5,7 @@ Every subcommand and flag the `tcr` binary accepts, with the behaviour behind it
 [configuration.md](configuration.md).
 
 All argument parsing lives in one file, `src/main.rs`; `src/cli.rs` is the *implementation*
-of the account subcommands, not the definitions. There are twelve subcommands plus the bare
-`tcr` form, and twenty-five flags between them. No flag has a single-dash short form, an
+of the account subcommands, not the definitions. No flag has a single-dash short form, an
 alias, an environment-variable binding or a clap-level default value; every default below is
 either a Rust default (`false`, `None`, empty vector) or a fallback applied after parsing,
 and each one was derived from the source, so start from `src/main.rs` to check any of them.
@@ -89,15 +88,18 @@ relocates it.
 
 ## `tcr run [-- <args>]`
 
-Launches Claude Code already pointed at the proxy.
+Launches Claude Code already pointed at the proxy, or, with `--codex`, OpenAI's `codex` CLI
+routed through the pool's Codex accounts.
 
 | flag | type | default | effect |
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | which config to read the port from |
-| `-- <args>` | strings | empty | passed verbatim to `claude` |
+| `--codex` | bool | `false` | launch `codex` instead of `claude` — see [below](#--codex-launching-codex-through-the-pool) |
+| `-- <args>` | strings | empty | passed verbatim to `claude`, or to `codex` with `--codex` |
 
 Trailing args are captured with `trailing_var_arg` and `allow_hyphen_values`, so
-`tcr run -- -p "hi"` reaches `claude` intact.
+`tcr run -- -p "hi"` reaches `claude` intact, and `tcr run --codex -- exec "hi"` runs
+`codex exec "hi"`.
 
 If the proxy is not listening, `tcr run` launches `claude` **untouched** and says so on
 stderr, so a stopped proxy never breaks the shell alias. When the proxy is up, the child
@@ -114,8 +116,21 @@ A value **you** exported is inherited untouched: an explicit choice wins, and it
 escape hatch for a `claude` with no claude.ai login of its own, which does need some
 credential to start. The process exits with `claude`'s own exit code.
 
-Every child also gets `TCR_RUN_ACTIVE=1`, on all three paths including the proxy-down
-passthrough. It means one thing: **a `tcr run` is already above you in this chain.**
+In see-through mode the routing environment also carries `CODEX_CA_CERTIFICATE`, naming the
+same CA as `NODE_EXTRA_CA_CERTS`. Claude Code ignores it. It is there for a `codex` that a
+Claude Code tool or plugin starts inside the session: that process inherits the proxy
+variables, and while its pool holds a Codex account, a proxy serving a leaf it minted
+terminates TLS for `chatgpt.com` too, so without the CA the nested `codex` would fail its
+handshake; with it, that `codex` is pooled. While the pool holds no Codex account, tcr tunnels
+`chatgpt.com` untouched and the nested `codex` runs on its own login. Once it holds one, adding
+`chatgpt.com` to `NO_PROXY` in the shell you start `tcr run` from keeps a nested `codex` on its
+own login: plain `tcr run` passes `NO_PROXY` through untouched. tcr's `CODEX_CA_CERTIFICATE`
+replaces any you exported, and `codex` reads `SSL_CERT_FILE` only while that variable is unset,
+so a corporate CA that a nested `codex` took from `SSL_CERT_FILE` stops applying; see
+[troubleshooting.md](troubleshooting.md#a-corporate-ssl_cert_file-is-ignored-under-tcr-run-and-tcr-run---codex).
+
+Every child also gets `TCR_RUN_ACTIVE=1`, on every path, the proxy-down passthrough and
+`--codex` included. It means one thing: **a `tcr run` is already above you in this chain.**
 `tcr run` finds `claude` on `PATH`, so on a machine where something else also wraps
 `claude` that lookup can land on a launcher which wraps in `tcr run` again — the routing
 environment applied twice is identical and nothing breaks, but every startup line prints
@@ -124,11 +139,159 @@ this variable hands off to the real `claude` instead. The name avoids the `CMUX_
 on purpose: cmux's own claude wrapper clears every `CMUX_*` variable before exec, so a
 marker named after it would be erased in transit.
 
+### `--codex`: launching `codex` through the pool
+
+```
+tcr run --codex                    # an interactive codex session
+tcr run --codex -- exec "…"        # everything after -- goes to codex
+```
+
+The binary is `codex` on `PATH` unless `TCR_CODEX_BIN` or `CODEX_BIN` names another
+([configuration.md](configuration.md#environment-overrides)), and the process exits with
+`codex`'s own exit code. The pool needs a Codex account to serve the session; add one with
+[`tcr login --from-codex`](#--from-codex-importing-the-login-codex-already-has).
+
+**See-through, or not routed at all.** tcr has no base-URL route for `codex` yet. A pooled
+launch leaves `codex` on its own backend URL, which is the real `https://chatgpt.com` for every
+login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to this proxy, and sets
+`CODEX_CA_CERTIFICATE` to tcr's CA, `~/.config/tcr-ca.pem`: that variable is where `codex`
+takes an extra CA from, and it takes none from `NODE_EXTRA_CA_CERTS`. Nothing of Claude's is
+set. A login whose ChatGPT workspace is FedRAMP, or routed to a data residency or to a backend
+of its own, is never pooled: tcr refuses to import it
+([`--from-codex`](#--from-codex-importing-the-login-codex-already-has)), tunnels another backend
+untouched, and relays a request that names such a routing on the login's own credential. The
+launch says so on stderr:
+
+```
+[tcr] see-through mode: codex keeps its own backend URL, tunnelling via http://127.0.0.1:3456; a FedRAMP or residency-routed login runs on its own credential, unpooled
+[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem
+```
+
+**The running proxy decides.** The launcher reads the running proxy's `/_tcr/status` document
+once, and pools the session only when that proxy reports a leaf it minted itself that intercepts
+`chatgpt.com`, lists a Codex account, and that leaf's CA file is on disk. It never decides from
+the certificate files alone: the proxy loads its leaf once, at boot, so an older proxy, or one
+whose TLS material failed to load, does not intercept what the files on disk would cover. Every
+other case launches `codex` directly, on its own login, with one line saying why:
+
+```
+[tcr] launching codex directly (not pooled): proxy not listening on :3456
+```
+
+Each reason, verbatim, and what it needs:
+
+- `proxy not listening on :<port>`. Start the proxy, then run `tcr run --codex` again.
+- `could not read the running proxy's status (<why>)`. Something holds the port, but its status
+  could not be read, and `<why>` says what failed. `HTTP 401 Unauthorized — the proxy api-key
+  in the config was rejected` means `proxy.apiKey` in the config is not the running proxy's,
+  and `the server did not answer within 5s` means the proxy is wedged: check `tcr status` and
+  [the log](troubleshooting.md#where-the-logs-are). `the response was not a tcr status
+  payload (…) — an older tcr forwards this path upstream` means a `tcr` too old to have a
+  status route holds the port: restart it on this build, as for the next reason.
+- `the proxy on :<port> (build <sha>) predates Codex interception — restart it on this build
+  at a quiet moment`. That build predates the `mitm` key of its status document, so it cannot
+  say what it intercepts. Restart it on this build when a cold prompt cache costs least (see
+  [A restart is not automatically total loss](troubleshooting.md#a-restart-is-not-automatically-total-loss)),
+  then run `tcr run --codex` again: the restarted proxy reports what it intercepts, and if that
+  is one of the cases below, its entry applies. If TcrBar runs the proxy, update TcrBar first
+  ([why](troubleshooting.md#the-fix-is-in-main-and-the-fix-is-in-the-process-serving-traffic-are-different-facts)).
+- `the proxy on :<port> is serving the JS teamclaude leaf, which covers api.anthropic.com only
+  and is never re-minted — a restart will not change this; see docs/troubleshooting.md`. A
+  restart alone never fixes this one; what does is in
+  [troubleshooting.md](troubleshooting.md#tcr-run---codex-says-it-is-launching-codex-directly-not-pooled).
+- `the proxy on :<port> is running without MITM: its TLS material failed to load at boot — see
+  its log`. The proxy could not load or mint its TLS material when it started, so it decrypts
+  nothing and tunnels every `CONNECT`. Its log has a `MITM disabled: could not load/generate
+  TLS material` line carrying the error. A restart loads the material again, so it helps only
+  once that cause is fixed.
+- `` the proxy on :<port> holds no Codex account, so it blind-tunnels chatgpt.com and codex keeps
+  its own login — add one with `tcr login --from-codex` ``. The proxy terminates `chatgpt.com`
+  only while its pool holds a Codex account, in any state, disabled included, and tunnels it
+  untouched otherwise, so the session would run on `codex`'s own login whatever the launch set.
+  Import one with [`tcr login --from-codex`](#--from-codex-importing-the-login-codex-already-has):
+  a running proxy takes it at once and counts its Codex accounts on every `CONNECT`, so the next
+  `tcr run --codex` is pooled with no restart.
+- `no readable CA at <path>`. The proxy intercepts `chatgpt.com` with a leaf it minted, but
+  `<path>`, where this launcher expects the CA that leaf chains to, holds no file, so `codex`
+  cannot be told to trust it. If the file was moved, put it back. If it is gone, restart the
+  proxy at a quiet moment: with the CA file missing, its next boot mints a new CA and leaf, and
+  anything that trusted the old CA then has to trust the new one.
+- `the proxy on :<port> serves a leaf it minted but does not intercept chatgpt.com (it
+  intercepts [<hosts>])`. A proxy of this build that serves a leaf it minted lists
+  `chatgpt.com` in `interceptedHosts`, so this one is a different build. Compare the
+  `serverSha` that `tcr status --json` reports with your build, and upgrade whichever of the
+  two is older.
+- `the proxy on :<port> (build <sha>) reports a leaf this build does not know ("<leaf>") — run
+  tcr run --codex from the same build as the proxy`. This build knows the `js`, `minted` and
+  `none` leaves only, so the proxy is a different build, most likely a newer one. Upgrade
+  whichever of the two is older, then run `tcr run --codex` again.
+
+**A direct launch removes the proxy variables that point at this tcr.** Any of `HTTPS_PROXY`,
+`ALL_PROXY` and `HTTP_PROXY`, in either case, whose value names `127.0.0.1`, `localhost` or
+`[::1]` on this proxy's port is removed from `codex`'s environment, and a second line names
+them: `[tcr] removed HTTPS_PROXY from codex's environment: it points at tcr on :3456, which
+this launch bypasses`. So a tcr that is down, or not intercepting, cannot capture the launch
+that goes around it. A proxy variable aimed anywhere else, a corporate egress proxy or a local
+proxy on another port, is left as it was.
+
+**A pooled launch drops the `NO_PROXY` entries that would exempt `chatgpt.com`.** An entry in
+`NO_PROXY` or `no_proxy` that matches `chatgpt.com` by the rules `codex`'s HTTP stack applies
+(`chatgpt.com`, `.chatgpt.com`, a parent domain such as `.com`, or `*`) would send the session
+around tcr while the banner said it was pooled. Those entries are dropped, and the launch says
+so: `[tcr] dropped .chatgpt.com from NO_PROXY for codex: it exempts chatgpt.com from the proxy,
+and the session would bypass tcr`. Every other entry keeps exempting what it did, and a
+variable left with no entries stays set, as an empty value.
+
+**`CODEX_CA_CERTIFICATE` outranks `SSL_CERT_FILE` in `codex`,** so a corporate CA that you
+supply through `SSL_CERT_FILE` stops applying inside a pooled session; see
+[troubleshooting.md](troubleshooting.md#a-corporate-ssl_cert_file-is-ignored-under-tcr-run-and-tcr-run---codex).
+
+**`--group` is refused.** `tcr run --codex --group <name>` fails before anything launches, with
+`--group is not supported with --codex yet; run without --group`. A group reaches the proxy as
+a header Claude Code sends from `ANTHROPIC_CUSTOM_HEADERS`, and `tcr run` has no way yet to make
+`codex` send it, so the session would quietly route to the whole Codex pool instead.
+
+**A 426 at the start of every session is expected.** `codex` first asks for a WebSocket, and
+tcr, which relays Codex over HTTP streaming only, answers that upgrade with a 426 before
+choosing any account. That answer is what makes `codex` use SSE for the rest of the session,
+and tcr logs it at debug level only.
+
+**When no account can serve.** A Codex request is served by a Codex account or not at all.
+With none eligible, `codex` gets a 429 shaped for it, in one of three kinds:
+
+- `usage_limit_reached` when the Codex account that frees soonest is out on a usage limit (a
+  five-hour or weekly window, or a refusal from the backend), or when none reports when it frees
+  and every one is out on such a limit. It carries `resets_in_seconds` and, if some Codex
+  account reports when it frees, `resets_at`, the time `codex` tells you to try again, and
+  `codex` ends the turn on it.
+- `pool_unavailable` when they are out for anything else: a hold on an upstream `retry-after`,
+  a dead login, or an account disabled, parked or reserved. It carries `resets_in_seconds` but
+  no `resets_at`, and the same `retry-after` a Claude client gets, and `codex` retries it after
+  that wait, up to five times, instead of ending the turn.
+- `no_codex_account`, whose message names `tcr login --from-codex`, when the config holds none.
+  tcr does not intercept `chatgpt.com` then, so a `codex` meets this one only on a tunnel opened
+  while the pool still held an account, or by sending to tcr's listener directly. `codex` shows
+  it only as a generic retry-limit error, without its message; tcr's log says that no Codex
+  account is configured, and `tcr login --from-codex` adds one.
+
+The request path in full is in [architecture.md](architecture.md#codex-requests).
+
+**Known limitation: `claude` inside a `tcr run --codex` session.** In a pooled session `codex`
+gets `TCR_RUN_ACTIVE=1` like every `tcr run` child, and `HTTPS_PROXY` aimed at tcr, but no
+`NODE_EXTRA_CA_CERTS`. A `claude` started inside the session, by a codex tool for instance,
+inherits both, and unless it goes through `tcr run`, which sets `NODE_EXTRA_CA_CERTS`, its TLS
+handshake with `api.anthropic.com`, which tcr terminates, fails because node does not trust
+tcr's CA. A wrapper that honours the marker is exactly what skips `tcr run`: it hands the call
+straight to the real `claude`. `tcr run --codex` passes an exported `NODE_EXTRA_CA_CERTS`
+through untouched, so exporting it in the shell you launch from, naming the CA path tcr logs
+at boot, avoids this.
+
 ---
 
 ## `tcr login`
 
-Runs the browser OAuth flow and adds the resulting account to the pool.
+Runs the browser OAuth flow and adds the resulting account to the pool. With `--from-codex` it
+adds a Codex account instead, from the login the `codex` CLI already holds.
 
 | flag | type | default | effect |
 |---|---|---|---|
@@ -137,6 +300,8 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
 | `--from-claude-code` | bool | `false` | add an account from the login the `claude` CLI on this machine already holds, instead of the browser flow — see below. A first run does this by itself |
+| `--from-codex` | bool | `false` | add a Codex account from the login the `codex` CLI on this machine already holds — see below. Refused together with `--token` or `--from-claude-code` |
+| `--codex-home <dir>` | path | none | read `<dir>/auth.json` instead of `$CODEX_HOME/auth.json`; accepted only with `--from-codex` |
 | `--name <name>` | string | none | name this account explicitly instead of letting `login` mint a name for it; refused when another account already has that name |
 | `--non-interactive` | bool | `false` | drive the login from another program: never reads stdin, never opens the browser, reports progress as JSON lines — see below |
 
@@ -371,6 +536,114 @@ removed on purpose stays removed — `--from-claude-code` is the explicit way to
 Keychain read or profile fetch that fails is one warning line and the verb carries on with
 zero accounts: never a non-zero exit, never a retry, and `--json` output is unchanged.
 
+### `--from-codex`: importing the login `codex` already has
+
+A Codex account is a ChatGPT login of OpenAI's `codex` CLI, and tcr has no browser flow of
+its own for one: it imports the login `codex` already holds.
+
+```bash
+codex login                 # once, if codex is not signed in yet
+tcr login --from-codex
+```
+
+It reads `$CODEX_HOME/auth.json`, which is `~/.codex/auth.json` when `CODEX_HOME` is unset or
+empty. Set `TCR_CODEX_AUTH` to a file path to read that file instead; a path that does not
+exist means "no Codex login on this machine". That file is where `codex` keeps its login by
+default, and the only place tcr looks: a login `codex` was told to keep in the system keyring
+instead (its `cli_auth_credentials_store` setting) is not read. A file holding an API-key
+login, or one with no refresh token, is refused by name, because tcr pools ChatGPT logins
+only. Nothing here ever prints or logs a token.
+
+**A workspace tcr can pool.** tcr pools a ChatGPT login only when its workspace is served at
+`https://chatgpt.com` with no routing of its own, and refuses any other, with nothing written.
+`codex` sends a FedRAMP or data-residency workspace's requests to its own backend, or marks them
+with a routing no pooled account shares, so a pooled copy of that login could serve nothing. A
+login whose id token carries `chatgpt_account_is_fedramp` is refused first, before anything is
+asked. Then the import sends one `GET <codexUpstream>/backend-api/wham/accounts/check` with the
+imported bearer, and imports the login only when the answer gives the workspace the backend
+origin `NO_CONSTRAINT` or `https://chatgpt.com` and the routing override `NO_CONSTRAINT`. An
+answer that names another origin or override is refused, quoting it. One that names neither, and
+a check that cannot complete (no connection, a timeout, an HTTP error or a body that is not
+JSON), refuse the import too, saying why tcr could not confirm the workspace.
+
+**A second account** is signed in under a `CODEX_HOME` of its own, then imported from there.
+`codex` wants that directory to exist already:
+
+```bash
+mkdir -p ~/.codex-second
+CODEX_HOME=~/.codex-second codex login         # or: CODEX_HOME=~/.codex-second codex login --device-auth
+tcr login --from-codex --codex-home ~/.codex-second
+```
+
+`--codex-home DIR` reads `DIR/auth.json`. It is refused, with nothing written, while
+`TCR_CODEX_AUTH` is set too: the variable would win, and the import would take the first
+login again and report success.
+
+**The name.** The account is named by the email in the login's id token. When an account of
+either provider already holds that name, it becomes `<email>/codex`, then `<email>/codex-2`,
+`<email>/codex-3` and so on, the way a second organization's Claude login becomes
+`email/<org-slug>`; so a ChatGPT login under the email your Claude login uses lands beside it
+as `alice@example.com/codex`. `--name` overrides all of that, and is refused when another
+account holds the name. A login whose id token carries no email needs `--name`. `--account
+<email>` refuses the import, with nothing written, unless the login carries that email: a
+guard against importing from the wrong `CODEX_HOME`.
+
+**Importing the same login again** updates its row in place and keeps the name the row is
+saved under, so a `--name` that differs from it is refused. It is refused outright when tcr
+already holds a newer credential for the account than `codex` does, which is the usual state
+once tcr has refreshed it, because the copy `codex` holds is then the dead one:
+
+```
+tcr already holds a newer credential for this account than `codex` does; run `codex login` first if you meant to replace it; nothing was written.
+```
+
+**A running proxy.** The import reaches the config the way every `tcr login` does, with the
+same live route, file route, refusals and `--force` rules described above. Over the live route
+it needs one thing more: the running proxy must name `codex` among the providers it can store,
+in the `x-tcr-providers` header on its account-add route's answer. A proxy built before Codex
+accounts names none. Handed the login, it would keep it as a Claude account and send its
+OpenAI tokens to Anthropic, so the import is refused with nothing written, and `--force` does
+not get past it: a confirmed live route is never traded for the file, and that proxy would
+refuse the file at its next start, or read it the same way if it predates the
+`credentialVersion` check (0.2.45 and older). The message and the fix are in
+[troubleshooting.md](troubleshooting.md#tcr-login---from-codex-says-the-proxy-predates-codex-accounts).
+The proxy's answer is checked as well, and must report the row stored as a Codex account. If
+it does not, the row is already live as a Claude account, and the import fails naming the
+`tcr remove` to run at once, followed by a fresh `codex login`.
+
+**The cost, stated on every import.** Each import prints one line on stderr carrying two
+notices, the first about the copy of the login the `codex` CLI keeps, the second about older
+proxies:
+
+```
+[tcr] imported as 'alice@example.com' (ChatGPT Pro); this copies the login the `codex` CLI itself uses, and Codex refresh tokens are single-use: the first time tcr refreshes it, the copy `codex` holds stops working and `codex` asks you to log in again, once, under `tcr run --codex` too. To avoid that, import a login made for tcr alone: `mkdir -p <dir>`, `CODEX_HOME=<dir> codex login`, then `tcr login --from-codex --codex-home <dir>`. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
+```
+
+The plan in parentheses is the label `tcr status` shows, left out when the login names no
+plan. A pooled `tcr run --codex` session does not spare the copy `codex` holds: tcr swaps the
+credential on inference only, every other `/backend-api/` call goes up under the login `codex`
+holds, and `codex` refreshes that copy itself, near its expiry and on a 401. A login made for
+tcr alone, under a `CODEX_HOME` of its own as [above](#--from-codex-importing-the-login-codex-already-has),
+leaves the one you use with `codex` alone.
+
+**Upgrade every `tcr` before the first import.** A Codex row is written at
+`credentialVersion: 2` ([configuration.md](configuration.md#accounts)), which a `tcr` that
+predates Codex accounts cannot serve, so upgrade every `tcr` that may boot on this config, the
+one TcrBar bundles included, before you import a Codex login. What an older build does with
+the file, and the recovery once one has refused it, are in
+[troubleshooting.md](troubleshooting.md#after-a-codex-import-an-older-proxy-refuses-to-load-the-config).
+
+**No first run imports it.** The first-run import above takes the `claude` CLI's login only. A
+Codex login enters the pool through `--from-codex` and nothing else.
+
+**TcrBar** does not tell a Codex account from a Claude one yet; see the
+[known limitation](../README.md#watching-it).
+
+Once imported, the account is refreshed against `auth.openai.com`, probed at
+`/backend-api/wham/usage`, never kept warm, and serves the inference requests
+(`/backend-api/codex/responses`) of `tcr run --codex` and of any `codex` routed through the
+proxy; [architecture.md](architecture.md#codex-requests) has the details.
+
 ---
 
 ## `tcr accounts`
@@ -600,6 +873,27 @@ the background quota probe fetches the profile once for any account that has no 
 records it, and writes it to the config. So a fresh checkout shows `null` until each account's first
 probe, not forever.
 
+### Codex rows on `--json`
+
+The output stays a bare array of rows. A Codex account's row carries `"provider": "codex"`; an
+Anthropic row carries no `provider` key at all, never `null`, so a client written before the key
+reads every Anthropic row exactly as before. On a Codex row `organizationType` is the ChatGPT plan
+claim, verbatim (`pro`, `plus`, `team`, …), `plan` is its label (`ChatGPT Pro`), and
+`rateLimitTier`, `seatTier`, `orgUuid` and `orgName` are `null`: a ChatGPT workspace is named by its
+account id alone. That plan is read from the login's token claims at import, and the probe never
+backfills it. The plain text carries the same label (`plan=ChatGPT Pro`), and the terminal
+dashboard tags a Codex row `[codex]` after its name.
+
+```
+tcr status --json | jq -r '.[] | select(.provider == "codex") | "\(.name)\t\(.plan // "unknown")"'
+```
+
+A Codex account's quota windows fill the same `fiveHour` and `sevenDay` keys an Anthropic
+account's do, matched by window length rather than by the slot Codex reports a window in.
+Measured on ChatGPT Pro logins, Codex reports a weekly window only, so such an account's
+`fiveHour` stays `null` while `sevenDay` moves; the mapping is in
+[architecture.md](architecture.md#codex-requests).
+
 ### The `usage` object on `--json`
 
 Every row carries `usage`: what that account spent, aggregated by the proxy as it served each
@@ -665,6 +959,30 @@ duration over a bounded reservoir, and `overOneMinute`) and `reqPerMinute` (30 w
 of request counts, oldest first, decaying to zeros as the session goes idle); the payload's
 top-level `sessionsSummary` is the same `byTool` shape summed across every session server-side, so
 a panel's fleet-wide headline never disagrees with the per-session rows by re-summing them itself.
+
+### The `mitm` object on `GET /_tcr/status`
+
+Also on the raw `/_tcr/status` document only, never in `tcr status --json`'s array: what the
+serving process's forward-proxy listener can intercept, decided once at boot from its policy and
+the TLS material that process loaded. `interceptedHosts` lists the hosts that policy and leaf let
+it terminate TLS for, and `leaf` names the certificate it presents: `minted` (a leaf tcr minted
+under `~/.config/tcr-ca.pem`), `js` (the JS teamclaude proxy's `teamclaude-leaf.pem`, which tcr
+takes to cover `api.anthropic.com` only) or `none` (MITM off: the TLS material failed to load,
+and every `CONNECT` is tunnelled). `chatgpt.com` in `interceptedHosts` says what the leaf allows,
+not what happens on every tunnel: the listener terminates it only while the pool holds a Codex
+account, counted again on each `CONNECT`, and tunnels it untouched otherwise. The same document's
+account rows show whether it holds one: a Codex row carries `"provider": "codex"`.
+
+```
+"mitm": {
+  "interceptedHosts": ["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+  "leaf": "minted"
+}
+```
+
+A server that has the key always sends it, MITM off included, and a server built before it leaves
+it out. That difference is how `tcr run --codex` tells an older proxy from one running without
+MITM.
 
 ---
 
