@@ -15466,6 +15466,42 @@ mod tests {
         );
     }
 
+    /// A 403 must hold the refused account for a short while, so the next requests
+    /// stop paying the same refused round trip, and the row must read `refused`
+    /// rather than `ok` while the hold lasts.
+    #[tokio::test]
+    async fn forbidden_403_holds_the_account_and_shows_refused() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_403()), Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        for _ in 0..4 {
+            assert_eq!(post_one(manager.clone()).await, 200);
+        }
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "one wasted attempt on `a`, then `a` is held and never retried"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(
+            a.requests, 0,
+            "a held `a` is never selected again; `attempts` alone cannot show this, \
+             because the scripted upstream answers by connection order, not by account"
+        );
+        assert_eq!(
+            serde_json::to_value(a.gate).unwrap(),
+            serde_json::json!("refused"),
+            "a held 403 account must not read `gate: ok`"
+        );
+        assert_eq!(
+            manager.account_status(0),
+            Some(AccountStatus::Active),
+            "the hold is bounded, never the terminal `Error`"
+        );
+    }
+
     /// When 403s cover the WHOLE eligible fleet, the client must get a 502
     /// `proxy_error` naming the refused account(s) — never the bare upstream 403
     /// (unusable: names a credential the client cannot act on) and never a
