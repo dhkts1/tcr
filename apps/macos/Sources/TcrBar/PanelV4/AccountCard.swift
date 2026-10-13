@@ -382,18 +382,10 @@ struct AccountCard<Actions: View>: View {
             + "requests wait until it is back."
     }
 
-    private var statePillText: String {
-        switch kind {
-        case .ok: return "OK"
-        case .near: return "Near"
-        case .spent: return "Spent"
-        case .unknown: return "Unknown"
-        case .needsRelogin: return "Needs re-login"
-        case .rejected: return "Rejected"
-        case .unmeasured: return "Unmeasured"
-        case .disabled: return "Parked"
-        }
-    }
+    /// ``FleetTally/Kind/pillText``, kept under this name because the pill
+    /// and the spoken label both read it, and a wiring test pins the pill's
+    /// call by it.
+    private var statePillText: String { kind.pillText }
 
     private var statePillRole: V4Pill.Role {
         switch kind {

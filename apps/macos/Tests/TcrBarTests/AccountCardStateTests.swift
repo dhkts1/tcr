@@ -124,6 +124,29 @@ final class AccountCardStateTests: XCTestCase {
         XCTAssertEqual(FleetTally.Kind(account: rejected).phrase, "rejected by Anthropic")
     }
 
+    /// Every word the card's state pill can draw, pinned, because the pill
+    /// text moved out of the card into ``FleetTally/Kind/pillText`` and a move
+    /// that only compiles proves no word survived it. The three registers
+    /// differ on purpose (`Parked` / `parked` / `disabled`), so this also
+    /// checks the pill did not collapse into either of the others.
+    func testEveryKindDrawsItsOwnPillWord() {
+        let expected: [(FleetTally.Kind, String)] = [
+            (.ok, "OK"),
+            (.near, "Near"),
+            (.spent, "Spent"),
+            (.unknown, "Unknown"),
+            (.needsRelogin, "Needs re-login"),
+            (.rejected, "Rejected"),
+            (.unmeasured, "Unmeasured"),
+            (.disabled, "Parked"),
+        ]
+        for (kind, word) in expected {
+            XCTAssertEqual(kind.pillText, word, "the pill for \(kind.token)")
+        }
+        XCTAssertNotEqual(FleetTally.Kind.disabled.pillText, FleetTally.Kind.disabled.token)
+        XCTAssertNotEqual(FleetTally.Kind.disabled.pillText, FleetTally.Kind.disabled.phrase)
+    }
+
     func testADeadCredentialStillOutranksAParkedGroupsQuotaCases() {
         let broken = stateAccount("iris@example.com", status: "error", quota: 0.1, probeStatus: .ok)
         XCTAssertEqual(FleetTally.Kind(account: broken), .needsRelogin)
