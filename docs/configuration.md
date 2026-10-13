@@ -146,7 +146,7 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
-| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; anything else is a static-key account |
+| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; `"apikey"` rows are quarantined at load, because tcr serves Claude subscriptions only; any other string is a static-key account, kept as written |
 | `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token |
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
 | `orgName` | string | absent | no | organization display name; also what a duplicated `name` is renamed from (`Henry Token` → `henry-token`) |
@@ -160,7 +160,10 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `egressStrict` | bool | `false` | no | what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
 
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
-keep-warm; any other value is treated as a static key.
+keep-warm. tcr serves Claude subscriptions only, so an `"apikey"` row is quarantined at
+load with a warning, and the rest of the config loads. Any other string is treated as a
+static key and written back exactly as it was; a `type` that is not a string quarantines
+its row.
 
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
@@ -351,7 +354,7 @@ Consequences worth knowing before you tune either number:
 | `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
-| `cacheTtlRewrite` | bool | **on when every account is OAuth, off if any is an API key** | no | rewrite every `cache_control` breakpoint to `"ttl":"1h"` before forwarding. Measured 2026-10-06: a 1h write costs a subscription's 5-hour window what a 5m write does and a read costs it nothing visible, so the hour is free and spares the full re-write after a 5-60 minute idle gap. An API-key account is billed at the published rates, where a 1h write is 2x input against 1.25x, so a fleet holding one forwards bodies as sent unless this is set `true`. `tcr wrap` still prices 1h writes at the API's 2x, so its dollar figure rises while a subscription's quota does not |
+| `cacheTtlRewrite` | bool | **on unless some account's `type` is a string tcr does not recognize** | no | rewrite every `cache_control` breakpoint to `"ttl":"1h"` before forwarding. Measured 2026-10-06: a 1h write costs a subscription's 5-hour window what a 5m write does and a read costs it nothing visible, so the hour is free and spares the full re-write after a 5-60 minute idle gap. A row of an unrecognized `type` is a static key tcr cannot classify and may be billed at the published rates, where a 1h write is 2x input against 1.25x, so a fleet holding one forwards bodies as sent unless this is set `true`. An `apikey` row cannot turn it off, because it never loads. `tcr wrap` still prices 1h writes at the API's 2x, so its dollar figure rises while a subscription's quota does not |
 | `throttleExemptNoise` | bool | **`false`** (OFF) | no | let `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) skip the **per-org** bucket instead of queueing behind inference. It still pays `fleetThrottle`, so exempt traffic is never entirely unpaced. Only a request with **no client bearer** is classified at all — one that carries its own is relayed under it and never enters a bucket (see [`controlIdentity`](#controlidentity-the-client-must-be-the-control-account)) |
 | `divertBudget` | u32 | **`0`** (unlimited) | no | max distinct destination accounts one session may be diverted to inside a single hold episode; `0` = unlimited, today's behaviour byte-for-byte |
 

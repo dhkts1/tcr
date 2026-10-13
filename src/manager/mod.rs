@@ -9299,8 +9299,9 @@ mod tests {
 
     /// The 1h rewrite's default follows the fleet: on when every account is
     /// OAuth (the window counts a 1h write like a 5m one), off as soon as one
-    /// API-key account is present (billed 2x against 1.25x on every write), and
-    /// an explicit `cacheTtlRewrite` wins either way.
+    /// row of an unrecognized type is present (a static key that may be billed
+    /// 2x against 1.25x on every write), and an explicit `cacheTtlRewrite` wins
+    /// either way. An API-key row cannot be the trigger: it never loads.
     ///
     /// Watched red before the default read the account types: the second
     /// assertion failed, a fleet with an API-key account still rewrote.
@@ -9313,7 +9314,7 @@ mod tests {
         assert!(all_oauth.cache_ttl_rewrite_enabled(), "all OAuth: on");
 
         let mut api_key = account("k", 0);
-        api_key.account_type = crate::config::AccountType::ApiKey;
+        api_key.account_type = crate::config::AccountType::Unrecognized("static".to_string());
         let mixed = build_manager(
             config_with(vec![account("a", 0), api_key.clone()]),
             pacing_refresher(),

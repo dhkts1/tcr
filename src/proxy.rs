@@ -2175,8 +2175,8 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         ));
     };
     // The same rule `config::load` applies to a file row: tcr does not serve
-    // API-key accounts. Without this, one added here would serve until the
-    // next load quarantined it.
+    // API-key accounts. Without this, one added here would serve, and only
+    // the next load would set it aside.
     let account_type = parsed.account_type.unwrap_or_default();
     if matches!(account_type, config::AccountType::ApiKey) {
         return stamp_add_endpoint(error_response(
