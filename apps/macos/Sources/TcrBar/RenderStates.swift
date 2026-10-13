@@ -74,6 +74,18 @@ enum RenderStates {
                 "henry.fitzgerald@example.com"
             ),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
+            // Option H's hover card (unit H2), pinned by ``hoverCardFixture(for:)``
+            // because this harness has no pointer. 02b: a line in the upper
+            // half, so the card opens below it, on the control account so the
+            // card's CONTROL pill is in frame. 02c: an out-of-tokens line in
+            // the lower half, so the card opens above it. Each is also drawn
+            // without its card and must come out the same size
+            // (``hoverCardKeepsPanelSize(without:with:named:)``).
+            (
+                "02b-mixed-thirteen-hover", .loaded(fleet(mixedJSON)), false,
+                "near@example.com"
+            ),
+            ("02c-mixed-thirteen-hover-lower", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
             ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false, nil),
@@ -279,6 +291,51 @@ enum RenderStates {
             return .tools
         default: return .accounts
         }
+    }
+
+    /// The account whose hover card a scene shows, or `nil` for none: a lookup
+    /// by name for the reason ``initialTab(for:)`` is one.
+    private static func hoverCardFixture(for sceneName: String) -> String? {
+        switch sceneName {
+        case "02b-mixed-thirteen-hover": return "near@example.com"
+        case "02c-mixed-thirteen-hover-lower": return "spent-5@example.com"
+        default: return nil
+        }
+    }
+
+    /// The hover card's two promises, measured on the scene that pins one:
+    /// the panel is the SAME size with the card as without it (the card is an
+    /// overlay and must never grow the list, the `ffe8a86` rule), and the two
+    /// pictures DIFFER (the card really drew). The second half is the positive
+    /// control: a card that silently failed to draw would pass the first half
+    /// on its own. Prints what failed and answers `false`, which fails the run.
+    @MainActor
+    private static func hoverCardKeepsPanelSize<A: View, B: View>(
+        without: A, with: B, named name: String
+    ) -> Bool {
+        let plain = ImageRenderer(content: without)
+        let hovered = ImageRenderer(content: with)
+        plain.scale = 2
+        hovered.scale = 2
+        guard let a = plain.nsImage, let b = hovered.nsImage else {
+            FileHandle.standardError.write(Data("hover check: \(name) did not render\n".utf8))
+            return false
+        }
+        if a.size != b.size {
+            FileHandle.standardError.write(
+                Data(
+                    ("hover check: \(name) is \(Int(b.size.width))x\(Int(b.size.height))pt "
+                        + "with its card and \(Int(a.size.width))x\(Int(a.size.height))pt "
+                        + "without: the card changed the panel's size\n").utf8))
+            return false
+        }
+        if a.tiffRepresentation == b.tiffRepresentation {
+            FileHandle.standardError.write(
+                Data("hover check: \(name) drew the same picture with and without its card\n".utf8))
+            return false
+        }
+        print("  hover check: \(name) \(Int(b.size.width))x\(Int(b.size.height))pt either way")
+        return true
     }
 
     /// `SessionFile`s for ``sessionsFixture``'s three sessions, on the two
@@ -537,7 +594,10 @@ enum RenderStates {
             UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
         }
 
-        let view =
+        // A closure over the hover pin, so a scene that pins a hover card can
+        // also be drawn without it and the two compared
+        // (``hoverCardKeepsPanelSize(without:with:named:)``).
+        let panel = { (hoverCard: String?) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -573,7 +633,8 @@ enum RenderStates {
                     ? noRequestsBannerZeroSince : nil,
                 initialClaudeCount: scene.name == "22-no-requests-banner" ? 1 : nil,
                 initialClaudeRoute: scene.name == "22-no-requests-banner"
-                    ? noRequestsBannerRoute : nil
+                    ? noRequestsBannerRoute : nil,
+                initialHoverCard: hoverCard
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -585,6 +646,9 @@ enum RenderStates {
             // concrete size renders the real content; the scroll area is simply
             // shown at full height instead of clipped.
             .fixedSize()
+        }
+        let hoverCard = hoverCardFixture(for: scene.name)
+        let view = panel(hoverCard)
 
         // The shipped default stays unsuffixed — every existing filename this
         // harness produces is unchanged — and only the forced `.comfortable`
@@ -595,6 +659,11 @@ enum RenderStates {
             density == .compact
             ? "\(scene.name)-\(appearance.rawValue).png"
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
+        if hoverCard != nil,
+            !hoverCardKeepsPanelSize(without: panel(nil), with: view, named: name)
+        {
+            return false
+        }
         return rasterise(view, named: name, into: directory)
     }
 

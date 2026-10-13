@@ -45,6 +45,12 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     var onSetExit: (String, AccountExit.Route, Bool) -> Void = { _, _, _ in }
     /// Opens a lender's sheet in Settings > Peers.
     var onOpenLender: (String) -> Void = { _ in }
+    /// The account whose hover card is showing, whose line draws `.hov`'s
+    /// fill. The card itself hangs from the panel root
+    /// (`AccountHoverCard.swift`), not from here.
+    var hoveredAccount: String? = nil
+    /// The pointer entering (`true`) or leaving a line, by account name.
+    var onHoverLine: (String, Bool) -> Void = { _, _ in }
     /// The row's own actions, as a context menu — the SECOND route to them,
     /// from the one definition in ``AccountRow``.
     @ViewBuilder var menu: (Account) -> Menu
@@ -104,7 +110,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// card instead of a line. Option H draws neither, and both are things a
     /// line has no room for: the lease line is the notice that another Mac may
     /// read this account's traffic, and the exit picker is a control. They
-    /// stay on the card until the hover card (unit H2) carries them.
+    /// stay on the card for good, not until the hover card carries them (lead
+    /// ruling, 2026-10-14): a control cannot live in a card that vanishes when
+    /// the pointer moves.
     @ViewBuilder
     private func looseLines(_ section: FleetSection, first: Bool) -> some View {
         let lines = section.rows.filter { !keepsCard($0) }
@@ -124,11 +132,18 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                             account: row.account, now: now, isControl: row.isControl,
                             snapshotMode: snapshotMode, nameWidth: nameWidth
                         ) { menu(row.account) }
+                        .hoverableLine(
+                            row, hovered: hoveredAccount == row.account.name, bleed: .zero
+                        ) { onHoverLine(row.account.name, $0) }
                     } else {
                         WaitingLineRow(
                             account: row.account, band: section.band, now: now,
                             isControl: row.isControl, snapshotMode: snapshotMode
                         ) { menu(row.account) }
+                        .hoverableLine(
+                            row, hovered: hoveredAccount == row.account.name,
+                            bleed: V4.waitBoxPaddingH
+                        ) { onHoverLine(row.account.name, $0) }
                     }
                 }
             }

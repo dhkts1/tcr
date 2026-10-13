@@ -158,6 +158,10 @@ struct FleetView: View {
     /// loop with a pass budget rather than a convergence test.
     @State private var v4ContentHeight: CGFloat = 0
 
+    /// Which account's hover card is showing (option H, unit H2). The card
+    /// hangs from ``v4Body``, never from the list; see `AccountHoverCard.swift`.
+    @State private var hoverCard = HoverCardTracker()
+
     /// Accounts / Sessions / Tools (F2 + F3). `.accounts` selected by default.
     @State private var selectedTab: PanelTab = .accounts
 
@@ -269,7 +273,11 @@ struct FleetView: View {
         // into a zero-request read.
         initialZeroRequestsSince: Date? = nil,
         initialClaudeCount: Int? = nil,
-        initialClaudeRoute: ClaudeRouteRead.Route? = nil
+        initialClaudeRoute: ClaudeRouteRead.Route? = nil,
+        // The account whose hover card shows on the first frame. The render
+        // harness has no pointer, so this is the only way it can draw the card;
+        // the live app leaves it `nil` and the pointer drives it.
+        initialHoverCard: String? = nil
     ) {
         self.poller = poller
         self.server = server
@@ -293,6 +301,7 @@ struct FleetView: View {
         self._zeroRequestsSince = State(initialValue: initialZeroRequestsSince)
         self._claudeCount = State(initialValue: initialClaudeCount)
         self._claudeRoute = State(initialValue: initialClaudeRoute)
+        self._hoverCard = State(initialValue: HoverCardTracker(shown: initialHoverCard))
     }
 
     /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
@@ -399,6 +408,45 @@ struct FleetView: View {
             content: { v4Content },
             footer: { v4Footer }
         )
+        // At the panel root, so the list's `ScrollView` cannot clip it and,
+        // being an overlay, it cannot change the panel's size. See
+        // `AccountHoverCard.swift`.
+        .accountHoverCard(
+            shown: hoverCard.shown,
+            onHover: { inside in
+                if inside {
+                    hoverCard.cardEntered()
+                } else {
+                    hoverCard.cardLeft()
+                    settleHoverCardSoon()
+                }
+            },
+            card: { row in hoverCardBody(row) }
+        )
+    }
+
+    /// The account's full card, as it was drawn in the list before option H,
+    /// with the same gear and right-click menu from `AccountRow`'s one
+    /// definition.
+    @ViewBuilder
+    private func hoverCardBody(_ row: FleetSectionRow) -> some View {
+        if case .loaded(let fleet) = poller.state {
+            AccountCard(
+                account: row.account, shape: .full, now: Date(), isControl: row.isControl,
+                snapshotMode: snapshotMode
+            ) {
+                v4AccountRow(row.account, in: fleet, actionsOnly: true)
+            }
+            .contextMenu { v4AccountRow(row.account, in: fleet, menuOnly: true) }
+        }
+    }
+
+    /// A leave waits a moment before the card goes, so the pointer can cross
+    /// from a line onto its card (``HoverCardTracker/settle()``).
+    private func settleHoverCardSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + V4.hoverCardGraceSeconds) {
+            hoverCard.settle()
+        }
     }
 
     /// Every account row the Accounts tab would draw, or `nil` when there is no
@@ -607,6 +655,7 @@ struct FleetView: View {
                 }
                 if snapshotMode {
                     accountsTabV4(fleet)
+                        .hoverCardList()
                 } else {
                     ScrollView {
                         accountsTabV4(fleet)
@@ -623,6 +672,9 @@ struct FleetView: View {
                             )
                     }
                     .frame(height: v4ListHeight(for: fleet))
+                    // The VISIBLE list, after the frame, so "the lower half"
+                    // means the lower half of what the reader can see.
+                    .hoverCardList()
                     .onPreferenceChange(V4ContentHeightKey.self) {
                         v4ContentHeight = PanelHeight.settled(v4ContentHeight, $0)
                     }
@@ -694,6 +746,15 @@ struct FleetView: View {
                 // re-open on the next visit.
                 SettingsNavigation.shared.peerSheet = lender
                 onSettings()
+            },
+            hoveredAccount: hoverCard.shown,
+            onHoverLine: { name, inside in
+                if inside {
+                    hoverCard.rowEntered(name)
+                } else {
+                    hoverCard.rowLeft(name)
+                    settleHoverCardSoon()
+                }
             }
         ) { account in
             // The row's own actions, from the ONE definition of them —
