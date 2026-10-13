@@ -358,18 +358,42 @@ impl Manager {
         if let Some(account) = accounts.get_mut(idx) {
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms = Some(until);
+            account.hold_cause = HoldCause::RateLimit;
             tracing::info!(account = %account.name, hold_seconds = hold, "rate limited");
         }
     }
 
-    /// Clear a rate-limit hold after live proof it no longer binds (any non-429).
+    /// Hold account `idx` out of rotation for [`REFUSED_HOLD_SECONDS`] after an
+    /// upstream 403 refused our credential. Leaves the status `Active`: the
+    /// terminal `Error` is wrong for a 403 (see the 403 arm in proxy.rs), and
+    /// `Throttled` would claim a rate limit. Selection skips any live
+    /// `rate_limited_until_ms` whatever the status, so the hold binds the same.
+    pub fn mark_refused(&self, idx: usize) {
+        let until = crate::now_ms() + REFUSED_HOLD_SECONDS * 1000;
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            account.rate_limited_until_ms = Some(until);
+            account.hold_cause = HoldCause::Refused;
+            tracing::info!(
+                account = %account.name,
+                hold_seconds = REFUSED_HOLD_SECONDS,
+                "refused by upstream 403, held out of rotation"
+            );
+        }
+    }
+
+    /// Clear a hold after live proof it no longer binds (any non-429): a
+    /// rate-limit hold, or a 403 refusal hold, since the account just answered.
     pub fn clear_rate_limited(&self, idx: usize) {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         if let Some(account) = accounts.get_mut(idx) {
             if account.status == AccountStatus::Throttled {
                 account.status = AccountStatus::Active;
                 account.rate_limited_until_ms = None;
+            } else if account.hold_cause == HoldCause::Refused {
+                account.rate_limited_until_ms = None;
             }
+            account.hold_cause = HoldCause::RateLimit;
         }
     }
 

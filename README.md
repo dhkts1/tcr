@@ -132,11 +132,9 @@ key, its default and the file's permissions are in
 
 ### Managing the fleet
 
-Most changes to the pool reach a running proxy without a restart. `enable`, `disable`,
-`remove` and `control` apply to it directly, and the proxy picks up `group` edits from the
-config file on its next request. `priority` is the exception: it only writes the file, so a
-running proxy keeps the old order until it restarts. Every flag is in
-[`docs/cli.md`](docs/cli.md).
+Changes to the pool reach a running proxy without a restart. `enable`, `disable`, `remove`,
+`priority` and `control` apply to it directly, and the proxy picks up `group` edits from the
+config file on its next request. Every flag is in [`docs/cli.md`](docs/cli.md).
 
 | Command | What it does |
 |---|---|
@@ -344,13 +342,11 @@ keeps them for conversations still within the cache lifetime.
 
 ### How long does the cache stay warm?
 
-Five minutes after its last use, unless the request asks for an hour. From 1.1.19, when every
-account in the pool is a subscription, `tcr` rewrites every cache breakpoint to the hour, so a
-conversation you come back to within the hour resumes warm instead of writing its prefix again. On
-a subscription the hour costs the five-hour window what five minutes does (measured 2026-10-06). An
-API key is billed twice the input price for an hour-long write, so with one in the pool `tcr`
-forwards requests as sent. `cacheTtlRewrite` in [`docs/configuration.md`](docs/configuration.md)
-overrides either default.
+Five minutes after its last use, unless the request asks for an hour. From 1.1.19 `tcr` rewrites
+every cache breakpoint to the hour, so a conversation you come back to within the hour resumes warm
+instead of writing its prefix again. On a subscription the hour costs the five-hour window what
+five minutes does (measured 2026-10-06). `cacheTtlRewrite` in
+[`docs/configuration.md`](docs/configuration.md) turns it off.
 
 ### What happens when an account runs out?
 
@@ -361,8 +357,8 @@ already on that account moves once, and pays one cache rebuild.
 ### Does it run on Linux, and with API keys?
 
 The `tcr` CLI and terminal dashboard run on Linux as static builds for x86_64 and aarch64. TcrBar,
-the menu-bar app, is macOS only. Accounts can be Claude subscriptions, logged in through the
-browser, or Anthropic API keys.
+the menu-bar app, is macOS only. Accounts are Claude subscriptions logged in through the browser;
+`tcr` does not serve Anthropic API keys.
 
 ### How is this related to teamclaude?
 

@@ -29,7 +29,7 @@ use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
-use crate::probe::{LiveUsageProber, UsageProber};
+use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
 use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
 use crate::status::{StatusPayload, STATUS_KIND};
 
@@ -361,42 +361,110 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Set the priority of the account matching `query`.
+/// The integer a [`PriorityArg`] means against `config`'s accounts.
 ///
 /// `--first` = `min(0, existing priorities) - 1`; `--last` =
-/// `max(0, existing priorities) + 1`; an explicit `N` is written verbatim. The
-/// `0` seed guarantees a relative move always crosses the default tier even when
-/// every existing priority sits on the same side of it.
-pub fn set_priority(config_path: &Path, query: &str, priority: PriorityArg) -> anyhow::Result<()> {
-    let (name, value) = edit_account(config_path, query, |config, idx| {
-        let value = match priority {
-            PriorityArg::N(n) => n,
-            PriorityArg::First => {
-                config
-                    .accounts
-                    .iter()
-                    .filter_map(|a| a.priority)
-                    .chain(std::iter::once(0))
-                    .min()
-                    .expect("chained 0 guarantees a min")
-                    - 1
-            }
-            PriorityArg::Last => {
-                config
-                    .accounts
-                    .iter()
-                    .filter_map(|a| a.priority)
-                    .chain(std::iter::once(0))
-                    .max()
-                    .expect("chained 0 guarantees a max")
-                    + 1
-            }
-        };
-        config.accounts[idx].priority = Some(value);
-        (config.accounts[idx].name.clone(), value)
-    })?;
+/// `max(0, existing priorities) + 1`; an explicit `N` is verbatim. The `0` seed
+/// guarantees a relative move always crosses the default tier even when every
+/// existing priority sits on the same side of it.
+fn priority_value(config: &Config, priority: PriorityArg) -> i64 {
+    let existing = config
+        .accounts
+        .iter()
+        .filter_map(|a| a.priority)
+        .chain(std::iter::once(0));
+    match priority {
+        PriorityArg::N(n) => n,
+        PriorityArg::First => existing.min().unwrap_or(0) - 1,
+        PriorityArg::Last => existing.max().unwrap_or(0) + 1,
+    }
+}
+
+/// Set the priority of the account matching `query`, **in the running proxy
+/// first** and then in the config file, the same posture as [`set_enabled`].
+///
+/// A file-only write was the gap: the proxy reads `priority` once at boot, so
+/// `tcr priority alice --first` changed nothing until a restart, and a restart
+/// costs every live session its warm prompt cache.
+///
+/// The value is computed from the FILE (so `--first`/`--last` mean what they
+/// always meant), the query is resolved in the file before anything is sent,
+/// and the server ([`crate::proxy::PRIORITY_PATH`]) applies that integer in
+/// memory only. This function writes the file. The arms follow
+/// [`set_enabled`]: a refused api-key or a refused query changes nothing; a
+/// missing route or an unusable answer writes the file and says the running
+/// proxy keeps the old order until it restarts.
+pub async fn set_priority(
+    config_path: &Path,
+    query: &str,
+    priority: PriorityArg,
+) -> anyhow::Result<()> {
+    let config = load_for_edit(config_path)?;
+    resolve_account(&config.accounts, query)?;
+    let value = priority_value(&config, priority);
+
+    match post_set_priority(&config, query, value).await {
+        Ok(applied) => {
+            write_priority(config_path, query, value).with_context(|| {
+                format!(
+                    "the running proxy already ranks '{}' at {value}, but the config file was not updated, so a restart will undo it",
+                    applied.name
+                )
+            })?;
+            println!("Set priority of '{}' to {value}.", applied.name);
+            return Ok(());
+        }
+        // Nothing is listening: the file is the whole truth.
+        Err(LiveControlError::NoServer) => {}
+        Err(LiveControlError::Unauthorized) => {
+            bail!(
+                "the proxy on :{} rejected the api-key in {}, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
+                config.proxy.port,
+                config_path.display()
+            );
+        }
+        // The server matched our query to nothing or to several accounts. The
+        // file's resolution could land on a different row, so do not fall back.
+        Err(LiveControlError::Rejected(message)) => {
+            bail!(
+                "the proxy running on :{} refused this: {message} Nothing was changed.",
+                config.proxy.port
+            );
+        }
+        Err(LiveControlError::NoRoute) => {
+            let name = write_priority(config_path, query, value)?;
+            eprintln!(
+                "[tcr] WARNING: the proxy running on :{} is too old to accept a live priority change (no {} route), so only the config file was changed. It will KEEP the old order until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                config.proxy.port,
+                crate::proxy::PRIORITY_PATH,
+            );
+            println!("Set priority of '{name}' to {value}.");
+            return Ok(());
+        }
+        Err(other) => {
+            let name = write_priority(config_path, query, value)?;
+            eprintln!(
+                "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP the old order until it restarts.",
+                config.proxy.port,
+                other.why(),
+            );
+            println!("Set priority of '{name}' to {value}.");
+            return Ok(());
+        }
+    }
+
+    let name = write_priority(config_path, query, value)?;
     println!("Set priority of '{name}' to {value}.");
     Ok(())
+}
+
+/// The file half of `tcr priority`: resolve, set, save, return the resolved
+/// name.
+fn write_priority(config_path: &Path, query: &str, value: i64) -> anyhow::Result<String> {
+    edit_account(config_path, query, |config, idx| {
+        config.accounts[idx].priority = Some(value);
+        config.accounts[idx].name.clone()
+    })
 }
 
 /// `tcr token <query>` — print the matched account's access token to stdout,
@@ -1504,6 +1572,75 @@ async fn post_set_control(
     Err(LiveControlError::Unusable(format!("HTTP {status}")))
 }
 
+/// Ask the running proxy to set one account's priority in its live rotation.
+/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
+/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
+/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
+/// [`crate::proxy::PRIORITY_ENDPOINT`].
+async fn post_set_priority(
+    config: &Config,
+    query: &str,
+    priority: i64,
+) -> Result<crate::proxy::SetPriorityResponse, LiveControlError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
+
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::PRIORITY_PATH
+    );
+    let mut request = client.post(&url).json(&serde_json::json!({
+        "query": query,
+        "priority": priority,
+    }));
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        // `is_timeout()` first: see `post_set_disabled`'s identical comment.
+        Err(e) if e.is_timeout() => {
+            return Err(LiveControlError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
+    };
+
+    let status = response.status();
+    let from_route = response
+        .headers()
+        .get(crate::proxy::ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(crate::proxy::PRIORITY_ENDPOINT);
+    let body = response.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        return serde_json::from_str(&body).map_err(|e| {
+            LiveControlError::Unusable(format!("the response was not a tcr priority payload ({e})"))
+        });
+    }
+    if status.as_u16() == 401 {
+        return Err(LiveControlError::Unauthorized);
+    }
+    if !from_route && matches!(status.as_u16(), 404 | 405) {
+        return Err(LiveControlError::NoRoute);
+    }
+    if from_route && matches!(status.as_u16(), 404 | 409) {
+        return Err(LiveControlError::Rejected(
+            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+}
+
 /// The file half of `tcr control`: resolve OFFLINE (when `query` is `Some`) →
 /// persist ONLY the top-level `controlAccount` key via
 /// [`config::save_control_account`] — mirroring [`write_disabled_flag`]'s
@@ -2188,9 +2325,9 @@ fn account_status_rows(
                 // this field existed, `status` was rewritten only for `Throttled`
                 // (see `snapshot.rs`), so a rejected account still read `status:
                 // "active"` and the panel drew it as eligible when the router will
-                // never select it. Kebab-case values ("ok", "hold", "five-hour",
-                // "seven-day", "fable-weekly", "standard", "login", "rejected",
-                // "disabled") via `GateReason`'s own `Serialize`. New field, so an
+                // never select it. Kebab-case values via `GateReason`'s own
+                // `Serialize`; every one is listed in docs/troubleshooting.md, which
+                // `stats::tests` keeps complete. New field, so an
                 // older reader on either end is unaffected: a client built before
                 // this shipped simply never looks at it.
                 gate: gate_reason_token(a.gate),
@@ -2325,6 +2462,15 @@ fn account_status_rows(
                 // serving counter and gets no null-on-offline guard.
                 last_probe_ms: a
                     .last_probe
+                    .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
+                // When a quota reading was last taken from EITHER source, the
+                // probe or a served response's headers
+                // (`AccountSnapshot::quota_updated_at`). `lastProbeMs` above
+                // cannot tell a consumer how old the bars are: headers move them
+                // between probes, and a failed probe stamps it while reading
+                // nothing. Real on both paths, like `lastProbeMs`.
+                quota_updated_at_ms: a
+                    .quota_updated_at
                     .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
                 probe_status: a.probe_status.as_str().to_string(),
                 probe_error: a.probe_error.clone(),
@@ -2836,7 +2982,77 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
+/// What `tcr status --check` concluded about the fleet it just printed.
+///
+/// # The rule: which probe outcomes count as failed
+///
+/// A row fails the check when its account is NOT disabled and its last probe
+/// ended in [`ProbeStatus::Error`], [`ProbeStatus::Timeout`] or
+/// [`ProbeStatus::UpstreamDown`]: the probe ran and did not get a reading.
+///
+/// These do not fail it:
+/// - [`ProbeStatus::Never`]: no probe has run (a fresh server, or an account
+///   the probe loop does not cover), so there is no outcome to judge.
+/// - [`ProbeStatus::RateLimited`]: the usage endpoint throttled the probe
+///   itself. Its own doc-comment calls this benign: the account's serving quota
+///   is untouched and its last bar is kept.
+/// - a disabled account, whatever its probe says: the operator took it out of
+///   rotation, so its health is not what a script polling the fleet asks about.
+///
+/// The match on [`ProbeStatus`] has no wildcard on purpose: a new variant does
+/// not compile until someone decides which side of this rule it is on.
+///
+/// # The exit code
+///
+/// [`StatusCheck::ProbeFailed`] exits 4, not 1, following `tcr doctor`'s
+/// convention ([`crate::doctor::Report::exit_code`]): 1 stays what every verb's
+/// `anyhow` error exits with (an unreadable config, say), and each condition a
+/// check reports gets a code of its own. 2 and 3 are taken by doctor's route
+/// verdicts, which `tcr status` also prints, so the probe failure takes 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusCheck {
+    /// No enabled account's last probe failed.
+    Clean,
+    /// At least one enabled account's last probe failed.
+    ProbeFailed,
+}
+
+impl StatusCheck {
+    /// Apply the rule above to every row of `snapshot`.
+    pub fn of(snapshot: &StatsSnapshot) -> Self {
+        if snapshot.accounts.iter().any(probe_failed) {
+            StatusCheck::ProbeFailed
+        } else {
+            StatusCheck::Clean
+        }
+    }
+
+    /// The process exit code this verdict maps to.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            StatusCheck::Clean => 0,
+            StatusCheck::ProbeFailed => 4,
+        }
+    }
+}
+
+/// One row's half of [`StatusCheck`]'s rule.
+fn probe_failed(a: &AccountSnapshot) -> bool {
+    if a.disabled {
+        return false;
+    }
+    match a.probe_status {
+        ProbeStatus::Error | ProbeStatus::Timeout | ProbeStatus::UpstreamDown => true,
+        ProbeStatus::Never | ProbeStatus::Ok | ProbeStatus::RateLimited => false,
+    }
+}
+
+/// `tcr status [--json] [--check]`. Returns the process exit code: always 0
+/// without `check`, whatever the probes said, because TcrBar runs
+/// `tcr status --json` and reads any non-zero exit as a failed poll
+/// (`StatusPoller.classify`), which would blank the panel. With `check`, the
+/// code is [`StatusCheck::exit_code`]. Either way stdout is the same bytes.
+pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Result<i32> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = load_config(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
@@ -2981,7 +3197,10 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         );
         print!("{}", render_accounts(&snapshot, source));
     }
-    Ok(())
+    if !check {
+        return Ok(0);
+    }
+    Ok(StatusCheck::of(&snapshot).exit_code())
 }
 
 /// `tcr list --json`: every configured account in claude-swap's list schema v1,
@@ -3147,7 +3366,8 @@ pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
         }
     };
 
-    let report = crate::doctor::inspect(config.proxy.port, served_recently);
+    let report =
+        crate::doctor::inspect(config.proxy.port, served_recently).with_config_keys(&config);
     if json {
         println!("{}", serde_json::to_string_pretty(&report.to_json())?);
     } else {
@@ -3455,44 +3675,126 @@ mod tests {
     }
 
     // --- priority ----------------------------------------------------------
+    //
+    // `config_on_a_dead_port`, never `TWO_ACCOUNTS`' literal 3456: `set_priority`
+    // dials the configured port for real, and 3456 is the live fleet proxy.
 
-    #[test]
-    fn set_priority_explicit_writes_int() {
-        let path = write_config("prio-n", TWO_ACCOUNTS);
-        set_priority(&path, "bob@example.com", PriorityArg::N(7)).unwrap();
+    #[tokio::test]
+    async fn set_priority_explicit_writes_int() {
+        let path = config_on_a_dead_port("prio-n").await;
+        set_priority(&path, "bob@example.com", PriorityArg::N(7))
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[1].priority, Some(7));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_priority_first_is_min0_minus_one() {
+    #[tokio::test]
+    async fn set_priority_first_is_min0_minus_one() {
         // Existing priorities are 0 and 1 → min(0, {0,1}) - 1 = -1.
-        let path = write_config("prio-first", TWO_ACCOUNTS);
-        set_priority(&path, "bob@example.com", PriorityArg::First).unwrap();
+        let path = config_on_a_dead_port("prio-first").await;
+        set_priority(&path, "bob@example.com", PriorityArg::First)
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[1].priority, Some(-1));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_priority_last_is_max0_plus_one() {
+    #[tokio::test]
+    async fn set_priority_last_is_max0_plus_one() {
         // Existing priorities are 0 and 1 → max(0, {0,1}) + 1 = 2.
-        let path = write_config("prio-last", TWO_ACCOUNTS);
-        set_priority(&path, "alice@example.com", PriorityArg::Last).unwrap();
+        let path = config_on_a_dead_port("prio-last").await;
+        set_priority(&path, "alice@example.com", PriorityArg::Last)
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].priority, Some(2));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_priority_nonexistent_errors_and_leaves_file_byte_identical() {
-        let path = write_config("prio-miss", TWO_ACCOUNTS);
+    #[tokio::test]
+    async fn set_priority_nonexistent_errors_and_leaves_file_byte_identical() {
+        let path = config_on_a_dead_port("prio-miss").await;
         let before = fs::read_to_string(&path).unwrap();
-        let result = set_priority(&path, "nobody@example.com", PriorityArg::N(3));
+        let result = set_priority(&path, "nobody@example.com", PriorityArg::N(3)).await;
         assert!(result.is_err());
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr priority bob --first` against a REAL proxy on an ephemeral port: the
+    /// serving process routes the next fresh session to bob, and the file
+    /// carries the new value too. Before the live route, only the file moved and
+    /// the running rotation kept picking alice until a restart.
+    #[tokio::test]
+    async fn set_priority_reorders_the_running_proxy_and_the_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-priority").await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+
+        let fresh_pick = |m: &Manager| {
+            m.select(
+                &std::collections::HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                "/v1/messages",
+                None,
+            )
+        };
+        assert_eq!(fresh_pick(&manager), Some(0), "alice leads at boot");
+
+        set_priority(&path, "bob@example.com", PriorityArg::First)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fresh_pick(&manager),
+            Some(1),
+            "the SERVING process now routes a fresh session to bob"
+        );
+        assert_eq!(
+            load(&path).accounts[1].priority,
+            Some(-1),
+            "and the file agrees"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A refused query (the live rotation holds two rows of one name) changes
+    /// neither the file nor the running proxy's order.
+    #[tokio::test]
+    async fn set_priority_refuses_an_ambiguous_live_query_without_writing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-priority-ambiguous").await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let mut config = load(&path);
+        config.accounts[1].name = "alice@example.com".to_string();
+        let before = fs::read_to_string(&path).unwrap();
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let err = set_priority(&path, "alice@example.com", PriorityArg::First)
+            .await
+            .expect_err("an ambiguous live query must not be applied");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        assert_eq!(before, fs::read_to_string(&path).unwrap());
         fs::remove_file(&path).ok();
     }
 
@@ -4713,7 +5015,7 @@ mod tests {
     fn blank_account() -> Account {
         Account {
             name: String::new(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4808,7 +5110,7 @@ mod tests {
 
         let account = Account {
             name: "new@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4864,7 +5166,7 @@ mod tests {
 
         let account = Account {
             name: "dup@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5898,6 +6200,60 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    // --- `tcr status --check` ----------------------------------------------
+
+    /// The `--check` rule, one probe outcome at a time, on a row produced by
+    /// the real offline snapshot (a 401 from the scripted prober reads `error`)
+    /// and then re-labelled per case. The positive control comes first: the
+    /// unmodified row must fail the check, or every `Clean` below is vacuous.
+    #[tokio::test]
+    async fn status_check_fails_only_on_an_enabled_account_whose_probe_failed() {
+        use crate::probe::ProbeStatus;
+        let path = write_config("status-check", EXPIRED_ACCOUNT);
+        let snapshot = snapshot_offline(
+            load(&path),
+            Arc::new(NoRefresh),
+            Arc::new(RejectingProber),
+            true,
+        )
+        .await;
+        fs::remove_file(&path).ok();
+        assert_eq!(snapshot.accounts[0].probe_status, ProbeStatus::Error);
+        assert_eq!(StatusCheck::of(&snapshot), StatusCheck::ProbeFailed);
+        assert_eq!(StatusCheck::ProbeFailed.exit_code(), 4);
+        assert_eq!(StatusCheck::Clean.exit_code(), 0);
+
+        let relabel = |probe: ProbeStatus, disabled: bool| {
+            let mut s = snapshot.clone();
+            s.accounts[0].probe_status = probe;
+            s.accounts[0].disabled = disabled;
+            StatusCheck::of(&s)
+        };
+        for failed in [
+            ProbeStatus::Error,
+            ProbeStatus::Timeout,
+            ProbeStatus::UpstreamDown,
+        ] {
+            assert_eq!(
+                relabel(failed, false),
+                StatusCheck::ProbeFailed,
+                "{failed:?}"
+            );
+            assert_eq!(
+                relabel(failed, true),
+                StatusCheck::Clean,
+                "a disabled account never fails the check ({failed:?})"
+            );
+        }
+        for benign in [
+            ProbeStatus::Never,
+            ProbeStatus::Ok,
+            ProbeStatus::RateLimited,
+        ] {
+            assert_eq!(relabel(benign, false), StatusCheck::Clean, "{benign:?}");
+        }
+    }
+
     // --- no-refresh guarantee (Fix 1) --------------------------------------
 
     /// A prober that always fails as if the usage endpoint rejected the token
@@ -6262,6 +6618,78 @@ mod tests {
         );
     }
 
+    /// `tcr status --json` carries `quotaUpdatedAtMs`, the time of the newest
+    /// quota reading, on both the offline path (its own probe) and the live
+    /// path (the server's payload, rebuilt by `into_snapshot`), and the two
+    /// agree.
+    #[tokio::test]
+    async fn render_accounts_json_carries_quota_updated_at() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let before = crate::now_ms();
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(BelowThresholdWindowProber),
+            true,
+        )
+        .await;
+        let render = |snapshot: &StatsSnapshot, source: StatusSource| {
+            let json = render_accounts_json(
+                snapshot,
+                &thresholds,
+                source,
+                None,
+                false,
+                None,
+                &Default::default(),
+            );
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(&json).expect("json is a bare array");
+            rows.into_iter()
+                .find(|r| r["name"] == "alice@example.com")
+                .expect("alice row")
+        };
+
+        let offline = render(&snapshot, StatusSource::Offline);
+        let at = offline["quotaUpdatedAtMs"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("a probed row carries quotaUpdatedAtMs: {offline}"));
+        assert!(
+            at >= before && at <= crate::now_ms(),
+            "a fresh probe reads as recent: {at}"
+        );
+
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &snapshot,
+            &thresholds,
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let (rebuilt, rebuilt_thresholds) = back.into_snapshot();
+        let live_json = render_accounts_json(
+            &rebuilt,
+            &rebuilt_thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
+        let live: Vec<serde_json::Value> = serde_json::from_str(&live_json).expect("json");
+        let live = live
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        assert_eq!(
+            live["quotaUpdatedAtMs"], offline["quotaUpdatedAtMs"],
+            "the live path carries the same instant the server read"
+        );
+    }
+
     #[tokio::test]
     async fn render_accounts_json_omits_reset_when_no_live_reset_exists() {
         let config = load_from(TWO_ACCOUNTS);
@@ -6510,6 +6938,7 @@ mod tests {
             rate_limited_until: None,
             probe_status,
             last_probe: None,
+            quota_updated_at: None,
             probe_error: probe_error.map(str::to_string),
             quota_state,
             gate: crate::stats::GateReason::Ok,
@@ -6811,6 +7240,9 @@ mod tests {
         // and the render stays deterministic.
         accounts[2].free_at = Some(fixture_instant(1_767_312_000_000));
         accounts[2].rate_limited_until = Some(fixture_instant(1_767_225_600_000));
+        // Same reason for `quotaUpdatedAtMs`: a number on the ordinary row, null
+        // on the others, so both shapes are pinned.
+        accounts[0].quota_updated_at = Some(fixture_instant(1_767_225_600_000));
 
         let thresholds = vec![0.9; accounts.len()];
         (
@@ -7361,6 +7793,7 @@ mod tests {
             rate_limited_until: None,
             probe_status: crate::probe::ProbeStatus::Never,
             last_probe: None,
+            quota_updated_at: None,
             probe_error: None,
             quota_state: QuotaState::Normal,
             gate: crate::stats::GateReason::Ok,

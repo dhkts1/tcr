@@ -21,7 +21,8 @@ use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::peer;
 use teamclaude_rs::proxy::GROUP_HEADER_NAME;
 use teamclaude_rs::{
-    affinity, build_info, demo, mint, mitm, oauth, server, singleton, status, tui, update,
+    affinity, build_info, config_keys, demo, mint, mitm, oauth, server, singleton, status, tui,
+    update,
 };
 
 #[derive(Parser)]
@@ -1202,6 +1203,16 @@ struct StatusArgs {
     /// Emit the fleet status as a JSON array instead of greppable text.
     #[arg(long)]
     json: bool,
+    /// Exit 4 when an enabled account's last probe failed (error, timeout or
+    /// upstream-down). Never-probed, rate-limited and disabled accounts do not
+    /// count. Output is unchanged; only the exit code differs.
+    ///
+    /// Opt-in because the DEFAULT exit is a contract: TcrBar runs
+    /// `tcr status --json` and reads any non-zero exit as a failed poll
+    /// (`StatusPoller.classify`), which would blank the panel. The rule and why
+    /// 4 rather than 1: `cli::StatusCheck`.
+    #[arg(long)]
+    check: bool,
 }
 
 /// `tcr doctor [--json]`: the route check. Same two options every read-only
@@ -1405,7 +1416,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
         Some(Command::Token(args)) => run_token(args),
-        Some(Command::Priority(args)) => run_priority(args),
+        Some(Command::Priority(args)) => run_priority(args).await,
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Control(args)) => run_control(args).await,
@@ -1442,8 +1453,9 @@ fn run_token(args: TokenArgs) -> anyhow::Result<()> {
     cli::print_access_token(&config_path, &args.query)
 }
 
-/// `tcr priority <query> [N|--first|--last]` — set rotation priority.
-fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
+/// `tcr priority <query> [N|--first|--last]` — set rotation priority, in the
+/// RUNNING proxy where there is one.
+async fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let priority = if args.first {
         PriorityArg::First
@@ -1454,7 +1466,7 @@ fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("provide a priority value, or one of --first / --last");
     };
-    cli::set_priority(&config_path, &args.query, priority)
+    cli::set_priority(&config_path, &args.query, priority).await
 }
 
 /// `tcr enable <query>` — clear an account's `disabled` flag, in the
@@ -5673,10 +5685,18 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
     }
 }
 
-/// `tcr status [--json]` — probe every account's live quota and print it.
+/// `tcr status [--json] [--check]` — probe every account's live quota and print it.
+///
+/// The exit code is carried out of [`cli::status`] and spent here, the same
+/// shape as [`run_doctor`]: it is non-zero only under `--check`, after the
+/// output is printed.
 async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::status(&config_path, args.json).await
+    let code = cli::status(&config_path, args.json, args.check).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// `tcr doctor [--json]`: whether Claude Code is routed to this proxy.
@@ -6461,6 +6481,15 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     };
 
     init_tracing(args.headless);
+
+    // A misspelled key is kept in the file and has no effect, so say so once
+    // at boot. Never fatal: the file is shared with teamclaude and its
+    // unmodelled keys are kept on purpose (see `config_keys`).
+    if let Some(line) = config_keys::boot_line(&config_keys::unknown_keys(
+        &serde_json::Value::Object(config.extra.clone()),
+    )) {
+        tracing::warn!("{line}");
+    }
 
     // Auto-migrating `throttle` in memory (see `config::load`) is only half the
     // fix Gil asked for — "our code should auto migrate" means the file itself
@@ -7900,7 +7929,7 @@ mod tests {
     fn account_with_groups(name: &str, groups: Option<&[&str]>) -> config::Account {
         config::Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

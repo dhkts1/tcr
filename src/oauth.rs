@@ -1064,7 +1064,7 @@ pub fn upsert_account(
     match crate::identity::resolve(config.accounts.iter().enumerate(), &probe) {
         crate::identity::Resolved::One(index) => {
             let account = &mut config.accounts[index];
-            account.account_type = "oauth".to_string();
+            account.account_type = crate::config::AccountType::OAuth;
             account.access_token = tokens.access_token.clone();
             account.refresh_token = tokens.refresh_token.clone();
             account.expires_at = Some(tokens.expires_at_ms);
@@ -1106,7 +1106,7 @@ pub fn upsert_account(
 
             config.accounts.push(Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid,
                 org_uuid,
                 org_name,
@@ -1290,7 +1290,7 @@ enum AddCapability {
 async fn probe_add_capability(config: &Config) -> AddCapability {
     let probe = Account {
         name: String::new(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         account_uuid: None,
         org_uuid: None,
         org_name: None,
@@ -1872,9 +1872,17 @@ pub async fn login_from_claude_code(
         );
     };
     let subscription_type = login.subscription_type.clone();
-    let saved =
-        import_claude_code_login(config_path, force, name, account, login, LoginUi::Terminal)
-            .await?;
+    let saved = import_claude_code_login(
+        config_path,
+        ImportInto::AnyFleet,
+        force,
+        name,
+        account,
+        login,
+        LoginUi::Terminal,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("the import skipped a non-empty fleet it was told to accept"))?;
     eprintln!(
         "[tcr] imported as '{saved}'{}; {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
         plan_suffix(subscription_type.as_deref())
@@ -1917,8 +1925,22 @@ pub async fn auto_import_claude_code_login(config_path: &Path) -> Option<String>
     // prose on STDOUT — `tcr status --json` and `tcr accounts --json` are piped
     // into `jq` and decoded by TcrBar, so everything this path says goes to
     // stderr.
-    match import_claude_code_login(config_path, false, None, None, login, LoginUi::Machine).await {
-        Ok(saved) => {
+    match import_claude_code_login(
+        config_path,
+        ImportInto::EmptyFleetOnly,
+        false,
+        None,
+        None,
+        login,
+        LoginUi::Machine,
+    )
+    .await
+    {
+        // Another `tcr` process (the server booting while `tcr status` polls
+        // it, typically) imported first. Its row is the import; adding ours
+        // too would be the `unnamed` + `unnamed-2` duplicate.
+        Ok(None) => None,
+        Ok(Some(saved)) => {
             eprintln!(
                 "[tcr] imported '{saved}'{} from your Claude Code login; \
                  {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
@@ -1945,14 +1967,18 @@ pub async fn auto_import_claude_code_login(config_path: &Path) -> Option<String>
 /// credential carries the full `user:profile` scope, so `fetch_profile` returns
 /// a real identity for [`assert_requested_identity`] to confirm the requested
 /// row against. There is nothing here that cannot be evaluated.
+///
+/// Returns `Ok(None)` only under [`ImportInto::EmptyFleetOnly`], when the
+/// config it loads already has an account in it.
 async fn import_claude_code_login(
     config_path: &Path,
+    into: ImportInto,
     force: bool,
     name: Option<&str>,
     account: Option<&str>,
     login: crate::claude_code_login::ClaudeCodeLogin,
     ui: LoginUi,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     ui.install();
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
@@ -1964,6 +1990,13 @@ async fn import_claude_code_login(
     let tokens = tokens_from_claude_code_login(login);
 
     let mut config = load_or_default(config_path)?;
+    // The caller's "fleet is empty" check ran on an earlier read, and the route
+    // probe above can take a while against a server that is still booting.
+    // Another `tcr` process may have imported in that gap, and minting a name
+    // against its row would add the same login a second time.
+    if into == ImportInto::EmptyFleetOnly && !config.accounts.is_empty() {
+        return Ok(None);
+    }
     let profile = fetch_profile(&tokens.access_token).await;
     let resolved_name = mint_login_name(&config, &profile, account, name, ui)?;
 
@@ -1977,6 +2010,17 @@ async fn import_claude_code_login(
         account,
     )
     .await
+    .map(Some)
+}
+
+/// Which configs [`import_claude_code_login`] may write a Claude Code login into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportInto {
+    /// `tcr login --from-claude-code`: the user asked, so any config.
+    AnyFleet,
+    /// The automatic first-run import: only a config with no accounts, checked
+    /// again on the read the write is based on.
+    EmptyFleetOnly,
 }
 
 /// Whether `s` is plausibly an email address — no whitespace, and exactly one
@@ -2162,7 +2206,7 @@ fn persist_via_file(
 ) -> anyhow::Result<String> {
     let account = Account {
         name: name.to_string(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         account_uuid: profile.account_uuid,
         org_uuid: profile.org_uuid,
         org_name: profile.org_name,
@@ -2316,7 +2360,7 @@ async fn finish_login(
         LoginRoute::Live => {
             let account = Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid: profile.account_uuid.clone(),
                 org_uuid: profile.org_uuid.clone(),
                 org_name: profile.org_name.clone(),
@@ -3136,7 +3180,7 @@ mod tests {
         assert_eq!(config.accounts.len(), 1);
         let account = &config.accounts[0];
         assert_eq!(account.name, "new@example.com");
-        assert_eq!(account.account_type, "oauth");
+        assert_eq!(account.account_type, crate::config::AccountType::OAuth);
         assert_eq!(account.access_token, "at1");
         assert_eq!(account.refresh_token.as_deref(), Some("rt1"));
         assert_eq!(account.expires_at, Some(111));
@@ -4434,7 +4478,7 @@ mod tests {
         // exactly the race `login()`'s doc-comment describes.
         let rotated_bob = Account {
             name: "bob@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4641,7 +4685,7 @@ mod tests {
         // silent in this scenario and cannot carry a real round-trip.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4744,7 +4788,7 @@ mod tests {
         // is silent for the whole test and cannot carry a real round-trip.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4932,7 +4976,7 @@ mod tests {
         // as every sibling clobber test in this file.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5370,7 +5414,7 @@ mod tests {
     fn named_account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5536,5 +5580,62 @@ mod tests {
             "the user must be told the `claude` CLI will need one browser login: \
              {CLAUDE_CODE_IMPORT_CONSEQUENCE}"
         );
+    }
+
+    /// The first-run race the macOS e2e caught: this process saw an empty
+    /// fleet when its verb started, and by the time the import reads the
+    /// config, another `tcr` process (the server booting) has written its
+    /// import there. The automatic import must stop on that read, not mint
+    /// `unnamed-2` beside the other process's `unnamed`. Returns before the
+    /// profile fetch, so no network.
+    #[tokio::test]
+    async fn first_run_import_stops_when_another_process_imported_first() {
+        let dead_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-import-race-{}-{dead_port}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [
+                     {{ "name": "unnamed", "accessToken": "at-fake-first", "refreshToken": "rt-fake-first" }}
+                   ] }}"#
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let login = crate::claude_code_login::ClaudeCodeLogin {
+            access_token: "at-fake-second".to_string(),
+            refresh_token: Some("rt-fake-second".to_string()),
+            expires_at: Some(4_102_444_800_000),
+            subscription_type: Some("max".to_string()),
+        };
+
+        let outcome = import_claude_code_login(
+            &path,
+            ImportInto::EmptyFleetOnly,
+            false,
+            None,
+            None,
+            login,
+            LoginUi::Machine,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome, None,
+            "the automatic import must skip a fleet that is no longer empty"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the config must be left byte-for-byte alone"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

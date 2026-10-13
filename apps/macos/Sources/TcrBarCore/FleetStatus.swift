@@ -134,7 +134,11 @@ extension QuotaState: Decodable {
 /// Rust spells these kebab-case (`src/stats.rs`'s `GateReason`, serialized by
 /// `gate_reason_token`): `ok`, `hold`, `five-hour`, `seven-day`,
 /// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`,
-/// `parked`.
+/// `parked`, `refused`.
+///
+/// [`Self/refused`] is the short hold the server arms after upstream answered
+/// 403 to this account's credential. Unlike `rejected` it self-frees when the
+/// hold ends.
 ///
 /// [`Self/rejected`] is the one the panel could not see before this existed,
 /// and it is the reason the type does. Anthropic's own
@@ -151,12 +155,14 @@ extension QuotaState: Decodable {
 public enum GateReason: Equatable, Sendable {
     case ok
     case rejected
+    case refused
     case unknown(String)
 
     public init(token: String) {
         switch token {
         case "ok": self = .ok
         case "rejected": self = .rejected
+        case "refused": self = .refused
         default: self = .unknown(token)
         }
     }
@@ -166,6 +172,7 @@ public enum GateReason: Equatable, Sendable {
         switch self {
         case .ok: return "ok"
         case .rejected: return "rejected"
+        case .refused: return "refused"
         case .unknown(let raw): return raw
         }
     }
@@ -2511,6 +2518,29 @@ public struct FleetTally: Equatable, Sendable {
             case .rejected: return "rejected by Anthropic"
             case .unmeasured: return "unmeasured"
             case .disabled: return "parked"
+            }
+        }
+
+        /// The same bucket as the v4 account card's state PILL: `OK`, `Near`,
+        /// `Needs re-login`.
+        ///
+        /// The third register, and like ``phrase`` not a rename of ``token``:
+        /// a pill is a label in title case, so it says `Needs re-login` where
+        /// the tally says `need re-login`, and `Parked` where ``token`` keeps
+        /// `disabled`. It lives here beside the other two, rather than in the
+        /// card, so a new case cannot be added to one register and left out
+        /// of another, and so the words can be tested: the test target links
+        /// this module only and cannot build the card.
+        public var pillText: String {
+            switch self {
+            case .ok: return "OK"
+            case .near: return "Near"
+            case .spent: return "Spent"
+            case .unknown: return "Unknown"
+            case .needsRelogin: return "Needs re-login"
+            case .rejected: return "Rejected"
+            case .unmeasured: return "Unmeasured"
+            case .disabled: return "Parked"
             }
         }
 

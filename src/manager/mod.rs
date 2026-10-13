@@ -83,6 +83,31 @@ const REQUEST_LOG_CAPACITY: usize = 200;
 /// pinned out for hours with no live request to clear the hold (finding #5).
 const MAX_RATE_LIMIT_HOLD_SECONDS: i64 = 3600;
 
+/// How long an upstream 403 holds the refused account out of rotation. Short on
+/// purpose: a 403 can be about one model or one request, not the whole account,
+/// so it must not bench a healthy account for long. Without any hold, though,
+/// least-recently-selected rotation brings the account straight back and every
+/// next request pays the same refused round trip. Longer than the exhaustion
+/// soft-wait ceiling (under 60 s in proxy.rs), so a fleet that is refused
+/// everywhere is not waited on as if it were a brief park. Kept clearly under
+/// [`CACHE_WARM_HOLD_SECS`], so a session pinned to the account keeps its pin
+/// and diverts request by request (`Manager::hold_clears_while_warm`) rather
+/// than being re-keyed over what may be one refused request; a value at the
+/// boundary would flip between the two a few milliseconds after arming.
+pub(crate) const REFUSED_HOLD_SECONDS: i64 = 120;
+
+/// Why [`AccountRuntime::rate_limited_until_ms`] is armed. Both causes hold the
+/// account out of selection the same way; the cause only decides what the
+/// account's gate reads ([`GateReason::Hold`] or [`GateReason::Refused`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HoldCause {
+    /// A 429 rate-limit hold ([`Manager::mark_rate_limited`]).
+    #[default]
+    RateLimit,
+    /// An upstream 403 refusing our credential ([`Manager::mark_refused`]).
+    Refused,
+}
+
 /// The dividing line between a rate-limit hold a session should WAIT OUT on its
 /// pinned account and one long enough that re-keying is the cheaper trade:
 /// **Anthropic's default ephemeral prompt-cache TTL, 5 minutes.**
@@ -272,7 +297,7 @@ impl AccountStatus {
 #[derive(Debug, Clone)]
 pub struct AccountRuntime {
     pub name: String,
-    pub account_type: String,
+    pub account_type: config::AccountType,
     /// The pooled account's own UUID, injected into the outbound request body's
     /// `metadata.user_id.account_uuid` so it matches the token we serve with
     /// (see [`crate::account_uuid`]). `None` leaves the body unchanged.
@@ -393,6 +418,8 @@ pub struct AccountRuntime {
     /// min-spacing between two selects of the SAME account.
     pub last_served_ms: i64,
     pub rate_limited_until_ms: Option<i64>,
+    /// What armed `rate_limited_until_ms`; read only to name the gate.
+    pub hold_cause: HoldCause,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -610,6 +637,18 @@ pub enum SetDisabledOutcome {
     Ambiguous(Vec<String>),
 }
 
+/// What [`Manager::set_priority_by_query`] did. Same resolution arms as
+/// [`SetDisabledOutcome`], with no durable half: the CLI writes the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetPriorityOutcome {
+    /// The RESOLVED name of the account whose priority is now in force.
+    Applied { name: String },
+    /// The query named no account in the live rotation.
+    NoMatch,
+    /// The query named more than one.
+    Ambiguous(Vec<String>),
+}
+
 /// What [`Manager::add_or_update_account`] did.
 ///
 /// Same shape as [`SetDisabledOutcome`] — resolve by identity against the LIVE
@@ -689,6 +728,7 @@ impl AccountRuntime {
             in_flight: 0,
             last_served_ms: 0,
             rate_limited_until_ms: None,
+            hold_cause: HoldCause::RateLimit,
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
@@ -2543,6 +2583,32 @@ impl Manager {
         }
     }
 
+    /// Resolve `query` against the LIVE rotation and set that account's
+    /// `priority` in memory, so the next selection ranks by it. For the
+    /// [`crate::proxy::PRIORITY_PATH`] route behind `tcr priority`.
+    ///
+    /// Memory only, deliberately unlike [`Self::set_disabled`]: `tcr priority`
+    /// computes the value from the config file (its `--first`/`--last` are
+    /// relative to the file's priorities) and writes the file itself, then
+    /// sends the resolved integer here. Resolution is the same
+    /// [`crate::identity::match_one`] over the rotation slots that
+    /// [`Self::set_disabled_by_query`] uses, for the same reason.
+    pub fn set_priority_by_query(&self, query: &str, priority: i64) -> SetPriorityOutcome {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let idx = match crate::identity::match_one(&accounts[..], query) {
+            crate::identity::Match::One(idx) => idx,
+            crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
+            crate::identity::Match::Ambiguous(names) => {
+                return SetPriorityOutcome::Ambiguous(names)
+            }
+        };
+        let account = &mut accounts[idx];
+        account.priority = priority;
+        SetPriorityOutcome::Applied {
+            name: account.name.clone(),
+        }
+    }
+
     /// The current control account's rotation index, or `None` when unset.
     pub fn control(&self) -> Option<usize> {
         *self.control_idx.read().expect("control lock poisoned")
@@ -3433,7 +3499,7 @@ mod tests {
     fn account(name: &str, priority: i64) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -7370,6 +7436,125 @@ mod tests {
         assert_eq!(snap.accounts[1].five_hour, None);
     }
 
+    /// `quotaUpdatedAtMs` is the time of the newest quota reading from EITHER
+    /// source, so a consumer can tell a reading too old to trust from a fresh
+    /// one. `lastProbeMs` alone cannot: a busy account's bars move from response
+    /// headers between probes, and an idle account with a wedged probe shows
+    /// frozen bars that `lastProbeMs` (stamped on failures too) reads as recent.
+    ///
+    /// Walks the hops a consumer sees: the runtime `Quota`, the manager's
+    /// snapshot, and the `tcr.status.v1` payload the server sends the CLI.
+    #[tokio::test]
+    async fn quota_updated_at_is_the_newest_reading_from_probe_or_headers() {
+        let manager = build_manager_with_prober(
+            config_with(vec![account("ok", 0), account("bad", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ScriptedProber {
+                ok_token: "at-ok".to_string(),
+            }),
+        );
+        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            let payload = crate::status::StatusPayload::from_snapshot(
+                &snap,
+                &[],
+                false,
+                None,
+                Default::default(),
+            );
+            let json = serde_json::to_value(&payload).expect("payload serializes");
+            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
+        };
+
+        // Nothing read yet: absent, never a fabricated "just now".
+        assert_eq!(wire_value(&manager, 0), None);
+
+        // A fresh account: a successful probe stamps a recent reading.
+        let before = crate::now_ms();
+        manager.probe_all().await;
+        let fresh = wire_value(&manager, 0).expect("a probed account carries quotaUpdatedAtMs");
+        assert!(
+            fresh >= before && fresh <= crate::now_ms(),
+            "a fresh probe reads as recent: {fresh} not in [{before}, now]"
+        );
+        // A FAILED probe is not a reading: `lastProbeMs` moves, this does not.
+        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+            .last_probe
+            .is_some());
+        assert_eq!(
+            wire_value(&manager, 1),
+            None,
+            "a failed probe read no quota and must not claim one"
+        );
+
+        // A stale account: the last reading was 40 minutes ago, past any sane
+        // freshness limit, and the wire says exactly when.
+        let stale = crate::now_ms() - 40 * 60 * 1000;
+        {
+            let mut accounts = accounts_mut(&manager);
+            accounts[0].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        }
+        assert_eq!(
+            wire_value(&manager, 0),
+            Some(stale),
+            "the status row carries the exact time of the stale reading"
+        );
+
+        // A response with no rate-limit headers (an error page) is silence, not
+        // a reading: the stale time stands.
+        manager.update_quota(0, &reqwest::header::HeaderMap::new());
+        assert_eq!(wire_value(&manager, 0), Some(stale));
+
+        // A header update after the stale probe moves it forward.
+        let before = crate::now_ms();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.30".parse().expect("header value"),
+        );
+        manager.update_quota(0, &headers);
+        let moved = wire_value(&manager, 0).expect("still present");
+        assert!(
+            moved >= before,
+            "a 5h header reading moves quotaUpdatedAtMs forward: {moved} < {before}"
+        );
+
+        // A header update that returns `false` (no 5h window) but reads the 7d
+        // window is still a reading, and also moves it forward.
+        {
+            let mut accounts = accounts_mut(&manager);
+            accounts[0].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        }
+        let before = crate::now_ms();
+        let mut weekly_only = reqwest::header::HeaderMap::new();
+        weekly_only.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.40".parse().expect("header value"),
+        );
+        assert!(
+            !manager.update_quota(0, &weekly_only),
+            "control: this response carries no 5h window"
+        );
+        let moved = wire_value(&manager, 0).expect("still present");
+        assert!(
+            moved >= before,
+            "a 7d-only header reading moves quotaUpdatedAtMs forward: {moved} < {before}"
+        );
+    }
+
+    /// Write access to the runtime rows, for tests that rewind a timestamp.
+    fn accounts_mut(manager: &Manager) -> std::sync::RwLockWriteGuard<'_, Vec<AccountRuntime>> {
+        manager.accounts.write().expect("accounts lock poisoned")
+    }
+
     /// Probe 429-tolerance: the usage endpoint throttling the *probe* is benign.
     /// After a good probe learns a bar, a following 429 probe must (a) read as
     /// `RateLimited`, never `Error`, and (b) leave the last-good utilization
@@ -9271,8 +9456,9 @@ mod tests {
 
     /// The 1h rewrite's default follows the fleet: on when every account is
     /// OAuth (the window counts a 1h write like a 5m one), off as soon as one
-    /// API-key account is present (billed 2x against 1.25x on every write), and
-    /// an explicit `cacheTtlRewrite` wins either way.
+    /// row of an unrecognized type is present (a static key that may be billed
+    /// 2x against 1.25x on every write), and an explicit `cacheTtlRewrite` wins
+    /// either way. An API-key row cannot be the trigger: it never loads.
     ///
     /// Watched red before the default read the account types: the second
     /// assertion failed, a fleet with an API-key account still rewrote.
@@ -9285,7 +9471,7 @@ mod tests {
         assert!(all_oauth.cache_ttl_rewrite_enabled(), "all OAuth: on");
 
         let mut api_key = account("k", 0);
-        api_key.account_type = "api_key".to_string();
+        api_key.account_type = crate::config::AccountType::Unrecognized("static".to_string());
         let mixed = build_manager(
             config_with(vec![account("a", 0), api_key.clone()]),
             pacing_refresher(),
@@ -10159,9 +10345,10 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let reset = now + Duration::seconds(5_000);
 
-        const ALL: [GateReason; 11] = [
+        const ALL: [GateReason; 12] = [
             GateReason::Ok,
             GateReason::Hold,
+            GateReason::Refused,
             GateReason::FiveHour,
             GateReason::SevenDay,
             GateReason::FableWeekly,
@@ -10244,6 +10431,21 @@ mod tests {
                     vec![
                         GateCase::plain("hold outliving the cache", long, false),
                         GateCase::plain("hold clearing while warm", short, true),
+                    ]
+                }
+                // A 403 refusal hold rides the same deadline as a rate-limit hold,
+                // so it splits on duration exactly the same way; only its name
+                // differs.
+                GateReason::Refused => {
+                    let mut long = gate_runtime();
+                    long.rate_limited_until_ms = Some(now_ms + (CACHE_WARM_HOLD_SECS + 60) * 1_000);
+                    long.hold_cause = HoldCause::Refused;
+                    let mut short = gate_runtime();
+                    short.rate_limited_until_ms = Some(now_ms + 30_000);
+                    short.hold_cause = HoldCause::Refused;
+                    vec![
+                        GateCase::plain("refusal hold outliving the cache", long, false),
+                        GateCase::plain("refusal hold clearing while warm", short, true),
                     ]
                 }
 
@@ -11549,7 +11751,7 @@ mod tests {
     #[test]
     fn add_or_update_account_backfills_identity_and_corrects_a_stale_account_type() {
         let legacy_api_row = Account {
-            account_type: "api".to_string(),
+            account_type: crate::config::AccountType::Unrecognized("api".to_string()),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -11561,7 +11763,7 @@ mod tests {
             build_manager_with_disk(config_with(vec![legacy_api_row]), "f6-backfill");
 
         let submission = Account {
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: Some("uuid-alice".to_string()),
             org_uuid: Some("org-corp-uuid".to_string()),
             org_name: Some("Corp".to_string()),
@@ -11578,7 +11780,8 @@ mod tests {
         {
             let accounts = manager.accounts.read().expect("accounts lock poisoned");
             assert_eq!(
-                accounts[0].account_type, "oauth",
+                accounts[0].account_type,
+                crate::config::AccountType::OAuth,
                 "a stale non-oauth type must be corrected, or refresh_plan silently \
                  never refreshes this account again"
             );
@@ -11588,7 +11791,10 @@ mod tests {
         }
 
         let reloaded = config::load(&path).expect("reload persisted config");
-        assert_eq!(reloaded.accounts[0].account_type, "oauth");
+        assert_eq!(
+            reloaded.accounts[0].account_type,
+            crate::config::AccountType::OAuth
+        );
         assert_eq!(
             reloaded.accounts[0].account_uuid.as_deref(),
             Some("uuid-alice")
@@ -11683,7 +11889,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let mut api = account("api", 0);
-        api.account_type = "api".to_string();
+        api.account_type = crate::config::AccountType::Unrecognized("api".to_string());
         let manager = build_manager(
             config_with(vec![
                 account("idle", 0),

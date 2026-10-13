@@ -476,8 +476,22 @@ every existing priority sits on the same side of it.
 
 The positional value conflicts with `--first`/`--last`, and `--first` conflicts with
 `--last`. There is no default: omitting all three is a runtime error,
-`provide a priority value, or one of --first / --last`. This is a file-only write; it does
-not reach a running proxy.
+`provide a priority value, or one of --first / --last`.
+
+**It changes the running proxy first, then the file**, so the next new session is routed by
+the new order with no restart. The value is worked out from the config file (that is what
+`--first` and `--last` are relative to), then POSTed to the proxy's
+`/_tcr/accounts/priority` route, which sets it in the live rotation. The command then writes
+the file. A session already pinned to an account stays on it; priority decides where new
+sessions go.
+
+| the proxy | what `tcr priority` does |
+|---|---|
+| applies it | writes the file |
+| is not running | writes the file; there is nothing live to update |
+| rejects the api-key, or refuses the query (no match, or more than one) | exits with an error and changes nothing |
+| is too old to have the route | writes the file and warns that the proxy keeps the old order until it restarts |
+| answers something unusable, or does not answer | writes the file and warns that the proxy may keep the old order until it restarts |
 
 ### `tcr enable <query>` and `tcr disable <query>`
 
@@ -527,6 +541,7 @@ Probes every account's live quota and prints the fleet.
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
 | `--json` | bool | `false` (text) | emit a JSON array instead of greppable text |
+| `--check` | bool | `false` | exit **4** when an enabled account's last probe failed; output unchanged |
 
 It asks the running proxy where there is one and falls back to an offline read where there
 is not; the output labels which it got, so a fallback is never silently presented as a live
@@ -538,6 +553,34 @@ With no accounts configured, it first tries to import this machine's Claude Code
 add one` on stderr and exits **0**: stdout stays the ordinary empty table (`[]` under `--json`), so a
 caller piping it into `jq` — TcrBar's panel among them — decodes an empty fleet rather than a
 failure. The same line and the same exit code come from `tcr accounts`.
+
+### `--check`: an exit code for scripts
+
+Without the flag, `tcr status` exits **0** whatever the probes said. With it, the output is the
+same bytes and only the exit code changes:
+
+| exit | meaning |
+|---|---|
+| **0** | no enabled account's last probe failed |
+| **1** | the command could not run (an unreadable config, say); not a probe verdict, so a script tells "tcr failed" from "a probe failed" |
+| **4** | at least one enabled account's last probe ended in `error`, `timeout` or `upstream-down` |
+
+These do not fail the check: `never` (no probe has run, so there is nothing to judge),
+`rate-limited` (the usage endpoint throttled the probe itself; the account's serving quota is
+untouched and its last bar is kept), and any account that is disabled, whatever its probe says.
+
+The code is 4 rather than 1 for the reason `tcr doctor` uses 2 and 3: 1 is what any verb exits
+with when it could not run at all (an unreadable config, say), and a script should be able to tell
+"the fleet has a failed probe" from "the command failed". 2 and 3 are doctor's route verdicts,
+which `tcr status` also prints, so they stay out of the way.
+
+The check is opt-in because the default exit is a contract. TcrBar runs `tcr status --json` and
+reads any non-zero exit as a failed poll (`StatusPoller.classify`), which would blank the panel
+every time one account's token was rejected.
+
+```sh
+tcr status --check >/dev/null || echo "a probe failed"
+```
 
 ### The weekly quota pair on `--json`
 
@@ -556,6 +599,22 @@ Unlike the shared `sevenDay` bucket, this window gates **Fable requests only** �
 request never checks it, and `held[]`/the general `quotaState` never reflect it either. It exists on
 the wire so a Fable-scoped caption and tint have something to read.
 
+### How old the quota reading is on `--json`
+
+| key | shape | what it is |
+|---|---|---|
+| `lastProbeMs` | Unix ms or `null` | when the background usage probe last finished, whether it succeeded or failed |
+| `quotaUpdatedAtMs` | Unix ms or `null` | when a quota reading was last taken from either source: a successful probe, or a served response that carried rate-limit headers. `null` when nothing has been read since the server started |
+
+Use `quotaUpdatedAtMs` to judge whether the bars are current. `lastProbeMs` cannot: a busy
+account's bars move from response headers between probes, and a failed probe moves
+`lastProbeMs` while reading nothing, so an idle account with a broken probe shows frozen bars
+next to a recent probe time. A server built before this key existed omits it.
+
+```sh
+tcr status --json | jq -r '.[] | "\(.name)\t\(((now * 1000 - (.quotaUpdatedAtMs // 0)) / 60000) | floor)m"'
+```
+
 ### The group keys on `--json`
 
 Each row carries its group labels plus the subsets that change what the row can serve. All
@@ -568,10 +627,10 @@ not an unmeasured one.
 | `reservedGroups` | array of strings | the subset marked `reserved` — the row serves only traffic that asked for one of its groups |
 | `parkedGroups` | array of strings | the subset marked `parked` (`tcr group park`) — non-empty means the row is out of rotation entirely, and names which group did it |
 
-A parked row's `gate` reads `"parked"`, beside the existing `"disabled"`, `"reserved"`,
-`"login"`, `"rejected"`, `"hold"`, `"five-hour"`, `"seven-day"`, `"fable-weekly"`,
-`"standard"` and `"ok"`. A row that is BOTH parked by its group and disabled on its own
-reports `"disabled"` — the row's own state outranks the group's, so the output never
+A parked row's `gate` reads `"parked"`. Every `gate` value, what it means and what to do
+about it is in [What the `gate` value means](troubleshooting.md#what-the-gate-value-means).
+A row that is BOTH parked by its group and disabled on its own
+reports `"disabled"`: the row's own state outranks the group's, so the output never
 attributes a bench to a group when a person did it.
 
 ```
@@ -678,6 +737,25 @@ of request counts, oldest first, decaying to zeros as the session goes idle); th
 top-level `sessionsSummary` is the same `byTool` shape summed across every session server-side, so
 a panel's fleet-wide headline never disagrees with the per-session rows by re-summing them itself.
 
+### `GET /_tcr/quota`, the light read for a status line
+
+A Claude Code status line ticks every turn and needs only the quota, so it can call this instead of
+`/_tcr/status`. It answers from the running proxy's memory: no probe and no upstream call. The only
+disk access is the one every snapshot makes, a `stat` of the config file, re-reading it only when it
+changed so group gates stay current. Same gate as `/_tcr/status` (loopback only, and `x-api-key` when `proxy.apiKey` is set); any
+verb but `GET` is a local 405.
+
+```json
+{"kind":"tcr.quota.v1","accounts":[
+  {"name":"alice","gate":"ok","fiveHour":0.5,"fiveHourResetMs":1767225600000,
+   "sevenDay":0.2,"sevenDayResetMs":1767830400000}]}
+```
+
+One row per account in the server's order. `gate` is the same token `tcr status --json` reports
+(`ok`, `hold`, `five-hour`, `seven-day`, ...); utilizations are fractions and resets are Unix
+milliseconds, `null` when the window has no reading yet. Check `kind` before trusting a body: a tcr
+too old to have the route answers it with a local 404.
+
 ---
 
 ## `tcr doctor`
@@ -739,6 +817,30 @@ the route is right, nothing answers, and the port is held by something that is n
 
 `--json` emits the same decision as one object, with `verdict` and `exitCode` written out so a
 caller reads one document instead of re-deriving either.
+
+### Config keys tcr does not recognise
+
+`doctor` also names every top-level key in the config that this build does not recognise, with the
+known key it is closest to. A misspelled key is kept in the file as written and has no effect, so
+without this line `quotaProbeSecs` looks exactly like a config that sets the probe cadence:
+
+```
+unknownKey: quotaProbeSecs (did you mean quotaProbeSeconds?)
+```
+
+In `--json` the same list is `unknownKeys`, an array that is `[]` when every key is known:
+
+```
+"unknownKeys": [{ "key": "quotaProbeSecs", "nearest": "quotaProbeSeconds" }]
+```
+
+`nearest` is `null` when no known key is close enough to be a likely typo. A key counts as known when
+it is a field tcr models, one of the keys read from the unmodelled map
+([configuration](configuration.md#keys-read-from-the-unmodelled-map)), a key teamclaude writes
+(`routes`, `sx`, `logDir`, `autoUpdate`), or the legacy `throttle`. The list is reported and never
+enforced: the file is not changed, the exit code above still describes routing alone, and the server
+logs the same keys once at boot. Only top-level keys are checked; per-account and `proxy` keys are
+not.
 
 `tcr status` prints this verdict line **first**, and only when it is exit 2 or 3, so a glance at the
 fleet cannot show healthy accounts while Claude Code talks to something else. The `--json` form of
@@ -805,8 +907,8 @@ What each field carries:
 | `accounts[].disabled` | `true` when the account is disabled or in a parked group |
 
 Not sent: `alias`, `usage.spend` (tcr's cost is a list-price equivalent with no limit) and
-`lastGoodUsage` (tcr keeps no quota reading on disk). An API-key account reads `unavailable`,
-because the status row does not say which kind of account it is.
+`lastGoodUsage` (tcr keeps no quota reading on disk). An API-key account is never listed: tcr
+serves Claude subscriptions only, so `apikey` rows are quarantined when the config loads.
 
 **It never probes.** CodexBar runs this on every refresh, so it reads the running proxy and
 nothing else. With no proxy answering it still lists every configured account, each as

@@ -30,8 +30,11 @@ writes the account for you. Hand-editing is for the *settings* keys below.
 
 The document deserializes into `Config` with `#[serde(rename_all = "camelCase")]`, so every
 key is camelCase. Unmodelled keys are preserved verbatim across a load→save round trip
-rather than dropped, but seven of them are also *read*, and are documented in their own
-section below.
+rather than dropped, but eight of them are also *read*, and are documented in their own
+section below. Because a misspelled key is kept and does nothing, `tcr doctor` names every
+top-level key this build does not recognise, with its nearest known spelling, and the server logs
+them once at boot ([`tcr doctor`](cli.md#config-keys-tcr-does-not-recognise)). The list of known
+keys is `src/config_keys.rs`.
 
 ## Top level
 
@@ -146,7 +149,7 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
-| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; anything else is a static-key account |
+| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; `"apikey"` rows are quarantined at load, because tcr serves Claude subscriptions only; any other string is a static-key account, kept as written |
 | `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token |
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
 | `orgName` | string | absent | no | organization display name; also what a duplicated `name` is renamed from (`Henry Token` → `henry-token`) |
@@ -160,7 +163,10 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `egressStrict` | bool | `false` | no | what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
 
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
-keep-warm; any other value is treated as a static key.
+keep-warm. tcr serves Claude subscriptions only, so an `"apikey"` row is quarantined at
+load with a warning, and the rest of the config loads. Any other string is treated as a
+static key and written back exactly as it was; a `type` that is not a string quarantines
+its row.
 
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
@@ -317,14 +323,14 @@ unchanged from the value already running in production, and only the fleet ceili
 
 ## Keys read from the unmodelled map
 
-These seven are not fields of `Config`. They land in the flattened `extra` map and are read
+These eight are not fields of `Config`. They land in the flattened `extra` map and are read
 back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
 They are fully live config with a caller in the boot or request path, not compatibility
 leftovers.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; `<= 0` disables probing |
+| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; halved for an account held out by its own quota; at most 20 probes per account in any trailing hour; `<= 0` disables probing |
 | `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task |
 
 ### Both cadences are random per account, not a fleet sweep
@@ -343,6 +349,17 @@ Consequences worth knowing before you tune either number:
   than re-anchoring the fleet's phase on boot time.
 - A single account's gap between probes is never the number you configured; it is a fresh
   draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
+- An account at or over its switch threshold, or one upstream answered `rejected`, is probed
+  around HALF the cadence (`105..=195s` at the default). It is out of rotation, so no served
+  response refreshes its quota and only a probe sees its window roll. An account serving
+  traffic is not probed any faster: every response's headers already rewrite the same
+  windows a probe reads.
+- No account is probed more than 20 times in any trailing 60 minutes, whatever the cadence.
+  The usage endpoint's budget was measured by claude-swap at about 28 to 30 requests per
+  identity in a trailing hour, not a refilling bucket. A `quotaProbeSeconds` under 180 is
+  therefore held to that cap rather than run as configured. The boot sweep, a probe's one
+  `401` retry and `tcr accounts --probe` are not counted, which is why the cap sits well
+  under the measured figure.
 - The probe (not keep-warm) still does ONE whole-fleet sweep at boot, spaced 350 ms, so the
   bars populate immediately instead of after a random offset.
 - Randomness is drawn from a SplitMix64 generator seeded once from the boot clock. There is
@@ -351,7 +368,7 @@ Consequences worth knowing before you tune either number:
 | `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
-| `cacheTtlRewrite` | bool | **on when every account is OAuth, off if any is an API key** | no | rewrite every `cache_control` breakpoint to `"ttl":"1h"` before forwarding. Measured 2026-10-06: a 1h write costs a subscription's 5-hour window what a 5m write does and a read costs it nothing visible, so the hour is free and spares the full re-write after a 5-60 minute idle gap. An API-key account is billed at the published rates, where a 1h write is 2x input against 1.25x, so a fleet holding one forwards bodies as sent unless this is set `true`. `tcr wrap` still prices 1h writes at the API's 2x, so its dollar figure rises while a subscription's quota does not |
+| `cacheTtlRewrite` | bool | **on unless some account's `type` is a string tcr does not recognize** | no | rewrite every `cache_control` breakpoint to `"ttl":"1h"` before forwarding. Measured 2026-10-06: a 1h write costs a subscription's 5-hour window what a 5m write does and a read costs it nothing visible, so the hour is free and spares the full re-write after a 5-60 minute idle gap. A row of an unrecognized `type` is a static key tcr cannot classify and may be billed at the published rates, where a 1h write is 2x input against 1.25x, so a fleet holding one forwards bodies as sent unless this is set `true`. An `apikey` row cannot turn it off, because it never loads. `tcr wrap` still prices 1h writes at the API's 2x, so its dollar figure rises while a subscription's quota does not |
 | `throttleExemptNoise` | bool | **`false`** (OFF) | no | let `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) skip the **per-org** bucket instead of queueing behind inference. It still pays `fleetThrottle`, so exempt traffic is never entirely unpaced. Only a request with **no client bearer** is classified at all — one that carries its own is relayed under it and never enters a bucket (see [`controlIdentity`](#controlidentity-the-client-must-be-the-control-account)) |
 | `divertBudget` | u32 | **`0`** (unlimited) | no | max distinct destination accounts one session may be diverted to inside a single hold episode; `0` = unlimited, today's behaviour byte-for-byte |
 
