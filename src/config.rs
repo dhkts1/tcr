@@ -1426,7 +1426,46 @@ fn credential_version_of(entry: &Value) -> Result<Option<u64>, ()> {
     }
 }
 
-fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
+/// Why [`unusable_account`] refused an `accounts[]` entry.
+#[derive(Debug, PartialEq)]
+enum Unusable {
+    /// The credential key the entry's type needs (`apiKey` or `accessToken`)
+    /// is absent or empty.
+    MissingCredential(&'static str),
+    /// The entry carries its own `upstream` (the teamclaude row shape for a
+    /// third-party vendor) whose host is neither Anthropic's API nor the host
+    /// this config forwards to. tcr ignores a per-account `upstream` and sends
+    /// every account's token to the config's one upstream as a Bearer
+    /// (`proxy::build_upstream_headers`), so loading this row would hand the
+    /// vendor's key to a host it was never issued for. Holds the raw value, for
+    /// the warning.
+    ForeignUpstream(String),
+}
+
+/// The host Anthropic serves its API on, parsed from [`default_upstream`] so
+/// the two can never disagree.
+fn anthropic_api_host() -> Option<String> {
+    reqwest::Url::parse(&default_upstream())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+/// The lowercased host of `raw`, or `None` when it does not parse as a URL
+/// with a host. Compared by host, never by substring, so
+/// `https://api.anthropic.com.example.net` is not mistaken for Anthropic.
+fn upstream_host(raw: &str) -> Option<String> {
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+/// `own_upstream_host` is the host of the config's top-level `upstream` (the
+/// one every account is actually forwarded to); a per-account `upstream` on
+/// that host, or on Anthropic's API host, loads normally. Any other value,
+/// including one that is not a string or not a URL, is
+/// [`Unusable::ForeignUpstream`]: a key whose destination cannot be shown to
+/// be one tcr sends to is not sent at all.
+fn unusable_account(entry: &Value, own_upstream_host: Option<&str>) -> Option<(String, Unusable)> {
     let name = entry
         .get("name")
         .and_then(Value::as_str)
@@ -1439,17 +1478,25 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
             .is_some_and(|s| !s.is_empty())
     };
     let is_apikey = entry.get("type").and_then(Value::as_str) == Some("apikey");
-    if is_apikey {
-        if has_nonempty("apiKey") {
-            None
-        } else {
-            Some((name, "apiKey"))
-        }
-    } else if has_nonempty("accessToken") {
-        None
-    } else {
-        Some((name, "accessToken"))
+    let credential = if is_apikey { "apiKey" } else { "accessToken" };
+    if !has_nonempty(credential) {
+        return Some((name, Unusable::MissingCredential(credential)));
     }
+    if let Some(upstream) = entry.get("upstream") {
+        let host = upstream.as_str().and_then(upstream_host);
+        let anthropic = anthropic_api_host();
+        let allowed = host.as_deref().is_some_and(|host| {
+            Some(host) == anthropic.as_deref() || Some(host) == own_upstream_host
+        });
+        if !allowed {
+            let shown = match upstream.as_str() {
+                Some(raw) => raw.to_string(),
+                None => upstream.to_string(),
+            };
+            return Some((name, Unusable::ForeignUpstream(shown)));
+        }
+    }
+    None
 }
 
 /// Load and parse the config at `path`.
@@ -1470,6 +1517,10 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 /// crashing the fleet. Every `Account` that survives into memory still has a
 /// real, non-empty credential — the 142 call sites reading `access_token` as a
 /// plain `String` are entitled to assume that.
+///
+/// The same quarantine covers an entry whose own `upstream` names a
+/// third-party host ([`Unusable::ForeignUpstream`]): its token is that
+/// vendor's key, and tcr would send it to its one configured upstream.
 ///
 /// If every account entry is unusable, that is still an error (an empty fleet
 /// booting silently is its own bug) — reported through the same
@@ -1610,19 +1661,36 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     // below writes by that index, so it must be the on-disk one.
     let mut file_index = Vec::new();
 
+    // The host every account is forwarded to: the file's own top-level
+    // `upstream`, or the default when the key is absent (what serde fills in
+    // below).
+    let own_upstream_host = match doc.get("upstream").and_then(Value::as_str) {
+        Some(raw) => upstream_host(raw),
+        None => upstream_host(&default_upstream()),
+    };
+
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
         let had_accounts = !accounts.is_empty();
         let mut position = 0usize;
         accounts.retain(|entry| {
             let index = position;
             position += 1;
-            match unusable_account(entry) {
+            match unusable_account(entry, own_upstream_host.as_deref()) {
             None => {
                 file_index.push(index);
                 true
             }
-            Some((name, reason)) => {
+            Some((name, Unusable::MissingCredential(reason))) => {
                 tracing::warn!(account = %name, missing = reason, "No token for \"{name}\", skipping");
+                quarantined.push(name);
+                false
+            }
+            Some((name, Unusable::ForeignUpstream(upstream))) => {
+                tracing::warn!(
+                    account = %name,
+                    upstream = %upstream,
+                    "Account \"{name}\" names a non-Anthropic upstream ({upstream}); tcr would send its key to its own upstream instead, skipping"
+                );
                 quarantined.push(name);
                 false
             }
@@ -1630,7 +1698,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         if had_accounts && accounts.is_empty() {
             return Err(ConfigError::Parse(
                 <serde_json::Error as serde::de::Error>::custom(format!(
-                    "no usable accounts remain after skipping {} without a credential: {}",
+                    "no usable accounts remain after skipping {} (no credential, or a non-Anthropic upstream): {}",
                     quarantined.len(),
                     quarantined.join(", ")
                 )),
@@ -4119,6 +4187,66 @@ mod tests {
 
         let config = load(&path).unwrap();
         assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A teamclaude-style row whose `upstream` names a third-party host
+    /// carries that vendor's key, and tcr forwards every account to its one
+    /// configured upstream with the row's token as a Bearer. Such a row is
+    /// quarantined at load, like a row with no token: it never serves, the
+    /// other accounts load, and the load itself does not fail.
+    #[test]
+    fn load_quarantines_a_foreign_upstream_account() {
+        let path = tmp_path("load-foreign-upstream");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"vendor","type":"oauth","accessToken":"sk-x","upstream":"https://api.example.net/anthropic"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
+        assert_eq!(config.quarantined_accounts, vec!["vendor".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The host is compared after parsing, not by substring: a host that only
+    /// starts with Anthropic's name is still foreign.
+    #[test]
+    fn load_quarantines_a_lookalike_anthropic_upstream() {
+        let path = tmp_path("load-lookalike-upstream");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"vendor","accessToken":"sk-x","upstream":"https://api.anthropic.com.example.net/v1"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "ok");
+        assert_eq!(config.quarantined_accounts, vec!["vendor".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// An `upstream` naming Anthropic's own API host, or the host this file
+    /// already forwards to, still loads as a normal account.
+    #[test]
+    fn load_keeps_an_anthropic_or_own_upstream_account() {
+        let path = tmp_path("load-anthropic-upstream");
+        fs::write(
+            &path,
+            r#"{"upstream":"http://127.0.0.1:9000","accounts":[
+                 {"name":"direct","accessToken":"a","upstream":"https://api.anthropic.com"},
+                 {"name":"stub","accessToken":"b","upstream":"http://127.0.0.1:9000/"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["direct", "stub"]);
+        assert!(config.quarantined_accounts.is_empty());
         fs::remove_file(&path).ok();
     }
 

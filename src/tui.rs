@@ -1213,6 +1213,15 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             };
             (label, red)
         }
+        // The short hold an upstream 403 arms: a countdown like HOLD, named so
+        // the row says the credential was refused rather than rate-limited.
+        GateReason::Refused => {
+            let label = match account.free_at {
+                Some(f) if f > now => format!("REFUSED {}s", (f - now).whole_seconds().max(1)),
+                _ => "REFUSED".to_string(),
+            };
+            (label, red)
+        }
         GateReason::FiveHour => (back("5H"), red),
         GateReason::SevenDay => (back("7D"), red),
         GateReason::FableWeekly => (back("FABLE-7D"), red),
@@ -2047,6 +2056,7 @@ mod tests {
             rate_limited_until: None,
             probe_status: ProbeStatus::Never,
             last_probe: None,
+            quota_updated_at: None,
             probe_error: None,
             quota_state: QuotaState::Normal,
             gate,

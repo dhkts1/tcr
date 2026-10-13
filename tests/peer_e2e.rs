@@ -225,6 +225,46 @@ fn free_loopback_port() -> u16 {
         .port()
 }
 
+/// How many draws [`loopback_port_other_than`] makes before it calls the
+/// runner broken rather than unlucky.
+const PORT_REDRAW_ATTEMPTS: u32 = 20;
+
+/// A port from `draw` that is not `excluded`.
+///
+/// The kernel may hand back a port the moment it is released, so a test
+/// that shuts a peer down and draws a "fresh" port can get the old one again.
+/// CI hit exactly that in `a_moved_peer_is_reached_through_a_refreshed_hello_endpoint`.
+/// `draw` is a parameter so `a_port_redraw_skips_the_excluded_port` can force
+/// that repeat every time instead of waiting for it.
+fn loopback_port_other_than(excluded: u16, mut draw: impl FnMut() -> u16) -> u16 {
+    for _ in 0..PORT_REDRAW_ATTEMPTS {
+        let port = draw();
+        if port != excluded {
+            return port;
+        }
+    }
+    panic!(
+        "the kernel handed back the excluded port {excluded} {PORT_REDRAW_ATTEMPTS} times in a row; \
+         that is a runner defect, not bad luck"
+    );
+}
+
+#[test]
+fn a_port_redraw_skips_the_excluded_port() {
+    let mut draws = [4000, 4000, 4000, 5000].into_iter();
+    let port = loopback_port_other_than(4000, || draws.next().expect("a stubbed draw"));
+    assert_eq!(
+        port, 5000,
+        "the excluded port must never come back as the fresh one"
+    );
+}
+
+#[test]
+#[should_panic(expected = "handed back the excluded port 4000")]
+fn a_port_redraw_that_only_sees_the_excluded_port_fails_loudly() {
+    loopback_port_other_than(4000, || 4000);
+}
+
 /// One `tcr` install: its own HOME, config, peers file, node key and logs.
 struct Mac {
     label: &'static str,
@@ -2604,9 +2644,16 @@ async fn a_moved_peer_is_reached_through_a_refreshed_hello_endpoint() {
     );
     mover.shutdown();
     let old_port = mover.peer_port;
-    mover.peer_port = free_loopback_port();
+    // Hold the old port until mover is back up, so neither the draw below nor
+    // a redraw inside `boot` (it draws again when it loses the port race) can
+    // get it from the kernel. The bind can fail if another process took the
+    // port first; that also keeps the kernel from handing it out, and
+    // `loopback_port_other_than` still refuses it if it comes back anyway.
+    let held_old_port = std::net::TcpListener::bind(("127.0.0.1", old_port));
+    mover.peer_port = loopback_port_other_than(old_port, free_loopback_port);
     mover.rewrite_listen_port();
     mover.boot();
+    drop(held_old_port);
     assert_ne!(
         mover.peer_port, old_port,
         "the whole point of this test is a peer answering on a DIFFERENT port"

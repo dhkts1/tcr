@@ -75,6 +75,9 @@ pub enum GateReason {
     Ok,
     /// A rate-limit hold (429 `retry-after`) that has not yet lifted.
     Hold,
+    /// Upstream answered 403, refusing our credential, and the short hold it
+    /// arms has not yet lifted. Self-frees at the hold's end, like [`Self::Hold`].
+    Refused,
     /// The shared 5-hour bucket is at/over threshold.
     FiveHour,
     /// The shared weekly bucket is at/over threshold.
@@ -168,6 +171,10 @@ pub struct AccountSnapshot {
     /// When the most recent probe finished — the TUI shows its age so a stalled
     /// probe is visible rather than silently freezing the quota bars.
     pub last_probe: Option<OffsetDateTime>,
+    /// When a quota reading was last taken, from a probe OR response headers
+    /// ([`crate::quota::Quota::updated_at`]). Unlike [`Self::last_probe`] it says
+    /// how old the windows shown beside it are. Display data only.
+    pub quota_updated_at: Option<OffsetDateTime>,
     /// The most recent probe's error message, if it failed.
     pub probe_error: Option<String>,
     /// Live quota state vs this account's switch threshold — for an honest
