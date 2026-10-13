@@ -1609,9 +1609,11 @@ async fn quota_method_not_allowed() -> Response {
 /// utilization with resets, the [`crate::status::QuotaPayload`] projection.
 ///
 /// Gated exactly as [`status_handler`] is, through [`local_endpoint_gate`]. It
-/// answers from the manager's in-memory snapshot only: no probe, no token
-/// refresh, no upstream call and, unlike the status route, no peers-file read,
-/// so a status line can call it on every turn.
+/// answers from the manager's in-memory snapshot: no probe, no token refresh,
+/// no upstream call and, unlike the status route, no peers-file read, so a
+/// status line can call it on every turn. The one disk access is the config
+/// `stat` inside [`Manager::snapshot`], which re-reads the file only when its
+/// mtime moved.
 async fn quota_handler(
     State(manager): State<Arc<Manager>>,
     parts: axum::http::request::Parts,

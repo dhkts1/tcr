@@ -682,8 +682,9 @@ a panel's fleet-wide headline never disagrees with the per-session rows by re-su
 ### `GET /_tcr/quota`, the light read for a status line
 
 A Claude Code status line ticks every turn and needs only the quota, so it can call this instead of
-`/_tcr/status`. It answers from the running proxy's memory: no probe, no upstream call, no file
-read. Same gate as `/_tcr/status` (loopback only, and `x-api-key` when `proxy.apiKey` is set); any
+`/_tcr/status`. It answers from the running proxy's memory: no probe and no upstream call. The only
+disk access is the one every snapshot makes, a `stat` of the config file, re-reading it only when it
+changed so group gates stay current. Same gate as `/_tcr/status` (loopback only, and `x-api-key` when `proxy.apiKey` is set); any
 verb but `GET` is a local 405.
 
 ```json

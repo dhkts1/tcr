@@ -535,7 +535,7 @@ pub const QUOTA_KIND: &str = "tcr.quota.v1";
 ///
 /// Built from the same [`StatsSnapshot`] as the status payload, so the gate and
 /// the utilizations are the ones selection and `tcr status` see. Nothing here is
-/// fetched: no probe, no upstream call, no file read.
+/// fetched: no probe and no upstream call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaPayload {
     /// Always [`QUOTA_KIND`].
