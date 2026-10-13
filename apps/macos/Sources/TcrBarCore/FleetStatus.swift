@@ -2521,6 +2521,29 @@ public struct FleetTally: Equatable, Sendable {
             }
         }
 
+        /// The same bucket as the v4 account card's state PILL: `OK`, `Near`,
+        /// `Needs re-login`.
+        ///
+        /// The third register, and like ``phrase`` not a rename of ``token``:
+        /// a pill is a label in title case, so it says `Needs re-login` where
+        /// the tally says `need re-login`, and `Parked` where ``token`` keeps
+        /// `disabled`. It lives here beside the other two, rather than in the
+        /// card, so a new case cannot be added to one register and left out
+        /// of another, and so the words can be tested: the test target links
+        /// this module only and cannot build the card.
+        public var pillText: String {
+            switch self {
+            case .ok: return "OK"
+            case .near: return "Near"
+            case .spent: return "Spent"
+            case .unknown: return "Unknown"
+            case .needsRelogin: return "Needs re-login"
+            case .rejected: return "Rejected"
+            case .unmeasured: return "Unmeasured"
+            case .disabled: return "Parked"
+            }
+        }
+
         /// The bucket an *enabled* account's quota state falls into.
         init(quotaState: QuotaState) {
             switch quotaState {
