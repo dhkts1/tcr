@@ -7351,6 +7351,31 @@ mod tests {
         }
     }
 
+    /// Every `tcr` command the "proxy too old" warnings tell the user to run
+    /// must be one this binary accepts. All four named a `restart` subcommand,
+    /// which clap rejected with exit 2: the remedy in the warning was itself an
+    /// error.
+    #[test]
+    fn restart_hint_names_only_commands_that_parse() {
+        let commands: Vec<&str> = cli::RESTART_HINT
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tcr "))
+            .collect();
+        assert!(
+            !commands.is_empty(),
+            "the hint must name a tcr command to run: {}",
+            cli::RESTART_HINT
+        );
+        for command in commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("the warning tells the user to run `{command}`, which does not parse: {e}");
+            }
+        }
+    }
+
     /// Each flag alone still parses — the deprecated one is accepted, as promised
     /// to the scripts and launch agents that already pass it.
     #[test]
