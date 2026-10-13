@@ -221,7 +221,7 @@ mod tests {
     fn account(name: &str, uuid: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some("org-1".to_string()),
             org_name: None,

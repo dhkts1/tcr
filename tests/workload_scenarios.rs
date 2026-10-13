@@ -103,7 +103,7 @@ fn to_ms(at: OffsetDateTime) -> i64 {
 fn account(name: &str, priority: i64) -> Account {
     Account {
         name: name.to_string(),
-        account_type: "oauth".to_string(),
+        account_type: teamclaude_rs::config::AccountType::OAuth,
         account_uuid: None,
         org_uuid: None,
         org_name: None,

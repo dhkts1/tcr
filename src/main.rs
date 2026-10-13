@@ -7929,7 +7929,7 @@ mod tests {
     fn account_with_groups(name: &str, groups: Option<&[&str]>) -> config::Account {
         config::Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

@@ -97,10 +97,14 @@ impl Manager {
     /// Measured 2026-10-06, a 1h write costs a subscription's 5-hour window exactly
     /// what a 5m write does and a read costs it nothing visible, so for OAuth
     /// accounts the longer window is free and saves the full re-write after every
-    /// 5-60 minute idle gap. An API-key account is billed per token at the
-    /// published rates, where a 1h write is 2x input against 1.25x for 5m: there
-    /// the rewrite would raise the bill 60% on every write, so a fleet with one
-    /// such account forwards bodies as sent unless the operator says otherwise.
+    /// 5-60 minute idle gap. An API-key row never reaches this list
+    /// (`config::load` quarantines it and live-add refuses it), so the only
+    /// row that turns the default off is one whose `type` is some other string
+    /// ([`crate::config::AccountType::Unrecognized`]): a static key tcr cannot
+    /// classify, which may be billed per token at the published rates, where a
+    /// 1h write is 2x input against 1.25x for 5m. There the rewrite would raise
+    /// the bill 60% on every write, so a fleet with one such row forwards
+    /// bodies as sent unless the operator says otherwise.
     /// The rewrite runs before an account is picked, so it cannot decide per
     /// account; the fleet's composition is the finest grain it has. An explicit
     /// `"cacheTtlRewrite": true` or `false` overrides the default either way.
@@ -112,7 +116,7 @@ impl Manager {
             .and_then(|v| v.as_bool())
         {
             Some(explicit) => explicit,
-            None => config.accounts.iter().all(|a| a.account_type == "oauth"),
+            None => config.accounts.iter().all(|a| a.account_type.is_oauth()),
         }
     }
 

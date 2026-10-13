@@ -297,7 +297,7 @@ impl AccountStatus {
 #[derive(Debug, Clone)]
 pub struct AccountRuntime {
     pub name: String,
-    pub account_type: String,
+    pub account_type: config::AccountType,
     /// The pooled account's own UUID, injected into the outbound request body's
     /// `metadata.user_id.account_uuid` so it matches the token we serve with
     /// (see [`crate::account_uuid`]). `None` leaves the body unchanged.
@@ -3499,7 +3499,7 @@ mod tests {
     fn account(name: &str, priority: i64) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -9456,8 +9456,9 @@ mod tests {
 
     /// The 1h rewrite's default follows the fleet: on when every account is
     /// OAuth (the window counts a 1h write like a 5m one), off as soon as one
-    /// API-key account is present (billed 2x against 1.25x on every write), and
-    /// an explicit `cacheTtlRewrite` wins either way.
+    /// row of an unrecognized type is present (a static key that may be billed
+    /// 2x against 1.25x on every write), and an explicit `cacheTtlRewrite` wins
+    /// either way. An API-key row cannot be the trigger: it never loads.
     ///
     /// Watched red before the default read the account types: the second
     /// assertion failed, a fleet with an API-key account still rewrote.
@@ -9470,7 +9471,7 @@ mod tests {
         assert!(all_oauth.cache_ttl_rewrite_enabled(), "all OAuth: on");
 
         let mut api_key = account("k", 0);
-        api_key.account_type = "api_key".to_string();
+        api_key.account_type = crate::config::AccountType::Unrecognized("static".to_string());
         let mixed = build_manager(
             config_with(vec![account("a", 0), api_key.clone()]),
             pacing_refresher(),
@@ -11750,7 +11751,7 @@ mod tests {
     #[test]
     fn add_or_update_account_backfills_identity_and_corrects_a_stale_account_type() {
         let legacy_api_row = Account {
-            account_type: "api".to_string(),
+            account_type: crate::config::AccountType::Unrecognized("api".to_string()),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -11762,7 +11763,7 @@ mod tests {
             build_manager_with_disk(config_with(vec![legacy_api_row]), "f6-backfill");
 
         let submission = Account {
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: Some("uuid-alice".to_string()),
             org_uuid: Some("org-corp-uuid".to_string()),
             org_name: Some("Corp".to_string()),
@@ -11779,7 +11780,8 @@ mod tests {
         {
             let accounts = manager.accounts.read().expect("accounts lock poisoned");
             assert_eq!(
-                accounts[0].account_type, "oauth",
+                accounts[0].account_type,
+                crate::config::AccountType::OAuth,
                 "a stale non-oauth type must be corrected, or refresh_plan silently \
                  never refreshes this account again"
             );
@@ -11789,7 +11791,10 @@ mod tests {
         }
 
         let reloaded = config::load(&path).expect("reload persisted config");
-        assert_eq!(reloaded.accounts[0].account_type, "oauth");
+        assert_eq!(
+            reloaded.accounts[0].account_type,
+            crate::config::AccountType::OAuth
+        );
         assert_eq!(
             reloaded.accounts[0].account_uuid.as_deref(),
             Some("uuid-alice")
@@ -11884,7 +11889,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let mut api = account("api", 0);
-        api.account_type = "api".to_string();
+        api.account_type = crate::config::AccountType::Unrecognized("api".to_string());
         let manager = build_manager(
             config_with(vec![
                 account("idle", 0),

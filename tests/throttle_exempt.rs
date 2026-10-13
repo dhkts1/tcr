@@ -119,7 +119,7 @@ fn fake_org_uuid(i: usize) -> String {
 fn account(i: usize) -> Account {
     Account {
         name: format!("acct{i}"),
-        account_type: "oauth".to_string(),
+        account_type: teamclaude_rs::config::AccountType::OAuth,
         account_uuid: Some(fake_uuid(i)),
         org_uuid: (i > 0).then(|| fake_org_uuid(i)),
         org_name: None,

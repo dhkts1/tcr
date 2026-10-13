@@ -3111,7 +3111,7 @@ mod revalidation_sticky_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3267,7 +3267,7 @@ mod sticky_divert_replay_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3437,7 +3437,7 @@ mod strict_group_door_tests {
     fn account(name: &str, groups: &[&str]) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3931,7 +3931,7 @@ mod reserved_gate_agreement_tests {
         AccountRuntime::from_config(
             &Account {
                 name: "probe".to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -4099,7 +4099,7 @@ mod group_miss_tests {
         AccountRuntime::from_config(
             &Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -4246,7 +4246,7 @@ mod reset_urgency_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4501,7 +4501,7 @@ mod fable_last_resort_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4880,7 +4880,7 @@ mod stale_pin_load_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

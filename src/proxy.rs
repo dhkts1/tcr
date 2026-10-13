@@ -2162,7 +2162,7 @@ async fn add_account_method_not_allowed() -> Response {
 struct AddAccountRequest {
     name: Option<String>,
     #[serde(rename = "type", default)]
-    account_type: Option<String>,
+    account_type: Option<config::AccountType>,
     #[serde(default)]
     account_uuid: Option<String>,
     #[serde(default)]
@@ -2376,12 +2376,24 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             None,
         ));
     };
+    // The same rule `config::load` applies to a file row: tcr does not serve
+    // API-key accounts. Without this, one added here would serve, and only
+    // the next load would set it aside.
+    let account_type = parsed.account_type.unwrap_or_default();
+    if matches!(account_type, config::AccountType::ApiKey) {
+        return stamp_add_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "tcr does not serve API-key accounts; add a Claude login instead.",
+            None,
+        ));
+    }
     let refresh_token = parsed.refresh_token.filter(|t| !t.trim().is_empty());
     let no_refresh_token_warning = refresh_token.is_none().then_some(NO_REFRESH_TOKEN_WARNING);
 
     let account = config::Account {
         name,
-        account_type: parsed.account_type.unwrap_or_else(|| "oauth".to_string()),
+        account_type,
         account_uuid: parsed.account_uuid,
         org_uuid: parsed.org_uuid,
         org_name: parsed.org_name,
@@ -6570,7 +6582,7 @@ mod tests {
     fn add_account_request_carries_the_plan_fields() {
         let mut account = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -6633,7 +6645,7 @@ mod tests {
             http1_only: false,
             accounts: vec![Account {
                 name: "dummy".to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -8724,7 +8736,7 @@ mod tests {
     fn two_account_config(api_key: Option<&str>) -> Config {
         let account = |name: &str, org: &str, uuid: &str, priority: i64| Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some(format!("11111111-1111-1111-1111-{org}")),
             org_name: Some(format!("Org {org}")),
@@ -10329,6 +10341,40 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// An `apikey` account is refused here with a stamped 400, by the same rule
+    /// `config::load` quarantines a file row by: tcr does not serve API-key
+    /// accounts. Neither the live rotation nor the file changes.
+    #[tokio::test]
+    async fn add_endpoint_refuses_an_api_key_account() {
+        let (manager, path) = control_manager("refuse-apikey", None);
+        let (status, headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","type":"apikey","accessToken":"sk-ant-api-fake"}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("does not serve API-key accounts"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(after.accounts.len(), 2, "nothing joined the rotation");
+        assert_eq!(account_count_in_file(&path), 2, "nothing reached the file");
+        std::fs::remove_file(&path).ok();
+    }
+
     /// THE BITING TEST for the update half: re-adding an EXISTING identity
     /// replaces its credentials in place — same index, same account count — and
     /// its routing state (priority) survives untouched.
@@ -10749,7 +10795,7 @@ mod tests {
         // sends it (`cli.rs:478`, `.json(account)`).
         let probe_body = Account {
             name: String::new(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: None,
             org_uuid: None,
             org_name: None,

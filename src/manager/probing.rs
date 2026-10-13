@@ -148,7 +148,7 @@ impl Manager {
             .iter()
             .enumerate()
             .filter(|(idx, a)| {
-                a.account_type == "oauth"
+                a.account_type.is_oauth()
                     && a.refresh_token.is_some()
                     && (!a.disabled || control == Some(*idx))
                     && (a.status != AccountStatus::Error

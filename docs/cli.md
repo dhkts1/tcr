@@ -907,8 +907,8 @@ What each field carries:
 | `accounts[].disabled` | `true` when the account is disabled or in a parked group |
 
 Not sent: `alias`, `usage.spend` (tcr's cost is a list-price equivalent with no limit) and
-`lastGoodUsage` (tcr keeps no quota reading on disk). An API-key account reads `unavailable`,
-because the status row does not say which kind of account it is.
+`lastGoodUsage` (tcr keeps no quota reading on disk). An API-key account is never listed: tcr
+serves Claude subscriptions only, so `apikey` rows are quarantined when the config loads.
 
 **It never probes.** CodexBar runs this on every refresh, so it reads the running proxy and
 nothing else. With no proxy answering it still lists every configured account, each as
