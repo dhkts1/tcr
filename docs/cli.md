@@ -444,9 +444,22 @@ Deletes the account from the config. Flags: `--config`.
 
 This is destructive and there is no confirmation prompt. The entry is removed and the file
 is rewritten in place; the access and refresh tokens go with it, so recovering the account
-means running `tcr login` again, not editing anything back. It is also a file-only
-operation: a running proxy keeps the account in its in-memory fleet until it is restarted,
-so removing an account is not a way to stop traffic going to it. Use `tcr disable` for that.
+means running `tcr login` again, not editing anything back.
+
+**It disables the account on the running proxy first, then deletes it from the file**, the
+same live route `tcr disable` uses. So a removed account leaves rotation at once, with no
+restart. What happens depends on what the proxy answers:
+
+| the proxy | what `tcr remove` does |
+|---|---|
+| accepts the disable | deletes the entry from the file |
+| is not running | deletes the entry from the file; there is nothing live to update |
+| rejects the api-key, or refuses the query (no match, or more than one) | exits with an error and changes nothing |
+| is too old to have the route | deletes the entry from the file and warns that the proxy will keep routing to the account until it restarts |
+| answers something unusable, or does not answer | deletes the entry from the file and warns that the proxy may keep routing to the account until it restarts |
+
+The refusals change nothing because a deletion cannot be undone: if the file lost the
+account while the proxy kept rotating it, there would be no record left to fix it from.
 
 ### `tcr priority <query> [N]`
 

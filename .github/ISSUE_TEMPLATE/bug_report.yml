@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in tcr or TcrBar does not work the way the docs say.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This tracker is public.** Before you paste anything, remove account emails, organization
+        and account UUIDs, workspace or org names, OAuth tokens, the proxy API key, and any part of
+        your config file (`~/.config/teamclaude.json`). Replace them with fake values such as
+        `alice@example.com`. Never attach the config file itself.
+
+        Many problems have an answer in [docs/troubleshooting.md](https://github.com/dhkts1/teamclaude-rs/blob/main/docs/troubleshooting.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: tcr version
+      description: The output of `tcr --version`.
+      placeholder: tcr 0.0.0
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build line from tcr status
+      description: |
+        The line from `tcr status` that starts with `status source=`. It names the build that is
+        actually serving (`server_sha`) and the one you just ran (`client_sha`). One way to get it:
+        `tcr status | grep '^status source='`
+      placeholder: status source=live server_sha=abc1234 ... client_sha=abc1234 ...
+  - type: dropdown
+    id: how-run
+    attributes:
+      label: How tcr runs
+      options:
+        - TcrBar (the macOS menu-bar app)
+        - CLI in a terminal (tcr server)
+        - CLI under something else (launchd, systemd, a script)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.5, or Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: tcr doctor output
+      description: |
+        The output of `tcr doctor`. It says whether Claude Code is reaching this proxy. Paths in it
+        may contain your user name; edit them if you like.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines (optional)
+      description: |
+        Relevant lines from the tcr log. Where it lives is in
+        [docs/cli.md](https://github.com/dhkts1/teamclaude-rs/blob/main/docs/cli.md#where-the-logs-actually-go).
+        Redact as above.
+      render: text
