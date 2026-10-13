@@ -903,7 +903,7 @@ What each field carries:
 | `accounts[].usageStatus` | `relogin_required` when the account needs a login; `ok` when the live server's last quota probe succeeded; `unavailable` otherwise, including every row when no server answers and any gate this build does not know |
 | `accounts[].usage.fiveHour`, `.sevenDay` | `{pct, resetsAt}`: percent used (0 to 100) and the reset in ISO-8601 UTC; omitted when unknown |
 | `accounts[].usage.scoped` | the Fable weekly window as `{"name": "Fable", ...}`; omitted when unknown |
-| `accounts[].usageFetchedAt` | when the quota was last probed |
+| `accounts[].usageFetchedAt` | when the bars were last read (`quotaUpdatedAtMs`: a successful probe or a served response's quota headers); omitted when unknown. Not `lastProbeMs`, which a failed probe also stamps |
 | `accounts[].disabled` | `true` when the account is disabled or in a parked group |
 
 Not sent: `alias`, `usage.spend` (tcr's cost is a list-price equivalent with no limit) and
