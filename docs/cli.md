@@ -528,6 +528,7 @@ Probes every account's live quota and prints the fleet.
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
 | `--json` | bool | `false` (text) | emit a JSON array instead of greppable text |
+| `--check` | bool | `false` | exit **4** when an enabled account's last probe failed; output unchanged |
 
 It asks the running proxy where there is one and falls back to an offline read where there
 is not; the output labels which it got, so a fallback is never silently presented as a live
@@ -539,6 +540,33 @@ With no accounts configured, it first tries to import this machine's Claude Code
 add one` on stderr and exits **0**: stdout stays the ordinary empty table (`[]` under `--json`), so a
 caller piping it into `jq` — TcrBar's panel among them — decodes an empty fleet rather than a
 failure. The same line and the same exit code come from `tcr accounts`.
+
+### `--check`: an exit code for scripts
+
+Without the flag, `tcr status` exits **0** whatever the probes said. With it, the output is the
+same bytes and only the exit code changes:
+
+| exit | meaning |
+|---|---|
+| **0** | no enabled account's last probe failed |
+| **4** | at least one enabled account's last probe ended in `error`, `timeout` or `upstream-down` |
+
+These do not fail the check: `never` (no probe has run, so there is nothing to judge),
+`rate-limited` (the usage endpoint throttled the probe itself; the account's serving quota is
+untouched and its last bar is kept), and any account that is disabled, whatever its probe says.
+
+The code is 4 rather than 1 for the reason `tcr doctor` uses 2 and 3: 1 is what any verb exits
+with when it could not run at all (an unreadable config, say), and a script should be able to tell
+"the fleet has a failed probe" from "the command failed". 2 and 3 are doctor's route verdicts,
+which `tcr status` also prints, so they stay out of the way.
+
+The check is opt-in because the default exit is a contract. TcrBar runs `tcr status --json` and
+reads any non-zero exit as a failed poll (`StatusPoller.classify`), which would blank the panel
+every time one account's token was rejected.
+
+```sh
+tcr status --check >/dev/null || echo "a probe failed"
+```
 
 ### The weekly quota pair on `--json`
 

@@ -29,7 +29,7 @@ use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
-use crate::probe::{LiveUsageProber, UsageProber};
+use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
 use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
 use crate::status::{StatusPayload, STATUS_KIND};
 
@@ -2789,7 +2789,77 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
+/// What `tcr status --check` concluded about the fleet it just printed.
+///
+/// # The rule: which probe outcomes count as failed
+///
+/// A row fails the check when its account is NOT disabled and its last probe
+/// ended in [`ProbeStatus::Error`], [`ProbeStatus::Timeout`] or
+/// [`ProbeStatus::UpstreamDown`]: the probe ran and did not get a reading.
+///
+/// These do not fail it:
+/// - [`ProbeStatus::Never`]: no probe has run (a fresh server, or an account
+///   the probe loop does not cover), so there is no outcome to judge.
+/// - [`ProbeStatus::RateLimited`]: the usage endpoint throttled the probe
+///   itself. Its own doc-comment calls this benign: the account's serving quota
+///   is untouched and its last bar is kept.
+/// - a disabled account, whatever its probe says: the operator took it out of
+///   rotation, so its health is not what a script polling the fleet asks about.
+///
+/// The match on [`ProbeStatus`] has no wildcard on purpose: a new variant does
+/// not compile until someone decides which side of this rule it is on.
+///
+/// # The exit code
+///
+/// [`StatusCheck::ProbeFailed`] exits 4, not 1, following `tcr doctor`'s
+/// convention ([`crate::doctor::Report::exit_code`]): 1 stays what every verb's
+/// `anyhow` error exits with (an unreadable config, say), and each condition a
+/// check reports gets a code of its own. 2 and 3 are taken by doctor's route
+/// verdicts, which `tcr status` also prints, so the probe failure takes 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusCheck {
+    /// No enabled account's last probe failed.
+    Clean,
+    /// At least one enabled account's last probe failed.
+    ProbeFailed,
+}
+
+impl StatusCheck {
+    /// Apply the rule above to every row of `snapshot`.
+    pub fn of(snapshot: &StatsSnapshot) -> Self {
+        if snapshot.accounts.iter().any(probe_failed) {
+            StatusCheck::ProbeFailed
+        } else {
+            StatusCheck::Clean
+        }
+    }
+
+    /// The process exit code this verdict maps to.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            StatusCheck::Clean => 0,
+            StatusCheck::ProbeFailed => 4,
+        }
+    }
+}
+
+/// One row's half of [`StatusCheck`]'s rule.
+fn probe_failed(a: &AccountSnapshot) -> bool {
+    if a.disabled {
+        return false;
+    }
+    match a.probe_status {
+        ProbeStatus::Error | ProbeStatus::Timeout | ProbeStatus::UpstreamDown => true,
+        ProbeStatus::Never | ProbeStatus::Ok | ProbeStatus::RateLimited => false,
+    }
+}
+
+/// `tcr status [--json] [--check]`. Returns the process exit code: always 0
+/// without `check`, whatever the probes said, because TcrBar runs
+/// `tcr status --json` and reads any non-zero exit as a failed poll
+/// (`StatusPoller.classify`), which would blank the panel. With `check`, the
+/// code is [`StatusCheck::exit_code`]. Either way stdout is the same bytes.
+pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Result<i32> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = load_config(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
@@ -2934,7 +3004,10 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         );
         print!("{}", render_accounts(&snapshot, source));
     }
-    Ok(())
+    if !check {
+        return Ok(0);
+    }
+    Ok(StatusCheck::of(&snapshot).exit_code())
 }
 
 /// `tcr doctor [--json]`: is Claude Code reaching this proxy, and if not, what
@@ -5569,6 +5642,60 @@ mod tests {
             "an offline status probe must never persist to the config file"
         );
         fs::remove_file(&path).ok();
+    }
+
+    // --- `tcr status --check` ----------------------------------------------
+
+    /// The `--check` rule, one probe outcome at a time, on a row produced by
+    /// the real offline snapshot (a 401 from the scripted prober reads `error`)
+    /// and then re-labelled per case. The positive control comes first: the
+    /// unmodified row must fail the check, or every `Clean` below is vacuous.
+    #[tokio::test]
+    async fn status_check_fails_only_on_an_enabled_account_whose_probe_failed() {
+        use crate::probe::ProbeStatus;
+        let path = write_config("status-check", EXPIRED_ACCOUNT);
+        let snapshot = snapshot_offline(
+            load(&path),
+            Arc::new(NoRefresh),
+            Arc::new(RejectingProber),
+            true,
+        )
+        .await;
+        fs::remove_file(&path).ok();
+        assert_eq!(snapshot.accounts[0].probe_status, ProbeStatus::Error);
+        assert_eq!(StatusCheck::of(&snapshot), StatusCheck::ProbeFailed);
+        assert_eq!(StatusCheck::ProbeFailed.exit_code(), 4);
+        assert_eq!(StatusCheck::Clean.exit_code(), 0);
+
+        let relabel = |probe: ProbeStatus, disabled: bool| {
+            let mut s = snapshot.clone();
+            s.accounts[0].probe_status = probe;
+            s.accounts[0].disabled = disabled;
+            StatusCheck::of(&s)
+        };
+        for failed in [
+            ProbeStatus::Error,
+            ProbeStatus::Timeout,
+            ProbeStatus::UpstreamDown,
+        ] {
+            assert_eq!(
+                relabel(failed, false),
+                StatusCheck::ProbeFailed,
+                "{failed:?}"
+            );
+            assert_eq!(
+                relabel(failed, true),
+                StatusCheck::Clean,
+                "a disabled account never fails the check ({failed:?})"
+            );
+        }
+        for benign in [
+            ProbeStatus::Never,
+            ProbeStatus::Ok,
+            ProbeStatus::RateLimited,
+        ] {
+            assert_eq!(relabel(benign, false), StatusCheck::Clean, "{benign:?}");
+        }
     }
 
     // --- no-refresh guarantee (Fix 1) --------------------------------------

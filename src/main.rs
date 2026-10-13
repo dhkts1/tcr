@@ -1196,6 +1196,16 @@ struct StatusArgs {
     /// Emit the fleet status as a JSON array instead of greppable text.
     #[arg(long)]
     json: bool,
+    /// Exit 4 when an enabled account's last probe failed (error, timeout or
+    /// upstream-down). Never-probed, rate-limited and disabled accounts do not
+    /// count. Output is unchanged; only the exit code differs.
+    ///
+    /// Opt-in because the DEFAULT exit is a contract: TcrBar runs
+    /// `tcr status --json` and reads any non-zero exit as a failed poll
+    /// (`StatusPoller.classify`), which would blank the panel. The rule and why
+    /// 4 rather than 1: `cli::StatusCheck`.
+    #[arg(long)]
+    check: bool,
 }
 
 /// `tcr doctor [--json]`: the route check. Same two options every read-only
@@ -5654,10 +5664,18 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
     }
 }
 
-/// `tcr status [--json]` — probe every account's live quota and print it.
+/// `tcr status [--json] [--check]` — probe every account's live quota and print it.
+///
+/// The exit code is carried out of [`cli::status`] and spent here, the same
+/// shape as [`run_doctor`]: it is non-zero only under `--check`, after the
+/// output is printed.
 async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::status(&config_path, args.json).await
+    let code = cli::status(&config_path, args.json, args.check).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// `tcr doctor [--json]`: whether Claude Code is routed to this proxy.
