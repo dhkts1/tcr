@@ -2085,8 +2085,41 @@ fn render_accounts_json(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
+    let rows: Vec<serde_json::Value> = account_status_rows(
+        snapshot,
+        thresholds,
+        source,
+        server,
+        http1_only,
+        control,
+        group_colors,
+    )
+    .into_iter()
+    // Round-trip through `Value` rather than serializing the struct
+    // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
+    // out alphabetically ordered. That matches this wire's output before
+    // this struct existed (the committed fixture's key order), while
+    // `AccountStatusRow`'s own field order stays whatever reads best in
+    // this source file.
+    .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
+    .collect();
+    serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The typed rows behind [`render_accounts_json`], one per account in the
+/// snapshot's order. Split out so `tcr list --json` projects the very rows
+/// `tcr status --json` prints instead of building a second copy of them.
+fn account_status_rows(
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+    server: Option<&BuildInfo>,
+    http1_only: bool,
+    control: Option<&str>,
+    group_colors: &std::collections::BTreeMap<String, String>,
+) -> Vec<tcr_status_wire::AccountStatusRow> {
     let now = OffsetDateTime::now_utc();
-    let rows: Vec<serde_json::Value> = snapshot
+    snapshot
         .accounts
         .iter()
         .enumerate()
@@ -2101,7 +2134,7 @@ fn render_accounts_json(
                     minutes_until_reset: (h.reset - now).whole_minutes().max(0),
                 })
                 .collect();
-            let row = tcr_status_wire::AccountStatusRow {
+            tcr_status_wire::AccountStatusRow {
                 source: source.as_str().to_string(),
                 // Which build produced these numbers. A script watching this
                 // output can diff it against `git rev-parse --short HEAD` and
@@ -2405,17 +2438,9 @@ fn render_accounts_json(
                 // both paths, like `groups`.
                 org_uuid: a.org_uuid.clone(),
                 org_name: a.org_name.clone(),
-            };
-            // Round-trip through `Value` rather than serializing the struct
-            // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
-            // out alphabetically ordered — matching this wire's output before
-            // this struct existed (the committed fixture's key order) — while
-            // `AccountStatusRow`'s own field order stays whatever reads best in
-            // this source file.
-            serde_json::to_value(row).unwrap_or(serde_json::Value::Null)
+            }
         })
-        .collect();
-    serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
+        .collect()
 }
 
 /// The wire's kebab-case `gate` token for a [`crate::stats::GateReason`] —
@@ -2935,6 +2960,135 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         print!("{}", render_accounts(&snapshot, source));
     }
     Ok(())
+}
+
+/// `tcr list --json`: every configured account in claude-swap's list schema v1,
+/// for CodexBar's claude-swap reader (`tcr_status_wire::cswap_v1` has the
+/// field-by-field contract).
+///
+/// Prints exactly one JSON document on stdout and returns the exit code: 0 with
+/// the account list, 1 with the schema-v1 error envelope. The envelope goes to
+/// stdout, not stderr, because CodexBar parses stdout whatever the exit code is.
+pub async fn list_v1(config_path: &Path) -> i32 {
+    let (document, code) = render_list_v1(config_path, Arc::new(LiveUsageProber::new())).await;
+    println!("{document}");
+    code
+}
+
+/// The document `tcr list --json` prints, and its exit code.
+///
+/// This NEVER probes. CodexBar runs it on every Claude refresh, and a read that
+/// fell back to `status`'s offline path (which probes every account) would turn
+/// each poll into one usage-endpoint call per account. So the live server is the
+/// only source of a reading: with no server, or one that cannot be read, every
+/// configured account is listed as `unavailable`. `prober` is a parameter only
+/// so a test can prove this; the offline snapshot below is built with probing
+/// off, and the prober it is handed must never be called.
+///
+/// A row's slot (`number`) is its position in the config FILE, derived here on
+/// purpose rather than taken from the order the server returns rows in. The
+/// server's list is its boot-time config plus accounts admitted since
+/// (`Manager::reload_groups_if_changed` appends them), so once the file is
+/// reordered the two orders differ. See [`overlay_live_rows`].
+async fn render_list_v1(config_path: &Path, prober: Arc<dyn UsageProber>) -> (String, i32) {
+    use tcr_status_wire::cswap_v1::{self, ErrorKind, ErrorV1};
+
+    // Read-only and polled, so no `import_claude_code_login_if_empty`: that
+    // import is a write, and a menu-bar poll must not be what triggers it.
+    let config = match load_config(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            return (
+                ErrorV1::new(ErrorKind::ConfigUnreadable, format!("{e:#}")).render(),
+                1,
+            )
+        }
+    };
+    let live = fetch_live_status(&config).await;
+    let proxy_port = config.proxy.port;
+
+    // Every account in the file, in file order, with nothing measured.
+    let thresholds = resolve_thresholds(&config);
+    let http1_only = config.http1_only;
+    let control = config
+        .control_account
+        .as_ref()
+        .map(|c| c.name().to_string());
+    let group_colors = config.group_colors();
+    let snapshot = snapshot_offline(config, Arc::new(NoRefresh), prober, false).await;
+    let file_rows = account_status_rows(
+        &snapshot,
+        &thresholds,
+        StatusSource::Offline,
+        None,
+        http1_only,
+        control.as_deref(),
+        &group_colors,
+    );
+
+    let rows = match live {
+        Ok(payload) => {
+            let build = payload.build.clone();
+            let http1_only = payload.http1_only;
+            let control = payload.control.clone();
+            let group_colors = payload.group_colors.clone();
+            let (snapshot, thresholds) = payload.into_snapshot();
+            let live_rows = account_status_rows(
+                &snapshot,
+                &thresholds,
+                StatusSource::Live,
+                Some(&build),
+                http1_only,
+                control.as_deref(),
+                &group_colors,
+            );
+            overlay_live_rows(file_rows, live_rows)
+        }
+        // The ordinary state of a machine whose proxy is down: the rows say
+        // `unavailable`, and that is the whole message.
+        Err(LiveStatusError::NoServer) => file_rows,
+        Err(reason) => {
+            eprintln!(
+                "[tcr] warning: could not read live status from the proxy on :{} ({}); listing every account as unavailable.",
+                proxy_port,
+                reason.why()
+            );
+            file_rows
+        }
+    };
+
+    match serde_json::to_string_pretty(&cswap_v1::from_rows(&rows)) {
+        Ok(document) => (document, 0),
+        Err(e) => (
+            ErrorV1::new(ErrorKind::RenderFailed, e.to_string()).render(),
+            1,
+        ),
+    }
+}
+
+/// Put the live server's rows into the config file's order.
+///
+/// Each file row is replaced by the live row of the same name (names are unique
+/// and are the whole address). A file row the server does not have (added to
+/// the file since the server last read it) stays as the file's unmeasured row.
+/// A live row the file no longer lists (removed since the server booted, and
+/// still served until a restart) goes after the file's rows, in server order,
+/// so every account the server is serving still appears, with a slot of its own.
+fn overlay_live_rows(
+    file_rows: Vec<tcr_status_wire::AccountStatusRow>,
+    mut live_rows: Vec<tcr_status_wire::AccountStatusRow>,
+) -> Vec<tcr_status_wire::AccountStatusRow> {
+    let mut rows: Vec<_> = file_rows
+        .into_iter()
+        .map(
+            |file_row| match live_rows.iter().position(|l| l.name == file_row.name) {
+                Some(at) => live_rows.remove(at),
+                None => file_row,
+            },
+        )
+        .collect();
+    rows.extend(live_rows);
+    rows
 }
 
 /// `tcr doctor [--json]`: is Claude Code reaching this proxy, and if not, what
@@ -4800,6 +4954,157 @@ mod tests {
                 })
             })
         }
+    }
+
+    // --- tcr list --json ----------------------------------------------------
+
+    /// A prober that only counts: `tcr list` must never reach it.
+    struct CountingProber {
+        calls: Arc<AtomicU64>,
+    }
+    impl UsageProber for CountingProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Usage {
+                    five_hour: Some(UsageBucket {
+                        utilization: Some(0.5),
+                        reset_at_ms: Some(crate::now_ms() + 3_600_000),
+                    }),
+                    seven_day: None,
+                    seven_day_oi: None,
+                    extra_usage_usd: None,
+                })
+            })
+        }
+    }
+
+    /// A loopback port nothing listens on: bound by the OS, then released.
+    fn unused_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        listener.local_addr().expect("local addr").port()
+    }
+
+    /// With no server, `tcr list --json` lists every configured account as
+    /// `unavailable`, in file order, and the prober sees ZERO calls. Both
+    /// accounts carry an unexpired token, so a path that probed would reach
+    /// the prober twice.
+    #[tokio::test]
+    async fn list_v1_with_no_server_never_probes_and_lists_every_account_unavailable() {
+        let json = TWO_ACCOUNTS.replace("3456", &unused_port().to_string());
+        let path = write_config("list-v1-no-server", &json);
+        let calls = Arc::new(AtomicU64::new(0));
+        let (document, code) = render_list_v1(
+            &path,
+            Arc::new(CountingProber {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "tcr list must never probe; a CodexBar poll would become a usage call per account"
+        );
+        assert_eq!(code, 0);
+        let doc: serde_json::Value = serde_json::from_str(&document).expect("one JSON document");
+        assert_eq!(doc["schemaVersion"], 1);
+        assert!(doc["activeAccountNumber"].is_null());
+        assert_eq!(doc["supportsAccountSwitching"], false);
+        let accounts = doc["accounts"].as_array().expect("accounts");
+        let got: Vec<(i64, &str, &str)> = accounts
+            .iter()
+            .map(|a| {
+                (
+                    a["number"].as_i64().expect("number"),
+                    a["email"].as_str().expect("email"),
+                    a["usageStatus"].as_str().expect("usageStatus"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "alice@example.com", "unavailable"),
+                (2, "bob@example.com", "unavailable"),
+            ]
+        );
+        assert!(
+            accounts.iter().all(|a| a["usage"] == serde_json::json!({})),
+            "nothing was measured, so no window is claimed"
+        );
+    }
+
+    /// A config that cannot be parsed is the schema-v1 error envelope on
+    /// stdout with exit 1, because CodexBar parses stdout on any exit code.
+    #[tokio::test]
+    async fn list_v1_reports_an_unreadable_config_in_the_error_envelope() {
+        let path = write_config("list-v1-bad", "{ not json");
+        let calls = Arc::new(AtomicU64::new(0));
+        let (document, code) = render_list_v1(
+            &path,
+            Arc::new(CountingProber {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(code, 1);
+        let doc: serde_json::Value = serde_json::from_str(&document).expect("one JSON document");
+        assert_eq!(doc["schemaVersion"], 1);
+        assert_eq!(doc["error"]["type"], "config_unreadable");
+        assert!(doc["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Slots follow the FILE, whatever order the server returns rows in: a row
+    /// the server lacks keeps the file's place, and one the file lost goes last.
+    #[tokio::test]
+    async fn overlay_live_rows_keeps_the_file_order() {
+        let config = load_from(TWO_ACCOUNTS);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            false,
+        )
+        .await;
+        let colors = std::collections::BTreeMap::new();
+        let file_rows = account_status_rows(
+            &snapshot,
+            &[],
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+            &colors,
+        );
+        // The server knows bob (first, as if the file was reordered after it
+        // booted) and carol (since removed from the file), not alice.
+        let mut bob = file_rows[1].clone();
+        bob.source = "live".into();
+        let mut carol = file_rows[0].clone();
+        carol.name = "carol@example.com".into();
+        carol.source = "live".into();
+
+        let rows = overlay_live_rows(file_rows, vec![bob, carol]);
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.source.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("alice@example.com", "offline"),
+                ("bob@example.com", "live"),
+                ("carol@example.com", "live"),
+            ]
+        );
     }
 
     #[tokio::test]

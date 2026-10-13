@@ -120,6 +120,7 @@ restart. Every flag is in [`docs/cli.md`](docs/cli.md).
 | `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
 | `tcr run --group <name>` | Start a session that prefers one group. |
 | `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour. The panel's Sessions and Tools tabs read the same feed. |
+| `tcr list --json` | Print every account in claude-swap's list format, so CodexBar can show them. Never probes. |
 | `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day. Needs no running proxy. |
 | `tcr token <account>` | Print an account's access token to stdout, for piping. |
 | `tcr update` | Update `tcr` in place, from the checkout or the published installer. |

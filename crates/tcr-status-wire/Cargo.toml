@@ -12,3 +12,9 @@ description = "Serde types for the `tcr status --json` wire contract, shared bet
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Already in the workspace's lockfile through the main crate; `cswap_v1` uses it to
+# write CodexBar's ISO-8601 timestamps. Pure Rust, Linux-clean.
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+time = { version = "0.3", features = ["formatting", "parsing"] }
