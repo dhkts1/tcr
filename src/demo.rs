@@ -80,6 +80,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         in_flight: 0,
         last_served_ms: 0,
         rate_limited_until_ms: None,
+        hold_cause: crate::manager::HoldCause::RateLimit,
         refresh_retry_after_ms: None,
         error_retry_after_ms: None,
         error_backoff_ms: 0,
