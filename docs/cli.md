@@ -477,8 +477,22 @@ every existing priority sits on the same side of it.
 
 The positional value conflicts with `--first`/`--last`, and `--first` conflicts with
 `--last`. There is no default: omitting all three is a runtime error,
-`provide a priority value, or one of --first / --last`. This is a file-only write; it does
-not reach a running proxy.
+`provide a priority value, or one of --first / --last`.
+
+**It changes the running proxy first, then the file**, so the next new session is routed by
+the new order with no restart. The value is worked out from the config file (that is what
+`--first` and `--last` are relative to), then POSTed to the proxy's
+`/_tcr/accounts/priority` route, which sets it in the live rotation. The command then writes
+the file. A session already pinned to an account stays on it; priority decides where new
+sessions go.
+
+| the proxy | what `tcr priority` does |
+|---|---|
+| applies it | writes the file |
+| is not running | writes the file; there is nothing live to update |
+| rejects the api-key, or refuses the query (no match, or more than one) | exits with an error and changes nothing |
+| is too old to have the route | writes the file and warns that the proxy keeps the old order until it restarts |
+| answers something unusable, or does not answer | writes the file and warns that the proxy may keep the old order until it restarts |
 
 ### `tcr enable <query>` and `tcr disable <query>`
 

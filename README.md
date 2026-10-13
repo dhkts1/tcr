@@ -106,11 +106,9 @@ key, its default and the file's permissions are in
 
 ### Managing the fleet
 
-Most changes to the pool reach a running proxy without a restart. `enable`, `disable`,
-`remove` and `control` apply to it directly, and the proxy picks up `group` edits from the
-config file on its next request. `priority` is the exception: it only writes the file, so a
-running proxy keeps the old order until it restarts. Every flag is in
-[`docs/cli.md`](docs/cli.md).
+Changes to the pool reach a running proxy without a restart. `enable`, `disable`, `remove`,
+`priority` and `control` apply to it directly, and the proxy picks up `group` edits from the
+config file on its next request. Every flag is in [`docs/cli.md`](docs/cli.md).
 
 | Command | What it does |
 |---|---|
