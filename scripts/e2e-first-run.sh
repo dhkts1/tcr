@@ -18,14 +18,9 @@ TCR="$(cd "$(dirname "$TCR")" && pwd)/$(basename "$TCR")"
 
 E2E_HOME="$(mktemp -d)"
 export HOME="$E2E_HOME"
-unset XDG_CACHE_HOME XDG_CONFIG_HOME TCR_CLAUDE_CODE_CREDENTIALS || true
+unset XDG_CACHE_HOME XDG_CONFIG_HOME || true
 CONFIG="$HOME/.config/teamclaude.json"
-# On CI the config does not exist before the server boots, which is the real
-# first run. On a developer Mac a live proxy usually holds :3456, so
-# TCR_E2E_PORT=<free port> pre-seeds `{"proxy":{"port":N}}` for cases 2 and 3 —
-# still zero accounts, still the import trigger, just not the default port.
-# `tcr status` has no --port flag; it reads the port from the config.
-E2E_PORT="${TCR_E2E_PORT:-}"
+CREDENTIALS="$HOME/.claude/.credentials.json"
 SERVER_PID=""
 
 cleanup() {
@@ -40,6 +35,45 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
+# The Claude Code login comes from TCR_CLAUDE_CODE_CREDENTIALS and nothing else.
+# Unset, `tcr` reads the macOS login Keychain, which a changed HOME does not
+# redirect: on a developer Mac that is the developer's real login, and an import
+# of it would later rotate its refresh token and log their `claude` out. Case 1
+# must see NO login, so the variable names a file that does not exist yet; the
+# fake login is written there before case 2.
+export TCR_CLAUDE_CODE_CREDENTIALS="$CREDENTIALS"
+
+# The server never boots on 3456, the default port a live proxy on a developer
+# Mac holds. TCR_E2E_PORT=<port> picks one; unset, the script asks the kernel
+# for a free one. Cases 2 and 3 pre-seed `{"proxy":{"port":N}}`, still zero
+# accounts and still the import trigger. `tcr status` has no --port flag; it
+# reads the port from the config.
+E2E_PORT="${TCR_E2E_PORT:-}"
+if [ -z "$E2E_PORT" ]; then
+  E2E_PORT="$(python3 -c 'import socket
+while True:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    if port != 3456:
+        print(port)
+        break')"
+fi
+case "$E2E_PORT" in
+  '' | *[!0-9]*) fail "TCR_E2E_PORT must be a port number, got '$E2E_PORT'" ;;
+esac
+[ "$E2E_PORT" != "3456" ] || fail "refusing port 3456: it is the default port a live proxy holds"
+
+# TCR_E2E_DRY_RUN=1 prints what the run would use and stops before any `tcr`
+# call. scripts/check-e2e-first-run-safe.sh reads it.
+if [ "${TCR_E2E_DRY_RUN:-}" = "1" ]; then
+  echo "port=$E2E_PORT"
+  echo "credentials=$TCR_CLAUDE_CODE_CREDENTIALS"
+  echo "home=$HOME"
+  exit 0
+fi
+
 accounts_count() {
   python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("accounts", [])))' "$CONFIG"
 }
@@ -53,31 +87,32 @@ grep -q "no accounts configured" /tmp/e2e-accounts-1.err || fail "expected the z
 # GNU stat first (Linux runners, and a Mac with coreutils on PATH), BSD second.
 perms="$(stat -c '%a' "$CONFIG" 2>/dev/null || stat -f '%Lp' "$CONFIG")"
 [ "$perms" = "600" ] || fail "config perms are $perms, want 600"
-pass "no config: tcr accounts exit 0, created $CONFIG (0600, 0 accounts, hint printed)"
+# The fresh config carries the default port. Asserted here, where nothing binds
+# it, so the server below can run on a port no live proxy holds.
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["proxy"]["port"])' "$CONFIG")" = "3456" ] || fail "fresh config did not get the default port"
+pass "no config: tcr accounts exit 0, created $CONFIG (0600, 0 accounts, default port, hint printed)"
 
 # --- 2. a Claude Code login file is imported at server boot ------------------
 rm -f "$CONFIG"
-if [ -n "$E2E_PORT" ]; then
-  printf '{"proxy":{"port":%s}}\n' "$E2E_PORT" >"$CONFIG"
-  chmod 600 "$CONFIG"
-fi
+printf '{"proxy":{"port":%s}}\n' "$E2E_PORT" >"$CONFIG"
+chmod 600 "$CONFIG"
 mkdir -p "$HOME/.claude"
 # Obviously fake values: the profile fetch will fail upstream, so the account
 # is named by the fallback ("unnamed"). The point is the wiring, not the token.
-cat >"$HOME/.claude/.credentials.json" <<'JSON'
+# This is the file TCR_CLAUDE_CODE_CREDENTIALS names.
+cat >"$CREDENTIALS" <<'JSON'
 {"claudeAiOauth":{"accessToken":"sk-ant-oat01-fake-e2e-access","refreshToken":"sk-ant-ort01-fake-e2e-refresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_5x"}}
 JSON
-chmod 600 "$HOME/.claude/.credentials.json"
+chmod 600 "$CREDENTIALS"
 
-"$TCR" --headless ${E2E_PORT:+--port "$E2E_PORT"} >/tmp/e2e-server.log 2>&1 &
+"$TCR" --headless --port "$E2E_PORT" >/tmp/e2e-server.log 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 60); do
   if "$TCR" status --json >/tmp/e2e-status-1.out 2>/tmp/e2e-status-1.err; then break; fi
   kill -0 "$SERVER_PID" 2>/dev/null || fail "server died during boot: $(cat /tmp/e2e-server.log)"
   sleep 0.5
 done
-[ -f "$CONFIG" ] || fail "server boot did not create $CONFIG"
-[ -n "$E2E_PORT" ] || [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["proxy"]["port"])' "$CONFIG")" = "3456" ] || fail "fresh config did not get the default port"
+[ -f "$CONFIG" ] || fail "server boot removed $CONFIG"
 [ "$(accounts_count)" = "1" ] || fail "server boot should have imported 1 account, config has $(accounts_count); server log: $(cat /tmp/e2e-server.log)"
 python3 - "$CONFIG" <<'PY' || fail "imported row is not the Claude Code login"
 import json, sys
