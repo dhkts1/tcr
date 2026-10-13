@@ -1331,12 +1331,12 @@ struct RunArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Prefer accounts labelled with this group when picking an account for a
-    /// NEW request — falls back to the whole pool when the group has no
-    /// capacity, and once a session settles onto an account (a "pin"), that
-    /// pin is honoured group-blind for the rest of the session (correct for
-    /// this PREFER semantics; the restricting form that also constrains an
-    /// existing pin is Phase 2).
+    /// Serve this session from accounts labelled with this group. Strict by
+    /// default: when no member can serve, the request waits for one or gets a
+    /// 429, and is never sent to an account outside the group, even one the
+    /// session is already pinned to. Set `groupSettings.<group>.spillToPool:
+    /// true` in the config to let it fall back to the whole pool instead (a
+    /// reserved group stays strict either way).
     #[arg(long)]
     group: Option<String>,
     /// Args passed verbatim to `claude` (e.g. `tcr run -- -p "hi"`).
