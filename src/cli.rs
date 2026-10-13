@@ -330,9 +330,10 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
                     config.accounts.remove(idx).name
                 })?;
                 eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{removed}' until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{removed}' until it restarts. {}",
                     config.proxy.port,
                     crate::proxy::DISABLED_PATH,
+                    RESTART_HINT,
                 );
                 println!("Removed account '{removed}'.");
                 return Ok(());
@@ -1140,10 +1141,11 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
             Err(LiveControlError::NoRoute) => {
                 let name = write_disabled_flag(config_path, query, disabled)?;
                 eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. {}",
                     config.proxy.port,
                     crate::proxy::DISABLED_PATH,
                     if disabled { "routing to" } else { "benching" },
+                    RESTART_HINT,
                 );
                 return Ok(());
             }
@@ -1190,6 +1192,25 @@ fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyho
         config.accounts[idx].name.clone()
     })
 }
+
+/// The last sentence of every "proxy too old for live control" warning: how to
+/// restart the proxy so it re-reads the config file it was just written.
+///
+/// There is no restart subcommand, so the hint names the two real routes:
+///
+/// - TcrBar's Settings > General > Restart, when TcrBar supervises the proxy.
+///   It stops the child it spawned and starts a new one
+///   (`apps/macos/Sources/TcrBar/SettingsPanes.swift`, `confirmRestart`). A
+///   terminal `--replace` would instead kill that child and leave the proxy
+///   tied to a terminal window.
+/// - `tcr server --replace` otherwise: the singleton kills the proxy holding
+///   the port and binds in its place (`ServerArgs::replace`, docs/cli.md
+///   "Taking over the port").
+///
+/// One copy, because the four warnings that print it all named a `restart`
+/// subcommand that never existed, and four copies is how that happened. `main.rs`'s `restart_hint_names_only_commands_that_parse` parses
+/// every backticked `tcr` command in this text with the real clap definition.
+pub const RESTART_HINT: &str = "Restart it when a cold prompt cache is acceptable: if TcrBar runs the proxy, use Restart in TcrBar's Settings > General; otherwise run `tcr server --replace`.";
 
 /// Why a live account-control request did not apply.
 ///
@@ -1592,9 +1613,10 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
             Err(LiveControlError::NoRoute) => {
                 write_control_account(config_path, query)?;
                 eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {}",
                     config.proxy.port,
                     crate::proxy::CONTROL_PATH,
+                    RESTART_HINT,
                 );
                 return Ok(());
             }

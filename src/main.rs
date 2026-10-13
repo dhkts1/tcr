@@ -1331,12 +1331,12 @@ struct RunArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Prefer accounts labelled with this group when picking an account for a
-    /// NEW request — falls back to the whole pool when the group has no
-    /// capacity, and once a session settles onto an account (a "pin"), that
-    /// pin is honoured group-blind for the rest of the session (correct for
-    /// this PREFER semantics; the restricting form that also constrains an
-    /// existing pin is Phase 2).
+    /// Serve this session from accounts labelled with this group. Strict by
+    /// default: when no member can serve, the request waits for one or gets a
+    /// 429, and is never sent to an account outside the group, even one the
+    /// session is already pinned to. Set `groupSettings.<group>.spillToPool:
+    /// true` in the config to let it fall back to the whole pool instead (a
+    /// reserved group stays strict either way).
     #[arg(long)]
     group: Option<String>,
     /// Args passed verbatim to `claude` (e.g. `tcr run -- -p "hi"`).
@@ -7348,6 +7348,31 @@ mod tests {
             vec!["tcr", "login", "--from-claude-code", "--force"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+        }
+    }
+
+    /// Every `tcr` command the "proxy too old" warnings tell the user to run
+    /// must be one this binary accepts. All four named a `restart` subcommand,
+    /// which clap rejected with exit 2: the remedy in the warning was itself an
+    /// error.
+    #[test]
+    fn restart_hint_names_only_commands_that_parse() {
+        let commands: Vec<&str> = cli::RESTART_HINT
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tcr "))
+            .collect();
+        assert!(
+            !commands.is_empty(),
+            "the hint must name a tcr command to run: {}",
+            cli::RESTART_HINT
+        );
+        for command in commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("the warning tells the user to run `{command}`, which does not parse: {e}");
+            }
         }
     }
 
