@@ -2748,6 +2748,15 @@ enum RenderStates {
     private static let hold =
         #"[{"window":"7d","minutesUntilReset":6498,"resetAtMs":1786406400224}]"#
 
+    /// A `held` array holding the 5-hour window until `minutes` from the
+    /// render clock, the way `tcr` sends it. Relative for the reason
+    /// `fiveHourResetInMinutes` is: a fixed epoch stops drawing a countdown
+    /// once it has passed.
+    private static func heldFiveHour(inMinutes minutes: Int) -> String {
+        let resetAtMs = Int64((Date().timeIntervalSince1970 + Double(minutes) * 60) * 1000)
+        return #"[{"window":"5h","minutesUntilReset":\#(minutes),"resetAtMs":\#(resetAtMs)}]"#
+    }
+
     /// Two healthy accounts, and the row's two shapes side by side: alice has a
     /// reset on every window and carries a caption beside each percentage; bob
     /// has none on the wire and must still read as a complete row. The caption
@@ -3560,9 +3569,18 @@ enum RenderStates {
             account(
                 "near@example.com", quota: "0.94", state: "near", held: hold,
                 fiveHourResetInMinutes: 47, sevenDayResetInMinutes: 6_498))
+        // Out of tokens the way most of a real fleet is: the 5-hour window
+        // spent and HELD, the week only partly used. The hold is relative to
+        // the render clock (``heldFiveHour(inMinutes:)``), because the fixed
+        // `hold` timestamp is already in the past and a one-line row draws no
+        // "back in" for a reset that has passed.
+        let weeks = ["0.6", "0.5", "0.7", "0.4", "0.6", "0.5"]
         rows += (1...6).map {
             account(
-                "spent-\($0)@example.com", quota: "1.0", state: "spent", held: hold,
+                "spent-\($0)@example.com", quota: "1.0", state: "spent",
+                held: heldFiveHour(inMinutes: 12 + $0 * 30),
+                fiveHour: "1.0", fiveHourState: "spent",
+                sevenDay: weeks[$0 - 1], sevenDayState: "ok",
                 fiveHourResetInMinutes: 12 + $0 * 30, sevenDayResetInMinutes: 6_498)
         }
         rows.append(

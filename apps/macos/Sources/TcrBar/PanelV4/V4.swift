@@ -587,6 +587,64 @@ enum V4 {
         max(own, segMarginBottom) - segMarginBottom
     }
 
+    // MARK: - One-line account rows (option H: `.slim`, `.wline`, `.bandhead`)
+
+    /// `.slim{min-height:26px}` at 13 pt type: the name's line box plus 8. Written
+    /// as that sum rather than as 26 so Comfortable's 15 pt name gets the same
+    /// 8 pt of air instead of a row its own text overflows.
+    static var lineRowHeight: CGFloat { lineHeight(nameSize) + lineRowAir }
+    static let lineRowAir: CGFloat = 8
+    /// `.wline{min-height:22px}`: a waiting line is 4 pt shorter than a live one,
+    /// because it carries no bars.
+    static var waitRowHeight: CGFloat { lineHeight(nameSize) + waitRowAir }
+    static let waitRowAir: CGFloat = 4
+    /// `.sbox{padding:2px 8px}` and `.wbox{padding:2px 10px}`.
+    static let lineBoxPaddingV: CGFloat = 2
+    static let liveBoxPaddingH: CGFloat = 8
+    static let waitBoxPaddingH: CGFloat = 10
+    /// `.sbox,.wbox{margin:0 0 8px}`. The band heading's own `margin-top:8`
+    /// collapses into it, so the heading adds no top margin of its own.
+    static let lineBoxMarginBottom: CGFloat = 8
+    /// `.slim{gap:7px}`, `.wline{gap:8px}`, `.sc{gap:4px}`.
+    static let liveLineGap: CGFloat = 7
+    static let waitLineGap: CGFloat = 8
+    static let lineMeterGap: CGFloat = 4
+    /// `.slim .ln{width:54px}` (clipped with an ellipsis) and
+    /// `.wline .ln{min-width:64px}`.
+    static let liveNameWidth: CGFloat = 54
+    /// The most a live box's name column grows to fit its widest name. Option
+    /// H's names are all short enough for 54; four `member-N` names in one box
+    /// all read `mem…` at 54, which names nobody. Past this the name truncates.
+    static let liveNameMaxWidth: CGFloat = 96
+    static let waitNameMinWidth: CGFloat = 64
+    /// `.sl{width:14px}`, `.mbar{width:32px;height:6px}`, `.mp{width:33px}`.
+    static let lineLabelWidth: CGFloat = 14
+    static let lineBarWidth: CGFloat = 32
+    static let lineBarHeight: CGFloat = 6
+    static let linePercentWidth: CGFloat = 33
+    /// `.dot{width:8px}`. The same disc as ``dotSize``, named for this row so
+    /// a change to the Sessions dot does not resize every account.
+    static let lineDotSize: CGFloat = 8
+    /// `.lr{font-size:11.5px}`: half a point over the mute size at either
+    /// density.
+    static var lineSignalSize: CGFloat { muteSize + lineSignalStep }
+    /// What a live line's signal column asks for before the labels drop: the
+    /// 56 pt option H leaves it at 372 pt. A longer signal still draws in
+    /// whatever the row has left, and truncates only past that.
+    static let lineSignalIdealWidth: CGFloat = 56
+    static let lineSignalStep: CGFloat = 0.5
+    /// `.slim+.slim{border-top:1px solid rgba(57,62,67,.6)}`: the hairline at
+    /// 60 %, between rows only.
+    static let lineDividerAlpha: Double = 0.6
+    /// `.bandhead{margin:8px 4px 4px; gap:6px; font-size:11px; font-weight:700;
+    /// letter-spacing:.1em}`.
+    static let bandHeadPaddingH: CGFloat = 4
+    static let bandHeadMarginBottom: CGFloat = 4
+    static let bandHeadGap: CGFloat = 6
+    static let bandHeadSize: CGFloat = 11
+    static let bandHeadTracking: CGFloat = 0.1 * 11
+    static let bandHeadTailTracking: CGFloat = 0.02 * 11
+
     // MARK: - Peers tab literals
 
     /// The small circle in an account row's parked-tally breakdown
