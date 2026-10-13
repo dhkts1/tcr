@@ -8262,6 +8262,230 @@ mod tests {
         }
     }
 
+    // --- GET /_tcr/quota ----------------------------------------------------
+
+    /// The public spelling of the quota route, written out rather than read from
+    /// the constant so a rename of the path a status line calls fails here.
+    const QUOTA_URI: &str = "/_tcr/quota";
+
+    /// [`status_request`]'s shape for the quota route: drive the router directly
+    /// with a `ClientAddr` we control.
+    async fn quota_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(QUOTA_URI);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder.body(Body::empty()).expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, body)
+    }
+
+    /// Feed account `idx` a 5-hour and a weekly reading through the same headers
+    /// a live reply carries. Resets are whole seconds, as Anthropic sends them.
+    fn feed_quota(manager: &Manager, idx: usize, five_hour: &str, seven_day: &str, now_s: i64) {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (
+                "anthropic-ratelimit-unified-5h-utilization",
+                five_hour.to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                (now_s + 3_600).to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization",
+                seven_day.to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset",
+                (now_s + 86_400).to_string(),
+            ),
+        ] {
+            headers.insert(name, HeaderValue::from_str(&value).expect("header value"));
+        }
+        manager.update_quota(idx, &headers);
+    }
+
+    /// THE GATE for the quota route: a status line ticks every turn, so the answer
+    /// must come from memory. It returns the small per-account shape, makes no
+    /// upstream attempt, and answers well inside one status-line tick.
+    ///
+    /// The upstream counter is checked live at the end: one real `/v1/messages`
+    /// through the same manager must move it to 1, so the 0 before it is a
+    /// measurement and not a harness that cannot count.
+    #[tokio::test]
+    async fn quota_endpoint_answers_from_memory_without_upstream() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![Some(raw_200())]).await;
+        let manager = fleet_configured(up_addr, &["alice", "bob"], |_| {});
+        let now_s = crate::now_ms() / 1000;
+        feed_quota(&manager, 0, "0.5", "0.2", now_s);
+        // Over `dummy_config`'s 0.90 threshold, so bob's gate names the window.
+        feed_quota(&manager, 1, "0.96", "0.4", now_s);
+
+        let started = std::time::Instant::now();
+        let (status, headers, body) = quota_request(
+            Arc::clone(&manager),
+            Method::GET,
+            Some(loopback_peer()),
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "loopback GET on the quota route is served, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the quota route answers from memory, took {elapsed:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the quota route never calls upstream"
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(payload["kind"], "tcr.quota.v1");
+        let accounts = payload["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts.len(), 2, "one row per account: {payload}");
+
+        // The row is the small shape and nothing more: a status line has no use
+        // for token counters, groups or plan fields.
+        let mut keys: Vec<&str> = accounts[0]
+            .as_object()
+            .expect("account row is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "fiveHour",
+                "fiveHourResetMs",
+                "gate",
+                "name",
+                "sevenDay",
+                "sevenDayResetMs"
+            ]
+        );
+
+        assert_eq!(accounts[0]["name"], "alice");
+        assert_eq!(accounts[0]["gate"], "ok");
+        assert_eq!(accounts[0]["fiveHour"], 0.5);
+        assert_eq!(accounts[0]["fiveHourResetMs"], (now_s + 3_600) * 1000);
+        assert_eq!(accounts[0]["sevenDay"], 0.2);
+        assert_eq!(accounts[0]["sevenDayResetMs"], (now_s + 86_400) * 1000);
+        assert_eq!(accounts[1]["name"], "bob");
+        assert_eq!(accounts[1]["gate"], "five-hour");
+        assert_eq!(accounts[1]["fiveHour"], 0.96);
+
+        // Positive control for the zero above: a real request through the same
+        // manager reaches the counted upstream.
+        assert_eq!(post_one(Arc::clone(&manager)).await, 200);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the upstream counter is live"
+        );
+    }
+
+    /// The quota route passes the same [`local_endpoint_gate`] as the status
+    /// route: a non-loopback or unproven peer is refused, and a configured proxy
+    /// key is required with no loopback exemption. A refusal carries no fleet
+    /// state.
+    #[tokio::test]
+    async fn quota_endpoint_has_the_status_gate() {
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let manager =
+                Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+            let (status, _headers, body) = quota_request(manager, Method::GET, peer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} must be refused");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("dummy") && !text.contains("accounts"),
+                "a refused caller learns nothing about the fleet: {text}"
+            );
+        }
+
+        let keyed = || {
+            Manager::with_live_refresher(
+                dummy_config(Some("sk-proxy-secret"), "http://127.0.0.1:1"),
+                None,
+            )
+        };
+        let (status, _h, _b) =
+            quota_request(keyed(), Method::GET, Some(loopback_peer()), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a keyless loopback caller is refused when a key is set"
+        );
+        let (status, _h, body) = quota_request(
+            keyed(),
+            Method::GET,
+            Some(loopback_peer()),
+            Some("sk-proxy-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the right key is served");
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"name\":\"dummy\""),
+            "the keyed answer is a real payload"
+        );
+    }
+
+    /// GET only, answered locally: any other verb is a local 405, never a
+    /// fall-through to the forwarder (which would answer 502 off the dead port).
+    #[tokio::test]
+    async fn quota_endpoint_is_get_only() {
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let manager =
+                Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+            let (status, _headers, body) =
+                quota_request(manager, method.clone(), Some(loopback_peer()), None).await;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on the quota path is refused locally, got {status}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&body).contains("fiveHour"),
+                "a refused method returns no quota"
+            );
+        }
+    }
+
     // --- POST /_tcr/accounts/disabled ---------------------------------------
 
     /// A two-account config with distinct orgs, written to `path` so the manager
