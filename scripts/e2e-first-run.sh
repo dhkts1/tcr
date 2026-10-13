@@ -107,11 +107,28 @@ chmod 600 "$CREDENTIALS"
 
 "$TCR" --headless --port "$E2E_PORT" >/tmp/e2e-server.log 2>&1 &
 SERVER_PID=$!
+# Wait on the port, not on `tcr status`: on an empty fleet `tcr status` runs
+# the first-run import itself, and if it wins the race the server log never
+# says "imported". The server imports before it binds (run_server in
+# src/main.rs), so an accepted connection means the boot import is done.
+port_open() {
+  python3 -c 'import socket,sys
+s = socket.socket()
+s.settimeout(0.5)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()' "$E2E_PORT"
+}
+booted=""
 for _ in $(seq 1 60); do
-  if "$TCR" status --json >/tmp/e2e-status-1.out 2>/tmp/e2e-status-1.err; then break; fi
+  if port_open; then booted=1; break; fi
   kill -0 "$SERVER_PID" 2>/dev/null || fail "server died during boot: $(cat /tmp/e2e-server.log)"
   sleep 0.5
 done
+[ -n "$booted" ] || fail "server did not accept connections on port $E2E_PORT within 30 s: $(cat /tmp/e2e-server.log)"
 [ -f "$CONFIG" ] || fail "server boot removed $CONFIG"
 [ "$(accounts_count)" = "1" ] || fail "server boot should have imported 1 account, config has $(accounts_count); server log: $(cat /tmp/e2e-server.log)"
 python3 - "$CONFIG" <<'PY' || fail "imported row is not the Claude Code login"

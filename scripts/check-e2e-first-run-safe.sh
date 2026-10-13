@@ -38,6 +38,15 @@ export_line="$(awk '/^[[:space:]]*export[[:space:]]+TCR_CLAUDE_CODE_CREDENTIALS=
 [ "$export_line" -lt "$first_call" ] || fail "$SCRIPT exports TCR_CLAUDE_CODE_CREDENTIALS at line $export_line, after the first tcr call at line $first_call"
 pass "static: TCR_CLAUDE_CODE_CREDENTIALS exported at line $export_line, before the first tcr call at line $first_call, never unset"
 
+# `tcr status` on an empty fleet runs the first-run import itself, so a status
+# call before the server's import line is asserted can win that import and
+# fail the job (the race #456 hit). The boot wait polls the port instead.
+import_check="$(awk '/grep -q "imported"/ { print NR; exit }' "$SCRIPT")"
+first_status="$(awk '/"\$TCR"[[:space:]]+status/ { print NR; exit }' "$SCRIPT")"
+[ -n "$import_check" ] || fail "found no server-log import assertion in $SCRIPT; this check no longer matches the script"
+[ -z "$first_status" ] || [ "$first_status" -gt "$import_check" ] || fail "$SCRIPT:$first_status calls tcr status before the import is asserted at line $import_check, and that call can run the import itself"
+pass "static: no tcr status call before the import is asserted at line $import_check"
+
 # --- dynamic: run the script with a stub tcr --------------------------------
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
