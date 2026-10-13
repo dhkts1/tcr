@@ -544,6 +544,22 @@ Unlike the shared `sevenDay` bucket, this window gates **Fable requests only** â
 request never checks it, and `held[]`/the general `quotaState` never reflect it either. It exists on
 the wire so a Fable-scoped caption and tint have something to read.
 
+### How old the quota reading is on `--json`
+
+| key | shape | what it is |
+|---|---|---|
+| `lastProbeMs` | Unix ms or `null` | when the background usage probe last finished, whether it succeeded or failed |
+| `quotaUpdatedAtMs` | Unix ms or `null` | when a quota reading was last taken from either source: a successful probe, or a served response that carried rate-limit headers. `null` when nothing has been read since the server started |
+
+Use `quotaUpdatedAtMs` to judge whether the bars are current. `lastProbeMs` cannot: a busy
+account's bars move from response headers between probes, and a failed probe moves
+`lastProbeMs` while reading nothing, so an idle account with a broken probe shows frozen bars
+next to a recent probe time. A server built before this key existed omits it.
+
+```sh
+tcr status --json | jq -r '.[] | "\(.name)\t\(((now * 1000 - (.quotaUpdatedAtMs // 0)) / 60000) | floor)m"'
+```
+
 ### The group keys on `--json`
 
 Each row carries its group labels plus the subsets that change what the row can serve. All

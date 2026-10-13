@@ -2271,6 +2271,15 @@ fn render_accounts_json(
                 last_probe_ms: a
                     .last_probe
                     .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
+                // When a quota reading was last taken from EITHER source, the
+                // probe or a served response's headers
+                // (`AccountSnapshot::quota_updated_at`). `lastProbeMs` above
+                // cannot tell a consumer how old the bars are: headers move them
+                // between probes, and a failed probe stamps it while reading
+                // nothing. Real on both paths, like `lastProbeMs`.
+                quota_updated_at_ms: a
+                    .quota_updated_at
+                    .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
                 probe_status: a.probe_status.as_str().to_string(),
                 probe_error: a.probe_error.clone(),
                 // Decayed count of stream failures — an in-band SSE `error` event,
@@ -5935,6 +5944,78 @@ mod tests {
         );
     }
 
+    /// `tcr status --json` carries `quotaUpdatedAtMs`, the time of the newest
+    /// quota reading, on both the offline path (its own probe) and the live
+    /// path (the server's payload, rebuilt by `into_snapshot`), and the two
+    /// agree.
+    #[tokio::test]
+    async fn render_accounts_json_carries_quota_updated_at() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let before = crate::now_ms();
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(BelowThresholdWindowProber),
+            true,
+        )
+        .await;
+        let render = |snapshot: &StatsSnapshot, source: StatusSource| {
+            let json = render_accounts_json(
+                snapshot,
+                &thresholds,
+                source,
+                None,
+                false,
+                None,
+                &Default::default(),
+            );
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(&json).expect("json is a bare array");
+            rows.into_iter()
+                .find(|r| r["name"] == "alice@example.com")
+                .expect("alice row")
+        };
+
+        let offline = render(&snapshot, StatusSource::Offline);
+        let at = offline["quotaUpdatedAtMs"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("a probed row carries quotaUpdatedAtMs: {offline}"));
+        assert!(
+            at >= before && at <= crate::now_ms(),
+            "a fresh probe reads as recent: {at}"
+        );
+
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &snapshot,
+            &thresholds,
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let (rebuilt, rebuilt_thresholds) = back.into_snapshot();
+        let live_json = render_accounts_json(
+            &rebuilt,
+            &rebuilt_thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
+        let live: Vec<serde_json::Value> = serde_json::from_str(&live_json).expect("json");
+        let live = live
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        assert_eq!(
+            live["quotaUpdatedAtMs"], offline["quotaUpdatedAtMs"],
+            "the live path carries the same instant the server read"
+        );
+    }
+
     #[tokio::test]
     async fn render_accounts_json_omits_reset_when_no_live_reset_exists() {
         let config = load_from(TWO_ACCOUNTS);
@@ -6183,6 +6264,7 @@ mod tests {
             rate_limited_until: None,
             probe_status,
             last_probe: None,
+            quota_updated_at: None,
             probe_error: probe_error.map(str::to_string),
             quota_state,
             gate: crate::stats::GateReason::Ok,
@@ -6484,6 +6566,9 @@ mod tests {
         // and the render stays deterministic.
         accounts[2].free_at = Some(fixture_instant(1_767_312_000_000));
         accounts[2].rate_limited_until = Some(fixture_instant(1_767_225_600_000));
+        // Same reason for `quotaUpdatedAtMs`: a number on the ordinary row, null
+        // on the others, so both shapes are pinned.
+        accounts[0].quota_updated_at = Some(fixture_instant(1_767_225_600_000));
 
         let thresholds = vec![0.9; accounts.len()];
         (
@@ -7034,6 +7119,7 @@ mod tests {
             rate_limited_until: None,
             probe_status: crate::probe::ProbeStatus::Never,
             last_probe: None,
+            quota_updated_at: None,
             probe_error: None,
             quota_state: QuotaState::Normal,
             gate: crate::stats::GateReason::Ok,

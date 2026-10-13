@@ -251,6 +251,12 @@ pub struct AccountStatus {
     pub rate_limited_until_ms: Option<i64>,
     pub probe_status: ProbeStatus,
     pub last_probe_ms: Option<i64>,
+    /// [`AccountSnapshot::quota_updated_at`]: when a quota reading was last taken,
+    /// from a probe or response headers. `#[serde(default)]` so an older server's
+    /// payload, which has no such key, decodes as `None` ("not reported"); no
+    /// [`STATUS_KIND`] bump, for the reason [`StatusPayload::peers_error`] gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_updated_at_ms: Option<i64>,
     pub probe_error: Option<String>,
     pub quota_state: QuotaState,
     pub gate: GateReason,
@@ -412,6 +418,7 @@ impl StatusPayload {
                 rate_limited_until_ms: a.rate_limited_until.map(to_ms),
                 probe_status: a.probe_status,
                 last_probe_ms: a.last_probe.map(to_ms),
+                quota_updated_at_ms: a.quota_updated_at.map(to_ms),
                 probe_error: a.probe_error.clone(),
                 quota_state: a.quota_state,
                 gate: a.gate,
@@ -497,6 +504,7 @@ impl StatusPayload {
                     rate_limited_until: a.rate_limited_until_ms.and_then(from_ms),
                     probe_status: a.probe_status,
                     last_probe: a.last_probe_ms.and_then(from_ms),
+                    quota_updated_at: a.quota_updated_at_ms.and_then(from_ms),
                     probe_error: a.probe_error,
                     quota_state: a.quota_state,
                     gate: a.gate,
@@ -1737,6 +1745,7 @@ mod tests {
                 rate_limited_until: None,
                 probe_status: ProbeStatus::Ok,
                 last_probe: from_ms(crate::now_ms()),
+                quota_updated_at: None,
                 probe_error: None,
                 quota_state: QuotaState::Normal,
                 gate: GateReason::Ok,
@@ -2117,6 +2126,47 @@ mod tests {
         // renderer one layer out has the same fact to work with.
         let (snapshot, _) = payload.into_snapshot();
         assert_eq!(snapshot.accounts[0].usage, None);
+    }
+
+    /// An older server sends no `quotaUpdatedAtMs`. The row must still decode,
+    /// read as `None` ("this server does not report it"), and carry that absence
+    /// into the rebuilt snapshot, never a fabricated "just now".
+    #[test]
+    fn a_payload_without_quota_updated_at_still_decodes() {
+        let old_server = r#"{"kind":"tcr.status.v1","accounts":[{"name":"alice@example.com","priority":0,"status":"active","disabled":false,"fiveHour":0.5,"fiveHourResetMs":null,"sevenDay":null,"sevenDayResetMs":null,"sevenDayOi":null,"requests":7,"inputTokens":1000,"outputTokens":200,"cacheReadTokens":750,"cacheCreationTokens":50,"lastUsedMs":null,"rateLimitedUntilMs":null,"probeStatus":"ok","lastProbeMs":1767225600000,"probeError":null,"quotaState":"normal","gate":"ok","freeAtMs":null,"threshold":0.85,"lastStreamError":null}]}"#;
+        let payload: StatusPayload = serde_json::from_str(old_server)
+            .expect("a payload with no quotaUpdatedAtMs key must still deserialize");
+        let account = payload.accounts.first().expect("one account");
+        assert_eq!(account.quota_updated_at_ms, None);
+        assert_eq!(account.last_probe_ms, Some(1_767_225_600_000));
+        let (snapshot, _) = payload.into_snapshot();
+        assert_eq!(snapshot.accounts[0].quota_updated_at, None);
+    }
+
+    /// The other direction: a value on the wire survives the server to CLI
+    /// round trip unchanged.
+    #[test]
+    fn quota_updated_at_round_trips_through_the_payload() {
+        let mut snapshot = snapshot_with_counters();
+        snapshot.accounts[0].quota_updated_at = from_ms(1_767_225_600_000);
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        assert!(
+            wire.contains("\"quotaUpdatedAtMs\":1767225600000"),
+            "camelCase key carries the instant in ms: {wire}"
+        );
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let (rebuilt, _) = back.into_snapshot();
+        assert_eq!(
+            rebuilt.accounts[0].quota_updated_at,
+            from_ms(1_767_225_600_000)
+        );
     }
 
     /// The other direction: a usage object on the wire survives the round trip
