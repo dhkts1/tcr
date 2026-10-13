@@ -1,0 +1,31 @@
+name: Feature request
+description: Something tcr or TcrBar should do that it does not do today.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This tracker is public.** Leave out account emails, organization and account UUIDs,
+        workspace or org names, tokens, and anything from your config file.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where tcr gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like
+      description: The change you have in mind, if you have one.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where
+      options:
+        - The tcr CLI or proxy
+        - TcrBar (the macOS menu-bar app)
+        - The TUI
+        - Docs
+        - Not sure
