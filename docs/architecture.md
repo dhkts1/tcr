@@ -22,7 +22,7 @@ client                      tcr: ONE listener on 127.0.0.1:<port>
   v
 one axum router, identical for both modes
   |
-  v  local routes: GET /_tcr/status | POST /_tcr/accounts/disabled
+  v  local routes: GET /_tcr/status | GET /_tcr/quota | POST /_tcr/accounts/disabled
   v  everything else -> the forwarding handler
 api-key gate -> path-shape gate -> /_tcr guard -> host guard (421)
   -> relay bypass for /v1/code and the OAuth file endpoints

@@ -679,6 +679,24 @@ of request counts, oldest first, decaying to zeros as the session goes idle); th
 top-level `sessionsSummary` is the same `byTool` shape summed across every session server-side, so
 a panel's fleet-wide headline never disagrees with the per-session rows by re-summing them itself.
 
+### `GET /_tcr/quota`, the light read for a status line
+
+A Claude Code status line ticks every turn and needs only the quota, so it can call this instead of
+`/_tcr/status`. It answers from the running proxy's memory: no probe, no upstream call, no file
+read. Same gate as `/_tcr/status` (loopback only, and `x-api-key` when `proxy.apiKey` is set); any
+verb but `GET` is a local 405.
+
+```json
+{"kind":"tcr.quota.v1","accounts":[
+  {"name":"alice","gate":"ok","fiveHour":0.5,"fiveHourResetMs":1767225600000,
+   "sevenDay":0.2,"sevenDayResetMs":1767830400000}]}
+```
+
+One row per account in the server's order. `gate` is the same token `tcr status --json` reports
+(`ok`, `hold`, `five-hour`, `seven-day`, ...); utilizations are fractions and resets are Unix
+milliseconds, `null` when the window has no reading yet. Check `kind` before trusting a body: a tcr
+too old to have the route answers it with a local 404.
+
 ---
 
 ## `tcr doctor`

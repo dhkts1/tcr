@@ -860,6 +860,11 @@ fn stable_session_key(
 /// ever answers locally belongs under this prefix.
 pub const STATUS_PATH: &str = "/_tcr/status";
 
+/// Path of the light quota read [`quota_handler`] serves, for a status line that
+/// ticks every turn: per account its gate and its 5-hour and weekly utilization,
+/// read from memory. `GET` only, behind the same gate as [`STATUS_PATH`].
+pub const QUOTA_PATH: &str = "/_tcr/quota";
+
 /// Path of the live account-control endpoint [`set_disabled_handler`] serves —
 /// `POST` only, the one route on this process that MUTATES rotation.
 ///
@@ -1377,6 +1382,12 @@ pub fn app(manager: Arc<Manager>) -> Router {
             STATUS_PATH,
             axum::routing::get(status_handler).fallback(status_method_not_allowed),
         )
+        // The quota read: a pure GET like the status route, registered the same
+        // way and for the same reasons.
+        .route(
+            QUOTA_PATH,
+            axum::routing::get(quota_handler).fallback(quota_method_not_allowed),
+        )
         // The two MUTATING local routes. Same reasoning as above, and the method
         // fallback matters more here: an unregistered method must answer a local
         // 405, never fall through to `handle` and be forwarded upstream.
@@ -1579,6 +1590,49 @@ async fn status_handler(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     // Operational state that is stale the instant it is read, from a
     // credential-holding process — never store it anywhere.
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+}
+
+/// A non-`GET` on [`QUOTA_PATH`]. A local 405, for the reasons
+/// [`status_method_not_allowed`] gives.
+async fn quota_method_not_allowed() -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr quota endpoint is read-only: GET.",
+        None,
+    )
+}
+
+/// `GET /_tcr/quota`: per account its gate and its 5-hour and weekly
+/// utilization with resets, the [`crate::status::QuotaPayload`] projection.
+///
+/// Gated exactly as [`status_handler`] is, through [`local_endpoint_gate`]. It
+/// answers from the manager's in-memory snapshot only: no probe, no token
+/// refresh, no upstream call and, unlike the status route, no peers-file read,
+/// so a status line can call it on every turn.
+async fn quota_handler(
+    State(manager): State<Arc<Manager>>,
+    parts: axum::http::request::Parts,
+) -> Response {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "quota") {
+        return refusal;
+    }
+
+    let payload =
+        crate::status::QuotaPayload::from_snapshot(&manager.snapshot(OffsetDateTime::now_utc()));
+    let Ok(body) = serde_json::to_string(&payload) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "Could not serialize the quota snapshot.",
+            None,
+        );
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert("cache-control", HeaderValue::from_static("no-store"));
     response
 }
