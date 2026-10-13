@@ -21,7 +21,8 @@ env:
 
 jobs:
   # Decide ONCE whether this change can possibly affect a build or a test, so the
-  # four expensive jobs below can sit out a change that only edits prose.
+  # four expensive jobs below can sit out a change that only edits prose. `ci`
+  # sits out only its build and test steps: its secret scan runs on every change.
   #
   # Measured on #341, nine lines of apps/macos/appcast.xml: macos 294s, ci 179s,
   # tsan 122s, miri 88s, 715 seconds total, on a file nothing compiles.
@@ -66,22 +67,91 @@ jobs:
           verdict="$(printf '%s\n' "${paths}" | .github/scripts/changed-is-inert.sh)"
           echo "verdict: ${verdict}"
           if [ "${verdict}" = "inert" ]; then
-            echo "nothing here can affect a build; ci, macos, tsan and miri will skip."
+            echo "nothing here can affect a build; ci runs only its secret scan, macos, tsan and miri will skip."
             echo "inert=true" >>"${GITHUB_OUTPUT}"
           else
             echo "inert=false" >>"${GITHUB_OUTPUT}"
           fi
 
+  # Unlike macos, tsan and miri, this job carries no job-level `if:`. A
+  # docs-only change still runs it, and every step after the secret scan
+  # carries the inert condition on its own instead. The reason is the scan: a
+  # token pasted into a README is the likeliest leak this repository has, and
+  # a README edit is exactly the change the inert rule skips. A skipped job
+  # reports as passing to branch protection, so a scan inside a skipped `ci`
+  # would let that README merge with every required check green. On an inert
+  # change this job costs a checkout and one scan, a few seconds.
   ci:
     name: ci
     needs: changes
-    if: needs.changes.outputs.inert != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The scan below reads the commits between the pull request's base
+          # and head, and a depth-1 checkout has neither.
+          fetch-depth: 0
+
+      # The backstop for the pre-commit hook's `gitleaks git --staged`, with the
+      # same .gitleaks.toml. That hook yields to `--no-verify` and a fork never
+      # runs it, so without this step nothing on the way to `main` scans for
+      # credentials at all.
+      #
+      # It scans the pull request's own commits (base..head), not the whole
+      # history, so the result measures this change: an old finding that was
+      # later allowlisted cannot turn every pull request red. On a push to main
+      # it scans the pushed range; when the old tip is gone (a force push) it
+      # scans the tree instead.
+      #
+      # The binary is the upstream release, pinned by version and by sha256,
+      # rather than a third-party action: the checksum is what makes the pin
+      # mean anything, and this job then runs no code beyond what it names.
+      # To bump it, take the new line from the release's
+      # gitleaks_<version>_checksums.txt.
+      - name: Secret scan (gitleaks)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}" gitleaks
+          gitleaks="${RUNNER_TEMP}/gitleaks"
+          "${gitleaks}" version
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            range="${PR_BASE}..${PR_HEAD}"
+          elif git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            range="${PUSH_BEFORE}..${PUSH_AFTER}"
+          else
+            echo "old tip ${PUSH_BEFORE} is not in this clone; scanning the tree."
+            "${gitleaks}" dir --no-banner --redact --verbose --config .gitleaks.toml .
+            exit 0
+          fi
+          # `--remerge-diff` is what makes a merge commit's own changes visible.
+          # gitleaks runs `git log -p -U0 <log-opts>` (sources/git.go:75-91 at
+          # v8.30.1), and plain `git log -p` prints no diff for a merge, so a
+          # value added while resolving a conflict reached main unscanned. The
+          # remerge diff is the merge against git's own automatic merge of its
+          # parents: only what the merge introduced, never each parent's whole
+          # diff again (`-m` does that and reports one leak twice). `--cc` is no
+          # help: gitleaks cannot parse a combined diff and scans nothing.
+          # On a conflicted file gitleaks reports the path as `b/<path>`, so a
+          # path allowlist in .gitleaks.toml must stay unanchored to cover it.
+          echo "scanning commits ${range}, merge commits included"
+          "${gitleaks}" git --no-banner --redact --verbose --config .gitleaks.toml --log-opts="--remerge-diff ${range}" .
 
       - name: Install Rust toolchain
+        if: needs.changes.outputs.inert != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -90,15 +160,18 @@ jobs:
       # rustc version + job name, so this cache stays isolated from the tsan/
       # miri jobs' sanitizer builds. Typically 50-80% faster warm builds.
       - name: Cache cargo
+        if: needs.changes.outputs.inert != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Format
+        if: needs.changes.outputs.inert != 'true'
         run: cargo fmt --all --check
 
       # An `--org` flag on an account verb narrows nothing now that account
       # names are unique, so one would be a lie in `--help`. It came back once
       # already, one verb at a time — see the script's own header.
       - name: No --org flag
+        if: needs.changes.outputs.inert != 'true'
         run: scripts/check-no-org-flag.sh
 
       # SwiftUI's `.secondary`/`.tertiary` resolve against the system window
@@ -106,6 +179,7 @@ jobs:
       # `tcrbar-palette.py` measures and gates never applied to them. Thirteen
       # text runs had drifted onto them, the worst at 1.86:1 — see the script.
       - name: No hierarchical styles used as panel ink
+        if: needs.changes.outputs.inert != 'true'
         run: scripts/check-panel-ink.sh
 
       # `PanelV4/` is a transcription of the approved mockup's stylesheet, one
@@ -113,6 +187,7 @@ jobs:
       # drifted through hand-written sizes — a 16 here, an 8 there — so a view
       # that writes one, or reaches for a pre-v4 geometry token, is refused.
       - name: PanelV4 writes no sizes of its own
+        if: needs.changes.outputs.inert != 'true'
         run: scripts/check-panel-v4.sh
 
       # This repository is public and takes pull requests from forks, which
@@ -122,6 +197,7 @@ jobs:
       # .githooks/lib/disclosure-scan.sh). This is the same check the hook
       # runs on a staged diff, run here over the whole tracked tree instead.
       - name: No internal-scaffolding citations in the tree
+        if: needs.changes.outputs.inert != 'true'
         run: scripts/check-public-disclosure.sh
 
       # The same check, over the PR's own title and body: a description that
@@ -129,7 +205,7 @@ jobs:
       # does. Skipped on a plain push to `main`, where there is no PR text to
       # check.
       - name: No internal-scaffolding citations in the PR title/body
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && needs.changes.outputs.inert != 'true'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -143,17 +219,21 @@ jobs:
       # email — in a diff AND in a commit message. A gate nobody has watched
       # fail is a gate that reports safety.
       - name: Disclosure scan fixtures
+        if: needs.changes.outputs.inert != 'true'
         run: .githooks/test-disclosure-scan.sh
 
       # --locked: fail if CI would silently rewrite Cargo.lock. Pins the exact
       # dependency set that was reviewed — important for an auth-handling proxy.
       - name: Clippy
+        if: needs.changes.outputs.inert != 'true'
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
+        if: needs.changes.outputs.inert != 'true'
         run: cargo test --all --locked
 
       - name: Build (release)
+        if: needs.changes.outputs.inert != 'true'
         run: cargo build --release --locked
 
       # Tokens.swift says a failing design token is a build error. Until this
@@ -175,6 +255,7 @@ jobs:
       # stylesheet publishing the old hex under the generator's authority. The
       # generator writes nothing when it fails, so the diff cannot mask it.
       - name: Design tokens (contrast + freshness)
+        if: needs.changes.outputs.inert != 'true'
         run: |
           python3 scripts/tcrbar-palette.py \
             --emit-css "$RUNNER_TEMP/tokens.css" \
