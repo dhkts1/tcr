@@ -4,16 +4,18 @@
 
 # teamclaude-rs (`tcr`)
 
-A local proxy that spreads Claude Code across a pool of Claude accounts.
+A local proxy that runs Claude Code across multiple Claude accounts.
 
 Point Claude Code (or any Anthropic API client) at it. For each request it picks an account by
 looking at what every account has left in every quota window. It keeps a conversation on the
 account whose prompt cache is already warm, and it shows you what the traffic would have cost.
 
+[![Latest release](https://img.shields.io/github/v/release/dhkts1/teamclaude-rs)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
-[Install](#install) · [Usage](#usage) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
+[Install](#install) · [Usage](#usage) · [Compared with other tools](#compared-with-other-tools) · [FAQ](#faq) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
 
 [![Download TcrBar for macOS](https://img.shields.io/badge/Download-TcrBar%20for%20macOS-blue?style=for-the-badge)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
 [![Install the CLI](https://img.shields.io/badge/Install-the%20CLI-lightgrey?style=for-the-badge)](#install)
@@ -23,6 +25,20 @@ account whose prompt cache is already warm, and it shows you what the traffic wo
 <img src="assets/tcrbar-panel-healthy.png" alt="TcrBar menu-bar panel showing a healthy fleet" width="400">
 
 </div>
+
+## Why tcr
+
+- **It chooses by quota, not by turn.** It reads the five-hour, weekly and per-model weekly window
+  on every account, and spends first the quota that resets soonest, so less of it expires unused.
+- **It keeps the prompt cache warm.** Anthropic caches per account, so each conversation stays on
+  one account. Over 30 days of the author's own traffic, ending 2026-10-13, 97.6% of prompt tokens
+  were read from cache.
+- **One proxy serves every session.** Each Claude Code session on the machine gets its own pin, and
+  you can add, disable or remove accounts while it runs.
+- **You can watch it.** A macOS menu-bar app and a terminal dashboard show every window, every
+  session, and what the traffic would have cost at list price.
+- **It stays on your machine.** No telemetry and no crash reporting. Tokens, logs and pins are
+  files on your own disk.
 
 ## Install
 
@@ -242,6 +258,65 @@ a Mac you already trust uses `IK`, and `IKpsk1` is for when a join key has been 
 WireGuard is built on the same handshake family, and if you want to understand how any
 Diffie-Hellman based authentication works, that one spec is the best hour you can spend.
 [`docs/peers.md`](docs/peers.md) covers finding, trusting, lending and what each step sends.
+
+## Compared with other tools
+
+Several tools let Claude Code use more than one account. They differ in where they sit: a proxy in
+the request path chooses an account for every request, while a switcher changes which login Claude
+Code itself holds.
+
+| Tool | How it switches | How it picks an account | Keeps each conversation on one account | Runs on | License |
+|---|---|---|---|---|---|
+| **tcr** | Local proxy in the request path | Every request, by what is left in the five-hour, weekly and per-model weekly windows | Yes, always; moves only when that account cannot serve | macOS, Linux | PolyForm Noncommercial |
+| [claude-swap](https://github.com/realiti4/claude-swap) | Swaps Claude Code's stored login, for the whole machine or one terminal | By hand, next in turn, or automatically at a five-hour or seven-day threshold | Per terminal with `cswap run`; a switch moves the running session, which its README says rebuilds the cache | macOS, Linux, Windows | MIT |
+| [teamclaude](https://github.com/KarpelesLab/teamclaude) | Local proxy in the request path | Rotates when the five-hour or weekly window reaches a threshold, and tracks the per-model weekly cap | Opt-in with `distributeSessions`, off by default | Node.js 20+ | MIT |
+| [ccs](https://github.com/kaitranntt/ccs) | Launches Claude Code with a chosen profile; account pools go through a local proxy | Profile chosen at launch; pools rotate round-robin by default, or fill-first | Not stated in its README | macOS, Linux, Windows | MIT |
+| [Quotio](https://github.com/nguyenphutrong/quotio) | macOS app that manages a local proxy (CLIProxyAPI) | Round-robin or fill-first | Not stated in its README | macOS app; CLI on macOS and Linux | MIT |
+| [cux](https://github.com/inulute/cux) | Swaps the login, restarts Claude Code and resumes the conversation | On a rate limit by default, with optional five-hour and seven-day thresholds | No: moving the conversation is how it works | Linux, macOS, Windows | GPL-3.0 |
+| [cc-account-switcher](https://github.com/ming86/cc-account-switcher) | Swaps the stored login while Claude Code is closed | By hand | Not stated in its README | macOS, Linux, WSL | MIT |
+
+Each row comes from that project's own README and docs, read on 2026-10-13. "Not stated" means its
+README does not say, not that the tool cannot.
+
+Another tool fits better if you need Windows (claude-swap, ccs, cux), want Codex, Gemini or other
+providers behind the same tool (teamclaude, ccs, Quotio), want no proxy in the request path
+(claude-swap, cux, cc-account-switcher), or need an open-source license for commercial use (every
+other row).
+
+## FAQ
+
+### How do I use Claude Code with more than one Claude account?
+
+Install `tcr`, run `tcr login` once for each account, start the proxy with `tcr` (or let TcrBar run
+it), and launch Claude Code with `tcr run`. Every request then goes through the proxy, which picks
+an account from the pool. If you are already logged in to Claude Code, the first run imports that
+login, so you only log in to the others.
+
+### Does switching accounts lose the prompt cache?
+
+Yes. Anthropic keeps the prompt cache per account, so a conversation that moves rebuilds its whole
+cached prefix. That is why `tcr` keeps each conversation on one account, even past the point where
+it would send new conversations elsewhere. It moves only when that account cannot serve the
+request. Pins are saved to disk, so a restart keeps them for conversations still within the cache
+lifetime.
+
+### What happens when an account runs out?
+
+New conversations skip any account that is close to a limit, on a rate-limit hold, or out of the
+model window a request needs, and go to the account the quota rules pick next. A conversation
+already on that account moves once, and pays one cache rebuild.
+
+### Does it run on Linux, and with API keys?
+
+The `tcr` CLI and terminal dashboard run on Linux as static builds for x86_64 and aarch64. TcrBar,
+the menu-bar app, is macOS only. Accounts can be Claude subscriptions, logged in through the
+browser, or Anthropic API keys.
+
+### How is this related to teamclaude?
+
+`tcr` is a from-scratch Rust rewrite of the Node proxy
+[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and drops in for it: same
+config file, certificates and port.
 
 ## Documentation
 
