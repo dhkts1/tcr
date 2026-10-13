@@ -1,1 +1,2 @@
-setting = "left"
+setting = "both"
+TCR_PROXY_API_KEY = "q7Zt9Rw2Kx4Lm8Np3Vb6Hj1Yc5Gd0Sf7"
