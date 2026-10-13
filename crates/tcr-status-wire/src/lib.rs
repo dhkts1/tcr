@@ -367,6 +367,13 @@ pub struct AccountStatusRow {
     pub cache_read_tokens: Option<u64>,
     pub cache_hit_ratio: Option<f64>,
     pub last_probe_ms: Option<i64>,
+    /// When a quota reading was last taken, from a probe OR response headers, in
+    /// Unix ms; `null` when nothing has been read. `lastProbeMs` cannot say how
+    /// old the windows are: headers move them between probes, and a failed probe
+    /// stamps it while reading nothing. `#[serde(default)]` so a row from an
+    /// older server, which has no such key, decodes as `None`.
+    #[serde(default)]
+    pub quota_updated_at_ms: Option<i64>,
     pub probe_status: String,
     pub probe_error: Option<String>,
     pub stream_error_count: Option<u64>,

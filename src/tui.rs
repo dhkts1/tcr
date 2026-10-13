@@ -2056,6 +2056,7 @@ mod tests {
             rate_limited_until: None,
             probe_status: ProbeStatus::Never,
             last_probe: None,
+            quota_updated_at: None,
             probe_error: None,
             quota_state: QuotaState::Normal,
             gate,

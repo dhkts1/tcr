@@ -235,6 +235,7 @@ impl Manager {
                         .and_then(ms_to_odt),
                     probe_status: a.probe_status,
                     last_probe: a.last_probe_ms.and_then(ms_to_odt),
+                    quota_updated_at: a.quota.updated_at,
                     probe_error: a.probe_error.clone(),
                     quota_state,
                     gate,

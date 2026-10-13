@@ -7398,6 +7398,125 @@ mod tests {
         assert_eq!(snap.accounts[1].five_hour, None);
     }
 
+    /// `quotaUpdatedAtMs` is the time of the newest quota reading from EITHER
+    /// source, so a consumer can tell a reading too old to trust from a fresh
+    /// one. `lastProbeMs` alone cannot: a busy account's bars move from response
+    /// headers between probes, and an idle account with a wedged probe shows
+    /// frozen bars that `lastProbeMs` (stamped on failures too) reads as recent.
+    ///
+    /// Walks the hops a consumer sees: the runtime `Quota`, the manager's
+    /// snapshot, and the `tcr.status.v1` payload the server sends the CLI.
+    #[tokio::test]
+    async fn quota_updated_at_is_the_newest_reading_from_probe_or_headers() {
+        let manager = build_manager_with_prober(
+            config_with(vec![account("ok", 0), account("bad", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ScriptedProber {
+                ok_token: "at-ok".to_string(),
+            }),
+        );
+        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            let payload = crate::status::StatusPayload::from_snapshot(
+                &snap,
+                &[],
+                false,
+                None,
+                Default::default(),
+            );
+            let json = serde_json::to_value(&payload).expect("payload serializes");
+            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
+        };
+
+        // Nothing read yet: absent, never a fabricated "just now".
+        assert_eq!(wire_value(&manager, 0), None);
+
+        // A fresh account: a successful probe stamps a recent reading.
+        let before = crate::now_ms();
+        manager.probe_all().await;
+        let fresh = wire_value(&manager, 0).expect("a probed account carries quotaUpdatedAtMs");
+        assert!(
+            fresh >= before && fresh <= crate::now_ms(),
+            "a fresh probe reads as recent: {fresh} not in [{before}, now]"
+        );
+        // A FAILED probe is not a reading: `lastProbeMs` moves, this does not.
+        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+            .last_probe
+            .is_some());
+        assert_eq!(
+            wire_value(&manager, 1),
+            None,
+            "a failed probe read no quota and must not claim one"
+        );
+
+        // A stale account: the last reading was 40 minutes ago, past any sane
+        // freshness limit, and the wire says exactly when.
+        let stale = crate::now_ms() - 40 * 60 * 1000;
+        {
+            let mut accounts = accounts_mut(&manager);
+            accounts[0].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        }
+        assert_eq!(
+            wire_value(&manager, 0),
+            Some(stale),
+            "the status row carries the exact time of the stale reading"
+        );
+
+        // A response with no rate-limit headers (an error page) is silence, not
+        // a reading: the stale time stands.
+        manager.update_quota(0, &reqwest::header::HeaderMap::new());
+        assert_eq!(wire_value(&manager, 0), Some(stale));
+
+        // A header update after the stale probe moves it forward.
+        let before = crate::now_ms();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.30".parse().expect("header value"),
+        );
+        manager.update_quota(0, &headers);
+        let moved = wire_value(&manager, 0).expect("still present");
+        assert!(
+            moved >= before,
+            "a 5h header reading moves quotaUpdatedAtMs forward: {moved} < {before}"
+        );
+
+        // A header update that returns `false` (no 5h window) but reads the 7d
+        // window is still a reading, and also moves it forward.
+        {
+            let mut accounts = accounts_mut(&manager);
+            accounts[0].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        }
+        let before = crate::now_ms();
+        let mut weekly_only = reqwest::header::HeaderMap::new();
+        weekly_only.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.40".parse().expect("header value"),
+        );
+        assert!(
+            !manager.update_quota(0, &weekly_only),
+            "control: this response carries no 5h window"
+        );
+        let moved = wire_value(&manager, 0).expect("still present");
+        assert!(
+            moved >= before,
+            "a 7d-only header reading moves quotaUpdatedAtMs forward: {moved} < {before}"
+        );
+    }
+
+    /// Write access to the runtime rows, for tests that rewind a timestamp.
+    fn accounts_mut(manager: &Manager) -> std::sync::RwLockWriteGuard<'_, Vec<AccountRuntime>> {
+        manager.accounts.write().expect("accounts lock poisoned")
+    }
+
     /// Probe 429-tolerance: the usage endpoint throttling the *probe* is benign.
     /// After a good probe learns a bar, a following 429 probe must (a) read as
     /// `RateLimited`, never `Error`, and (b) leave the last-good utilization
