@@ -327,7 +327,7 @@ leftovers.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; `<= 0` disables probing |
+| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; halved for an account held out by its own quota; at most 20 probes per account in any trailing hour; `<= 0` disables probing |
 | `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task |
 
 ### Both cadences are random per account, not a fleet sweep
@@ -346,6 +346,17 @@ Consequences worth knowing before you tune either number:
   than re-anchoring the fleet's phase on boot time.
 - A single account's gap between probes is never the number you configured; it is a fresh
   draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
+- An account at or over its switch threshold, or one upstream answered `rejected`, is probed
+  around HALF the cadence (`105..=195s` at the default). It is out of rotation, so no served
+  response refreshes its quota and only a probe sees its window roll. An account serving
+  traffic is not probed any faster: every response's headers already rewrite the same
+  windows a probe reads.
+- No account is probed more than 20 times in any trailing 60 minutes, whatever the cadence.
+  The usage endpoint's budget was measured by claude-swap at about 28 to 30 requests per
+  identity in a trailing hour, not a refilling bucket. A `quotaProbeSeconds` under 180 is
+  therefore held to that cap rather than run as configured. The boot sweep, a probe's one
+  `401` retry and `tcr accounts --probe` are not counted, which is why the cap sits well
+  under the measured figure.
 - The probe (not keep-warm) still does ONE whole-fleet sweep at boot, spaced 350 ms, so the
   bars populate immediately instead of after a random offset.
 - Randomness is drawn from a SplitMix64 generator seeded once from the boot clock. There is
