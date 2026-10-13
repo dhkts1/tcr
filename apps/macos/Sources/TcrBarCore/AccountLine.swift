@@ -196,8 +196,15 @@ extension FleetSection {
     /// a view that draws it in a colour of its own.
     public func firstBackCountdown(now: Date) -> String? {
         guard band == .outOfTokens else { return nil }
+        return Self.firstBackCountdown(rows.map(\.account), now: now)
+    }
+
+    /// The soonest ``Account/backAtMs`` among `accounts` that is still ahead,
+    /// as a countdown. One rule for this heading and for the strip's "next
+    /// back in" (unit H3), so the two can never show different figures.
+    public static func firstBackCountdown(_ accounts: [Account], now: Date) -> String? {
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
-        let soonest = rows.compactMap(\.account.backAtMs).filter { $0 > nowMs }.min()
+        let soonest = accounts.compactMap(\.backAtMs).filter { $0 > nowMs }.min()
         return QuotaFormat.resetCaption(resetAtMs: soonest, now: now)
     }
 }

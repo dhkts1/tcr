@@ -164,6 +164,11 @@ struct FleetView: View {
     /// `AccountHoverCard.swift`.
     @State private var hoverCard = HoverCardTracker()
 
+    /// The account whose segment the pointer is on in the strip over the
+    /// Accounts tab (unit H3), by ``Account/id``. Lights every line of that
+    /// account; opens no hover card.
+    @State private var litAccount: String?
+
     /// Accounts / Sessions / Tools (F2 + F3). `.accounts` selected by default.
     @State private var selectedTab: PanelTab = .accounts
 
@@ -280,7 +285,10 @@ struct FleetView: View {
         // frame. The render harness has no pointer, so this is the only way it
         // can draw the card; the live app leaves it `nil` and the pointer
         // drives it.
-        initialHoverCard: String? = nil
+        initialHoverCard: String? = nil,
+        // The account (``Account/id``) whose strip segment is pointed at on
+        // the first frame, for the same reason: the harness has no pointer.
+        initialLitAccount: String? = nil
     ) {
         self.poller = poller
         self.server = server
@@ -305,6 +313,7 @@ struct FleetView: View {
         self._claudeCount = State(initialValue: initialClaudeCount)
         self._claudeRoute = State(initialValue: initialClaudeRoute)
         self._hoverCard = State(initialValue: HoverCardTracker(shown: initialHoverCard))
+        self._litAccount = State(initialValue: initialLitAccount)
     }
 
     /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
@@ -570,7 +579,7 @@ struct FleetView: View {
         if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
             switch visibleTab {
             case .accounts:
-                SummaryLine.accounts(fleet)
+                if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
@@ -653,6 +662,10 @@ struct FleetView: View {
         case .loaded(let fleet) where !fleet.accounts.isEmpty:
             switch visibleTab {
             case .accounts:
+                // Over the list and outside its `ScrollView`, so it does not
+                // scroll; the list's own budget is unchanged and the panel
+                // grows by the strip (option H's note: "the list is the same").
+                accountsStrip(fleet)
                 if fleet.source.countersAreStructural {
                     offlineNotice(fleet.source)
                 }
@@ -716,6 +729,24 @@ struct FleetView: View {
         Task { await peers.refresh() }
     }
 
+    /// The strip over the Accounts tab (unit H3), from the same sections,
+    /// caps and forms ``AccountsTabV4`` draws, so its segments read in the
+    /// list's own order.
+    private func accountsStrip(_ fleet: Fleet) -> some View {
+        FleetStripHeader(
+            strip: AccountsTabV4<EmptyView, EmptyView>.strip(
+                fleet: fleet, controlName: control.current, expandedGroups: expandedGroups,
+                lentTo: peers.snapshot.lentTo, exits: peers.snapshot.exits, now: Date()),
+            lit: litAccount
+        ) { account, inside in
+            if inside {
+                litAccount = account
+            } else if litAccount == account {
+                litAccount = nil
+            }
+        }
+    }
+
     private func accountsTabV4(_ fleet: Fleet) -> some View {
         accountsTabBody(fleet)
             // One read per visit to this tab, for the lent-to lines. The read
@@ -751,6 +782,7 @@ struct FleetView: View {
                 onSettings()
             },
             hoveredRow: hoverCard.shown,
+            litAccount: litAccount,
             onHoverLine: { rowID, inside in
                 if inside {
                     hoverCard.rowEntered(rowID)

@@ -691,6 +691,33 @@ enum V4 {
     /// from the row onto the card without the card vanishing under it.
     static let hoverCardGraceSeconds: Double = 0.15
 
+    // MARK: - The strip over the Accounts tab (option H: `.hsum`, `.hstrip`, `.hseg`)
+
+    /// `.hsum.htop{margin:0 4px 8px}`. The bottom is the tab bar's own
+    /// ``segMarginBottom`` (8 at Compact, as the frame draws it), so the first
+    /// block of the list collapses into it through ``marginAfterStrip(_:)``
+    /// exactly as it collapsed into the tab bar before the strip came between.
+    static let stripPaddingSide: CGFloat = 4
+    static var stripMarginBottom: CGFloat { segMarginBottom }
+    /// `.hsum .hl:first-child{font-size:13.5px}`: half a point over the
+    /// summary size at either density.
+    static var stripHeadlineSize: CGFloat { summarySize + stripHeadlineStep }
+    static let stripHeadlineStep: CGFloat = 0.5
+    /// `.hl{gap:6px}`.
+    static let stripHeadlineGap: CGFloat = 6
+    /// `.hstrip{gap:2px;height:14px;margin:5px 0 5px}`, `.hseg{border-radius:3px}`.
+    static let stripHeight: CGFloat = 14
+    static let stripGap: CGFloat = 2
+    static let stripMarginV: CGFloat = 5
+    static let stripSegmentRadius: CGFloat = 3
+    /// `.hseg.spent{background:rgba(234,90,86,.55)}`, `.hseg.off{background:
+    /// rgba(148,146,141,.3)}`: the whole segment washed, no fill.
+    static let stripSpentAlpha: Double = 0.55
+    static let stripOffAlpha: Double = 0.3
+    /// `.hseg.on{box-shadow:0 0 0 2px var(--ink)}`: a 2 pt ring OUTSIDE the
+    /// segment, drawn as an overlay so pointing at one changes no size.
+    static let stripRingWidth: CGFloat = 2
+
     // MARK: - Peers tab literals
 
     /// The width of the frame around the row's "more" ellipsis glyph
