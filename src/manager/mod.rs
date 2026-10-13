@@ -610,6 +610,18 @@ pub enum SetDisabledOutcome {
     Ambiguous(Vec<String>),
 }
 
+/// What [`Manager::set_priority_by_query`] did. Same resolution arms as
+/// [`SetDisabledOutcome`], with no durable half: the CLI writes the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetPriorityOutcome {
+    /// The RESOLVED name of the account whose priority is now in force.
+    Applied { name: String },
+    /// The query named no account in the live rotation.
+    NoMatch,
+    /// The query named more than one.
+    Ambiguous(Vec<String>),
+}
+
 /// What [`Manager::add_or_update_account`] did.
 ///
 /// Same shape as [`SetDisabledOutcome`] — resolve by identity against the LIVE
@@ -2540,6 +2552,32 @@ impl Manager {
         SetDisabledOutcome::Applied {
             name,
             persist: self.set_disabled(idx, disabled),
+        }
+    }
+
+    /// Resolve `query` against the LIVE rotation and set that account's
+    /// `priority` in memory, so the next selection ranks by it. For the
+    /// [`crate::proxy::PRIORITY_PATH`] route behind `tcr priority`.
+    ///
+    /// Memory only, deliberately unlike [`Self::set_disabled`]: `tcr priority`
+    /// computes the value from the config file (its `--first`/`--last` are
+    /// relative to the file's priorities) and writes the file itself, then
+    /// sends the resolved integer here. Resolution is the same
+    /// [`crate::identity::match_one`] over the rotation slots that
+    /// [`Self::set_disabled_by_query`] uses, for the same reason.
+    pub fn set_priority_by_query(&self, query: &str, priority: i64) -> SetPriorityOutcome {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let idx = match crate::identity::match_one(&accounts[..], query) {
+            crate::identity::Match::One(idx) => idx,
+            crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
+            crate::identity::Match::Ambiguous(names) => {
+                return SetPriorityOutcome::Ambiguous(names)
+            }
+        };
+        let account = &mut accounts[idx];
+        account.priority = priority;
+        SetPriorityOutcome::Applied {
+            name: account.name.clone(),
         }
     }
 

@@ -1387,7 +1387,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
         Some(Command::Token(args)) => run_token(args),
-        Some(Command::Priority(args)) => run_priority(args),
+        Some(Command::Priority(args)) => run_priority(args).await,
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Control(args)) => run_control(args).await,
@@ -1423,8 +1423,9 @@ fn run_token(args: TokenArgs) -> anyhow::Result<()> {
     cli::print_access_token(&config_path, &args.query)
 }
 
-/// `tcr priority <query> [N|--first|--last]` — set rotation priority.
-fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
+/// `tcr priority <query> [N|--first|--last]` — set rotation priority, in the
+/// RUNNING proxy where there is one.
+async fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let priority = if args.first {
         PriorityArg::First
@@ -1435,7 +1436,7 @@ fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("provide a priority value, or one of --first / --last");
     };
-    cli::set_priority(&config_path, &args.query, priority)
+    cli::set_priority(&config_path, &args.query, priority).await
 }
 
 /// `tcr enable <query>` — clear an account's `disabled` flag, in the
