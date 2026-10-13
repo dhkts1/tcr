@@ -684,7 +684,7 @@ mod tests {
             for idx in schedule.due(now) {
                 fires.push(now);
                 schedule.reschedule(idx, now, cadence, ProbeUrgency::NearLimit, &mut rng);
-                if fires.len() % 7 == 0 {
+                if fires.len().is_multiple_of(7) {
                     schedule.sync(now, &[], cadence, &mut rng);
                     schedule.sync(now, &[0], cadence, &mut rng);
                 }
