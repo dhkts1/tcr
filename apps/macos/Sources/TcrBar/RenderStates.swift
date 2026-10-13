@@ -128,6 +128,10 @@ enum RenderStates {
             // own seeding of `FleetView.expandedGroupsKey` for
             // `henry-team`, the wholly-parked group `parkedGroupJSON` builds.
             ("15b-parked-group-expanded", .loaded(fleet(parkedGroupJSON)), false, nil),
+            // A line INSIDE a group box with its hover card (unit H1b): carol,
+            // DEV's one live account, pinned by ``hoverCardFixture(for:)`` and
+            // held to the same with-and-without size check as 02b.
+            ("15c-parked-group-hover", .loaded(fleet(parkedGroupJSON)), false, nil),
             // F2 — the Sessions tab, grouped by account, one row with a
             // tool running and one waiting, plus an unassigned session with
             // no matching Claude Code session file (`sessionsFixture`'s
@@ -293,12 +297,17 @@ enum RenderStates {
         }
     }
 
-    /// The account whose hover card a scene shows, or `nil` for none: a lookup
-    /// by name for the reason ``initialTab(for:)`` is one.
+    /// The row whose hover card a scene shows (``FleetSectionRow/id``), or
+    /// `nil` for none: a lookup by name for the reason ``initialTab(for:)`` is
+    /// one.
     private static func hoverCardFixture(for sceneName: String) -> String? {
         switch sceneName {
-        case "02b-mixed-thirteen-hover": return "near@example.com"
-        case "02c-mixed-thirteen-hover-lower": return "spent-5@example.com"
+        case "02b-mixed-thirteen-hover":
+            return FleetSectionRow.id(group: .ungrouped, accountID: "near@example.com")
+        case "02c-mixed-thirteen-hover-lower":
+            return FleetSectionRow.id(group: .ungrouped, accountID: "spent-5@example.com")
+        case "15c-parked-group-hover":
+            return FleetSectionRow.id(group: .named("dev"), accountID: "carol@example.com")
         default: return nil
         }
     }

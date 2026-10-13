@@ -223,6 +223,10 @@ struct BandHeading: View {
 struct LineBox<Item: Identifiable, Row: View>: View {
     let items: [Item]
     let paddingH: CGFloat
+    /// `.sbox,.wbox{margin:0 0 8px}` on the tab itself. Inside a group box
+    /// the box keeps the spacing the group's cards had instead
+    /// (``V4/groupCardGap``), so the group closes at the same height.
+    var marginBottom: CGFloat = V4.lineBoxMarginBottom
     @ViewBuilder var row: (Item) -> Row
 
     var body: some View {
@@ -243,7 +247,7 @@ struct LineBox<Item: Identifiable, Row: View>: View {
         .overlay(
             RoundedRectangle(cornerRadius: V4.cardRadius)
                 .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth))
-        .padding(.bottom, V4.lineBoxMarginBottom)
+        .padding(.bottom, marginBottom)
     }
 }
 

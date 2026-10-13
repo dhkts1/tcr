@@ -135,6 +135,41 @@ final class AccountLineTests: XCTestCase {
         let spent = fleet.sectionsInDisplayOrder().first { $0.band == .outOfTokens }
         XCTAssertEqual(spent?.firstBackCaption(now: now), "first back in 1h 30m")
     }
+
+    // MARK: - Row form
+
+    /// Inside a group section an account gets the same one line as outside
+    /// one (lead ruling on H1b, 2026-10-14), chosen by the same band: a
+    /// fleet mixing cards and lines reads as unfinished.
+    func testAGroupedAccountResolvesToTheLineOfItsBand() {
+        let fleet = Fleet(accounts: [
+            lineAccount("bob@example.com", groups: ["dev"]),
+            lineAccount("frank@example.com", quotaState: .spent, fiveHour: 1.0, groups: ["dev"]),
+            lineAccount(
+                "mallory@example.com", groups: ["henry-team"], parkedGroups: ["henry-team"]),
+            lineAccount("carol@example.com"),
+        ])
+        let forms = Dictionary(
+            uniqueKeysWithValues: fleet.sectionsInDisplayOrder().flatMap(\.rows).map {
+                ($0.account.name, $0.form(carriesLease: false, carriesExit: false))
+            })
+        XCTAssertEqual(forms["bob@example.com"], .liveLine)
+        XCTAssertEqual(forms["frank@example.com"], .waitingLine)
+        XCTAssertEqual(forms["mallory@example.com"], .waitingLine)
+        XCTAssertEqual(forms["carol@example.com"], .liveLine)
+    }
+
+    /// A lease line or an exit picker keeps the card, in a group or out of
+    /// one: neither fits a line, and neither belongs only in a hover card.
+    func testALeaseOrAnExitKeepsTheCardInAGroupToo() {
+        for group in [FleetGroupKey.named("dev"), .ungrouped] {
+            let row = FleetSectionRow(
+                account: lineAccount("bob@example.com"), group: group, band: .live,
+                isControl: false)
+            XCTAssertEqual(row.form(carriesLease: true, carriesExit: false), .card, "\(group)")
+            XCTAssertEqual(row.form(carriesLease: false, carriesExit: true), .card, "\(group)")
+        }
+    }
 }
 
 private func hold(_ window: String, _ resetAtMs: Int64) -> HeldWindow {
@@ -154,7 +189,9 @@ private func lineAccount(
     sevenDayState: QuotaState? = nil,
     fiveHourResetAtMs: Int64? = nil,
     sevenDayResetAtMs: Int64? = nil,
-    held: [HeldWindow] = []
+    held: [HeldWindow] = [],
+    groups: [String]? = nil,
+    parkedGroups: [String]? = nil
 ) -> Account {
     Account(
         name: name,
@@ -182,6 +219,10 @@ private func lineAccount(
         streamErrorCount: 0,
         source: .live,
         serverSha: "abc1234",
-        serverDirty: false
+        serverDirty: false,
+        groups: groups,
+        reservedGroups: nil,
+        parkedGroups: parkedGroups,
+        groupColors: nil
     )
 }

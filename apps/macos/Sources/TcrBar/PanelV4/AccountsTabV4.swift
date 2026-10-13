@@ -45,11 +45,11 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     var onSetExit: (String, AccountExit.Route, Bool) -> Void = { _, _, _ in }
     /// Opens a lender's sheet in Settings > Peers.
     var onOpenLender: (String) -> Void = { _ in }
-    /// The account whose hover card is showing, whose line draws `.hov`'s
-    /// fill. The card itself hangs from the panel root
+    /// The row whose hover card is showing (``FleetSectionRow/id``), whose
+    /// line draws `.hov`'s fill. The card itself hangs from the panel root
     /// (`AccountHoverCard.swift`), not from here.
-    var hoveredAccount: String? = nil
-    /// The pointer entering (`true`) or leaving a line, by account name.
+    var hoveredRow: String? = nil
+    /// The pointer entering (`true`) or leaving a line, by row identity.
     var onHoverLine: (String, Bool) -> Void = { _, _ in }
     /// The row's own actions, as a context menu — the SECOND route to them,
     /// from the one definition in ``AccountRow``.
@@ -107,45 +107,18 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// line would sit under nothing that says why it is waiting.
     ///
     /// An account carrying a lease line or an exit picker keeps today's full
-    /// card instead of a line. Option H draws neither, and both are things a
-    /// line has no room for: the lease line is the notice that another Mac may
-    /// read this account's traffic, and the exit picker is a control. They
-    /// stay on the card for good, not until the hover card carries them (lead
-    /// ruling, 2026-10-14): a control cannot live in a card that vanishes when
-    /// the pointer moves.
+    /// card instead of a line (``FleetSectionRow/form(carriesLease:carriesExit:)``
+    /// has the ruling and its reason).
     @ViewBuilder
     private func looseLines(_ section: FleetSection, first: Bool) -> some View {
-        let lines = section.rows.filter { !keepsCard($0) }
-        let cards = section.rows.filter { keepsCard($0) }
-        let nameWidth = AccountLineRow<EmptyView>.nameColumnWidth(for: lines.map(\.account))
+        let lines = section.rows.filter { form($0) != .card }
+        let cards = section.rows.filter { form($0) == .card }
         VStack(alignment: .leading, spacing: 0) {
             if section.band != .live {
                 BandHeading(section: section, now: now)
             }
             if !lines.isEmpty {
-                LineBox(
-                    items: lines,
-                    paddingH: section.band == .live ? V4.liveBoxPaddingH : V4.waitBoxPaddingH
-                ) { row in
-                    if section.band == .live {
-                        AccountLineRow(
-                            account: row.account, now: now, isControl: row.isControl,
-                            snapshotMode: snapshotMode, nameWidth: nameWidth
-                        ) { menu(row.account) }
-                        .hoverableLine(
-                            row, hovered: hoveredAccount == row.account.name, bleed: .zero
-                        ) { onHoverLine(row.account.name, $0) }
-                    } else {
-                        WaitingLineRow(
-                            account: row.account, band: section.band, now: now,
-                            isControl: row.isControl, snapshotMode: snapshotMode
-                        ) { menu(row.account) }
-                        .hoverableLine(
-                            row, hovered: hoveredAccount == row.account.name,
-                            bleed: V4.waitBoxPaddingH
-                        ) { onHoverLine(row.account.name, $0) }
-                    }
-                }
+                lineBox(lines, band: section.band, marginBottom: V4.lineBoxMarginBottom)
             }
             ForEach(cards) { row in
                 card(row, shape: .full)
@@ -157,11 +130,54 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         .padding(.top, first ? V4.marginAfterStrip(V4.cardGap) : .zero)
     }
 
-    /// Whether this account carries something only the full card draws: a
-    /// lease line, or an exit row.
-    private func keepsCard(_ row: FleetSectionRow) -> Bool {
-        !PeerLease.leases(forAccountLabel: row.account.name, in: lentTo).isEmpty
-            || PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil
+    /// One box of one-line rows, the same box on the tab and inside a group:
+    /// the live line or the waiting line, each with its hover card (unit H2).
+    ///
+    /// A line is hovered and anchored by its ROW's identity, not by its
+    /// account's name: an account in two groups draws two lines, and keyed by
+    /// name the card would hang from whichever line published last and both
+    /// lines would draw the hover fill.
+    private func lineBox(
+        _ rows: [FleetSectionRow], band: FleetBand, marginBottom: CGFloat
+    ) -> some View {
+        let nameWidth = AccountLineRow<EmptyView>.nameColumnWidth(for: rows.map(\.account))
+        return LineBox(
+            items: rows,
+            paddingH: band == .live ? V4.liveBoxPaddingH : V4.waitBoxPaddingH,
+            marginBottom: marginBottom
+        ) { row in
+            switch form(row) {
+            case .liveLine:
+                AccountLineRow(
+                    account: row.account, now: now, isControl: row.isControl,
+                    snapshotMode: snapshotMode, nameWidth: nameWidth
+                ) { menu(row.account) }
+                .hoverableLine(row, hovered: hoveredRow == row.id, bleed: .zero) {
+                    onHoverLine(row.id, $0)
+                }
+            case .waitingLine:
+                WaitingLineRow(
+                    account: row.account, band: row.band, now: now,
+                    isControl: row.isControl, snapshotMode: snapshotMode
+                ) { menu(row.account) }
+                .hoverableLine(
+                    row, hovered: hoveredRow == row.id, bleed: V4.waitBoxPaddingH
+                ) { onHoverLine(row.id, $0) }
+            case .card:
+                // Never reached: both callers pass only rows whose form is a
+                // line, and draw the cards themselves.
+                EmptyView()
+            }
+        }
+    }
+
+    /// Which form this row takes, from what only this view knows: whether the
+    /// account carries a lease line or an exit row.
+    private func form(_ row: FleetSectionRow) -> AccountRowForm {
+        row.form(
+            carriesLease: !PeerLease.leases(forAccountLabel: row.account.name, in: lentTo)
+                .isEmpty,
+            carriesExit: PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil)
     }
 
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
@@ -248,22 +264,35 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     parkedHeader(section)
                         .padding(.top, V4.groupCardGap)
                 }
-                // `.grp .card{margin:6px 0}` — EVERY card, the first included.
-                // Its top margin does not collapse into the group's own 12 pt
-                // padding, so the first card sits 18 pt under the stroke; giving
-                // the first card nothing put it at 11 pt. The LAST card carries
-                // the same margin on its OWN bottom, but only when nothing else
-                // follows it: `GroupBox`'s own bottom padding (4 pt) plus this
-                // 6 pt closes the box at the mockup's 10, and a disclosure row
-                // right below the cards gets the 6 pt instead, so the two never
-                // stack into 12.
-                ForEach(Array(visible.enumerated()), id: \.element.id) { index, row in
+                // One line per account, in the box the tab's own lines use
+                // (option H, lead ruling on H1b 2026-10-14); an account with a
+                // lease line or an exit row keeps its card, after the lines,
+                // as on the tab.
+                //
+                // `.grp .card{margin:6px 0}` — EVERY item, the first included,
+                // and the line box counts as one. Its top margin does not
+                // collapse into the group's own 12 pt padding, so the first
+                // item sits 18 pt under the stroke; giving it nothing put it
+                // at 11 pt. The LAST item carries the same margin on its OWN
+                // bottom, but only when nothing else follows it: `GroupBox`'s
+                // own bottom padding (4 pt) plus this 6 pt closes the box at
+                // the mockup's 10, and a disclosure row right below gets the
+                // 6 pt instead, so the two never stack into 12.
+                let lines = visible.filter { form($0) != .card }
+                let cards = visible.filter { form($0) == .card }
+                let closes = !isCollapsible(section)
+                if !lines.isEmpty {
+                    lineBox(
+                        lines, band: section.band,
+                        marginBottom: cards.isEmpty && closes ? V4.groupCardGap : 0
+                    )
+                    .padding(.top, V4.groupCardGap)
+                }
+                ForEach(Array(cards.enumerated()), id: \.element.id) { index, row in
                     card(row, shape: .compact)
                         .padding(.top, V4.groupCardGap)
                         .padding(
-                            .bottom,
-                            index == visible.count - 1 && !isCollapsible(section)
-                                ? V4.groupCardGap : 0)
+                            .bottom, index == cards.count - 1 && closes ? V4.groupCardGap : 0)
                 }
             }
             if isCollapsible(section) {

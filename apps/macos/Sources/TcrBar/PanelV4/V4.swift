@@ -656,7 +656,15 @@ enum V4 {
     /// about half a CSS blur.
     static let hoverCardShadowRadius: CGFloat = 14
     static let hoverCardShadowY: CGFloat = 10
-    static let hoverCardShadowAlpha: Double = 0.65
+    /// The shadow's black, per appearance. Dark keeps option H's `.65`. Light
+    /// is lighter (lead ruling on H1b, 2026-10-14: ".65 is too heavy in light
+    /// mode"): on the light panel a `.65` black reads as a smudge around the
+    /// card, where on the dark one it is barely darker than the panel.
+    static func hoverCardShadowAlpha(_ scheme: ColorScheme) -> Double {
+        scheme == .dark ? hoverCardShadowAlphaDark : hoverCardShadowAlphaLight
+    }
+    static let hoverCardShadowAlphaDark: Double = 0.65
+    static let hoverCardShadowAlphaLight: Double = 0.25
     /// How long a leave waits before the card goes, so the pointer can cross
     /// from the row onto the card without the card vanishing under it.
     static let hoverCardGraceSeconds: Double = 0.15
