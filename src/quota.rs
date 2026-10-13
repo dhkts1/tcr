@@ -95,6 +95,18 @@ pub struct Quota {
     /// [`crate::pricing`]'s synthetic token-counted estimate, and a fabricated
     /// `0.0` here would read as "no overage" instead of "we don't know yet".
     pub extra_usage_usd: Option<f64>,
+    /// When a quota reading was last taken, from EITHER source: a successful
+    /// usage probe ([`Self::apply_usage`]) or a response that carried rate-limit
+    /// headers ([`Self::update_from_headers`]). `None` means nothing has been
+    /// read since this process started.
+    ///
+    /// The probe's own clock (`AccountRuntime::last_probe_ms`) cannot answer "is
+    /// this reading too old to trust": a busy account's windows move from headers
+    /// between probes, and a failed probe stamps `last_probe_ms` while reading
+    /// nothing, so an idle account with a broken probe shows frozen windows next
+    /// to a recent probe time. This is display data only; nothing in selection
+    /// reads it. It crosses the wire as `quotaUpdatedAtMs`.
+    pub updated_at: Option<OffsetDateTime>,
 }
 
 /// A generic view over "case-insensitive header name → value" so the same
@@ -120,10 +132,21 @@ impl Quota {
     /// window, while a response without it (an error page, a non-Anthropic
     /// upstream) says nothing at all — and the two must never be confused for the
     /// keep-warm gate. See [`crate::manager::AccountRuntime::quota_known`].
+    ///
+    /// [`Self::updated_at`] is stamped on a different test than the return value:
+    /// it moves when this response carried ANY quota header that was read (a
+    /// window's utilization, the `7d_oi` allowed verdict, the unified status, or
+    /// an API-key token or request limit). A `false` return therefore still counts
+    /// as a fresh reading when, say, only the weekly window came back: that window
+    /// is first-hand evidence read just now, and an API-key account never reports
+    /// a 5h window at all, so keying on the return value would leave it reading
+    /// as stale forever. A response with none of these headers (an error page, a
+    /// non-Anthropic upstream) read nothing and leaves the stamp alone.
     #[must_use]
     pub fn update_from_headers(&mut self, headers: &impl HeaderView) -> bool {
         let now = OffsetDateTime::now_utc();
         let mut read_five_hour = false;
+        let mut read_any = false;
         if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-5h-utilization")
             .filter(|v| v.is_finite())
         {
@@ -139,6 +162,7 @@ impl Quota {
                 reset,
             });
             read_five_hour = true;
+            read_any = true;
         }
         if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-7d-utilization")
             .filter(|v| v.is_finite())
@@ -154,6 +178,7 @@ impl Quota {
                 utilization: util,
                 reset,
             });
+            read_any = true;
         }
         if let Some(util) =
             get_parsed::<f64>(headers, "anthropic-ratelimit-unified-7d_oi-utilization")
@@ -170,6 +195,7 @@ impl Quota {
                 utilization: util,
                 reset,
             });
+            read_any = true;
         } else if scope_is_allowed(headers, "anthropic-ratelimit-unified-7d_oi-status")
             && self.seven_day_oi.is_some_and(|w| w.utilization >= 1.0)
         {
@@ -189,9 +215,11 @@ impl Quota {
                     SEVEN_DAY,
                 ),
             });
+            read_any = true;
         }
 
         if let Some(status) = headers.get_str("anthropic-ratelimit-unified-status") {
+            read_any = true;
             // The aggregate `rejected` is a terminal account gate
             // (`Manager::account_terminal_gate`), so it must not be stored when the
             // sub-scope headers say the rejection is model-scoped: the account still
@@ -209,20 +237,28 @@ impl Quota {
 
         if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-tokens-limit") {
             self.tokens_limit = Some(v);
+            read_any = true;
         }
         if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-tokens-remaining") {
             self.tokens_remaining = Some(v);
+            read_any = true;
         }
         if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-requests-limit") {
             self.requests_limit = Some(v);
+            read_any = true;
         }
         if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-requests-remaining") {
             self.requests_remaining = Some(v);
+            read_any = true;
         }
         if let Some(reset) = get_reset(headers, "anthropic-ratelimit-tokens-reset")
             .or_else(|| get_reset(headers, "anthropic-ratelimit-requests-reset"))
         {
             self.standard_reset = Some(reset);
+            read_any = true;
+        }
+        if read_any {
+            self.updated_at = Some(now);
         }
         read_five_hour
     }
@@ -366,6 +402,11 @@ impl Quota {
         if let Some(extra) = usage.extra_usage_usd {
             self.extra_usage_usd = Some(extra);
         }
+        // Called only with a SUCCESSFUL probe's usage, so this is a reading even
+        // when the endpoint reported no bucket: "we read this account's quota" is
+        // about the read, the same rule `Manager::apply_usage` latches
+        // `quota_known` on. A failed probe never reaches here.
+        self.updated_at = Some(OffsetDateTime::now_utc());
     }
 
     /// Drop a `rejected` status whose window has since rolled.

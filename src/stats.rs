@@ -171,6 +171,10 @@ pub struct AccountSnapshot {
     /// When the most recent probe finished — the TUI shows its age so a stalled
     /// probe is visible rather than silently freezing the quota bars.
     pub last_probe: Option<OffsetDateTime>,
+    /// When a quota reading was last taken, from a probe OR response headers
+    /// ([`crate::quota::Quota::updated_at`]). Unlike [`Self::last_probe`] it says
+    /// how old the windows shown beside it are. Display data only.
+    pub quota_updated_at: Option<OffsetDateTime>,
     /// The most recent probe's error message, if it failed.
     pub probe_error: Option<String>,
     /// Live quota state vs this account's switch threshold — for an honest
