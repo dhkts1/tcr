@@ -74,6 +74,32 @@ scripts/install-cli.sh          # places `tcr` at ~/.local/bin/tcr by default
 The Linux builds are static musl binaries, so they run on both Alpine and glibc systems. TcrBar and
 `tcr ui` are macOS-only.
 
+### Verify a download
+
+Get `tcr` from this repository's [release page](https://github.com/dhkts1/teamclaude-rs/releases)
+or `install.sh` above, never a copy repackaged elsewhere: it is about to hold your account tokens.
+Each CLI archive has a `.sha256` file beside it:
+
+```sh
+shasum -a 256 -c teamclaude-rs-aarch64-apple-darwin.tar.xz.sha256
+```
+
+TcrBar is signed with a Developer ID certificate and notarized by Apple. The commands that check
+it, and what the checksum does not prove, are in
+[`docs/architecture.md`](docs/architecture.md#verifying-a-download).
+
+### Uninstall
+
+Stop the proxy, then delete the binary: `~/.cargo/bin/tcr` from either installer, or
+`~/.local/bin/tcr` from `scripts/install-cli.sh`. On macOS, `apps/macos/scripts/uninstall.sh`
+removes TcrBar and its login item.
+
+Nothing deletes your data for you. `~/.config/teamclaude.json` holds working credentials for every
+account in the pool, so delete it too, along with `~/.cache/teamclaude/` and any
+`ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or `NODE_EXTRA_CA_CERTS` you exported. Every file `tcr` keeps
+is listed in [`docs/architecture.md`](docs/architecture.md#files-on-disk), and the full steps are
+under [Uninstalling](docs/architecture.md#uninstalling).
+
 ## Usage
 
 ```sh
@@ -106,8 +132,11 @@ key, its default and the file's permissions are in
 
 ### Managing the fleet
 
-These commands act on the running proxy when one is up, so changing the pool does not need a
-restart. Every flag is in [`docs/cli.md`](docs/cli.md).
+Most changes to the pool reach a running proxy without a restart. `enable`, `disable`,
+`remove` and `control` apply to it directly, and the proxy picks up `group` edits from the
+config file on its next request. `priority` is the exception: it only writes the file, so a
+running proxy keeps the old order until it restarts. Every flag is in
+[`docs/cli.md`](docs/cli.md).
 
 | Command | What it does |
 |---|---|
@@ -120,6 +149,7 @@ restart. Every flag is in [`docs/cli.md`](docs/cli.md).
 | `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
 | `tcr run --group <name>` | Start a session that prefers one group. |
 | `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour. The panel's Sessions and Tools tabs read the same feed. |
+| `tcr list --json` | Print every account in claude-swap's list format, so CodexBar can show them. Never probes. |
 | `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day. Needs no running proxy. |
 | `tcr token <account>` | Print an account's access token to stdout, for piping. |
 | `tcr update` | Update `tcr` in place, from the checkout or the published installer. |
@@ -293,6 +323,14 @@ it), and launch Claude Code with `tcr run`. Every request then goes through the 
 an account from the pool. If you are already logged in to Claude Code, the first run imports that
 login, so you only log in to the others.
 
+Claude Code has its own answer: `CLAUDE_CONFIG_DIR` moves its configuration directory, and
+[Anthropic's docs](https://code.claude.com/docs/en/env-vars) suggest it for running accounts side
+by side, as in `CLAUDE_CONFIG_DIR=~/.claude-work claude`. There you pick the account by picking
+the directory when you start a session. `tcr` keeps one Claude Code setup and picks the account
+for every request instead. `tcr` does not read `CLAUDE_CONFIG_DIR`: the import takes Claude Code's
+default login, and [`docs/cli.md`](docs/cli.md#--from-claude-code-importing-the-login-claude-already-has)
+says how to point it at another file.
+
 ### Does switching accounts lose the prompt cache?
 
 Yes. Anthropic keeps the prompt cache per account, so a conversation that moves arrives cold and
@@ -339,7 +377,7 @@ config file, certificates and port.
 | [`docs/configuration.md`](docs/configuration.md) | Every config key, its type, default and source citation. |
 | [`docs/cli.md`](docs/cli.md) | Every command and flag, exit codes, account resolution. |
 | [`docs/peers.md`](docs/peers.md) | Finding, trusting and sharing accounts with other Macs on your network. |
-| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, account selection, quota probes. |
+| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, account selection, quota probes, files on disk, verifying a download, uninstalling. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptoms and what they mean. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, test and lint gates, what `main` requires. |
 

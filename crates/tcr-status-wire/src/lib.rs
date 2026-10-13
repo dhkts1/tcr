@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cswap_v1;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

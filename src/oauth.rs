@@ -738,7 +738,7 @@ async fn exchange_code(
     verifier: &str,
     state: &str,
     redirect_uri: &str,
-) -> anyhow::Result<Tokens> {
+) -> anyhow::Result<Exchanged> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -763,6 +763,55 @@ async fn exchange_code(
     tokens_from_exchange_body(&text)
 }
 
+/// What one code-for-token exchange produced: the credential, and the identity
+/// the token endpoint sent beside it.
+struct Exchanged {
+    tokens: Tokens,
+    identity: ExchangeIdentity,
+}
+
+/// The `account` and `organization` objects of a token-exchange response.
+///
+/// The token endpoint sends these on every exchange, whatever the scope
+/// (`docs/design/long-lived-tokens.md`, "Identity arrives free at exchange
+/// time"). [`login`] still asks the profile endpoint first, because only it
+/// carries the plan fields; this is what names the row when that fetch comes
+/// back empty, instead of [`unnamed_fallback`].
+#[derive(Debug, Default, Deserialize)]
+struct ExchangeIdentity {
+    #[serde(default)]
+    account: Option<ExchangeAccount>,
+    #[serde(default)]
+    organization: Option<ExchangeOrg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeAccount {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    email_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeOrg {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The token-exchange response: the refresh fields plus the identity. A
+/// separate struct from [`RefreshResponse`], because a refresh never needs
+/// the identity.
+#[derive(Deserialize)]
+struct ExchangeResponse {
+    #[serde(flatten)]
+    refresh: RefreshResponse,
+    #[serde(flatten)]
+    identity: ExchangeIdentity,
+}
+
 /// Turn a raw token-endpoint response body into [`Tokens`], failing the exchange
 /// when no usable `refresh_token` is present.
 ///
@@ -772,9 +821,11 @@ async fn exchange_code(
 /// here would mint an account whose stored token is `""`; that account dies with
 /// `AuthRejected` on its first refresh (the refresh POST sends the empty token).
 /// Fail the exchange instead of persisting a self-destructing account.
-fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
-    let data: RefreshResponse =
-        serde_json::from_str(text).context("parse token-exchange response")?;
+fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Exchanged> {
+    let ExchangeResponse {
+        refresh: data,
+        identity,
+    } = serde_json::from_str(text).context("parse token-exchange response")?;
 
     let refresh_token = match data.refresh_token {
         Some(token) if !token.trim().is_empty() => token,
@@ -786,10 +837,13 @@ fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
         normalize_expires_at,
     );
 
-    Ok(Tokens {
-        access_token: data.access_token,
-        refresh_token: Some(refresh_token),
-        expires_at_ms,
+    Ok(Exchanged {
+        tokens: Tokens {
+            access_token: data.access_token,
+            refresh_token: Some(refresh_token),
+            expires_at_ms,
+        },
+        identity,
     })
 }
 
@@ -824,6 +878,26 @@ impl Profile {
     /// `account.uuid`, or `None` when the fetch failed or the endpoint sent none.
     pub fn account_uuid(&self) -> Option<&str> {
         self.account_uuid.as_deref()
+    }
+
+    /// This profile, with each identity field the profile endpoint left empty
+    /// taken from the token-exchange response instead. A field the profile
+    /// endpoint did send is kept. Both answers describe the one token the
+    /// exchange just minted, so they cannot name two different accounts.
+    fn or_exchange_identity(self, identity: ExchangeIdentity) -> Profile {
+        let (account_uuid, email) = identity
+            .account
+            .map_or((None, None), |a| (a.uuid, a.email_address));
+        let (org_uuid, org_name) = identity
+            .organization
+            .map_or((None, None), |o| (o.uuid, o.name));
+        Profile {
+            email: self.email.or(email),
+            account_uuid: self.account_uuid.or(account_uuid),
+            org_uuid: self.org_uuid.or(org_uuid),
+            org_name: self.org_name.or(org_name),
+            ..self
+        }
     }
 }
 
@@ -1435,14 +1509,18 @@ pub async fn login(
     } = authorized;
 
     ui.say("Exchanging authorization code for tokens...");
-    let tokens = exchange_code(&code, &flow.verifier, &flow.state, &redirect_uri).await?;
+    let Exchanged { tokens, identity } =
+        exchange_code(&code, &flow.verifier, &flow.state, &redirect_uri).await?;
 
     // Load the existing config once (missing file → empty default; a corrupt
     // file surfaces as an error so login never clobbers it with defaults).
     let mut config = load_or_default(config_path)?;
 
-    // Fetch the account+org identity, then MINT a name for it.
-    let profile = fetch_profile(&tokens.access_token).await;
+    // Fetch the account+org identity, then MINT a name for it. A failed
+    // profile fetch still names the row from the exchange response.
+    let profile = fetch_profile(&tokens.access_token)
+        .await
+        .or_exchange_identity(identity);
     let name = mint_login_name(&config, &profile, account, name_override, ui)?;
 
     let saved = finish_login_checked(
@@ -1476,9 +1554,12 @@ pub async fn login(
 ///   row on re-login would break the pins, groups and control-account key that
 ///   name is the identity for; the row is confirmed to be the same account by
 ///   [`assert_requested_identity`] a moment later.
-/// * A profile with no email at all — the inference-only case — is the only path
-///   left that prompts ([`prompt_account_name`]), and the name it comes back
-///   with is minted for uniqueness too. Under [`LoginUi::Machine`] there is
+/// * A profile with no email at all is the only path left that prompts. A
+///   browser login reaches it only when the token-exchange response carried no
+///   email either ([`Profile::or_exchange_identity`]); a setup-token login,
+///   which never sees an exchange response, reaches it every time. The prompt is
+///   [`prompt_account_name`], and the name it comes back with is minted for
+///   uniqueness too. Under [`LoginUi::Machine`] there is
 ///   nobody to prompt, so that path takes [`unnamed_fallback`] directly — the
 ///   same answer an empty reply to the prompt gives.
 fn mint_login_name(
@@ -2325,10 +2406,11 @@ async fn finish_login(
                 Err(crate::cli::LiveControlError::NoRoute) => {
                     let saved = persist_via_account(config_path, &account)?;
                     eprintln!(
-                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running — it will not see this account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running. It will not see this account until it restarts. {}",
                         config.proxy.port,
                         crate::proxy::ADD_ACCOUNT_PATH,
                         config_path.display(),
+                        crate::cli::RESTART_HINT,
                     );
                     Ok(saved)
                 }
@@ -2666,6 +2748,83 @@ mod tests {
         assert_eq!(name, "unnamed");
     }
 
+    /// A browser login whose profile fetch came back empty takes its name from
+    /// the token-exchange response, not from [`unnamed_fallback`]. The fixture
+    /// is the response shape `docs/design/long-lived-tokens.md` records.
+    #[test]
+    fn a_login_with_an_empty_profile_is_named_from_the_exchange_response() {
+        let body = r#"{
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expires_in": 31536000,
+            "account": {
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "email_address": "alice@example.com"
+            },
+            "organization": {
+                "uuid": "22222222-2222-2222-2222-222222222222",
+                "name": "Example Org"
+            }
+        }"#;
+
+        // A config where the fallback would hand out `unnamed-2`, and one
+        // where alice's bare email is already taken.
+        let with_unnamed: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "unnamed", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+        let with_alice: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+
+        for (config, expected) in [
+            (&with_unnamed, "alice@example.com"),
+            (&with_alice, "alice@example.com/example-org"),
+        ] {
+            let Exchanged { identity, .. } =
+                tokens_from_exchange_body(body).expect("a present refresh_token must return Ok");
+            let profile = all_none_profile().or_exchange_identity(identity);
+            let name = mint_login_name(config, &profile, None, None, LoginUi::Machine).unwrap();
+            assert_eq!(name, expected);
+            assert_eq!(
+                profile.account_uuid(),
+                Some("11111111-1111-1111-1111-111111111111")
+            );
+            assert_eq!(
+                profile.org_uuid.as_deref(),
+                Some("22222222-2222-2222-2222-222222222222")
+            );
+        }
+    }
+
+    /// A field the profile endpoint DID send is kept; only its gaps are filled.
+    #[test]
+    fn exchange_identity_never_overrides_what_the_profile_sent() {
+        let body = r#"{
+            "access_token": "at",
+            "refresh_token": "rt",
+            "account": { "uuid": "33333333", "email_address": "bob@example.com" },
+            "organization": { "uuid": "44444444", "name": "Other Org" }
+        }"#;
+        let Exchanged { identity, .. } = tokens_from_exchange_body(body).unwrap();
+        let profile = profile_with_identity(
+            "alice@example.com",
+            Some("11111111"),
+            Some("22222222"),
+            None,
+        )
+        .or_exchange_identity(identity);
+        assert_eq!(profile.email(), Some("alice@example.com"));
+        assert_eq!(profile.account_uuid(), Some("11111111"));
+        assert_eq!(profile.org_uuid.as_deref(), Some("22222222"));
+        assert_eq!(profile.org_name.as_deref(), Some("Other Org"));
+    }
+
     // --- token-exchange refresh_token guard --------------------------------
 
     #[test]
@@ -2693,7 +2852,8 @@ mod tests {
         let tokens = tokens_from_exchange_body(
             r#"{"access_token":"at","refresh_token":"rt","expires_at":1700000000000}"#,
         )
-        .expect("a present refresh_token must return Ok");
+        .expect("a present refresh_token must return Ok")
+        .tokens;
         assert_eq!(tokens.access_token, "at");
         assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
         assert_eq!(tokens.expires_at_ms, 1_700_000_000_000);
@@ -2710,7 +2870,8 @@ mod tests {
         let tokens = tokens_from_exchange_body(
             r#"{"access_token":"at","refresh_token":"rt","expires_in":31536000}"#,
         )
-        .expect("a present refresh_token must return Ok");
+        .expect("a present refresh_token must return Ok")
+        .tokens;
         let after = crate::now_ms();
 
         let year_ms: i64 = 31_536_000 * 1000;
