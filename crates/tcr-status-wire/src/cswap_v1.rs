@@ -67,9 +67,11 @@ pub struct AccountV1 {
     pub organization_name: String,
     pub active: bool,
     pub usage_status: UsageStatus,
-    /// When this row's quota was last probed, ISO-8601 UTC. tcr also learns
-    /// quota from the responses it serves, so this can understate how fresh the
-    /// bars are, which is the safe direction.
+    /// When the bars were last read, ISO-8601 UTC: a successful probe or the
+    /// quota headers of a served response, whichever is newer
+    /// (`quotaUpdatedAtMs`). Not `lastProbeMs`, because a failed probe stamps
+    /// that while reading nothing, so a broken probe over hours-old bars would
+    /// look fresh. Omitted when tcr has no reading time, which means unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_fetched_at: Option<String>,
     /// Out of tcr's rotation: disabled by hand, or in a parked group.
@@ -197,7 +199,7 @@ fn project(number: usize, row: &AccountStatusRow) -> AccountV1 {
         organization_name: row.org_name.clone().unwrap_or_default(),
         active: false,
         usage_status: usage_status(row),
-        usage_fetched_at: row.last_probe_ms.and_then(iso_utc),
+        usage_fetched_at: row.quota_updated_at_ms.and_then(iso_utc),
         disabled: row.disabled || !row.parked_groups.is_empty(),
         usage: UsageV1 {
             five_hour: window(row.five_hour, row.five_hour_reset_at_ms),

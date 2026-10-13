@@ -199,7 +199,7 @@ fn base(name: &str) -> AccountStatusRow {
 /// The six rows the committed fixture is the projection of, in fixture order.
 fn fixture_rows() -> Vec<AccountStatusRow> {
     vec![
-        // All three windows, an org suffix on the name, a probe time.
+        // All three windows, an org suffix on the name, a reading time.
         AccountStatusRow {
             five_hour: Some(0.4),
             five_hour_reset_at_ms: Some(T0 + 4 * HOUR),
@@ -208,6 +208,7 @@ fn fixture_rows() -> Vec<AccountStatusRow> {
             seven_day_oi: Some(0.1),
             seven_day_oi_reset_at_ms: Some(T0 + 168 * HOUR),
             last_probe_ms: Some(T0 - HOUR),
+            quota_updated_at_ms: Some(T0 - HOUR),
             org_name: Some("Example Team".into()),
             ..base("alice@example.com/example-team")
         },
@@ -366,5 +367,39 @@ fn the_committed_fixture_is_the_projection_and_codexbar_accepts_it() {
     assert_eq!(
         rendered, committed,
         "the projection drifted from the committed fixture"
+    );
+}
+
+/// `usageFetchedAt` is when the bars were read, not when the probe last ran. A
+/// failed probe stamps `lastProbeMs` and reads nothing, so an account whose
+/// probe broke an hour ago over bars from a day ago must report the day-old
+/// time. With no reading time the key is left out: unknown, not fresh.
+#[test]
+fn usage_fetched_at_is_the_reading_time_not_the_probe_time() {
+    let failed_probe = AccountStatusRow {
+        probe_status: "error".into(),
+        five_hour: Some(0.4),
+        last_probe_ms: Some(T0 - HOUR),
+        quota_updated_at_ms: Some(T0 - 24 * HOUR),
+        ..base("alice@example.com")
+    };
+    let never_read = AccountStatusRow {
+        probe_status: "error".into(),
+        last_probe_ms: Some(T0 - HOUR),
+        quota_updated_at_ms: None,
+        ..base("bob@example.com")
+    };
+    let doc = project(&[failed_probe, never_read]);
+    assert_eq!(
+        doc["accounts"][0]["usageFetchedAt"], "2025-12-31T00:00:00Z",
+        "the time of the old reading, not of the failed probe"
+    );
+    assert!(
+        !doc["accounts"][1]
+            .as_object()
+            .expect("row")
+            .contains_key("usageFetchedAt"),
+        "no reading time means no key: {:#}",
+        doc["accounts"][1]
     );
 }
