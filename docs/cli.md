@@ -627,10 +627,10 @@ not an unmeasured one.
 | `reservedGroups` | array of strings | the subset marked `reserved` — the row serves only traffic that asked for one of its groups |
 | `parkedGroups` | array of strings | the subset marked `parked` (`tcr group park`) — non-empty means the row is out of rotation entirely, and names which group did it |
 
-A parked row's `gate` reads `"parked"`, beside the existing `"disabled"`, `"reserved"`,
-`"login"`, `"rejected"`, `"hold"`, `"five-hour"`, `"seven-day"`, `"fable-weekly"`,
-`"standard"` and `"ok"`. A row that is BOTH parked by its group and disabled on its own
-reports `"disabled"` — the row's own state outranks the group's, so the output never
+A parked row's `gate` reads `"parked"`. Every `gate` value, what it means and what to do
+about it is in [What the `gate` value means](troubleshooting.md#what-the-gate-value-means).
+A row that is BOTH parked by its group and disabled on its own
+reports `"disabled"`: the row's own state outranks the group's, so the output never
 attributes a bench to a group when a person did it.
 
 ```

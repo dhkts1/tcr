@@ -326,3 +326,118 @@ pub struct StatsSnapshot {
     /// server-side rather than re-summed by every client.
     pub wire_sessions_summary: tcr_status_wire::SessionsSummary,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GateReason;
+    use serde::de::{Deserialize as _, Visitor};
+
+    /// What the probe deserializer below hands back: serde's own list of the
+    /// enum's wire names, or a sign that the derive took some other path.
+    #[derive(Debug)]
+    enum Probe {
+        Variants(&'static [&'static str]),
+        Other(String),
+    }
+
+    impl std::fmt::Display for Probe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Probe::Variants(names) => write!(f, "variant names {names:?}"),
+                Probe::Other(msg) => f.write_str(msg),
+            }
+        }
+    }
+
+    impl std::error::Error for Probe {}
+
+    impl serde::de::Error for Probe {
+        fn custom<T: std::fmt::Display>(msg: T) -> Self {
+            Probe::Other(msg.to_string())
+        }
+    }
+
+    /// A deserializer that reads nothing. Its only job is to catch the
+    /// `variants` slice `#[derive(Deserialize)]` passes to `deserialize_enum`:
+    /// the derive builds that slice from the enum's variants after
+    /// `rename_all`, so it grows by itself when a variant is added and nobody
+    /// has to remember to extend a list here.
+    struct VariantNames;
+
+    impl<'de> serde::Deserializer<'de> for VariantNames {
+        type Error = Probe;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Probe> {
+            Err(Probe::Other(
+                "the derive asked for something other than an enum".to_string(),
+            ))
+        }
+
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            variants: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Probe> {
+            Err(Probe::Variants(variants))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map struct identifier ignored_any
+        }
+    }
+
+    /// Every `gate` token `tcr status --json` can print, taken from the type.
+    fn gate_tokens() -> Vec<&'static str> {
+        match GateReason::deserialize(VariantNames) {
+            Err(Probe::Variants(names)) => names.to_vec(),
+            other => panic!("could not read GateReason's variant names: {other:?}"),
+        }
+    }
+
+    /// The names serde deserializes are the names it serializes: each one
+    /// round-trips through the real wire format to itself. Without this, a
+    /// `#[serde(rename(serialize = ...))]` could make the probe list differ
+    /// from what `tcr status --json` prints.
+    #[test]
+    fn gate_tokens_are_the_serialized_wire_tokens() {
+        let tokens = gate_tokens();
+        // Positive control: the probe sees known variants, so an empty or
+        // wrong list cannot pass the doc test below by matching nothing.
+        assert!(tokens.contains(&"ok"), "{tokens:?}");
+        assert!(tokens.contains(&"five-hour"), "{tokens:?}");
+        assert!(tokens.contains(&"refused"), "{tokens:?}");
+        for token in tokens {
+            let gate: GateReason = serde_json::from_value(serde_json::json!(token))
+                .unwrap_or_else(|err| panic!("{token} does not deserialize: {err}"));
+            assert_eq!(
+                serde_json::to_value(gate).expect("GateReason serializes"),
+                serde_json::json!(token),
+                "{gate:?} serializes to a different token than it deserializes from"
+            );
+        }
+    }
+
+    /// docs/troubleshooting.md has a table row for every gate value. A new
+    /// `GateReason` variant fails this test until its row is written, because
+    /// the token list comes from the type, not from this file.
+    #[test]
+    fn troubleshooting_doc_has_a_row_for_every_gate_token() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/troubleshooting.md");
+        let doc =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+        let missing: Vec<&str> = gate_tokens()
+            .into_iter()
+            .filter(|token| {
+                let row = format!("| `{token}` |");
+                !doc.lines().any(|line| line.starts_with(&row))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/troubleshooting.md has no `| `<token>` |` table row for gate token(s) {missing:?}"
+        );
+    }
+}

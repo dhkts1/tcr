@@ -2325,9 +2325,9 @@ fn account_status_rows(
                 // this field existed, `status` was rewritten only for `Throttled`
                 // (see `snapshot.rs`), so a rejected account still read `status:
                 // "active"` and the panel drew it as eligible when the router will
-                // never select it. Kebab-case values ("ok", "hold", "refused",
-                // "five-hour", "seven-day", "fable-weekly", "standard", "login",
-                // "rejected", "disabled") via `GateReason`'s own `Serialize`. New field, so an
+                // never select it. Kebab-case values via `GateReason`'s own
+                // `Serialize`; every one is listed in docs/troubleshooting.md, which
+                // `stats::tests` keeps complete. New field, so an
                 // older reader on either end is unaffected: a client built before
                 // this shipped simply never looks at it.
                 gate: gate_reason_token(a.gate),
