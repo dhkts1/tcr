@@ -3777,12 +3777,37 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // A 403 here is evidence about THIS request's account access, not proof the
         // refresh token itself is dead — that is still caught at the source, where
         // a rejected refresh sets `Error` directly.
+        //
+        // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
+        // keeps the status `Active`. Without one, rotation brought the account
+        // straight back and the next request paid the same refused round trip,
+        // while `tcr status` read the row as `gate: ok`; the hold's gate reads
+        // `refused` instead.
         if status == StatusCode::FORBIDDEN {
             tracing::warn!(
                 account = account_name.as_deref().unwrap_or("?"),
                 account_index = idx,
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
+            // Upstream's own words for the refusal, read capped in size and time
+            // exactly as the 429 arm reads its body, so a body that never
+            // completes cannot become a hang.
+            match tokio::time::timeout(
+                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+            )
+            .await
+            {
+                Ok(Ok(body)) => {
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &body)
+                }
+                Ok(Err(_)) | Err(_) => tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    "upstream 403 body could not be read within the cap"
+                ),
+            }
+            manager.mark_refused(idx);
             refused_403.push((idx, account_name.clone()));
             tried.insert(idx);
             continue;
@@ -5937,6 +5962,7 @@ fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
         GateReason::SevenDay | GateReason::FableWeekly => Some("seven_day"),
         GateReason::Ok
         | GateReason::Hold
+        | GateReason::Refused
         | GateReason::Standard
         | GateReason::Login
         | GateReason::Rejected
@@ -6067,6 +6093,7 @@ fn gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Ok => "in rotation",
         GateReason::Hold => "on an upstream hold",
+        GateReason::Refused => "refused upstream (403)",
         GateReason::FiveHour => "in the 5-hour window",
         GateReason::SevenDay => "in the weekly window",
         GateReason::FableWeekly => "in the Fable weekly window",
@@ -15463,6 +15490,42 @@ mod tests {
             "a 403 is evidence about THIS request's access, not proof the refresh \
              token is dead — the account must stay eligible for the next request, \
              the same rule the 401 branch already follows"
+        );
+    }
+
+    /// A 403 must hold the refused account for a short while, so the next requests
+    /// stop paying the same refused round trip, and the row must read `refused`
+    /// rather than `ok` while the hold lasts.
+    #[tokio::test]
+    async fn forbidden_403_holds_the_account_and_shows_refused() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_403()), Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        for _ in 0..4 {
+            assert_eq!(post_one(manager.clone()).await, 200);
+        }
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "one wasted attempt on `a`, then `a` is held and never retried"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(
+            a.requests, 0,
+            "a held `a` is never selected again; `attempts` alone cannot show this, \
+             because the scripted upstream answers by connection order, not by account"
+        );
+        assert_eq!(
+            serde_json::to_value(a.gate).unwrap(),
+            serde_json::json!("refused"),
+            "a held 403 account must not read `gate: ok`"
+        );
+        assert_eq!(
+            manager.account_status(0),
+            Some(AccountStatus::Active),
+            "the hold is bounded, never the terminal `Error`"
         );
     }
 

@@ -2488,7 +2488,11 @@ impl Manager {
         }
         if let Some(until) = account.rate_limited_until_ms {
             if now_ms < until {
-                gates.push((GateReason::Hold, ms_to_odt(until)));
+                let reason = match account.hold_cause {
+                    HoldCause::RateLimit => GateReason::Hold,
+                    HoldCause::Refused => GateReason::Refused,
+                };
+                gates.push((reason, ms_to_odt(until)));
             }
         }
         if let Some(window) = account.quota.five_hour {

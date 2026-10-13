@@ -81,6 +81,12 @@ enum Command {
     /// one-liners in the docs). Sessions get their own object-shaped verb
     /// rather than a flag that changes `status`'s top-level type.
     Sessions(SessionsArgs),
+    /// Print every account as claude-swap's `list --json` document, for
+    /// CodexBar. JSON only: `tcr status` is the view for a person.
+    ///
+    /// Its own verb for the same reason as `sessions`: the document is an
+    /// object, and `status --json`'s bare array has clients.
+    List(ListArgs),
     /// Print a usage report for the last N days (default 7), read from the
     /// usage ledger — cost, tokens, cache-hit ratio, by model/account/day, and
     /// the busiest sessions.
@@ -1211,6 +1217,18 @@ struct DoctorArgs {
     json: bool,
 }
 
+/// `tcr list --json`: the same two options as `status`, and `--json` is the
+/// only output there is.
+#[derive(clap::Args)]
+struct ListArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Emit claude-swap's list schema v1 (required: there is no text form).
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(clap::Args)]
 struct SessionsArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
@@ -1395,6 +1413,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Peer(args)) => run_peer(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Sessions(args)) => run_sessions(args).await,
+        Some(Command::List(args)) => run_list(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
@@ -5683,6 +5702,30 @@ async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     cli::sessions(&config_path, args.json).await
 }
 
+/// `tcr list --json`: claude-swap's list schema v1, for CodexBar.
+///
+/// Bare `tcr list` is a usage error (exit 2, clap's code for one) that names
+/// both ways forward, rather than a second, text rendering: the people who
+/// want a table already have `tcr status`, and a text form here would be one
+/// more thing to keep in step with it.
+///
+/// Exit 1 carries the schema-v1 error envelope on stdout ([`cli::list_v1`]);
+/// `std::process::exit` after the printing, the same shape `run_doctor` uses.
+async fn run_list(args: ListArgs) -> anyhow::Result<()> {
+    if !args.json {
+        eprintln!(
+            "error: `tcr list` prints JSON only, for CodexBar: run `tcr list --json`, or `tcr status` for the readable view"
+        );
+        std::process::exit(2);
+    }
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    let code = cli::list_v1(&config_path).await;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 /// `tcr wrap [--days N] [--json]` — a usage report read from the ledger.
 fn run_wrap(args: WrapArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
@@ -7348,6 +7391,31 @@ mod tests {
             vec!["tcr", "login", "--from-claude-code", "--force"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+        }
+    }
+
+    /// Every `tcr` command the "proxy too old" warnings tell the user to run
+    /// must be one this binary accepts. All four named a `restart` subcommand,
+    /// which clap rejected with exit 2: the remedy in the warning was itself an
+    /// error.
+    #[test]
+    fn restart_hint_names_only_commands_that_parse() {
+        let commands: Vec<&str> = cli::RESTART_HINT
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tcr "))
+            .collect();
+        assert!(
+            !commands.is_empty(),
+            "the hint must name a tcr command to run: {}",
+            cli::RESTART_HINT
+        );
+        for command in commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("the warning tells the user to run `{command}`, which does not parse: {e}");
+            }
         }
     }
 

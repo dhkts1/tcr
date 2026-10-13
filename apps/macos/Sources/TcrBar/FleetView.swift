@@ -680,6 +680,10 @@ struct FleetView: View {
             exits: peers.snapshot.exits,
             exitPeers: peers.snapshot.rows.filter { $0.trust == .trusted }.map(\.title),
             exitPeerRows: peers.snapshot.entries,
+            // Every account line is a `Menu` now (`AccountLineRow`), and
+            // `ImageRenderer` draws a `Menu` as the "prohibited" glyph, so a
+            // render has to ask for the still label.
+            snapshotMode: snapshotMode,
             onSetExit: { account, route, must in
                 peers.run(
                     PeerCommand.accountExit(account: account, route: route, must: must))

@@ -83,6 +83,31 @@ const REQUEST_LOG_CAPACITY: usize = 200;
 /// pinned out for hours with no live request to clear the hold (finding #5).
 const MAX_RATE_LIMIT_HOLD_SECONDS: i64 = 3600;
 
+/// How long an upstream 403 holds the refused account out of rotation. Short on
+/// purpose: a 403 can be about one model or one request, not the whole account,
+/// so it must not bench a healthy account for long. Without any hold, though,
+/// least-recently-selected rotation brings the account straight back and every
+/// next request pays the same refused round trip. Longer than the exhaustion
+/// soft-wait ceiling (under 60 s in proxy.rs), so a fleet that is refused
+/// everywhere is not waited on as if it were a brief park. Kept clearly under
+/// [`CACHE_WARM_HOLD_SECS`], so a session pinned to the account keeps its pin
+/// and diverts request by request (`Manager::hold_clears_while_warm`) rather
+/// than being re-keyed over what may be one refused request; a value at the
+/// boundary would flip between the two a few milliseconds after arming.
+pub(crate) const REFUSED_HOLD_SECONDS: i64 = 120;
+
+/// Why [`AccountRuntime::rate_limited_until_ms`] is armed. Both causes hold the
+/// account out of selection the same way; the cause only decides what the
+/// account's gate reads ([`GateReason::Hold`] or [`GateReason::Refused`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HoldCause {
+    /// A 429 rate-limit hold ([`Manager::mark_rate_limited`]).
+    #[default]
+    RateLimit,
+    /// An upstream 403 refusing our credential ([`Manager::mark_refused`]).
+    Refused,
+}
+
 /// The dividing line between a rate-limit hold a session should WAIT OUT on its
 /// pinned account and one long enough that re-keying is the cheaper trade:
 /// **Anthropic's default ephemeral prompt-cache TTL, 5 minutes.**
@@ -393,6 +418,8 @@ pub struct AccountRuntime {
     /// min-spacing between two selects of the SAME account.
     pub last_served_ms: i64,
     pub rate_limited_until_ms: Option<i64>,
+    /// What armed `rate_limited_until_ms`; read only to name the gate.
+    pub hold_cause: HoldCause,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -689,6 +716,7 @@ impl AccountRuntime {
             in_flight: 0,
             last_served_ms: 0,
             rate_limited_until_ms: None,
+            hold_cause: HoldCause::RateLimit,
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
@@ -10159,9 +10187,10 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let reset = now + Duration::seconds(5_000);
 
-        const ALL: [GateReason; 11] = [
+        const ALL: [GateReason; 12] = [
             GateReason::Ok,
             GateReason::Hold,
+            GateReason::Refused,
             GateReason::FiveHour,
             GateReason::SevenDay,
             GateReason::FableWeekly,
@@ -10244,6 +10273,21 @@ mod tests {
                     vec![
                         GateCase::plain("hold outliving the cache", long, false),
                         GateCase::plain("hold clearing while warm", short, true),
+                    ]
+                }
+                // A 403 refusal hold rides the same deadline as a rate-limit hold,
+                // so it splits on duration exactly the same way; only its name
+                // differs.
+                GateReason::Refused => {
+                    let mut long = gate_runtime();
+                    long.rate_limited_until_ms = Some(now_ms + (CACHE_WARM_HOLD_SECS + 60) * 1_000);
+                    long.hold_cause = HoldCause::Refused;
+                    let mut short = gate_runtime();
+                    short.rate_limited_until_ms = Some(now_ms + 30_000);
+                    short.hold_cause = HoldCause::Refused;
+                    vec![
+                        GateCase::plain("refusal hold outliving the cache", long, false),
+                        GateCase::plain("refusal hold clearing while warm", short, true),
                     ]
                 }
 

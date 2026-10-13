@@ -137,8 +137,18 @@ jobs:
             "${gitleaks}" dir --no-banner --redact --verbose --config .gitleaks.toml .
             exit 0
           fi
-          echo "scanning commits ${range}"
-          "${gitleaks}" git --no-banner --redact --verbose --config .gitleaks.toml --log-opts="${range}" .
+          # `--remerge-diff` is what makes a merge commit's own changes visible.
+          # gitleaks runs `git log -p -U0 <log-opts>` (sources/git.go:75-91 at
+          # v8.30.1), and plain `git log -p` prints no diff for a merge, so a
+          # value added while resolving a conflict reached main unscanned. The
+          # remerge diff is the merge against git's own automatic merge of its
+          # parents: only what the merge introduced, never each parent's whole
+          # diff again (`-m` does that and reports one leak twice). `--cc` is no
+          # help: gitleaks cannot parse a combined diff and scans nothing.
+          # On a conflicted file gitleaks reports the path as `b/<path>`, so a
+          # path allowlist in .gitleaks.toml must stay unanchored to cover it.
+          echo "scanning commits ${range}, merge commits included"
+          "${gitleaks}" git --no-banner --redact --verbose --config .gitleaks.toml --log-opts="--remerge-diff ${range}" .
 
       - name: Install Rust toolchain
         if: needs.changes.outputs.inert != 'true'
