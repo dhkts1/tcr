@@ -361,42 +361,110 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Set the priority of the account matching `query`.
+/// The integer a [`PriorityArg`] means against `config`'s accounts.
 ///
 /// `--first` = `min(0, existing priorities) - 1`; `--last` =
-/// `max(0, existing priorities) + 1`; an explicit `N` is written verbatim. The
-/// `0` seed guarantees a relative move always crosses the default tier even when
-/// every existing priority sits on the same side of it.
-pub fn set_priority(config_path: &Path, query: &str, priority: PriorityArg) -> anyhow::Result<()> {
-    let (name, value) = edit_account(config_path, query, |config, idx| {
-        let value = match priority {
-            PriorityArg::N(n) => n,
-            PriorityArg::First => {
-                config
-                    .accounts
-                    .iter()
-                    .filter_map(|a| a.priority)
-                    .chain(std::iter::once(0))
-                    .min()
-                    .expect("chained 0 guarantees a min")
-                    - 1
-            }
-            PriorityArg::Last => {
-                config
-                    .accounts
-                    .iter()
-                    .filter_map(|a| a.priority)
-                    .chain(std::iter::once(0))
-                    .max()
-                    .expect("chained 0 guarantees a max")
-                    + 1
-            }
-        };
-        config.accounts[idx].priority = Some(value);
-        (config.accounts[idx].name.clone(), value)
-    })?;
+/// `max(0, existing priorities) + 1`; an explicit `N` is verbatim. The `0` seed
+/// guarantees a relative move always crosses the default tier even when every
+/// existing priority sits on the same side of it.
+fn priority_value(config: &Config, priority: PriorityArg) -> i64 {
+    let existing = config
+        .accounts
+        .iter()
+        .filter_map(|a| a.priority)
+        .chain(std::iter::once(0));
+    match priority {
+        PriorityArg::N(n) => n,
+        PriorityArg::First => existing.min().unwrap_or(0) - 1,
+        PriorityArg::Last => existing.max().unwrap_or(0) + 1,
+    }
+}
+
+/// Set the priority of the account matching `query`, **in the running proxy
+/// first** and then in the config file, the same posture as [`set_enabled`].
+///
+/// A file-only write was the gap: the proxy reads `priority` once at boot, so
+/// `tcr priority alice --first` changed nothing until a restart, and a restart
+/// costs every live session its warm prompt cache.
+///
+/// The value is computed from the FILE (so `--first`/`--last` mean what they
+/// always meant), the query is resolved in the file before anything is sent,
+/// and the server ([`crate::proxy::PRIORITY_PATH`]) applies that integer in
+/// memory only. This function writes the file. The arms follow
+/// [`set_enabled`]: a refused api-key or a refused query changes nothing; a
+/// missing route or an unusable answer writes the file and says the running
+/// proxy keeps the old order until it restarts.
+pub async fn set_priority(
+    config_path: &Path,
+    query: &str,
+    priority: PriorityArg,
+) -> anyhow::Result<()> {
+    let config = load_for_edit(config_path)?;
+    resolve_account(&config.accounts, query)?;
+    let value = priority_value(&config, priority);
+
+    match post_set_priority(&config, query, value).await {
+        Ok(applied) => {
+            write_priority(config_path, query, value).with_context(|| {
+                format!(
+                    "the running proxy already ranks '{}' at {value}, but the config file was not updated, so a restart will undo it",
+                    applied.name
+                )
+            })?;
+            println!("Set priority of '{}' to {value}.", applied.name);
+            return Ok(());
+        }
+        // Nothing is listening: the file is the whole truth.
+        Err(LiveControlError::NoServer) => {}
+        Err(LiveControlError::Unauthorized) => {
+            bail!(
+                "the proxy on :{} rejected the api-key in {}, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
+                config.proxy.port,
+                config_path.display()
+            );
+        }
+        // The server matched our query to nothing or to several accounts. The
+        // file's resolution could land on a different row, so do not fall back.
+        Err(LiveControlError::Rejected(message)) => {
+            bail!(
+                "the proxy running on :{} refused this: {message} Nothing was changed.",
+                config.proxy.port
+            );
+        }
+        Err(LiveControlError::NoRoute) => {
+            let name = write_priority(config_path, query, value)?;
+            eprintln!(
+                "[tcr] WARNING: the proxy running on :{} is too old to accept a live priority change (no {} route), so only the config file was changed. It will KEEP the old order until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                config.proxy.port,
+                crate::proxy::PRIORITY_PATH,
+            );
+            println!("Set priority of '{name}' to {value}.");
+            return Ok(());
+        }
+        Err(other) => {
+            let name = write_priority(config_path, query, value)?;
+            eprintln!(
+                "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP the old order until it restarts.",
+                config.proxy.port,
+                other.why(),
+            );
+            println!("Set priority of '{name}' to {value}.");
+            return Ok(());
+        }
+    }
+
+    let name = write_priority(config_path, query, value)?;
     println!("Set priority of '{name}' to {value}.");
     Ok(())
+}
+
+/// The file half of `tcr priority`: resolve, set, save, return the resolved
+/// name.
+fn write_priority(config_path: &Path, query: &str, value: i64) -> anyhow::Result<String> {
+    edit_account(config_path, query, |config, idx| {
+        config.accounts[idx].priority = Some(value);
+        config.accounts[idx].name.clone()
+    })
 }
 
 /// `tcr token <query>` — print the matched account's access token to stdout,
@@ -1488,6 +1556,75 @@ async fn post_set_control(
             LiveControlError::Unusable(format!(
                 "the response was not a tcr control-account payload ({e})"
             ))
+        });
+    }
+    if status.as_u16() == 401 {
+        return Err(LiveControlError::Unauthorized);
+    }
+    if !from_route && matches!(status.as_u16(), 404 | 405) {
+        return Err(LiveControlError::NoRoute);
+    }
+    if from_route && matches!(status.as_u16(), 404 | 409) {
+        return Err(LiveControlError::Rejected(
+            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+}
+
+/// Ask the running proxy to set one account's priority in its live rotation.
+/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
+/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
+/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
+/// [`crate::proxy::PRIORITY_ENDPOINT`].
+async fn post_set_priority(
+    config: &Config,
+    query: &str,
+    priority: i64,
+) -> Result<crate::proxy::SetPriorityResponse, LiveControlError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
+
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::PRIORITY_PATH
+    );
+    let mut request = client.post(&url).json(&serde_json::json!({
+        "query": query,
+        "priority": priority,
+    }));
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        // `is_timeout()` first: see `post_set_disabled`'s identical comment.
+        Err(e) if e.is_timeout() => {
+            return Err(LiveControlError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
+    };
+
+    let status = response.status();
+    let from_route = response
+        .headers()
+        .get(crate::proxy::ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(crate::proxy::PRIORITY_ENDPOINT);
+    let body = response.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        return serde_json::from_str(&body).map_err(|e| {
+            LiveControlError::Unusable(format!("the response was not a tcr priority payload ({e})"))
         });
     }
     if status.as_u16() == 401 {
@@ -3465,44 +3602,126 @@ mod tests {
     }
 
     // --- priority ----------------------------------------------------------
+    //
+    // `config_on_a_dead_port`, never `TWO_ACCOUNTS`' literal 3456: `set_priority`
+    // dials the configured port for real, and 3456 is the live fleet proxy.
 
-    #[test]
-    fn set_priority_explicit_writes_int() {
-        let path = write_config("prio-n", TWO_ACCOUNTS);
-        set_priority(&path, "bob@example.com", PriorityArg::N(7)).unwrap();
+    #[tokio::test]
+    async fn set_priority_explicit_writes_int() {
+        let path = config_on_a_dead_port("prio-n").await;
+        set_priority(&path, "bob@example.com", PriorityArg::N(7))
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[1].priority, Some(7));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_priority_first_is_min0_minus_one() {
+    #[tokio::test]
+    async fn set_priority_first_is_min0_minus_one() {
         // Existing priorities are 0 and 1 → min(0, {0,1}) - 1 = -1.
-        let path = write_config("prio-first", TWO_ACCOUNTS);
-        set_priority(&path, "bob@example.com", PriorityArg::First).unwrap();
+        let path = config_on_a_dead_port("prio-first").await;
+        set_priority(&path, "bob@example.com", PriorityArg::First)
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[1].priority, Some(-1));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_priority_last_is_max0_plus_one() {
+    #[tokio::test]
+    async fn set_priority_last_is_max0_plus_one() {
         // Existing priorities are 0 and 1 → max(0, {0,1}) + 1 = 2.
-        let path = write_config("prio-last", TWO_ACCOUNTS);
-        set_priority(&path, "alice@example.com", PriorityArg::Last).unwrap();
+        let path = config_on_a_dead_port("prio-last").await;
+        set_priority(&path, "alice@example.com", PriorityArg::Last)
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].priority, Some(2));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_priority_nonexistent_errors_and_leaves_file_byte_identical() {
-        let path = write_config("prio-miss", TWO_ACCOUNTS);
+    #[tokio::test]
+    async fn set_priority_nonexistent_errors_and_leaves_file_byte_identical() {
+        let path = config_on_a_dead_port("prio-miss").await;
         let before = fs::read_to_string(&path).unwrap();
-        let result = set_priority(&path, "nobody@example.com", PriorityArg::N(3));
+        let result = set_priority(&path, "nobody@example.com", PriorityArg::N(3)).await;
         assert!(result.is_err());
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr priority bob --first` against a REAL proxy on an ephemeral port: the
+    /// serving process routes the next fresh session to bob, and the file
+    /// carries the new value too. Before the live route, only the file moved and
+    /// the running rotation kept picking alice until a restart.
+    #[tokio::test]
+    async fn set_priority_reorders_the_running_proxy_and_the_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-priority").await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+
+        let fresh_pick = |m: &Manager| {
+            m.select(
+                &std::collections::HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                "/v1/messages",
+                None,
+            )
+        };
+        assert_eq!(fresh_pick(&manager), Some(0), "alice leads at boot");
+
+        set_priority(&path, "bob@example.com", PriorityArg::First)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fresh_pick(&manager),
+            Some(1),
+            "the SERVING process now routes a fresh session to bob"
+        );
+        assert_eq!(
+            load(&path).accounts[1].priority,
+            Some(-1),
+            "and the file agrees"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A refused query (the live rotation holds two rows of one name) changes
+    /// neither the file nor the running proxy's order.
+    #[tokio::test]
+    async fn set_priority_refuses_an_ambiguous_live_query_without_writing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-priority-ambiguous").await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let mut config = load(&path);
+        config.accounts[1].name = "alice@example.com".to_string();
+        let before = fs::read_to_string(&path).unwrap();
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let err = set_priority(&path, "alice@example.com", PriorityArg::First)
+            .await
+            .expect_err("an ambiguous live query must not be applied");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        assert_eq!(before, fs::read_to_string(&path).unwrap());
         fs::remove_file(&path).ok();
     }
 

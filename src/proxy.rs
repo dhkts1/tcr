@@ -54,7 +54,7 @@ use crate::config;
 use crate::fallback;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
-    InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome,
+    InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
 use crate::quota::{quota_rejections, UnifiedRejectionKind};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
@@ -933,6 +933,24 @@ pub const CONTROL_PATH: &str = "/_tcr/accounts/control";
 /// the three mutating routes answered.
 pub const CONTROL_ENDPOINT: &str = "account-control";
 
+/// Path of the live priority endpoint [`set_priority_handler`] serves, `POST`
+/// only, the fourth route on this process that changes rotation state.
+///
+/// It exists because `priority` was a boot-time read: `tcr priority` wrote the
+/// config file and the running proxy kept ranking by the old value until it
+/// restarted, which is the cold-cache event this tool exists to avoid.
+///
+/// Same shape as [`DISABLED_PATH`] and for the same reasons: registered as a
+/// real route so axum matches it exactly and BEFORE the catch-all, so a `POST`
+/// here can never be rewritten onto api.anthropic.com carrying a pooled OAuth
+/// Bearer. What authorizes the change is [`local_endpoint_gate`] plus the
+/// `application/json` requirement.
+pub const PRIORITY_PATH: &str = "/_tcr/accounts/priority";
+
+/// The [`ENDPOINT_HEADER`] value [`set_priority_handler`] stamps, so a caller
+/// can tell which mutating route answered.
+pub const PRIORITY_ENDPOINT: &str = "accounts-priority";
+
 /// Body cap for the local control route: a JSON object with three short fields.
 /// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
 /// route buffers into memory in a credential-holding process, and nothing
@@ -1392,6 +1410,10 @@ pub fn app(manager: Arc<Manager>) -> Router {
             CONTROL_PATH,
             axum::routing::post(set_control_handler).fallback(control_method_not_allowed),
         )
+        .route(
+            PRIORITY_PATH,
+            axum::routing::post(set_priority_handler).fallback(priority_method_not_allowed),
+        )
         .fallback(handle)
         .with_state(manager)
 }
@@ -1836,6 +1858,130 @@ pub struct SetControlResponse {
     /// [`crate::manager::ControlPersist::warning`], verbatim, or `null`.
     #[serde(default)]
     pub warning: Option<String>,
+}
+
+/// The 200 body of [`PRIORITY_PATH`]. Deserializable too, because `tcr
+/// priority` reads it and both halves of the wire contract belong to one type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SetPriorityResponse {
+    /// The RESOLVED account name, for the same reason as
+    /// [`SetDisabledResponse::name`].
+    pub name: String,
+    /// The priority now in force in the live rotation.
+    pub priority: i64,
+}
+
+/// The request body of [`PRIORITY_PATH`]. Both fields are `Option` so a body
+/// missing either is a 400 naming the field, the same reasoning as
+/// [`SetDisabledRequest`].
+#[derive(serde::Deserialize)]
+struct SetPriorityRequest {
+    query: Option<String>,
+    priority: Option<i64>,
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the priority route produced.
+fn stamp_priority_endpoint(response: Response) -> Response {
+    stamp_endpoint_as(response, PRIORITY_ENDPOINT)
+}
+
+/// A non-`POST` on [`PRIORITY_PATH`]. Answered locally with 405, same
+/// reasoning as [`disabled_method_not_allowed`].
+async fn priority_method_not_allowed() -> Response {
+    stamp_priority_endpoint(error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr priority endpoint takes POST.",
+        None,
+    ))
+}
+
+/// `POST /_tcr/accounts/priority`: set one account's priority IN THE LIVE
+/// ROTATION, for `tcr priority`.
+///
+/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
+/// first (refusal NOT stamped), then [`is_json_content_type`] (stamped). The
+/// work is [`Manager::set_priority_by_query`], which changes memory only; the
+/// CLI writes the config file, because `--first`/`--last` are computed from it.
+async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-priority") {
+        // NOT stamped: see `set_disabled_handler`'s identical comment.
+        return refusal;
+    }
+
+    if !is_json_content_type(&parts.headers) {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "The tcr priority endpoint requires Content-Type: application/json.",
+            None,
+        ));
+    }
+
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+            None,
+        ));
+    };
+    let Some(parsed) = parse_object::<SetPriorityRequest>(&bytes) else {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object: {\"query\": \"<account>\", \"priority\": 0}.",
+            None,
+        ));
+    };
+    let (Some(query), Some(priority)) = (parsed.query, parsed.priority) else {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Both \"query\" (string) and \"priority\" (integer) are required.",
+            None,
+        ));
+    };
+    if query.trim().is_empty() {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "\"query\" must not be empty.",
+            None,
+        ));
+    }
+
+    match manager.set_priority_by_query(&query, priority) {
+        SetPriorityOutcome::NoMatch => stamp_priority_endpoint(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("No account in the live rotation matches '{query}'."),
+            None,
+        )),
+        SetPriorityOutcome::Ambiguous(names) => stamp_priority_endpoint(error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &crate::cli::ambiguous_query_message(&query, &names),
+            None,
+        )),
+        SetPriorityOutcome::Applied { name } => {
+            let payload = SetPriorityResponse { name, priority };
+            let Ok(body) = serde_json::to_string(&payload) else {
+                return stamp_priority_endpoint(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Could not serialize the priority result.",
+                    None,
+                ));
+            };
+            let mut response = Response::new(Body::from(body));
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert("cache-control", HeaderValue::from_static("no-store"));
+            stamp_priority_endpoint(response)
+        }
+    }
 }
 
 /// `POST /_tcr/accounts/control` — set or clear the identity-bound CONTROL
@@ -9122,6 +9268,235 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Drive the priority route with a `ClientAddr` we control, the same shape
+    /// as [`control_request`] but against [`PRIORITY_PATH`].
+    async fn priority_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(PRIORITY_PATH);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, bytes)
+    }
+
+    /// What a fresh session (no affinity pin, nothing tried) is routed to.
+    fn fresh_pick(manager: &Manager) -> Option<usize> {
+        manager.select(
+            &HashSet::new(),
+            OffsetDateTime::now_utc(),
+            None,
+            None,
+            "/v1/messages",
+            None,
+        )
+    }
+
+    /// THE BITING TEST for the priority route: after the endpoint answers, the
+    /// NEXT fresh session is routed by the new priority in the running process.
+    ///
+    /// Before the route existed `tcr priority` wrote only the file, so the live
+    /// rotation kept picking alice (priority 0) over bob (priority 1) until a
+    /// restart. A 200 alone would not catch a handler that answers and changes
+    /// nothing; the selection is the assertion that does.
+    #[tokio::test]
+    async fn priority_endpoint_reorders_the_live_rotation() {
+        let (manager, path) = control_manager("priority-apply", None);
+        assert_eq!(fresh_pick(&manager), Some(0), "alice leads at priority 0");
+
+        let (status, headers, body) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"bob@example.com","priority":-1}"#,
+        )
+        .await;
+        let picked = fresh_pick(&manager);
+        assert_eq!(
+            (status, picked),
+            (StatusCode::OK, Some(1)),
+            "the route must answer 200 and the next fresh session must go to bob; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(PRIORITY_ENDPOINT),
+            "the route stamps itself so a caller can tell it from a missing route"
+        );
+        let payload: SetPriorityResponse =
+            serde_json::from_slice(&body).expect("a priority payload");
+        assert_eq!(payload.name, "bob@example.com", "the RESOLVED name");
+        assert_eq!(payload.priority, -1);
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(snap.accounts[1].priority, -1, "status shows the live value");
+        assert_eq!(
+            snap.accounts[0].priority, 0,
+            "only the resolved account moved"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The live priority of rotation slot `idx`.
+    fn live_priority(manager: &Manager, idx: usize) -> i64 {
+        manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].priority
+    }
+
+    /// The priority route passes the same two gates as the other mutating
+    /// routes: a non-loopback or unprovable origin is 403, a missing or wrong
+    /// api-key is 401, and neither changes the live rotation.
+    #[tokio::test]
+    async fn priority_endpoint_refuses_bad_origin_and_bad_key() {
+        let body = r#"{"query":"bob@example.com","priority":-1}"#;
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let (manager, path) = control_manager("priority-origin", None);
+            let (status, _h, _b) =
+                priority_request(Arc::clone(&manager), Method::POST, peer, None, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} must be refused");
+            assert_eq!(live_priority(&manager, 1), 1, "{label} changed priority");
+            std::fs::remove_file(&path).ok();
+        }
+        for (label, provided) in [("no key at all", None), ("a wrong key", Some("wrong-key"))] {
+            let (manager, path) = control_manager("priority-key", Some("secret-key"));
+            let (status, _h, _b) = priority_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                provided,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{label} must be refused");
+            assert_eq!(live_priority(&manager, 1), 1, "{label} changed priority");
+            std::fs::remove_file(&path).ok();
+        }
+        let (manager, path) = control_manager("priority-key-ok", Some("secret-key"));
+        let (status, _h, b) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            Some("secret-key"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(live_priority(&manager, 1), -1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Request-shape refusals are local, stamped, and change nothing: a missing
+    /// content type (415), a wrong method (405), malformed bodies (400), an
+    /// unknown account (404) and an ambiguous one (409).
+    #[tokio::test]
+    async fn priority_endpoint_refuses_bad_requests_locally() {
+        use tower::ServiceExt as _;
+        let (manager, path) = control_manager("priority-shape", None);
+        let stamped = |h: &HeaderMap| {
+            h.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()) == Some(PRIORITY_ENDPOINT)
+        };
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(PRIORITY_PATH)
+            .body(Body::from(r#"{"query":"bob@example.com","priority":-1}"#))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(Arc::clone(&manager))
+            .oneshot(req)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(stamped(response.headers()), "a 415 names its route");
+
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+            let (status, headers, _b) = priority_request(
+                Arc::clone(&manager),
+                method.clone(),
+                Some(loopback_peer()),
+                None,
+                r#"{"query":"bob@example.com","priority":-1}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert!(stamped(&headers), "{method}: a 405 names its route");
+        }
+
+        for bad in [
+            "not json",
+            r#"["bob@example.com",-1]"#,
+            r#"{"query":"bob@example.com"}"#,
+            r#"{"priority":-1}"#,
+            r#"{"query":"bob@example.com","priority":"first"}"#,
+            r#"{"query":"  ","priority":-1}"#,
+        ] {
+            let (status, headers, _b) = priority_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                None,
+                bad,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(stamped(&headers), "{bad}: a 400 names its route");
+        }
+
+        let (status, headers, body) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"nobody@example.com","priority":-1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(stamped(&headers));
+        assert!(String::from_utf8_lossy(&body).contains("nobody@example.com"));
+        assert_eq!(live_priority(&manager, 0), 0, "nothing moved");
+        assert_eq!(live_priority(&manager, 1), 1, "nothing moved");
+        std::fs::remove_file(&path).ok();
+
+        let path = control_config_path("priority-ambiguous");
+        let mut config = two_account_config(None);
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        let (status, headers, _b) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","priority":-1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(stamped(&headers));
+        assert_eq!(live_priority(&manager, 0), 0, "a tie sets nothing");
+        assert_eq!(live_priority(&manager, 1), 1, "a tie sets nothing");
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Drive the control route with FULL control over the request line and every
     /// header, so a BROWSER-shaped or forward-proxy-shaped request is testable as
     /// it would actually arrive. [`control_request`] always sends
@@ -11051,7 +11426,10 @@ mod tests {
             (Method::POST, "/_tcr/accounts/"),
             (Method::POST, "/_tcr/accounts/disable"),
             (Method::POST, "/_tcr/accounts/disabled/extra"),
-            (Method::POST, "/_tcr/accounts/priority"),
+            // `/_tcr/accounts/priority` itself is a route now (PRIORITY_PATH);
+            // its near-misses stay here.
+            (Method::POST, "/_tcr/accounts/priorities"),
+            (Method::POST, "/_tcr/accounts/priority/extra"),
             // The bare path IS registered (ADD_ACCOUNT_PATH) — a `GET` on it
             // gets a local 405, not a 404 like every other row here — but it
             // belongs in this table anyway for the assertion this table makes
