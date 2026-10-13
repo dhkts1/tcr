@@ -157,6 +157,14 @@ final class AccountIdentityTests: XCTestCase {
         )
     }
 
+    /// The server's 403 hold decodes as its own case and round-trips, and is not
+    /// mistaken for Anthropic's `rejected` verdict.
+    func testTheRefusedGateDecodes() {
+        XCTAssertEqual(GateReason(token: "refused"), .refused)
+        XCTAssertEqual(GateReason(token: "refused").token, "refused")
+        XCTAssertFalse(GateReason(token: "refused") == .rejected)
+    }
+
     /// A gate token this build does not know must stay readable rather than
     /// throwing the row away — the same tolerance `QuotaState` has.
     func testAnUnknownGateTokenIsKeptVerbatim() {

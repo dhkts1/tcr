@@ -3777,12 +3777,37 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // A 403 here is evidence about THIS request's account access, not proof the
         // refresh token itself is dead — that is still caught at the source, where
         // a rejected refresh sets `Error` directly.
+        //
+        // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
+        // keeps the status `Active`. Without one, rotation brought the account
+        // straight back and the next request paid the same refused round trip,
+        // while `tcr status` read the row as `gate: ok`; the hold's gate reads
+        // `refused` instead.
         if status == StatusCode::FORBIDDEN {
             tracing::warn!(
                 account = account_name.as_deref().unwrap_or("?"),
                 account_index = idx,
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
+            // Upstream's own words for the refusal, read capped in size and time
+            // exactly as the 429 arm reads its body, so a body that never
+            // completes cannot become a hang.
+            match tokio::time::timeout(
+                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+            )
+            .await
+            {
+                Ok(Ok(body)) => {
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &body)
+                }
+                Ok(Err(_)) | Err(_) => tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    "upstream 403 body could not be read within the cap"
+                ),
+            }
+            manager.mark_refused(idx);
             refused_403.push((idx, account_name.clone()));
             tried.insert(idx);
             continue;
@@ -5937,6 +5962,7 @@ fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
         GateReason::SevenDay | GateReason::FableWeekly => Some("seven_day"),
         GateReason::Ok
         | GateReason::Hold
+        | GateReason::Refused
         | GateReason::Standard
         | GateReason::Login
         | GateReason::Rejected
@@ -6067,6 +6093,7 @@ fn gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Ok => "in rotation",
         GateReason::Hold => "on an upstream hold",
+        GateReason::Refused => "refused upstream (403)",
         GateReason::FiveHour => "in the 5-hour window",
         GateReason::SevenDay => "in the weekly window",
         GateReason::FableWeekly => "in the Fable weekly window",

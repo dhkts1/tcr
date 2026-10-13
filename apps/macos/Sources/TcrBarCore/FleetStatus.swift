@@ -134,7 +134,11 @@ extension QuotaState: Decodable {
 /// Rust spells these kebab-case (`src/stats.rs`'s `GateReason`, serialized by
 /// `gate_reason_token`): `ok`, `hold`, `five-hour`, `seven-day`,
 /// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`,
-/// `parked`.
+/// `parked`, `refused`.
+///
+/// [`Self/refused`] is the short hold the server arms after upstream answered
+/// 403 to this account's credential. Unlike `rejected` it self-frees when the
+/// hold ends.
 ///
 /// [`Self/rejected`] is the one the panel could not see before this existed,
 /// and it is the reason the type does. Anthropic's own
@@ -151,12 +155,14 @@ extension QuotaState: Decodable {
 public enum GateReason: Equatable, Sendable {
     case ok
     case rejected
+    case refused
     case unknown(String)
 
     public init(token: String) {
         switch token {
         case "ok": self = .ok
         case "rejected": self = .rejected
+        case "refused": self = .refused
         default: self = .unknown(token)
         }
     }
@@ -166,6 +172,7 @@ public enum GateReason: Equatable, Sendable {
         switch self {
         case .ok: return "ok"
         case .rejected: return "rejected"
+        case .refused: return "refused"
         case .unknown(let raw): return raw
         }
     }
