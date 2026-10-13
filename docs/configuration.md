@@ -30,8 +30,11 @@ writes the account for you. Hand-editing is for the *settings* keys below.
 
 The document deserializes into `Config` with `#[serde(rename_all = "camelCase")]`, so every
 key is camelCase. Unmodelled keys are preserved verbatim across a load→save round trip
-rather than dropped, but seven of them are also *read*, and are documented in their own
-section below.
+rather than dropped, but eight of them are also *read*, and are documented in their own
+section below. Because a misspelled key is kept and does nothing, `tcr doctor` names every
+top-level key this build does not recognise, with its nearest known spelling, and the server logs
+them once at boot ([`tcr doctor`](cli.md#config-keys-tcr-does-not-recognise)). The list of known
+keys is `src/config_keys.rs`.
 
 ## Top level
 
@@ -317,7 +320,7 @@ unchanged from the value already running in production, and only the fleet ceili
 
 ## Keys read from the unmodelled map
 
-These seven are not fields of `Config`. They land in the flattened `extra` map and are read
+These eight are not fields of `Config`. They land in the flattened `extra` map and are read
 back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
 They are fully live config with a caller in the boot or request path, not compatibility
 leftovers.

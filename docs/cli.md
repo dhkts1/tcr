@@ -756,6 +756,30 @@ the route is right, nothing answers, and the port is held by something that is n
 `--json` emits the same decision as one object, with `verdict` and `exitCode` written out so a
 caller reads one document instead of re-deriving either.
 
+### Config keys tcr does not recognise
+
+`doctor` also names every top-level key in the config that this build does not recognise, with the
+known key it is closest to. A misspelled key is kept in the file as written and has no effect, so
+without this line `quotaProbeSecs` looks exactly like a config that sets the probe cadence:
+
+```
+unknownKey: quotaProbeSecs (did you mean quotaProbeSeconds?)
+```
+
+In `--json` the same list is `unknownKeys`, an array that is `[]` when every key is known:
+
+```
+"unknownKeys": [{ "key": "quotaProbeSecs", "nearest": "quotaProbeSeconds" }]
+```
+
+`nearest` is `null` when no known key is close enough to be a likely typo. A key counts as known when
+it is a field tcr models, one of the keys read from the unmodelled map
+([configuration](configuration.md#keys-read-from-the-unmodelled-map)), a key teamclaude writes
+(`routes`, `sx`, `logDir`, `autoUpdate`), or the legacy `throttle`. The list is reported and never
+enforced: the file is not changed, the exit code above still describes routing alone, and the server
+logs the same keys once at boot. Only top-level keys are checked; per-account and `proxy` keys are
+not.
+
 `tcr status` prints this verdict line **first**, and only when it is exit 2 or 3, so a glance at the
 fleet cannot show healthy accounts while Claude Code talks to something else. The `--json` form of
 `status` is untouched: it stays a bare array.
