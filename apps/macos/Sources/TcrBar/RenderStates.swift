@@ -86,6 +86,11 @@ enum RenderStates {
                 "near@example.com"
             ),
             ("02c-mixed-thirteen-hover-lower", .loaded(fleet(mixedJSON)), false, nil),
+            // The strip over the Accounts tab (unit H3) with the pointer on
+            // its 8th segment, spent-3, pinned by ``litAccountFixture(for:)``:
+            // the segment ringed and spent-3's line lit, and no hover card.
+            // Held to the same with-and-without size check as 02b.
+            ("02d-mixed-thirteen-segment-hover", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
             ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false, nil),
@@ -312,12 +317,25 @@ enum RenderStates {
         }
     }
 
+    /// The account (``Account/id``) whose strip segment a scene points at, or
+    /// `nil` for none: a lookup by name for the reason ``initialTab(for:)`` is
+    /// one.
+    private static func litAccountFixture(for sceneName: String) -> String? {
+        switch sceneName {
+        case "02d-mixed-thirteen-segment-hover": return "spent-3@example.com"
+        default: return nil
+        }
+    }
+
     /// The hover card's two promises, measured on the scene that pins one:
     /// the panel is the SAME size with the card as without it (the card is an
     /// overlay and must never grow the list, the `ffe8a86` rule), and the two
     /// pictures DIFFER (the card really drew). The second half is the positive
     /// control: a card that silently failed to draw would pass the first half
     /// on its own. Prints what failed and answers `false`, which fails the run.
+    ///
+    /// A pointed-at strip segment (unit H3) makes the same two promises: the
+    /// ring and the lit line change no size, and they do draw.
     @MainActor
     private static func hoverCardKeepsPanelSize<A: View, B: View>(
         without: A, with: B, named name: String
@@ -606,7 +624,7 @@ enum RenderStates {
         // A closure over the hover pin, so a scene that pins a hover card can
         // also be drawn without it and the two compared
         // (``hoverCardKeepsPanelSize(without:with:named:)``).
-        let panel = { (hoverCard: String?) in
+        let panel = { (hoverCard: String?, litAccount: String?) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -643,7 +661,8 @@ enum RenderStates {
                 initialClaudeCount: scene.name == "22-no-requests-banner" ? 1 : nil,
                 initialClaudeRoute: scene.name == "22-no-requests-banner"
                     ? noRequestsBannerRoute : nil,
-                initialHoverCard: hoverCard
+                initialHoverCard: hoverCard,
+                initialLitAccount: litAccount
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -657,7 +676,8 @@ enum RenderStates {
             .fixedSize()
         }
         let hoverCard = hoverCardFixture(for: scene.name)
-        let view = panel(hoverCard)
+        let litAccount = litAccountFixture(for: scene.name)
+        let view = panel(hoverCard, litAccount)
 
         // The shipped default stays unsuffixed — every existing filename this
         // harness produces is unchanged — and only the forced `.comfortable`
@@ -668,8 +688,8 @@ enum RenderStates {
             density == .compact
             ? "\(scene.name)-\(appearance.rawValue).png"
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
-        if hoverCard != nil,
-            !hoverCardKeepsPanelSize(without: panel(nil), with: view, named: name)
+        if hoverCard != nil || litAccount != nil,
+            !hoverCardKeepsPanelSize(without: panel(nil, nil), with: view, named: name)
         {
             return false
         }

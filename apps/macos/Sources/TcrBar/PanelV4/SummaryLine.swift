@@ -66,37 +66,14 @@ struct SummaryLine: View {
 }
 
 extension SummaryLine {
-    /// The Accounts tab's two lines, built from the fleet's own tallies — never
-    /// re-counted here. Line one is the population breakdown (`9 ready · 3 near
-    /// limit · 1 unmeasured`), line two is what it cost (`$41.80 today · cache
-    /// 95%`).
+    /// The Accounts tab's one line under the title: what it cost (`$41.80
+    /// today · cache 95%`), or `nil` when nothing was measured.
     ///
-    /// ``Fleet/sentenceBreakdown``, not ``Fleet/breakdown``: the latter leaves
-    /// out the unmeasured and need-re-login buckets for a header that names them
-    /// in a clause this line does not have.
-    /// `.sum .ok{color:var(--ok);font-weight:600}`, `.sum .warn{color:var(--warn)}`,
-    /// `.sum .bad{color:var(--bad)}` — and nothing else. A bucket with no role
-    /// class stays `dim` at 400: the sheet colours what the operator can ACT on,
-    /// and colouring every clause is how a sentence stops reading as a sentence.
-    /// Only `ok` carries the weight.
-    private static func tint(_ kind: FleetTally.Kind) -> Color {
-        switch kind {
-        case .ok: return Tok.ok
-        case .near: return Tok.near
-        case .spent, .needsRelogin, .rejected: return Tok.spent
-        case .unknown, .unmeasured, .disabled: return Tok.dim
-        }
-    }
-
-    static func accounts(_ fleet: Fleet) -> SummaryLine {
-        var first: [Run] = fleet.sentenceBreakdown.map { tally in
-            Run(
-                text: tally.sentenceLabel, tint: tint(tally.kind),
-                emphasised: tally.kind == .ok)
-        }
-        if first.isEmpty {
-            first = [Run(text: fleet.capacitySummary, tint: Tok.color(for: fleet.capacityState))]
-        }
+    /// The tally line that led it (`4 ready · 1 near limit · 6 spent`) is gone
+    /// (option H, unit H3): the strip at the top of the tab counts the fleet
+    /// now ("5 of 13 can take work now"), and two counts of one fleet in two
+    /// wordings, one over the other, is one too many.
+    static func accounts(_ fleet: Fleet) -> SummaryLine? {
         var second: [Run] = []
         if fleet.hasUsage {
             // `dim` at 400: the mockup's money clause is `.nw`, which sets
@@ -113,8 +90,6 @@ extension SummaryLine {
                 second.append(Run(text: "\(unpriced) unpriced today", tint: Tok.mute))
             }
         }
-        return SummaryLine(
-            lines: second.isEmpty ? [first] : [first, second],
-            accessibilityText: "\(fleet.capacitySummary). \(fleet.breakdownLabel)")
+        return second.isEmpty ? nil : SummaryLine(lines: [second])
     }
 }

@@ -49,6 +49,10 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// line draws `.hov`'s fill. The card itself hangs from the panel root
     /// (`AccountHoverCard.swift`), not from here.
     var hoveredRow: String? = nil
+    /// The account whose segment the pointer is on in the strip above the list
+    /// (unit H3), by ``Account/id``: every line of that account draws `.hov`'s
+    /// fill, as a hovered line does, and no hover card opens.
+    var litAccount: String? = nil
     /// The pointer entering (`true`) or leaving a line, by row identity.
     var onHoverLine: (String, Bool) -> Void = { _, _ in }
     /// The row's own actions, as a context menu — the SECOND route to them,
@@ -70,17 +74,29 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// two is one line now, saying its own week used.
     static var parkedVisibleRows: Int { 2 }
 
+    /// ``Fleet/accountsTabSections(pinning:expandedGroups:)``, the order the
+    /// strip's segments read too.
     private var sections: [FleetSection] {
-        let all = fleet.sectionsInDisplayOrder(pinning: controlName)
-        let loose = all.filter { $0.group == .ungrouped }
-        let named = all.filter { $0.group != .ungrouped }
-        return loose + named.filter { !isSummarised($0) } + named.filter { isSummarised($0) }
+        fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
     }
 
     /// A group the operator has not opened and that the fleet says collapses by
     /// default: one line, its tally, and a button.
     private func isSummarised(_ section: FleetSection) -> Bool {
-        section.collapsesByDefault && !expandedGroups.contains(section.group.token)
+        section.isSummarised(expandedGroups: expandedGroups)
+    }
+
+    /// The strip over this tab (unit H3): one segment per account, in the
+    /// order this view draws its rows, from the same sections, caps and forms.
+    static func strip(
+        fleet: Fleet, controlName: String?, expandedGroups: Set<String>,
+        lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit], now: Date
+    ) -> FleetStrip {
+        let rows = fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
+            .rowsInDrawOrder(expandedGroups: expandedGroups, parkedCap: parkedVisibleRows) {
+                form($0, lentTo: lentTo, exits: exits) == .card
+            }
+        return FleetStrip(drawnRows: rows, now: now)
     }
 
     var body: some View {
@@ -157,7 +173,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     account: row.account, now: now, isControl: row.isControl,
                     snapshotMode: snapshotMode, nameWidth: nameWidth
                 ) { menu(row.account) }
-                .hoverableLine(row, hovered: hoveredRow == row.id, bleed: .zero) {
+                .hoverableLine(row, hovered: lit(row), bleed: .zero) {
                     onHoverLine(row.id, $0)
                 }
             case .waitingLine:
@@ -166,7 +182,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     isControl: row.isControl, snapshotMode: snapshotMode
                 ) { menu(row.account) }
                 .hoverableLine(
-                    row, hovered: hoveredRow == row.id, bleed: V4.waitBoxPaddingH
+                    row, hovered: lit(row), bleed: V4.waitBoxPaddingH
                 ) { onHoverLine(row.id, $0) }
             case .card:
                 // Never reached: both callers pass only rows whose form is a
@@ -207,10 +223,23 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// Which form this row takes, from what only this view knows: whether the
     /// account carries a lease line or an exit row.
     private func form(_ row: FleetSectionRow) -> AccountRowForm {
+        Self.form(row, lentTo: lentTo, exits: exits)
+    }
+
+    private static func form(
+        _ row: FleetSectionRow, lentTo: [String: [PeerLentToEntry]],
+        exits: [String: AccountExit]
+    ) -> AccountRowForm {
         row.form(
             carriesLease: !PeerLease.leases(forAccountLabel: row.account.name, in: lentTo)
                 .isEmpty,
             carriesExit: PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil)
+    }
+
+    /// Whether a line draws `.hov`'s fill: its own hover card is showing, or
+    /// the pointer is on its account's segment in the strip.
+    private func lit(_ row: FleetSectionRow) -> Bool {
+        hoveredRow == row.id || litAccount == row.account.id
     }
 
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
