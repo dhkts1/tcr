@@ -2325,10 +2325,11 @@ async fn finish_login(
                 Err(crate::cli::LiveControlError::NoRoute) => {
                     let saved = persist_via_account(config_path, &account)?;
                     eprintln!(
-                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running — it will not see this account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running. It will not see this account until it restarts. {}",
                         config.proxy.port,
                         crate::proxy::ADD_ACCOUNT_PATH,
                         config_path.display(),
+                        crate::cli::RESTART_HINT,
                     );
                     Ok(saved)
                 }
