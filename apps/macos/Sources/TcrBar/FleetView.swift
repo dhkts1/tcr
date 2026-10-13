@@ -169,6 +169,17 @@ struct FleetView: View {
     /// account; opens no hover card.
     @State private var litAccount: String?
 
+    /// The accounts whose card is kept open in the Accounts tab ("Keep Card
+    /// Open" in the row's right-click menu, Gil 2026-10-14), by
+    /// ``Account/id``. Persisted under ``keptOpenCardsKey`` in TcrBar's own
+    /// `UserDefaults`, the way ``expandedGroups`` is, so the choice outlives a
+    /// panel close and an app restart on this Mac and never reaches the `tcr`
+    /// config file. Pruned on each poll (``pruneKeptOpenCards()``).
+    @State private var keptOpen: KeptOpenCards
+
+    /// Internal, not `private`, for the reason ``expandedGroupsKey`` is.
+    static let keptOpenCardsKey = "keptOpenAccountCards"
+
     /// Accounts / Sessions / Tools (F2 + F3). `.accounts` selected by default.
     @State private var selectedTab: PanelTab = .accounts
 
@@ -288,7 +299,12 @@ struct FleetView: View {
         initialHoverCard: String? = nil,
         // The account (``Account/id``) whose strip segment is pointed at on
         // the first frame, for the same reason: the harness has no pointer.
-        initialLitAccount: String? = nil
+        initialLitAccount: String? = nil,
+        // The kept-open set for the first frame. `nil`, the live app's value,
+        // reads ``keptOpenCardsKey``; the render harness passes its own set
+        // for every scene, so an operator's real choice never leaks into a
+        // render.
+        initialKeptOpen: KeptOpenCards? = nil
     ) {
         self.poller = poller
         self.server = server
@@ -314,6 +330,10 @@ struct FleetView: View {
         self._claudeRoute = State(initialValue: initialClaudeRoute)
         self._hoverCard = State(initialValue: HoverCardTracker(shown: initialHoverCard))
         self._litAccount = State(initialValue: initialLitAccount)
+        self._keptOpen = State(
+            initialValue: initialKeptOpen
+                ?? KeptOpenCards(
+                    UserDefaults.standard.stringArray(forKey: Self.keptOpenCardsKey) ?? []))
     }
 
     /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
@@ -353,6 +373,7 @@ struct FleetView: View {
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
+                pruneKeptOpenCards()
             }
         }
         // The kill confirm. `docs/design/tools-tab.md`: "a destructive control
@@ -443,13 +464,11 @@ struct FleetView: View {
     @ViewBuilder
     private func hoverCardBody(_ row: FleetSectionRow) -> some View {
         if case .loaded(let fleet) = poller.state {
-            AccountCard(
-                account: row.account, shape: .full, now: Date(), isControl: row.isControl,
-                snapshotMode: snapshotMode
-            ) {
+            AccountHoverCardContent(row: row, now: Date(), snapshotMode: snapshotMode) {
                 v4AccountRow(row.account, in: fleet, actionsOnly: true)
+            } menu: {
+                v4AccountRow(row.account, in: fleet, menuOnly: true)
             }
-            .contextMenu { v4AccountRow(row.account, in: fleet, menuOnly: true) }
         }
     }
 
@@ -736,7 +755,8 @@ struct FleetView: View {
         FleetStripHeader(
             strip: AccountsTabV4<EmptyView, EmptyView>.strip(
                 fleet: fleet, controlName: control.current, expandedGroups: expandedGroups,
-                lentTo: peers.snapshot.lentTo, exits: peers.snapshot.exits, now: Date()),
+                lentTo: peers.snapshot.lentTo, exits: peers.snapshot.exits,
+                keptOpen: keptOpen, now: Date()),
             lit: litAccount
         ) { account, inside in
             if inside {
@@ -783,6 +803,7 @@ struct FleetView: View {
             },
             hoveredRow: hoverCard.shown,
             litAccount: litAccount,
+            keptOpen: keptOpen,
             onHoverLine: { rowID, inside in
                 if inside {
                     hoverCard.rowEntered(rowID)
@@ -827,7 +848,11 @@ struct FleetView: View {
             allAccounts: fleet.accounts,
             snapshotMode: snapshotMode,
             menuOnly: menuOnly,
-            actionsOnly: actionsOnly
+            actionsOnly: actionsOnly,
+            cardKeptOpen: AccountsTabV4<EmptyView, EmptyView>.keepsTallCard(
+                account, lentTo: peers.snapshot.lentTo, exits: peers.snapshot.exits)
+                ? nil : keptOpen.contains(account.id),
+            onToggleKeptOpen: { toggleKeptOpen(account.id) }
         )
     }
 
@@ -2274,6 +2299,25 @@ struct FleetView: View {
     /// this count needs an answer either way. See ``NoRequestsBanner``.
     private func refreshClaudeCount() {
         claudeCount = ProcessTable.read().filter { $0.name == "claude" }.count
+    }
+
+    /// Drops every kept-open account the poll that just landed no longer
+    /// lists, so a card never stays open as a ghost of an account that left.
+    /// Only off a loaded fleet: an unreachable proxy says nothing about which
+    /// accounts exist, and pruning on it would close every card.
+    private func pruneKeptOpenCards() {
+        guard case .loaded(let fleet) = poller.state else { return }
+        let pruned = keptOpen.pruned(to: fleet.accounts)
+        guard pruned != keptOpen else { return }
+        keptOpen = pruned
+        UserDefaults.standard.set(keptOpen.ids, forKey: Self.keptOpenCardsKey)
+    }
+
+    /// "Keep Card Open" / "Close Card": the line turns into the card, or the
+    /// card back into the line, at once.
+    private func toggleKeptOpen(_ accountID: String) {
+        keptOpen.toggle(accountID)
+        UserDefaults.standard.set(keptOpen.ids, forKey: Self.keptOpenCardsKey)
     }
 
     /// Advances or clears ``zeroRequestsSince`` off the poll that just landed.
@@ -4014,6 +4058,14 @@ struct AccountRow: View {
     /// Takes precedence over ``menuOnly`` when both are set, which no call site
     /// does — the card passes one or the other.
     var actionsOnly: Bool = false
+    /// Whether this account's card is kept open in the Accounts tab, or `nil`
+    /// where the menu offers no "Keep Card Open" at all: the legacy panel,
+    /// which has no hover card to keep, and an account that already draws
+    /// its tall card (a lease line or an exit row).
+    var cardKeptOpen: Bool? = nil
+    /// Opens or closes this account's kept-open card (``FleetView``'s set,
+    /// keyed by ``Account/id``).
+    var onToggleKeptOpen: () -> Void = {}
     /// The last "Copy Access Token" that did not land — `tcr`'s own words,
     /// drawn under the row like the other failure lines. Row-local rather
     /// than a controller: nothing else needs to know, and a copy that did
@@ -4701,6 +4753,18 @@ struct AccountRow: View {
     @ViewBuilder
     private var contextMenuItems: some View {
         let enabling = account.disabled
+        // First, and in its own section: it changes how this panel draws the
+        // account, not the account, and Gil asked for it in this menu (Gil,
+        // 2026-10-14: "The row's right-click menu gains 'Keep card open' /
+        // 'Close card'").
+        if let kept = cardKeptOpen {
+            Button(kept ? "Close Card" : "Keep Card Open") { onToggleKeptOpen() }
+                .help(
+                    kept
+                        ? "Draws this account as one line again."
+                        : "Shows this account's card in the list all the time, on this Mac.")
+            Divider()
+        }
         Button(enabling ? "Enable" : "Disable") {
             Task { await performToggle(enabling: enabling) }
         }

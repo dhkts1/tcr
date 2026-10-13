@@ -25,6 +25,10 @@ struct V4Card<Content: View>: View {
     /// not anybody looks. A colour spent on a card that is simply there
     /// forever stops meaning anything on the card that is not.
     var accent: Color?
+    /// The pointer is on this card's account somewhere else on the panel (its
+    /// strip segment): the card's fill turns `.hov`'s, the way a lit line's
+    /// does. `false` is the plain card byte for byte.
+    var lit: Bool = false
     @ViewBuilder var content: () -> Content
 
     private var fill: Color { accent?.opacity(V4.accentWashAlpha) ?? .clear }
@@ -38,7 +42,7 @@ struct V4Card<Content: View>: View {
         .padding(.horizontal, V4.cardInsetH)
         .background(
             RoundedRectangle(cornerRadius: V4.cardRadius)
-                .fill(Tok.cardFill)
+                .fill(lit ? Tok.hover : Tok.cardFill)
                 // The wash sits OVER the card fill rather than replacing it,
                 // which is what `color-mix(in srgb, near 7%, card)` means: the
                 // card is still the panel's card, warmed.

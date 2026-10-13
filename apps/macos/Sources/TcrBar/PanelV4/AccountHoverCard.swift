@@ -42,6 +42,10 @@ import TcrBarCore
 /// only on hover. The same rule holds inside a group box, where every other
 /// account is a line too (unit H1b) and gets this card exactly as a line
 /// outside a group does.
+///
+/// An account the operator keeps open ("Keep Card Open" in its right-click
+/// menu, Gil 2026-10-14) draws this card's content in the list in place of its
+/// line (``AccountHoverCardContent``), and so never floats a copy of it.
 struct HoverableLine {
     let anchor: Anchor<CGRect>
     let row: FleetSectionRow
@@ -129,6 +133,35 @@ extension View {
                 }
             }
         }
+    }
+}
+
+/// What the hover card says: the account's full ``AccountCard``, with the gear
+/// and the right-click menu from `AccountRow`'s one definition. ONE view for
+/// the floating card and for a card kept open in the list ("Keep Card Open",
+/// Gil 2026-10-14), so the two cannot drift into two layouts.
+///
+/// `shape` is `.compact` for a kept-open card inside a group box, which only
+/// narrows the room its name row measures (``AccountCard/Shape``); the
+/// floating card is always `.full`.
+struct AccountHoverCardContent<Actions: View, Menu: View>: View {
+    let row: FleetSectionRow
+    var shape: AccountCard<Actions>.Shape = .full
+    let now: Date
+    let snapshotMode: Bool
+    /// A kept-open card whose strip segment the pointer is on.
+    var lit: Bool = false
+    @ViewBuilder var actions: () -> Actions
+    @ViewBuilder var menu: () -> Menu
+
+    var body: some View {
+        AccountCard(
+            account: row.account, shape: shape, now: now, isControl: row.isControl,
+            snapshotMode: snapshotMode, lit: lit
+        ) {
+            actions()
+        }
+        .contextMenu { menu() }
     }
 }
 

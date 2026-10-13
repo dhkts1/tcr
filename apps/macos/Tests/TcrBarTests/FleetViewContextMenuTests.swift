@@ -29,6 +29,21 @@ final class ContextMenuReloginAvailabilityTests: XCTestCase {
         )
     }
 
+    /// "Keep Card Open" / "Close Card" lives in the row's right-click menu
+    /// (Gil, 2026-10-14), wired to the toggle, beside every existing item.
+    func testKeepCardOpenItemIsInTheContextMenu() throws {
+        let body = try contextMenuItemsBody()
+        XCTAssertTrue(
+            body.contains(#"Button(kept ? "Close Card" : "Keep Card Open") { onToggleKeptOpen() }"#),
+            "the Keep Card Open item is missing from contextMenuItems")
+        for item in [
+            #"Button(enabling ? "Enable" : "Disable")"#, #"Button("Copy Account Name")"#,
+            #"Button("Delete Account…")"#,
+        ] {
+            XCTAssertTrue(body.contains(item), "\(item) is gone from contextMenuItems")
+        }
+    }
+
     /// Isolates the `contextMenuItems` computed property's source text so
     /// the assertion above cannot accidentally match some other `.needsRelogin`
     /// check elsewhere in the file (e.g. the standalone `reloginButton`'s own
