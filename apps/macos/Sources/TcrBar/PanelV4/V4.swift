@@ -645,6 +645,22 @@ enum V4 {
     static let bandHeadTracking: CGFloat = 0.1 * 11
     static let bandHeadTailTracking: CGFloat = 0.02 * 11
 
+    // MARK: - Hover card (option H: `.hcard`, `.hov`)
+
+    /// `.hcard{left:10px;right:10px}`: the card spans the panel less its own
+    /// side padding, the width every box on the Accounts tab has.
+    static var hoverCardInset: CGFloat { panelPaddingSide }
+    /// `rr.bottom + 4` / `rr.top - h - 4`: the card stands 4 pt off its row.
+    static let hoverCardGap: CGFloat = 4
+    /// `box-shadow:0 10px 28px rgba(0,0,0,.65)`. SwiftUI's shadow radius is
+    /// about half a CSS blur.
+    static let hoverCardShadowRadius: CGFloat = 14
+    static let hoverCardShadowY: CGFloat = 10
+    static let hoverCardShadowAlpha: Double = 0.65
+    /// How long a leave waits before the card goes, so the pointer can cross
+    /// from the row onto the card without the card vanishing under it.
+    static let hoverCardGraceSeconds: Double = 0.15
+
     // MARK: - Peers tab literals
 
     /// The small circle in an account row's parked-tally breakdown
