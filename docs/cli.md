@@ -770,8 +770,8 @@ today UTC), read straight off the usage ledger in `~/.cache/teamclaude/usage/`. 
 status`, this needs no running proxy: the ledger is a durable, append-only record on disk, and
 `tcr wrap` just reads it.
 
-It reports, in order: totals (requests, input/output/cache-read tokens, cost, cache-hit
-ratio), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
+It reports, in order: totals (requests; uncached input, output, cache-write and cache-read
+tokens; cost; and the cache-hit ratio, the share of all prompt tokens read from cache), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
 per-day breakdown with the busiest day marked, the count of distinct sessions plus the three
 longest-running ones by request count, and a comparison against the previous `N`-day period
 (`+12%` / `-3%`). `--config` (default `~/.config/teamclaude.json`) is consulted only for
@@ -802,24 +802,24 @@ Example (fake data):
 $ tcr wrap --days 7
 tcr wrap: last 7 day(s), 2026-09-06 to 2026-09-12 (UTC)
 
-totals requests=1204 input=812000 output=241500 cacheRead=98000 cost=$42.17 cacheHitRatio=12.1%
+totals requests=1200 input=812000 output=241500 cacheWrite=90000 cacheRead=98000 cost=$42.17 cacheHitRatio=9.8%
 
 by model (sorted by cost):
-  claude-opus-5                requests=610      cost=$31.80
-  claude-sonnet-5              requests=594      cost=$10.37
+  claude-opus-5                requests=600      cost=$31.80
+  claude-sonnet-5              requests=600      cost=$10.37
 
 by account (sorted by requests):
-  alice@example.com            requests=812      cost=$28.44
-  bob@example.com              requests=392      cost=$13.73
+  alice@example.com            requests=800      cost=$28.44
+  bob@example.com              requests=400      cost=$13.73
 
 by day (busiest marked *):
   2026-09-06   requests=140      cost=$4.90
   2026-09-07   requests=210      cost=$7.35
-  2026-09-08 * requests=305      cost=$10.68
+  2026-09-08 * requests=300      cost=$10.68
   2026-09-09   requests=180      cost=$6.30
-  2026-09-10   requests=145      cost=$5.08
+  2026-09-10   requests=140      cost=$5.08
   2026-09-11   requests=120      cost=$4.20
-  2026-09-12   requests=104      cost=$3.66
+  2026-09-12   requests=110      cost=$3.66
 
 sessions: 38 distinct; top 3 by requests:
   session 1234567890123456789 requests=210
