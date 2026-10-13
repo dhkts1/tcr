@@ -533,6 +533,60 @@ impl StatusPayload {
     }
 }
 
+/// Discriminator carried by every quota response, for the same reason as
+/// [`STATUS_KIND`]: a tcr too old to have the quota route answers it with a local
+/// 404, and a caller should trust a body only when this matches.
+pub const QUOTA_KIND: &str = "tcr.quota.v1";
+
+/// The light quota read served on [`crate::proxy::QUOTA_PATH`], for a status line
+/// that ticks every turn and has no use for the rest of [`StatusPayload`].
+///
+/// Built from the same [`StatsSnapshot`] as the status payload, so the gate and
+/// the utilizations are the ones selection and `tcr status` see. Nothing here is
+/// fetched: no probe and no upstream call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaPayload {
+    /// Always [`QUOTA_KIND`].
+    pub kind: String,
+    pub accounts: Vec<AccountQuota>,
+}
+
+/// One account's row on the quota route: why it is out of rotation, if it is,
+/// and its 5-hour and weekly utilization with their resets. Field names and
+/// units match [`AccountStatus`], so a client reading both decodes one way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuota {
+    pub name: String,
+    pub gate: GateReason,
+    pub five_hour: Option<f64>,
+    pub five_hour_reset_ms: Option<i64>,
+    pub seven_day: Option<f64>,
+    pub seven_day_reset_ms: Option<i64>,
+}
+
+impl QuotaPayload {
+    /// Project a live snapshot onto the quota wire, in the server's account order.
+    pub fn from_snapshot(snapshot: &StatsSnapshot) -> Self {
+        let accounts = snapshot
+            .accounts
+            .iter()
+            .map(|a| AccountQuota {
+                name: a.name.clone(),
+                gate: a.gate,
+                five_hour: a.five_hour,
+                five_hour_reset_ms: a.five_hour_reset.map(to_ms),
+                seven_day: a.seven_day,
+                seven_day_reset_ms: a.seven_day_reset.map(to_ms),
+            })
+            .collect();
+        Self {
+            kind: QUOTA_KIND.to_string(),
+            accounts,
+        }
+    }
+}
+
 /// Which kind of route a [`PathStatus`] describes.
 ///
 /// A typed discriminant rather than a bool or a string, because the panel
