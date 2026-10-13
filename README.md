@@ -30,9 +30,10 @@ account whose prompt cache is already warm, and it shows you what the traffic wo
 
 - **It chooses by quota, not by turn.** It reads the five-hour, weekly and per-model weekly window
   on every account, and spends first the quota that resets soonest, so less of it expires unused.
-- **It keeps the prompt cache warm.** Anthropic caches per account, so each conversation stays on
-  one account. Over 30 days of the author's own traffic, ending 2026-10-13, 97.6% of prompt tokens
-  were read from cache.
+- **It keeps the prompt cache warm.** A conversation that moves to another account starts cold, and
+  its next request pays at least 12.5 times as much for the cached prefix. So each conversation
+  stays on one account, and on subscriptions the cache is held for an hour instead of five minutes. Over 30 days of the
+  author's own traffic, ending 2026-10-13, 97.6% of prompt tokens were read from cache.
 - **One proxy serves every session.** Each Claude Code session on the machine gets its own pin, and
   you can add, disable or remove accounts while it runs.
 - **You can watch it.** A macOS menu-bar app and a terminal dashboard show every window, every
@@ -294,11 +295,24 @@ login, so you only log in to the others.
 
 ### Does switching accounts lose the prompt cache?
 
-Yes. Anthropic keeps the prompt cache per account, so a conversation that moves rebuilds its whole
-cached prefix. That is why `tcr` keeps each conversation on one account, even past the point where
-it would send new conversations elsewhere. It moves only when that account cannot serve the
-request. Pins are saved to disk, so a restart keeps them for conversations still within the cache
-lifetime.
+Yes. Anthropic keeps the prompt cache per account, so a conversation that moves arrives cold and
+writes its whole cached prefix again. A cache write bills at 1.25 times the input price and a cache
+read at a tenth of it or less, so the first request after a move pays at least 12.5 times as much
+for that prefix (25 times on Opus 5.5), and on a long conversation the prefix is nearly all of the
+request. That is why `tcr` keeps each
+conversation on one account, even past the point where it would send new conversations elsewhere.
+It moves only when that account cannot serve the request. Pins are saved to disk, so a restart
+keeps them for conversations still within the cache lifetime.
+
+### How long does the cache stay warm?
+
+Five minutes after its last use, unless the request asks for an hour. From 1.1.19, when every
+account in the pool is a subscription, `tcr` rewrites every cache breakpoint to the hour, so a
+conversation you come back to within the hour resumes warm instead of writing its prefix again. On
+a subscription the hour costs the five-hour window what five minutes does (measured 2026-10-06). An
+API key is billed twice the input price for an hour-long write, so with one in the pool `tcr`
+forwards requests as sent. `cacheTtlRewrite` in [`docs/configuration.md`](docs/configuration.md)
+overrides either default.
 
 ### What happens when an account runs out?
 
