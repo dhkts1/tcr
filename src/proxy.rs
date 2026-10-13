@@ -11399,7 +11399,10 @@ mod tests {
             (Method::POST, "/_tcr/accounts/"),
             (Method::POST, "/_tcr/accounts/disable"),
             (Method::POST, "/_tcr/accounts/disabled/extra"),
-            (Method::POST, "/_tcr/accounts/priority"),
+            // `/_tcr/accounts/priority` itself is a route now (PRIORITY_PATH);
+            // its near-misses stay here.
+            (Method::POST, "/_tcr/accounts/priorities"),
+            (Method::POST, "/_tcr/accounts/priority/extra"),
             // The bare path IS registered (ADD_ACCOUNT_PATH) — a `GET` on it
             // gets a local 405, not a 404 like every other row here — but it
             // belongs in this table anyway for the assertion this table makes
