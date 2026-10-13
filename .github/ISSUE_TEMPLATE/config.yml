@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Report a security issue privately
+    url: https://github.com/dhkts1/teamclaude-rs/security/advisories/new
+    about: Send a vulnerability to the maintainer privately instead of opening a public issue.
   - name: Troubleshooting guide
     url: https://github.com/dhkts1/teamclaude-rs/blob/main/docs/troubleshooting.md
     about: Common problems and what to check first, before you open an issue.
