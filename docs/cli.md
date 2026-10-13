@@ -549,6 +549,7 @@ same bytes and only the exit code changes:
 | exit | meaning |
 |---|---|
 | **0** | no enabled account's last probe failed |
+| **1** | the command could not run (an unreadable config, say); not a probe verdict, so a script tells "tcr failed" from "a probe failed" |
 | **4** | at least one enabled account's last probe ended in `error`, `timeout` or `upstream-down` |
 
 These do not fail the check: `never` (no probe has run, so there is nothing to judge),
