@@ -611,15 +611,16 @@ enum V4 {
     static let lineMeterGap: CGFloat = 4
     /// `.slim .ln{width:54px}` (clipped with an ellipsis) and
     /// `.wline .ln{min-width:64px}`.
+    /// The live name column is this at the least and grows to the widest name
+    /// only as far as the line leaves room (``AccountLineFit``): four
+    /// `member-N` names all read `mem…` at 54, which names nobody.
     static let liveNameWidth: CGFloat = 54
-    /// The most a live box's name column grows to fit its widest name. Option
-    /// H's names are all short enough for 54; four `member-N` names in one box
-    /// all read `mem…` at 54, which names nobody. Past this the name truncates.
-    static let liveNameMaxWidth: CGFloat = 96
     static let waitNameMinWidth: CGFloat = 64
     /// `.sl{width:14px}`, `.mbar{width:32px;height:6px}`, `.mp{width:33px}`.
+    /// The label and percent columns are at least these, and wide enough for
+    /// "5h"/"7d" and "100%" at the panel's type size.
     static let lineLabelWidth: CGFloat = 14
-    static let lineBarWidth: CGFloat = 32
+    static let lineBarMaxWidth: CGFloat = 32
     static let lineBarHeight: CGFloat = 6
     static let linePercentWidth: CGFloat = 33
     /// `.dot{width:8px}`. The same disc as ``dotSize``, named for this row so
@@ -628,11 +629,31 @@ enum V4 {
     /// `.lr{font-size:11.5px}`: half a point over the mute size at either
     /// density.
     static var lineSignalSize: CGFloat { muteSize + lineSignalStep }
-    /// What a live line's signal column asks for before the labels drop: the
-    /// 56 pt option H leaves it at 372 pt. A longer signal still draws in
-    /// whatever the row has left, and truncates only past that.
+    /// The room held for a live line's signal: the 56 pt option H leaves it at
+    /// 372 pt. A longer signal still draws in whatever the row has left, and
+    /// truncates only past that.
     static let lineSignalIdealWidth: CGFloat = 56
     static let lineSignalStep: CGFloat = 0.5
+    /// The live line's tokens at this density's type sizes, for
+    /// ``AccountLineFit``. Read on each draw, so a density change re-measures.
+    static var lineMetrics: AccountLineFit.Metrics {
+        AccountLineFit.Metrics(
+            dot: lineDotSize, gap: liveLineGap, meterGap: lineMeterGap,
+            labelMinWidth: lineLabelWidth, percentMinWidth: linePercentWidth,
+            signalWidth: lineSignalIdealWidth, nameMinWidth: liveNameWidth,
+            barMaxWidth: lineBarMaxWidth, labelSize: muteSize, percentSize: dimSize)
+    }
+    /// A live line's width in the tab's own box, and a group's padding, which
+    /// a line inside a group box loses on each side.
+    static var lineRoom: AccountLineFit.Room {
+        AccountLineFit.Room(
+            looseWidth: panelWidth - 2 * panelPaddingSide - 2 * liveBoxPaddingH,
+            groupInset: groupPaddingSide)
+    }
+    /// The ONE bar width for every live line in the panel (lead ruling on H1b,
+    /// 2026-10-14): option H's 32, or less if a grouped line could not fit both
+    /// labels and "100%" twice at this density.
+    static var lineBarWidth: CGFloat { AccountLineFit.barWidth(lineRoom, lineMetrics) }
     /// `.slim+.slim{border-top:1px solid rgba(57,62,67,.6)}`: the hairline at
     /// 60 %, between rows only.
     static let lineDividerAlpha: Double = 0.6
@@ -670,12 +691,6 @@ enum V4 {
     static let hoverCardGraceSeconds: Double = 0.15
 
     // MARK: - Peers tab literals
-
-    /// The small circle in an account row's parked-tally breakdown
-    /// (`AccountsTabV4.parkedHeader`): one dot per kind of parked exit,
-    /// beside its count. Not ``dotSize`` (8): that is the freshness dot's own
-    /// size, a different circle in a different card.
-    static let tallyDotSize: CGFloat = 7
 
     /// The width of the frame around the row's "more" ellipsis glyph
     /// (`PeersTabV4.rowMenuLabel`); the height is ``PeersTabV4/hitTarget``.

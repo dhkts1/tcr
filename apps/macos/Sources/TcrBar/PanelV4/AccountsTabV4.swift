@@ -66,9 +66,8 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
 
     /// How many accounts a parked group shows before its "Show N more accounts"
     /// button — round 2's approved mockup draws two of HENRY-TOKEN's five
-    /// ("Show 3 more accounts"), one fewer than round 1's three, now that the
-    /// group's own header line carries the worst-of figures the extra card
-    /// used to be the only way to see.
+    /// ("Show 3 more accounts"), one fewer than round 1's three. Each of the
+    /// two is one line now, saying its own week used.
     static var parkedVisibleRows: Int { 2 }
 
     private var sections: [FleetSection] {
@@ -118,7 +117,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 BandHeading(section: section, now: now)
             }
             if !lines.isEmpty {
-                lineBox(lines, band: section.band, marginBottom: V4.lineBoxMarginBottom)
+                lineBox(
+                    lines, band: section.band, grouped: false,
+                    marginBottom: V4.lineBoxMarginBottom)
             }
             ForEach(cards) { row in
                 card(row, shape: .full)
@@ -137,10 +138,14 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// account's name: an account in two groups draws two lines, and keyed by
     /// name the card would hang from whichever line published last and both
     /// lines would draw the hover fill.
+    ///
+    /// A live line's name column is the panel's one column
+    /// (``liveNameColumn``), less the group's padding inside a group box, so
+    /// its bars start at the same x as the lines above and below it.
     private func lineBox(
-        _ rows: [FleetSectionRow], band: FleetBand, marginBottom: CGFloat
+        _ rows: [FleetSectionRow], band: FleetBand, grouped: Bool, marginBottom: CGFloat
     ) -> some View {
-        let nameWidth = AccountLineRow<EmptyView>.nameColumnWidth(for: rows.map(\.account))
+        let nameWidth = liveNameColumn - (grouped ? V4.lineRoom.groupInset : 0)
         return LineBox(
             items: rows,
             paddingH: band == .live ? V4.liveBoxPaddingH : V4.waitBoxPaddingH,
@@ -169,6 +174,29 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 EmptyView()
             }
         }
+    }
+
+    /// The name column of a live line outside a group, ONE for the whole panel
+    /// (lead ruling on H1b, 2026-10-14). Measured over the live lines that are
+    /// drawn: a group closed to its summary line has none, and counting its
+    /// members would truncate the names on screen to make room for lines that
+    /// are not.
+    private var liveNameColumn: CGFloat {
+        var loose: CGFloat = 0
+        var grouped: CGFloat?
+        for section in sections where !isSummarised(section) {
+            for row in section.rows where form(row) == .liveLine {
+                let width = AccountLineRow<EmptyView>.nameTextWidth(row.account)
+                if section.group == .ungrouped {
+                    loose = max(loose, width)
+                } else {
+                    grouped = max(grouped ?? 0, width)
+                }
+            }
+        }
+        return AccountLineFit.nameColumn(
+            widestLoose: loose, widestGrouped: grouped, bar: V4.lineBarWidth, V4.lineRoom,
+            V4.lineMetrics)
     }
 
     /// Which form this row takes, from what only this view knows: whether the
@@ -252,18 +280,12 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     }
                 }
             } else {
-                // The parked group's own one-line header
-                // (`docs/design/panel-tabs-mockup.html`'s `.grpsum.tally`
-                // under `HENRY-TOKEN · PARKED · 5`): a dot per state, then the
-                // spend and worst-of figures. Drawn for EVERY wholly-parked
-                // section, capped or fully expanded — the mockup draws it
-                // while still showing two of its five member cards, so this
-                // is not the collapsed-group summary above; that one
-                // REPLACES the cards, this one sits above them.
-                if section.isWhollyParked {
-                    parkedHeader(section)
-                        .padding(.top, V4.groupCardGap)
-                }
+                // No summary line over a parked group's lines any more (lead
+                // ruling on H1b, 2026-10-14): it said "worst 5h N% · 7d N%"
+                // over lines that each show their own week, and Gil called
+                // explanatory lines over rows "not needed". The legend still
+                // says PARKED and how many.
+                //
                 // One line per account, in the box the tab's own lines use
                 // (option H, lead ruling on H1b 2026-10-14); an account with a
                 // lease line or an exit row keeps its card, after the lines,
@@ -283,7 +305,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 let closes = !isCollapsible(section)
                 if !lines.isEmpty {
                     lineBox(
-                        lines, band: section.band,
+                        lines, band: section.band, grouped: true,
                         marginBottom: cards.isEmpty && closes ? V4.groupCardGap : 0
                     )
                     .padding(.top, V4.groupCardGap)
@@ -344,46 +366,6 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         if expanded { return "Show fewer accounts" }
         if isSummarised(section) { return section.expandButtonLabel }
         return "Show \(hidden) more \(hidden == 1 ? "account" : "accounts")"
-    }
-
-    /// ONE 11pt line (`docs/design/panel-tabs-mockup.html`'s `.grpsum.tally`):
-    /// a dot+count per state ``FleetSection/breakdown`` reports — the same
-    /// array the collapsed-group summary above draws its pills from, so the
-    /// two headers cannot disagree about one section's tally — then
-    /// ``FleetSection/parkedStatsLine``, dropped entirely when empty (a group
-    /// whose members carry no spend and no quota reading at all).
-    ///
-    /// Each dot's colour is ``pillRole(_:)``'s own tint, the same mapping the
-    /// pill it replaced used — `ok` green, `near` amber, `unmeasured` blue,
-    /// same as the mockup's own three states in this fixture, and every other
-    /// kind by the same rule. Each carries ``FleetTally/label`` ("3 ok") as
-    /// both its hover and its spoken name — a coloured dot says nothing on
-    /// its own to a reader who cannot see colour.
-    @ViewBuilder
-    private func parkedHeader(_ section: FleetSection) -> some View {
-        HStack(spacing: 4) {
-            ForEach(section.breakdown, id: \.kind.token) { tally in
-                HStack(spacing: 3) {
-                    Circle()
-                        .fill(pillRole(tally.kind).tint)
-                        .frame(width: V4.tallyDotSize, height: V4.tallyDotSize)
-                    Text("\(tally.count)")
-                        .font(V4.font(V4.muteSize))
-                        .foregroundStyle(Tok.mute)
-                }
-                .help(tally.label)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(tally.label)
-            }
-            if !section.parkedStatsLine.isEmpty {
-                Text("· \(section.parkedStatsLine)")
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            Spacer(minLength: 0)
-        }
     }
 
     private func pillRole(_ kind: FleetTally.Kind) -> V4Pill.Role {

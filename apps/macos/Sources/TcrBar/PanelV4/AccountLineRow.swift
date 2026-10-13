@@ -10,8 +10,11 @@ import TcrBarCore
 /// `TcrBarCore/AccountLine.swift`, where it is tested.
 ///
 /// No column headings and no caption over the rows (Gil, 2026-10-13: "this is
-/// bad and not needed"). The `5h` and `7d` labels sit beside their bars while
-/// they fit and drop when they do not, which is what larger text does to them.
+/// bad and not needed"). Every line draws its `5h` and `7d` labels and every
+/// bar starts at the same x, in a group box or out of one (lead ruling on H1b,
+/// 2026-10-14): the bar width and the name column are chosen once for the
+/// panel by ``AccountLineFit``, never per row, and a name too long for the
+/// room truncates rather than taking the labels with it.
 ///
 /// ## The actions, without a gear
 ///
@@ -26,20 +29,16 @@ struct AccountLineRow<MenuItems: View>: View {
     let now: Date
     var isControl: Bool = false
     var snapshotMode: Bool = false
-    /// The name column's width, shared by every row in one box so the bars
-    /// line up: ``nameColumnWidth(for:)``.
+    /// The name column's width: one panel-wide column, less a group's padding
+    /// inside a group box, so every bar starts at the same x
+    /// (``AccountLineFit/nameColumn(widestLoose:widestGrouped:bar:_:_:)``).
     var nameWidth: CGFloat = V4.liveNameWidth
     @ViewBuilder var menu: () -> MenuItems
 
-    /// The widest of `accounts`' names at the row's name font, held between
-    /// ``V4/liveNameWidth`` (option H's column) and ``V4/liveNameMaxWidth``.
-    static func nameColumnWidth(for accounts: [Account]) -> CGFloat {
-        let widest =
-            accounts.map {
-                NameRowFit.textWidth(
-                    AccountName.localPart($0.name), size: V4.nameSize, weight: .semibold)
-            }.max() ?? 0
-        return min(max(widest.rounded(.up), V4.liveNameWidth), V4.liveNameMaxWidth)
+    /// The width `account`'s name draws at the row's name font.
+    static func nameTextWidth(_ account: Account) -> CGFloat {
+        NameRowFit.textWidth(
+            AccountName.localPart(account.name), size: V4.nameSize, weight: .semibold)
     }
 
     var body: some View {
@@ -65,15 +64,6 @@ struct AccountLineRow<MenuItems: View>: View {
     }
 
     private var content: some View {
-        ViewThatFits(in: .horizontal) {
-            line(labelled: true)
-            line(labelled: false)
-        }
-        .frame(minHeight: V4.lineRowHeight)
-        .contentShape(Rectangle())
-    }
-
-    private func line(labelled: Bool) -> some View {
         HStack(spacing: V4.liveLineGap) {
             LineDot(color: LineColor.dot(account))
             Text(AccountName.localPart(account.name))
@@ -82,47 +72,49 @@ struct AccountLineRow<MenuItems: View>: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(width: nameWidth, alignment: .leading)
-            meter("5h", account.fiveHour, account.quotaBarTintSource(for: .fiveHour), labelled)
-            meter("7d", account.sevenDay, account.quotaBarTintSource(for: .sevenDay), labelled)
+            meter("5h", account.fiveHour, account.quotaBarTintSource(for: .fiveHour))
+            meter("7d", account.sevenDay, account.quotaBarTintSource(for: .sevenDay))
             let signal = account.liveSignal(now: now)
             Text(signal.text)
                 .font(V4.font(V4.lineSignalSize))
                 .foregroundStyle(LineColor.tone(signal.tone))
                 .lineLimit(1)
                 .truncationMode(.tail)
-                // One ideal width for EVERY row's signal, whatever it says, so
-                // `ViewThatFits` makes the same choice on every line of a box
-                // and the bars stay in one column. Measured per row, a long
-                // signal dropped one row's labels and left its neighbours'.
+                // Whatever the row has left after the name and the meters,
+                // which ``AccountLineFit`` keeps at least the room it holds
+                // for the signal.
                 .frame(
                     minWidth: 0, idealWidth: V4.lineSignalIdealWidth, maxWidth: .infinity,
                     alignment: .trailing)
         }
+        .frame(minHeight: V4.lineRowHeight)
+        .contentShape(Rectangle())
     }
 
     /// `.sc`: the window's label, its small bar, its percentage.
+    /// Both columns are fixed widths measured for the widest they draw
+    /// (``AccountLineFit/labelColumn(_:)``, ``AccountLineFit/percentColumn(_:)``),
+    /// so a row's own digits never move the bar after them.
     private func meter(
-        _ label: String, _ value: Double?, _ tint: QuotaBarTintSource, _ labelled: Bool
+        _ label: String, _ value: Double?, _ tint: QuotaBarTintSource
     ) -> some View {
         HStack(spacing: V4.lineMeterGap) {
-            if labelled {
-                // Natural width, never wrapped: at Comfortable's 12 pt the
-                // label is wider than the sheet's 14 pt column and wrapped to
-                // "5" over "h" inside a fixed frame.
-                Text(label)
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .frame(minWidth: V4.lineLabelWidth, alignment: .leading)
-            }
+            // Natural width, never wrapped, inside a column measured for it:
+            // at Comfortable's 12 pt the label is wider than the sheet's 14 pt
+            // and wrapped to "5" over "h" inside a frame of that width.
+            Text(label)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(Tok.mute)
+                .lineLimit(1)
+                .fixedSize()
+                .frame(width: AccountLineFit.labelColumn(V4.lineMetrics), alignment: .leading)
             LineBar(value: value, tint: tint)
             Text(QuotaFormat.percent(value))
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.dim)
                 .lineLimit(1)
                 .fixedSize()
-                .frame(minWidth: V4.linePercentWidth, alignment: .trailing)
+                .frame(width: AccountLineFit.percentColumn(V4.lineMetrics), alignment: .trailing)
         }
         .fixedSize()
     }
