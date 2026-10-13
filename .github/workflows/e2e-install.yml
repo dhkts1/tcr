@@ -19,6 +19,7 @@ on:
       - install.sh
       - scripts/install-tcrbar-from-dmg.sh
       - scripts/e2e-first-run.sh
+      - scripts/check-e2e-first-run-safe.sh
       - src/claude_code_login.rs
       - src/config.rs
       - .github/workflows/e2e-install.yml
@@ -75,6 +76,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # Before any build: the script must never read the login Keychain or
+      # bind 3456, so it is safe on a developer Mac. Runs no real tcr.
+      - name: First-run script is safe on a developer Mac
+        run: scripts/check-e2e-first-run-safe.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build tcr from this ref
