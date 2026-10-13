@@ -31,15 +31,9 @@ struct AccountLineRow<MenuItems: View>: View {
     var snapshotMode: Bool = false
     /// The name column's width: one panel-wide column, less a group's padding
     /// inside a group box, so every bar starts at the same x
-    /// (``AccountLineFit/nameColumn(widestLoose:widestGrouped:bar:_:_:)``).
+    /// (``AccountLineFit/nameColumn(looseNames:groupedNames:signals:bar:_:_:)``).
     var nameWidth: CGFloat = V4.liveNameWidth
     @ViewBuilder var menu: () -> MenuItems
-
-    /// The width `account`'s name draws at the row's name font.
-    static func nameTextWidth(_ account: Account) -> CGFloat {
-        NameRowFit.textWidth(
-            AccountName.localPart(account.name), size: V4.nameSize, weight: .semibold)
-    }
 
     var body: some View {
         Group {
@@ -66,12 +60,20 @@ struct AccountLineRow<MenuItems: View>: View {
     private var content: some View {
         HStack(spacing: V4.liveLineGap) {
             LineDot(color: LineColor.dot(account))
-            Text(AccountName.localPart(account.name))
-                .font(V4.font(V4.nameSize, .semibold))
-                .foregroundStyle(Tok.ink)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(width: nameWidth, alignment: .leading)
+            // Cut in the MIDDLE by ``AccountLineFit/fitName(_:width:_:)``,
+            // measured in this font, so `henry9` and `henry10` stay two names
+            // (lead ruling, 2026-10-14). `.middle` is the backstop should the
+            // measure and the draw ever differ by a fraction of a point; the
+            // full name is the line's help and spoken label.
+            Text(
+                AccountLineFit.fitName(
+                    AccountName.localPart(account.name), width: nameWidth, V4.lineMetrics)
+            )
+            .font(V4.font(V4.nameSize, .semibold))
+            .foregroundStyle(Tok.ink)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(width: nameWidth, alignment: .leading)
             meter("5h", account.fiveHour, account.quotaBarTintSource(for: .fiveHour))
             meter("7d", account.sevenDay, account.quotaBarTintSource(for: .sevenDay))
             let signal = account.liveSignal(now: now)
@@ -81,11 +83,9 @@ struct AccountLineRow<MenuItems: View>: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 // Whatever the row has left after the name and the meters,
-                // which ``AccountLineFit`` keeps at least the room it holds
-                // for the signal.
-                .frame(
-                    minWidth: 0, idealWidth: V4.lineSignalIdealWidth, maxWidth: .infinity,
-                    alignment: .trailing)
+                // which ``AccountLineFit`` keeps at least as wide as the
+                // widest signal the panel draws.
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .frame(minHeight: V4.lineRowHeight)
         .contentShape(Rectangle())
@@ -159,7 +159,9 @@ struct WaitingLineRow<MenuItems: View>: View {
                 .font(V4.font(V4.nameSize, .semibold))
                 .foregroundStyle(Tok.ink)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                // The middle, for the reason the live line's name is cut
+                // there: the end of a name is what tells two apart.
+                .truncationMode(.middle)
                 .frame(minWidth: V4.waitNameMinWidth, alignment: .leading)
             if let middle = account.waitingLineText {
                 Text(middle)

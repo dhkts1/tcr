@@ -181,22 +181,27 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// drawn: a group closed to its summary line has none, and counting its
     /// members would truncate the names on screen to make room for lines that
     /// are not.
+    ///
+    /// The signals of the same lines size the column at the right, and what a
+    /// short one leaves goes to the names (lead ruling, 2026-10-14).
     private var liveNameColumn: CGFloat {
-        var loose: CGFloat = 0
-        var grouped: CGFloat?
+        var loose: [String] = []
+        var grouped: [String]?
+        var signals: [String] = []
         for section in sections where !isSummarised(section) {
             for row in section.rows where form(row) == .liveLine {
-                let width = AccountLineRow<EmptyView>.nameTextWidth(row.account)
+                let name = AccountName.localPart(row.account.name)
                 if section.group == .ungrouped {
-                    loose = max(loose, width)
+                    loose.append(name)
                 } else {
-                    grouped = max(grouped ?? 0, width)
+                    grouped = (grouped ?? []) + [name]
                 }
+                signals.append(row.account.liveSignal(now: now).text)
             }
         }
         return AccountLineFit.nameColumn(
-            widestLoose: loose, widestGrouped: grouped, bar: V4.lineBarWidth, V4.lineRoom,
-            V4.lineMetrics)
+            looseNames: loose, groupedNames: grouped, signals: signals, bar: V4.lineBarWidth,
+            V4.lineRoom, V4.lineMetrics)
     }
 
     /// Which form this row takes, from what only this view knows: whether the

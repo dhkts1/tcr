@@ -641,7 +641,8 @@ enum V4 {
             dot: lineDotSize, gap: liveLineGap, meterGap: lineMeterGap,
             labelMinWidth: lineLabelWidth, percentMinWidth: linePercentWidth,
             signalWidth: lineSignalIdealWidth, nameMinWidth: liveNameWidth,
-            barMaxWidth: lineBarMaxWidth, labelSize: muteSize, percentSize: dimSize)
+            barMaxWidth: lineBarMaxWidth, nameSize: nameSize, labelSize: muteSize,
+            percentSize: dimSize, signalSize: lineSignalSize)
     }
     /// A live line's width in the tab's own box, and a group's padding, which
     /// a line inside a group box loses on each side.
