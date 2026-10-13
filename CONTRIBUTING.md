@@ -253,5 +253,7 @@ specific bug they exist to prevent. Read the doc-comment before "fixing" what it
 
 ## Questions
 
-Open an issue. If you are reporting something involving credentials, quotas or account data, please
+Open an issue with the [bug report](https://github.com/dhkts1/teamclaude-rs/issues/new?template=bug_report.yml)
+or [feature request](https://github.com/dhkts1/teamclaude-rs/issues/new?template=feature_request.yml)
+form. If you are reporting something involving credentials, quotas or account data, please
 redact before posting; the issue tracker is as public as the repository.
