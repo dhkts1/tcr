@@ -82,18 +82,71 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
                 if section.group == .ungrouped {
-                    ForEach(Array(section.rows.enumerated()), id: \.element.id) { row, account in
-                        card(account, shape: .full)
-                            .padding(
-                                .top,
-                                index == 0 && row == 0
-                                    ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
-                    }
+                    looseLines(section, first: index == 0)
                 } else {
                     group(section, first: index == 0)
                 }
             }
         }
+    }
+
+    /// The ungrouped accounts of one band, one line each (option H, Gil
+    /// 2026-10-14): live ones in a box with no heading, out-of-tokens and
+    /// parked ones under a band heading that counts them.
+    ///
+    /// The heading is drawn here although ``Array/soleGroupInBand(at:)``
+    /// suppresses it in the legacy panel. That rule exists so a band heading
+    /// never stacks over a group legend that already names the band; an
+    /// ungrouped section has no legend, so without this heading a waiting
+    /// line would sit under nothing that says why it is waiting.
+    ///
+    /// An account carrying a lease line or an exit picker keeps today's full
+    /// card instead of a line. Option H draws neither, and both are things a
+    /// line has no room for: the lease line is the notice that another Mac may
+    /// read this account's traffic, and the exit picker is a control. They
+    /// stay on the card until the hover card (unit H2) carries them.
+    @ViewBuilder
+    private func looseLines(_ section: FleetSection, first: Bool) -> some View {
+        let lines = section.rows.filter { !keepsCard($0) }
+        let cards = section.rows.filter { keepsCard($0) }
+        let nameWidth = AccountLineRow<EmptyView>.nameColumnWidth(for: lines.map(\.account))
+        VStack(alignment: .leading, spacing: 0) {
+            if section.band != .live {
+                BandHeading(section: section, now: now)
+            }
+            if !lines.isEmpty {
+                LineBox(
+                    items: lines,
+                    paddingH: section.band == .live ? V4.liveBoxPaddingH : V4.waitBoxPaddingH
+                ) { row in
+                    if section.band == .live {
+                        AccountLineRow(
+                            account: row.account, now: now, isControl: row.isControl,
+                            snapshotMode: snapshotMode, nameWidth: nameWidth
+                        ) { menu(row.account) }
+                    } else {
+                        WaitingLineRow(
+                            account: row.account, band: section.band, now: now,
+                            isControl: row.isControl, snapshotMode: snapshotMode
+                        ) { menu(row.account) }
+                    }
+                }
+            }
+            ForEach(cards) { row in
+                card(row, shape: .full)
+                    .padding(.bottom, V4.lineBoxMarginBottom)
+            }
+        }
+        // The first block under the tab strip collapses its margin into the
+        // strip's, as a card there always has.
+        .padding(.top, first ? V4.marginAfterStrip(V4.cardGap) : .zero)
+    }
+
+    /// Whether this account carries something only the full card draws: a
+    /// lease line, or an exit row.
+    private func keepsCard(_ row: FleetSectionRow) -> Bool {
+        !PeerLease.leases(forAccountLabel: row.account.name, in: lentTo).isEmpty
+            || PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil
     }
 
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
