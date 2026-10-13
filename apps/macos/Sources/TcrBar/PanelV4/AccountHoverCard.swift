@@ -39,15 +39,18 @@ import TcrBarCore
 /// 2026-10-14). The exit picker is a control, and a control cannot live in a
 /// card that vanishes when the pointer moves; the lease line is the notice that
 /// another Mac may read this account's traffic, which is not something to show
-/// only on hover. Grouped accounts still draw compact cards and have no line
-/// either (their lines are unit H1b).
+/// only on hover. The same rule holds inside a group box, where every other
+/// account is a line too (unit H1b) and gets this card exactly as a line
+/// outside a group does.
 struct HoverableLine {
     let anchor: Anchor<CGRect>
     let row: FleetSectionRow
 }
 
 /// What the panel root needs to float a card: the list's visible bounds, and
-/// every hoverable line's bounds, keyed by account name.
+/// every hoverable line's bounds, keyed by ``FleetSectionRow/id``. Not by
+/// account name: an account in two groups draws two lines, and one name would
+/// hang the card from whichever of them published last.
 struct HoverCardAnchors {
     var list: Anchor<CGRect>?
     var lines: [String: HoverableLine] = [:]
@@ -80,7 +83,7 @@ extension View {
         )
         .onHover(perform: onHover)
         .anchorPreference(key: HoverCardAnchorsKey.self, value: .bounds) {
-            HoverCardAnchors(lines: [row.account.name: HoverableLine(anchor: $0, row: row)])
+            HoverCardAnchors(lines: [row.id: HoverableLine(anchor: $0, row: row)])
         }
     }
 
@@ -94,9 +97,10 @@ extension View {
         }
     }
 
-    /// Floats `card` for the account named `shown` beside its line. Draws
-    /// nothing when no line by that name is on screen (another tab, a grouped
-    /// account, a fleet that changed under the pointer).
+    /// Floats `card` for the row whose ``FleetSectionRow/id`` is `shown`,
+    /// beside its line. Draws nothing when that line is not on screen (another
+    /// tab, an account drawn as a card, a fleet that changed under the
+    /// pointer).
     func accountHoverCard<Card: View>(
         shown: String?, onHover: @escaping (Bool) -> Void,
         @ViewBuilder card: @escaping (FleetSectionRow) -> Card
@@ -132,6 +136,9 @@ extension View {
 /// so it reads as above the lines it covers rather than as one of them.
 private struct FloatingCard<Content: View>: View {
     @ViewBuilder var content: () -> Content
+    /// The same appearance the palette resolves against, so the shadow and the
+    /// colours never disagree about which mode the panel is in.
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         content()
@@ -144,7 +151,7 @@ private struct FloatingCard<Content: View>: View {
                 RoundedRectangle(cornerRadius: V4.cardRadius)
                     .fill(Tok.cardFill)
                     .shadow(
-                        color: Color.black.opacity(V4.hoverCardShadowAlpha),
+                        color: Color.black.opacity(V4.hoverCardShadowAlpha(colorScheme)),
                         radius: V4.hoverCardShadowRadius, y: V4.hoverCardShadowY)
             )
             .overlay(

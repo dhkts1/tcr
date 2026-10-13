@@ -25,6 +25,37 @@ public enum AccountLineTone: Equatable, Sendable {
     case info
 }
 
+/// How the Accounts tab draws one account: a one-line row, or its card.
+public enum AccountRowForm: Equatable, Sendable {
+    /// `.slim`: the dot, the name, both bars and one signal.
+    case liveLine
+    /// `.wline`: the dot, the name, the week used, and "back in" or "parked".
+    case waitingLine
+    /// The account's card, in the list itself.
+    case card
+}
+
+extension FleetSectionRow {
+    /// Which form this row takes.
+    ///
+    /// A line follows the band: a live account gets the live line, an out of
+    /// tokens or parked one the waiting line. The group does not enter into
+    /// it: an account inside a group box gets the same line as one outside
+    /// (lead ruling on H1b, 2026-10-14: "a fleet mixing cards and lines reads
+    /// as unfinished").
+    ///
+    /// An account carrying a lease line (`carriesLease`) or an exit picker
+    /// (`carriesExit`) keeps its card for good (lead ruling, 2026-10-14): the
+    /// lease line is the notice that another Mac may read this account's
+    /// traffic, which is not something to show only on hover, and the exit
+    /// picker is a control, which cannot live in a hover card that vanishes
+    /// when the pointer moves.
+    public func form(carriesLease: Bool, carriesExit: Bool) -> AccountRowForm {
+        if carriesLease || carriesExit { return .card }
+        return band == .live ? .liveLine : .waitingLine
+    }
+}
+
 /// One run of words and the role it is drawn in.
 public struct AccountLineText: Equatable, Sendable {
     public let text: String

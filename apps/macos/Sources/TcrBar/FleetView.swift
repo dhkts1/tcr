@@ -158,8 +158,10 @@ struct FleetView: View {
     /// loop with a pass budget rather than a convergence test.
     @State private var v4ContentHeight: CGFloat = 0
 
-    /// Which account's hover card is showing (option H, unit H2). The card
-    /// hangs from ``v4Body``, never from the list; see `AccountHoverCard.swift`.
+    /// Which row's hover card is showing (option H, unit H2), by
+    /// ``FleetSectionRow/id``, because an account in two groups draws two
+    /// lines. The card hangs from ``v4Body``, never from the list; see
+    /// `AccountHoverCard.swift`.
     @State private var hoverCard = HoverCardTracker()
 
     /// Accounts / Sessions / Tools (F2 + F3). `.accounts` selected by default.
@@ -274,9 +276,10 @@ struct FleetView: View {
         initialZeroRequestsSince: Date? = nil,
         initialClaudeCount: Int? = nil,
         initialClaudeRoute: ClaudeRouteRead.Route? = nil,
-        // The account whose hover card shows on the first frame. The render
-        // harness has no pointer, so this is the only way it can draw the card;
-        // the live app leaves it `nil` and the pointer drives it.
+        // The row (``FleetSectionRow/id``) whose hover card shows on the first
+        // frame. The render harness has no pointer, so this is the only way it
+        // can draw the card; the live app leaves it `nil` and the pointer
+        // drives it.
         initialHoverCard: String? = nil
     ) {
         self.poller = poller
@@ -747,12 +750,12 @@ struct FleetView: View {
                 SettingsNavigation.shared.peerSheet = lender
                 onSettings()
             },
-            hoveredAccount: hoverCard.shown,
-            onHoverLine: { name, inside in
+            hoveredRow: hoverCard.shown,
+            onHoverLine: { rowID, inside in
                 if inside {
-                    hoverCard.rowEntered(name)
+                    hoverCard.rowEntered(rowID)
                 } else {
-                    hoverCard.rowLeft(name)
+                    hoverCard.rowLeft(rowID)
                     settleHoverCardSoon()
                 }
             }

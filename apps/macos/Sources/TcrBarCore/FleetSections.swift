@@ -189,7 +189,14 @@ public struct FleetSectionRow: Identifiable, Equatable, Sendable {
     /// including it would mean a row's identity changes the moment an account
     /// runs out of tokens — SwiftUI would treat that as a delete plus an insert
     /// and animate a row that merely changed color.
-    public var id: String { "\(group.token)\u{1F}\(account.id)" }
+    public var id: String { Self.id(group: group, accountID: account.id) }
+
+    /// The ``id`` the row for `accountID` under `group` has, for a caller that
+    /// must name a row before any exists (the render harness pinning a hover
+    /// card). One construction, so the two cannot drift.
+    public static func id(group: FleetGroupKey, accountID: String) -> String {
+        "\(group.token)\u{1F}\(accountID)"
+    }
 }
 
 /// One heading and the rows under it.
