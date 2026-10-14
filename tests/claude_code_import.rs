@@ -238,3 +238,158 @@ fn an_unreadable_credentials_document_warns_and_carries_on() {
         "and still print the ordinary empty-fleet hint: {stderr}"
     );
 }
+
+/// [`run_tcr`]'s command, with codex's own login pinned inside the scratch `HOME`: `CODEX_HOME`
+/// and `TCR_CODEX_AUTH` removed, so the only codex login the child can find is
+/// `<home>/.codex/auth.json`.
+fn run_tcr_without_codex(
+    home: &Path,
+    credentials: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let bin = env!("CARGO_BIN_EXE_tcr");
+    let out = Command::new(bin)
+        .args(args)
+        .env("HOME", home)
+        .env("TCR_CLAUDE_CODE_CREDENTIALS", credentials)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("CODEX_HOME")
+        .env_remove("TCR_CODEX_AUTH")
+        .output()
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Puts a file's mode back to `0o600` when dropped, so a test that made it unreadable leaves
+/// nothing behind that its tempdir cannot clean up, whether its assertions pass or not.
+struct RestoreMode<'a>(&'a Path);
+
+impl Drop for RestoreMode<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _restored = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// `tcr run --codex` on a first run launches codex and nothing else: the Claude Code login on
+/// the machine stays where it is, because a Codex session has no use for a Claude account and
+/// an import would spend its single-use refresh token. Nothing listens on the config's port,
+/// so codex launches directly, as the fake binary here.
+///
+/// The positive control is the same home's `tcr accounts`, which does import the login: the
+/// fake login was importable all along, so the empty fleet after `run --codex` is the verb's
+/// choice and not a login it could not read.
+#[test]
+fn run_codex_on_a_first_run_never_imports_the_claude_login() {
+    let (home, credentials) = scratch_home();
+    let config = config_path_in(home.path());
+
+    let bin = env!("CARGO_BIN_EXE_tcr");
+    let out = Command::new(bin)
+        .args(["run", "--codex"])
+        .env("HOME", home.path())
+        .env("TCR_CLAUDE_CODE_CREDENTIALS", &credentials)
+        .env_remove("XDG_CACHE_HOME")
+        .env("TCR_CODEX_BIN", "/usr/bin/true")
+        .env_remove("CODEX_BIN")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .output()
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "codex launched directly and exited 0. stderr={stderr}"
+    );
+    assert!(
+        accounts_of(&config).is_empty(),
+        "`tcr run --codex` must never import the Claude Code login. stderr={stderr}"
+    );
+
+    let (code, _, stderr) = run_tcr(home.path(), &credentials, &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(
+        accounts_of(&config).len(),
+        1,
+        "control: `tcr accounts` imports the same login. stderr={stderr}"
+    );
+}
+
+/// A fleet a delete emptied (`"claudeCodeImport": false`) imports no Claude Code login, and
+/// still names a codex login on disk: the key stops the import and nothing else, and the codex
+/// line is evidence, never an import. The login file is checked for existence only, and left
+/// as it was.
+///
+/// The positive control is the same home with the key removed, which imports the login: the
+/// fake login was importable all along.
+#[test]
+fn a_fleet_a_delete_emptied_keeps_the_codex_hint_and_imports_nothing() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let (home, credentials) = scratch_home();
+    let config = config_path_in(home.path());
+    let set_import_key = |value: Option<bool>| {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("the config"))
+                .expect("a readable config");
+        let object = document.as_object_mut().expect("the config is an object");
+        match value {
+            Some(value) => object.insert("claudeCodeImport".to_string(), value.into()),
+            None => object.remove("claudeCodeImport"),
+        };
+        std::fs::write(&config, document.to_string()).expect("writing the config back");
+    };
+    set_import_key(Some(false));
+
+    let login = home.path().join(".codex").join("auth.json");
+    std::fs::create_dir_all(login.parent().expect("the login has a parent"))
+        .expect("creating the scratch .codex dir");
+    std::fs::write(&login, "").expect("writing an empty login file");
+    std::fs::set_permissions(&login, std::fs::Permissions::from_mode(0o000))
+        .expect("making the login unreadable");
+    let _restore = RestoreMode(&login);
+
+    let (code, _, stderr) = run_tcr_without_codex(home.path(), &credentials, &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    let stderr = stderr.replace(&home.path().display().to_string(), "<home>");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let empty_fleet = lines
+        .iter()
+        .position(|line| *line == "no accounts configured — run `tcr login` to add one")
+        .unwrap_or_else(|| panic!("no empty-fleet line: {stderr}"));
+    assert_eq!(
+        lines.get(empty_fleet + 1).copied(),
+        Some(
+            "[tcr] found a codex login at <home>/.codex/auth.json: `tcr login --codex` adds a \
+             Codex account of tcr's own, and `tcr login --from-codex` imports that one (codex \
+             then asks you to log in again, once)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("[tcr] imported")),
+        "{stderr}"
+    );
+    assert!(accounts_of(&config).is_empty(), "{stderr}");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).expect("the config"))
+            .expect("a readable config");
+    assert_eq!(written["claudeCodeImport"], serde_json::json!(false));
+    let after = std::fs::metadata(&login).expect("the login is still there");
+    assert_eq!(after.len(), 0, "the login file is untouched");
+    assert_eq!(after.mode() & 0o777, 0o000, "the login file keeps its mode");
+
+    set_import_key(None);
+    let (code, _, stderr) = run_tcr(home.path(), &credentials, &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(
+        accounts_of(&config).len(),
+        1,
+        "control: without the key the same login imports. stderr={stderr}"
+    );
+}

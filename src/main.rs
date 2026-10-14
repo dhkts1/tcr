@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 
 use teamclaude_rs::cli::{self, validate_group_label_chars, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
+use teamclaude_rs::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use teamclaude_rs::peer;
 use teamclaude_rs::proxy::{self, GROUP_HEADER_NAME};
 use teamclaude_rs::{
@@ -29,7 +30,7 @@ use teamclaude_rs::{
 #[command(
     name = "tcr",
     version,
-    about = "Lean single-user rotating Anthropic proxy with a live TUI",
+    about = "Lean single-user rotating proxy for Claude and Codex (ChatGPT) accounts, with a live TUI",
     // Let `tcr [flags]` (no subcommand) behave as the default server run, while
     // `tcr server [flags]` is the explicit form. The two cannot be mixed.
     args_conflicts_with_subcommands = true
@@ -48,11 +49,12 @@ enum Command {
     /// Run Claude Code, or `codex` with `--codex`, through the proxy (launches it
     /// directly if we're not up).
     Run(RunArgs),
-    /// Authenticate a Claude account via the browser and add it to the config.
+    /// Add an account: Claude through the browser, or Codex (ChatGPT) with
+    /// --codex or --from-codex.
     Login(LoginArgs),
-    /// Mint a long-lived (365-day) token for an existing account, or every
-    /// account in a group, and put the result on the clipboard. Nothing is
-    /// stored — export only.
+    /// Mint a long-lived (365-day) token for an existing Claude account, or
+    /// every Claude account in a group, and put the result on the clipboard.
+    /// Nothing is stored — export only (Claude accounts only).
     Mint(MintArgs),
     /// List the configured accounts (offline; `--probe` refreshes live quota).
     Accounts(AccountsArgs),
@@ -67,7 +69,8 @@ enum Command {
     Enable(EnableArgs),
     /// Disable an account (holds it out of rotation).
     Disable(DisableArgs),
-    /// Set, clear, or show the identity-bound control account.
+    /// Set, clear, or show the identity-bound control account (Claude accounts
+    /// only).
     Control(ControlArgs),
     /// Manage account group membership (`ls` / `add` / `rm`).
     Group(GroupArgs),
@@ -83,7 +86,7 @@ enum Command {
     /// one-liners in the docs). Sessions get their own object-shaped verb
     /// rather than a flag that changes `status`'s top-level type.
     Sessions(SessionsArgs),
-    /// Print every account as claude-swap's `list --json` document, for
+    /// Print every Claude account as claude-swap's `list --json` document, for
     /// CodexBar. JSON only: `tcr status` is the view for a person.
     ///
     /// Its own verb for the same reason as `sessions`: the document is an
@@ -100,8 +103,9 @@ enum Command {
     /// Open TcrBar, the macOS menu-bar app (macOS only).
     Ui,
     /// Say whether Claude Code is actually reaching this proxy, and which file
-    /// decides that. Exits 0 when it is, 2 when another base URL owns the
-    /// route, 3 when the route points here and no proxy answers.
+    /// decides that; and whether codex is pooled, when the fleet holds a Codex
+    /// account or with --codex. Exits 0 when it is, 2 when another base URL
+    /// owns the route, 3 when the route points here and no proxy answers.
     Doctor(DoctorArgs),
 }
 
@@ -151,6 +155,7 @@ mod peer_cli {
         Name(PeerNameArgs),
         /// Let trusted Macs serve requests with this Mac's accounts, which
         /// means they read those requests, prompts included.
+        /// Codex requests always leave from this Mac: no Mac lends, serves or carries them in this version.
         Share(PeerSwitchArgs),
         /// Trust a Mac interactively: both screens show six digits, you
         /// compare them, you confirm on both.
@@ -173,8 +178,10 @@ mod peer_cli {
         /// Grant or revoke one thing for one peer.
         Allow(PeerAllowArgs),
         /// Set what one peer may borrow on one window, or take it away.
+        /// Codex requests always leave from this Mac: no Mac lends, serves or carries them in this version.
         Lend(PeerLendArgs),
         /// Choose how this Mac reaches the internet.
+        /// Codex requests always leave from this Mac: no Mac lends, serves or carries them in this version.
         Via(PeerViaArgs),
         /// Turn this Mac's dead drop on or off: leaving a friend that has also
         /// moved this Mac's current address on an HTTPS surface you own, and
@@ -215,6 +222,7 @@ mod peer_cli {
         Internet(PeerInternetArgs),
         /// Set where one account's requests leave from, and what an exit
         /// this Mac cannot reach costs.
+        /// Codex accounts always leave from this Mac.
         Account(PeerAccountArgs),
         /// Ask the RUNNING proxy what it holds for each pinned Mac.
         Status(PeerStatusArgs),
@@ -1227,9 +1235,10 @@ struct StatusArgs {
     check: bool,
 }
 
-/// `tcr doctor [--json]`: the route check. Same two options every read-only
-/// verb here takes, and no third: the question it answers is about THIS
-/// machine's configuration, so there is nothing to select.
+/// `tcr doctor [--json] [--codex]`: the route check. The same two options every
+/// read-only verb here takes, plus `--codex`, which narrows the question to
+/// codex's route: the question it answers is about THIS machine's
+/// configuration, so there is nothing to select.
 #[derive(clap::Args)]
 struct DoctorArgs {
     /// Path to the config file (default: the usual per-user path).
@@ -1238,6 +1247,9 @@ struct DoctorArgs {
     /// Emit one JSON object instead of greppable `key: value` lines.
     #[arg(long)]
     json: bool,
+    /// Report only whether codex is pooled, and exit with that verdict's code.
+    #[arg(long)]
+    codex: bool,
 }
 
 /// `tcr list --json`: the same two options as `status`, and `--json` is the
@@ -1400,6 +1412,7 @@ struct RunArgs {
     /// session is already pinned to. Set `groupSettings.<group>.spillToPool:
     /// true` in the config to let it fall back to the whole pool instead (a
     /// reserved group stays strict either way).
+    /// Claude sessions only; a Codex session cannot ask for a group.
     #[arg(long)]
     group: Option<String>,
     /// Launch `codex` instead of `claude`, routed through the proxy's Codex accounts.
@@ -5837,7 +5850,9 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tcr doctor [--json]`: whether Claude Code is routed to this proxy.
+/// `tcr doctor [--json] [--codex]`: whether Claude Code is routed to this
+/// proxy, and whether codex is pooled when the fleet holds a Codex account or
+/// `--codex` asks.
 ///
 /// The exit code is the point of the verb (a script asks `tcr doctor >/dev/null
 /// || …`), so it is carried out of [`cli::doctor`] and spent here rather than
@@ -5847,7 +5862,7 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
 /// uses.
 async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    let code = cli::doctor(&config_path, args.json).await?;
+    let code = cli::doctor(&config_path, args.json, args.codex).await?;
     if code != 0 {
         std::process::exit(code);
     }
@@ -6195,8 +6210,9 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // Claude Code — see `apply_see_through_env` for why we prefer the first.
         // Anything missing from the MITM material lands us in base-URL mode, which
         // always works; there is no half-applied third state.
-        match see_through_ca() {
-            Some(ca) => apply_see_through_env(&mut cmd, port, &ca),
+        let holds_codex = config.holds_codex();
+        match see_through_ca(holds_codex) {
+            Some(ca) => apply_see_through_env(&mut cmd, port, &ca, holds_codex),
             None => apply_base_url_env(&mut cmd, port),
         }
     } else {
@@ -6424,6 +6440,7 @@ fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &Codex
     match launch {
         CodexLaunch::SeeThrough { ca, no_proxy } => {
             apply_codex_see_through_env(cmd, port, ca);
+            apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
             }
@@ -6463,27 +6480,6 @@ fn proxy_vars_at(port: u16, inherited: &dyn Fn(&str) -> Option<String>) -> Vec<&
         .into_iter()
         .filter(|var| inherited(var).is_some_and(|value| points_at_tcr(&value, port)))
         .collect()
-}
-
-/// Does a proxy variable's value name tcr on `port`: host `127.0.0.1`,
-/// `localhost` or `[::1]`, and that port (the scheme's default when none is
-/// written)? The scheme is optional, as it is to codex's HTTP stack, which
-/// reads a bare `host:port` as `http://host:port`. A value that does not
-/// parse names nothing.
-fn points_at_tcr(value: &str, port: u16) -> bool {
-    let value = value.trim();
-    let parsed = if value.contains("://") {
-        reqwest::Url::parse(value)
-    } else {
-        reqwest::Url::parse(&format!("http://{value}"))
-    };
-    let Ok(url) = parsed else {
-        return false;
-    };
-    let loopback = url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]"
-    });
-    loopback && url.port_or_known_default() == Some(port)
 }
 
 /// One inherited `NO_PROXY` spelling, rewritten for a see-through launch.
@@ -6529,35 +6525,6 @@ fn no_proxy_rewrites(
             })
         })
         .collect()
-}
-
-/// Does one `NO_PROXY` entry exempt the domain `host` from the proxy?
-///
-/// The rules of the matcher codex's HTTP stack applies (`hyper-util` 0.1.20,
-/// `src/client/proxy/matcher.rs:445-535`, the version `openai/codex` pins),
-/// for a domain host: an entry exempts it when, trimmed and with one leading
-/// `.` removed, it equals `host` or a parent domain of it at a label boundary,
-/// ignoring ASCII case; or when it is `*`. An IP or CIDR entry never exempts a
-/// domain.
-fn no_proxy_entry_exempts(entry: &str, host: &str) -> bool {
-    let entry = entry.trim();
-    if entry.is_empty() || entry.contains('/') || entry.parse::<std::net::IpAddr>().is_ok() {
-        return false;
-    }
-    if entry == "*" {
-        return true;
-    }
-    let domain = entry.strip_prefix('.').unwrap_or(entry);
-    if domain.eq_ignore_ascii_case(host) {
-        return true;
-    }
-    let Some(dot) = host.len().checked_sub(domain.len() + 1) else {
-        return false;
-    };
-    host.as_bytes()[dot] == b'.'
-        && host
-            .get(dot + 1..)
-            .is_some_and(|parent| parent.eq_ignore_ascii_case(domain))
 }
 
 /// The oldest Claude Code that forwards `ANTHROPIC_CUSTOM_HEADERS` as a real
@@ -6749,8 +6716,10 @@ fn mark_run_active(cmd: &mut std::process::Command) {
 /// AND we must be able to name the CA that signed it (so `claude` can be told to
 /// trust it). `load_tls` is the same loader the server ran at boot against the
 /// same dir, so it resolves to the same material rather than a second opinion.
-fn see_through_ca() -> Option<PathBuf> {
-    match mitm::load_tls() {
+/// `holds_codex` (the config holds a Codex account) words the hint a fresh CA
+/// prints ([`mitm::ca_export_hint`]).
+fn see_through_ca(holds_codex: bool) -> Option<PathBuf> {
+    match mitm::load_tls(holds_codex) {
         Ok(assets) => match assets.ca_path {
             Some(ca) if ca.is_file() => Some(ca),
             // A path we cannot read is not a CA we can hand to claude.
@@ -6816,8 +6785,9 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
 /// While the pool holds no Codex account, tcr blind-tunnels `chatgpt.com` and
 /// that codex runs on its own login; once the pool holds one, tcr terminates
 /// `chatgpt.com`, and with the CA the nested codex is pooled (without it, its
-/// TLS handshake fails). Claude ignores it.
-fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
+/// TLS handshake fails). Claude ignores it. The notice names it once the config
+/// holds a Codex account (`holds_codex`, [`see_through_ca_notice`]).
+fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path, holds_codex: bool) {
     let proxy = format!("http://127.0.0.1:{port}");
     cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
     cmd.env("HTTPS_PROXY", &proxy);
@@ -6830,10 +6800,25 @@ fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) 
     eprintln!(
         "[tcr] see-through mode: claude keeps https://api.anthropic.com, tunnelling via {proxy}"
     );
-    eprintln!(
-        "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
-        ca.display()
-    );
+    eprintln!("{}", see_through_ca_notice(ca, holds_codex));
+}
+
+/// The line naming the CA a see-through claude session trusts. That session
+/// carries `CODEX_CA_CERTIFICATE` as well, for a codex it starts
+/// ([`apply_see_through_env`]); the line says so once the config holds a Codex
+/// account (`holds_codex`), and reads as it always did otherwise.
+fn see_through_ca_notice(ca: &Path, holds_codex: bool) -> String {
+    if holds_codex {
+        format!(
+            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE={}",
+            ca.display()
+        )
+    } else {
+        format!(
+            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
+            ca.display()
+        )
+    }
 }
 
 /// SEE-THROUGH mode for `codex`, the only mode tcr routes it in. `codex` keeps
@@ -6844,8 +6829,10 @@ fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) 
 /// workspace is routed elsewhere (FedRAMP, data residency) is never pooled: tcr
 /// blind-tunnels another origin, and relays a request that names its routing on
 /// the client's own credential. Both proxy spellings for the reason
-/// [`apply_see_through_env`] gives. Nothing of Claude's is set: no
-/// `ANTHROPIC_BASE_URL`, no `NODE_EXTRA_CA_CERTS`, no capability defaults.
+/// [`apply_see_through_env`] gives. Nothing of Claude's is set here: no
+/// `ANTHROPIC_BASE_URL`, no `NODE_EXTRA_CA_CERTS`, no capability defaults. A
+/// pooled launch adds `NODE_EXTRA_CA_CERTS` on its own, for a `claude` the
+/// session starts ([`apply_nested_claude_ca`]).
 fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
     let proxy = format!("http://127.0.0.1:{port}");
     cmd.env("HTTPS_PROXY", &proxy);
@@ -6861,6 +6848,21 @@ fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &
         "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
         ca.display()
     );
+}
+
+/// Let a `claude` started inside a pooled codex session trust tcr's leaf: set
+/// `NODE_EXTRA_CA_CERTS` to tcr's CA on the codex child, unless the caller
+/// exported one (`caller_exported`), which the child then inherits untouched.
+///
+/// The codex child carries `HTTPS_PROXY` aimed at tcr, and so does everything it
+/// starts. A `claude` among them meets tcr's leaf for `api.anthropic.com`, and
+/// node trusts that leaf only through this variable; without it the nested
+/// session fails TLS. codex itself reads only `CODEX_CA_CERTIFICATE`, so this
+/// changes nothing for codex. Silent, as the rest of the launch's defaults are.
+fn apply_nested_claude_ca(cmd: &mut std::process::Command, ca: &Path, caller_exported: bool) {
+    if !caller_exported {
+        cmd.env("NODE_EXTRA_CA_CERTS", ca);
+    }
 }
 
 /// The host the MITM leaf must cover for `tcr run --codex` to route `codex`
@@ -7782,7 +7784,7 @@ mod tests {
     #[test]
     fn see_through_env_lets_a_nested_codex_trust_the_leaf() {
         let mut cmd = std::process::Command::new("true");
-        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"));
+        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"), false);
         let set = |name: &str| {
             cmd.get_envs()
                 .find_map(|(k, v)| (k == name).then(|| v.map(|v| v.to_string_lossy().into_owned())))
@@ -7811,7 +7813,7 @@ mod tests {
             (
                 "see-through",
                 &(|cmd: &mut std::process::Command| {
-                    apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"))
+                    apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"), false)
                 }) as &dyn Fn(&mut std::process::Command),
             ),
             (
@@ -9911,5 +9913,181 @@ mod tests {
             "tests/headless_sigterm.rs matches this exact text; changing it here \
              without changing it there turns that test red for no real reason"
         );
+    }
+
+    /// The help renders no fleet, so every fleet reads the same help: it names both providers,
+    /// and says which verbs, flags and peer features are Claude's alone. clap drops a
+    /// doc-comment's closing period from the text it shows. The tokens TcrBar probes the help
+    /// for stay whole tokens.
+    #[test]
+    fn help_names_both_providers() {
+        use clap::CommandFactory as _;
+        let cli = Cli::command();
+        let text = |styled: Option<&clap::builder::StyledStr>| {
+            styled.map(ToString::to_string).unwrap_or_default()
+        };
+        let sub = |path: &[&str]| -> clap::Command {
+            let mut command = cli.clone();
+            for name in path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("tcr has no {path:?} subcommand"))
+                    .clone();
+            }
+            command
+        };
+        let arg_help = |command: &clap::Command, id: &str| {
+            text(
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_id() == id)
+                    .unwrap_or_else(|| panic!("no {id} argument"))
+                    .get_help(),
+            )
+        };
+
+        assert_eq!(
+            text(cli.get_about()),
+            "Lean single-user rotating proxy for Claude and Codex (ChatGPT) accounts, with a \
+             live TUI"
+        );
+        assert_eq!(
+            text(sub(&["login"]).get_about()),
+            "Add an account: Claude through the browser, or Codex (ChatGPT) with --codex or \
+             --from-codex"
+        );
+        assert_eq!(
+            text(sub(&["mint"]).get_about()),
+            "Mint a long-lived (365-day) token for an existing Claude account, or every Claude \
+             account in a group, and put the result on the clipboard. Nothing is stored — \
+             export only (Claude accounts only)"
+        );
+        assert_eq!(
+            text(sub(&["control"]).get_about()),
+            "Set, clear, or show the identity-bound control account (Claude accounts only)"
+        );
+        assert_eq!(
+            text(sub(&["doctor"]).get_about()),
+            "Say whether Claude Code is actually reaching this proxy, and which file decides \
+             that; and whether codex is pooled, when the fleet holds a Codex account or with \
+             --codex. Exits 0 when it is, 2 when another base URL owns the route, 3 when the \
+             route points here and no proxy answers"
+        );
+        assert_eq!(
+            arg_help(&sub(&["doctor"]), "codex"),
+            "Report only whether codex is pooled, and exit with that verdict's code"
+        );
+        assert!(
+            text(sub(&["list"]).get_about()).starts_with(
+                "Print every Claude account as claude-swap's `list --json` document, for \
+                 CodexBar."
+            ),
+            "{}",
+            text(sub(&["list"]).get_about())
+        );
+        let account = text(sub(&["peer", "account"]).get_about());
+        assert!(
+            account.ends_with(". Codex accounts always leave from this Mac"),
+            "{account}"
+        );
+        for verb in ["share", "via", "lend"] {
+            let about = text(sub(&["peer", verb]).get_about());
+            assert!(
+                about.ends_with(
+                    ". Codex requests always leave from this Mac: no Mac lends, serves or \
+                     carries them in this version"
+                ),
+                "peer {verb}: {about}"
+            );
+        }
+        let group = arg_help(&sub(&["run"]), "group");
+        assert!(
+            group.ends_with(". Claude sessions only; a Codex session cannot ask for a group"),
+            "{group}"
+        );
+
+        for (path, tokens) in [
+            (&["login"][..], &["--non-interactive", "--codex"][..]),
+            (&["server"], &["--replace", "--no-replace"]),
+            (&["doctor"], &["--codex"]),
+        ] {
+            let help = sub(path).render_long_help().to_string();
+            for token in tokens {
+                assert!(
+                    teamclaude_rs::codex_local::help_has_whole_token(&help, token),
+                    "`tcr {} --help` must carry {token} as a whole token:\n{help}",
+                    path.join(" ")
+                );
+            }
+        }
+    }
+
+    /// The see-through notice names the CA's second variable once the config holds a Codex
+    /// account: the claude session carries `CODEX_CA_CERTIFICATE` too, for a codex it starts.
+    /// Without one the notice reads as it always did.
+    #[test]
+    fn the_claude_see_through_notice_names_both_cas_with_a_codex_account() {
+        let ca = Path::new("/Users/example/.config/tcr-ca.pem");
+        assert_eq!(
+            see_through_ca_notice(ca, true),
+            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS and \
+             CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem"
+        );
+        assert_eq!(
+            see_through_ca_notice(ca, false),
+            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem"
+        );
+    }
+
+    /// A pooled codex session carries `HTTPS_PROXY` aimed at tcr, so a `claude` that codex
+    /// starts meets tcr's leaf for `api.anthropic.com`, and node trusts it only through
+    /// `NODE_EXTRA_CA_CERTS`. A pooled launch sets it to tcr's CA, unless the caller exported one,
+    /// which the child then inherits untouched. A direct launch meets no leaf and sets nothing.
+    #[test]
+    fn a_claude_inside_a_pooled_codex_gets_node_extra_ca_certs() {
+        let ca = Path::new("/tmp/ca.pem");
+        let mut cmd = std::process::Command::new("true");
+        apply_nested_claude_ca(&mut cmd, ca, false);
+        assert_eq!(
+            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"),
+            Some(&Some("/tmp/ca.pem".to_string()))
+        );
+        let mut cmd = std::process::Command::new("true");
+        apply_nested_claude_ca(&mut cmd, ca, true);
+        assert_eq!(
+            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"),
+            None,
+            "the caller's own value is inherited, not replaced"
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(
+            &mut cmd,
+            3999,
+            &CodexLaunch::SeeThrough {
+                ca: ca.to_path_buf(),
+                no_proxy: Vec::new(),
+            },
+        );
+        let expected = match std::env::var_os("NODE_EXTRA_CA_CERTS") {
+            None => Some(Some("/tmp/ca.pem".to_string())),
+            Some(_) => None,
+        };
+        assert_eq!(
+            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS").cloned(),
+            expected,
+            "a pooled launch sets the CA for a nested claude unless this process exported one"
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(
+            &mut cmd,
+            3999,
+            &CodexLaunch::Direct {
+                reason: "no proxy answered on 127.0.0.1:3999".to_string(),
+                unset: Vec::new(),
+            },
+        );
+        assert_eq!(env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"), None);
     }
 }

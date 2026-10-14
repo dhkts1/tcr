@@ -77,6 +77,10 @@ untouched, and a request that names such a routing (`x-openai-account-routing-ov
 `x-openai-fedramp`) is relayed on the client's own credential, inference included, and never
 pooled.
 
+Codex stays off the [peer mesh](peers.md) in this version: a Codex account is never lent to a
+peer, and a `codex` request is never borrowed from a peer or carried through one, so it always
+leaves from this Mac.
+
 ```
 codex   HTTPS_PROXY=http://127.0.0.1:<port>   CODEX_CA_CERTIFICATE=~/.config/tcr-ca.pem
   |
@@ -192,7 +196,7 @@ later. When they are out for anything else, a hold on an upstream `retry-after`,
 or an account disabled, parked or reserved, it is `pool_unavailable`: the same
 `resets_in_seconds` and capped `retry-after`, never a `resets_at`, and `codex` retries it after
 that `retry-after`, up to five times, instead of ending the turn. With no Codex account in the
-config at all it is `no_codex_account`, whose message names `tcr login --from-codex`, and it
+config at all it is `no_codex_account`, whose message names `tcr login --codex`, and it
 carries no `retry-after`, because waiting changes nothing; tcr intercepts no `chatgpt.com`
 tunnel then, so a `codex` meets it only on a tunnel opened while the pool still held an account,
 or by sending to the listener directly. `codex` shows a 429 of that type only as a generic
@@ -321,8 +325,8 @@ for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable i
 | `~/.config/teamclaude.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one | `0600` |
 | `~/.config/.teamclaude.json.tcr-*.tmp` | Left behind when a config write is killed halfway. Same contents as the config, and nothing removes them for you | `0600` |
 | `~/.config/tcr-codex-login.*` | Beside the config file, and only while `tcr login --codex` runs: the `CODEX_HOME` it gives `codex login`, holding that sign-in's `auth.json` until tcr has read it. tcr deletes it on every way out it can see; a SIGKILL of tcr can leave one behind, holding a live ChatGPT login | directory `0700` |
-| `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem` | `0644`, `0600` |
-| `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts, its key, and the host list it was made for | `0644`, `0600`, `0644` |
+| `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem`, and so does `CODEX_CA_CERTIFICATE` for `codex` | `0644`, `0600` |
+| `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts and `chatgpt.com`, its key, and the host list it was made for. tcr decrypts `chatgpt.com` with it only while the pool holds a Codex account | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
 | `~/.config/tcr-node.key`, `tcr-node.pub` | Peers only: this Mac's peer identity key pair | `0600`, `0644` |
 | `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater | |
@@ -335,7 +339,10 @@ for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable i
 
 If you also run the Node teamclaude proxy, its `teamclaude-leaf.pem`, `teamclaude-leaf.key` and
 `teamclaude-ca.pem` in `~/.config` belong to it. `tcr` reuses them when they are there and
-never writes them.
+never writes them. With that leaf in place, tcr never pools `codex`: the leaf covers
+`api.anthropic.com` alone, and tcr never re-mints a leaf it did not mint, so it tunnels
+`chatgpt.com` untouched
+([what to do about it](troubleshooting.md#tcr-run---codex-says-it-is-launching-codex-directly-not-pooled)).
 
 TcrBar adds three things of its own: `/Applications/TcrBar.app`, which carries its own copy
 of `tcr` and prefers it over the one on your `PATH`; its preferences, in the
@@ -399,11 +406,17 @@ Nothing below runs for you; there is no uninstall command for the CLI.
    `~/.config` files in the table above.
 5. **Delete the cache:** `~/.cache/teamclaude/` (or `$XDG_CACHE_HOME/teamclaude/`). Its logs
    name your accounts, and `session-wire.json` holds fragments of commands your sessions ran.
-6. **Undo what points at the proxy:** any `ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or
-   `NODE_EXTRA_CA_CERTS` you exported, in your shell or in the `env` block of a Claude Code
-   settings file. `tcr run` sets these only on the session it launches, so it leaves nothing
-   behind.
+6. **Undo what points at the proxy:** any `ANTHROPIC_BASE_URL`, `HTTPS_PROXY`,
+   `NODE_EXTRA_CA_CERTS` or `CODEX_CA_CERTIFICATE` you exported, in your shell or in the `env`
+   block of a Claude Code settings file, and any `chatgpt.com` entry you added to `NO_PROXY` for
+   tcr's sake. `tcr run` and `tcr run --codex` set their variables only on the session they
+   launch, so they leave nothing behind.
 
 `tcr` never writes Claude Code's own stored login; it only reads it, to import it. If `tcr`
 refreshed an imported login, that login's old refresh token no longer works, and `claude`
 asks you to log in through the browser once.
+
+The same holds for `codex`: tcr never writes the login `codex` keeps, and
+`tcr login --from-codex` only reads it. Once tcr has refreshed an imported login, the copy
+`codex` holds is dead, and `codex login` signs `codex` in again
+([troubleshooting.md](troubleshooting.md#a-codex-account-says-it-needs-sign-in)).

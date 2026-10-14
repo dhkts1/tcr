@@ -229,3 +229,55 @@ fn an_empty_fleet_without_a_codex_login_prints_todays_lines() {
     assert_eq!(stdout, "no accounts configured\n");
     assert_eq!(normalize_home(&stderr, home.path()), STDERR);
 }
+
+/// Puts a file's mode back to `0o600` when dropped, so a test that made it unreadable leaves
+/// nothing behind that its tempdir cannot clean up, whether its assertions pass or not.
+struct RestoreMode<'a>(&'a std::path::Path);
+
+impl Drop for RestoreMode<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _restored = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// A first run on a machine where codex holds a login prints one more stderr line, after the
+/// empty-fleet line: the two ways to pool codex. The login is evidence and nothing more: it is
+/// checked for existence, never opened (the file here is unreadable to everyone, and still
+/// counts), never imported, and left exactly as it was.
+#[test]
+fn a_codex_login_on_disk_adds_one_hint_line() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let login = home.path().join(".codex").join("auth.json");
+    std::fs::create_dir_all(login.parent().expect("the login has a parent"))
+        .expect("creating the scratch .codex dir");
+    std::fs::write(&login, "").expect("writing an empty login file");
+    std::fs::set_permissions(&login, std::fs::Permissions::from_mode(0o000))
+        .expect("making the login unreadable");
+    let _restore = RestoreMode(&login);
+
+    let (code, stdout, stderr) = run_tcr_without_codex(home.path(), &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "no accounts configured\n");
+    assert_eq!(
+        normalize_home(&stderr, home.path()),
+        "[tcr] created <home>/.config/teamclaude.json with no accounts\n\
+         no accounts configured — run `tcr login` to add one\n\
+         [tcr] found a codex login at <home>/.codex/auth.json: `tcr login --codex` adds a Codex \
+         account of tcr's own, and `tcr login --from-codex` imports that one (codex then asks \
+         you to log in again, once)\n"
+    );
+
+    let after = std::fs::metadata(&login).expect("the login is still there");
+    assert_eq!(after.len(), 0, "the login file is untouched");
+    assert_eq!(after.mode() & 0o777, 0o000, "the login file keeps its mode");
+    let written = std::fs::read_to_string(config_path_in(home.path())).expect("the config");
+    let parsed: serde_json::Value = serde_json::from_str(&written).expect("a readable config");
+    assert_eq!(
+        parsed.get("accounts").and_then(|a| a.as_array()),
+        Some(&vec![]),
+        "nothing is imported from a codex login: {written}"
+    );
+}

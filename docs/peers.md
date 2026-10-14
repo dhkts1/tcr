@@ -183,6 +183,9 @@ lets this Mac fall back to a trusted, willing Mac when its own connection to the
 down. `tcr peer via off` turns that off; `tcr peer via <peer>` pins one specific Mac instead
 of picking automatically.
 
+A `codex` request never goes this way: it always leaves from this Mac, and with the connection
+down it fails as it would without a peer.
+
 ## Exit lock: keeping an account on one IP
 
 ```

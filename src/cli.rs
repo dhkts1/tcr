@@ -157,10 +157,42 @@ async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -
 /// fleet must stay a well-formed empty fleet there, with the human-facing
 /// nudge on the other channel. The verb still exits 0: no accounts is a state,
 /// not a failure.
+///
+/// Only an empty fleet asks whether codex holds a login of its own
+/// ([`crate::codex_local::codex_login_exists`], a `metadata` call that never
+/// opens the file), so a fleet with accounts costs nothing extra.
 fn warn_if_no_accounts(config: &Config) {
-    if config.accounts.is_empty() {
-        eprintln!("no accounts configured — run `tcr login` to add one");
+    let codex_login = (config.accounts.is_empty() && crate::codex_local::codex_login_exists())
+        .then(crate::codex_local::codex_login_path);
+    for line in no_accounts_lines(config, codex_login.as_deref()) {
+        eprintln!("{line}");
     }
+}
+
+/// The lines [`warn_if_no_accounts`] prints: none for a fleet with accounts, else the
+/// empty-fleet sentence, then, when `codex_login` names the login codex keeps on this
+/// machine, the two ways to pool codex.
+///
+/// The codex line fires on evidence only. A machine with no codex login is a Claude-only
+/// first run and reads exactly as it always did; a machine where codex is signed in is one
+/// whose person uses codex, and should hear that tcr can pool it. tcr never imports that login
+/// on its own: an import spends codex's copy of a single-use refresh token, so it is the
+/// person's choice, and the line says what it costs. `claudeCodeImport: false` does not stop
+/// the line either, since it stops only the Claude Code import.
+fn no_accounts_lines(config: &Config, codex_login: Option<&Path>) -> Vec<String> {
+    if !config.accounts.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["no accounts configured — run `tcr login` to add one".to_string()];
+    if let Some(login) = codex_login {
+        lines.push(format!(
+            "[tcr] found a codex login at {}: `tcr login --codex` adds a Codex account of tcr's \
+             own, and `tcr login --from-codex` imports that one (codex then asks you to log in \
+             again, once)",
+            login.display()
+        ));
+    }
+    lines
 }
 
 /// Load the config for a management verb, warning if a server is live.
@@ -2447,6 +2479,22 @@ fn cache_hit_ratio(a: &AccountSnapshot, source: StatusSource) -> Option<f64> {
 /// whether it is a binding hold, so there is nothing left in this renderer to
 /// gate on it. `held_windows`/`held[]` (JSON) keep their own threshold — a
 /// different question this text line never answered.
+///
+/// A Codex row says so right after its name (` provider=codex`, the one
+/// greppable provider marker), and a Claude row's line is the line it always
+/// was. On a Codex row a window token reads `none` when the plan reported its
+/// windows and this one is not among them (a Pro plan has no 5-hour window, a
+/// Business plan may report none), while `n/a` keeps meaning a window expected
+/// and not measured yet. A reading left over for a window the plan no longer
+/// reports does not bring the window back: what the plan reports decides.
+///
+/// After `parked_groups=` a Codex row ends with what only it can say, in this
+/// order and each only when it has something to say ([`codex_tail`]): why its
+/// login died, the limit ChatGPT says it reached, a reached spend control, its
+/// credits, that it is unreachable while reserved (a Codex request carries no
+/// group that could reach it), and its workspace, the first 8 hex digits of its
+/// ChatGPT workspace id. That last one is what tells two rows apart that share
+/// one email in two ChatGPT workspaces.
 pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String {
     if snapshot.accounts.is_empty() {
         return "no accounts configured\n".to_string();
@@ -2454,8 +2502,14 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
     let now = OffsetDateTime::now_utc();
     let mut out = String::new();
     for a in snapshot.accounts.iter() {
-        let five_hour = render_window("5h", a.five_hour, a.five_hour_reset, now);
-        let seven_day = render_window("wk", a.seven_day, a.seven_day_reset, now);
+        let provider = match a.provider {
+            Provider::Codex => " provider=codex",
+            Provider::Anthropic => "",
+        };
+        let five_hour = unreported_window(a, "5h", "fiveHour")
+            .unwrap_or_else(|| render_window("5h", a.five_hour, a.five_hour_reset, now));
+        let seven_day = unreported_window(a, "wk", "sevenDay")
+            .unwrap_or_else(|| render_window("wk", a.seven_day, a.seven_day_reset, now));
         // Fable's model-scoped weekly never gates the general view: no reset field,
         // no countdown, and the whole token is omitted when it was never learned.
         let fable = match a.seven_day_oi {
@@ -2556,8 +2610,9 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             None => String::new(),
         };
         out.push_str(&format!(
-            "account {} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}{}\n",
+            "account {}{} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}{}{}\n",
             a.name,
+            provider,
             a.priority,
             plan,
             five_hour,
@@ -2574,9 +2629,71 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             groups,
             reserved_groups,
             parked_groups,
+            codex_tail(a),
         ));
     }
     out
+}
+
+/// `{label}=none` for a Codex row whose plan reported its usage windows without `window`
+/// (`"fiveHour"` or `"sevenDay"`), else `None`, leaving the token to [`render_window`]. An
+/// unknown list is not a plan without the window, and a Claude row has no such list at all.
+fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<String> {
+    let reported = a
+        .codex
+        .quota_windows
+        .as_ref()
+        .filter(|_| a.provider == Provider::Codex)?;
+    (!reported.iter().any(|w| w == window)).then(|| format!("{label}=none"))
+}
+
+/// The tokens that end a Codex row's line, in this order, each only when it has something to
+/// say: ` login_error=` (the raw error the login died with), ` limit_reached=` (the raw limit
+/// ChatGPT says it reached), ` spend_control=reached`, ` credits=` (`unlimited`, else the
+/// balance verbatim while the account has credits), ` reachable=no` (a reserved Codex row,
+/// which no Codex request can reach) and ` workspace=` ([`workspace_token`]). Empty on a Claude
+/// row, whatever its Codex facts hold.
+fn codex_tail(a: &AccountSnapshot) -> String {
+    if a.provider != Provider::Codex {
+        return String::new();
+    }
+    let mut tail = String::new();
+    if let Some(code) = &a.codex.login_error {
+        tail.push_str(&format!(" login_error={code}"));
+    }
+    if let Some(kind) = &a.codex.limit_reached_type {
+        tail.push_str(&format!(" limit_reached={kind}"));
+    }
+    if a.codex.spend_control_reached {
+        tail.push_str(" spend_control=reached");
+    }
+    match &a.codex.credits {
+        Some(credits) if credits.unlimited => tail.push_str(" credits=unlimited"),
+        Some(tcr_status_wire::CodexCredits {
+            has_credits: true,
+            balance: Some(balance),
+            ..
+        }) => tail.push_str(&format!(" credits={balance}")),
+        _ => {}
+    }
+    if a.gate == crate::stats::GateReason::Reserved {
+        tail.push_str(" reachable=no");
+    }
+    if let Some(workspace) = a.org_uuid.as_deref().and_then(workspace_token) {
+        tail.push_str(&format!(" workspace={workspace}"));
+    }
+    tail
+}
+
+/// The first 8 hex digits of a ChatGPT workspace id, the dashes skipped, as TcrBar and the
+/// re-login refusal show it; `None` when the id holds fewer than 8.
+fn workspace_token(org_uuid: &str) -> Option<String> {
+    let hex: String = org_uuid
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    (hex.len() == 8).then_some(hex)
 }
 
 /// Where a rendered fleet view's numbers came from.
@@ -3726,6 +3843,14 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 codex_route: Some(&codex_route),
             })
         );
+        // A signed-out Codex row's remedy goes to stderr, below the account lines that name
+        // it. It is not a probe verdict, so it never changes `--check`'s exit code.
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from);
+        for line in relogin_hint_lines(&snapshot, home.as_deref()) {
+            eprintln!("{line}");
+        }
         // What tcr did with codex lately goes to stderr, below the account lines it points at,
         // and only for a fleet that holds a Codex account.
         if holds_provider(&snapshot, Provider::Codex) {
@@ -3863,7 +3988,7 @@ pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
         )
     };
     out.push_str(&format!(
-        "status source={}{}{} http1Only={}{}\n",
+        "status source={}{}{} http1Only={}{}{}\n",
         text.source.as_str(),
         match text.source {
             StatusSource::Live => String::new(),
@@ -3873,9 +3998,57 @@ pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
         build_fields(text.server_build, text.client_build),
         text.http1_only,
         group_colors_field,
+        eligible_token(text.snapshot),
     ));
     out.push_str(&render_accounts(text.snapshot, text.source));
     out
+}
+
+/// ` eligible=claude:R/N,codex:R/N`, the header's count of each pool's eligible accounts, in a
+/// fleet that holds both providers; empty otherwise, so a Claude-only or Codex-only header is
+/// the one it always was. N is every row of that provider, and R the rows whose gate is `ok`
+/// and that are not disabled: the dashboard's "eligible", which a row held by an upstream 403
+/// or 429 is not.
+fn eligible_token(snapshot: &StatsSnapshot) -> String {
+    let tally = |provider: Provider| {
+        let rows: Vec<&AccountSnapshot> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.provider == provider)
+            .collect();
+        let eligible = rows
+            .iter()
+            .filter(|a| a.gate == crate::stats::GateReason::Ok && !a.disabled)
+            .count();
+        (eligible, rows.len())
+    };
+    let (claude, claude_rows) = tally(Provider::Anthropic);
+    let (codex, codex_rows) = tally(Provider::Codex);
+    if claude_rows == 0 || codex_rows == 0 {
+        return String::new();
+    }
+    format!(" eligible=claude:{claude}/{claude_rows},codex:{codex}/{codex_rows}")
+}
+
+/// The stderr line `tcr status` prints for each Codex row whose login is dead (gate LOGIN), in
+/// row order: the command that signs it in again, after why it died when that is known
+/// ([`AccountSnapshot::relogin_why`], the one place the why is worded, so this line and the
+/// dashboard's re-login hint cannot disagree). With no recorded why, the clause and its colon
+/// are dropped and the line still prints. `home` shows a codex folder under it as `~`.
+fn relogin_hint_lines(snapshot: &StatsSnapshot, home: Option<&Path>) -> Vec<String> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Codex && a.gate == crate::stats::GateReason::Login)
+        .map(|a| {
+            let name = &a.name;
+            let why = a
+                .relogin_why(home)
+                .map(|why| format!(": {why}"))
+                .unwrap_or_default();
+            format!("[tcr] {name} needs re-login{why} — tcr login --codex --account {name}")
+        })
+        .collect()
 }
 
 /// `tcr list --json`: every configured account in claude-swap's list schema v1,
@@ -4029,15 +4202,26 @@ fn overlay_live_rows(
     rows
 }
 
-/// `tcr doctor [--json]`: is Claude Code reaching this proxy, and if not, what
-/// decided otherwise. Returns the exit code the caller hands to the process:
-/// 0 routed here and serving, 2 routed somewhere else, 3 routed here with
-/// nothing answering ([`crate::doctor::Report::exit_code`]).
+/// `tcr doctor [--json] [--codex]`: is Claude Code reaching this proxy, and if
+/// not, what decided otherwise; and, for a fleet that holds a Codex account or
+/// with `--codex`, would codex be pooled from this shell. Returns the exit code
+/// the caller hands to the process, with the meanings
+/// [`crate::doctor::Report::exit_code`] gives them: 0 routed here and serving,
+/// 2 routed somewhere else, 3 routed here with nothing answering. Whose code it
+/// is follows the fleet ([`crate::doctor::Diagnosis`]): Claude's while the
+/// fleet holds a Claude account, so a script asking about Claude Code gets the
+/// answer it always got; Codex's for a fleet of Codex accounts alone, and with
+/// `--codex`. A config key this build does not recognise is named and changes
+/// no exit code.
 ///
 /// The live read happens here rather than in `crate::doctor` so there stays
 /// exactly ONE client speaking to the status endpoint, with one set of
 /// timeouts and one api-key rule. Everything this prints is decided by
-/// [`crate::doctor::inspect`], which is pure and tested against a temp HOME.
+/// [`crate::doctor::inspect`] and [`crate::doctor::inspect_codex`], over that
+/// one read. The fleet is the running proxy's when it answered, else the
+/// config's, and only a fleet holding a Codex account, or `--codex`, pays for
+/// the Codex half: a Claude-only fleet's doctor never searches for a codex
+/// binary.
 ///
 /// `LiveStatusError::NoServer` is the only failure that reads as "no proxy
 /// answered" without a word on stderr: it is the ordinary state of a machine
@@ -4045,11 +4229,12 @@ fn overlay_live_rows(
 /// The other two mean something IS on the port and could not be read, which the
 /// operator has to be told, since the request count then reads `none` for a
 /// reason that is not "the proxy is down".
-pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
+pub async fn doctor(config_path: &Path, json: bool, codex_only: bool) -> anyhow::Result<i32> {
     let config = load_config(config_path)?;
-    let served_recently = match fetch_live_status(&config).await {
+    let live = fetch_live_status(&config).await;
+    let served_recently = match &live {
         Ok(payload) => Some(crate::doctor::requests_in_window(
-            &payload,
+            payload,
             crate::doctor::REQUEST_WINDOW_MINUTES,
         )),
         Err(LiveStatusError::NoServer) => None,
@@ -4063,14 +4248,26 @@ pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
         }
     };
 
-    let report =
+    let claude =
         crate::doctor::inspect(config.proxy.port, served_recently).with_config_keys(&config);
+    let holds = |provider: Provider| match &live {
+        Ok(payload) => payload.accounts.iter().any(|row| row.provider == provider),
+        Err(_) => config.accounts.iter().any(|a| a.provider == provider),
+    };
+    let codex = (codex_only || holds(Provider::Codex))
+        .then(|| crate::doctor::inspect_codex(config.proxy.port, live.as_ref(), &config));
+    let diagnosis = crate::doctor::Diagnosis {
+        claude,
+        codex,
+        holds_anthropic: holds(Provider::Anthropic),
+        codex_only,
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+        println!("{}", serde_json::to_string_pretty(&diagnosis.to_json())?);
     } else {
-        println!("{}", report.render_text());
+        println!("{}", diagnosis.render_text());
     }
-    Ok(report.exit_code())
+    Ok(diagnosis.exit_code())
 }
 
 /// The build `key=value` tail of the `status source=` line.
@@ -11157,5 +11354,406 @@ mod tests {
         );
 
         fs::remove_file(&path).ok();
+    }
+
+    /// A snapshot holding `accounts` and nothing else: no account serving, no session, no log.
+    fn snapshot_of(accounts: Vec<AccountSnapshot>) -> StatsSnapshot {
+        StatsSnapshot {
+            accounts,
+            current: None,
+            current_by_provider: crate::stats::CurrentByProvider::default(),
+            recent: Vec::new(),
+            sessions: Vec::new(),
+            wire_sessions: Vec::new(),
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+        }
+    }
+
+    /// A Codex row says it is one right after its name, and ends with what only a Codex row can
+    /// say, after `parked_groups=` and in a fixed order, each token only when it has something
+    /// to say. A Claude row never prints any of it, whatever its Codex facts hold.
+    #[test]
+    fn codex_account_line_tokens_follow_parked_groups_in_order() {
+        use crate::stats::GateReason;
+        use tcr_status_wire::CodexCredits;
+
+        let mut kim = canonical_codex_row(
+            "kim@example.com",
+            9,
+            "pro",
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        );
+        kim.groups = vec!["orchard".to_string(), "research".to_string()];
+        kim.reserved_groups = vec!["research".to_string()];
+        kim.parked_groups = vec!["orchard".to_string()];
+        kim.gate = GateReason::Reserved;
+        kim.codex.login_error = Some("refresh_token_reused".to_string());
+        kim.codex.limit_reached_type = Some("rate_limit_reached".to_string());
+        kim.codex.spend_control_reached = true;
+        kim.codex.credits = Some(CodexCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("12.50".to_string()),
+        });
+        let line = |row: &AccountSnapshot| {
+            render_accounts(&snapshot_of(vec![row.clone()]), StatusSource::Live)
+        };
+
+        assert_eq!(
+            line(&kim),
+            "account kim@example.com provider=codex priority=9 plan=ChatGPT Pro 5h=n/a wk=n/a \
+             cache=n/a state=ok status=active probe=ok stream_errors=0 \
+             groups=orchard,research reserved_groups=research parked_groups=orchard \
+             login_error=refresh_token_reused limit_reached=rate_limit_reached \
+             spend_control=reached credits=12.50 reachable=no workspace=dddddddd\n"
+        );
+
+        let no_workspace = AccountSnapshot {
+            org_uuid: None,
+            ..kim.clone()
+        };
+        assert_eq!(
+            line(&no_workspace),
+            line(&kim).replace(" workspace=dddddddd", ""),
+            "no workspace id, no workspace token"
+        );
+
+        let mut unlimited = kim.clone();
+        unlimited.codex.credits = Some(CodexCredits {
+            has_credits: false,
+            unlimited: true,
+            balance: None,
+        });
+        assert_eq!(
+            line(&unlimited),
+            line(&kim).replace(" credits=12.50", " credits=unlimited")
+        );
+
+        let mut spent = kim.clone();
+        spent.codex.credits = Some(CodexCredits {
+            has_credits: false,
+            unlimited: false,
+            balance: Some("0.00".to_string()),
+        });
+        assert_eq!(
+            line(&spent),
+            line(&kim).replace(" credits=12.50", ""),
+            "a balance with no credits behind it says nothing"
+        );
+
+        let reachable = AccountSnapshot {
+            gate: GateReason::Ok,
+            ..kim.clone()
+        };
+        assert_eq!(
+            line(&reachable),
+            line(&kim).replace(" reachable=no", ""),
+            "only a reserved Codex row is unreachable"
+        );
+
+        let claude = AccountSnapshot {
+            provider: Provider::Anthropic,
+            ..kim.clone()
+        };
+        let claude_without_codex_facts = AccountSnapshot {
+            codex: CodexFacts::default(),
+            ..claude.clone()
+        };
+        assert_eq!(
+            line(&claude),
+            line(&claude_without_codex_facts),
+            "a Claude row's line never reads its Codex facts"
+        );
+        for token in [
+            " provider=",
+            "=none",
+            " login_error=",
+            " limit_reached=",
+            " spend_control=",
+            " credits=",
+            " reachable=",
+            " workspace=",
+        ] {
+            assert!(
+                !line(&claude).contains(token),
+                "a Claude row printed {token:?}: {}",
+                line(&claude)
+            );
+        }
+    }
+
+    /// `none` is a window the plan does not report, from the row's own list of windows, and
+    /// `n/a` keeps meaning a window expected and not yet measured: an unknown list, or a listed
+    /// window with no reading. A reading left over for a window the plan dropped does not bring
+    /// it back, and a Claude row never reads the list.
+    #[test]
+    fn five_hour_none_and_weekly_none_on_codex_rows() {
+        let windows = |list: &[&str]| Some(list.iter().map(|w| w.to_string()).collect());
+        let codex = |name: &str, quota_windows: Option<Vec<String>>| {
+            let mut row =
+                canonical_codex_row(name, 0, "pro", "55555555-5555-4555-8555-555555555555");
+            row.codex.quota_windows = quota_windows;
+            row
+        };
+        let mut ivy = codex("ivy@example.com", windows(&["sevenDay"]));
+        ivy.five_hour = Some(0.5);
+        let mut alice = contract_account(
+            "alice@example.com",
+            0,
+            "active",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::probe::ProbeStatus::Ok,
+            None,
+            QuotaState::Normal,
+            &[],
+            None,
+            (Some("claude_max"), Some("default_claude_max_20x"), None),
+            (None, None),
+        );
+        alice.codex.quota_windows = windows(&[]);
+        let rows = vec![
+            codex("bob@example.com/codex", windows(&["sevenDay"])),
+            codex("jo@example.com", windows(&[])),
+            codex("dana@example.com", windows(&["fiveHour", "sevenDay"])),
+            codex("hal@example.com", None),
+            ivy,
+            alice,
+        ];
+        let text = render_accounts(&snapshot_of(rows), StatusSource::Live);
+        let lines: Vec<&str> = text.lines().collect();
+        let expected = [
+            ("bob@example.com/codex", " 5h=none wk=n/a cache="),
+            ("jo@example.com", " 5h=none wk=none cache="),
+            ("dana@example.com", " 5h=n/a wk=n/a cache="),
+            ("hal@example.com", " 5h=n/a wk=n/a cache="),
+            ("ivy@example.com", " 5h=none "),
+            ("alice@example.com", " 5h=n/a wk=n/a cache="),
+        ];
+        assert_eq!(lines.len(), expected.len(), "{text}");
+        for (line, (name, holds)) in lines.iter().zip(expected) {
+            assert!(
+                line.starts_with(&format!("account {name} ")),
+                "rows keep their order: {line}"
+            );
+            assert!(line.contains(holds), "{name} must hold {holds:?}: {line}");
+        }
+    }
+
+    /// `tcr accounts` prints `tcr status`'s account line, the Codex tokens included, from its
+    /// offline snapshot. The Claude row is the line it always was: its workspace id prints no
+    /// `workspace=`.
+    #[test]
+    fn accounts_text_carries_the_codex_tokens() {
+        let alice = contract_account(
+            "alice@example.com",
+            0,
+            "active",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::probe::ProbeStatus::Never,
+            None,
+            QuotaState::Normal,
+            &[],
+            None,
+            (Some("claude_max"), Some("default_claude_max_20x"), None),
+            (Some("11111111-1111-1111-1111-111111111111"), None),
+        );
+        let bob = AccountSnapshot {
+            probe_status: crate::probe::ProbeStatus::Never,
+            ..canonical_codex_row(
+                "bob@example.com/codex",
+                1,
+                "pro",
+                "55555555-5555-4555-8555-555555555555",
+            )
+        };
+        assert_eq!(
+            render_accounts(&snapshot_of(vec![alice, bob]), StatusSource::Offline),
+            "account alice@example.com priority=0 plan=Max 20x 5h=n/a wk=n/a cache=n/a state=ok \
+             status=active probe=never stream_errors=n/a\n\
+             account bob@example.com/codex provider=codex priority=1 plan=ChatGPT Pro 5h=n/a \
+             wk=n/a cache=n/a state=ok status=active probe=never stream_errors=n/a \
+             workspace=55555555\n"
+        );
+    }
+
+    /// A Claude row for the header and re-login tests: probed, in no group, its plan known,
+    /// and gated `gate`.
+    fn claude_row(name: &str, gate: crate::stats::GateReason) -> AccountSnapshot {
+        AccountSnapshot {
+            gate,
+            ..contract_account(
+                name,
+                0,
+                "active",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                None,
+                (Some("claude_max"), Some("default_claude_max_20x"), None),
+                (None, None),
+            )
+        }
+    }
+
+    /// A Codex row for the header and re-login tests, gated `gate`.
+    fn codex_row(name: &str, gate: crate::stats::GateReason) -> AccountSnapshot {
+        AccountSnapshot {
+            gate,
+            ..canonical_codex_row(name, 0, "pro", "55555555-5555-4555-8555-555555555555")
+        }
+    }
+
+    /// A mixed fleet's header counts each pool's eligible accounts: gate `ok` and not
+    /// disabled, over every row of that provider. A fleet of one provider, or of none, keeps
+    /// the header it always had.
+    #[test]
+    fn the_eligible_header_prints_only_in_mixed_fleets() {
+        use crate::stats::GateReason;
+
+        let alice = claude_row("alice@example.com", GateReason::Ok);
+        let frank = claude_row("frank@example.com", GateReason::FiveHour);
+        let bob = codex_row("bob@example.com/codex", GateReason::Ok);
+        let dana = AccountSnapshot {
+            disabled: true,
+            ..codex_row("dana@example.com", GateReason::Ok)
+        };
+        let erin = codex_row("erin@example.com/codex", GateReason::Login);
+        let all = vec![
+            alice.clone(),
+            frank.clone(),
+            bob.clone(),
+            dana.clone(),
+            erin.clone(),
+        ];
+
+        assert_eq!(
+            eligible_token(&snapshot_of(all.clone())),
+            " eligible=claude:1/2,codex:1/3"
+        );
+        assert_eq!(eligible_token(&snapshot_of(vec![alice.clone(), frank])), "");
+        assert_eq!(eligible_token(&snapshot_of(vec![bob, dana, erin])), "");
+        assert_eq!(eligible_token(&snapshot_of(Vec::new())), "");
+
+        // A Codex row held by an upstream 403 is out of rotation until its hold ends.
+        let pat = codex_row("pat@example.com/codex", GateReason::Refused);
+        assert_eq!(
+            eligible_token(&snapshot_of(vec![alice, pat])),
+            " eligible=claude:1/1,codex:0/1"
+        );
+
+        let build = |sha: &str| BuildInfo {
+            sha: sha.to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let group_colors = std::collections::BTreeMap::new();
+        let pooled = tcr_status_wire::CodexRoute {
+            pooled: true,
+            code: None,
+            reason: None,
+            upstream: None,
+        };
+        let text = render_status_text(&StatusText {
+            snapshot: &snapshot_of(all),
+            source: StatusSource::Live,
+            server_build: Some(&build("abc1234")),
+            client_build: &build("def5678"),
+            http1_only: false,
+            group_colors: &group_colors,
+            claude_verdict: None,
+            codex_route: Some(&pooled),
+        });
+        let header = text
+            .lines()
+            .find(|line| line.starts_with("status source="))
+            .unwrap_or_else(|| panic!("no header:\n{text}"));
+        assert!(
+            header.ends_with(" eligible=claude:1/2,codex:1/3"),
+            "the count ends the header: {header}"
+        );
+    }
+
+    /// Each Codex row in LOGIN gets one stderr line naming the command that signs it in again,
+    /// and why its login died when that is known, in the words the dashboard uses. A Claude row
+    /// never does, and neither does a Codex row whose gate is not LOGIN.
+    #[test]
+    fn status_prints_one_relogin_hint_per_signed_out_codex_row() {
+        use crate::stats::GateReason;
+
+        let mut erin = codex_row("erin@example.com/codex", GateReason::Login);
+        erin.codex.login_error = Some("refresh_token_reused".to_string());
+        erin.codex.codex_home = Some("/Users/example/.codex".to_string());
+        let ivy = codex_row("ivy@example.com/codex", GateReason::Login);
+        let frank = claude_row("frank@example.com", GateReason::Login);
+        let mut bob = codex_row("bob@example.com/codex", GateReason::Ok);
+        bob.codex.login_error = Some("refresh_token_reused".to_string());
+
+        assert_eq!(
+            relogin_hint_lines(
+                &snapshot_of(vec![erin, ivy, frank, bob]),
+                Some(Path::new("/Users/example"))
+            ),
+            [
+                "[tcr] erin@example.com/codex needs re-login: the codex CLI in ~/.codex \
+                 refreshed this shared login first — tcr login --codex --account \
+                 erin@example.com/codex",
+                "[tcr] ivy@example.com/codex needs re-login — tcr login --codex --account \
+                 ivy@example.com/codex",
+            ]
+        );
+    }
+
+    /// The empty-fleet line, as it always read, and nothing more without a codex login on
+    /// disk. A fleet with accounts prints no hint at all, codex login or not.
+    #[test]
+    fn warn_if_no_accounts_is_unchanged_without_codex_login() {
+        assert_eq!(
+            no_accounts_lines(&load_from(r#"{"accounts": []}"#), None),
+            vec!["no accounts configured — run `tcr login` to add one"]
+        );
+        assert!(no_accounts_lines(
+            &load_from(TWO_ACCOUNTS),
+            Some(Path::new("/Users/example/.codex/auth.json"))
+        )
+        .is_empty());
+    }
+
+    /// An empty fleet on a machine where codex holds a login gets one more line: the two
+    /// ways to pool codex, and what the import costs. The login is named, never read.
+    #[test]
+    fn the_first_run_with_a_codex_login_prints_the_codex_hint() {
+        assert_eq!(
+            no_accounts_lines(
+                &load_from(r#"{"accounts": []}"#),
+                Some(Path::new("/Users/example/.codex/auth.json"))
+            ),
+            vec![
+                "no accounts configured — run `tcr login` to add one".to_string(),
+                "[tcr] found a codex login at /Users/example/.codex/auth.json: `tcr login \
+                 --codex` adds a Codex account of tcr's own, and `tcr login --from-codex` \
+                 imports that one (codex then asks you to log in again, once)"
+                    .to_string(),
+            ]
+        );
     }
 }

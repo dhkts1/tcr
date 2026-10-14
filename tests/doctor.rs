@@ -465,3 +465,554 @@ fn claude_only_doctor_is_unchanged() {
         golden.display()
     );
 }
+
+/// A `/_tcr/status` endpoint on a kernel-assigned port, answering every connection with
+/// `body`, as [`fake_status_endpoint`] does. `body` must parse as the payload the CLI reads, so
+/// a misspelled key fails here, loudly, rather than as a status the CLI could not read.
+fn serve_status(body: serde_json::Value) -> u16 {
+    if let Err(error) = serde_json::from_value::<teamclaude_rs::status::StatusPayload>(body.clone())
+    {
+        panic!("the fake status payload does not parse ({error}): {body}");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
+    let port = listener.local_addr().expect("local addr").port();
+    let body = body.to_string();
+    std::thread::spawn(move || loop {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        serve_one(stream, &body);
+    });
+    port
+}
+
+/// One account row of a status payload: active, probed, in rotation, nothing served.
+fn status_row(name: &str, codex: bool) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "name": name, "priority": 0, "status": "active", "disabled": false, "requests": 0,
+        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+        "probeStatus": "ok", "quotaState": "normal", "gate": "ok", "threshold": 0.9,
+    });
+    if codex {
+        row["provider"] = serde_json::json!("codex");
+    }
+    row
+}
+
+/// One session of a status payload, [`fake_status_endpoint`]'s, with `served` requests in its
+/// newest minute.
+fn session_row(id: &str, served: u16, codex: bool) -> serde_json::Value {
+    let mut sparkline = vec![0u16; 30];
+    sparkline[29] = served;
+    let mut row = serde_json::json!({
+        "sessionId": id, "firstSeenMs": 0, "lastSeenMs": 0, "reqPerMinute": sparkline,
+    });
+    if codex {
+        row["provider"] = serde_json::json!("codex");
+    }
+    row
+}
+
+/// A status payload holding `rows` and `sessions`, whose MITM listener serves `leaf` and
+/// intercepts `hosts`.
+fn payload(
+    rows: Vec<serde_json::Value>,
+    sessions: Vec<serde_json::Value>,
+    leaf: &str,
+    hosts: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "tcr.status.v1",
+        "accounts": rows,
+        "sessions": sessions,
+        "mitm": {"interceptedHosts": hosts, "leaf": leaf},
+    })
+}
+
+/// [`run_tcr`], with this machine's codex kept out: no proxy or CA variable reaches the child,
+/// codex's login can only be `<home>/.codex/auth.json`, and the only `codex` it can find is a
+/// fake one at `<home>/bin/codex`, named by `TCR_CODEX_BIN`, with the search past `PATH`
+/// pointed at an empty folder, so no real codex and no npm prefix is ever consulted.
+fn run_tcr_codex(
+    home: &Path,
+    base_url_env: Option<&str>,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).expect("create the scratch bin directory");
+    let codex = bin.join("codex");
+    std::fs::write(&codex, "#!/bin/sh\nexit 0\n").expect("write the fake codex");
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake codex executable");
+    let no_dirs = home.join("no-dirs");
+    std::fs::create_dir_all(&no_dirs).expect("create the empty search directory");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CACHE_HOME")
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("no-credentials.json"),
+        )
+        .current_dir(work_dir(home));
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "CODEX_CA_CERTIFICATE",
+        "CODEX_HOME",
+        "TCR_CODEX_AUTH",
+        "CODEX_BIN",
+    ] {
+        command.env_remove(var);
+    }
+    command
+        .env("TCR_CODEX_BIN", &codex)
+        .env("TCR_CODEX_SEARCH_DIRS", &no_dirs);
+    match base_url_env {
+        Some(url) => command.env("ANTHROPIC_BASE_URL", url),
+        None => command.env_remove("ANTHROPIC_BASE_URL"),
+    };
+    let out = command.output().expect("run tcr");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A port nothing listens on that is not `excluded`: the kernel can hand a released port
+/// straight back, and a run meant to find no proxy must not meet one.
+fn free_port_other_than(excluded: u16) -> u16 {
+    for _ in 0..20 {
+        let port = free_port();
+        if port != excluded {
+            return port;
+        }
+    }
+    panic!("the kernel handed back {excluded} twenty times in a row");
+}
+
+/// The mixed fleet of the tests below: alice for Claude, bob for Codex, each with a session
+/// (3 Claude requests and 2 Codex ones in the newest minute), behind a proxy that runs without
+/// MITM and has refused 4 Codex requests and relayed 1 unpooled.
+fn mixed_payload() -> serde_json::Value {
+    let mut body = payload(
+        vec![
+            status_row("alice@example.com", false),
+            status_row("bob@example.com/codex", true),
+        ],
+        vec![
+            session_row("11111111-1111-1111-1111-111111111111", 3, false),
+            session_row("22222222-2222-2222-2222-222222222222", 2, true),
+        ],
+        "none",
+        &[],
+    );
+    body["codex_traffic"] = serde_json::json!({"refused10m": 4, "unpooled10m": 1});
+    body
+}
+
+/// A mixed fleet's doctor prints Claude's facts, the Codex block and both verdicts, Claude's
+/// last and in words that say its count is Claude's, and exits with Claude's code: a script
+/// asking whether Claude Code reaches this proxy gets the answer it always got, even while
+/// codex is not pooled.
+#[test]
+fn a_mixed_fleet_doctor_keeps_claudes_exit_code() {
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_status(mixed_payload());
+    let config = write_config_with(home.path(), port, ALICE)
+        .display()
+        .to_string();
+
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&format!("http://127.0.0.1:{port}")),
+        &["doctor", "--config", &config],
+    );
+
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let text = normalize(&stdout, home.path(), port);
+    let tail: Vec<&str> = text.lines().skip(5).collect();
+    assert_eq!(
+        tail,
+        [
+            "requests10m: 3",
+            "codexAccounts: 1 (1 in rotation)",
+            "codexIntercept: no",
+            "codexCa: <home>/.config/tcr-ca.pem (not readable)",
+            "codexUpstream: https://chatgpt.com (default)",
+            "codexBin: <home>/bin/codex (TCR_CODEX_BIN)",
+            "codexEnv: HTTPS_PROXY unset · NO_PROXY unset · SSL_CERT_FILE unset",
+            "codexLogin: <home>/.codex/auth.json does not exist (existence only; never read)",
+            "codexRequests10m: 2",
+            "codexRefused10m: 4",
+            "codexUnpooled10m: 1",
+            "codexProblem: codex needs a login of its own to start, even when pooled: run `codex \
+             login` once",
+            "codexProblem: the proxy on :<port> is running without MITM: its TLS material failed \
+             to load at boot — see its log",
+            "codexVerdict: codex is not pooled: the proxy on :<port> is running without MITM: \
+             its TLS material failed to load at boot — see its log",
+            "verdict: Claude is routed to http://127.0.0.1:<port> (ANTHROPIC_BASE_URL); this \
+             proxy has served 3 Claude requests",
+        ],
+        "{text}"
+    );
+}
+
+/// With no Claude account the Codex verdict is THE verdict: keyed `verdict:`, last, and its
+/// code is the exit code, whatever Claude's route would have said.
+#[test]
+fn a_codex_only_doctor_ends_with_the_codex_verdict() {
+    // Not pooled: Claude's own route is fine (it would exit 0); codex's is not.
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_status(payload(
+        vec![status_row("bob@example.com/codex", true)],
+        Vec::new(),
+        "none",
+        &[],
+    ));
+    let config = write_config_with(home.path(), port, ALICE)
+        .display()
+        .to_string();
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&format!("http://127.0.0.1:{port}")),
+        &["doctor", "--config", &config],
+    );
+    assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let text = normalize(&stdout, home.path(), port);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("baseUrl: "), "{text}");
+    assert_eq!(
+        lines.last().copied(),
+        Some(
+            "verdict: codex is not pooled: the proxy on :<port> is running without MITM: its \
+             TLS material failed to load at boot — see its log"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("verdict:"))
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("codexVerdict:")),
+        "{text}"
+    );
+
+    // Pooled: Claude's own route is elsewhere (it would exit 2); codex is pooled.
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_status(payload(
+        vec![status_row("bob@example.com/codex", true)],
+        vec![session_row("22222222-2222-2222-2222-222222222222", 2, true)],
+        "minted",
+        &["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+    ));
+    let config = write_config_with(home.path(), port, ALICE)
+        .display()
+        .to_string();
+    std::fs::write(home.path().join(".config").join("tcr-ca.pem"), "any bytes")
+        .expect("write a CA file; only its presence is read");
+    let (code, stdout, stderr) = run_tcr_codex(home.path(), None, &["doctor", "--config", &config]);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let text = normalize(&stdout, home.path(), port);
+    assert!(text.contains("\ncodexIntercept: yes\n"), "{text}");
+    assert!(
+        text.contains("\ncodexCa: <home>/.config/tcr-ca.pem (readable)\n"),
+        "{text}"
+    );
+    assert_eq!(
+        text.lines().last(),
+        Some(
+            "verdict: codex is pooled: `tcr run --codex` routes chatgpt.com through this proxy, \
+             which served 2 Codex requests in the last 10 min"
+        ),
+        "{text}"
+    );
+}
+
+/// `--codex` asks only whether codex is pooled: the Codex block and its verdict, keyed
+/// `verdict:`, and Codex's exit code, even for a fleet with no Codex account and a Claude route
+/// that is fine.
+#[test]
+fn doctor_codex_prints_only_the_codex_block_and_exits_with_its_code() {
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_status(payload(
+        vec![status_row("alice@example.com", false)],
+        Vec::new(),
+        "minted",
+        &["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+    ));
+    let config = write_config_with(home.path(), port, ALICE)
+        .display()
+        .to_string();
+    std::fs::write(home.path().join(".config").join("tcr-ca.pem"), "any bytes")
+        .expect("write a CA file; only its presence is read");
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&format!("http://127.0.0.1:{port}")),
+        &["doctor", "--codex", "--config", &config],
+    );
+    assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let text = normalize(&stdout, home.path(), port);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "codexAccounts: 0", "{text}");
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("baseUrl:") || line.starts_with("codexVerdict:")),
+        "{text}"
+    );
+    assert_eq!(
+        lines.last().copied(),
+        Some(
+            "verdict: codex is not pooled: the proxy on :<port> holds no Codex account, so it \
+             blind-tunnels chatgpt.com and codex keeps its own login — add one with `tcr login \
+             --codex`"
+        ),
+        "{text}"
+    );
+
+    let offline = free_port_other_than(port);
+    let config = write_config_with(home.path(), offline, ALICE)
+        .display()
+        .to_string();
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&format!("http://127.0.0.1:{offline}")),
+        &["doctor", "--codex", "--config", &config],
+    );
+    assert_eq!(code, Some(3), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let text = normalize(&stdout, home.path(), offline);
+    assert!(text.contains("\ncodexIntercept: unknown\n"), "{text}");
+    assert_eq!(
+        text.lines().last(),
+        Some("verdict: codex is not pooled: no proxy answered on 127.0.0.1:<port>"),
+        "{text}"
+    );
+}
+
+/// `--json` carries the Codex block as one `codex` object, and only when the text prints the
+/// block: a Claude-only fleet's document is the one it always was. A mixed fleet keeps
+/// Claude's `verdict` and `exitCode` at the top; `--codex --json` is the `codex` object alone.
+#[test]
+fn doctor_json_carries_a_codex_object_only_with_the_block() {
+    // (a) A Claude-only fleet.
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_status(payload(
+        vec![status_row("alice@example.com", false)],
+        Vec::new(),
+        "minted",
+        &["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+    ));
+    let config = write_config_with(home.path(), port, ALICE)
+        .display()
+        .to_string();
+    let routed = format!("http://127.0.0.1:{port}");
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&routed),
+        &["doctor", "--json", "--config", &config],
+    );
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    assert!(document.get("codex").is_none(), "{document}");
+
+    // (b) The mixed fleet.
+    let home = tempfile::tempdir().expect("temp home");
+    let port = serve_status(mixed_payload());
+    let config = write_config_with(home.path(), port, ALICE)
+        .display()
+        .to_string();
+    let routed = format!("http://127.0.0.1:{port}");
+    let (_, text, _) = run_tcr_codex(home.path(), Some(&routed), &["doctor", "--config", &config]);
+    let text = normalize(&text, home.path(), port);
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&routed),
+        &["doctor", "--json", "--config", &config],
+    );
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    assert_eq!(document["exitCode"], 0);
+    let verdict = normalize(
+        document["verdict"].as_str().expect("a verdict"),
+        home.path(),
+        port,
+    );
+    assert_eq!(
+        Some(verdict.as_str()),
+        text.lines().last(),
+        "the JSON verdict is the text's last line"
+    );
+    assert_eq!(
+        verdict,
+        "verdict: Claude is routed to http://127.0.0.1:<port> (ANTHROPIC_BASE_URL); this proxy \
+         has served 3 Claude requests"
+    );
+    let codex = document["codex"].as_object().expect("a codex object");
+    let mut keys: Vec<&str> = codex.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut expected = vec![
+        "accounts",
+        "intercept",
+        "route",
+        "ca",
+        "upstream",
+        "bin",
+        "env",
+        "login",
+        "requests10m",
+        "refused10m",
+        "unpooled10m",
+        "problems",
+        "verdict",
+        "exitCode",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
+    assert_eq!(codex["exitCode"], 2);
+    assert_eq!(codex["intercept"], "no");
+    assert_eq!(codex["route"]["code"], "mitm-off");
+    assert_eq!(
+        codex["accounts"],
+        serde_json::json!({"total": 1, "byGate": {"ok": 1}})
+    );
+    assert_eq!(codex["env"]["pointsAtTcr"], false);
+    let verdict = codex["verdict"].as_str().expect("a verdict");
+    assert!(
+        verdict.starts_with("codex is not pooled: ") && !verdict.starts_with("verdict: "),
+        "{verdict}"
+    );
+
+    // (c) `--codex --json` on the same proxy.
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&routed),
+        &["doctor", "--codex", "--json", "--config", &config],
+    );
+    assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    assert!(document.get("intercept").is_some(), "{document}");
+    assert!(document.get("baseUrl").is_none(), "{document}");
+    assert_eq!(document["exitCode"], 2);
+}
+
+/// A misspelled config key is named beside the Codex block, as it is in a Claude-only fleet:
+/// after `requests10m:` and before `codexAccounts:`, and in `unknownKeys`. `--codex` names it
+/// too, right before its verdict, since a misspelled `codexUpstream` is a Codex reader's
+/// problem. Offline, where the upstream comes from the config, the misspelled key visibly sets
+/// nothing.
+#[test]
+fn an_unknown_config_key_is_named_beside_the_codex_block() {
+    const LINE: &str = "unknownKey: codexUpstrem (did you mean codexUpstream?)";
+    let keys = serde_json::json!([{"key": "codexUpstrem", "nearest": "codexUpstream"}]);
+    let home = tempfile::tempdir().expect("temp home");
+    let write = |port: u16| {
+        let dir = home.path().join(".config");
+        std::fs::create_dir_all(&dir).expect("create the config directory");
+        let path = dir.join("teamclaude.json");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"accounts\": [{ALICE}], \"proxy\": {{\"port\": {port}}}, \
+                 \"codexUpstrem\": \"http://127.0.0.1:9\"}}"
+            ),
+        )
+        .expect("write the config");
+        path.display().to_string()
+    };
+    let port = serve_status(payload(
+        vec![
+            status_row("alice@example.com", false),
+            status_row("bob@example.com/codex", true),
+        ],
+        Vec::new(),
+        "none",
+        &[],
+    ));
+    let config = write(port);
+    let routed = format!("http://127.0.0.1:{port}");
+
+    let (code, stdout, stderr) =
+        run_tcr_codex(home.path(), Some(&routed), &["doctor", "--config", &config]);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    let at = |prefix: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no line starts {prefix:?}:\n{stdout}"))
+    };
+    assert_eq!(
+        lines.iter().filter(|line| **line == LINE).count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        at("requests10m: ") < at(LINE) && at(LINE) < at("codexAccounts: "),
+        "{stdout}"
+    );
+    // The upstream is the proxy's, which names none: the misspelled key cannot show here.
+    assert!(
+        lines.contains(&"codexUpstream: https://chatgpt.com (default)"),
+        "{stdout}"
+    );
+
+    let (_, stdout, _) = run_tcr_codex(
+        home.path(),
+        Some(&routed),
+        &["doctor", "--json", "--config", &config],
+    );
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    assert_eq!(document["unknownKeys"], keys);
+    assert!(document["codex"].is_object(), "{document}");
+
+    let (_, stdout, _) = run_tcr_codex(
+        home.path(),
+        Some(&routed),
+        &["doctor", "--codex", "--config", &config],
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[lines.len() - 2], LINE, "{stdout}");
+    assert!(lines[lines.len() - 1].starts_with("verdict: "), "{stdout}");
+    let (_, stdout, _) = run_tcr_codex(
+        home.path(),
+        Some(&routed),
+        &["doctor", "--codex", "--json", "--config", &config],
+    );
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    assert_eq!(document["unknownKeys"], keys);
+
+    // Offline the upstream is the config's, and the misspelled key set nothing; honoured, it
+    // would read `http://127.0.0.1:9 (set by codexUpstream)`.
+    let offline = free_port_other_than(port);
+    let config = write(offline);
+    let (code, stdout, stderr) = run_tcr_codex(
+        home.path(),
+        Some(&format!("http://127.0.0.1:{offline}")),
+        &["doctor", "--codex", "--config", &config],
+    );
+    assert_eq!(code, Some(3), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "codexUpstream: https://chatgpt.com (default)"),
+        "{stdout}"
+    );
+}

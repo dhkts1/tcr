@@ -388,8 +388,14 @@ fn sans_match(sidecar: &[String], required: &[&str]) -> bool {
 /// `.key` if present and loadable (the primary path — a cert Gil's clients
 /// already trust), else reuse the chain we minted on an earlier run, else mint a
 /// fresh CA+leaf with rcgen and persist it.
-pub fn load_tls() -> anyhow::Result<TlsAssets> {
-    load_tls_in(&config_dir())
+///
+/// `holds_codex` is whether the config holds a Codex account. It changes only
+/// what a load says: once one is configured, the fresh-CA hint and the re-mint
+/// line name `CODEX_CA_CERTIFICATE` beside `NODE_EXTRA_CA_CERTS`
+/// ([`ca_export_hint`], [`remint_note`]), because codex reads its extra CA from
+/// that variable alone. Without one, both read as they always did.
+pub fn load_tls(holds_codex: bool) -> anyhow::Result<TlsAssets> {
+    load_tls_in_with(&config_dir(), holds_codex)
 }
 
 /// [`load_tls`] against an explicit config dir: for tests, the integration tests that run the
@@ -432,6 +438,12 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
 /// - **C: mint fresh.** `covered_hosts` is `FALLBACK_LEAF_SANS`, known by
 ///   construction.
 pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
+    load_tls_in_with(dir, false)
+}
+
+/// [`load_tls_in`], with [`load_tls`]'s `holds_codex` threaded to the two notices a load can
+/// print: the re-mint line and the fresh-CA hint.
+fn load_tls_in_with(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAssets> {
     ensure_crypto_provider();
     let leaf_cert = dir.join("teamclaude-leaf.pem");
     let leaf_key = dir.join("teamclaude-leaf.key");
@@ -503,12 +515,12 @@ pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
             );
         }
 
-        if let Some(assets) = remint_leaf_under_persisted_ca(&minted) {
+        if let Some(assets) = remint_leaf_under_persisted_ca(&minted, holds_codex) {
             return Ok(assets);
         }
     }
 
-    generate_and_persist(dir)
+    generate_and_persist(dir, holds_codex)
 }
 
 /// Branch D: sign a fresh leaf under the CA key already persisted beside
@@ -518,8 +530,8 @@ pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
 /// [`generate_and_persist`], which mints a brand-new CA. That fallback is the
 /// one unavoidable CA rotation described on [`MintedPaths::ca_key`]; after it,
 /// this branch is what keeps every later SAN change from rotating the CA
-/// again.
-fn remint_leaf_under_persisted_ca(minted: &MintedPaths) -> Option<TlsAssets> {
+/// again. `holds_codex` words its log line ([`remint_note`]).
+fn remint_leaf_under_persisted_ca(minted: &MintedPaths, holds_codex: bool) -> Option<TlsAssets> {
     if !(minted.ca.is_file() && minted.ca_key.is_file()) {
         return None;
     }
@@ -539,7 +551,8 @@ fn remint_leaf_under_persisted_ca(minted: &MintedPaths) -> Option<TlsAssets> {
         tracing::info!(
             cert = %minted.leaf_cert.display(),
             hosts = ?covered_hosts,
-            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+            "{}",
+            remint_note(holds_codex)
         );
         Ok(TlsAssets {
             acceptor,
@@ -588,14 +601,15 @@ fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'sta
 /// persist them to `~/.config/tcr-{ca,leaf}.pem` + `tcr-ca.key` + `tcr-leaf.key`
 /// (both keys `0600`) plus the `tcr-leaf.sans` coverage sidecar, and hand back
 /// an acceptor over the fresh leaf. The CA path is advertised so the user can
-/// `export NODE_EXTRA_CA_CERTS=<ca>`.
+/// `export NODE_EXTRA_CA_CERTS=<ca>`, and `CODEX_CA_CERTIFICATE=<ca>` too once
+/// the config holds a Codex account (`holds_codex`, [`ca_export_hint`]).
 ///
 /// Only ever mints a NEW CA — reusing an existing one is
 /// [`remint_leaf_under_persisted_ca`]'s job, tried first by [`load_tls_in`].
 /// This is the path that used to re-mint (and thus rotate) the CA on every
 /// SAN change; persisting `tcr-ca.key` here is what makes that a one-time
 /// cost instead of a recurring one.
-fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
+fn generate_and_persist(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAssets> {
     let ca = generate_ca()?;
     let ca_cert_pem = ca
         .cert_pem
@@ -614,10 +628,7 @@ fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
     let acceptor = build_acceptor(&minted.leaf_cert, &minted.leaf_key)?;
     let covered_hosts = fallback_hosts_vec();
     set_covered_hosts(&covered_hosts);
-    eprintln!(
-        "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}",
-        minted.ca.display()
-    );
+    eprintln!("{}", ca_export_hint(&minted.ca, holds_codex));
     tracing::info!(hosts = ?covered_hosts, "MITM: minted a fresh CA + leaf");
     Ok(TlsAssets {
         acceptor,
@@ -625,6 +636,45 @@ fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
         covered_hosts,
         leaf: LeafSource::Minted,
     })
+}
+
+/// What tcr prints when it mints a fresh CA: the export that makes a client trust it.
+/// `NODE_EXTRA_CA_CERTS` is the variable claude (node) reads; once the config holds a Codex
+/// account (`holds_codex`) the line also names `CODEX_CA_CERTIFICATE`, the one codex reads
+/// (`openai/codex` f82e365, `http-client/src/custom_ca.rs:385-409`), so a codex reaching this
+/// proxy some other way than `tcr run --codex` can trust the leaf too.
+pub fn ca_export_hint(ca: &Path, holds_codex: bool) -> String {
+    let codex = if holds_codex {
+        format!(" CODEX_CA_CERTIFICATE={}", ca.display())
+    } else {
+        String::new()
+    };
+    format!(
+        "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}{codex}",
+        ca.display()
+    )
+}
+
+/// The log line for a leaf re-minted under the persisted CA, which keeps every exported CA
+/// variable valid: `NODE_EXTRA_CA_CERTS`, and `CODEX_CA_CERTIFICATE` once the config holds a
+/// Codex account.
+fn remint_note(holds_codex: bool) -> &'static str {
+    if holds_codex {
+        "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS and \
+         CODEX_CA_CERTIFICATE stay valid"
+    } else {
+        "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+    }
+}
+
+/// The server's boot log line naming how a client trusts the CA it loaded:
+/// `NODE_EXTRA_CA_CERTS`, and `CODEX_CA_CERTIFICATE` once the config holds a Codex account.
+pub fn advertise_note(holds_codex: bool) -> &'static str {
+    if holds_codex {
+        "MITM: advertise this CA via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE"
+    } else {
+        "MITM: advertise this CA via NODE_EXTRA_CA_CERTS"
+    }
 }
 
 /// A CA's private key, PEM-encoded, plus its cert PEM when we happen to have
@@ -1821,5 +1871,41 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    }
+
+    /// The CA notices name `CODEX_CA_CERTIFICATE` beside `NODE_EXTRA_CA_CERTS` once the config
+    /// holds a Codex account, since codex reads its extra CA from that variable alone. Without one
+    /// each reads as it always did.
+    #[test]
+    fn the_ca_export_hint_names_both_variables_with_a_codex_account() {
+        let ca = Path::new("/Users/example/.config/tcr-ca.pem");
+        assert_eq!(
+            ca_export_hint(ca, false),
+            "[tcr] minted a fresh MITM CA — trust it with:\n         \
+             export NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem"
+        );
+        assert_eq!(
+            ca_export_hint(ca, true),
+            "[tcr] minted a fresh MITM CA — trust it with:\n         \
+             export NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem \
+             CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem"
+        );
+        assert_eq!(
+            remint_note(false),
+            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+        );
+        assert_eq!(
+            remint_note(true),
+            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS and \
+             CODEX_CA_CERTIFICATE stay valid"
+        );
+        assert_eq!(
+            advertise_note(false),
+            "MITM: advertise this CA via NODE_EXTRA_CA_CERTS"
+        );
+        assert_eq!(
+            advertise_note(true),
+            "MITM: advertise this CA via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE"
+        );
     }
 }

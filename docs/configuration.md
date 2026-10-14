@@ -373,10 +373,11 @@ Consequences worth knowing before you tune either number:
 - A single account's gap between probes is never the number you configured; it is a fresh
   draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
 - An account at or over its switch threshold, or one upstream answered `rejected`, is probed
-  around HALF the cadence (`105..=195s` at the default). It is out of rotation, so no served
-  response refreshes its quota and only a probe sees its window roll. An account serving
-  traffic is not probed any faster: every response's headers already rewrite the same
-  windows a probe reads.
+  around HALF the cadence (`105..=195s` at the default). So is a Codex account ChatGPT refused
+  (its row carries `limitReachedType`), whatever gate its row shows, except `disabled` and
+  `login`, which outrank the refusal. It is out of rotation, so no served response refreshes
+  its quota and only a probe sees its window roll. An account serving traffic is not probed any
+  faster: every response's headers already rewrite the same windows a probe reads.
 - No account is probed more than 20 times in any trailing 60 minutes, whatever the cadence.
   The usage endpoint's budget was measured by claude-swap at about 28 to 30 requests per
   identity in a trailing hour, not a refilling bucket. A `quotaProbeSeconds` under 180 is
@@ -454,6 +455,9 @@ which is exactly why it defaults to `0` while the probe defaults to `300`. The d
 says it outright: it "spends real quota, so it ships dark and is only ever running when
 explicitly enabled". Set it only when you have measured that a cold prefix costs you more
 than the warming requests do.
+
+It never warms a Codex account: a warm is an Anthropic request, so only Claude accounts are kept
+warm, whatever the fleet holds.
 
 ## `lockAccount`: read this before setting it
 
@@ -729,12 +733,12 @@ session's shell environment anyway.
 | `CODEX_BIN` | absent | same, as a fallback when `TCR_CODEX_BIN` is unset |
 
 With neither of a pair set, `claude` is resolved from `PATH`. `codex` is found by one search
-that serves `tcr run --codex` and `tcr login --codex` alike: `PATH`, then `~/.local/bin`,
-`~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, then the `bin` of npm's global prefix,
-which is `NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global` (tcr never runs
-npm). **An empty value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does
-not silently win over a real `CLAUDE_BIN`, and two empty values fall all the way through to
-the default. A set `codex` key always decides and never falls through: a value with a `/` must be
+that serves `tcr run --codex`, `tcr login --codex` and `tcr doctor` alike: `PATH`, then
+`~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, then the `bin` of npm's
+global prefix, which is `NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global` (tcr
+never runs npm). **An empty value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by
+a shell does not silently win over a real `CLAUDE_BIN`, and two empty values fall all the way
+through to the default. A set `codex` key always decides and never falls through: a value with a `/` must be
 an executable file, a bare name must be one on `PATH`, and either failing is an error that names
 the key, rather than whatever other `codex` the search would have found.
 
@@ -852,7 +856,7 @@ replacing the ones already granted:
 | json key | type | what it does |
 |---|---|---|
 | `id` | string (32 hex chars) | the wire lease id this grant mints leases under, the handle `--revoke`/`--relend` take. `0` is a grant written before ids existed; the next save mints one |
-| `scope` | `"all"` \| `{"group": "<name>"}` \| `{"accounts": ["<label>", ...]}` | what this grant lends FROM. Defaults to `"all"`, which is what every grant written before scopes existed already meant. Never crosses the wire |
+| `scope` | `"all"` \| `{"group": "<name>"}` \| `{"accounts": ["<label>", ...]}` | what this grant lends FROM. Defaults to `"all"`, which is what every grant written before scopes existed already meant. Never crosses the wire. A Codex account is never lent, whatever the scope names: `all` and a group draw on Claude accounts only, and `tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex account |
 | `window` | `5h` \| `7d` \| `7d_oi` | which rate-limit window this grant draws from |
 | `fraction` | float | ceiling on any one lease, as a fraction of the SCOPE's headroom. Clamped to `0.0..=0.5`, mirroring the clamp the main config applies to its own reserve |
 | `ttlS` | int | how long a granted lease lives, in seconds, before it needs renewing |
