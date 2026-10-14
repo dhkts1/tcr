@@ -93,9 +93,11 @@ pub enum GateReason {
     Standard,
     /// A dead credential (`AccountStatus::Error`) — needs a re-login, never self-frees.
     Login,
-    /// Anthropic answered `anthropic-ratelimit-unified-status: rejected` for this
-    /// account. Unlike a window it carries no reset to wait on, so it never
-    /// self-frees. Long held out of rotation by
+    /// The provider itself refused this account. On an Anthropic account that is
+    /// an `anthropic-ratelimit-unified-status: rejected` header; on a Codex account
+    /// it is a 429 that carried `x-codex-rate-limit-reached-type`
+    /// ([`crate::quota::is_codex_quota_refusal`]). Unlike a window it carries no
+    /// reset to wait on, so it never self-frees. Long held out of rotation by
     /// [`crate::manager::Manager::account_hard_ok`], it had no reason of its own
     /// here and so rendered as [`GateReason::Ok`].
     Rejected,
@@ -254,6 +256,45 @@ pub struct AccountSnapshot {
     /// honest-null discipline `cacheHitRatio` follows: an unmeasured zero read
     /// as a measurement is how a real prompt-cache catastrophe went unseen.
     pub usage: Option<tcr_status_wire::UsageRow>,
+    /// What this account reports as a Codex account, and an Anthropic one never
+    /// does — see [`CodexFacts`]. `CodexFacts::default()`, nothing reported, on
+    /// every Anthropic account.
+    pub codex: CodexFacts,
+}
+
+/// What a Codex account reports and an Anthropic one never does: which quota
+/// windows its plan has and how long they are, why ChatGPT refused it, its
+/// credits and spend control, why its login is dead, and the folder its login
+/// was imported from.
+///
+/// Grouped in one struct so an Anthropic row is the one line
+/// `codex: CodexFacts::default()`, instead of eight fields every Anthropic
+/// literal must spell out.
+///
+/// `None` and `false` mean "not reported", never "reported absent". The one
+/// value that is a fact rather than a gap is `quota_windows: Some(vec![])`: a
+/// plan that reported no usage window at all, which is not the same as one
+/// whose windows are unknown (`None`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexFacts {
+    /// The usage windows the plan reported, from `"fiveHour"` and `"sevenDay"`,
+    /// in that order. `None`: unknown. `Some(vec![])`: the plan reported none.
+    pub quota_windows: Option<Vec<String>>,
+    /// The length, in minutes, the five-hour slot's window reported.
+    pub five_hour_window_minutes: Option<u32>,
+    /// The length, in minutes, the weekly slot's window reported.
+    pub seven_day_window_minutes: Option<u32>,
+    /// Why ChatGPT refused the account, verbatim (`rate_limit_reached`, or a
+    /// credits or spend-cap kind), present exactly while the refusal stands.
+    pub limit_reached_type: Option<String>,
+    /// Whether the account's spend control is reached.
+    pub spend_control_reached: bool,
+    /// The account's credits, once reported.
+    pub credits: Option<tcr_status_wire::CodexCredits>,
+    /// Why the account's login is known dead (`refresh_token_reused`, …).
+    pub login_error: Option<String>,
+    /// The absolute path of the folder the account's login was imported from.
+    pub codex_home: Option<String>,
 }
 
 impl AccountSnapshot {

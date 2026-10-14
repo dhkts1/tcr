@@ -718,6 +718,9 @@ mod tests {
             req_per_minute,
             cost_usd: 0.0,
             cache_ttl_secs: None,
+            provider: None,
+            unpriced_requests: 0,
+            reasoning_tokens: 0,
         }
     }
 
@@ -734,6 +737,8 @@ mod tests {
             peers: Vec::new(),
             peers_error: None,
             mitm: None,
+            codex_traffic: None,
+            codex_upstream: None,
         }
     }
 

@@ -74,14 +74,26 @@ pub struct UsageTotals {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub unpriced_requests: u64,
+    /// The reasoning tokens this bucket's requests reported: a Codex response's
+    /// `output_tokens_details.reasoning_tokens`. tcr reads them from Codex responses only,
+    /// so a Claude bucket stays at zero and the key is skipped there: every Anthropic row
+    /// stays the bytes it was before the key existed. Absent decodes as `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
+}
+
+/// `skip_serializing_if` for a counter that is written only once it counts something.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// [`UsageTotals`] for a bounded window, plus the instant the window opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
-    /// Unix milliseconds: the start of this account's current 5-hour window
-    /// (`fiveHourResetAtMs - 5h`), as read from Anthropic's own headers.
+    /// Unix milliseconds: the instant this window opened. For [`UsageRow::window`] that is
+    /// the account's current 5-hour window, `fiveHourResetAtMs` minus 5h; for
+    /// [`UsageRow::seven_day_window`] it is the weekly reset minus the window's length.
     pub since: i64,
     #[serde(flatten)]
     pub totals: UsageTotals,
@@ -109,6 +121,12 @@ pub struct UsageRow {
     /// `today`, split by model id.
     #[serde(default)]
     pub today_by_model: BTreeMap<String, UsageTotals>,
+    /// This account's weekly window, opened at the weekly reset minus the window's
+    /// length. Absent when the weekly reset is not known, so the window's start cannot
+    /// be named — the same reason [`Self::window`] is absent — and on every row from a
+    /// server that predates the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_window: Option<UsageWindow>,
 }
 
 /// A gating window (`5h` or `7d`) currently holding an account out of rotation.
@@ -119,6 +137,61 @@ pub struct HeldWindowRow {
     pub window: String,
     pub reset_at_ms: i64,
     pub minutes_until_reset: i64,
+}
+
+/// A Codex account's credits, as ChatGPT reported them on a response or a usage probe.
+///
+/// Optional on the row ([`AccountStatusRow::credits`]) because a Codex row carries it only
+/// once credits were reported, and an Anthropic row never does: absent means "never
+/// reported", not "no credits". `balance` is the provider's own string, verbatim
+/// (`"12.50"`), and is itself absent when the report carried no balance.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCredits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+}
+
+/// Whether `tcr run --codex` would pool a codex session through this proxy, and if not,
+/// why: a machine `code` and the sentence the launch itself prints as `reason`.
+///
+/// A fleet-wide fact the CLI computes, never the server, and repeats on every Codex row
+/// ([`AccountStatusRow::codex_route`]) as `serverSha` is repeated. Optional because a row
+/// from a CLI that predates it carries none, and an Anthropic row never does. `pooled:
+/// true` carries no `code` and no `reason`; `upstream` is present only when the server's
+/// Codex upstream is not the default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRoute {
+    pub pooled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+}
+
+/// What tcr did with Codex requests in the last ten minutes: how many it refused itself,
+/// the latest refusal's error `type` and when, and how many it relayed on the client's
+/// own credential instead of a pooled one.
+///
+/// Fleet-wide, counted by the serving process and repeated on every Codex row
+/// ([`AccountStatusRow::codex_traffic`]). Optional because a server or a CLI that predates
+/// it reports none, and an Anthropic row never carries it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTraffic {
+    #[serde(rename = "refused10m")]
+    pub refused_10m: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refusal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refusal_at_ms: Option<i64>,
+    #[serde(rename = "unpooled10m")]
+    pub unpooled_10m: u64,
 }
 
 /// One tool call still awaiting its `tool_result`, on the wire.
@@ -142,6 +215,13 @@ pub struct RunningToolRow {
     /// `CommandClass` in the main crate for the classifier itself.
     #[serde(default)]
     pub command_class: Option<String>,
+    /// The timeout the call carried, in seconds. `None` when it carried none, and the key
+    /// is then skipped, so a Claude session's bytes are unchanged. No Claude call carries
+    /// one, and neither does a Codex call through codex's default, interactive
+    /// `exec_command`, which has no timeout argument. Only codex's one-shot `exec_command`,
+    /// which managed requirements select, carries `timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// One completed tool call, for a session's "ten slowest" list.
@@ -312,6 +392,23 @@ pub struct SessionRow {
     /// as `None`; the key is omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl_secs: Option<u32>,
+    /// `"codex"` for a Codex session. Absent means Anthropic, which is also how a server
+    /// that predates the key reads every session, so a Claude session's bytes are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// How many of [`Self::requests`] could not be priced, because no rate is known for
+    /// the model. [`Self::cost_usd`] keeps its meaning — such a request adds `0.0` to it —
+    /// so a count here says the figure is a floor. Skipped at zero: every request priced,
+    /// or a server that does not count them, so an absent key never proves the figure
+    /// complete.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unpriced_requests: u64,
+    /// The reasoning tokens this session's responses reported, a Codex response's
+    /// `output_tokens_details.reasoning_tokens`. Skipped at zero, which is every Claude
+    /// session.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
 }
 
 /// One account's row on the `tcr status --json` wire.
@@ -343,6 +440,11 @@ pub struct AccountStatusRow {
     /// `"five-hour"`, `"seven-day"`, `"fable-weekly"`, `"standard"`, `"login"`,
     /// `"rejected"`, `"disabled"`, `"reserved"`, or `"parked"`. `"refused"` is the
     /// short hold an upstream 403 arms; it self-frees like `"hold"`.
+    ///
+    /// `"rejected"` is the provider's own refusal, which means a different signal per
+    /// provider: on an Anthropic row, Anthropic's `anthropic-ratelimit-unified-status:
+    /// rejected` header; on a Codex row, a 429 that carried
+    /// `x-codex-rate-limit-reached-type`.
     pub gate: String,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
@@ -419,6 +521,53 @@ pub struct AccountStatusRow {
     /// (every TcrBar build before this change) decodes the row exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    // The ten keys below are the facts a Codex account reports and an Anthropic one never
+    // does. Each is optional and skipped when it holds nothing, so an Anthropic row
+    // serializes exactly as it did before they existed, and a row from an older server
+    // decodes with every one unknown.
+    /// Which usage windows the plan reported, from `"fiveHour"` and `"sevenDay"`, in that
+    /// order. Absent: unknown, so a panel draws both rows. `[]`: the plan reported no
+    /// window at all, which is a fact, not a gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_windows: Option<Vec<String>>,
+    /// The length, in minutes, the 5-hour slot's window reported. Absent when no length
+    /// was reported; the label is then `5h`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_window_minutes: Option<u32>,
+    /// The length, in minutes, the weekly slot's window reported. Absent when no length
+    /// was reported; the label is then `7d`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_window_minutes: Option<u32>,
+    /// Why ChatGPT refused this account, verbatim: `rate_limit_reached`, or a credits or
+    /// spend-cap kind. Present exactly while a quota refusal stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_reached_type: Option<String>,
+    /// Whether the account's spend control is reached. Skipped when `false`, and the
+    /// `default` is load-bearing on a non-`Option` field: without it, a row from a server
+    /// that predates the key fails to decode at all (see the main crate's
+    /// `status::AccountStatus::stream_error_count`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spend_control_reached: bool,
+    /// The account's credits, once reported. Absent when never reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<CodexCredits>,
+    /// Why this account's login is known dead: `refresh_token_reused`,
+    /// `refresh_token_expired`, `refresh_token_invalidated`, `invalid_grant`, `http_401`,
+    /// or another raw code. Absent when the login is not known dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_error: Option<String>,
+    /// The absolute path of the folder this account's login was imported from. Absent for
+    /// a login of tcr's own, and for one imported before the key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+    /// Whether `tcr run --codex` would pool codex, the same on every Codex row. Filled by
+    /// the CLI, never by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_route: Option<CodexRoute>,
+    /// The last ten minutes of Codex refusals and unpooled requests, the same on every
+    /// Codex row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_traffic: Option<CodexTraffic>,
     /// The organization's plan as the profile endpoint reported it, VERBATIM
     /// (`claude_max`, `claude_team`, `claude_pro`, `claude_enterprise`) — for a
     /// script that wants the provider's own word rather than our label. `None`

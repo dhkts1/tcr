@@ -306,6 +306,7 @@ impl Totals {
             output_tokens: self.output,
             cost_usd,
             unpriced_requests: self.unpriced_requests,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -1285,6 +1286,7 @@ impl UsageTracker {
             window,
             last_hour: range(account, now_ms - ONE_HOUR_MS, now_ms).to_wire(),
             today_by_model,
+            seven_day_window: None,
         }
     }
 }
@@ -1635,6 +1637,41 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger line carrying a key this build does not read parses through the one real
+    /// parse path, and the keys it does read survive.
+    ///
+    /// The ledger outlives the binary that wrote it: a newer tcr writes keys an older one
+    /// has never heard of, and the older one replays the same files after a downgrade.
+    /// That works only while `LedgerLine` skips what it does not know, and this is what
+    /// fails the day it starts rejecting unknown keys. `r` is not the unknown key here: it
+    /// is the cache-read count every line already carries.
+    #[test]
+    fn ledger_line_parses_with_an_unknown_key() {
+        let dir = scratch("ledger-unknown-key");
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let path = dir.join("2026-01-01.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"t":1767225600000,"a":"bob@example.com/codex","m":"gpt-5.1-codex","i":1,"c5":0,"c1":0,"r":0,"o":2,"p":"codex","addedLater":{"n":1}}"#,
+                "\n"
+            ),
+        )
+        .expect("write the ledger line");
+
+        let (lines, malformed) = parse_ledger_file(&path);
+        assert_eq!(
+            malformed, 0,
+            "an unknown key does not make a line malformed"
+        );
+        assert_eq!(lines.len(), 1, "the line is read, not skipped");
+        assert_eq!(lines[0].a, "bob@example.com/codex");
+        assert_eq!(lines[0].m.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(lines[0].o, 2);
+
+        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
     }
 
     /// A ledger line naming an account this config no longer has is dropped,

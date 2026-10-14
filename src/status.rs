@@ -43,7 +43,7 @@ pub mod network_fact;
 
 use crate::build_info::BuildInfo;
 use crate::probe::ProbeStatus;
-use crate::stats::{AccountSnapshot, GateReason, QuotaState, StatsSnapshot};
+use crate::stats::{AccountSnapshot, CodexFacts, GateReason, QuotaState, StatsSnapshot};
 
 /// Discriminator carried by every status response, checked by the client before
 /// it trusts a body.
@@ -233,6 +233,29 @@ pub struct StatusPayload {
     /// server reports no interception").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mitm: Option<MitmStatus>,
+    /// What the serving process did with Codex requests in the last ten minutes:
+    /// the 429s it sent itself, the latest one's error `type` and when, and the
+    /// requests it relayed on the client's own credential. A fleet-wide fact the
+    /// CLI copies onto every Codex row of `tcr status --json`. `from_snapshot`
+    /// leaves it `None` and the serving process fills it, as with [`Self::mitm`].
+    ///
+    /// `#[serde(default, skip_serializing_if)]` and, per this struct's `build`
+    /// doc-comment on when a bump is and is not warranted, NOT a
+    /// [`STATUS_KIND`] bump: an OLD client skips the unknown key, and a NEW
+    /// client reading an OLD server reads `None`, which is the truth ("that
+    /// server predates it").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_traffic: Option<tcr_status_wire::CodexTraffic>,
+    /// Where the serving process sends a Codex account's requests, the boot
+    /// snapshot of `codexUpstream`, sent only when it is not the default
+    /// (`https://chatgpt.com`). `None` is the default, or an OLD server that
+    /// predates the key; either way the CLI names no other upstream.
+    ///
+    /// `#[serde(default, skip_serializing_if)]` and, like [`Self::mitm`], NOT a
+    /// [`STATUS_KIND`] bump: an OLD client skips the unknown key, and a NEW
+    /// client reading an OLD server reads `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_upstream: Option<String>,
 }
 
 /// What a running proxy's MITM listener can intercept, by its policy and loaded
@@ -474,6 +497,40 @@ pub struct AccountStatus {
     /// key off the wire entirely rather than emitting `"usage": null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<tcr_status_wire::UsageRow>,
+    // The eight facts below are `AccountSnapshot::codex`, flattened onto this row
+    // under the names `tcr status --json` gives them, with the same attributes as
+    // on `tcr_status_wire::AccountStatusRow`. Each is skipped when it holds
+    // nothing, which is always on an Anthropic account, so an Anthropic-only
+    // fleet's payload is the bytes it was before they existed, and a payload from
+    // an OLD server reads every one as "not reported". Neither skew direction is
+    // MISREAD, so, per `StatusPayload::build`'s doc-comment, none bumps
+    // `STATUS_KIND`. See `CodexFacts` for what each one means.
+    /// [`CodexFacts::quota_windows`]: `Some(vec![])` is a plan that reported no
+    /// window, and stays apart from `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_windows: Option<Vec<String>>,
+    /// [`CodexFacts::five_hour_window_minutes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_window_minutes: Option<u32>,
+    /// [`CodexFacts::seven_day_window_minutes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_window_minutes: Option<u32>,
+    /// [`CodexFacts::limit_reached_type`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_reached_type: Option<String>,
+    /// [`CodexFacts::spend_control_reached`]. A bare `bool`, so its `default`
+    /// is load-bearing for the reason [`Self::stream_error_count`] gives.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spend_control_reached: bool,
+    /// [`CodexFacts::credits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<tcr_status_wire::CodexCredits>,
+    /// [`CodexFacts::login_error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_error: Option<String>,
+    /// [`CodexFacts::codex_home`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -542,6 +599,14 @@ impl StatusPayload {
                 org_uuid: a.org_uuid.clone(),
                 org_name: a.org_name.clone(),
                 usage: a.usage.clone(),
+                quota_windows: a.codex.quota_windows.clone(),
+                five_hour_window_minutes: a.codex.five_hour_window_minutes,
+                seven_day_window_minutes: a.codex.seven_day_window_minutes,
+                limit_reached_type: a.codex.limit_reached_type.clone(),
+                spend_control_reached: a.codex.spend_control_reached,
+                credits: a.codex.credits.clone(),
+                login_error: a.codex.login_error.clone(),
+                codex_home: a.codex.codex_home.clone(),
             })
             .collect();
         Self {
@@ -569,6 +634,12 @@ impl StatusPayload {
             // and leaf allow is boot state of the serving process, not a fact in a
             // `StatsSnapshot`. The serving process assigns `Some`.
             mitm: None,
+            // `None` for the same reason again. The Codex traffic counts live in
+            // the serving process's own rings, and the upstream is its boot
+            // config; a `StatsSnapshot` carries neither, so the serving process
+            // assigns both after this call.
+            codex_traffic: None,
+            codex_upstream: None,
         }
     }
 
@@ -627,6 +698,16 @@ impl StatusPayload {
                     parked_groups: a.parked_groups,
                     control_allowed_groups: a.control_allowed_groups,
                     usage: a.usage,
+                    codex: CodexFacts {
+                        quota_windows: a.quota_windows,
+                        five_hour_window_minutes: a.five_hour_window_minutes,
+                        seven_day_window_minutes: a.seven_day_window_minutes,
+                        limit_reached_type: a.limit_reached_type,
+                        spend_control_reached: a.spend_control_reached,
+                        credits: a.credits,
+                        login_error: a.login_error,
+                        codex_home: a.codex_home,
+                    },
                 }
             })
             .collect();
@@ -1934,6 +2015,7 @@ mod tests {
                 parked_groups: Vec::new(),
                 control_allowed_groups: vec!["codereview".to_string()],
                 usage: None,
+                codex: Default::default(),
             }],
             current: Some(0),
             recent: Vec::new(),
@@ -1966,6 +2048,7 @@ mod tests {
                         started_ms: crate::now_ms() - 5_000,
                         command_head: Some("ls -la".to_string()),
                         command_class: Some("other".to_string()),
+                        timeout_seconds: None,
                     }],
                     subagents_running: 0,
                     slowest: vec![tcr_status_wire::SlowToolRow {
@@ -1987,6 +2070,9 @@ mod tests {
                 req_per_minute: vec![0; 29].into_iter().chain(std::iter::once(3)).collect(),
                 cost_usd: 0.0125,
                 cache_ttl_secs: Some(300),
+                provider: None,
+                unpriced_requests: 0,
+                reasoning_tokens: 0,
             }],
             wire_sessions_summary: tcr_status_wire::SessionsSummary {
                 calls: 2,
@@ -2361,6 +2447,7 @@ mod tests {
             output_tokens: 400,
             cost_usd: Some(0.0425),
             unpriced_requests: 1,
+            reasoning_tokens: 0,
         };
         snapshot.accounts[0].usage = Some(tcr_status_wire::UsageRow {
             today: totals,
@@ -2372,6 +2459,7 @@ mod tests {
             today_by_model: [("claude-opus-5".to_string(), totals)]
                 .into_iter()
                 .collect(),
+            seven_day_window: None,
         });
         let wire = serde_json::to_string(&StatusPayload::from_snapshot(
             &snapshot,
@@ -2551,6 +2639,311 @@ mod tests {
             let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
             assert_eq!(back.mitm, Some(reported));
         }
+    }
+
+    /// Every Codex fact a server knows, the facts its snapshot groups under `codex`,
+    /// crosses this wire to the CLI and comes back as the facts it set, beside a usage row
+    /// carrying the weekly window and reasoning tokens.
+    ///
+    /// `from_snapshot` and `into_snapshot` name every field by hand, which is this module's
+    /// no-secret discipline, and a field one of them forgets is a fact the CLI never
+    /// renders. A payload from a server that predates every Codex key rebuilds as
+    /// `CodexFacts::default()`: nothing reported, never a fabricated fact.
+    #[test]
+    fn account_status_carries_every_codex_field_through_the_snapshot() {
+        let facts = CodexFacts {
+            quota_windows: Some(vec!["fiveHour".into(), "sevenDay".into()]),
+            five_hour_window_minutes: Some(300),
+            seven_day_window_minutes: Some(10_080),
+            limit_reached_type: Some("rate_limit_reached".into()),
+            spend_control_reached: true,
+            credits: Some(tcr_status_wire::CodexCredits {
+                has_credits: true,
+                unlimited: false,
+                balance: Some("12.50".into()),
+            }),
+            login_error: Some("refresh_token_reused".into()),
+            codex_home: Some("/Users/example/.codex".into()),
+        };
+        let totals = tcr_status_wire::UsageTotals {
+            requests: 3,
+            input_tokens: 1_000,
+            cache_read_tokens: 800,
+            output_tokens: 40,
+            reasoning_tokens: 1_200,
+            cost_usd: None,
+            unpriced_requests: 3,
+            ..Default::default()
+        };
+        let usage = tcr_status_wire::UsageRow {
+            today: totals,
+            window: None,
+            last_hour: totals,
+            today_by_model: [("gpt-5.1-codex".to_string(), totals)]
+                .into_iter()
+                .collect(),
+            seven_day_window: Some(tcr_status_wire::UsageWindow {
+                since: 1_766_966_400_000,
+                totals,
+            }),
+        };
+        let mut snapshot = snapshot_with_counters();
+        snapshot.accounts[0].provider = crate::provider::Provider::Codex;
+        snapshot.accounts[0].codex = facts.clone();
+        snapshot.accounts[0].usage = Some(usage.clone());
+
+        let wire = serde_json::to_value(StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        let account = &wire["accounts"][0];
+        assert_eq!(
+            account.get("quotaWindows"),
+            Some(&serde_json::json!(["fiveHour", "sevenDay"])),
+            "{account}"
+        );
+        assert_eq!(
+            account.get("fiveHourWindowMinutes"),
+            Some(&serde_json::json!(300)),
+            "{account}"
+        );
+        assert_eq!(
+            account.get("spendControlReached"),
+            Some(&serde_json::json!(true)),
+            "{account}"
+        );
+        assert_eq!(
+            account.get("credits"),
+            Some(&serde_json::json!({"hasCredits": true, "unlimited": false, "balance": "12.50"})),
+            "{account}"
+        );
+        assert_eq!(
+            account.get("loginError"),
+            Some(&serde_json::json!("refresh_token_reused")),
+            "{account}"
+        );
+        assert_eq!(
+            account.get("codexHome"),
+            Some(&serde_json::json!("/Users/example/.codex")),
+            "{account}"
+        );
+
+        let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
+        let (rebuilt, _) = back.into_snapshot();
+        assert_eq!(
+            rebuilt.accounts[0].codex, facts,
+            "every Codex fact crosses the wire and comes back"
+        );
+        assert_eq!(
+            rebuilt.accounts[0].usage,
+            Some(usage),
+            "the weekly window and the reasoning tokens cross with the rest of usage"
+        );
+
+        // The same row as an older server sends it: no Codex key at all.
+        let old_server = r#"{"kind":"tcr.status.v1","accounts":[{"name":"alice@example.com","priority":0,"status":"active","disabled":false,"fiveHour":null,"fiveHourResetMs":null,"sevenDay":null,"sevenDayResetMs":null,"sevenDayOi":null,"requests":7,"inputTokens":1000,"outputTokens":200,"cacheReadTokens":750,"cacheCreationTokens":50,"lastUsedMs":null,"rateLimitedUntilMs":null,"probeStatus":"ok","lastProbeMs":null,"probeError":null,"quotaState":"normal","gate":"ok","freeAtMs":null,"threshold":0.85,"lastStreamError":null}]}"#;
+        let payload: StatusPayload = serde_json::from_str(old_server)
+            .expect("a payload with no Codex key must still deserialize");
+        let (snapshot, _) = payload.into_snapshot();
+        assert_eq!(
+            snapshot.accounts[0].codex,
+            CodexFacts::default(),
+            "an older server reports no Codex fact, and none is invented"
+        );
+    }
+
+    /// A plan that reported no usage window crosses this wire as `"quotaWindows": []` and
+    /// comes back as `Some(vec![])`, never as an absent key.
+    ///
+    /// The empty list and the absent key are two different facts. `[]` says the plan has no
+    /// window, so the panel draws none; no key says the windows are unknown, so it draws
+    /// both rows. A Codex account's facts cross this server-to-CLI hop before
+    /// `tcr status --json` renders them, so an empty list skipped here would reach the
+    /// panel as "unknown" however carefully the row type downstream keeps the two apart.
+    #[test]
+    fn an_empty_quota_windows_list_crosses_the_payload_as_a_fact() {
+        let mut snapshot = snapshot_with_counters();
+        snapshot.accounts[0].provider = crate::provider::Provider::Codex;
+        snapshot.accounts[0].codex.quota_windows = Some(Vec::new());
+
+        let wire = serde_json::to_value(StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        assert_eq!(
+            wire["accounts"][0].get("quotaWindows"),
+            Some(&serde_json::json!([])),
+            "[] is a fact: the plan reported no window"
+        );
+
+        let back: StatusPayload = serde_json::from_value(wire).expect("deserialize");
+        let (rebuilt, _) = back.into_snapshot();
+        assert_eq!(
+            rebuilt.accounts[0].codex.quota_windows,
+            Some(Vec::new()),
+            "[] is a fact: the plan reported no window"
+        );
+    }
+
+    /// The server's payload parses with a key this build does not know, at the top level
+    /// and inside every object that gained a Codex key: an account row, a session row, a
+    /// running tool and `codex_traffic`.
+    ///
+    /// `status_payload_tolerates_an_unknown_field` covers the top level only. An older CLI
+    /// reads a newer server by skipping what it does not know, at every depth, and this is
+    /// what fails the day one of these types starts rejecting unknown keys. The payload is
+    /// literal text, written the way a newer server would send it.
+    #[test]
+    fn status_payload_parses_with_an_unknown_key() {
+        let newer = r#"{"kind":"tcr.status.v1","addedLater":{"n":1},
+            "accounts":[{"name":"a@example.com","priority":0,"status":"active","disabled":false,
+                "requests":7,"inputTokens":1,"outputTokens":2,"cacheReadTokens":0,
+                "cacheCreationTokens":0,"probeStatus":"ok","quotaState":"normal","gate":"ok",
+                "threshold":0.85,"provider":"codex","quotaWindows":["sevenDay"],
+                "addedLater":{"n":1}}],
+            "sessions":[{"sessionId":"019a3c5e-0000-7000-8000-000000000002",
+                "firstSeenMs":1767224880000,"lastSeenMs":1767225599000,"provider":"codex",
+                "addedLater":{"n":1},
+                "tools":{"running":[{"tool":"exec_command","startedMs":1767225555000,
+                    "timeoutSeconds":120,"addedLater":{"n":1}}]}}],
+            "codex_traffic":{"refused10m":12,"unpooled10m":3,"addedLater":{"n":1}},
+            "codex_upstream":"http://127.0.0.1:9"}"#;
+        let payload: StatusPayload =
+            serde_json::from_str(newer).expect("an unknown key is skipped at every depth");
+        assert_eq!(
+            payload.accounts[0].quota_windows,
+            Some(vec!["sevenDay".to_string()])
+        );
+        assert_eq!(payload.sessions[0].provider.as_deref(), Some("codex"));
+        assert_eq!(
+            payload.sessions[0].tools.running[0].timeout_seconds,
+            Some(120)
+        );
+        assert_eq!(
+            payload.codex_traffic,
+            Some(tcr_status_wire::CodexTraffic {
+                refused_10m: 12,
+                unpooled_10m: 3,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            payload.codex_upstream.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+    }
+
+    /// An Anthropic account's row on this wire carries none of the Codex keys, its usage
+    /// no weekly window and no reasoning tokens, and the payload neither fleet-wide Codex
+    /// key; a payload with neither key reads both as `None`.
+    ///
+    /// The compatibility promise is that an Anthropic-only fleet's payload is the bytes it
+    /// was before Codex existed. Every new key is skipped when it holds nothing, and this
+    /// is what fails when one of them is written as `null` or `false` instead.
+    #[test]
+    fn an_anthropic_account_status_serializes_with_no_new_key() {
+        let totals = tcr_status_wire::UsageTotals {
+            requests: 3,
+            input_tokens: 1_000,
+            cache_creation_tokens: 2_000,
+            cache_creation_1h_tokens: 500,
+            cache_read_tokens: 9_000,
+            output_tokens: 400,
+            cost_usd: Some(0.0425),
+            unpriced_requests: 1,
+            reasoning_tokens: 0,
+        };
+        let mut snapshot = snapshot_with_counters();
+        snapshot.accounts[0].usage = Some(tcr_status_wire::UsageRow {
+            today: totals,
+            window: Some(tcr_status_wire::UsageWindow {
+                since: 1_767_207_600_000,
+                totals,
+            }),
+            last_hour: totals,
+            today_by_model: [("claude-opus-5".to_string(), totals)]
+                .into_iter()
+                .collect(),
+            seven_day_window: None,
+        });
+        assert_eq!(
+            snapshot.accounts[0].provider,
+            crate::provider::Provider::Anthropic
+        );
+
+        let wire = serde_json::to_value(StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        let account = wire["accounts"][0]
+            .as_object()
+            .expect("an account is an object");
+        for key in [
+            "quotaWindows",
+            "fiveHourWindowMinutes",
+            "sevenDayWindowMinutes",
+            "limitReachedType",
+            "spendControlReached",
+            "credits",
+            "loginError",
+            "codexHome",
+        ] {
+            assert!(
+                !account.contains_key(key),
+                "an Anthropic account carries no {key}: {account:?}"
+            );
+        }
+        let usage = account["usage"].as_object().expect("usage is an object");
+        assert!(
+            !usage.contains_key("sevenDayWindow"),
+            "no weekly window, no sevenDayWindow key: {usage:?}"
+        );
+        let mut buckets = vec![&usage["today"], &usage["lastHour"], &usage["window"]];
+        buckets.extend(
+            usage["todayByModel"]
+                .as_object()
+                .expect("todayByModel is an object")
+                .values(),
+        );
+        for bucket in buckets {
+            let bucket = bucket.as_object().expect("a bucket is an object");
+            assert!(
+                !bucket.contains_key("reasoningTokens"),
+                "a bucket with no reasoning tokens carries no key: {bucket:?}"
+            );
+        }
+        let payload = wire.as_object().expect("the payload is an object");
+        assert!(
+            !payload.contains_key("codex_traffic"),
+            "no codex_traffic key until the serving process reports one"
+        );
+        assert!(
+            !payload.contains_key("codex_upstream"),
+            "no codex_upstream key until the serving process reports one"
+        );
+
+        let old: StatusPayload =
+            serde_json::from_str(r#"{"kind":"tcr.status.v1","accounts":[]}"#).expect("parse");
+        assert_eq!(
+            old.codex_traffic, None,
+            "an older server reports no traffic"
+        );
+        assert_eq!(
+            old.codex_upstream, None,
+            "an older server reports no upstream"
+        );
     }
 
     /// The `kind` discriminator is what stops an older server's upstream-forwarded

@@ -305,6 +305,7 @@ impl Manager {
                                 .map(odt_to_ms),
                         ),
                     ),
+                    codex: crate::stats::CodexFacts::default(),
                 }
             })
             .collect();

@@ -31,7 +31,7 @@ use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
 use crate::provider::Provider;
-use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
+use crate::stats::{AccountSnapshot, CodexFacts, QuotaState, StatsSnapshot};
 use crate::status::{StatusPayload, STATUS_KIND};
 
 /// Reject a group label whose CONTENT could corrupt header composition
@@ -2332,6 +2332,9 @@ impl StatusSource {
 /// whose build could be reported — `serverSha` is then `null`, the same
 /// "not measured" idiom `cacheHitRatio` uses, never a placeholder that reads
 /// like a real sha.
+///
+/// It renders no Codex route or traffic: every Codex row comes out without
+/// `codexRoute` and `codexTraffic`, as from a CLI that predates them.
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
     thresholds: &[f64],
@@ -2341,7 +2344,8 @@ fn render_accounts_json(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    let rows: Vec<serde_json::Value> = account_status_rows(
+    render_accounts_json_at(
+        OffsetDateTime::now_utc(),
         snapshot,
         thresholds,
         source,
@@ -2349,6 +2353,47 @@ fn render_accounts_json(
         http1_only,
         control,
         group_colors,
+        None,
+        None,
+    )
+}
+
+/// [`render_accounts_json`] at a given clock, with the fleet's Codex route and
+/// traffic.
+///
+/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
+/// are computed against. Taking it as a parameter lets a test compare a fixed
+/// instant with a committed fixture, with no normalisation layer between them.
+///
+/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
+/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
+///
+/// No Codex key ever reaches an Anthropic row — neither these two nor the
+/// account's own Codex facts — so such a row is the bytes it always was.
+#[allow(clippy::too_many_arguments)]
+fn render_accounts_json_at(
+    now: OffsetDateTime,
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+    server: Option<&BuildInfo>,
+    http1_only: bool,
+    control: Option<&str>,
+    group_colors: &std::collections::BTreeMap<String, String>,
+    codex_route: Option<&tcr_status_wire::CodexRoute>,
+    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
+) -> String {
+    let rows: Vec<serde_json::Value> = account_status_rows_at(
+        now,
+        snapshot,
+        thresholds,
+        source,
+        server,
+        http1_only,
+        control,
+        group_colors,
+        codex_route,
+        codex_traffic,
     )
     .into_iter()
     // Round-trip through `Value` rather than serializing the struct
@@ -2365,6 +2410,9 @@ fn render_accounts_json(
 /// The typed rows behind [`render_accounts_json`], one per account in the
 /// snapshot's order. Split out so `tcr list --json` projects the very rows
 /// `tcr status --json` prints instead of building a second copy of them.
+///
+/// Like [`render_accounts_json`], it passes no Codex route or traffic. The list
+/// drops every Codex row anyway ([`is_claude_row`]).
 fn account_status_rows(
     snapshot: &StatsSnapshot,
     thresholds: &[f64],
@@ -2374,7 +2422,35 @@ fn account_status_rows(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> Vec<tcr_status_wire::AccountStatusRow> {
-    let now = OffsetDateTime::now_utc();
+    account_status_rows_at(
+        OffsetDateTime::now_utc(),
+        snapshot,
+        thresholds,
+        source,
+        server,
+        http1_only,
+        control,
+        group_colors,
+        None,
+        None,
+    )
+}
+
+/// [`account_status_rows`] at a given clock, with the fleet's Codex route and
+/// traffic: the typed rows [`render_accounts_json_at`] prints.
+#[allow(clippy::too_many_arguments)]
+fn account_status_rows_at(
+    now: OffsetDateTime,
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+    server: Option<&BuildInfo>,
+    http1_only: bool,
+    control: Option<&str>,
+    group_colors: &std::collections::BTreeMap<String, String>,
+    codex_route: Option<&tcr_status_wire::CodexRoute>,
+    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
+) -> Vec<tcr_status_wire::AccountStatusRow> {
     snapshot
         .accounts
         .iter()
@@ -2382,6 +2458,15 @@ fn account_status_rows(
         .map(|(i, a)| {
             let quota = gating_quota(a);
             let threshold = thresholds.get(i).copied().unwrap_or(1.0);
+            // The Codex keys are written on a Codex row only. An Anthropic row
+            // takes the empty facts and no route or traffic whatever it was
+            // given, so every one of its keys is skipped.
+            let codex = a.provider == Provider::Codex;
+            let facts = if codex {
+                a.codex.clone()
+            } else {
+                CodexFacts::default()
+            };
             let held: Vec<tcr_status_wire::HeldWindowRow> = held_windows(a, threshold)
                 .into_iter()
                 .map(|h| tcr_status_wire::HeldWindowRow {
@@ -2417,10 +2502,13 @@ fn account_status_rows(
                 quota_state: quota_state_token(a.quota_state).to_string(),
                 // The server's own terminal-gate verdict
                 // (`Manager::account_terminal_gate`/`account_gate`), including the
-                // one TcrBar could not otherwise see: `rejected` (Anthropic's own
-                // `anthropic-ratelimit-unified-status: rejected` header). Before
-                // this field existed, `status` was rewritten only for `Throttled`
-                // (see `snapshot.rs`), so a rejected account still read `status:
+                // one TcrBar could not otherwise see: `rejected`, the provider's
+                // own refusal. On an Anthropic row that is the
+                // `anthropic-ratelimit-unified-status: rejected` header; on a
+                // Codex row, a 429 that carried `x-codex-rate-limit-reached-type`
+                // (`crate::quota::is_codex_quota_refusal`). Before this field
+                // existed, `status` was rewritten only for `Throttled` (see
+                // `snapshot.rs`), so a rejected account still read `status:
                 // "active"` and the panel drew it as eligible when the router will
                 // never select it. Kebab-case values via `GateReason`'s own
                 // `Serialize`; every one is listed in docs/troubleshooting.md, which
@@ -2681,6 +2769,24 @@ fn account_status_rows(
                 // A config fact, real on both paths like `groups`.
                 provider: (a.provider != Provider::Anthropic)
                     .then(|| a.provider.as_str().to_string()),
+                // What a Codex account reports and an Anthropic one never does
+                // (`CodexFacts`), copied from the snapshot. No `source` guard:
+                // unlike the serving counters above, a fact nobody reported is
+                // already `None` or `false` and its key is skipped, so it can
+                // never read as a measurement. Empty on every Anthropic row.
+                quota_windows: facts.quota_windows,
+                five_hour_window_minutes: facts.five_hour_window_minutes,
+                seven_day_window_minutes: facts.seven_day_window_minutes,
+                limit_reached_type: facts.limit_reached_type,
+                spend_control_reached: facts.spend_control_reached,
+                credits: facts.credits,
+                login_error: facts.login_error,
+                codex_home: facts.codex_home,
+                // Fleet-wide, repeated on every Codex row like `serverSha`:
+                // whether `tcr run --codex` would pool codex, and what the
+                // server did with Codex requests in the last ten minutes.
+                codex_route: codex_route.filter(|_| codex).cloned(),
+                codex_traffic: codex_traffic.filter(|_| codex).cloned(),
                 // The plan, three raw fields and one label. Real on BOTH paths
                 // like `groups`/`control` above: this is a config fact read
                 // from disk, not a serving counter, so the offline path knows
@@ -6450,6 +6556,9 @@ mod tests {
             req_per_minute: vec![0, 1, 2],
             cost_usd: 0.5,
             cache_ttl_secs: Some(3600),
+            provider: None,
+            unpriced_requests: 0,
+            reasoning_tokens: 0,
         };
         let rendered = render_sessions_json(true, std::slice::from_ref(&row));
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
@@ -7486,6 +7595,7 @@ mod tests {
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage,
+            codex: Default::default(),
         }
     }
 
@@ -7524,6 +7634,7 @@ mod tests {
                     / 1e9
             }),
             unpriced_requests: if price.is_some() { 0 } else { requests },
+            reasoning_tokens: 0,
         }
     }
 
@@ -7555,6 +7666,7 @@ mod tests {
                 Some((nanos(totals.cost_usd) + nanos(other.cost_usd)) as f64 / 1e9)
             },
             unpriced_requests,
+            reasoning_tokens: totals.reasoning_tokens + other.reasoning_tokens,
         }
     }
 
@@ -7609,6 +7721,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            seven_day_window: None,
         }
     }
 
@@ -7626,6 +7739,7 @@ mod tests {
             window: None,
             last_hour: idle,
             today_by_model: std::collections::BTreeMap::new(),
+            seven_day_window: None,
         }
     }
 
@@ -8051,6 +8165,919 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // The canonical Codex fixtures TcrBar decodes.
+    // ---------------------------------------------------------------------
+
+    /// One of the canonical Codex fixtures, read from where TcrBar's decode tests read it
+    /// (`apps/macos/Tests/Fixtures/`). The same file, never a copy: one set of fixtures
+    /// with two proofs, the panel's decode and this renderer's output, is what keeps the
+    /// producer and the consumer from drifting apart.
+    fn canonical_fixture(name: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("apps/macos/Tests/Fixtures")
+            .join(name);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("cannot read the canonical fixture {}: {e}", path.display())
+        });
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("the canonical fixture {} is not JSON: {e}", path.display()))
+    }
+
+    /// The canonical fixtures' clock, 2026-01-01T00:00:00Z. Every time in them is an
+    /// offset from it.
+    const CANONICAL_NOW_MS: i64 = 1_767_225_600_000;
+    const SECOND_MS: i64 = 1_000;
+    const MINUTE_MS: i64 = 60 * SECOND_MS;
+    const HOUR_MS: i64 = 60 * MINUTE_MS;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    /// A weekly window's length, 10,080 minutes.
+    const WEEK_MS: i64 = 7 * DAY_MS;
+
+    /// The ten keys a Codex row may carry and an Anthropic row never does.
+    const CODEX_ROW_KEYS: [&str; 10] = [
+        "quotaWindows",
+        "fiveHourWindowMinutes",
+        "sevenDayWindowMinutes",
+        "limitReachedType",
+        "spendControlReached",
+        "credits",
+        "loginError",
+        "codexHome",
+        "codexRoute",
+        "codexTraffic",
+    ];
+
+    /// The instant `offset_ms` from the canonical clock.
+    fn canonical_at(offset_ms: i64) -> OffsetDateTime {
+        fixture_instant(CANONICAL_NOW_MS + offset_ms)
+    }
+
+    /// The serving build both fixtures name.
+    fn fixture_build() -> BuildInfo {
+        BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The fleet-wide Codex facts every canonical Codex row repeats: codex is pooled, and
+    /// in the last ten minutes tcr refused twelve requests itself and relayed three on the
+    /// client's own credential.
+    fn canonical_codex_route_and_traffic(
+    ) -> (tcr_status_wire::CodexRoute, tcr_status_wire::CodexTraffic) {
+        (
+            tcr_status_wire::CodexRoute {
+                pooled: true,
+                ..Default::default()
+            },
+            tcr_status_wire::CodexTraffic {
+                refused_10m: 12,
+                last_refusal: Some("usage_limit_reached".to_string()),
+                last_refusal_at_ms: Some(1_767_225_560_000),
+                unpooled_10m: 3,
+            },
+        )
+    }
+
+    /// The keys whose values differ between two JSON objects, from the union of both
+    /// objects' keys, so a key only one side carries is named too.
+    fn differing_keys(got: &serde_json::Value, want: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = got
+            .as_object()
+            .into_iter()
+            .chain(want.as_object())
+            .flat_map(|object| object.keys().cloned())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys.retain(|key| got.get(key) != want.get(key));
+        keys
+    }
+
+    /// One bucket of a canonical Codex row's usage, as `Totals::to_wire` reports traffic no
+    /// configured rate prices, which is all Codex traffic: every request unpriced, so
+    /// `costUsd` is `null` once the bucket served anything, and the measured zero `0.0`
+    /// while it served nothing. `input` is BASE input, the row's quota counter less cache
+    /// reads, as `Totals::to_wire` reports it.
+    fn codex_bucket(
+        requests: u64,
+        input: u64,
+        cache_read: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> tcr_status_wire::UsageTotals {
+        tcr_status_wire::UsageTotals {
+            requests,
+            input_tokens: input,
+            cache_read_tokens: cache_read,
+            output_tokens: output,
+            reasoning_tokens: reasoning,
+            unpriced_requests: requests,
+            cost_usd: if requests == 0 { Some(0.0) } else { None },
+            ..Default::default()
+        }
+    }
+
+    /// A canonical Codex row's usage. Each window opens where the usage tracker opens it,
+    /// read off the row's own resets so the two cannot disagree: the five-hour window at
+    /// the five-hour reset minus five hours, the weekly window at the weekly reset minus a
+    /// week. `todayByModel` holds today's one model once today served anything.
+    fn canonical_codex_usage(
+        row: &AccountSnapshot,
+        today: tcr_status_wire::UsageTotals,
+        last_hour: tcr_status_wire::UsageTotals,
+        window: Option<tcr_status_wire::UsageTotals>,
+        seven_day_window: Option<tcr_status_wire::UsageTotals>,
+    ) -> tcr_status_wire::UsageRow {
+        let opened = |reset: Option<OffsetDateTime>, length_ms: i64| {
+            let reset = reset.expect("a window's usage needs the window's reset");
+            (reset.unix_timestamp_nanos() / 1_000_000) as i64 - length_ms
+        };
+        tcr_status_wire::UsageRow {
+            today,
+            window: window.map(|totals| tcr_status_wire::UsageWindow {
+                since: opened(row.five_hour_reset, crate::usage::FIVE_HOURS_MS),
+                totals,
+            }),
+            last_hour,
+            today_by_model: if today.requests > 0 {
+                [("gpt-5.1-codex".to_string(), today)].into_iter().collect()
+            } else {
+                std::collections::BTreeMap::new()
+            },
+            seven_day_window: seven_day_window.map(|totals| tcr_status_wire::UsageWindow {
+                since: opened(row.seven_day_reset, WEEK_MS),
+                totals,
+            }),
+        }
+    }
+
+    /// A canonical Codex row before the facts its state adds: active, probed `ok`, in no
+    /// group, nothing served, every Codex fact unreported. Built by [`contract_account`],
+    /// so a new [`AccountSnapshot`] field breaks this sample as it breaks the contract one.
+    fn canonical_codex_row(
+        name: &str,
+        priority: i64,
+        plan: &str,
+        org_uuid: &str,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            provider: Provider::Codex,
+            ..contract_account(
+                name,
+                priority,
+                "active",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                None,
+                (Some(plan), None, None),
+                (Some(org_uuid), None),
+            )
+        }
+    }
+
+    /// The snapshot behind `codex-status.json`: its ten rows in fixture order, alice's
+    /// Claude row and one Codex row per state, each with a threshold of 0.85.
+    ///
+    /// Only facts are set here. Every derived key, `quota`, the per-window states, `held`,
+    /// `secondsUntilFree`, `cacheHitRatio` and `plan`, is the renderer's to compute, which
+    /// is what makes the comparison a proof of the renderer rather than of this function.
+    fn canonical_codex_snapshot() -> (StatsSnapshot, Vec<f64>) {
+        use crate::stats::GateReason;
+        use tcr_status_wire::CodexCredits;
+
+        let at = canonical_at;
+        let idle = codex_bucket(0, 0, 0, 0, 0);
+        let weekly_only = || CodexFacts {
+            quota_windows: Some(vec!["sevenDay".to_string()]),
+            seven_day_window_minutes: Some(10_080),
+            ..CodexFacts::default()
+        };
+        let both_windows = || CodexFacts {
+            quota_windows: Some(vec!["fiveHour".to_string(), "sevenDay".to_string()]),
+            five_hour_window_minutes: Some(300),
+            seven_day_window_minutes: Some(10_080),
+            ..CodexFacts::default()
+        };
+
+        // Claude, OK, in ORCHARD: contract row 1 with its windows moved into the future.
+        let mut alice_usage = contract_usage("claude-sonnet-5");
+        alice_usage.window = alice_usage.window.map(|w| tcr_status_wire::UsageWindow {
+            since: 1_767_217_140_000,
+            ..w
+        });
+        let alice = contract_account(
+            "alice@example.com",
+            0,
+            "active",
+            false,
+            Some(0.47),
+            Some(at(2 * HOUR_MS + 39 * MINUTE_MS)),
+            Some(0.20),
+            Some(at(4 * DAY_MS)),
+            Some(0.62),
+            Some(at(4 * DAY_MS)),
+            crate::probe::ProbeStatus::Ok,
+            None,
+            QuotaState::Normal,
+            &["orchard"],
+            Some(alice_usage),
+            (Some("claude_max"), Some("default_claude_max_20x"), None),
+            (
+                Some("11111111-1111-1111-1111-111111111111"),
+                Some("Example Personal"),
+            ),
+        );
+
+        // OK, one weekly window.
+        let mut bob = AccountSnapshot {
+            seven_day: Some(0.34),
+            seven_day_reset: Some(at(4 * DAY_MS)),
+            last_probe: Some(at(-30 * SECOND_MS)),
+            requests: 42,
+            input_tokens: 1_100_000,
+            cache_read_tokens: 902_000,
+            output_tokens: 22_000,
+            codex: weekly_only(),
+            ..canonical_codex_row(
+                "bob@example.com/codex",
+                1,
+                "pro",
+                "55555555-5555-4555-8555-555555555555",
+            )
+        };
+        bob.usage = Some(canonical_codex_usage(
+            &bob,
+            codex_bucket(42, 198_000, 902_000, 22_000, 9_000),
+            codex_bucket(7, 30_000, 160_000, 4_100, 1_200),
+            None,
+            Some(codex_bucket(
+                1_480, 11_000_000, 50_000_000, 1_100_000, 420_000,
+            )),
+        ));
+
+        // SPENT on its weekly window, with credits left.
+        let mut carol = AccountSnapshot {
+            seven_day: Some(1.0),
+            seven_day_reset: Some(at(3 * DAY_MS + 4 * HOUR_MS)),
+            last_probe: Some(at(-30 * SECOND_MS)),
+            quota_state: QuotaState::Exhausted,
+            gate: GateReason::SevenDay,
+            free_at: Some(at(3 * DAY_MS + 4 * HOUR_MS)),
+            requests: 310,
+            input_tokens: 5_400_000,
+            cache_read_tokens: 4_806_000,
+            output_tokens: 61_000,
+            codex: CodexFacts {
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                credits: Some(CodexCredits {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: Some("12.50".to_string()),
+                }),
+                ..weekly_only()
+            },
+            ..canonical_codex_row(
+                "carol@example.com",
+                2,
+                "pro",
+                "66666666-6666-4666-8666-666666666666",
+            )
+        };
+        carol.usage = Some(canonical_codex_usage(
+            &carol,
+            codex_bucket(310, 594_000, 4_806_000, 61_000, 21_000),
+            idle,
+            None,
+            Some(codex_bucket(
+                2_900,
+                20_000_000,
+                140_000_000,
+                5_400_000,
+                2_100_000,
+            )),
+        ));
+
+        // OK, both windows.
+        let mut dana = AccountSnapshot {
+            five_hour: Some(0.18),
+            five_hour_reset: Some(at(3 * HOUR_MS + 2 * MINUTE_MS)),
+            seven_day: Some(0.25),
+            seven_day_reset: Some(at(5 * DAY_MS)),
+            last_probe: Some(at(-30 * SECOND_MS)),
+            requests: 96,
+            input_tokens: 2_000_000,
+            cache_read_tokens: 1_700_000,
+            output_tokens: 260_000,
+            codex: both_windows(),
+            ..canonical_codex_row(
+                "dana@example.com",
+                3,
+                "plus",
+                "77777777-7777-4777-8777-777777777777",
+            )
+        };
+        dana.usage = Some(canonical_codex_usage(
+            &dana,
+            codex_bucket(96, 300_000, 1_700_000, 260_000, 70_000),
+            codex_bucket(9, 30_000, 150_000, 24_000, 6_000),
+            Some(codex_bucket(31, 100_000, 540_000, 210_000, 55_000)),
+            Some(codex_bucket(400, 1_400_000, 7_600_000, 640_000, 180_000)),
+        ));
+
+        // NEEDS RE-LOGIN, imported from a folder.
+        let mut erin = AccountSnapshot {
+            status: "error".to_string(),
+            five_hour: Some(0.0),
+            five_hour_reset: None,
+            seven_day: Some(0.40),
+            seven_day_reset: Some(at(2 * DAY_MS)),
+            probe_status: crate::probe::ProbeStatus::Error,
+            last_probe: Some(at(-MINUTE_MS)),
+            probe_error: Some("refresh_token_reused".to_string()),
+            gate: GateReason::Login,
+            codex: CodexFacts {
+                login_error: Some("refresh_token_reused".to_string()),
+                codex_home: Some("/Users/example/.codex".to_string()),
+                ..both_windows()
+            },
+            ..canonical_codex_row(
+                "erin@example.com/codex",
+                4,
+                "team",
+                "88888888-8888-4888-8888-888888888888",
+            )
+        };
+        erin.usage = Some(canonical_codex_usage(
+            &erin,
+            idle,
+            idle,
+            None,
+            Some(codex_bucket(120, 1_000_000, 4_000_000, 140_000, 50_000)),
+        ));
+
+        // REFUSED with no window full: the spend control.
+        let mut gil = AccountSnapshot {
+            five_hour: Some(0.15),
+            five_hour_reset: Some(at(3 * HOUR_MS + 2 * MINUTE_MS)),
+            seven_day: Some(0.10),
+            seven_day_reset: Some(at(6 * DAY_MS)),
+            last_probe: Some(at(-MINUTE_MS)),
+            gate: GateReason::Rejected,
+            requests: 24,
+            input_tokens: 400_000,
+            cache_read_tokens: 284_000,
+            output_tokens: 52_000,
+            codex: CodexFacts {
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                spend_control_reached: true,
+                ..both_windows()
+            },
+            ..canonical_codex_row(
+                "gil@example.com",
+                5,
+                "team",
+                "99999999-9999-4999-8999-999999999999",
+            )
+        };
+        gil.usage = Some(canonical_codex_usage(
+            &gil,
+            codex_bucket(24, 116_000, 284_000, 52_000, 14_000),
+            codex_bucket(2, 9_000, 21_000, 3_000, 800),
+            Some(codex_bucket(20, 96_000, 234_000, 48_000, 13_000)),
+            Some(codex_bucket(140, 900_000, 2_100_000, 310_000, 90_000)),
+        ));
+
+        // REFUSED, still held: throttled for the 47 minutes its hold has left, since a Codex
+        // hold never outlasts an hour.
+        let mut hal = AccountSnapshot {
+            status: "throttled".to_string(),
+            seven_day: Some(0.60),
+            seven_day_reset: Some(at(5 * DAY_MS)),
+            last_probe: Some(at(-2 * MINUTE_MS)),
+            gate: GateReason::Hold,
+            free_at: Some(at(47 * MINUTE_MS)),
+            rate_limited_until: Some(at(47 * MINUTE_MS)),
+            requests: 77,
+            input_tokens: 1_900_000,
+            cache_read_tokens: 1_520_000,
+            output_tokens: 40_000,
+            codex: CodexFacts {
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                ..weekly_only()
+            },
+            ..canonical_codex_row(
+                "hal@example.com",
+                6,
+                "pro",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            )
+        };
+        hal.usage = Some(canonical_codex_usage(
+            &hal,
+            codex_bucket(77, 380_000, 1_520_000, 40_000, 15_000),
+            idle,
+            None,
+            Some(codex_bucket(900, 8_000_000, 32_000_000, 1_900_000, 700_000)),
+        ));
+
+        // NEAR on its five-hour window, in ORCHARD.
+        let mut ivy = AccountSnapshot {
+            five_hour: Some(0.88),
+            five_hour_reset: Some(at(52 * MINUTE_MS)),
+            seven_day: Some(0.17),
+            seven_day_reset: Some(at(6 * DAY_MS)),
+            last_probe: Some(at(-40 * SECOND_MS)),
+            quota_state: QuotaState::NearLimit,
+            gate: GateReason::FiveHour,
+            free_at: Some(at(52 * MINUTE_MS)),
+            groups: vec!["orchard".to_string()],
+            requests: 60,
+            input_tokens: 1_300_000,
+            cache_read_tokens: 1_014_000,
+            output_tokens: 260_000,
+            codex: both_windows(),
+            ..canonical_codex_row(
+                "ivy@example.com",
+                7,
+                "plus",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+        };
+        ivy.usage = Some(canonical_codex_usage(
+            &ivy,
+            codex_bucket(60, 286_000, 1_014_000, 260_000, 70_000),
+            codex_bucket(20, 90_000, 330_000, 80_000, 22_000),
+            Some(codex_bucket(52, 240_000, 860_000, 210_000, 60_000)),
+            Some(codex_bucket(300, 1_600_000, 5_400_000, 900_000, 250_000)),
+        ));
+
+        // OK with no usage window at all, and unlimited credits.
+        let mut jo = AccountSnapshot {
+            last_probe: Some(at(-50 * SECOND_MS)),
+            requests: 30,
+            input_tokens: 300_000,
+            cache_read_tokens: 225_000,
+            output_tokens: 6_000,
+            codex: CodexFacts {
+                quota_windows: Some(Vec::new()),
+                credits: Some(CodexCredits {
+                    has_credits: true,
+                    unlimited: true,
+                    balance: None,
+                }),
+                ..CodexFacts::default()
+            },
+            ..canonical_codex_row(
+                "jo@example.com",
+                8,
+                "business",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+        };
+        jo.usage = Some(canonical_codex_usage(
+            &jo,
+            codex_bucket(30, 75_000, 225_000, 6_000, 1_000),
+            idle,
+            None,
+            None,
+        ));
+
+        // UNREACHABLE: its one group, RESEARCH, is reserved.
+        let mut kim = AccountSnapshot {
+            seven_day: Some(0.05),
+            seven_day_reset: Some(at(6 * DAY_MS)),
+            last_probe: Some(at(-3 * MINUTE_MS)),
+            gate: GateReason::Reserved,
+            groups: vec!["research".to_string()],
+            reserved_groups: vec!["research".to_string()],
+            codex: weekly_only(),
+            ..canonical_codex_row(
+                "kim@example.com",
+                9,
+                "pro",
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            )
+        };
+        kim.usage = Some(canonical_codex_usage(
+            &kim,
+            idle,
+            idle,
+            None,
+            Some(codex_bucket(40, 200_000, 700_000, 30_000, 9_000)),
+        ));
+
+        let accounts = vec![alice, bob, carol, dana, erin, gil, hal, ivy, jo, kim];
+        let thresholds = vec![0.85; accounts.len()];
+        (
+            StatsSnapshot {
+                accounts,
+                current: None,
+                recent: Vec::new(),
+                sessions: Vec::new(),
+                wire_sessions: Vec::new(),
+                wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+            },
+            thresholds,
+        )
+    }
+
+    /// The two sessions behind `codex-sessions.json`: a Claude session with a running
+    /// `Bash`, and a Codex session with a running `exec_command`. That is codex's default,
+    /// interactive tool, which has no timeout argument, so the call carries none.
+    fn canonical_codex_sessions() -> Vec<tcr_status_wire::SessionRow> {
+        let ms = |offset_ms: i64| CANONICAL_NOW_MS + offset_ms;
+        let ramp = |zeros: usize, tail: &[u16]| -> Vec<u16> {
+            std::iter::repeat_n(0, zeros)
+                .chain(tail.iter().copied())
+                .collect()
+        };
+        let bucket = |tool: &str, calls: u64, seconds_p50: f64| tcr_status_wire::ToolBucketRow {
+            tool: tool.to_string(),
+            calls,
+            seconds_p50,
+            ..Default::default()
+        };
+        let slow = |tool: &str, seconds: f64, head: &str, class: Option<&str>, ended_ms: i64| {
+            tcr_status_wire::SlowToolRow {
+                tool: tool.to_string(),
+                seconds,
+                command_head: Some(head.to_string()),
+                command_class: class.map(str::to_string),
+                ended_ms,
+            }
+        };
+        let claude = tcr_status_wire::SessionRow {
+            session_id: "a1f3c2d4-0000-4000-8000-000000000001".to_string(),
+            account: Some("alice@example.com".to_string()),
+            model: Some("claude-opus-5".to_string()),
+            first_seen_ms: ms(-40 * MINUTE_MS),
+            last_seen_ms: ms(-3 * SECOND_MS),
+            requests: 24,
+            input_tokens: 180_000,
+            output_tokens: 9_200,
+            cache_read_tokens: 160_000,
+            cache_creation_tokens: 12_000,
+            tools: tcr_status_wire::SessionToolsRow {
+                calls: 12,
+                running: vec![tcr_status_wire::RunningToolRow {
+                    tool: "Bash".to_string(),
+                    started_ms: ms(-20 * SECOND_MS),
+                    command_head: Some("cargo test".to_string()),
+                    command_class: Some("build".to_string()),
+                    timeout_seconds: None,
+                }],
+                by_tool: vec![bucket("Bash", 8, 2.5), bucket("Read", 4, 0.1)],
+                // The ten slowest of its twelve calls.
+                slowest: vec![
+                    slow(
+                        "Bash",
+                        12.0,
+                        "cargo build --release",
+                        Some("build"),
+                        ms(-295 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        6.0,
+                        "cargo build",
+                        Some("build"),
+                        ms(-230 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        3.0,
+                        "rg -n TODO",
+                        Some("search"),
+                        ms(-175 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.5,
+                        "cargo test -p example",
+                        Some("build"),
+                        ms(-250 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.5,
+                        "git status",
+                        Some("git-local"),
+                        ms(-160 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.0,
+                        "git status",
+                        Some("git-local"),
+                        ms(-320 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.0,
+                        "cargo test",
+                        Some("build"),
+                        ms(-110 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        1.5,
+                        "git status",
+                        Some("git-local"),
+                        ms(-125 * SECOND_MS),
+                    ),
+                    slow(
+                        "Read",
+                        0.4,
+                        "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+                        None,
+                        ms(-280 * SECOND_MS),
+                    ),
+                    slow(
+                        "Read",
+                        0.1,
+                        "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+                        None,
+                        ms(-350 * SECOND_MS),
+                    ),
+                ],
+                ..Default::default()
+            },
+            // Twenty of its 24 requests fall in the ring; the other four came before it.
+            req_per_minute: ramp(22, &[1, 2, 3, 2, 4, 3, 5, 0]),
+            cost_usd: 1.2034,
+            cache_ttl_secs: Some(3600),
+            provider: None,
+            unpriced_requests: 0,
+            reasoning_tokens: 0,
+        };
+        let codex = tcr_status_wire::SessionRow {
+            session_id: "019a3c5e-0000-7000-8000-000000000002".to_string(),
+            account: Some("bob@example.com/codex".to_string()),
+            model: Some("gpt-5.1-codex".to_string()),
+            first_seen_ms: ms(-175 * SECOND_MS),
+            last_seen_ms: ms(-50 * SECOND_MS),
+            requests: 7,
+            input_tokens: 95_000,
+            output_tokens: 4_100,
+            cache_read_tokens: 80_000,
+            cache_creation_tokens: 0,
+            tools: tcr_status_wire::SessionToolsRow {
+                calls: 3,
+                running: vec![tcr_status_wire::RunningToolRow {
+                    tool: "exec_command".to_string(),
+                    started_ms: ms(-45 * SECOND_MS),
+                    command_head: Some("cargo build".to_string()),
+                    command_class: Some("build".to_string()),
+                    timeout_seconds: None,
+                }],
+                by_tool: vec![
+                    bucket("exec_command", 2, 4.0),
+                    bucket("apply_patch", 1, 0.2),
+                ],
+                slowest: vec![
+                    slow(
+                        "exec_command",
+                        4.0,
+                        "cargo test",
+                        Some("build"),
+                        ms(-115 * SECOND_MS),
+                    ),
+                    slow(
+                        "exec_command",
+                        4.0,
+                        "cargo check",
+                        Some("build"),
+                        ms(-55_500),
+                    ),
+                    slow("apply_patch", 0.2, "apply_patch", None, ms(-94_800)),
+                ],
+                ..Default::default()
+            },
+            req_per_minute: ramp(26, &[2, 3, 2, 0]),
+            cost_usd: 0.0,
+            cache_ttl_secs: None,
+            provider: Some("codex".to_string()),
+            unpriced_requests: 7,
+            reasoning_tokens: 1_200,
+        };
+        vec![claude, codex]
+    }
+
+    /// `render_accounts_json_at`, given the facts behind `codex-status.json`, emits exactly
+    /// the rows TcrBar decodes from that file: every key and every derived value, compared
+    /// as `serde_json::Value`s with no normalisation and no rounding.
+    ///
+    /// The fixture belongs to the panel, whose decode tests read the same file; this is
+    /// the producer's half of that contract. A key renamed, dropped or computed differently
+    /// fails here before it reaches a screen. The render runs at the fixture's own clock,
+    /// so `held` and `secondsUntilFree` come out as committed with nothing to normalise.
+    #[test]
+    fn canonical_codex_status_matches_the_renderer() {
+        let (snapshot, thresholds) = canonical_codex_snapshot();
+        let (route, traffic) = canonical_codex_route_and_traffic();
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            ("orchard".to_string(), "#30d158".to_string()),
+            ("research".to_string(), "#bf5af2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_accounts_json_at(
+            fixture_instant(CANONICAL_NOW_MS),
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            Some(&fixture_build()),
+            false,
+            None,
+            &group_colors,
+            Some(&route),
+            Some(&traffic),
+        );
+        let rendered: Vec<serde_json::Value> =
+            serde_json::from_str(&rendered).expect("the renderer emits a JSON array");
+        let serde_json::Value::Array(fixture) = canonical_fixture("codex-status.json") else {
+            panic!("codex-status.json is a bare array");
+        };
+
+        assert_eq!(fixture.len(), 10, "codex-status.json carries ten rows");
+        assert_eq!(rendered.len(), 10, "the renderer emits one row per account");
+        let names = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter()
+                .map(|r| r["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&rendered),
+            names(&fixture),
+            "the renderer emits the fixture's rows in the fixture's order"
+        );
+        // Row by row, naming the keys: one assertion over the whole array prints over a
+        // thousand lines and points at none of them.
+        for (got, want) in rendered.iter().zip(&fixture) {
+            if got != want {
+                panic!(
+                    "{} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
+                    want["name"],
+                    differing_keys(got, want)
+                );
+            }
+        }
+    }
+
+    /// `render_sessions_json` emits exactly `codex-sessions.json` for the two sessions
+    /// behind it.
+    ///
+    /// The session shape the panel decodes, pinned the way the status rows are: the Codex
+    /// keys present on the Codex session, and absent, never `null` or `0`, on the Claude one,
+    /// whose bytes are the ones it had before Codex existed.
+    #[test]
+    fn canonical_codex_sessions_match_the_renderer() {
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_sessions_json(true, &canonical_codex_sessions()))
+                .expect("valid JSON");
+        let fixture = canonical_fixture("codex-sessions.json");
+        let (Some(got), Some(want)) = (
+            rendered["sessions"].as_array(),
+            fixture["sessions"].as_array(),
+        ) else {
+            panic!("both documents carry a sessions array: {rendered} / {fixture}");
+        };
+        for (got, want) in got.iter().zip(want) {
+            if got != want {
+                panic!(
+                    "session {} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
+                    want["sessionId"],
+                    differing_keys(got, want)
+                );
+            }
+        }
+        assert_eq!(
+            rendered, fixture,
+            "render_sessions_json no longer emits codex-sessions.json"
+        );
+    }
+
+    /// An Anthropic row renders exactly as the committed contract fixture holds it, with no
+    /// Codex key: with no Codex fact, and again with every Codex fact set and a Codex route
+    /// and traffic passed in.
+    ///
+    /// This is the compatibility promise for a Claude-only fleet: `tcr status --json` prints
+    /// the bytes it always did. The renderer writes the Codex keys on Codex rows only, so
+    /// neither a snapshot that wrongly carries a Codex fact nor a fleet-wide route can reach
+    /// an Anthropic row. Compared with the committed file, never a regenerated copy.
+    #[test]
+    fn anthropic_rows_serialize_with_no_new_key() {
+        let (mut snapshot, mut thresholds) = status_contract_snapshot();
+        snapshot.accounts.truncate(4);
+        thresholds.truncate(4);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .all(|a| a.provider == Provider::Anthropic),
+            "the contract's first four rows are its Anthropic rows"
+        );
+        assert_eq!(thresholds, vec![0.9; 4]);
+
+        let committed: Vec<serde_json::Value> = serde_json::from_str(
+            &fs::read_to_string(status_contract_fixture_path())
+                .expect("committed contract fixture is readable"),
+        )
+        .expect("the contract fixture is a bare JSON array");
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            (
+                "codereview".to_string(),
+                crate::config::derive_group_color("codereview"),
+            ),
+            ("dev".to_string(), "#0a84ff".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (route, traffic) = canonical_codex_route_and_traffic();
+        let render = |snapshot: &StatsSnapshot| -> Vec<serde_json::Value> {
+            let json = render_accounts_json_at(
+                // After every instant in the contract sample, so each clock-derived field
+                // clamps exactly as it does in the committed file.
+                fixture_instant(1_767_398_400_000),
+                snapshot,
+                &thresholds,
+                StatusSource::Live,
+                Some(&fixture_build()),
+                false,
+                None,
+                &group_colors,
+                Some(&route),
+                Some(&traffic),
+            );
+            serde_json::from_str(&json).expect("the renderer emits a JSON array")
+        };
+        let check = |pass: &str, rows: Vec<serde_json::Value>| {
+            assert_eq!(rows.len(), 4, "{pass}: one row per account");
+            for (row, committed) in rows.iter().zip(&committed) {
+                let name = row["name"].as_str().expect("every row has a name");
+                for key in CODEX_ROW_KEYS {
+                    assert!(row.get(key).is_none(), "{pass}: {name} carries {key}");
+                }
+                if let Some(usage) = row.get("usage") {
+                    assert!(
+                        usage.get("sevenDayWindow").is_none(),
+                        "{pass}: {name}'s usage carries sevenDayWindow"
+                    );
+                    let mut buckets = vec![&usage["today"], &usage["lastHour"]];
+                    buckets.extend(usage.get("window"));
+                    buckets.extend(
+                        usage["todayByModel"]
+                            .as_object()
+                            .expect("todayByModel is an object")
+                            .values(),
+                    );
+                    for bucket in buckets {
+                        assert!(
+                            bucket.get("reasoningTokens").is_none(),
+                            "{pass}: a bucket of {name}'s usage carries reasoningTokens: {bucket}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    row, committed,
+                    "{pass}: {name} is not the committed contract row"
+                );
+            }
+        };
+
+        check("with no Codex fact", render(&snapshot));
+
+        for account in &mut snapshot.accounts {
+            account.codex = CodexFacts {
+                quota_windows: Some(vec!["fiveHour".to_string(), "sevenDay".to_string()]),
+                five_hour_window_minutes: Some(300),
+                seven_day_window_minutes: Some(10_080),
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                spend_control_reached: true,
+                credits: Some(tcr_status_wire::CodexCredits {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: Some("12.50".to_string()),
+                }),
+                login_error: Some("refresh_token_reused".to_string()),
+                codex_home: Some("/Users/example/.codex".to_string()),
+            };
+        }
+        check("with every Codex fact set", render(&snapshot));
+    }
+
     /// `groups` on the JSON path: an array for a labelled account (including
     /// multi-membership), and `[]` — never `null` — for an unlabelled one. This
     /// is config, not a serving counter, so it does not get the
@@ -8388,6 +9415,7 @@ mod tests {
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage: None,
+            codex: Default::default(),
         };
         let accounts = vec![
             AccountSnapshot {

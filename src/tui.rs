@@ -2097,6 +2097,7 @@ mod tests {
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage: None,
+            codex: Default::default(),
         }
     }
 

@@ -188,6 +188,7 @@ impl Manager {
                             started_ms: r.started_ms,
                             command_head: r.command_head,
                             command_class: r.command_class.map(|c| c.as_str().to_string()),
+                            timeout_seconds: None,
                         })
                         .collect(),
                     slowest: s
@@ -218,6 +219,9 @@ impl Manager {
                 req_per_minute: s.req_per_minute.projected(now_ms),
                 cost_usd: Self::price_session(&self.usage, &s.by_model),
                 cache_ttl_secs: s.cache_ttl_secs,
+                provider: None,
+                unpriced_requests: 0,
+                reasoning_tokens: 0,
             })
             .collect()
     }
