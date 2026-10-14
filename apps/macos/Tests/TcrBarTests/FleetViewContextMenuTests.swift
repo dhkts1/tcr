@@ -44,6 +44,60 @@ final class ContextMenuReloginAvailabilityTests: XCTestCase {
         }
     }
 
+    /// The legacy panel (`TCRBAR_LEGACY_PANEL=1`) words its six account strings
+    /// through `LegacyRowCopy`, which keeps a Claude row's words and gives a Codex
+    /// row ChatGPT's, so no Codex row is credited to Anthropic. Read from the source
+    /// because the legacy row is a view in the app target; the words themselves are
+    /// tested in `CodexCardFactsTests`. The four refusal branches also open to a
+    /// refused Codex row, whatever held it, or it would read as rotating.
+    func testEachLegacySiteCallsLegacyRowCopy() throws {
+        let source = try String(
+            contentsOf: repoRoot().appendingPathComponent(
+                "apps/macos/Sources/TcrBar/FleetView.swift"),
+            encoding: .utf8)
+        let calls: [(call: String, sites: Int)] = [
+            ("LegacyRowCopy.planHelp(account)", 1),
+            ("LegacyRowCopy.orgTagHelp(account)", 1),
+            ("LegacyRowCopy.rotatingHelp(account)", 1),
+            ("LegacyRowCopy.rejectedPillWord(account)", 2),
+            ("LegacyRowCopy.rejectedPillHelp(account", 1),
+            ("LegacyRowCopy.rejectedSpoken(account", 1),
+        ]
+        for (call, sites) in calls {
+            XCTAssertEqual(
+                source.components(separatedBy: call).count - 1, sites,
+                "FleetView.swift no longer calls \(call) at its \(sites) legacy site(s)")
+        }
+        for literal in [
+            "This account's plan, as Anthropic reports it for its organization.",
+            "The organization half of this account's name",
+            "In the rotation — this account can be picked for traffic",
+            #"StatusPill("rejected""#,
+            "Anthropic has rejected this account, so `tcr` sends it no",
+            "rejected by Anthropic, not in rotation",
+        ] {
+            XCTAssertFalse(
+                source.contains(literal),
+                "FleetView.swift still holds \(literal), which a Codex row would read")
+        }
+        XCTAssertEqual(
+            source.components(
+                separatedBy:
+                    "account.isRejected || account.isRefusedHold || account.isForbiddenHold"
+            ).count - 1, 4,
+            "the four legacy refusal branches no longer open to a refused Codex row")
+        XCTAssertFalse(source.contains("} else if account.isRejected {"))
+    }
+
+    private func repoRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // FleetViewContextMenuTests.swift -> TcrBarTests
+            .deletingLastPathComponent()  // TcrBarTests -> Tests
+            .deletingLastPathComponent()  // Tests -> apps/macos
+            .deletingLastPathComponent()  // apps/macos -> apps
+            .deletingLastPathComponent()  // apps -> repo root
+    }
+
     /// Isolates the `contextMenuItems` computed property's source text so
     /// the assertion above cannot accidentally match some other `.needsRelogin`
     /// check elsewhere in the file (e.g. the standalone `reloginButton`'s own

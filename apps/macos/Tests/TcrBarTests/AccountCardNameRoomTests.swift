@@ -167,6 +167,66 @@ final class AccountCardNameRoomTests: XCTestCase {
                 + "gives way first")
     }
 
+    // MARK: - Codex cards
+
+    /// A Codex login's name carries a `/codex` handle and its plan reads `ChatGPT Pro`,
+    /// both longer than a Claude card's. On an ordinary card the plan still draws whole:
+    /// the handle is the piece that gives way, and `bob @example.com/co…` shows it.
+    func testACodexProCardKeepsItsPlanWhole() throws {
+        let available = try nameRoom(pills: ["OK"])
+        XCTAssertTrue(
+            try drawsPlan(name: "bob@example.com/codex", plan: "ChatGPT Pro", available: available),
+            "a Codex Pro card drops its plan with \(pt(available)) available")
+    }
+
+    /// A signed-out Codex card draws its `Re-login…` button in the header, so the name
+    /// row is that much narrower, and the plan is what gives way. The name and a
+    /// truncated handle still draw, at both densities.
+    func testASignedOutCodexCardReservesItsReloginButtonAndDropsThePlan() throws {
+        let pillGap = try token("pillGap")
+        let tabGap = try token("tabGap")
+        for density in [ResolvedPanelDensity.comfortable, .compact] {
+            let room =
+                try nameRoom(pills: ["Needs re-login"], density: density)
+                - (NameRowFit.reloginButtonWidth + pillGap)
+            let nameSize =
+                density == .compact
+                ? try compactDensityToken("nameSize") : try densityToken("nameSize")
+            let planSize =
+                density == .compact
+                ? try compactDensityToken("muteSize") : try densityToken("muteSize")
+            XCTAssertFalse(
+                NameRowFit.drawsPlan(
+                    localPart: "erin", domain: "@example.com/codex", plan: "ChatGPT Team",
+                    available: room, nameSize: nameSize, planSize: planSize, gap: tabGap),
+                "\(density): the plan still draws beside the Re-login button in \(pt(room))")
+            XCTAssertLessThanOrEqual(
+                measure("erin", size: nameSize, weight: .semibold) + tabGap
+                    + NameRowFit.handleFloorWidth(size: nameSize),
+                room,
+                "\(density): the name and a truncated handle no longer fit \(pt(room))")
+        }
+    }
+
+    /// Only a Codex card reserves the button's width. A Claude card drawing the same
+    /// button keeps today's room, so no Claude pixel moves.
+    func testTheReloginWidthIsReservedOnCodexCardsOnly() throws {
+        XCTAssertTrue(try canonical("erin@example.com/codex").reservesReloginInNameRow)
+        XCTAssertFalse(
+            try canonical("alice@example.com", ["status": "error"]).reservesReloginInNameRow)
+        XCTAssertFalse(try canonical("bob@example.com/codex").reservesReloginInNameRow)
+
+        XCTAssertEqual(
+            NameRowFit.actionsWidth(reservesRelogin: false, gap: 6), NameRowFit.actionsSlotWidth)
+        XCTAssertEqual(
+            NameRowFit.actionsWidth(reservesRelogin: true, gap: 6),
+            NameRowFit.actionsSlotWidth + NameRowFit.reloginButtonWidth + 6)
+        XCTAssertGreaterThanOrEqual(
+            NameRowFit.reloginButtonWidth,
+            NameRowFit.textWidth("Re-login\u{2026}", size: 11, weight: .regular),
+            "the button is narrower than its own label")
+    }
+
     private func drawsPlan(name: String, plan: String, available: CGFloat) throws -> Bool {
         let at = name.firstIndex(of: "@")
         return NameRowFit.drawsPlan(
@@ -198,11 +258,21 @@ final class AccountCardNameRoomTests: XCTestCase {
     /// trailing: { pills } ; actions() }`, `V4Row` itself an `HStack(spacing:
     /// rowGap)` whose trailing column is `fixedSize()`, so every term below is
     /// a width the name row can never take back.
-    private func nameRoom(pills: [String], compact: Bool = false) throws -> CGFloat {
+    ///
+    /// `density` picks the branch every `compact ? a : b` token is read from;
+    /// `compact` still means a card inside a group box.
+    private func nameRoom(
+        pills: [String], compact: Bool = false,
+        density: ResolvedPanelDensity = .comfortable
+    ) throws -> CGFloat {
         let panelWidth = try token("panelWidth")
         let panelPaddingSide = try token("panelPaddingSide")
-        let cardInsetH = try densityToken("cardPaddingH") + (try token("panelBorderWidth"))
-        let rowGap = try densityToken("rowGap")
+        let cardPaddingH =
+            density == .compact
+            ? try compactDensityToken("cardPaddingH") : try densityToken("cardPaddingH")
+        let cardInsetH = cardPaddingH + (try token("panelBorderWidth"))
+        let rowGap =
+            density == .compact ? try compactDensityToken("rowGap") : try densityToken("rowGap")
         let pillGap = try token("pillGap")
         // A card inside a group box loses that box's side padding and stroke
         // on both edges before it starts.
@@ -300,6 +370,16 @@ final class AccountCardNameRoomTests: XCTestCase {
         return CGFloat(try XCTUnwrap(Double(value)))
     }
 
+    /// The same token's compact branch, the `a` of `compact ? a : b`.
+    private func compactDensityToken(_ name: String) throws -> CGFloat {
+        let value = try XCTUnwrap(
+            firstCapture(
+                of: "staticvar\(name):CGFloat\\{compact\\?([0-9.]+):[0-9.]+\\}",
+                in: try squashedV4Source()),
+            "V4.\(name) is no longer `compact ? <n> : <n>`")
+        return CGFloat(try XCTUnwrap(Double(value)))
+    }
+
     private func firstCapture(of pattern: String, in source: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: pattern),
             let match = regex.firstMatch(
@@ -328,4 +408,29 @@ final class AccountCardNameRoomTests: XCTestCase {
             contentsOf: repoRoot.appendingPathComponent("apps/macos/Sources/TcrBar/\(relative)"),
             encoding: .utf8)
     }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// The canonical row, decoded, failing the test if it does not decode.
+private func canonical(_ name: String, _ overrides: [String: Any] = [:]) throws -> Account {
+    let fleet = try decodeFleet([try canonicalRow(name, overrides)])
+    XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+    return try XCTUnwrap(fleet.accounts.first)
 }

@@ -230,6 +230,29 @@ enum RenderStates {
             // strip counts each pool on its own row, and the money line adds
             // the Codex tokens. See ``mixedFleetJSON``.
             ("24-mixed-fleet", .loaded(fleet(mixedFleetJSON)), false, nil),
+            // A Codex account's card in its states, kept open so each draws as a
+            // card: a Pro plan's one weekly row (bob), spent on its week with
+            // credits (carol), both windows (dana), and refused (gil). See
+            // ``codexScene(_:)``.
+            ("25-codex-cards", .loaded(fleet(codexScene([.bob, .carol, .dana, .gil]))), false, nil),
+            // The other four: refused with a known hold (hal), signed out with its
+            // reason under its card (erin), a plan that reports no window (jo), and
+            // a reserved Codex account no request can reach (kim, in RESEARCH).
+            ("25b-codex-cards-b", .loaded(fleet(codexScene([.hal, .erin, .jo, .kim]))), false, nil),
+            // Every canonical row kept open, at the compact density ten rows take.
+            (
+                "25c-codex-cards-compact", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))),
+                false, nil
+            ),
+            // A Codex account before its first probe: unmeasured, both rows empty.
+            ("25e-codex-unmeasured", .loaded(fleet(unmeasuredCodexJSON)), false, nil),
+            // Every canonical row as the tab draws it, one line each, nothing pinned.
+            ("25g-codex-lines", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))), false, nil),
+            // The same lines, with the signed-out Codex account's hover card showing.
+            (
+                "25h-codex-hover-card", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))),
+                false, nil
+            ),
         ]
     }
 
@@ -348,6 +371,9 @@ enum RenderStates {
             return FleetSectionRow.id(group: .ungrouped, accountID: "spent-5@example.com")
         case "15c-parked-group-hover":
             return FleetSectionRow.id(group: .named("dev"), accountID: "carol@example.com")
+        case "25h-codex-hover-card":
+            return FleetSectionRow.id(
+                group: .ungrouped, accountID: CanonicalCodexRow.erin.rawValue)
         default: return nil
         }
     }
@@ -359,6 +385,16 @@ enum RenderStates {
         switch sceneName {
         case "02e-mixed-thirteen-kept-open":
             return KeptOpenCards(["ok-2@example.com", "spent-2@example.com"])
+        // The Codex card scenes keep their accounts' cards open, so each state
+        // draws as the card it is.
+        case "25-codex-cards":
+            return KeptOpenCards([CanonicalCodexRow.bob, .carol, .dana, .gil].map(\.rawValue))
+        case "25b-codex-cards-b":
+            return KeptOpenCards([CanonicalCodexRow.hal, .erin, .jo, .kim].map(\.rawValue))
+        case "25c-codex-cards-compact":
+            return KeptOpenCards(CanonicalCodexRow.allCases.map(\.rawValue))
+        case "25e-codex-unmeasured":
+            return KeptOpenCards(["lee@example.com/codex"])
         default: return KeptOpenCards()
         }
     }
@@ -470,6 +506,10 @@ enum RenderStates {
 
     @MainActor
     static func run(into directory: URL) -> Never {
+        // A Codex row's note shortens its codex home against the home folder, and
+        // the fixtures' homes are `/Users/example`: so every scene reads the same
+        // on every Mac, and none names this one's user.
+        HomePath.current = "/Users/example"
         do {
             try FileManager.default.createDirectory(
                 at: directory, withIntermediateDirectories: true)
@@ -3960,6 +4000,29 @@ extension RenderStates {
         window["outputTokens"] = 31_000
         usage["window"] = window
         return jsonText(usage, laying: [:])
+    }
+
+    /// The canonical rows `rows`, at the real clock, as one scene's array. Every Codex row
+    /// lays ``quietCodexTraffic`` over its own, because the canonical rows carry refusals,
+    /// which draw the refusal banner; alice, the one Claude row, reports no Codex traffic.
+    private static func codexScene(_ rows: [CanonicalCodexRow]) -> String {
+        let now = Date()
+        let built = rows.map { row in
+            row == .alice
+                ? codexRow(row, now: now)
+                : codexRow(row, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        }
+        return "[\(built.joined(separator: ","))]"
+    }
+
+    /// Scene `25e-codex-unmeasured`: one Codex account before its first probe, with no
+    /// quota, no usage, and no word yet on which windows its plan has.
+    private static var unmeasuredCodexJSON: String {
+        "["
+            + account(
+                "lee@example.com/codex", quota: "null", state: "ok", probe: "never",
+                usage: "null", plan: "ChatGPT Plus", provider: "codex")
+            + "]"
     }
 
     /// `apps/macos/Tests/Fixtures/codex-status.json`, verbatim, indented to sit here.

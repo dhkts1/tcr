@@ -33,6 +33,16 @@ struct AccountLineRow<MenuItems: View>: View {
     /// inside a group box, so every bar starts at the same x
     /// (``AccountLineFit/nameColumn(looseNames:groupedNames:signals:bar:_:_:)``).
     var nameWidth: CGFloat = V4.liveNameWidth
+    /// The fleet also holds Codex accounts, so a Claude line's spoken label says
+    /// which provider it serves (``Account/cardSummaryLabel(now:isControl:namesProvider:)``).
+    var namesProvider: Bool = false
+    /// The meters' label column, ONE for the panel, as wide as the widest label
+    /// any line draws: a Codex window labelled by its length (`30d`) widens it
+    /// for every line, so every bar still starts at one x. The default is the
+    /// column for `5h` and `7d` alone.
+    var labelWidth: CGFloat = AccountLineFit.labelColumn(V4.lineMetrics)
+    /// The one bar width, measured with those same labels (``V4/lineBarWidth(labels:)``).
+    var barWidth: CGFloat = V4.lineBarWidth
     @ViewBuilder var menu: () -> MenuItems
 
     var body: some View {
@@ -51,9 +61,13 @@ struct AccountLineRow<MenuItems: View>: View {
             }
         }
         .contextMenu { menu() }
-        .help(account.name)
+        .help(CodexCardFacts.nameHelp(account))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(account.cardSummaryLabel(now: now, isControl: isControl))
+        .accessibilityLabel(
+            account.cardSummaryLabel(
+                now: now, isControl: isControl, namesProvider: namesProvider)
+        )
+        .modifier(LineValue(value: CodexCardFacts.lineValue(account, now: now)))
         .accessibilityHint("Opens this account's actions.")
     }
 
@@ -74,8 +88,24 @@ struct AccountLineRow<MenuItems: View>: View {
             .lineLimit(1)
             .truncationMode(.middle)
             .frame(width: nameWidth, alignment: .leading)
-            meter("5h", account.fiveHour, account.quotaBarTintSource(for: .fiveHour))
-            meter("7d", account.sevenDay, account.quotaBarTintSource(for: .sevenDay))
+            if let noWindows = account.lineNoWindowsText {
+                // A plan that reports no window: one mute phrase across both
+                // meter slots, which keep their width so the signal stays put.
+                HStack(spacing: V4.liveLineGap) {
+                    meter(AccountLineFit.labels[0], nil, .unmeasured).hidden()
+                    meter(AccountLineFit.labels[1], nil, .unmeasured).hidden()
+                }
+                .overlay(alignment: .leading) {
+                    Text(noWindows)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                        .lineLimit(1)
+                }
+            } else {
+                let slots = account.lineSlotLabels
+                slot(0, slots[0], account.fiveHour, account.quotaBarTintSource(for: .fiveHour))
+                slot(1, slots[1], account.sevenDay, account.quotaBarTintSource(for: .sevenDay))
+            }
             let signal = account.liveSignal(now: now)
             Text(signal.text)
                 .font(V4.font(V4.lineSignalSize))
@@ -91,9 +121,23 @@ struct AccountLineRow<MenuItems: View>: View {
         .contentShape(Rectangle())
     }
 
+    /// One meter slot: the window's meter under its label, or, for a window the
+    /// plan does not report (`label` is `nil`), the same meter hidden, so the
+    /// slot keeps its width and the bars after it keep their x.
+    @ViewBuilder
+    private func slot(
+        _ index: Int, _ label: String?, _ value: Double?, _ tint: QuotaBarTintSource
+    ) -> some View {
+        if let label {
+            meter(label, value, tint)
+        } else {
+            meter(AccountLineFit.labels[index], value, tint).hidden()
+        }
+    }
+
     /// `.sc`: the window's label, its small bar, its percentage.
     /// Both columns are fixed widths measured for the widest they draw
-    /// (``AccountLineFit/labelColumn(_:)``, ``AccountLineFit/percentColumn(_:)``),
+    /// (``AccountLineFit/labelColumn(_:labels:)``, ``AccountLineFit/percentColumn(_:)``),
     /// so a row's own digits never move the bar after them.
     private func meter(
         _ label: String, _ value: Double?, _ tint: QuotaBarTintSource
@@ -107,8 +151,8 @@ struct AccountLineRow<MenuItems: View>: View {
                 .foregroundStyle(Tok.mute)
                 .lineLimit(1)
                 .fixedSize()
-                .frame(width: AccountLineFit.labelColumn(V4.lineMetrics), alignment: .leading)
-            LineBar(value: value, tint: tint)
+                .frame(width: labelWidth, alignment: .leading)
+            LineBar(value: value, tint: tint, width: barWidth)
             Text(QuotaFormat.percent(value))
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.dim)
@@ -128,6 +172,8 @@ struct WaitingLineRow<MenuItems: View>: View {
     let now: Date
     var isControl: Bool = false
     var snapshotMode: Bool = false
+    /// See ``AccountLineRow/namesProvider``.
+    var namesProvider: Bool = false
     @ViewBuilder var menu: () -> MenuItems
 
     var body: some View {
@@ -146,9 +192,13 @@ struct WaitingLineRow<MenuItems: View>: View {
             }
         }
         .contextMenu { menu() }
-        .help(account.name)
+        .help(CodexCardFacts.nameHelp(account))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(account.cardSummaryLabel(now: now, isControl: isControl))
+        .accessibilityLabel(
+            account.cardSummaryLabel(
+                now: now, isControl: isControl, namesProvider: namesProvider)
+        )
+        .modifier(LineValue(value: CodexCardFacts.lineValue(account, now: now)))
         .accessibilityHint("Opens this account's actions.")
     }
 
@@ -254,6 +304,11 @@ struct LineBox<Item: Identifiable, Row: View>: View {
 /// `.mute`'s size, wrapped rather than cut (a reason is useless with its end
 /// missing), in `Tok.spent` for a failure and `Tok.near` for a note, the two
 /// colours the rest of the panel already uses for those.
+///
+/// An alert, a state the account is in such as a signed-out Codex login, is red
+/// like a failure but spoken as written: no action failed to produce it. Both
+/// choices are exhaustive switches, so a new tone cannot fall silently into the
+/// amber branch.
 struct RowNotices: View {
     let notices: [AccountRowNotice]
 
@@ -263,16 +318,44 @@ struct RowNotices: View {
                 ForEach(notices) { notice in
                     Text(notice.text)
                         .font(V4.font(V4.muteSize))
-                        .foregroundStyle(notice.tone == .failure ? Tok.spent : Tok.near)
+                        .foregroundStyle(Self.color(notice.tone))
                         .lineLimit(nil)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(notice.text)
-                        .accessibilityLabel(
-                            notice.tone == .failure
-                                ? "Failed: \(notice.text)" : notice.text)
+                        .accessibilityLabel(Self.spoken(notice))
                 }
             }
+        }
+    }
+
+    private static func color(_ tone: AccountRowNotice.Tone) -> Color {
+        switch tone {
+        case .failure, .alert: return Tok.spent
+        case .note: return Tok.near
+        }
+    }
+
+    private static func spoken(_ notice: AccountRowNotice) -> String {
+        switch notice.tone {
+        case .failure: return "Failed: \(notice.text)"
+        case .alert, .note: return notice.text
+        }
+    }
+}
+
+/// A line's accessibility value, set only when there is one: a Codex line's
+/// state help (``CodexCardFacts/lineValue(_:now:timeZone:home:)``), which its
+/// card's pill would show on hover. Every other line gets no value, as before.
+private struct LineValue: ViewModifier {
+    let value: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let value {
+            content.accessibilityValue(value)
+        } else {
+            content
         }
     }
 }
@@ -295,6 +378,8 @@ private struct LineDot: View {
 private struct LineBar: View {
     let value: Double?
     let tint: QuotaBarTintSource
+    /// The panel's one bar width (``AccountLineRow/barWidth``).
+    let width: CGFloat
 
     private var fraction: Double {
         switch QuotaFormat.barFill(value) {
@@ -310,10 +395,10 @@ private struct LineBar: View {
             if let fill = tint.fillColor {
                 RoundedRectangle(cornerRadius: V4.barRadius)
                     .fill(fill)
-                    .frame(width: max(V4.barMinWidth, V4.lineBarWidth * fraction))
+                    .frame(width: max(V4.barMinWidth, width * fraction))
             }
         }
-        .frame(width: V4.lineBarWidth, height: V4.lineBarHeight)
+        .frame(width: width, height: V4.lineBarHeight)
     }
 }
 

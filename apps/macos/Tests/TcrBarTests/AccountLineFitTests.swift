@@ -136,4 +136,44 @@ final class AccountLineFitTests: XCTestCase {
         let m = densities[0].1
         XCTAssertEqual(AccountLineFit.fitName("henry10", width: 200, m), "henry10")
     }
+
+    // MARK: - Labels other than 5h and 7d
+
+    /// A Codex plan's 30-day window draws a `30d` label. The label column widens to
+    /// hold it, and the one bar narrows rather than pushing a line past its room.
+    func testAThirtyDayLabelWidensTheLabelColumnAndNeverTheBar() {
+        let labels = ["5h", "7d", "30d"]
+        for (density, m) in densities {
+            XCTAssertGreaterThan(
+                AccountLineFit.labelColumn(m, labels: labels), AccountLineFit.labelColumn(m),
+                density)
+            XCTAssertLessThanOrEqual(
+                AccountLineFit.barWidth(room, m, labels: labels),
+                AccountLineFit.barWidth(room, m), density)
+        }
+    }
+
+    /// Main's two labels, passed explicitly, give every one of main's widths: a fleet
+    /// with no other label draws exactly as before.
+    func testMainsLabelsGiveMainsWidths() {
+        let labels = AccountLineFit.labels
+        for (density, m) in densities {
+            XCTAssertEqual(
+                AccountLineFit.labelColumn(m, labels: labels), AccountLineFit.labelColumn(m),
+                density)
+            let bar = AccountLineFit.barWidth(room, m)
+            XCTAssertEqual(AccountLineFit.barWidth(room, m, labels: labels), bar, density)
+            XCTAssertEqual(
+                AccountLineFit.meterWidth(bar: bar, m, labels: labels),
+                AccountLineFit.meterWidth(bar: bar, m), density)
+            XCTAssertEqual(
+                AccountLineFit.nameColumn(
+                    looseNames: [longName], groupedNames: [longName], signals: ["ready"],
+                    bar: bar, room, m, labels: labels),
+                AccountLineFit.nameColumn(
+                    looseNames: [longName], groupedNames: [longName], signals: ["ready"],
+                    bar: bar, room, m),
+                density)
+        }
+    }
 }

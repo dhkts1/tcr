@@ -198,6 +198,37 @@ final class FleetStripTests: XCTestCase {
         XCTAssertFalse(strip(accounts(26)).isPointable)
         XCTAssertEqual(strip(accounts(26)).segments.count, 26)
     }
+
+    // MARK: - Codex segments
+
+    /// A Codex plan may report no 5-hour window, so its segment fills from the
+    /// window it does report: a Pro account from its week. A plan that reports no
+    /// window at all fills whole, and a row nothing has measured stays grey.
+    func testACodexSegmentFillsFromTheWindowItsPlanReports() throws {
+        guard case .room(let room, let tone) = StripSegmentKind(try canonical("bob@example.com/codex"))
+        else { return XCTFail("bob should be a filled live segment") }
+        // 34 out of 100 of bob's week used leaves 66; `1 - 0.34` is not exactly 0.66.
+        XCTAssertEqual(room, 0.66, accuracy: 1e-9)
+        XCTAssertEqual(tone, .ok)
+
+        XCTAssertEqual(StripSegmentKind(try canonical("jo@example.com")), .room(1, .ok))
+
+        let lee = try canonical(
+            "bob@example.com/codex",
+            [
+                "name": "lee@example.com/codex", "quota": NSNull(), "quotaWindows": NSNull(),
+                "sevenDay": NSNull(), "sevenDayState": NSNull(), "probeStatus": "never",
+            ])
+        XCTAssertEqual(StripSegmentKind(lee), .off)
+    }
+
+    /// The Claude half: a Claude row with no 5-hour reading stays grey, whatever its
+    /// week reads, by the rule the strip has always drawn.
+    func testAClaudeSegmentNeverFallsBackToTheWeek() {
+        let alice = stripAccount("alice@example.com", fiveHour: nil)
+        XCTAssertNotNil(alice.sevenDay)
+        XCTAssertEqual(StripSegmentKind(alice), .off)
+    }
 }
 
 private func hold(_ window: String, _ resetAtMs: Int64) -> HeldWindow {
@@ -247,4 +278,29 @@ private func stripAccount(
         parkedGroups: nil,
         groupColors: nil
     )
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// The canonical row, decoded, failing the test if it does not decode.
+private func canonical(_ name: String, _ overrides: [String: Any] = [:]) throws -> Account {
+    let fleet = try decodeFleet([try canonicalRow(name, overrides)])
+    XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+    return try XCTUnwrap(fleet.accounts.first)
 }

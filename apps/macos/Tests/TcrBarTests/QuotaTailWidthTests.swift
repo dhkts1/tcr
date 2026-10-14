@@ -57,6 +57,26 @@ final class QuotaTailWidthTests: XCTestCase {
         }
     }
 
+    /// A Codex card's tails are output tokens, with a dollar lead only when the
+    /// operator priced every request: none of them needs a wider column than the
+    /// Claude tails above already have. The no-windows sentence is not here, because
+    /// it is too wide to be a tail, which is why the card draws it as its own line.
+    func testEveryCodexTokenTailFitsTheColumn() throws {
+        let width = try token("usageTailWidth")
+        let size = try muteSize()
+        let codexTails = [
+            "1.1M", "5.4M", "12.4M", "210k", "999k", "0", "$1.20 · 210k", "$1,190 · 12.3M",
+        ]
+        for string in codexTails {
+            let drawn = (string as NSString)
+                .size(withAttributes: [.font: NSFont.systemFont(ofSize: size)]).width
+            XCTAssertLessThanOrEqual(
+                drawn, width,
+                "\"\(string)\" needs \(String(format: "%.1f", drawn)) pt and the column is "
+                    + "\(width) pt, so a Codex tail draws elided")
+        }
+    }
+
     /// The column is not free: it is subtracted from the bar on BOTH rows of
     /// EVERY card, and the bar is the thing a reader actually compares. Sizing
     /// it for a whole window caption once took the bar from 154 pt to 48 pt.

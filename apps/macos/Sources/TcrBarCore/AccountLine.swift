@@ -169,8 +169,10 @@ extension Account {
     ///    broken credential still reads as broken on a line with no pill.
     ///    `needs re-login` is shortened to `re-login`, the action, because the
     ///    whole phrase does not fit the column a line leaves it; the red dot
-    ///    and the spoken label (``cardSummaryLabel(now:isControl:)``) carry
-    ///    the rest.
+    ///    and the spoken label (``cardSummaryLabel(now:isControl:namesProvider:)``)
+    ///    carry the rest. A refused Codex row reads `refused`, ChatGPT's word, and
+    ///    carries no countdown: the column would widen for every line in the
+    ///    panel, and the hold's end is in the row's help.
     public func liveSignal(now: Date) -> AccountLineText {
         switch FleetTally.Kind(account: self) {
         case .ok:
@@ -187,7 +189,8 @@ extension Account {
         case .needsRelogin:
             return AccountLineText("re-login", .bad)
         case .rejected:
-            return AccountLineText("rejected", .bad)
+            // ChatGPT refuses a Codex account; only Anthropic rejects one.
+            return AccountLineText(provider == .codex ? "refused" : "rejected", .bad)
         case .unreachable:
             return AccountLineText("unreachable", .bad)
         case .unmeasured:
@@ -239,10 +242,38 @@ extension Account {
     /// (``hasQuotaEvidence``), which is a different fact from 0 % and must not
     /// look like one. `nil` for a measured account whose 7-day window has no
     /// reading: there is nothing to say, so the line says nothing.
+    ///
+    /// A Codex plan that reports no window says so (``lineNoWindowsText``). A
+    /// Codex plan whose weekly slot is not seven days long names its own length
+    /// (`30d 100% used`), because `week` would misstate the horizon the figure
+    /// is measured over; a 7-day or unknown length keeps `week`, as on every
+    /// Claude line.
     public var waitingLineText: String? {
         guard hasQuotaEvidence else { return "never measured" }
+        if let lineNoWindowsText { return lineNoWindowsText }
         guard let sevenDay else { return nil }
-        return "week \(QuotaFormat.percent(sevenDay)) used"
+        let label = windowLabel(for: .sevenDay)
+        let span = label == "7d" ? "week" : label
+        return "\(span) \(QuotaFormat.percent(sevenDay)) used"
+    }
+
+    /// The labels of a live line's two meter slots, 5-hour then weekly: the label
+    /// a window's length gives it (``windowLabel(for:)``), or `nil` for a window
+    /// the plan does not report, whose slot the line leaves blank so every bar
+    /// after it still starts at one x. `["5h", "7d"]` on every Claude line.
+    public var lineSlotLabels: [String?] {
+        let reported = reportedWindows
+        return [QuotaWindow.fiveHour, .sevenDay].map {
+            reported.contains($0) ? windowLabel(for: $0) : nil
+        }
+    }
+
+    /// `no usage windows`, across both meter slots of a Codex line whose plan has
+    /// said it reports no window at all; `nil` on every other line. Not before a
+    /// probe has said so: until then the row is unmeasured, like any other.
+    public var lineNoWindowsText: String? {
+        guard provider == .codex, quotaWindows == [], hasQuotaEvidence else { return nil }
+        return "no usage windows"
     }
 
     /// The right of a waiting line, for the band it sits in. A live band has

@@ -795,6 +795,27 @@ public enum QuotaFormat {
         return parts.joined(separator: ", ")
     }
 
+    /// `300` → `"5h"`, `10080` → `"7d"`, `43200` → `"30d"`, `90` → `"90m"`: a quota
+    /// window's label from its length in minutes.
+    ///
+    /// A ChatGPT plan says how long each of its windows is, and the label a row wears is
+    /// the reset horizon the operator plans around: a 30-day window drawn as `7d` would
+    /// read a month as a week. Whole days print as days, whole hours as hours, and
+    /// anything else in minutes, so the label is always exact. The caller passes a
+    /// positive length; a row without one keeps its fixed label
+    /// (``Account/windowLabel(for:)``).
+    public static func windowLabel(minutes: Int) -> String {
+        if minutes % 1440 == 0 { return "\(minutes / 1440)d" }
+        if minutes % 60 == 0 { return "\(minutes / 60)h" }
+        return "\(minutes)m"
+    }
+
+    /// `"7d"` → `"7d window"`: what a quota row's label speaks as. One function, so a
+    /// row whose label follows its window's length speaks that length too.
+    public static func spokenWindowLabel(_ label: String) -> String {
+        "\(label) window"
+    }
+
     /// Shared guard: `nil` in → `nil` out, never a placeholder — the same
     /// house rule ``percent(_:)`` states above. A reset at or before `now`
     /// also yields `nil`: the Rust side only ever sends future resets, but a
@@ -2236,6 +2257,48 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         case sevenDay
     }
 
+    /// The windows this account's card draws a row for, in order.
+    ///
+    /// Both, as always, on a Claude row and on a Codex row whose plan has not said
+    /// which windows it has (``quotaWindows`` is `nil`): an unknown is drawn as the
+    /// two rows the panel has always drawn, empty until measured. Otherwise exactly
+    /// the windows the plan reported, so a ChatGPT Pro plan, which has no 5-hour
+    /// window, draws one weekly row rather than a 5-hour row of nothing, and a plan
+    /// that reports none draws no row at all. A window the plan does not report is not
+    /// a reading nobody took; it does not exist, and the row would claim it does.
+    public var reportedWindows: [QuotaWindow] {
+        guard provider == .codex, let quotaWindows else { return [.fiveHour, .sevenDay] }
+        var windows: [QuotaWindow] = []
+        for kind in quotaWindows {
+            let window: QuotaWindow = kind == .fiveHour ? .fiveHour : .sevenDay
+            if !windows.contains(window) { windows.append(window) }
+        }
+        return windows
+    }
+
+    /// Whether this account's card reserves its `Re-login…` button's width in the
+    /// name row: a signed-out Codex account. Its card then measures the plan against
+    /// the room the button really leaves, and drops it rather than squeezing it.
+    ///
+    /// Not a Claude card, though it draws the same button: reserving it there would
+    /// move every signed-out Claude card's name, which the Claude panel keeps as it is.
+    public var reservesReloginInNameRow: Bool {
+        provider == .codex && health == .needsRelogin
+    }
+
+    /// `"5h"`, `"7d"`, or the length a Codex plan reported for that slot (`"30d"`).
+    ///
+    /// Only a Codex row reads its window's length: a Claude row's labels are fixed, and
+    /// a row whose length is not on the wire keeps the fixed label too, as every row
+    /// drew before lengths were reported.
+    public func windowLabel(for window: QuotaWindow) -> String {
+        let fixed = window == .fiveHour ? "5h" : "7d"
+        guard provider == .codex else { return fixed }
+        let minutes = window == .fiveHour ? fiveHourWindowMinutes : sevenDayWindowMinutes
+        guard let minutes, minutes > 0 else { return fixed }
+        return QuotaFormat.windowLabel(minutes: minutes)
+    }
+
     /// The per-window state word when present, else the shared composite
     /// `quotaState`. NOT by itself the answer to "what should this window's
     /// bar look like" — `fiveHourState`/`sevenDayState` are `nil` both when
@@ -2565,7 +2628,10 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     ///    can look perfectly healthy.
     ///  - ``servesGroupTrafficOnly`` — reserved, so it serves requests that ask
     ///    for its group and no pool traffic at all. `"Group only"`, the word
-    ///    the pre-v4 row already uses.
+    ///    the pre-v4 row already uses. Not on a Codex row: no Codex request
+    ///    carries a group, so a reserved Codex account serves nothing at all,
+    ///    and `Group only` would claim it serves its group. Its state pill says
+    ///    UNREACHABLE, which is the whole story, so it gets no second pill.
     ///
     /// Lives on the model rather than in the card so the two panels cannot
     /// drift into two different ladders, and so the rule is testable without
@@ -2577,7 +2643,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public var rotation: RotationState? {
         if disabled || isParkedByGroup { return nil }
         if health == .needsRelogin || isRejected { return nil }
-        if servesGroupTrafficOnly { return .groupOnly }
+        if servesGroupTrafficOnly { return provider == .codex ? nil : .groupOnly }
         return .rotating
     }
 
@@ -2639,16 +2705,55 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// read from `tcr control --show`, a separate call this type never makes
     /// — so the caller passes it in, the same way ``FleetSectionRow/isControl``
     /// already does for the list.
-    public func cardSummaryLabel(now: Date, isControl: Bool = false) -> String {
+    ///
+    /// A Codex card says so after its name (`Codex account`), always: its plan
+    /// reads `ChatGPT Pro` and no pill names the provider, so a listener would
+    /// otherwise have nothing to go on. A Claude card says `Claude account` only
+    /// when `namesProvider` is true, which the panel passes for a fleet that also
+    /// holds Codex accounts; a Claude-only fleet hears exactly what it always did.
+    ///
+    /// A Codex card speaks the windows its plan reports, under the labels it draws
+    /// them with, and says first when that is one window (`weekly window only`) or
+    /// none (`no usage windows reported`), so a listener does not wait for a 5-hour
+    /// reading that does not exist. Its credits come last, as the card shows them.
+    public func cardSummaryLabel(
+        now: Date, isControl: Bool = false, namesProvider: Bool = false
+    ) -> String {
         var parts = [name]
+        if provider == .codex {
+            parts.append("Codex account")
+        } else if namesProvider {
+            parts.append("Claude account")
+        }
         if let plan, !plan.isEmpty { parts.append(plan) }
         if isControl { parts.append("control account") }
         if let word = rotation?.label { parts.append(word.lowercased()) }
-        parts.append(FleetTally.Kind(account: self).phrase)
-        for window in [
+        parts.append(FleetTally.Kind(account: self).phrase(for: provider))
+        var windows: [(label: String, value: Double?, state: QuotaState?, reset: Int64?)] = [
             (label: "5h", value: fiveHour, state: fiveHourState, reset: fiveHourResetAtMs),
             (label: "7d", value: sevenDay, state: sevenDayState, reset: sevenDayResetAtMs),
-        ] {
+        ]
+        if provider == .codex {
+            let reported = reportedWindows
+            if reported == [.sevenDay] {
+                let label = windowLabel(for: .sevenDay)
+                parts.append(label == "7d" ? "weekly window only" : "\(label) window only")
+            } else if reported.isEmpty {
+                parts.append("no usage windows reported")
+            }
+            windows = reported.map { window in
+                window == .fiveHour
+                    ? (
+                        label: windowLabel(for: .fiveHour), value: fiveHour, state: fiveHourState,
+                        reset: fiveHourResetAtMs
+                    )
+                    : (
+                        label: windowLabel(for: .sevenDay), value: sevenDay, state: sevenDayState,
+                        reset: sevenDayResetAtMs
+                    )
+            }
+        }
+        for window in windows {
             guard window.value != nil else { continue }
             parts.append(
                 "\(window.label) "
@@ -2663,6 +2768,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
                         value: sevenDayOi, state: sevenDayOiState,
                         resetAtMs: sevenDayOiResetAtMs, now: now))
         }
+        if let credits = CodexCardFacts.creditsText(self) { parts.append(credits) }
         return parts.joined(separator: ", ")
     }
 

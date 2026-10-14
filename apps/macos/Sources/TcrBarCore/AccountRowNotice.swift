@@ -16,6 +16,10 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
     /// like an error.
     public enum Tone: Equatable, Sendable {
         case failure
+        /// A state the account is in, drawn red like a failure but spoken as
+        /// written: a signed-out Codex login, say. It is not an action that
+        /// failed, which is why it is never spoken as "Failed: …".
+        case alert
         case note
     }
 
@@ -31,11 +35,17 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
 
     /// Every notice for one row, failures first, in a fixed order so the lines
     /// do not swap places between two polls.
+    ///
+    /// `codexNote` is a Codex row's own note (``CodexCardFacts/noteLine(reloginRefusal:loginError:codexHome:groupAddWarning:home:)``),
+    /// after the failures and before the note on a success: a state the account
+    /// is in outranks a remark on something that worked. `nil` on every Claude
+    /// row, which therefore gets exactly the lines it always did.
     public static func collect(
         deleteFailure: RemoveAccountCommand.Failure?,
         deleteNotice: String?,
         groupFailure: (group: String, failure: GroupCommand.Failure)?,
-        toggleFailure: AccountCommand.Failure?
+        toggleFailure: AccountCommand.Failure?,
+        codexNote: AccountRowNotice? = nil
     ) -> [AccountRowNotice] {
         var lines: [AccountRowNotice] = []
         if let deleteFailure {
@@ -49,6 +59,9 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
         }
         if let toggleFailure {
             lines.append(AccountRowNotice(text: toggleFailure.summary, tone: .failure))
+        }
+        if let codexNote {
+            lines.append(codexNote)
         }
         if let deleteNotice {
             lines.append(AccountRowNotice(text: deleteNotice, tone: .note))

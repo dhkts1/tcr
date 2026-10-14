@@ -197,7 +197,8 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
             AccountHoverCardContent(
                 row: row, shape: grouped ? .compact : .full, now: now,
                 snapshotMode: snapshotMode,
-                lit: litAccount == row.account.id
+                lit: litAccount == row.account.id,
+                namesProvider: fleet.holdsCodex
             ) {
                 actions(row.account)
             } menu: {
@@ -216,12 +217,13 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// lines would draw the hover fill.
     ///
     /// A live line's name column is the panel's one column
-    /// (``liveNameColumn``), less the group's padding inside a group box, so
+    /// (``liveLineFit``), less the group's padding inside a group box, so
     /// its bars start at the same x as the lines above and below it.
     private func lineBox(
         _ rows: [FleetSectionRow], band: FleetBand, grouped: Bool, marginBottom: CGFloat
     ) -> some View {
-        let nameWidth = liveNameColumn - (grouped ? V4.lineRoom.groupInset : 0)
+        let fit = liveLineFit
+        let nameWidth = fit.nameColumn - (grouped ? V4.lineRoom.groupInset : 0)
         return LineBox(
             items: rows,
             paddingH: band == .live ? V4.liveBoxPaddingH : V4.waitBoxPaddingH,
@@ -234,7 +236,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 VStack(alignment: .leading, spacing: 0) {
                     AccountLineRow(
                         account: row.account, now: now, isControl: row.isControl,
-                        snapshotMode: snapshotMode, nameWidth: nameWidth
+                        snapshotMode: snapshotMode, nameWidth: nameWidth,
+                        namesProvider: fleet.holdsCodex,
+                        labelWidth: fit.labelWidth, barWidth: fit.barWidth
                     ) { menu(row.account) }
                     RowNotices(notices: notices(row.account))
                 }
@@ -245,7 +249,8 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 VStack(alignment: .leading, spacing: 0) {
                     WaitingLineRow(
                         account: row.account, band: row.band, now: now,
-                        isControl: row.isControl, snapshotMode: snapshotMode
+                        isControl: row.isControl, snapshotMode: snapshotMode,
+                        namesProvider: fleet.holdsCodex
                     ) { menu(row.account) }
                     RowNotices(notices: notices(row.account))
                 }
@@ -260,6 +265,16 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         }
     }
 
+    /// The live lines' widths, ONE set for the whole panel.
+    private struct LiveLineFit {
+        /// The name column of a live line outside a group.
+        let nameColumn: CGFloat
+        /// The meters' label column.
+        let labelWidth: CGFloat
+        /// The bar.
+        let barWidth: CGFloat
+    }
+
     /// The name column of a live line outside a group, ONE for the whole panel
     /// (lead ruling on H1b, 2026-10-14). Measured over the live lines that are
     /// drawn: a group closed to its summary line has none, and counting its
@@ -268,10 +283,16 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     ///
     /// The signals of the same lines size the column at the right, and what a
     /// short one leaves goes to the names (lead ruling, 2026-10-14).
-    private var liveNameColumn: CGFloat {
+    ///
+    /// The labels of the same lines size the meters' label column and the bar:
+    /// a Codex window labelled by its length (`30d`) widens the label column for
+    /// every line, and the bar gives it the room, so every bar still starts at
+    /// one x. A panel whose lines draw only `5h` and `7d` gets main's widths.
+    private var liveLineFit: LiveLineFit {
         var loose: [String] = []
         var grouped: [String]?
         var signals: [String] = []
+        var labels = AccountLineFit.labels
         for section in sections where !isSummarised(section) {
             for row in section.rows where form(row) == .liveLine {
                 let name = AccountName.localPart(row.account.name)
@@ -281,11 +302,19 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     grouped = (grouped ?? []) + [name]
                 }
                 signals.append(row.account.liveSignal(now: now).text)
+                for label in row.account.lineSlotLabels.compactMap({ $0 })
+                where !labels.contains(label) {
+                    labels.append(label)
+                }
             }
         }
-        return AccountLineFit.nameColumn(
-            looseNames: loose, groupedNames: grouped, signals: signals, bar: V4.lineBarWidth,
-            V4.lineRoom, V4.lineMetrics)
+        let bar = V4.lineBarWidth(labels: labels)
+        return LiveLineFit(
+            nameColumn: AccountLineFit.nameColumn(
+                looseNames: loose, groupedNames: grouped, signals: signals, bar: bar,
+                V4.lineRoom, V4.lineMetrics, labels: labels),
+            labelWidth: AccountLineFit.labelColumn(V4.lineMetrics, labels: labels),
+            barWidth: bar)
     }
 
     /// Which form this row takes, from what only this view knows: whether the
@@ -324,6 +353,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
         AccountCard(
             account: row.account, shape: shape, now: now, isControl: row.isControl,
+            namesProvider: fleet.holdsCodex,
             // Looked up through ``PeerLease/leases(forAccountLabel:in:)``, not
             // with a subscript: the CLI masks any label its sanitizer refuses,
             // so an email-labelled account arrives under one shared `[masked]`

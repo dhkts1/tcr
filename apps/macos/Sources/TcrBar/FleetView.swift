@@ -470,7 +470,10 @@ struct FleetView: View {
     @ViewBuilder
     private func hoverCardBody(_ row: FleetSectionRow) -> some View {
         if case .loaded(let fleet) = poller.state {
-            AccountHoverCardContent(row: row, now: Date(), snapshotMode: snapshotMode) {
+            AccountHoverCardContent(
+                row: row, now: Date(), snapshotMode: snapshotMode,
+                namesProvider: fleet.holdsCodex
+            ) {
                 v4AccountRow(row.account, in: fleet, actionsOnly: true)
             } menu: {
                 v4AccountRow(row.account, in: fleet, menuOnly: true)
@@ -820,12 +823,22 @@ struct FleetView: View {
             },
             // Read here, on the panel's own controllers, because option H's
             // rows never drew them: a refused delete looked like no click.
+            //
+            // A Codex row also carries its own note: why it is signed out, from
+            // the refresh error the server reports. It rides the same lines, so
+            // it shows under the row without a hover and is read in list order.
             notices: { account in
                 AccountRowNotice.collect(
                     deleteFailure: removeController.failure(for: account.ref),
                     deleteNotice: removeController.notice(for: account.ref),
                     groupFailure: groupController.failure(forAccount: account.ref),
-                    toggleFailure: accounts.failure(for: account.ref))
+                    toggleFailure: accounts.failure(for: account.ref),
+                    codexNote: account.provider == .codex
+                        ? CodexCardFacts.noteLine(
+                            reloginRefusal: nil, loginError: account.loginError,
+                            codexHome: account.codexHome, groupAddWarning: nil
+                        ).map(AccountRowNotice.init(codexNote:))
+                        : nil)
             },
             menu: { account in
                 // The row's own actions, from the ONE definition of them —
@@ -2910,8 +2923,8 @@ struct FleetView: View {
     private func smooshedStatePill(_ account: Account) -> some View {
         if account.health == .needsRelogin {
             StatusPill("needs re-login", tint: Tok.spent)
-        } else if account.isRejected {
-            StatusPill("rejected", tint: Tok.spent)
+        } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
+            StatusPill(LegacyRowCopy.rejectedPillWord(account), tint: Tok.spent)
         } else if account.hasQuotaEvidence {
             StatusPill(account.quotaState.token, tint: Tok.color(for: account.quotaState))
         } else if account.probeStatus.isFailure {
@@ -4434,10 +4447,7 @@ struct AccountRow: View {
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
                 .textSelection(.enabled)
-                .help(
-                    "The organization half of this account's name — the full name is "
-                        + "\(account.name), which is what every `tcr` command takes."
-                )
+                .help(LegacyRowCopy.orgTagHelp(account))
         }
     }
 
@@ -4448,7 +4458,7 @@ struct AccountRow: View {
                 .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
-                .help("This account's plan, as Anthropic reports it for its organization.")
+                .help(LegacyRowCopy.planHelp(account))
         } else if let usageLabel = account.windowUsageLabel {
             // No plan on the wire, but there is still a spend figure to show
             // — draw it alone rather than losing it, the same "an absent
@@ -4522,8 +4532,9 @@ struct AccountRow: View {
                 .transition(.opacity)
         } else if account.health == .needsRelogin {
             EmptyView()
-        } else if account.isRejected {
-            // Anthropic's own verdict, and the third exclusion named above.
+        } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
+            // Anthropic's own verdict, or ChatGPT's refusal of a Codex account,
+            // and the third exclusion named above.
             // Drawn INSTEAD of "rotating": the router will never select this
             // account, so claiming it is in rotation is the exact
             // "misread as its own opposite" defect the other two gates were
@@ -4549,12 +4560,7 @@ struct AccountRow: View {
                 .transition(.opacity)
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
-                .help(
-                    "In the rotation — this account can be picked for traffic, as "
-                        + "far as this build can tell. A quota rejection from "
-                        + "Anthropic can also exclude an account without changing "
-                        + "its status; TcrBar cannot see that gate yet."
-                )
+                .help(LegacyRowCopy.rotatingHelp(account))
                 .transition(.opacity)
         }
     }
@@ -4602,8 +4608,8 @@ struct AccountRow: View {
                     + "out of rotation")
         } else if account.health == .needsRelogin {
             parts.append("not in rotation")
-        } else if account.isRejected {
-            parts.append("rejected by Anthropic, not in rotation")
+        } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
+            parts.append(LegacyRowCopy.rejectedSpoken(account, now: Date()))
         } else {
             parts.append("rotating")
         }
@@ -5322,19 +5328,15 @@ struct AccountRow: View {
                             "The refresh token was rejected — this account is out "
                                 + "of rotation and serves no traffic until you re-login."
                         )
-                } else if account.isRejected {
+                } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
                     // Ahead of the quota cases deliberately. A rejected account
                     // can carry a perfectly ordinary reading — the gate is
                     // Anthropic's, not a quota fact — so `spent`/`ok` would be
                     // a true number attached to a false conclusion about
                     // whether traffic can land here. The cause outranks the
                     // measurement, the same way `needs re-login` above does.
-                    StatusPill("rejected", tint: Tok.spent)
-                        .help(
-                            "Anthropic has rejected this account, so `tcr` sends it no "
-                                + "traffic whatever its quota reads. It returns on their "
-                                + "verdict, not on a reset."
-                        )
+                    StatusPill(LegacyRowCopy.rejectedPillWord(account), tint: Tok.spent)
+                        .help(LegacyRowCopy.rejectedPillHelp(account, now: Date()) ?? "")
                 } else if account.hasQuotaEvidence {
                     StatusPill(account.quotaState.token, tint: quotaTint)
                 } else if account.probeStatus.isFailure {

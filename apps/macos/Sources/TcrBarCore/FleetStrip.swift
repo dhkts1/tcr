@@ -3,7 +3,9 @@ import Foundation
 /// The strip at the top of the Accounts tab (option H, unit H3; Gil
 /// 2026-10-14): a count headline, "next back in", and one segment per account
 /// in the order the tab draws its rows, each filled by that account's own
-/// 5-hour room.
+/// 5-hour room. A Codex plan may report no 5-hour window, so a Codex segment
+/// fills from its week instead, and from nothing at all when the plan reports
+/// no window: it is then filled whole.
 ///
 /// Pure, and in the library rather than in the view, for the reason
 /// ``PanelHeight`` gives: the test target links `TcrBarCore` only, and the
@@ -49,6 +51,11 @@ public enum StripSegmentKind: Equatable, Sendable {
     /// reads as a window used up.
     case off
 
+    /// A live Codex account fills from the first window its plan reports: its
+    /// 5-hour room, or its week's on a plan with no 5-hour window, such as Pro,
+    /// whose 5-hour reading is absent for good rather than not yet taken. A plan
+    /// that reports no window at all has nothing used, so it fills whole, in its
+    /// row's colour. Every other account keeps the 5-hour rule.
     public init(_ account: Account) {
         switch FleetBand(account) {
         case .parked:
@@ -56,12 +63,26 @@ public enum StripSegmentKind: Equatable, Sendable {
         case .outOfTokens:
             self = .outOfTokens
         case .live:
+            if account.provider == .codex {
+                self = Self.codexRoom(account)
+                return
+            }
             guard account.hasQuotaEvidence, let used = account.fiveHour else {
                 self = .off
                 return
             }
             self = .room(min(1, max(0, 1 - used)), StripSegmentTone(FleetTally.Kind(account: account)))
         }
+    }
+
+    /// A live Codex account's segment: grey with no evidence, whole for a plan with
+    /// no window, else the room left in its 5-hour window or, without one, its week.
+    private static func codexRoom(_ account: Account) -> StripSegmentKind {
+        guard account.hasQuotaEvidence else { return .off }
+        let tone = StripSegmentTone(FleetTally.Kind(account: account))
+        if account.quotaWindows == [] { return .room(1, tone) }
+        guard let used = account.fiveHour ?? account.sevenDay else { return .off }
+        return .room(min(1, max(0, 1 - used)), tone)
     }
 }
 

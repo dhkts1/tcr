@@ -663,6 +663,12 @@ enum V4 {
     /// 2026-10-14): option H's 32, or less if a grouped line could not fit both
     /// labels and "100%" twice at this density.
     static var lineBarWidth: CGFloat { AccountLineFit.barWidth(lineRoom, lineMetrics) }
+    /// The same bar, for a panel whose lines draw `labels`: a Codex window
+    /// labelled by its length (`30d`) widens the label column, and the bar gives
+    /// it the room. With `5h` and `7d` alone it is ``lineBarWidth``.
+    static func lineBarWidth(labels: [String]) -> CGFloat {
+        AccountLineFit.barWidth(lineRoom, lineMetrics, labels: labels)
+    }
     /// `.slim+.slim{border-top:1px solid rgba(57,62,67,.6)}`: the hairline at
     /// 60 %, between rows only.
     static let lineDividerAlpha: Double = 0.6
