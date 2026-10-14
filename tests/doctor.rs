@@ -91,6 +91,10 @@ fn run_tcr(
         .args(args)
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
+        // doctor looks for `tcr setup shell`'s block in the shell's startup
+        // files; neither variable may point that read outside the scratch HOME.
+        .env_remove("ZDOTDIR")
+        .env_remove("XDG_CONFIG_HOME")
         // A scratch HOME does not scratch the login Keychain, see
         // `tests/first_run_no_config.rs` for why this override is set to a path
         // that does not exist.

@@ -150,6 +150,10 @@ fn run_status(home: &Path, config: &Path, port: u16, extra: &[&str]) -> (Option<
         .args(&args)
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
+        // The route line reads the shell's startup files for `tcr setup
+        // shell`'s block; keep that read inside the scratch HOME.
+        .env_remove("ZDOTDIR")
+        .env_remove("XDG_CONFIG_HOME")
         .env(
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-credentials.json"),
