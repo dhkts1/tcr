@@ -283,10 +283,16 @@ public enum CodexCardFacts {
         }
     }
 
+    /// The dollar figure a fully priced bucket leads with, or nothing. A priced total
+    /// under half a cent prints as `$0.00`, which no Codex surface draws (the rule
+    /// ``FleetSection/todaySpend`` follows for a Codex box), so that tail keeps its
+    /// tokens alone.
     private static func pricedLead(_ bucket: UsageTotals) -> String {
         guard bucket.requests > 0, bucket.unpricedRequests == 0, let cost = bucket.costUsd
         else { return "" }
-        return QuotaFormat.usd(cost) + " · "
+        let dollars = QuotaFormat.usd(cost)
+        guard dollars != "$0.00" else { return "" }
+        return dollars + " · "
     }
 
     // MARK: - The note under a row

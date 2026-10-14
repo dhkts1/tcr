@@ -53,9 +53,10 @@ public enum StripSegmentKind: Equatable, Sendable {
 
     /// A live Codex account fills from the first window its plan reports: its
     /// 5-hour room, or its week's on a plan with no 5-hour window, such as Pro,
-    /// whose 5-hour reading is absent for good rather than not yet taken. A plan
-    /// that reports no window at all has nothing used, so it fills whole, in its
-    /// row's colour. Every other account keeps the 5-hour rule.
+    /// whose 5-hour window does not exist rather than is not yet measured, so any
+    /// 5-hour reading left on its row is ignored. A plan that reports no window at
+    /// all has nothing used, so it fills whole, in its row's colour. Every other
+    /// account keeps the 5-hour rule.
     public init(_ account: Account) {
         switch FleetBand(account) {
         case .parked:
@@ -77,11 +78,18 @@ public enum StripSegmentKind: Equatable, Sendable {
 
     /// A live Codex account's segment: grey with no evidence, whole for a plan with
     /// no window, else the room left in its 5-hour window or, without one, its week.
+    ///
+    /// The window comes from what the plan reports, not from which reading is present:
+    /// a plan with no 5-hour window can still carry a 5-hour reading, such as the last
+    /// one a Plus account took before it became Pro, and that reading is not its room.
     private static func codexRoom(_ account: Account) -> StripSegmentKind {
         guard account.hasQuotaEvidence else { return .off }
         let tone = StripSegmentTone(FleetTally.Kind(account: account))
         if account.quotaWindows == [] { return .room(1, tone) }
-        guard let used = account.fiveHour ?? account.sevenDay else { return .off }
+        let used =
+            account.reportedWindows.first == .sevenDay
+            ? account.sevenDay : account.fiveHour ?? account.sevenDay
+        guard let used else { return .off }
         return .room(min(1, max(0, 1 - used)), tone)
     }
 }

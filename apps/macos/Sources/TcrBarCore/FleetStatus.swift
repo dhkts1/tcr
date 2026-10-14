@@ -2418,14 +2418,25 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// - the cost dropped entirely, never zeroed, when NOTHING in the bucket
     ///   could be priced; the token count is still a measurement and prints on
     ///   its own. A bucket that served nothing prints `$0.00` — see
-    ///   ``UsageTotals/measuredCost``.
+    ///   ``UsageTotals/measuredCost`` — except on a Codex row, which never reads
+    ///   `$0.00` (``drawnCost(_:)``).
     public var windowUsageLabel: String? {
         guard let usage else { return nil }
         let bucket = usage.windowOrToday
         let tokens = "\(QuotaFormat.tokens(bucket.outputTokens)) out"
-        guard let cost = bucket.measuredCost else { return spanned(tokens, usage) }
+        guard let cost = drawnCost(bucket) else { return spanned(tokens, usage) }
         let partial = bucket.unpricedRequests > 0 ? "+" : ""
         return "\(spanned(QuotaFormat.usd(cost) + partial, usage)) · \(tokens)"
+    }
+
+    /// The cost the usage label tells: ``UsageTotals/measuredCost``, except none on a
+    /// Codex row whose figure prints as `$0.00`, an idle bucket or one priced under half
+    /// a cent. A Codex surface never draws `$0.00`, which would claim the traffic was
+    /// free, so that row's tokens are told alone. A Claude row's measured zero stays.
+    private func drawnCost(_ bucket: UsageTotals) -> Double? {
+        guard let cost = bucket.measuredCost else { return nil }
+        if provider == .codex, QuotaFormat.usd(cost) == "$0.00" { return nil }
+        return cost
     }
 
     /// `"$9.41 today"` for a day bucket, the figure unchanged for a window one.
@@ -2446,7 +2457,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         let bucket = usage.windowOrToday
         let span = usage.windowOrTodaySpan == .day ? "today" : "this window"
         let tokens = "\(QuotaFormat.tokens(bucket.outputTokens)) output tokens"
-        guard let cost = bucket.measuredCost else { return "\(span): \(tokens), cost not priced" }
+        guard bucket.measuredCost != nil else { return "\(span): \(tokens), cost not priced" }
+        guard let cost = drawnCost(bucket) else { return "\(span): \(tokens)" }
         let spoken = QuotaFormat.usd(cost)
         let priced = bucket.unpricedRequests > 0 ? "at least \(spoken)" : spoken
         return "\(span): \(priced), \(tokens)"

@@ -299,6 +299,37 @@ final class CodexCardFactsTests: XCTestCase {
         }
     }
 
+    /// A bucket every request of which was priced, but for less than half a cent, rounds
+    /// to `$0.00`: the first cached turn of a window under a `gpt-` price override, or an
+    /// override priced at zero. The tail then keeps its tokens alone, by the rule a Codex
+    /// box's spend follows.
+    func testAPricedTailUnderHalfACentKeepsItsTokensAlone() throws {
+        for cost in [0.004, 0.0] {
+            var priced = try canonicalRow("dana@example.com")
+            var usage = try XCTUnwrap(priced["usage"] as? [String: Any])
+            var window = try XCTUnwrap(usage["window"] as? [String: Any])
+            window["costUsd"] = cost
+            window["unpricedRequests"] = 0
+            usage["window"] = window
+            priced["usage"] = usage
+            try assertTail(
+                try decoded(priced), .fiveHour, "210k",
+                "210k output tokens in this 5-hour window (55k reasoning)")
+        }
+
+        // The rounding edge: half a cent and up is a cent, and leads.
+        var cent = try canonicalRow("dana@example.com")
+        var usage = try XCTUnwrap(cent["usage"] as? [String: Any])
+        var window = try XCTUnwrap(usage["window"] as? [String: Any])
+        window["costUsd"] = 0.0051
+        window["unpricedRequests"] = 0
+        usage["window"] = window
+        cent["usage"] = usage
+        try assertTail(
+            try decoded(cent), .fiveHour, "$0.01 · 210k",
+            "$0.01 · 210k output tokens in this 5-hour window (55k reasoning)")
+    }
+
     // MARK: - The legacy panel's words
 
     func testTheLegacyPanelWordsCodexRowsAndKeepsClaudeRows() throws {
@@ -365,6 +396,42 @@ final class CodexCardFactsTests: XCTestCase {
         XCTAssertEqual(
             LegacyRowCopy.rejectedSpoken(try canonical("hal@example.com"), now: fixtureNow),
             "refused by ChatGPT, not in rotation")
+    }
+
+    /// The legacy panel's plan line prints a Claude row's idle day as a measured
+    /// `$0.00 today`. A Codex row never reads `$0.00`, so its idle day, and a day priced
+    /// under half a cent, print the tokens alone, drawn and spoken.
+    func testTheLegacyPlanLineNeverReadsZeroDollarsOnACodexRow() throws {
+        for name in ["erin@example.com/codex", "kim@example.com"] {
+            let idle = try canonical(name)
+            XCTAssertEqual(idle.windowUsageLabel, "0 out today", name)
+            XCTAssertEqual(idle.windowUsageSpokenLabel, "today: 0 output tokens", name)
+        }
+
+        var cheap = try canonicalRow("dana@example.com")
+        var usage = try XCTUnwrap(cheap["usage"] as? [String: Any])
+        var window = try XCTUnwrap(usage["window"] as? [String: Any])
+        window["costUsd"] = 0.004
+        window["unpricedRequests"] = 0
+        usage["window"] = window
+        cheap["usage"] = usage
+        let dana = try decoded(cheap)
+        XCTAssertEqual(dana.windowUsageLabel, "210k out")
+        XCTAssertEqual(dana.windowUsageSpokenLabel, "this window: 210k output tokens")
+
+        // A Claude row's measured zero is the line it always drew.
+        var idleAlice = try canonicalRow("alice@example.com")
+        var aliceUsage = try XCTUnwrap(idleAlice["usage"] as? [String: Any])
+        aliceUsage.removeValue(forKey: "window")
+        aliceUsage["today"] = [
+            "requests": 0, "unpricedRequests": 0, "costUsd": 0.0, "inputTokens": 0,
+            "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+            "cacheCreation1hTokens": 0,
+        ]
+        idleAlice["usage"] = aliceUsage
+        let alice = try decoded(idleAlice)
+        XCTAssertEqual(alice.windowUsageLabel, "$0.00 today · 0 out")
+        XCTAssertEqual(alice.windowUsageSpokenLabel, "today: $0.00, 0 output tokens")
     }
 
     // MARK: - The note under a signed-out row

@@ -247,6 +247,22 @@ final class FleetStripTests: XCTestCase {
         XCTAssertEqual(StripSegmentKind(lee), .off)
     }
 
+    /// A 5-hour reading on a plan that reports no 5-hour window is not that plan's room.
+    /// A Plus account upgraded to Pro while the proxy runs keeps its last Plus reading,
+    /// which reads 0 once its reset passes, so filling from it would draw a Pro account
+    /// with most of its week used as a full segment. The card and the line draw the week
+    /// alone; so does the strip.
+    func testACodexSegmentIgnoresAFiveHourReadingItsPlanDoesNotReport() throws {
+        for leftover in [0.0, 0.5] {
+            guard
+                case .room(let room, let tone) = StripSegmentKind(
+                    try canonical("bob@example.com/codex", ["fiveHour": leftover]))
+            else { return XCTFail("bob should be a filled live segment") }
+            XCTAssertEqual(room, 0.66, accuracy: 1e-9, "a leftover 5-hour reading of \(leftover)")
+            XCTAssertEqual(tone, .ok)
+        }
+    }
+
     /// The Claude half: a Claude row with no 5-hour reading stays grey, whatever its
     /// week reads, by the rule the strip has always drawn.
     func testAClaudeSegmentNeverFallsBackToTheWeek() {
