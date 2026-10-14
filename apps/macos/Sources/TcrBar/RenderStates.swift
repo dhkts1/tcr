@@ -253,6 +253,51 @@ enum RenderStates {
                 "25h-codex-hover-card", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))),
                 false, nil
             ),
+            // Both providers at compact density: ORCHARD is drawn once under each head, each
+            // box holding its own provider's members. See ``mixedFleetCompactJSON``.
+            ("24b-mixed-fleet-compact", .loaded(fleet(mixedFleetCompactJSON)), false, nil),
+            // A fleet of Codex accounts alone: one list and no head.
+            ("24c-codex-only", .loaded(fleet(codexScene([.bob, .dana, .carol, .erin]))), false, nil),
+            // Both providers, every Codex account switched off: the head still counts them.
+            ("24d-mixed-codex-all-parked", .loaded(fleet(mixedCodexAllParkedJSON)), false, nil),
+            // The empty fleet on a Mac holding a codex login: one more line under its detail.
+            // See ``codexSeeds(for:)``.
+            ("07b-empty-fleet-codex-login", .loaded(fleet("[]")), false, nil),
+            // A proxy serving the JS leaf, which cannot pool codex: the Codex line says why.
+            (
+                "26-codex-not-pooled-banner",
+                .loaded(
+                    fleet(
+                        codexRows(
+                            [.bob, .dana],
+                            extra: ["codexRoute": jsLeafRoute, "codexTraffic": quietCodexTraffic]))),
+                false, nil
+            ),
+            // The canonical refusals, while this Mac shares its accounts with trusted Macs.
+            ("26b-codex-refusals-banner", .loaded(fleet(codexRows([.bob, .carol]))), false, nil),
+            // Requests that ran on their own login, the one Codex line drawn dim.
+            (
+                "26c-codex-unpooled-banner",
+                .loaded(
+                    fleet(codexRows([.bob], extra: ["codexTraffic": ["refused10m": 0, "unpooled10m": 3]]))
+                ),
+                false, nil
+            ),
+            // Two codex sessions running and no Codex request reaching tcr for ten minutes.
+            ("26d-codex-no-requests-banner", .loaded(fleet(idleCodexJSON)), false, nil),
+            // The same, on a Mac running Claude Code too: no Claude account, so no Claude line.
+            ("26e-codex-only-no-claude-nag", .loaded(fleet(idleCodexJSON)), false, nil),
+            // A route that is not pooled and refusals at once: only the route's line shows.
+            (
+                "26f-codex-banner-precedence",
+                .loaded(fleet(codexRows([.bob, .dana], extra: ["codexRoute": jsLeafRoute]))),
+                false, nil
+            ),
+            // 26d with no command-line tcr on this Mac: the line names the tcr inside TcrBar.
+            ("26g-codex-no-requests-banner-no-path-tcr", .loaded(fleet(idleCodexJSON)), false, nil),
+            // Scene 22's Claude account beside a Codex account that is serving: the Claude
+            // line names Claude, and no Codex line shows.
+            ("26h-mixed-claude-no-requests-banner", .loaded(fleet(mixedClaudeQuietJSON)), false, nil),
         ]
     }
 
@@ -282,6 +327,50 @@ enum RenderStates {
     private static let noRequestsBannerZeroSince = Date().addingTimeInterval(-600)
     private static let noRequestsBannerRoute = ClaudeRouteRead.Route(
         url: "http://127.0.0.1:9443", source: "settings.json")
+
+    /// The scenes that seed the Claude line's clock, count and route: scene 22,
+    /// and the two Codex scenes that show what that line does beside a Codex
+    /// account.
+    private static let claudeBannerScenes: Set<String> = [
+        "22-no-requests-banner", "26e-codex-only-no-claude-nag",
+        "26h-mixed-claude-no-requests-banner",
+    ]
+
+    /// What a scene tells the panel about codex on this Mac and about its Codex
+    /// line's inputs. The harness never reads the process table, the clock, the
+    /// peers file, the bundle or the disk for these, so a scene that needs one
+    /// names it here.
+    private struct CodexSeeds {
+        var codexCount: Int?
+        var codexZeroSince: Date?
+        var peerSharing: Bool?
+        var presence: CodexPresence = .absent
+        var home: String?
+        var bundledTcr: String?
+    }
+
+    /// The seeds for one scene: none, the panel's own default, for every scene
+    /// but these.
+    private static func codexSeeds(for sceneName: String) -> CodexSeeds {
+        switch sceneName {
+        case "07b-empty-fleet-codex-login":
+            return CodexSeeds(
+                presence: CodexPresence(codexHome: "/Users/example/.codex", hasLoginFile: true),
+                home: "/Users/example")
+        case "26b-codex-refusals-banner":
+            return CodexSeeds(peerSharing: true)
+        case "26d-codex-no-requests-banner":
+            return CodexSeeds(codexCount: 2, codexZeroSince: noRequestsBannerZeroSince)
+        case "26e-codex-only-no-claude-nag":
+            return CodexSeeds(codexCount: 1, codexZeroSince: noRequestsBannerZeroSince)
+        case "26g-codex-no-requests-banner-no-path-tcr":
+            return CodexSeeds(
+                codexCount: 2, codexZeroSince: noRequestsBannerZeroSince,
+                bundledTcr: "/Applications/TcrBar.app/Contents/MacOS/tcr")
+        default:
+            return CodexSeeds()
+        }
+    }
 
     /// The ``UpdateState`` a scene's `Updater` should report, or `nil` for
     /// every scene not about the update row — the same by-name lookup
@@ -707,6 +796,10 @@ enum RenderStates {
             UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
         }
 
+        // Computed once, so the panel drawn with a pin and without it carry the
+        // same seeds.
+        let seeds = codexSeeds(for: scene.name)
+
         // A closure over the hover pin, so a scene that pins a hover card can
         // also be drawn without it and the two compared
         // (``hoverCardKeepsPanelSize(without:with:named:)``).
@@ -735,8 +828,9 @@ enum RenderStates {
                 groupController: GroupController(),
                 removeController: removeControllerFixture(for: scene.name),
                 startServerAtLaunch: .constant(false),
-                // `.absent` in every render: render mode never looks at this Mac's codex.
-                codexPresence: .absent,
+                // Render mode never looks at this Mac's codex: `.absent`, except in
+                // the one scene that names a presence of its own.
+                codexPresence: seeds.presence,
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
                 initialSessionFiles: sessionFilesFixture(for: scene.name),
@@ -744,11 +838,16 @@ enum RenderStates {
                 initialRunningProcesses: runningProcessesFixture(
                     for: scene.name, state: scene.state),
                 initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name),
-                initialZeroRequestsSince: scene.name == "22-no-requests-banner"
+                initialZeroRequestsSince: claudeBannerScenes.contains(scene.name)
                     ? noRequestsBannerZeroSince : nil,
-                initialClaudeCount: scene.name == "22-no-requests-banner" ? 1 : nil,
-                initialClaudeRoute: scene.name == "22-no-requests-banner"
+                initialClaudeCount: claudeBannerScenes.contains(scene.name) ? 1 : nil,
+                initialClaudeRoute: claudeBannerScenes.contains(scene.name)
                     ? noRequestsBannerRoute : nil,
+                initialCodexCount: seeds.codexCount,
+                initialCodexZeroRequestsSince: seeds.codexZeroSince,
+                initialPeerSharing: seeds.peerSharing,
+                initialHomeDirectory: seeds.home,
+                initialBundledTcrWithoutCLI: seeds.bundledTcr,
                 initialHoverCard: hoverCard,
                 initialLitAccount: litAccount,
                 initialKeptOpen: keptOpenFixture(for: scene.name)
@@ -768,11 +867,12 @@ enum RenderStates {
         let litAccount = litAccountFixture(for: scene.name)
         let view = panel(hoverCard, litAccount)
 
-        // The shipped default stays unsuffixed — every existing filename this
-        // harness produces is unchanged — and only the forced `.comfortable`
-        // variant gets `-comfortable`, per `densityVariantScenes`. Computed
-        // here rather than in `rasterise`, which is shared with the sheet
-        // scenes and has no density of its own.
+        // The main pass is `.auto`, the shipped default, so its files are
+        // `<scene>-auto-<appearance>.png`; the forced `.comfortable` variant's
+        // are `<scene>-comfortable-<appearance>.png`, per
+        // `densityVariantScenes`. Only a `.compact` render, which no pass asks
+        // for, would be unsuffixed. Computed here rather than in `rasterise`,
+        // which is shared with the sheet scenes and has no density of its own.
         let name =
             density == .compact
             ? "\(scene.name)-\(appearance.rawValue).png"
@@ -3002,7 +3102,14 @@ enum RenderStates {
     /// an offline `nil`), and zero requests served: the colleague's fleet
     /// this feature exists for.
     private static var zeroRequestsJSON: String {
-        "[\(account("colleague@example.com", quota: "0.0", state: "ok", source: "live", plan: "Team Standard", orgUuid: "33333333-3333-3333-3333-333333333333", requests: 0))]"
+        "[\(colleagueRow)]"
+    }
+
+    /// Scene 22's one account: live, and at zero requests.
+    private static var colleagueRow: String {
+        account(
+            "colleague@example.com", quota: "0.0", state: "ok", source: "live", plan: "Team Standard",
+            orgUuid: "33333333-3333-3333-3333-333333333333", requests: 0)
     }
 
     /// F1's wire shape, attached to
@@ -3953,16 +4060,24 @@ extension RenderStates {
     /// row, which reports no Codex traffic at all.
     private static let quietCodexTraffic: [String: Any] = ["refused10m": 0, "unpooled10m": 0]
 
-    /// Scene `24-mixed-fleet`, at the real clock: Claude's two accounts both out of tokens,
-    /// and Codex's two split.
+    /// Scene `24-mixed-fleet`, at the real clock: Claude's two accounts both out of tokens
+    /// (``mixedClaudeRows(now:)``), and Codex's two split: bob is ready and carol is held on
+    /// her week, both canonical, with quiet traffic.
+    private static var mixedFleetJSON: String {
+        let now = Date()
+        let bob = codexRow(.bob, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        let carol = codexRow(.carol, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        return "[\((mixedClaudeRows(now: now) + [bob, carol]).joined(separator: ","))]"
+    }
+
+    /// Scene `24-mixed-fleet`'s two Claude accounts, both out of tokens, which scene
+    /// `24d-mixed-codex-all-parked` draws too.
     ///
     /// - alice is the canonical row with her 5-hour window full and held, her week at 41%,
     ///   and in no group.
     /// - frank is a second Claude account: his 5-hour window at 22%, his week spent and
     ///   held, and alice's day of usage, so the money line totals two of her days.
-    /// - bob is ready and carol is held on her week, both canonical, with quiet traffic.
-    private static var mixedFleetJSON: String {
-        let now = Date()
+    private static func mixedClaudeRows(now: Date) -> [String] {
         func atMs(_ minutes: Int) -> Int64 {
             Int64((now.timeIntervalSince1970 + Double(minutes) * 60) * 1000)
         }
@@ -3982,9 +4097,75 @@ extension RenderStates {
             fiveHourResetInMinutes: 250, sevenDayResetInMinutes: 4320,
             sevenDayOi: "0.40", sevenDayOiState: "ok", usage: frankUsage(now: now),
             plan: "Max 20x", now: now)
-        let bob = codexRow(.bob, now: now, extra: ["codexTraffic": quietCodexTraffic])
-        let carol = codexRow(.carol, now: now, extra: ["codexTraffic": quietCodexTraffic])
-        return "[\(alice),\(frank),\(bob),\(carol)]"
+        return [alice, frank]
+    }
+
+    /// Scene `24b-mixed-fleet-compact`, at the real clock: seven accounts, so `.auto` draws
+    /// it compact. Claude's are nina (near her 5-hour limit), grace (switched off), henry and
+    /// canonical alice, both in ORCHARD; Codex's are bob, erin (signed out) and ivy, in
+    /// ORCHARD too, with quiet traffic. ORCHARD holds members of both providers, so it is
+    /// drawn once under each head.
+    private static var mixedFleetCompactJSON: String {
+        let now = Date()
+        let claude = [
+            account(
+                "nina@example.com", quota: "0.91", state: "near", fiveHour: "0.91",
+                fiveHourState: "near", sevenDay: "0.25", sevenDayState: "ok",
+                fiveHourResetInMinutes: 72, sevenDayResetInMinutes: 7200, plan: "Max 5x",
+                orgUuid: "44444444-4444-4444-8444-444444444444"),
+            account(
+                "grace@example.com", quota: "0.12", state: "ok", disabled: true, fiveHour: "0.08",
+                sevenDay: "0.12", fiveHourResetInMinutes: 181, sevenDayResetInMinutes: 8640,
+                plan: "Max 20x", orgUuid: "55555555-5555-4555-8555-555555555555", requests: 0),
+            account(
+                "henry@example.com", quota: "0.30", state: "ok", fiveHour: "0.30", sevenDay: "0.15",
+                fiveHourResetInMinutes: 100, sevenDayResetInMinutes: 5760, groups: ["orchard"],
+                groupColors: ["orchard": "#30d158"], plan: "Team 5x",
+                orgUuid: "66666666-6666-4666-8666-666666666666"),
+            codexRow(.alice, now: now),
+        ]
+        let codex = [CanonicalCodexRow.bob, .erin, .ivy].map {
+            codexRow($0, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        }
+        return "[\((claude + codex).joined(separator: ","))]"
+    }
+
+    /// Scene `24d-mixed-codex-all-parked`: scene 24's two Claude accounts, and bob and carol
+    /// switched off. No Codex account can serve, so no Codex line can show, and the rows
+    /// need no quiet traffic.
+    private static var mixedCodexAllParkedJSON: String {
+        let now = Date()
+        let codex = [CanonicalCodexRow.bob, .carol].map {
+            codexRow($0, now: now, extra: ["disabled": true])
+        }
+        return "[\((mixedClaudeRows(now: now) + codex).joined(separator: ","))]"
+    }
+
+    /// The canonical `rows` at the real clock, each with `extra` laid over it, as one scene's
+    /// array. Unlike ``codexScene(_:)``, each row keeps the fixture's traffic, twelve
+    /// refusals, unless `extra` lays its own: these scenes are about the Codex line.
+    private static func codexRows(_ rows: [CanonicalCodexRow], extra: [String: Any] = [:]) -> String {
+        let now = Date()
+        return "[\(rows.map { codexRow($0, now: now, extra: extra) }.joined(separator: ","))]"
+    }
+
+    /// The route of a proxy serving the JS teamclaude leaf, which cannot pool codex, in the
+    /// words `tcr status --json` gives it.
+    private static let jsLeafRoute: [String: Any] = [
+        "pooled": false, "code": "js-leaf",
+        "reason":
+            "the proxy on :3456 is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md",
+    ]
+
+    /// Scenes `26d`, `26e` and `26g`: bob and dana at zero requests, with quiet traffic.
+    private static var idleCodexJSON: String {
+        codexRows([.bob, .dana], extra: ["requests": 0, "codexTraffic": quietCodexTraffic])
+    }
+
+    /// Scene `26h`: scene 22's live Claude account at zero requests, beside canonical bob,
+    /// who has served 42, with quiet traffic.
+    private static var mixedClaudeQuietJSON: String {
+        "[\(colleagueRow),\(codexRow(.bob, now: Date(), extra: ["codexTraffic": quietCodexTraffic]))]"
     }
 
     /// frank's `usage`: canonical alice's, so his day is hers, with his own window on his

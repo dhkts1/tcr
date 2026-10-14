@@ -229,6 +229,42 @@ final class FleetStripTests: XCTestCase {
         XCTAssertNotNil(alice.sevenDay)
         XCTAssertEqual(StripSegmentKind(alice), .off)
     }
+
+    // MARK: - Two pools
+
+    /// In a fleet holding both providers the tab draws Claude's list first, so the strip
+    /// reads Claude's segments, then Codex's, each in its own list's order, and the second
+    /// pool starts at the first Codex segment.
+    func testAMixedFleetsSegmentsRunClaudeThenCodex() throws {
+        let strip = try poolStrip(try canonicalFleet())
+        XCTAssertEqual(
+            strip.segments.map(\.id),
+            [
+                "alice@example.com", "bob@example.com/codex", "dana@example.com",
+                "erin@example.com/codex", "gil@example.com", "hal@example.com", "jo@example.com",
+                "carol@example.com", "ivy@example.com", "kim@example.com",
+            ])
+        XCTAssertEqual(strip.poolBreak, 1)
+    }
+
+    /// Only a fleet of both providers has a break: a Claude-only fleet's strip is the one it
+    /// always drew, and a Codex-only fleet has one pool.
+    func testOnlyAFleetOfBothProvidersBreaksTheStrip() throws {
+        XCTAssertNil(strip(mixed).poolBreak)
+        let codexOnly = try decodeFleet(
+            ["bob@example.com/codex", "dana@example.com", "carol@example.com", "erin@example.com/codex"]
+                .map { try canonicalRow($0) })
+        XCTAssertNil(try poolStrip(codexOnly).poolBreak)
+    }
+
+    /// The strip the tab builds for a fleet holding Codex accounts: its rows from the
+    /// per-provider lists, in draw order, with nothing open and nothing kept as a card.
+    private func poolStrip(_ fleet: Fleet) throws -> FleetStrip {
+        let rows = try XCTUnwrap(fleet.accountsTabSectionsByProvider(expandedGroups: []))
+            .flatMap(\.sections)
+            .rowsInDrawOrder(expandedGroups: [], parkedCap: 2) { _ in false }
+        return FleetStrip(drawnRows: rows, now: fixtureNow)
+    }
 }
 
 private func hold(_ window: String, _ resetAtMs: Int64) -> HeldWindow {
@@ -296,6 +332,19 @@ private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) thro
 
 private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
     try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// 2026-01-01T00:00:00Z: the clock every canonical timestamp is written against.
+private let fixtureNow = Date(timeIntervalSince1970: 1_767_225_600)
+
+/// All ten canonical rows: alice (Claude, in orchard) and nine Codex rows.
+private func canonicalFleet() throws -> Fleet {
+    try decodeFleet(
+        [
+            "alice@example.com", "bob@example.com/codex", "carol@example.com", "dana@example.com",
+            "erin@example.com/codex", "gil@example.com", "hal@example.com", "ivy@example.com",
+            "jo@example.com", "kim@example.com",
+        ].map { try canonicalRow($0) })
 }
 
 /// The canonical row, decoded, failing the test if it does not decode.

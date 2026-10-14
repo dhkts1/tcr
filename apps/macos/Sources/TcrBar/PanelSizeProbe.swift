@@ -106,7 +106,8 @@ enum PanelSizeProbe {
 
     /// `Tok`'s figures, passed in rather than read from the library — `Tok`
     /// lives in this target and `TcrBarCore` cannot see it, which is what keeps
-    /// the arithmetic testable without linking a view.
+    /// the arithmetic testable without linking a view. A provider head is the
+    /// line box of `SectionHead`'s own size, as the Accounts tab draws it.
     static let geometry = PanelSize.Geometry(
         panelWidth: Tok.panelWidth,
         gutter: Tok.gutter,
@@ -115,7 +116,8 @@ enum PanelSizeProbe {
         rowSpacing: Tok.rowSpacing,
         hairlineWidth: Tok.hairlineWidth,
         rowHeight: estimatedRowHeight,
-        fixedControlsHeight: estimatedFixedControlsHeight
+        fixedControlsHeight: estimatedFixedControlsHeight,
+        sectionHeadHeight: V4.lineHeight(V4.sectionHeadSize)
     )
 
     /// The chrome strings the HEADER is drawing right now — the same
@@ -184,8 +186,14 @@ enum PanelSizeProbe {
             if case .loaded(let fleet) = state { return fleet.accounts.count }
             return 0
         }()
+        // A head over each provider's list, in a fleet holding both.
+        let sectionHeads: Int = {
+            if case .loaded(let fleet) = state { return PanelSize.sectionHeadCount(for: fleet) }
+            return 0
+        }()
         let plan = PanelSize.plan(
             rowCount: rowCount,
+            sectionHeads: sectionHeads,
             header: header,
             footer: footer,
             geometry: geometry,

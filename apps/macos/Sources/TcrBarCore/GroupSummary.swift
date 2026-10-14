@@ -24,16 +24,28 @@ public struct GroupSummary: Equatable, Sendable, Identifiable {
     /// `nil` when no member carries a colour for this group — the neutral
     /// fallback every other group-colour reader in this app already uses.
     public let colorHex: String?
+    /// How many of ``memberCount`` are Codex accounts. A group may hold
+    /// accounts of both providers; the Accounts tab then draws it once in each
+    /// provider's list, and Settings can say so.
+    public let codexMemberCount: Int
 
     public init(
-        name: String, memberCount: Int, isParked: Bool, isReserved: Bool, colorHex: String?
+        name: String, memberCount: Int, isParked: Bool, isReserved: Bool, colorHex: String?,
+        codexMemberCount: Int = 0
     ) {
         self.name = name
         self.memberCount = memberCount
         self.isParked = isParked
         self.isReserved = isReserved
         self.colorHex = colorHex
+        self.codexMemberCount = codexMemberCount
     }
+
+    /// How many of ``memberCount`` are Claude accounts.
+    public var claudeMemberCount: Int { memberCount - codexMemberCount }
+
+    /// Whether the group holds accounts of both providers.
+    public var spansBothProviders: Bool { codexMemberCount > 0 && claudeMemberCount > 0 }
 
     /// Every group name any account in `accounts` carries, each summarised
     /// once. Sorted by name so the pane's row order is stable across polls —
@@ -61,7 +73,8 @@ public struct GroupSummary: Equatable, Sendable, Identifiable {
                 // pane should not paper over by picking `all`.
                 isParked: !parkedMembers.isEmpty,
                 isReserved: !reservedMembers.isEmpty,
-                colorHex: color
+                colorHex: color,
+                codexMemberCount: members.filter { $0.provider == .codex }.count
             )
         }
     }

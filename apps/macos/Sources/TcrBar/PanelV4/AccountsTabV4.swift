@@ -15,12 +15,22 @@ import TcrBarCore
 /// `HENRY-TOKEN · PARKED` with its member cards, then the collapsed
 /// `ORCHARD · ACTIVE` — and it is a rule, not a transcription: a box holding
 /// one line is a lid, and a lid between two open boxes reads as the end of the
-/// list.
+/// list. The rule lives in the library (``Fleet/accountsTabSections(pinning:expandedGroups:)``),
+/// so the strip reads the same order.
+///
+/// In a fleet holding both providers the tab is two lists, CLAUDE then CODEX,
+/// each under its own head and each in that order
+/// (``Fleet/accountsTabSectionsByProvider(pinning:expandedGroups:)``): what can
+/// serve Claude Code and what can serve codex are two questions, and a group
+/// with members of both is drawn once in each list. A fleet of one provider
+/// draws one list and no head.
 struct AccountsTabV4<Menu: View, Actions: View>: View {
     let fleet: Fleet
     let controlName: String?
-    /// Group tokens the operator has opened. Same store the pre-v4 panel used,
-    /// so a group left open stays open across this migration.
+    /// The expansion keys of the groups the operator has opened
+    /// (``FleetSection/expansionKey``). A Claude box's key is its group's token,
+    /// the store the pre-v4 panel used, so a group left open stays open; a
+    /// Codex box's key is its own, so opening one box does not open the other.
     let expandedGroups: Set<String>
     let onToggleGroup: (String) -> Void
     let now: Date
@@ -82,9 +92,16 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     static var parkedVisibleRows: Int { 2 }
 
     /// ``Fleet/accountsTabSections(pinning:expandedGroups:)``, the order the
-    /// strip's segments read too.
+    /// strip's segments read too: the one list a fleet without Codex draws.
     private var sections: [FleetSection] {
         fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
+    }
+
+    /// The tab's lists, Claude first: one per provider in a fleet holding Codex,
+    /// and ``sections`` as the one list otherwise.
+    private var lists: [ProviderSections] {
+        fleet.accountsTabSectionsByProvider(pinning: controlName, expandedGroups: expandedGroups)
+            ?? [ProviderSections(provider: .anthropic, sections: sections)]
     }
 
     /// A group the operator has not opened and that the fleet says collapses by
@@ -101,25 +118,62 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit],
         keptOpen: KeptOpenCards, now: Date
     ) -> FleetStrip {
+        // In a fleet holding Codex the lists run Claude's, then Codex's, as the
+        // tab draws them.
+        let sections =
+            fleet.accountsTabSectionsByProvider(pinning: controlName, expandedGroups: expandedGroups)?
+            .flatMap(\.sections)
+            ?? fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
         // A kept-open card is drawn in its line's own place, so only the tall
         // card moves a row to the end of its section.
-        let rows = fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
-            .rowsInDrawOrder(expandedGroups: expandedGroups, parkedCap: parkedVisibleRows) {
-                form($0, lentTo: lentTo, exits: exits, keptOpen: keptOpen) == .card
-            }
+        let rows = sections.rowsInDrawOrder(
+            expandedGroups: expandedGroups, parkedCap: parkedVisibleRows
+        ) {
+            form($0, lentTo: lentTo, exits: exits, keptOpen: keptOpen) == .card
+        }
         return FleetStrip(drawnRows: rows, now: now, pools: fleet.providerPools(now: now))
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                if section.group == .ungrouped {
-                    looseLines(section, first: index == 0)
-                } else {
-                    group(section, first: index == 0)
+            ForEach(Array(lists.enumerated()), id: \.element.provider.token) { place, list in
+                let head = fleet.sectionHead(for: list.provider)
+                if let head {
+                    providerHead(head, leadsTheTab: place == 0)
+                }
+                ForEach(Array(list.sections.enumerated()), id: \.element.id) { index, section in
+                    let after = marginAbove(index, headed: head != nil)
+                    if section.group == .ungrouped {
+                        looseLines(section, after: after)
+                    } else {
+                        group(section, after: after)
+                    }
                 }
             }
         }
+    }
+
+    /// The bottom margin of what a list's first block follows: the strip's, or the head's.
+    /// `nil` for every later block, which its predecessor's own 8 pt bottom already spaces.
+    private func marginAbove(_ index: Int, headed: Bool) -> CGFloat? {
+        guard index == 0 else { return nil }
+        return headed ? V4.sectionHeadMarginBottom : V4.segMarginBottom
+    }
+
+    /// `CLAUDE · 4 accounts`: the head over one provider's list, in a fleet holding
+    /// both. Mute and untinted, as every section head is; VoiceOver reads it as one
+    /// header, without the dot the unit draws.
+    private func providerHead(_ head: ProviderSectionHead, leadsTheTab: Bool) -> some View {
+        // Collapses into the strip's margin above the first list, and into the last block's
+        // 8 pt (`lineBoxMarginBottom`, equal to `groupMarginBottom`) above the second.
+        let top = V4.marginAfter(
+            V4.sectionHeadMarginTop,
+            previous: leadsTheTab ? V4.segMarginBottom : V4.lineBoxMarginBottom)
+        return SectionHead(title: head.title, unit: head.unit)
+            .accessibilityLabel(head.spoken)
+            .padding(.horizontal, V4.sectionHeadMarginSide)
+            .padding(.top, top)
+            .padding(.bottom, V4.sectionHeadMarginBottom)
     }
 
     /// The ungrouped accounts of one band, one line each (option H, Gil
@@ -136,9 +190,10 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// card instead of a line (``FleetSectionRow/form(carriesLease:carriesExit:)``
     /// has the ruling and its reason).
     @ViewBuilder
-    private func looseLines(_ section: FleetSection, first: Bool) -> some View {
+    private func looseLines(_ section: FleetSection, after: CGFloat?) -> some View {
         let lines = section.rows.filter { form($0) != .card }
         let cards = section.rows.filter { form($0) == .card }
+        let top = after.map { V4.marginAfter(V4.cardGap, previous: $0) } ?? .zero
         VStack(alignment: .leading, spacing: 0) {
             if section.band != .live {
                 BandHeading(section: section, now: now)
@@ -156,9 +211,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 .padding(.bottom, V4.lineBoxMarginBottom)
             }
         }
-        // The first block under the tab strip collapses its margin into the
-        // strip's, as a card there always has.
-        .padding(.top, first ? V4.marginAfterStrip(V4.cardGap) : .zero)
+        // The first block under the tab strip or a head collapses its margin
+        // into theirs, as a card there always has.
+        .padding(.top, top)
     }
 
     /// The one-line rows of a section, with each kept-open account's card in
@@ -279,7 +334,8 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// (lead ruling on H1b, 2026-10-14). Measured over the live lines that are
     /// drawn: a group closed to its summary line has none, and counting its
     /// members would truncate the names on screen to make room for lines that
-    /// are not.
+    /// are not. In a fleet holding both providers it spans both lists, so the
+    /// bars under the CODEX head start where the ones under CLAUDE do.
     ///
     /// The signals of the same lines size the column at the right, and what a
     /// short one leaves goes to the names (lead ruling, 2026-10-14).
@@ -293,7 +349,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         var grouped: [String]?
         var signals: [String] = []
         var labels = AccountLineFit.labels
-        for section in sections where !isSummarised(section) {
+        for section in lists.flatMap(\.sections) where !isSummarised(section) {
             for row in section.rows where form(row) == .liveLine {
                 let name = AccountName.localPart(row.account.name)
                 if section.group == .ungrouped {
@@ -386,8 +442,10 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     }
 
     @ViewBuilder
-    private func group(_ section: FleetSection, first: Bool) -> some View {
-        let expanded = expandedGroups.contains(section.group.token)
+    private func group(_ section: FleetSection, after: CGFloat?) -> some View {
+        let expanded = expandedGroups.contains(section.expansionKey)
+        let top =
+            after.map { V4.marginAfter(V4.groupMarginTop, previous: $0) - V4.groupMarginTop } ?? .zero
         let summarised = isSummarised(section)
         let capped = section.isWhollyParked && !expanded
         let visible =
@@ -408,7 +466,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 } trailing: {
                     HStack(spacing: V4.pillGap) {
                         ForEach(section.breakdown, id: \.kind.token) { tally in
-                            V4Pill(text: tally.label, role: pillRole(tally.kind))
+                            V4Pill(text: section.tallyLabel(tally), role: pillRole(tally.kind))
                         }
                         // The control account can be a member of a group
                         // small enough to collapse. Its own card is gone —
@@ -470,16 +528,17 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     help: expanded
                         ? "Collapses this group again."
                         : "Shows every account in this group."
-                ) { onToggleGroup(section.group.token) }
+                ) { onToggleGroup(section.expansionKey) }
                 .padding(.bottom, V4.groupCardGap)
             }
         }
         // A group that leads the tab collapses its own 20 pt top margin with the
-        // strip's 12 the same way a card does. ``GroupBox`` has already applied
-        // the full margin, so the collapse is the difference — negative, and it
-        // is a subtraction rather than a parameter because the margin belongs to
-        // the group, not to whoever happens to draw it first.
-        .padding(.top, first ? V4.marginAfterStrip(V4.groupMarginTop) - V4.groupMarginTop : 0)
+        // strip's 12 the same way a card does, and one that leads a list collapses
+        // it with the head's 4. ``GroupBox`` has already applied the full margin,
+        // so the collapse is the difference — negative, and it is a subtraction
+        // rather than a parameter because the margin belongs to the group, not to
+        // whoever happens to draw it first.
+        .padding(.top, top)
     }
 
     /// Whether this group has a disclosure at all — whether it has ever hidden

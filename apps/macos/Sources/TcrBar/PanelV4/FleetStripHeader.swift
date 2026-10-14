@@ -16,7 +16,9 @@ import TcrBarCore
 /// the one headline (``StripPoolLine``), Claude first: a Claude account and a
 /// Codex account serve different clients, and one folded count would hide a
 /// pool with nothing left. Each extra row grows the panel by one headline
-/// line; the list keeps its own budget.
+/// line; the list keeps its own budget. A fleet holding both providers also
+/// leaves a wider gap between Claude's segments and Codex's
+/// (``FleetStrip/poolBreak``), where the tab's two lists meet.
 ///
 /// The frame's week line, "login ends in", "reading 40m old" and faded
 /// segments wait for data `tcr` does not send yet, and are absent.
@@ -119,7 +121,10 @@ struct FleetStripHeader: View {
 
     private var segments: some View {
         HStack(spacing: V4.stripGap) {
-            ForEach(strip.segments) { segment in
+            ForEach(Array(strip.segments.enumerated()), id: \.element.id) { index, segment in
+                if index == strip.poolBreak {
+                    Color.clear.frame(width: V4.stripPoolSpacer)
+                }
                 StripSegmentView(kind: segment.kind, ringed: lit == segment.id)
                     .contentShape(Rectangle())
                     .onHover { inside in

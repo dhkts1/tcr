@@ -289,4 +289,54 @@ final class ProcessStatsTests: XCTestCase {
         let shell = process(pid: 48765, parent: 31389, group: 48700, startOffset: 0.2)
         XCTAssertEqual(ProcessKill.target(matched: shell, sessionPid: 31389), .success(48700))
     }
+
+    // MARK: - The codex sessions running on this Mac
+
+    /// The native binary is named `codex`; nothing else in the table counts, and no process
+    /// but a `node` one has its arguments read.
+    func testANativeCodexProcessCounts() {
+        var asked: [Int32] = []
+        let arguments: (Int32) -> [String]? = { pid in
+            asked.append(pid)
+            return nil
+        }
+        let one = [process(pid: 10, parent: 1, name: "codex"), process(pid: 11, parent: 1, name: "zsh")]
+        XCTAssertEqual(CodexProcesses.count(in: one, arguments: arguments), 1)
+        let two = one + [process(pid: 12, parent: 1, name: "codex")]
+        XCTAssertEqual(CodexProcesses.count(in: two, arguments: arguments), 2)
+        XCTAssertEqual(asked, [], "a process that is not node had its arguments read")
+    }
+
+    /// The npm package runs as `node` with the shim's path as an argument, and starts the
+    /// native binary as its child: one session, counted once.
+    func testANodeShimWithACodexArgumentCounts() {
+        let shim = process(pid: 20, parent: 1, name: "node")
+        let argv: [Int32: [String]] = [
+            20: ["node", "/Users/example/.npm-global/bin/codex", "exec", "hello"]
+        ]
+        XCTAssertEqual(CodexProcesses.count(in: [shim], arguments: { argv[$0] }), 1)
+        let child = process(pid: 21, parent: 20, name: "codex")
+        XCTAssertEqual(
+            CodexProcesses.count(in: [shim, child], arguments: { argv[$0] }), 1,
+            "the shim's native child was counted as a second session")
+    }
+
+    /// Any other `node` is not codex: another script, a bare word, a name that only starts
+    /// with codex, an unreadable argument list, and a path ending in `/codex` that is only
+    /// the program name. A miss draws no banner; a false match would draw a false one.
+    func testAnyOtherNodeProcessDoesNot() {
+        let node = process(pid: 30, parent: 1, name: "node")
+        let others: [[String]?] = [
+            ["node", "/Users/example/app/server.js"],
+            ["node", "codex"],
+            ["node", "/Users/example/bin/codex-helper"],
+            nil,
+            ["/Users/example/bin/codex"],
+        ]
+        for argv in others {
+            XCTAssertEqual(
+                CodexProcesses.count(in: [node], arguments: { _ in argv }), 0,
+                "node \(argv.map { $0.joined(separator: " ") } ?? "(unreadable)") counted as codex")
+        }
+    }
 }

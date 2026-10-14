@@ -34,8 +34,10 @@ struct FleetView: View {
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
     /// What this Mac shows of codex, decided by the caller once per panel open.
-    /// Nothing reads it yet. It is a parameter for the same reason
-    /// ``snapshotMode`` is: the render harness passes `.absent`.
+    /// The empty fleet reads it for its one Codex line
+    /// (``CodexPresence/emptyFleetHint(home:)``). It is a parameter for the same
+    /// reason ``snapshotMode`` is: the render harness passes `.absent`, except in
+    /// the one scene that names its own.
     let codexPresence: CodexPresence
 
     /// Render the account list unscrolled, for the PNG harness only.
@@ -229,6 +231,28 @@ struct FleetView: View {
     /// so `body` never touches disk. See ``ClaudeRouteRead``.
     @State private var claudeRoute: ClaudeRouteRead.Route?
 
+    /// The running codex sessions (``CodexProcesses``), read only while the
+    /// fleet holds a Codex account, so a Claude-only fleet never pays for the
+    /// walk. `nil` before the first read, and whenever the fleet holds none.
+    @State private var codexCount: Int?
+
+    /// When this app first saw the Codex accounts that can serve at zero
+    /// requests, on a live read, in a row: ``zeroRequestsSince``'s clock for the
+    /// Codex line (``CodexBanner/codexRequests(_:)``).
+    @State private var codexZeroRequestsSince: Date?
+
+    /// Whether this Mac shares its accounts with trusted Macs, for the Codex
+    /// refusal line, when the render harness names it; `nil` reads the peers
+    /// controller.
+    private let peerSharingSeed: Bool?
+
+    /// The home folder a Codex path is shortened against, as `~`.
+    private let homeDirectory: String
+
+    /// The tcr inside TcrBar when this Mac has no other, for the Codex line that
+    /// says to start codex with `tcr run --codex`; `nil` while unknown.
+    private let bundledTcrSeed: String?
+
     /// The kill a confirm is currently open for, `nil` when none is.
     ///
     /// The request holds what the DIALOG needs to name — the command and the
@@ -297,6 +321,23 @@ struct FleetView: View {
         initialZeroRequestsSince: Date? = nil,
         initialClaudeCount: Int? = nil,
         initialClaudeRoute: ClaudeRouteRead.Route? = nil,
+        // Seeded for the same reason as the three above, for the Codex line:
+        // the render harness never reads the process table or the real clock, so
+        // without these no scene can be five minutes into a quiet Codex pool with
+        // codex running.
+        initialCodexCount: Int? = nil,
+        initialCodexZeroRequestsSince: Date? = nil,
+        // Seeded because the harness never reads the peers file: the one scene
+        // whose refusal line says trusted Macs cannot serve Codex requests names
+        // the sharing it draws. `nil`, the live app's value, reads the controller.
+        initialPeerSharing: Bool? = nil,
+        // The home a Codex path is shortened against. The harness never names
+        // the real home: `nil`, the live app's value, reads ``HomePath/current``.
+        initialHomeDirectory: String? = nil,
+        // The tcr inside TcrBar when no other is found, which the Codex line
+        // names. Seeded because a render never reads the bundle or the disk for
+        // it; the live app resolves it beside ``codexPresence``.
+        initialBundledTcrWithoutCLI: String? = nil,
         // The row (``FleetSectionRow/id``) whose hover card shows on the first
         // frame. The render harness has no pointer, so this is the only way it
         // can draw the card; the live app leaves it `nil` and the pointer
@@ -334,6 +375,11 @@ struct FleetView: View {
         self._zeroRequestsSince = State(initialValue: initialZeroRequestsSince)
         self._claudeCount = State(initialValue: initialClaudeCount)
         self._claudeRoute = State(initialValue: initialClaudeRoute)
+        self._codexCount = State(initialValue: initialCodexCount)
+        self._codexZeroRequestsSince = State(initialValue: initialCodexZeroRequestsSince)
+        self.peerSharingSeed = initialPeerSharing
+        self.homeDirectory = initialHomeDirectory ?? HomePath.current
+        self.bundledTcrSeed = initialBundledTcrWithoutCLI
         self._hoverCard = State(initialValue: HoverCardTracker(shown: initialHoverCard))
         self._litAccount = State(initialValue: initialLitAccount)
         self._keptOpen = State(
@@ -369,6 +415,7 @@ struct FleetView: View {
                 refreshRunningProcesses()
                 refreshClaudeCount()
                 claudeRoute = ClaudeRouteRead.current()
+                refreshCodexCount()
             }
         }
         .onChange(of: poller.lastPollAt) { _ in
@@ -379,6 +426,8 @@ struct FleetView: View {
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
+                refreshCodexCount()
+                refreshCodexZeroRequestsSince()
                 pruneKeptOpenCards()
             }
         }
@@ -543,6 +592,27 @@ struct FleetView: View {
         }
     }
 
+    /// The one Codex line, under the Claude one and built the same way: amber
+    /// when it asks for action, dim when it only reports. Every input is what
+    /// this panel measured or the harness seeded. See ``CodexBanner``.
+    @ViewBuilder
+    private func codexBanner(_ fleet: Fleet) -> some View {
+        if let banner = CodexBanner.current(
+            fleet: fleet, codexProcesses: codexCount,
+            codexQuietFor: codexZeroRequestsSince.map { Date().timeIntervalSince($0) },
+            peerSharing: peerSharingSeed ?? peers.snapshot.sharing,
+            bundledTcrWithoutCLI: bundledTcrSeed)
+        {
+            Text(banner.text)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(banner.tint == .near ? Tok.near : Tok.dim)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, V4.summaryPaddingSide)
+                .padding(.bottom, V4.summaryPaddingBottom)
+                .accessibilityLabel(banner.text)
+        }
+    }
+
     /// Is there a fleet to draw tabs over? `.loaded` with at least one account
     /// — the exact case ``v4Content`` gives a tab body to. Every other state
     /// (pending, tool missing, command failed, undecodable, empty fleet) falls
@@ -610,6 +680,7 @@ struct FleetView: View {
                 if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
+                codexBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
             // header at ``header`` has always carried and the v4 summary block
             // dropped: a server that predates the sessions wire reports no
@@ -1346,7 +1417,10 @@ struct FleetView: View {
                         icon: Tok.unreadableGlyph,
                         title: "No accounts configured",
                         detail: "tcr answered, and the fleet is empty. Add one to start serving.",
-                        tint: Tok.unknown
+                        tint: Tok.unknown,
+                        // Only on evidence of codex: with none there is no line,
+                        // and the empty fleet is the one it always was.
+                        extra: codexPresence.emptyFleetHint(home: homeDirectory)
                     )
                     V4Button(
                         title: "Add account…",
@@ -2331,6 +2405,17 @@ struct FleetView: View {
         claudeCount = ProcessTable.read().filter { $0.name == "claude" }.count
     }
 
+    /// The running codex sessions, off one more walk of the process table, and
+    /// only while the fleet holds a Codex account: a Claude-only fleet never
+    /// pays for it. See ``CodexBanner``.
+    private func refreshCodexCount() {
+        guard case .loaded(let fleet) = poller.state, fleet.holdsCodex else {
+            codexCount = nil
+            return
+        }
+        codexCount = CodexProcesses.readLive()
+    }
+
     /// Drops every kept-open account the poll that just landed no longer
     /// lists, so a card never stays open as a ghost of an account that left.
     /// Only off a loaded fleet: an unreachable proxy says nothing about which
@@ -2367,10 +2452,33 @@ struct FleetView: View {
         }
     }
 
+    /// ``refreshZeroRequestsSince()`` for the Codex line: advances or clears
+    /// ``codexZeroRequestsSince`` off the poll that just landed. The pure check
+    /// is ``CodexBanner/codexRequests(_:)``.
+    private func refreshCodexZeroRequestsSince() {
+        guard case .loaded(let fleet) = poller.state,
+            let total = CodexBanner.codexRequests(fleet)
+        else {
+            codexZeroRequestsSince = nil
+            return
+        }
+        if total > 0 {
+            codexZeroRequestsSince = nil
+        } else if codexZeroRequestsSince == nil {
+            codexZeroRequestsSince = Date()
+        }
+    }
+
     /// The Accounts tab's no-requests banner text, or `nil` when it must not
     /// show. See ``NoRequestsBanner``. Beside a Codex account the proxy does
     /// serve requests, so the sentence names Claude.
+    ///
+    /// In a fleet holding a Codex account the live clock already clears without
+    /// an enabled Claude account; the first guard makes the text say the same to
+    /// a seeded clock. A Claude-only fleet skips the check and draws exactly what
+    /// it drew.
     private func noRequestsBannerText(_ fleet: Fleet) -> String? {
+        guard !fleet.holdsCodex || NoRequestsBanner.totalRequests(fleet) != nil else { return nil }
         guard let since = zeroRequestsSince, let route = claudeRoute else { return nil }
         return NoRequestsBanner.text(
             liveFor: Date().timeIntervalSince(since),
@@ -3130,9 +3238,11 @@ struct FleetView: View {
     /// Persisted across launches under ``expandedGroupsKey`` — a collapsed
     /// group an operator has already opened once should stay open, not
     /// re-collapse on the next poll or the next time the panel opens. Keyed on
-    /// ``FleetGroupKey/token`` rather than the bare name for the same collision
-    /// reason `FleetSectionRow.id` uses it: a group literally named
-    /// `Ungrouped` cannot borrow the sentinel's key.
+    /// ``FleetSection/expansionKey``: a Claude box's key is its group's
+    /// ``FleetGroupKey/token``, as the legacy panel's is, rather than the bare
+    /// name, for the same collision reason `FleetSectionRow.id` uses it — a
+    /// group literally named `Ungrouped` cannot borrow the sentinel's key — and
+    /// a Codex box's key adds `codex:`, so the two boxes of one group open apart.
     ///
     /// ONE set for both collapsed shapes — the parked smoosh and a live
     /// group's summary line. "This group is open" is one fact about one group,
@@ -3146,11 +3256,11 @@ struct FleetView: View {
     /// (`15b-parked-group-expanded`) without a second copy of the literal.
     static let expandedGroupsKey = "expandedGroupNames"
 
-    private func toggleGroupExpansion(_ groupToken: String) {
-        if expandedGroups.contains(groupToken) {
-            expandedGroups.remove(groupToken)
+    private func toggleGroupExpansion(_ key: String) {
+        if expandedGroups.contains(key) {
+            expandedGroups.remove(key)
         } else {
-            expandedGroups.insert(groupToken)
+            expandedGroups.insert(key)
         }
         UserDefaults.standard.set(Array(expandedGroups), forKey: Self.expandedGroupsKey)
     }
@@ -3419,7 +3529,11 @@ struct FleetView: View {
         .foregroundStyle(Tok.offline)
     }
 
-    private func banner(icon: String, title: String, detail: String, tint: Color) -> some View {
+    /// `extra`, when given, is one more line under the detail, in its type and
+    /// `Tok.dim`: the empty fleet's Codex hint. Every other banner passes none.
+    private func banner(
+        icon: String, title: String, detail: String, tint: Color, extra: String? = nil
+    ) -> some View {
         HStack(alignment: .top, spacing: Tok.gutter) {
             Image(systemName: icon).foregroundStyle(tint)
             VStack(alignment: .leading, spacing: Tok.tightSpacing) {
@@ -3428,6 +3542,12 @@ struct FleetView: View {
                     .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .foregroundStyle(Tok.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
+                if let extra {
+                    Text(extra)
+                        .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
+                        .foregroundStyle(Tok.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(.vertical, Tok.tightSpacing)

@@ -236,13 +236,23 @@ public struct FleetStrip: Equatable, Sendable {
     public var headline: String { "\(canTakeWork) of \(total) can take work now" }
 
     public var isPointable: Bool { segments.count <= Self.pointableLimit }
+
+    /// The index of the first segment of the second pool, in a fleet holding both providers: the
+    /// tab draws Claude's list first, so it is the first Codex segment. `nil` when every segment is
+    /// one provider's.
+    public var poolBreak: Int? {
+        guard let lead = segments.first?.account.provider else { return nil }
+        return segments.firstIndex { $0.account.provider != lead }
+    }
 }
 
 extension FleetSection {
     /// A group the operator has not opened and that collapses by default: the
-    /// tab draws it as one summary line, after every open group.
+    /// tab draws it as one summary line, after every open group. Opened under
+    /// its own ``expansionKey``, so a Codex box and a Claude box of one group
+    /// open apart.
     public func isSummarised(expandedGroups: Set<String>) -> Bool {
-        collapsesByDefault && !expandedGroups.contains(group.token)
+        collapsesByDefault && !expandedGroups.contains(expansionKey)
     }
 }
 
@@ -254,16 +264,41 @@ extension Fleet {
     public func accountsTabSections(
         pinning controlName: String? = nil, expandedGroups: Set<String>
     ) -> [FleetSection] {
-        let all = sectionsInDisplayOrder(pinning: controlName)
-        let loose = all.filter { $0.group == .ungrouped }
-        let named = all.filter { $0.group != .ungrouped }
-        return loose
-            + named.filter { !$0.isSummarised(expandedGroups: expandedGroups) }
-            + named.filter { $0.isSummarised(expandedGroups: expandedGroups) }
+        sectionsInDisplayOrder(pinning: controlName).inTabOrder(expandedGroups: expandedGroups)
+    }
+
+    /// The Accounts tab's lists in a fleet holding Codex, Claude first, one per provider that
+    /// has rows; `nil` in a fleet with no Codex row, which draws `accountsTabSections` unchanged.
+    ///
+    /// In a mixed fleet the provider is the outer level, because the operator asks two
+    /// questions: what can serve Claude Code, and what can serve codex. A group with members of
+    /// both is drawn once in each list, so each box's count, tally and spend cover one
+    /// provider. Each list is in the tab's own order, which the strip reads too.
+    public func accountsTabSectionsByProvider(
+        pinning controlName: String? = nil, expandedGroups: Set<String>
+    ) -> [ProviderSections]? {
+        guard holdsCodex else { return nil }
+        return [Provider.anthropic, .codex].compactMap { provider in
+            let rows = accounts.filter { $0.provider == provider }
+            guard !rows.isEmpty else { return nil }
+            return ProviderSections(
+                provider: provider,
+                sections: FleetSection.sections(of: rows, provider: provider, pinning: controlName)
+                    .inTabOrder(expandedGroups: expandedGroups))
+        }
     }
 }
 
 extension Array where Element == FleetSection {
+    /// The tab's order over one list: the loose sections, then the open groups, then the groups
+    /// closed to one summary line, each run in the list's own order.
+    public func inTabOrder(expandedGroups: Set<String>) -> [FleetSection] {
+        let loose = filter { $0.group == .ungrouped }
+        let named = filter { $0.group != .ungrouped }
+        return loose
+            + named.filter { !$0.isSummarised(expandedGroups: expandedGroups) }
+            + named.filter { $0.isSummarised(expandedGroups: expandedGroups) }
+    }
     /// Every row of these sections, in the order the tab draws them: in each
     /// section its lines, then its cards (`isCard`: an account carrying a
     /// lease line or an exit row). A wholly-parked group the tab caps at
@@ -277,7 +312,7 @@ extension Array where Element == FleetSection {
             let shown: [FleetSectionRow]
             if section.isSummarised(expandedGroups: expandedGroups) {
                 shown = []
-            } else if section.isWhollyParked && !expandedGroups.contains(section.group.token) {
+            } else if section.isWhollyParked && !expandedGroups.contains(section.expansionKey) {
                 shown = [FleetSectionRow](section.rows.prefix(parkedCap))
             } else {
                 shown = section.rows

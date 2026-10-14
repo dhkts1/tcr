@@ -39,6 +39,30 @@ public struct CodexPresence: Equatable, Sendable {
         fleetHoldsCodex || codexExecutable != nil || codexHome != nil || storedExecutable != nil
     }
 
+    /// The one line an empty fleet's banner draws under its detail, or `nil` for none.
+    ///
+    /// The hint is drawn only on evidence of codex; with none, the empty fleet is the one it
+    /// always was. The strongest evidence wins: a login file, then an executable, then a codex
+    /// folder. Only a login file is worded as a login: a folder or a binary is not one, and the
+    /// line for each claims no more than was found.
+    ///
+    /// `home` is a parameter, so a render names `/Users/example` and never the rendering Mac's
+    /// home. A login file with no codex home to name falls through to the next line.
+    public func emptyFleetHint(home: String) -> String? {
+        if hasLoginFile, let codexHome {
+            return
+                "Found a codex login at \(HomePath.short(codexHome, home: home)): Add account… can sign in a Codex account of tcr's own, or import that one."
+        }
+        if codexExecutable != nil || storedExecutable != nil {
+            return "codex is on this Mac: Add account… can sign in a Codex (ChatGPT) account too."
+        }
+        if let codexHome {
+            return
+                "Found a codex folder at \(HomePath.short(codexHome, home: home)): Add account… can sign in a Codex account of tcr's own."
+        }
+        return nil
+    }
+
     /// No source at all. What every render passes.
     public static let absent = CodexPresence()
 }

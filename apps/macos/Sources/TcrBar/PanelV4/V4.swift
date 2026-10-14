@@ -585,6 +585,13 @@ enum V4 {
     /// it, so a 12 pt plan wrapping under a 15 pt name still occupies 21 pt.
     static var rowLineHeight: CGFloat { lineHeight(nameSize) }
 
+    /// What a block's top margin becomes after a block whose bottom margin is `previous`:
+    /// adjacent CSS margins collapse to the larger, and SwiftUI adds paddings, so the
+    /// block pays only the difference.
+    static func marginAfter(_ own: CGFloat, previous: CGFloat) -> CGFloat {
+        max(own, previous) - previous
+    }
+
     /// What a block's top margin becomes when it follows the segmented strip.
     ///
     /// Adjacent CSS margins COLLAPSE to the larger of the two: the strip's
@@ -592,7 +599,7 @@ enum V4 {
     /// gap, not 26. SwiftUI adds paddings, which is how the first v4 render put
     /// 29 pt of nothing under the tabs against the mockup's 15.
     static func marginAfterStrip(_ own: CGFloat) -> CGFloat {
-        max(own, segMarginBottom) - segMarginBottom
+        marginAfter(own, previous: segMarginBottom)
     }
 
     // MARK: - One-line account rows (option H: `.slim`, `.wline`, `.bandhead`)
@@ -722,6 +729,11 @@ enum V4 {
     /// `.hstrip{gap:2px;height:14px;margin:5px 0 5px}`, `.hseg{border-radius:3px}`.
     static let stripHeight: CGFloat = 14
     static let stripGap: CGFloat = 2
+    /// The break between the Claude and the Codex segments, in a fleet holding both. No mockup
+    /// draws two pools: three ``stripGap``s read as a break at any segment width.
+    static let stripPoolGap: CGFloat = 6
+    /// The spacer drawn at that break: the segment row's own ``stripGap`` already sits on each side.
+    static var stripPoolSpacer: CGFloat { stripPoolGap - 2 * stripGap }
     static let stripMarginV: CGFloat = 5
     static let stripSegmentRadius: CGFloat = 3
     /// `.hseg.spent{background:rgba(234,90,86,.55)}`, `.hseg.off{background:
