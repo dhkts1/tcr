@@ -316,7 +316,7 @@ public enum CodexCardFacts {
                 tone: .spent)
         }
         if let groupAddWarning, !groupAddWarning.isEmpty {
-            return CodexNoteLine(text: groupAddWarning, tone: .near)
+            return CodexNoteLine(text: groupAddWarning, tone: .caution)
         }
         return nil
     }
@@ -358,8 +358,10 @@ public enum CodexCardFacts {
 /// is in (`spent`, drawn red) or a warning about a group (`near`).
 public struct CodexNoteLine: Equatable, Sendable {
     public enum Tone: Equatable, Sendable {
+        /// A state the account is in: signed out, or a re-login tcr refused.
         case spent
-        case near
+        /// A caution about how the account is set up: a group no Codex request can reach.
+        case caution
     }
 
     public let text: String
@@ -374,11 +376,11 @@ public struct CodexNoteLine: Equatable, Sendable {
 extension AccountRowNotice {
     /// A Codex row's note as one more line under the row. A signed-out or refused
     /// re-login is a state the account is in, so it is an alert, red and spoken as
-    /// written; a group warning is a note.
+    /// written; a group warning is a caution, which is not a quota state.
     public init(codexNote: CodexNoteLine) {
         switch codexNote.tone {
         case .spent: self.init(text: codexNote.text, tone: .alert)
-        case .near: self.init(text: codexNote.text, tone: .note)
+        case .caution: self.init(text: codexNote.text, tone: .caution)
         }
     }
 }

@@ -51,6 +51,36 @@ final class CodexPanelWiringTests: XCTestCase {
                 + "alert would read as a note")
     }
 
+    /// A group add's warning on a Codex row is a caution about how the row is set up, not
+    /// a quota state, so it is drawn in the panel's dim ink: in the near-limit amber it sat
+    /// beside the row's own amber bar and read as part of it. A note on a Claude row keeps
+    /// its amber.
+    func testAGroupAddWarningIsDrawnInTheDimInkNotTheNearLimitAmber() throws {
+        let notices = try slice(
+            try source("apps/macos/Sources/TcrBar/PanelV4/AccountLineRow.swift"),
+            from: "private static func color(_ tone: AccountRowNotice.Tone) -> Color {",
+            to: "private static func spoken(")
+        XCTAssertTrue(
+            notices.contains("case .caution: return Tok.dim"),
+            "a Codex group-add warning is no longer drawn in the dim ink")
+        XCTAssertTrue(
+            notices.contains("case .note: return Tok.near"), "a note on a success lost its amber")
+    }
+
+    /// The chooser's import link is drawn in the system's link colour, which stays a link's
+    /// blue whatever accent colour the Mac is set to: in the accent colour, a Mac set to
+    /// graphite drew it as plain grey text.
+    func testTheImportLinkIsDrawnInTheLinkColour() throws {
+        let sheet = try slice(
+            try source("apps/macos/Sources/TcrBar/LoginSheet.swift"),
+            from: "Button(CodexSignInCopy.importLink)", to: ".help(CodexSignInCopy.importLinkHelp)")
+        XCTAssertTrue(sheet.contains(".foregroundStyle(Tok.link)"), "the import link lost its colour")
+        XCTAssertTrue(
+            try source("apps/macos/Sources/TcrBar/Tokens.swift")
+                .contains("public static let link = Color(nsColor: .linkColor)"),
+            "Tok.link is no longer the system's link colour")
+    }
+
     // MARK: - Source helpers
 
     private func repoRoot() -> URL {

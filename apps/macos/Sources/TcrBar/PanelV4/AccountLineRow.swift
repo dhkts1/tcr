@@ -303,7 +303,9 @@ struct LineBox<Item: Identifiable, Row: View>: View {
 ///
 /// `.mute`'s size, wrapped rather than cut (a reason is useless with its end
 /// missing), in `Tok.spent` for a failure and `Tok.near` for a note, the two
-/// colours the rest of the panel already uses for those.
+/// colours the rest of the panel already uses for those. A caution, a Codex
+/// row's group-add warning, is in `Tok.dim`: every hue here means a state, and
+/// amber under a row reads as that row being near its limit.
 ///
 /// An alert, a state the account is in such as a signed-out Codex login, is red
 /// like a failure but spoken as written: no action failed to produce it. Both
@@ -333,13 +335,14 @@ struct RowNotices: View {
         switch tone {
         case .failure, .alert: return Tok.spent
         case .note: return Tok.near
+        case .caution: return Tok.dim
         }
     }
 
     private static func spoken(_ notice: AccountRowNotice) -> String {
         switch notice.tone {
         case .failure: return "Failed: \(notice.text)"
-        case .alert, .note: return notice.text
+        case .alert, .note, .caution: return notice.text
         }
     }
 }

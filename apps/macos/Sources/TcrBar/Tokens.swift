@@ -130,6 +130,10 @@ public enum Tok {
     /// The system accent stays a system colour: it is the user's choice, and
     /// overriding it would be this app asserting a preference it does not own.
     public static let accent = Color(nsColor: .controlAccentColor)
+    /// A text link that is not a button: the system's link colour, which stays a
+    /// link's blue whatever accent the Mac is set to. Drawn in ``accent``, a link
+    /// on a Mac set to the graphite accent read as plain grey text.
+    public static let link = Color(nsColor: .linkColor)
 
     /// The panel's lit top edge (`PanelV4`, the mockup's own
     /// `border-top-color:rgba(255,255,255,.18)`) — literal white, in EVERY

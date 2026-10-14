@@ -69,7 +69,7 @@ struct LoginSheet: View {
                 Button(CodexSignInCopy.importLink) { onImportLink() }
                     .buttonStyle(.plain)
                     .font(V4.font(V4.dimSize))
-                    .foregroundStyle(Tok.accent)
+                    .foregroundStyle(Tok.link)
                     .help(CodexSignInCopy.importLinkHelp)
             }
             // Why the codex a person picked cannot be used, under tcr's reason, so

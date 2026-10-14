@@ -21,6 +21,11 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
         /// failed, which is why it is never spoken as "Failed: …".
         case alert
         case note
+        /// A caution about how the account is set up, spoken as written: a Codex row's
+        /// group-add warning, that no Codex request reaches the group. Drawn in the
+        /// panel's dim ink, not a note's amber, which beside a row's near-limit amber
+        /// read as a quota state.
+        case caution
     }
 
     public let text: String

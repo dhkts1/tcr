@@ -514,7 +514,7 @@ final class CodexCardFactsTests: XCTestCase {
             CodexCardFacts.noteLine(
                 reloginRefusal: nil, loginError: nil, codexHome: nil, groupAddWarning: warning,
                 home: "/Users/example"),
-            CodexNoteLine(text: warning, tone: .near))
+            CodexNoteLine(text: warning, tone: .caution))
         XCTAssertNil(
             CodexCardFacts.noteLine(
                 reloginRefusal: nil, loginError: nil, codexHome: nil, groupAddWarning: nil,
@@ -523,7 +523,7 @@ final class CodexCardFactsTests: XCTestCase {
 
     /// The note reaches the panel as one more line under the row, in the panel's own
     /// notice grammar: a signed-out reason is red and spoken as written, never as a
-    /// failed action, and a group-add warning is a note.
+    /// failed action, and a group-add warning is a caution.
     func testTheCodexNoteIsARowNotice() throws {
         let signedOut = try XCTUnwrap(
             CodexCardFacts.noteLine(
@@ -540,7 +540,24 @@ final class CodexCardFactsTests: XCTestCase {
             CodexCardFacts.noteLine(
                 reloginRefusal: nil, loginError: nil, codexHome: nil,
                 groupAddWarning: "'orchard' labels it and can park it", home: "/Users/example"))
-        XCTAssertEqual(AccountRowNotice(codexNote: warned).tone, .note)
+        XCTAssertEqual(AccountRowNotice(codexNote: warned).tone, .caution)
+    }
+
+    /// A group add's warning is a caution about how the row is set up: no Codex request
+    /// reaches the group. It is not a quota state, so it never wears the near-limit amber
+    /// a note on a success wears; a Claude row's note keeps it.
+    func testAGroupAddWarningIsACaution() throws {
+        let warned = try XCTUnwrap(
+            CodexCardFacts.noteLine(
+                reloginRefusal: nil, loginError: nil, codexHome: nil,
+                groupAddWarning: "'orchard' labels it and can park it", home: "/Users/example"))
+        XCTAssertEqual(warned.tone, .caution)
+        XCTAssertEqual(AccountRowNotice(codexNote: warned).tone, .caution)
+        XCTAssertEqual(
+            AccountRowNotice.collect(
+                deleteFailure: nil, deleteNotice: "keeps listing it until it restarts",
+                groupFailure: nil, toggleFailure: nil
+            ).map(\.tone), [.note])
     }
 
     func testTheCodexNoteSitsAfterTheFailuresAndBeforeTheNote() {
