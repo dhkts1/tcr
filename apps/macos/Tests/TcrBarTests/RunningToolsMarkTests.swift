@@ -204,10 +204,11 @@ final class RunningToolsMarkTests: XCTestCase {
 
     // MARK: - capacityTintKind (the one glyph's colour regime, F6 coffee-mark)
     //
-    // `MenuBarShell.cupTint(for:awake:)` attaches `Tok`'s real colours to this
-    // and lives in `TcrBar`, which this test target does not link (see this
-    // file's own doc-comment); `PollState.capacityTintKind(awake:)` is the pure
-    // decision underneath it, and it is what these tests exercise directly.
+    // `MenuBarShell.cupTint(for:awake:cupPool:)` attaches `Tok`'s real colours
+    // to this and lives in `TcrBar`, which this test target does not link (see
+    // this file's own doc-comment); `PollState.capacityTintKind(awake:cupPool:)`
+    // is the pure decision underneath it, and these tests exercise it directly,
+    // through `capacityTintKind(awake:)`, which follows the emptier pool.
 
     /// The precedence's top rule: a read failure outranks everything, keep-awake
     /// included — there is no fleet to ask about capacity or the Mac's sleep

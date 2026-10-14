@@ -457,6 +457,24 @@ final class PoolCapacityTests: XCTestCase {
         }
     }
 
+    /// The tie the worse state decides with Codex the worse pool: both at 0 of 2, Claude
+    /// near and Codex spent. Codex governs, so the cup is not amber, and the tooltip says
+    /// the cup shows Codex. The first pool, Claude's, would win the tie on its own.
+    func testASpentCodexPoolOutranksANearClaudePoolAtTheSameFraction() throws {
+        let fleet = try decodeFleet(
+            try [alice(["quotaState": "near", "quota": 0.9]), frank()] + [
+                canonicalRow("carol@example.com"),
+                canonicalRow("dana@example.com", ["quotaState": "spent"]),
+            ])
+        XCTAssertEqual(fleet.governingPool(.emptier, now: fixtureNow)?.provider, .codex)
+        let state = PollState.loaded(fleet)
+        XCTAssertEqual(state.capacityTintKind(awake: false, cupPool: .emptier), .template)
+        XCTAssertEqual(
+            state.tooltipSentence(cupPool: .emptier, now: fixtureNow),
+            "Claude · 0 of 2 accounts ready · 1 near their limit · next in 3d\n"
+                + "Codex · 0 of 2 accounts ready · next in 3d 4h · shown on the cup")
+    }
+
     /// A pool with no enabled account is out of the count and out of the cup, and a pin to
     /// it falls through to the pool that has one.
     func testAPoolWithNoEnabledAccountDropsOut() throws {
@@ -550,6 +568,24 @@ final class PoolCapacityTests: XCTestCase {
                 awake: false, showRunningTools: false, knocks: 0, cupPool: .emptier,
                 now: fixtureNow),
             "2 of 4 Codex accounts ready")
+    }
+
+    /// A mixed fleet's last line is what the Mac is doing: the running tools, then
+    /// keep-awake, under the waiting Mac's sentence and the pool lines.
+    func testAMixedFleetsActivityLineCountsRunningToolsBeforeKeepAwake() throws {
+        let accounts = try decodeFleet(sceneTwentyFourRows()).accounts
+        let state = PollState.loaded(
+            Fleet(
+                accounts: accounts,
+                sessions: [session(running: true), session(running: true), session(running: false)],
+                sessionsSupported: true))
+        XCTAssertEqual(
+            state.menuBarToolTip(
+                awake: true, showRunningTools: true, knocks: 1, cupPool: .emptier, now: fixtureNow),
+            "1 Mac is asking to connect. Open the Peers tab to answer it.\n"
+                + "Claude · 0 of 2 accounts ready · next in 2h 39m · shown on the cup\n"
+                + "Codex · 1 of 2 accounts ready\n"
+                + "2 tools running · Keeping this Mac awake")
     }
 
     /// A pool with nothing ready says when it next frees: the soonest still-ahead return of

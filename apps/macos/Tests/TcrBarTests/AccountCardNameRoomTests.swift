@@ -227,6 +227,24 @@ final class AccountCardNameRoomTests: XCTestCase {
             "the button is narrower than its own label")
     }
 
+    /// The two tests above model the header on the test side, so they hold whatever the
+    /// card itself passes. Pinned at the source: the card's name room asks its account
+    /// whether to reserve the button.
+    func testTheCardReservesTheReloginWidthItsAccountAsksFor() throws {
+        let squashed = try panelSource("PanelV4/AccountCard.swift")
+            .components(separatedBy: .whitespacesAndNewlines).joined()
+        let body = try XCTUnwrap(
+            squashed.range(of: "privatevarnameRowWidth:CGFloat{")
+                .map { String(squashed[$0.upperBound...].prefix(1200)) },
+            "AccountCard no longer computes `nameRowWidth` in the shape this test reads")
+        XCTAssertTrue(
+            body.contains(
+                "-NameRowFit.actionsWidth(reservesRelogin:account.reservesReloginInNameRow,"
+                    + "gap:V4.pillGap)"),
+            "the card's name room no longer reserves the Re-login button on the cards that "
+                + "draw it, so a signed-out Codex card's plan is squeezed against the button")
+    }
+
     private func drawsPlan(name: String, plan: String, available: CGFloat) throws -> Bool {
         let at = name.firstIndex(of: "@")
         return NameRowFit.drawsPlan(

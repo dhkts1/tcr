@@ -340,3 +340,23 @@ final class ProcessStatsTests: XCTestCase {
         }
     }
 }
+
+/// ``ProcessTable/arguments(pid:)``, the kernel read the codex count takes its `node`
+/// arguments from.
+///
+/// The one process a test can read without asserting about the machine it runs on is its
+/// own: the kernel's copy of this process's arguments is exactly what it was started with,
+/// on a laptop and on a CI runner alike. No other process is spawned or read.
+final class ProcessTableArgumentsTests: XCTestCase {
+    /// `KERN_PROCARGS2`'s buffer holds `argc`, the executable's path, NUL padding, then the
+    /// arguments. Read for this process, it is this process's own `argv`, whole.
+    func testItReadsThisProcessesOwnArguments() {
+        XCTAssertEqual(ProcessTable.arguments(pid: getpid()), CommandLine.arguments)
+    }
+
+    /// A pid no process can have (macOS hands out pids below 100000) reads as `nil`, never
+    /// as an empty argument list.
+    func testAPidWithNoProcessReadsAsNil() {
+        XCTAssertNil(ProcessTable.arguments(pid: Int32.max))
+    }
+}

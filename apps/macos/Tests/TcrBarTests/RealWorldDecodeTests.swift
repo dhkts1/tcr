@@ -322,8 +322,8 @@ final class RealWorldDecodeTests: XCTestCase {
             "every row of the committed contract must decode; unreadable: \(fleet.unreadable)"
         )
         XCTAssertEqual(fleet.accounts.count, 5)
-        // The fifth row is a Codex account: its `provider` key, which this app does not read,
-        // must cost it nothing.
+        // The fifth row is a Codex account, and decodes as one: its `provider` key is read
+        // (``testCommittedContractFixtureHasNoCodexKeys``), and costs the row nothing.
         XCTAssertEqual(
             fleet.accounts.map(\.name),
             [
