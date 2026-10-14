@@ -98,6 +98,10 @@ Launches Claude Code already pointed at the proxy.
 Trailing args are captured with `trailing_var_arg` and `allow_hyphen_values`, so
 `tcr run -- -p "hi"` reaches `claude` intact.
 
+`tcr-run` is `tcr run` under another name, for a tool that takes a Claude Code executable path:
+`tcr setup tcr-run` links it beside the `tcr` on `PATH` (refusing a `tcr-run` that is not its own
+symlink, and `--remove` takes it out), and `tcr-run <args>` behaves exactly as `tcr run <args>`.
+
 If the proxy is not listening, `tcr run` launches `claude` **untouched** and says so on
 stderr, so a stopped proxy never breaks the shell alias. When the proxy is up, the child
 gets the routing environment and nothing else, in particular **no `ANTHROPIC_API_KEY`**,
@@ -122,6 +126,95 @@ twice and a second `tcr` sits in the process tree for the session. A launcher th
 this variable hands off to the real `claude` instead. The name avoids the `CMUX_` prefix
 on purpose: cmux's own claude wrapper clears every `CMUX_*` variable before exec, so a
 marker named after it would be erased in transit.
+
+---
+
+## `tcr setup`
+
+Makes typing `claude` go through tcr, one of two ways. TcrBar asks once which one you want and
+has a row in Settings > General to change or undo it; these are the commands it runs.
+
+| command | what it writes | covers |
+|---|---|---|
+| `tcr setup shell` | a `claude` function in your shell's startup file | terminals |
+| `tcr setup claude-settings` | `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json` | every claude launch |
+| `tcr setup status [--json]` | nothing | reports both, and anything in the way |
+
+Each install takes `--remove`, which undoes it.
+
+### `tcr setup shell [--shell zsh|bash|fish] [--remove]`
+
+Adds this block to the shell's startup file (default: the shell `$SHELL` names):
+
+```sh
+# >>> tcr >>>  (added by tcr; remove with: tcr setup shell --remove)
+claude() {
+  if [ -n "$TCR_RUN_ACTIVE" ]; then command claude "$@"
+  else tcr run -- "$@"; fi
+}
+# <<< tcr <<<
+```
+
+`tcr run` already launches plain `claude` when the proxy is down, and `TCR_RUN_ACTIVE` marks that a
+`tcr run` is already above you, so neither a stopped proxy nor a nested shell breaks the command.
+When no `tcr` is on `PATH` (TcrBar runs the copy inside its bundle), the block names that binary's
+full path instead.
+
+| shell | file |
+|---|---|
+| zsh | `$ZDOTDIR/.zshrc`, else `~/.zshrc` |
+| bash | `~/.bashrc`; on macOS also the login file bash reads (`~/.bash_profile`, `~/.bash_login` or `~/.profile`, the first that exists) unless it already sources `~/.bashrc` |
+| fish | `~/.config/fish/functions/claude.fish`, a file of its own |
+
+tcr only ever edits between its own two marker lines. Running it again changes nothing, and
+`--remove` takes the block out of every shell's files and leaves each one byte-identical to before
+(the fish file, which held nothing else, is deleted). A symlinked startup file stays a symlink.
+
+**A `claude` that is already defined is refused, never overwritten.** An `alias claude=…`, a
+`claude()` or `function claude` (and in fish an `abbr` for `claude`, or a `claude.fish` tcr did not
+write) in any of that shell's startup files would decide what `claude` means: in zsh an alias wins
+over a function outright, so the block would silently do nothing. tcr exits non-zero and prints each
+line it found with its `file:line`. Remove or rename that definition, then run it again. It reads
+only the startup files themselves, so a definition pulled in from somewhere they `source` is not
+seen.
+
+The block covers what a terminal starts. An IDE extension or an app that launches claude on its own
+never reads it.
+
+### `tcr setup claude-settings [--force] [--remove]`
+
+Merges one key into `~/.claude/settings.json`:
+
+```json
+"env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456" }
+```
+
+The port comes from the tcr config (`--config`). Every other key, and the file's own formatting,
+stays as it was: the edit is made in the text and then checked against a parse, and anything that
+would change more than the one key writes nothing.
+
+**The cost, said plainly:** every claude process now talks to tcr, so while tcr is not running
+claude cannot reach Anthropic at all, until tcr starts or the key is removed.
+
+An `ANTHROPIC_BASE_URL` that already points somewhere else is refused and named; `--force` replaces
+it. `--remove` takes out only a value tcr writes (`http://127.0.0.1:<port>`), and `env` with it when
+that was its only key. It refuses to remove any other value.
+
+### `tcr setup status [--json]`
+
+```
+$ tcr setup status
+route: shell
+shell: zsh
+shellRoute: installed (/Users/example/.zshrc)
+claudeSettings: not installed
+```
+
+`route` is `off`, `shell`, `everyLaunch` or `both`. Each conflict found gets its own `conflict:` line
+with its `file:line`. `--json` is one object (`route`, `shell`, `shellRoute`, `claudeSettings`,
+`conflicts`, `port`); each conflict carries `route` (`shell` or `claudeSettings`), `kind` (`alias`,
+`function`, `abbreviation`, `foreignFile`, `baseUrl`), `path`, `line` and `text`. It exits 0
+whatever it finds.
 
 ---
 
@@ -788,6 +881,7 @@ proxyPort: 3456
 portHolder: pid 4242 tcr
 portHolderIsTcr: yes
 requests10m: 0
+shellRoute: not installed
 verdict: this proxy is not on Claude's route: /Users/example/.claude/settings.json sets https://gateway.example.com
 ```
 
@@ -799,6 +893,12 @@ verdict: this proxy is not on Claude's route: /Users/example/.claude/settings.js
 
 "Routed here" means the base URL names a loopback address (`127.0.0.1`, `localhost`, `[::1]`) on the
 port this config uses. Another machine's proxy on the same port is not this one.
+
+The `shellRoute:` line names the startup file holding [`tcr setup shell`](#tcr-setup)'s block for your
+login shell, or says `not installed`. With the block in place and no settings file naming a base URL,
+a `claude` typed in a terminal runs `tcr run`, so doctor counts that as routed here and the verdict
+says so. A settings file that names another URL still wins, because Claude Code applies it over what
+`tcr run` exports.
 
 ### Why the base URL can come from a file rather than the variable
 

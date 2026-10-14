@@ -116,6 +116,7 @@ struct SettingsDependencies {
     var panelDensityPreference: PanelDensityPreference
     var groupController: GroupController
     var updater: Updater
+    var claudeRoute: ClaudeRouteController
     var onWhatsNew: () -> Void = {}
 }
 

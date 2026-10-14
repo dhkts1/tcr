@@ -225,7 +225,68 @@ enum RenderStates {
             // refused "Delete Account…" looked like a click that did nothing.
             // See ``removeControllerFixture(for:)``.
             ("24-delete-outcomes", .loaded(fleet(healthyJSON)), false, nil),
+            // The one-time "Send claude through tcr?" prompt on the Accounts
+            // tab, then the same opening after "In my shell" was answered:
+            // the outcome line in the buttons' place. The second scene also
+            // checks that answering changed no size and did draw
+            // (``claudeRoutePromptKeepsPanelSize(before:after:named:)``).
+            ("25-claude-route-prompt", .loaded(fleet(healthyJSON)), false, nil),
+            ("25b-claude-route-answered", .loaded(fleet(healthyJSON)), false, nil),
         ]
+    }
+
+    /// The claude-route controller a scene draws with: scenes 25 and 25b get
+    /// one pinned to the prompt (asked, then answered); every other scene a
+    /// pinned controller that shows nothing. Pinned controllers never run
+    /// `tcr` and never write the operator's defaults.
+    @MainActor
+    private static func claudeRouteFixture(for sceneName: String) -> ClaudeRouteController {
+        let off = ClaudeRouteCommand.Reading.status(ClaudeRouteStatus(route: .off))
+        switch sceneName {
+        case "25-claude-route-prompt":
+            return ClaudeRouteController(pinned: off, promptShown: true)
+        case "25b-claude-route-answered":
+            return ClaudeRouteController(
+                pinned: off, promptShown: true,
+                promptOutcome: ClaudeRoutePrompt.outcome(for: .shell, failure: nil))
+        default:
+            return ClaudeRouteController(pinned: off)
+        }
+    }
+
+    /// Answering the prompt must move nothing (Gil, 2026-10-14): the panel
+    /// with the question and the panel with its outcome line are the same
+    /// size, and they are different pictures (a swap that drew nothing would
+    /// pass the size half alone). Prints what failed and answers `false`,
+    /// which fails the run, the same contract as
+    /// ``hoverCardKeepsPanelSize(without:with:named:)``.
+    @MainActor
+    private static func claudeRoutePromptKeepsPanelSize<A: View, B: View>(
+        before: A, after: B, named name: String
+    ) -> Bool {
+        let asked = ImageRenderer(content: before)
+        let answered = ImageRenderer(content: after)
+        asked.scale = 2
+        answered.scale = 2
+        guard let a = asked.nsImage, let b = answered.nsImage else {
+            FileHandle.standardError.write(Data("prompt check: \(name) did not render\n".utf8))
+            return false
+        }
+        if a.size != b.size {
+            FileHandle.standardError.write(
+                Data(
+                    ("prompt check: \(name) is \(Int(b.size.width))x\(Int(b.size.height))pt "
+                        + "answered and \(Int(a.size.width))x\(Int(a.size.height))pt asked: "
+                        + "answering changed the panel's size\n").utf8))
+            return false
+        }
+        if a.tiffRepresentation == b.tiffRepresentation {
+            FileHandle.standardError.write(
+                Data("prompt check: \(name) drew the same picture asked and answered\n".utf8))
+            return false
+        }
+        print("  prompt check: \(name) \(Int(b.size.width))x\(Int(b.size.height))pt either way")
+        return true
     }
 
     /// The delete outcomes scene 24 draws; every other scene gets a controller
@@ -671,7 +732,8 @@ enum RenderStates {
         // A closure over the hover pin, so a scene that pins a hover card can
         // also be drawn without it and the two compared
         // (``hoverCardKeepsPanelSize(without:with:named:)``).
-        let panel = { (hoverCard: String?, litAccount: String?) in
+        let panel = {
+            (hoverCard: String?, litAccount: String?, routeController: ClaudeRouteController) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -695,6 +757,7 @@ enum RenderStates {
                 updater: updater,
                 groupController: GroupController(),
                 removeController: removeControllerFixture(for: scene.name),
+                routeController: routeController,
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
@@ -725,7 +788,7 @@ enum RenderStates {
         }
         let hoverCard = hoverCardFixture(for: scene.name)
         let litAccount = litAccountFixture(for: scene.name)
-        let view = panel(hoverCard, litAccount)
+        let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name))
 
         // The shipped default stays unsuffixed — every existing filename this
         // harness produces is unchanged — and only the forced `.comfortable`
@@ -737,7 +800,16 @@ enum RenderStates {
             ? "\(scene.name)-\(appearance.rawValue).png"
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
         if hoverCard != nil || litAccount != nil,
-            !hoverCardKeepsPanelSize(without: panel(nil, nil), with: view, named: name)
+            !hoverCardKeepsPanelSize(
+                without: panel(nil, nil, claudeRouteFixture(for: scene.name)), with: view,
+                named: name)
+        {
+            return false
+        }
+        if scene.name == "25b-claude-route-answered",
+            !claudeRoutePromptKeepsPanelSize(
+                before: panel(nil, nil, claudeRouteFixture(for: "25-claude-route-prompt")),
+                after: view, named: name)
         {
             return false
         }
@@ -785,6 +857,7 @@ enum RenderStates {
                 updater: Updater(startingUpdater: false),
                 groupController: GroupController(),
                 removeController: RemoveAccountController(),
+                routeController: ClaudeRouteController(pinned: nil),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: .accounts,
@@ -2305,9 +2378,45 @@ enum RenderStates {
         let view: AnyView
     }
 
+    /// Settings > General's "Send claude through tcr" row, one PNG per thing
+    /// it can say: off, each route, and a conflict in the way. The live row is a menu `Picker`, which
+    /// `ImageRenderer` cannot draw, so the row's snapshot mode shows the
+    /// current choice as text.
+    @MainActor
+    private static var claudeRouteSettingsScenes: [ControlScene] {
+        let row = { (reading: ClaudeRouteCommand.Reading) in
+            AnyView(
+                ClaudeRouteSettingsRow(
+                    controller: ClaudeRouteController(pinned: reading), snapshotMode: true))
+        }
+        return [
+            ControlScene(
+                name: "26-claude-route-settings-off",
+                view: row(.status(ClaudeRouteStatus(route: .off)))),
+            ControlScene(
+                name: "26b-claude-route-settings-shell",
+                view: row(.status(ClaudeRouteStatus(route: .shell)))),
+            ControlScene(
+                name: "26c-claude-route-settings-every-launch",
+                view: row(.status(ClaudeRouteStatus(route: .everyLaunch)))),
+            ControlScene(
+                name: "26d-claude-route-settings-conflict",
+                view: row(
+                    .status(
+                        ClaudeRouteStatus(
+                            route: .off,
+                            conflicts: [
+                                ClaudeRouteConflict(
+                                    route: "shell", kind: "alias",
+                                    path: "/Users/alice/.zshrc", line: 40,
+                                    text: "alias claude='claude --verbose'")
+                            ])))),
+        ]
+    }
+
     @MainActor
     private static var controlScenes: [ControlScene] {
-        [
+        claudeRouteSettingsScenes + [
             // The "Reachable from the internet" row, one PNG per state it can
             // be in: the switch off, the router being asked, a mapping held,
             // a router that never answered, that question asked again from

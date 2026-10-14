@@ -389,16 +389,34 @@ pub struct Report {
     /// them as written (see [`crate::config_keys`]). They do not change
     /// [`Self::exit_code`], which is about routing alone.
     pub unknown_keys: Vec<UnknownKey>,
+    /// The startup file holding `tcr setup shell`'s `claude` function for the
+    /// login shell, when it is installed. That function runs `tcr run`, which
+    /// sets the base URL on its own child, so it routes a typed `claude` here
+    /// whenever no settings file names a base URL (a settings file outranks
+    /// the process environment, see the module doc-comment).
+    pub shell_route: Option<PathBuf>,
 }
 
 impl Report {
+    /// The base URL alone does not reach this proxy, and a typed `claude`
+    /// still does: the shell route is installed and nothing in a settings
+    /// file overrides what `tcr run` exports.
+    pub fn routed_by_shell(&self) -> bool {
+        !self.routed_here
+            && self.shell_route.is_some()
+            && matches!(
+                self.base_url_source,
+                BaseUrlSource::ProcessEnv | BaseUrlSource::Default
+            )
+    }
+
     /// 0 routed here and serving, 2 routed somewhere else, 3 routed here with
-    /// nothing answering.
+    /// nothing answering. The shell route counts as routed here.
     ///
     /// "Somewhere else" outranks "nothing answered": when Claude is pointed at
     /// another URL, whether THIS proxy is up is not the operator's problem.
     pub fn exit_code(&self) -> i32 {
-        if !self.routed_here {
+        if !self.routed_here && !self.routed_by_shell() {
             2
         } else if self.requests_in_window.is_none() {
             3
@@ -410,6 +428,17 @@ impl Report {
     /// The one-sentence answer, on its own `verdict:` line.
     pub fn verdict(&self) -> String {
         let source = self.base_url_source.label();
+        if let (true, Some(file)) = (self.routed_by_shell(), &self.shell_route) {
+            let served = match self.requests_in_window {
+                Some(served) => format!("this proxy has served {served} requests"),
+                None => format!("no proxy answered on 127.0.0.1:{}", self.proxy_port),
+            };
+            return format!(
+                "verdict: claude typed in a terminal goes through tcr run (the tcr block in {}); apps that start claude themselves use {} ({source}); {served}",
+                file.display(),
+                self.base_url
+            );
+        }
         if !self.routed_here {
             return format!(
                 "verdict: this proxy is not on Claude's route: {source} sets {}",
@@ -450,6 +479,13 @@ impl Report {
             format!("portHolder: {holder}"),
             format!("portHolderIsTcr: {holder_is_tcr}"),
             format!("requests{REQUEST_WINDOW_MINUTES}m: {requests}"),
+            format!(
+                "shellRoute: {}",
+                self.shell_route.as_ref().map_or_else(
+                    || "not installed".to_string(),
+                    |file| file.display().to_string()
+                )
+            ),
         ];
         for problem in &self.problems {
             lines.push(format!("problem: {problem}"));
@@ -512,7 +548,23 @@ pub fn inspect(port: u16, requests_in_window: Option<u64>) -> Report {
         requests_in_window,
         problems: resolution.problems,
         unknown_keys: Vec::new(),
+        shell_route: installed_shell_route(),
     }
+}
+
+/// The file carrying `tcr setup shell`'s block for the login shell, when the
+/// route is installed for it. A read failure here is not doctor's question to
+/// answer (`tcr setup status` reports it), so it reads as not installed.
+fn installed_shell_route() -> Option<PathBuf> {
+    let homes = crate::setup::Homes::from_env().ok()?;
+    let shell = crate::setup::chosen_shell(None)?;
+    let status = crate::setup::shell_status(Some(shell), &homes).ok()?;
+    if !status.installed {
+        return None;
+    }
+    crate::setup::shell_targets(shell, &homes)
+        .into_iter()
+        .next()
 }
 
 #[cfg(test)]
@@ -768,7 +820,57 @@ mod tests {
             requests_in_window: requests,
             problems: Vec::new(),
             unknown_keys: Vec::new(),
+            shell_route: None,
         }
+    }
+
+    /// `tcr setup claude-settings` writes a value doctor must call on-route.
+    #[test]
+    fn the_every_launch_value_is_on_route() {
+        let url = crate::setup::proxy_base_url(3456);
+        let report = report_for(
+            &url,
+            BaseUrlSource::UserSettings {
+                path: PathBuf::from("/home/alice/.claude/settings.json"),
+            },
+            Some(2),
+        );
+        assert!(report.routed_here);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    /// The shell route routes a typed `claude` when no settings file names a
+    /// base URL, and does not when one does.
+    #[test]
+    fn the_shell_route_is_on_route_unless_a_settings_file_overrides_it() {
+        let rc = PathBuf::from("/home/alice/.zshrc");
+        let mut report = report_for(DEFAULT_BASE_URL, BaseUrlSource::Default, Some(2));
+        assert_eq!(report.exit_code(), 2, "no shell route: off route");
+        report.shell_route = Some(rc.clone());
+        assert_eq!(report.exit_code(), 0);
+        assert!(
+            report.verdict().contains("/home/alice/.zshrc"),
+            "{}",
+            report.verdict()
+        );
+
+        let mut silent = report_for(DEFAULT_BASE_URL, BaseUrlSource::Default, None);
+        silent.shell_route = Some(rc.clone());
+        assert_eq!(silent.exit_code(), 3);
+
+        let mut overridden = report_for(
+            "https://gateway.example.com",
+            BaseUrlSource::UserSettings {
+                path: PathBuf::from("/home/alice/.claude/settings.json"),
+            },
+            Some(2),
+        );
+        overridden.shell_route = Some(rc);
+        assert_eq!(
+            overridden.exit_code(),
+            2,
+            "a settings file outranks tcr run's export"
+        );
     }
 
     #[test]
