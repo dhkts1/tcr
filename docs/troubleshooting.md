@@ -84,6 +84,13 @@ names the account and `tcr login --codex --account <name>`
 ([`cli.md`](cli.md#--codex-launching-codex-through-the-pool)), and its requests during the
 120-second hold get a 429 it retries.
 
+In the dashboard a Codex row's chip uses ChatGPT's terms: `rejected` reads `REFUSED`, `hold`
+reads `REFUSED` and the time left while ChatGPT's refusal stands, `reserved` reads `UNREACHABLE`,
+and a usage window that is not 5 hours or 7 days long is named by its length (`30D 12d`).
+`refused` reads `REFUSED` and the time left too while ChatGPT's refusal stands, which outlasts the
+hold; otherwise it reads as on a Claude row, the seconds left of the upstream 403's hold
+(`REFUSED 107s`).
+
 ## A response that breaks partway through is not moved to another account
 
 tcr picks an account for each request inside a retry loop. A 401, a 403, a 429 or a

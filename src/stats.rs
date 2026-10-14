@@ -6,6 +6,8 @@
 //! so a bar the TUI draws is never a stale cached value — that is the display half
 //! of bug #2's fix.
 
+use std::path::Path;
+
 use time::OffsetDateTime;
 
 use crate::probe::ProbeStatus;
@@ -19,6 +21,25 @@ pub struct RequestLogEntry {
     pub path: String,
     pub status: u16,
     pub account: String,
+    /// The provider the request was for, decided by its path as the proxy routed it. The
+    /// dashboard's log shortens a Codex path to its tail, so it must not have to guess the
+    /// provider back from the path it shortens.
+    pub provider: Provider,
+}
+
+/// `path` with the home folder shown as `~`, for a line a person reads: `~/.codex` rather
+/// than the full path. Only a whole leading component counts, so `/Users/example2` is not
+/// inside `/Users/example`. With no home, or a home that is the root or empty, the path is
+/// returned as it is.
+pub fn short_path(path: &str, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|home| home.parent().is_some()) else {
+        return path.to_string();
+    };
+    match Path::new(path).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_string(),
+    }
 }
 
 /// How close an account is to its own switch threshold, evaluated live. Drives
@@ -137,6 +158,17 @@ pub enum GateReason {
 /// A single account's live-computed view.
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
+    /// This account's rotation index: the one [`crate::manager::Manager::set_disabled`],
+    /// [`crate::manager::Manager::set_current`], the session pins and the sessions use.
+    ///
+    /// [`StatsSnapshot::accounts`] leaves out rows deleted from the config while the process
+    /// runs, and those rows keep their slots, so a row's position in that list equals its slot
+    /// only until a row before it is deleted. Anything that acts on an account it found by its
+    /// position in the list acts through this.
+    ///
+    /// Never on any wire: no status row, quota row or session row carries it, and a snapshot
+    /// rebuilt from a status document numbers its rows by position.
+    pub slot: usize,
     pub name: String,
     /// Which upstream this account belongs to, carried from
     /// [`crate::manager::AccountRuntime::provider`]. It decides which vocabulary
@@ -339,6 +371,36 @@ impl AccountSnapshot {
             Provider::Codex => tcr_status_wire::codex_plan_label(self.organization_type.as_deref()),
         }
     }
+
+    /// Why this Codex account's login is dead, as one clause for a person: the refresh error
+    /// it died with ([`CodexFacts::login_error`]), in words. `None` on an Anthropic account, and
+    /// on a Codex account with no recorded error, which leaves the caller to say only that the
+    /// account needs a re-login.
+    ///
+    /// The one place the clause is worded, so the dashboard's re-login hint and `tcr status`'s
+    /// re-login line cannot disagree. A reused refresh token on a row imported from a codex
+    /// folder names that folder (`home` shown as `~`, see [`short_path`]): ChatGPT refresh
+    /// tokens are single-use, and the codex CLI sharing the login is what spent it first.
+    pub fn relogin_why(&self, home: Option<&Path>) -> Option<String> {
+        if self.provider != Provider::Codex {
+            return None;
+        }
+        let code = self.codex.login_error.as_deref()?;
+        Some(match code {
+            "refresh_token_reused" => match self.codex.codex_home.as_deref() {
+                Some(folder) => format!(
+                    "the codex CLI in {} refreshed this shared login first",
+                    short_path(folder, home)
+                ),
+                None => "another copy of this login refreshed first".to_string(),
+            },
+            "refresh_token_expired" => "the login expired".to_string(),
+            "refresh_token_invalidated" => "the login was revoked".to_string(),
+            "invalid_grant" => "ChatGPT rejected the refresh (invalid_grant)".to_string(),
+            "http_401" => "ChatGPT answered the refresh with 401".to_string(),
+            other => format!("ChatGPT refused the refresh ({other})"),
+        })
+    }
 }
 
 /// Whether a live session was keyed on a stable client identity (a Codex
@@ -384,6 +446,10 @@ pub struct SessionSnapshot {
     pub last_served_account: String,
     pub requests: u64,
     pub last_seen: Option<OffsetDateTime>,
+    /// The provider of the account this session is pinned to ([`Self::account`]), else of the
+    /// one that last served it. A session belongs to one provider for its whole life, so the
+    /// dashboard can mark a Codex session's group without guessing it from a name.
+    pub provider: Provider,
     /// [`SessionKind::Stable`] when keyed on a stable client identity (x-api-key /
     /// `metadata.user_id`); [`SessionKind::Prefix`] when there was none but the
     /// request's `system`/`tools` hash pinned it anyway; [`SessionKind::Fallback`]
@@ -396,12 +462,46 @@ pub struct SessionSnapshot {
     pub kind: SessionKind,
 }
 
+/// The account serving each provider right now, as positions in [`StatsSnapshot::accounts`]:
+/// the account that most recently served a request of that provider. `None` for a provider
+/// that has served nothing since the process started, or whose serving row was deleted.
+///
+/// One per provider because a mixed fleet serves both at once: the account a Claude request
+/// last went to says nothing about where codex's requests go, and a single index made one
+/// provider's serving account vanish from the dashboard every time the other one served.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CurrentByProvider {
+    pub anthropic: Option<usize>,
+    pub codex: Option<usize>,
+}
+
+impl CurrentByProvider {
+    /// The account serving `provider`.
+    pub fn get(&self, provider: Provider) -> Option<usize> {
+        match provider {
+            Provider::Anthropic => self.anthropic,
+            Provider::Codex => self.codex,
+        }
+    }
+
+    /// Record `idx` as the account serving `provider`.
+    pub fn set(&mut self, provider: Provider, idx: usize) {
+        match provider {
+            Provider::Anthropic => self.anthropic = Some(idx),
+            Provider::Codex => self.codex = Some(idx),
+        }
+    }
+}
+
 /// The whole picture the TUI paints each tick.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub accounts: Vec<AccountSnapshot>,
     /// Index of the account that most recently served a request, if any.
     pub current: Option<usize>,
+    /// The account serving each provider, as positions in [`Self::accounts`], the space
+    /// [`Self::current`] uses. Read it through [`Self::serving`].
+    pub current_by_provider: CurrentByProvider,
     /// Most-recent-first request log.
     pub recent: Vec<RequestLogEntry>,
     /// Live per-session serving stats in a STABLE order (pinned account, then
@@ -421,10 +521,29 @@ pub struct StatsSnapshot {
     pub wire_sessions_summary: tcr_status_wire::SessionsSummary,
 }
 
+impl StatsSnapshot {
+    /// The account serving `provider`, as a position in [`Self::accounts`], the space
+    /// [`Self::current`] uses: [`Self::current_by_provider`]'s entry, else [`Self::current`]
+    /// when that account belongs to `provider`. So a snapshot that carries only `current` (one
+    /// built by hand, or from a source that does not track a serving account per provider)
+    /// still marks its serving row.
+    pub fn serving(&self, provider: Provider) -> Option<usize> {
+        self.current_by_provider.get(provider).or_else(|| {
+            self.current.filter(|&idx| {
+                self.accounts
+                    .get(idx)
+                    .is_some_and(|a| a.provider == provider)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::GateReason;
+    use super::*;
     use serde::de::{Deserialize as _, Visitor};
+    use std::path::Path;
 
     /// What the probe deserializer below hands back: serde's own list of the
     /// enum's wire names, or a sign that the derive took some other path.
@@ -532,6 +651,129 @@ mod tests {
         assert!(
             missing.is_empty(),
             "docs/troubleshooting.md has no `| `<token>` |` table row for gate token(s) {missing:?}"
+        );
+    }
+
+    /// The home folder reads `~`, and only as a whole leading component: a sibling folder whose
+    /// name merely starts with the home's is not inside it.
+    #[test]
+    fn short_path_shows_home_as_a_tilde() {
+        let home = Some(Path::new("/Users/example"));
+        assert_eq!(short_path("/Users/example/.codex", home), "~/.codex");
+        assert_eq!(short_path("/opt/codex", home), "/opt/codex");
+        // A sibling whose name merely starts with the home's. Shown under /srv because the
+        // repository's disclosure gate refuses a /Users/<name>/ path for any name but a few
+        // fixture ones, and a sibling of /Users/example cannot be one of them.
+        let srv = Some(Path::new("/srv/example"));
+        assert_eq!(
+            short_path("/srv/example2/.codex", srv),
+            "/srv/example2/.codex"
+        );
+        assert_eq!(short_path("/srv/example/.codex", srv), "~/.codex");
+        assert_eq!(
+            short_path("/Users/example/.codex", None),
+            "/Users/example/.codex"
+        );
+    }
+
+    /// A signed-out Codex row, its login dead with `login_error`, imported from `codex_home`.
+    fn signed_out_codex_row(
+        login_error: Option<&str>,
+        codex_home: Option<&str>,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            slot: 0,
+            name: "erin@example.com".to_string(),
+            provider: Provider::Codex,
+            organization_type: Some("team".to_string()),
+            rate_limit_tier: None,
+            seat_tier: None,
+            org_uuid: None,
+            org_name: None,
+            priority: 0,
+            status: "error".to_string(),
+            disabled: false,
+            five_hour: None,
+            five_hour_reset: None,
+            seven_day: None,
+            seven_day_reset: None,
+            seven_day_oi: None,
+            seven_day_oi_reset: None,
+            requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            last_used: None,
+            rate_limited_until: None,
+            probe_status: ProbeStatus::Error,
+            last_probe: None,
+            quota_updated_at: None,
+            probe_error: None,
+            quota_state: QuotaState::Normal,
+            gate: GateReason::Login,
+            free_at: None,
+            stream_error_count: 0,
+            last_stream_error: None,
+            groups: Vec::new(),
+            reserved_groups: Vec::new(),
+            parked_groups: Vec::new(),
+            control_allowed_groups: Vec::new(),
+            usage: None,
+            codex: CodexFacts {
+                login_error: login_error.map(str::to_string),
+                codex_home: codex_home.map(str::to_string),
+                ..CodexFacts::default()
+            },
+        }
+    }
+
+    /// Why a Codex login died, one sentence per refresh error, in the words the dashboard's
+    /// re-login hint and `tcr status` both print. A reused refresh token names the codex CLI's
+    /// folder when the row was imported from one, because that CLI is what refreshed first.
+    #[test]
+    fn the_relogin_why_follows_the_login_error() {
+        let home = Some(Path::new("/Users/example"));
+        let why = |login_error: Option<&str>, codex_home: Option<&str>| {
+            signed_out_codex_row(login_error, codex_home).relogin_why(home)
+        };
+        assert_eq!(
+            why(Some("refresh_token_reused"), Some("/Users/example/.codex")).as_deref(),
+            Some("the codex CLI in ~/.codex refreshed this shared login first")
+        );
+        assert_eq!(
+            why(Some("refresh_token_reused"), None).as_deref(),
+            Some("another copy of this login refreshed first")
+        );
+        for codex_home in [Some("/Users/example/.codex"), None] {
+            for (login_error, sentence) in [
+                ("refresh_token_expired", "the login expired"),
+                ("refresh_token_invalidated", "the login was revoked"),
+                (
+                    "invalid_grant",
+                    "ChatGPT rejected the refresh (invalid_grant)",
+                ),
+                ("http_401", "ChatGPT answered the refresh with 401"),
+                (
+                    "token_revoked_by_admin",
+                    "ChatGPT refused the refresh (token_revoked_by_admin)",
+                ),
+            ] {
+                assert_eq!(
+                    why(Some(login_error), codex_home).as_deref(),
+                    Some(sentence),
+                    "{login_error} with codex_home {codex_home:?}"
+                );
+            }
+            assert_eq!(why(None, codex_home), None, "no login error, no why");
+        }
+
+        let mut anthropic = signed_out_codex_row(Some("refresh_token_reused"), None);
+        anthropic.provider = Provider::Anthropic;
+        assert_eq!(
+            anthropic.relogin_why(home),
+            None,
+            "an Anthropic row has no Codex login to explain"
         );
     }
 }

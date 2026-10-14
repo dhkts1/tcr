@@ -855,6 +855,25 @@ impl DisablePersist {
             }),
         }
     }
+
+    /// [`Self::warning`] for a row of `provider`. Only the duplicate notice differs: two
+    /// entries that share a Codex login are told apart by neither of them holding it twice,
+    /// so a Codex row names that remedy (remove one, or re-import it under a name of its own),
+    /// where a Claude row keeps its `orgUuid` remedy. Every other outcome reads the same for
+    /// both providers.
+    pub fn warning_for(
+        self,
+        disabled: bool,
+        provider: crate::provider::Provider,
+    ) -> Option<&'static str> {
+        match (self, provider) {
+            (Self::Ambiguous, crate::provider::Provider::Codex) => Some(
+                "NOT SAVED: two config entries share this Codex login — remove the duplicate \
+                 (tcr remove <name>), or re-import it with --name",
+            ),
+            _ => self.warning(disabled),
+        }
+    }
 }
 
 /// What [`Manager::set_control_by_query`] did. Same shape as
@@ -1261,6 +1280,14 @@ pub struct Manager {
     fleet_tat_ms: AsyncMutex<i64>,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
+    /// The slot that most recently served each provider, as [`Self::current`] is for either:
+    /// the dashboard marks the account serving Claude and the one serving codex at once.
+    /// [`Self::snapshot`] re-counts each into a position among the rows it lists.
+    ///
+    /// Lock order: taken alone, after [`Self::current`] is released. `snapshot` reads it while
+    /// it holds the accounts lock, so [`Self::set_current`] reads the slot's provider (the
+    /// accounts lock, released) BEFORE it takes this or `current`.
+    current_by_provider: Mutex<crate::stats::CurrentByProvider>,
     /// Monotonic counter handed out one tick at a time by [`Manager::select`] to
     /// stamp the account it picks, so the next select prefers a different one
     /// (load spread). Starts at 1 so 0 reads unambiguously as "never selected".
@@ -1680,6 +1707,7 @@ impl Manager {
             fleet_tat_ms: AsyncMutex::new(0),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
+            current_by_provider: Mutex::new(crate::stats::CurrentByProvider::default()),
             select_seq: AtomicU64::new(1),
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
@@ -2901,7 +2929,15 @@ impl Manager {
         // (config, then accounts) — the shape a deadlock is made of.
         let target = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-            let Some(account) = accounts.get_mut(idx) else {
+            // A row deleted from the config keeps its slot, parked and unlisted, and
+            // `disabled` is all that keeps it out of rotation (`eligible` never reads
+            // `removed`), so it answers as a row that no longer exists: enabling it would
+            // serve an account the operator deleted, on its in-memory credentials, until a
+            // restart. Checked under this write lock, so no reload can mark or revive the
+            // row between the check and the write. Reached by a dashboard key drawn before
+            // the delete, and by `set_disabled_by_query`, which resolves under a read lock
+            // it releases before calling here.
+            let Some(account) = accounts.get_mut(idx).filter(|account| !account.removed) else {
                 return DisablePersist::NoSuchAccount;
             };
             account.disabled = disabled;
@@ -3215,9 +3251,22 @@ impl Manager {
         }
     }
 
-    /// Record which account actually served the most recent request.
+    /// Record which account actually served the most recent request, and that it is now the
+    /// account serving its provider.
+    ///
+    /// The slot's provider is read FIRST, which takes and releases the accounts lock, and only
+    /// then are `current` and `current_by_provider` taken, one at a time. [`Self::snapshot`]
+    /// holds the accounts lock while it takes both, so holding either of them here while
+    /// taking the accounts lock would be the two orders a deadlock is made of.
     pub fn set_current(&self, idx: usize) {
+        let provider = self.provider(idx);
         *self.current.lock().expect("current lock poisoned") = Some(idx);
+        if let Some(provider) = provider {
+            self.current_by_provider
+                .lock()
+                .expect("current_by_provider lock poisoned")
+                .set(provider, idx);
+        }
     }
 
     /// Append a new account to the live rotation and return its index.
@@ -13505,6 +13554,287 @@ mod tests {
             "the Anthropic row must be untouched: {after}"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// `account` as a Codex account, told from the others by its name alone (no workspace or
+    /// user id, unlike [`codex_account`], whose rows all share one login).
+    fn codex_account_named(name: &str) -> Account {
+        Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(name, 0)
+        }
+    }
+
+    /// Delete every account but `kept` from the config at `path` while `manager` runs, the way
+    /// `tcr remove` or a hand edit does, and take the snapshot that notices. The sleep moves the
+    /// file's mtime, which is what the reload watches.
+    fn delete_from_disk(
+        manager: &Manager,
+        path: &std::path::Path,
+        kept: Vec<Account>,
+    ) -> StatsSnapshot {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        config::save(path, &config_with(kept)).expect("rewrite the test config");
+        manager.snapshot(OffsetDateTime::now_utc())
+    }
+
+    fn names(snapshot: &StatsSnapshot) -> Vec<&str> {
+        snapshot.accounts.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    fn slots(snapshot: &StatsSnapshot) -> Vec<usize> {
+        snapshot.accounts.iter().map(|a| a.slot).collect()
+    }
+
+    /// The dashboard marks the account serving EACH provider, so the manager remembers one per
+    /// provider: a Codex request served after a Claude one must not erase which account is
+    /// serving Claude. `current` keeps its meaning, the account that served last of either.
+    #[test]
+    fn the_serving_account_is_tracked_per_provider() {
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                account("alice@example.com", 0),
+                codex_account_named("bob@example.com/codex"),
+            ]),
+            "serving-per-provider",
+        );
+        manager.set_current(0);
+        manager.set_current(1);
+
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: Some(1),
+            }
+        );
+        assert_eq!(snapshot.current, Some(1));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The serving accounts are positions in the snapshot's list, as `current` is, so a row
+    /// deleted above one moves it up by one, and a deleted serving row reads as nothing serving.
+    /// A slot is never what the list is indexed by: after the first delete, carol is slot 2 and
+    /// position 1.
+    #[test]
+    fn the_serving_account_survives_a_deleted_row_above_it() {
+        let alice = account("alice@example.com", 0);
+        let carol = codex_account_named("carol@example.com/codex");
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                alice.clone(),
+                codex_account_named("bob@example.com/codex"),
+                carol.clone(),
+            ]),
+            "serving-past-a-delete",
+        );
+        manager.set_current(0);
+        manager.set_current(2);
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(slots(&before), [0, 1, 2]);
+        assert_eq!(
+            before.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: Some(2),
+            }
+        );
+
+        let without_bob = delete_from_disk(&manager, &path, vec![alice.clone(), carol]);
+        // First, that the reload happened at all: a file it could not parse would keep every
+        // row, and the assertions below would pass or fail for that reason instead.
+        assert_eq!(
+            names(&without_bob),
+            ["alice@example.com", "carol@example.com/codex"]
+        );
+        assert_eq!(slots(&without_bob), [0, 2]);
+        assert_eq!(
+            without_bob.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: Some(1),
+            }
+        );
+        assert_eq!(without_bob.current, Some(1));
+
+        let without_carol = delete_from_disk(&manager, &path, vec![alice]);
+        assert_eq!(names(&without_carol), ["alice@example.com"]);
+        assert_eq!(
+            without_carol.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: None,
+            }
+        );
+        assert_eq!(without_carol.current, None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A session carries the provider of the account it is pinned to, and a log line the
+    /// provider it was pushed with. A session pinned to a row deleted from the config keeps
+    /// that row's provider, as it keeps that row's name: the pin still points at the slot.
+    #[test]
+    fn sessions_and_log_entries_carry_their_provider() {
+        let alice = account("alice@example.com", 0);
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                alice.clone(),
+                codex_account_named("bob@example.com/codex"),
+            ]),
+            "session-provider",
+        );
+        let now_ms = crate::now_ms();
+        manager.seed_session(0xA11CE, 0, 3, now_ms, SessionKind::Stable);
+        pin_session(&manager, 0xA11CE, 0);
+        manager.seed_session(0xB0B, 1, 5, now_ms, SessionKind::Stable);
+        pin_session(&manager, 0xB0B, 1);
+        for (path, provider) in [
+            ("/v1/messages", crate::provider::Provider::Anthropic),
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                crate::provider::Provider::Codex,
+            ),
+        ] {
+            manager.push_log(RequestLogEntry {
+                time: OffsetDateTime::now_utc(),
+                method: "POST".to_string(),
+                path: path.to_string(),
+                status: 200,
+                account: String::new(),
+                provider,
+            });
+        }
+
+        let provider_of = |snapshot: &StatsSnapshot, account: &str| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|s| s.account == account)
+                .unwrap_or_else(|| {
+                    panic!("no session pinned to {account}: {:?}", snapshot.sessions)
+                })
+                .provider
+        };
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            provider_of(&snapshot, "alice@example.com"),
+            crate::provider::Provider::Anthropic
+        );
+        assert_eq!(
+            provider_of(&snapshot, "bob@example.com/codex"),
+            crate::provider::Provider::Codex
+        );
+        let logged: Vec<(&str, crate::provider::Provider)> = snapshot
+            .recent
+            .iter()
+            .map(|e| (e.path.as_str(), e.provider))
+            .collect();
+        assert_eq!(
+            logged,
+            [
+                (
+                    crate::provider::CODEX_RESPONSES_PATH,
+                    crate::provider::Provider::Codex
+                ),
+                ("/v1/messages", crate::provider::Provider::Anthropic),
+            ]
+        );
+
+        let without_bob = delete_from_disk(&manager, &path, vec![alice]);
+        assert_eq!(names(&without_bob), ["alice@example.com"]);
+        assert_eq!(
+            provider_of(&without_bob, "bob@example.com/codex"),
+            crate::provider::Provider::Codex,
+            "a session pinned to a deleted row keeps its provider"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A row deleted from the config keeps its slot, parked and unlisted, and only `disabled`
+    /// keeps it out of rotation: `eligible` never reads `removed`. So no key may reach it. An
+    /// enable would put an account the operator deleted back into rotation on its in-memory
+    /// credentials until a restart, and a bench would report a save for a row nobody can see.
+    #[test]
+    fn a_deleted_row_is_never_benched_or_enabled() {
+        let bob = account("bob@example.com", 0);
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0), bob.clone()]),
+            "deleted-row-keys",
+        );
+        manager.snapshot(OffsetDateTime::now_utc());
+        let without_alice = delete_from_disk(&manager, &path, vec![bob]);
+        assert_eq!(names(&without_alice), ["bob@example.com"]);
+        let on_disk = std::fs::read(&path).expect("read the test config");
+
+        assert_eq!(
+            manager.set_disabled(0, false),
+            DisablePersist::NoSuchAccount,
+            "an enable must not reach a deleted row"
+        );
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert!(accounts[0].removed, "the deleted row is still marked");
+            assert!(
+                accounts[0].disabled,
+                "and still parked: an enable of it would put it back in rotation"
+            );
+        }
+        assert_eq!(
+            manager.set_disabled(0, true),
+            DisablePersist::NoSuchAccount,
+            "a bench of a deleted row is refused too"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read the test config"),
+            on_disk,
+            "nothing was written for a row the file no longer holds"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The duplicate notice a Codex row gets names the Codex remedy: remove the duplicate or
+    /// re-import it under its own name. Giving each entry its own `orgUuid`, the Claude remedy,
+    /// does nothing for two entries that share one ChatGPT login. Every other outcome, and every
+    /// Claude row, reads exactly as `warning` does.
+    #[test]
+    fn the_codex_duplicate_notice_names_the_codex_remedy() {
+        const CODEX_DUPLICATE: &str = "NOT SAVED: two config entries share this Codex login \
+            — remove the duplicate (tcr remove <name>), or re-import it with --name";
+        let outcomes = [
+            DisablePersist::Persisted,
+            DisablePersist::NoConfigFile,
+            DisablePersist::NoSuchAccount,
+            DisablePersist::NoEntry,
+            DisablePersist::Ambiguous,
+            DisablePersist::WriteFailed,
+        ];
+        for disabled in [true, false] {
+            assert_eq!(
+                DisablePersist::Ambiguous.warning_for(disabled, crate::provider::Provider::Codex),
+                Some(CODEX_DUPLICATE)
+            );
+            for outcome in outcomes {
+                assert_eq!(
+                    outcome.warning_for(disabled, crate::provider::Provider::Anthropic),
+                    outcome.warning(disabled),
+                    "a Claude row reads {outcome:?} as it always has"
+                );
+                if outcome != DisablePersist::Ambiguous {
+                    assert_eq!(
+                        outcome.warning_for(disabled, crate::provider::Provider::Codex),
+                        outcome.warning(disabled),
+                        "{outcome:?} says the same about either provider"
+                    );
+                }
+            }
+        }
+        assert!(
+            DisablePersist::Ambiguous
+                .warning_for(true, crate::provider::Provider::Anthropic)
+                .is_some_and(|text| text.ends_with("give each its own orgUuid")),
+            "the Claude duplicate notice keeps its remedy"
+        );
     }
 
     /// A manager with NO `config_path` — every test here, `tcr demo`, and

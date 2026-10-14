@@ -4797,6 +4797,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // Cloned, not moved: the streaming arm below still needs
             // `account_name` to log a mid-stream transport failure by name.
             account: account_name.clone().unwrap_or_default(),
+            // The provider this request was routed on, decided once from its path.
+            provider,
         });
 
         let is_stream = up_headers
@@ -19941,6 +19943,64 @@ mod tests {
             anthropic_echo.request_count(),
             0,
             "a Codex request never reaches the Anthropic origin"
+        );
+    }
+
+    /// Each line of the recent-request log carries the provider its request was routed on,
+    /// because the dashboard draws a Codex path by its tail and must not guess the provider back
+    /// from a path it shortens.
+    #[tokio::test]
+    async fn codex_and_claude_requests_log_their_provider() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("chatgpt-account-id", CODEX_CLIENT_ID),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let logged: Vec<(String, String, crate::provider::Provider)> = manager
+            .snapshot(time::OffsetDateTime::now_utc())
+            .recent
+            .into_iter()
+            .map(|entry| (entry.path, entry.account, entry.provider))
+            .collect();
+        assert_eq!(
+            logged,
+            [
+                (
+                    "/v1/messages".to_string(),
+                    "alice@example.com".to_string(),
+                    crate::provider::Provider::Anthropic
+                ),
+                (
+                    crate::provider::CODEX_RESPONSES_PATH.to_string(),
+                    "bob@example.com/codex".to_string(),
+                    crate::provider::Provider::Codex
+                ),
+            ],
+            "most recent first"
         );
     }
 

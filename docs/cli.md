@@ -84,6 +84,48 @@ start, because log lines can carry account emails; if it cannot be made owner-on
 refuses to log there rather than writing into a world-readable directory. `XDG_CACHE_HOME`
 relocates it.
 
+### The dashboard with Codex accounts
+
+With a Codex account in the fleet, the dashboard tells the two providers apart. A fleet with no
+Codex account draws exactly the dashboard it always did.
+
+- **A banner segment per provider.** `CLAUDE 1/3 eligible │ CODEX 2/4 eligible`. Each segment
+  counts only its own provider's accounts, the ones that provider's clients can get, and when
+  none of them is ready it turns red and names its own next free account
+  (`CODEX 0/2 eligible · next free carol@example.com in 3d`). A fleet of one provider keeps one
+  segment.
+- **What tcr knows about codex, on the CODEX segment.** `· not pooled: <why>`, in yellow, while
+  this process does not pool codex (`JS leaf covers api.anthropic.com only`,
+  `no readable CA at <path>`, …); `· <n> refused in 10m`, in yellow, for the Codex requests tcr
+  refused in the last ten minutes; and `· <n> unpooled in 10m`, dim, for those it relayed
+  without the pool. When the line is too long for the terminal, the unpooled count drops first,
+  then the refused count, then the account names in the next-free tails, then the tails. Last,
+  the not-pooled reason is cut with a visible `…`: the counts and `not pooled:` always stay.
+- **A section per provider.** The Claude rows sit under the pane's title, then a divider,
+  `codex (<n>)`, then the Codex rows, in columns that line up with the ones above. Each section
+  marks the account serving its own provider with its own `▶`. When the rows do not fit, each
+  section keeps two and the rest go to the section the cursor is in, and each title says how
+  many of its rows are on screen (`codex (3/5 ▼)`). `d` and `e` act on the row under the
+  cursor; the cursor stays on its account when the config changes, and a row deleted from the
+  config is never benched or re-enabled.
+- **`none` for a window the plan does not report.** ChatGPT Pro reports its weekly window only,
+  so a Pro row's 5h cell reads `none`, dim; `—` still means not measured yet. A Codex row's name
+  keeps its end, where `/codex` and `/codex-2` tell two seats of one login apart
+  (`bob@e…/codex`), and shows the plan's short form (`Pro`). Its Fable cell is blank.
+- **ChatGPT's terms on the chip.** On a Codex row, `REFUSED` says ChatGPT is refusing the
+  account, by its quota answer or by an upstream 403, and the chip's countdown says when tcr
+  tries it again (`REFUSED 47m`, or `REFUSED 107s` for an upstream 403's hold). `UNREACHABLE`
+  marks a Codex member of a reserved group, and a usage window that is not 5 hours or 7 days
+  long is named by its length (`30D 12d`).
+- **The re-login hint.** With the cursor on a signed-out Codex row, the pane's bottom border
+  says who needs a re-login, why, and the command that does it:
+  `erin@example.com needs re-login: the codex CLI in ~/.codex refreshed this shared login first — tcr login --codex --account erin@example.com`.
+  On a narrow terminal the why is cut first, so the name and the command stay whole.
+- **The empty fleet with a codex login on disk.** With no account at all and the codex CLI's
+  own login at `~/.codex/auth.json`, the banner reads `FLEET 0/0 eligible`, dim, and the pane
+  says `no accounts — tcr login (Claude) · tcr login --codex (Codex)` and where that login is.
+  The dashboard checks only that the file exists, and never reads it.
+
 ---
 
 ## `tcr run [-- <args>]`
@@ -821,8 +863,8 @@ the file, and the recovery once one has refused it, are in
 **No first run imports it.** The first-run import above takes the `claude` CLI's login only. A
 Codex login enters the pool through `--codex` or `--from-codex` and nothing else.
 
-**TcrBar** does not tell a Codex account from a Claude one yet; see the
-[known limitation](../README.md#watching-it).
+**TcrBar** and the terminal dashboard show Codex accounts in sections of their own; see
+[Watching it](../README.md#watching-it).
 
 Once imported, the account is refreshed against `auth.openai.com`, probed at
 `/backend-api/wham/usage`, never kept warm, and serves the inference requests
@@ -1228,8 +1270,8 @@ from the login's token claims at import and kept current by the quota probe, who
 names it on every probe: when the plan changes at ChatGPT (Plus to Pro, say), the new one is written
 to that row's `organizationType` in the config, and no other key is touched. A probe whose
 `plan_type` is missing or blank names no plan, and leaves the one the row has. The plain text
-carries the same label (`plan=ChatGPT Pro`), and the terminal dashboard tags a Codex row `[codex]`
-after its name.
+carries the same label (`plan=ChatGPT Pro`), and the terminal dashboard lists Codex rows in a
+section of their own, with the plan's short form (`Pro`) after the name.
 
 ```
 tcr status --json | jq -r '.[] | select(.provider == "codex") | "\(.name)\t\(.plan // "unknown")"'
@@ -1804,6 +1846,12 @@ build's SHA if you need to know which one is live.
 
 Takes no flags. Renders the TUI against fake accounts, which is how the sanitized README
 screenshots are produced. It touches no real config and makes no network calls.
+
+Its fleet holds six Claude accounts and three Codex ones: a ChatGPT Pro row with the weekly
+window only, a Plus row with both windows, and a Pro row at its weekly limit. It also seeds one
+Codex session and one `…/codex/responses` log line, so the dashboard's Codex sections show
+without a real account. The demo draws as if codex were pooled and reads nothing from this
+machine, so a screenshot of it shows no path of yours.
 
 ---
 

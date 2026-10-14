@@ -1737,6 +1737,9 @@ pub async fn record_carried(manager: &crate::manager::Manager, record: CarriedRe
         path: record.path,
         status: record.status,
         account: record.account.unwrap_or_default(),
+        // A peer carries Claude requests only: no Codex request leaves through a peer in this
+        // version (see the Codex arm of `pinned_egress`), so a carried request is Anthropic's.
+        provider: crate::provider::Provider::Anthropic,
     });
 }
 

@@ -99,6 +99,13 @@ impl Manager {
         self.config.lock().expect("config lock poisoned").http1_only
     }
 
+    /// The port this server listens on, as its config holds it: `server::serve` writes a
+    /// `--port` override into the config before it builds the manager. The dashboard passes it
+    /// to the in-process Codex route, whose reasons name the port.
+    pub fn proxy_port(&self) -> u16 {
+        self.config.lock().expect("config lock poisoned").proxy.port
+    }
+
     /// What this process's MITM listener can intercept by its policy and leaf — see
     /// [`crate::status::MitmStatus`]. Server-wide boot state, exposed for the
     /// reason [`Self::http1_only`] is: a client must not re-derive it, here
@@ -162,11 +169,24 @@ impl Manager {
         // A row deleted from the config while this process ran keeps its slot
         // (see `AccountRuntime::removed`) and is left out of everything a
         // reader sees. `current` is re-counted over the rows that remain, so
-        // it still indexes `accounts` below.
-        let current = (*self.current.lock().expect("current lock poisoned")).and_then(|idx| {
+        // it still indexes `accounts` below, and so is the account serving each
+        // provider: the same rule, so the two spaces can never be mixed.
+        let listed_position = |idx: usize| {
             (!accounts.get(idx)?.removed)
                 .then(|| accounts[..idx].iter().filter(|a| !a.removed).count())
-        });
+        };
+        let current =
+            (*self.current.lock().expect("current lock poisoned")).and_then(listed_position);
+        let current_by_provider = {
+            let serving = *self
+                .current_by_provider
+                .lock()
+                .expect("current_by_provider lock poisoned");
+            crate::stats::CurrentByProvider {
+                anthropic: serving.anthropic.and_then(listed_position),
+                codex: serving.codex.and_then(listed_position),
+            }
+        };
         let account_snaps = accounts
             .iter()
             .enumerate()
@@ -250,6 +270,9 @@ impl Manager {
                     None
                 };
                 AccountSnapshot {
+                    // The rotation index, which keys act on: this row's position in the list
+                    // equals it only until a row before it is deleted.
+                    slot: idx,
                     name: a.name.clone(),
                     provider: a.provider,
                     organization_type: a.organization_type.clone(),
@@ -350,6 +373,9 @@ impl Manager {
         // Resolve each session's PIN (from `pins`, read above) and its LAST SERVER
         // (`SessionStat.account_idx`) to names from the accounts guard we already
         // hold. A session with no pin has no home, so it shows where it last served.
+        // Its provider is read the same way, from the same unfiltered slots, so a
+        // session pinned to a row deleted from the config keeps that row's provider
+        // as it keeps that row's name.
         let sessions = {
             let map = self.sessions.lock().expect("sessions lock poisoned");
             let name_of = |idx: usize| {
@@ -358,10 +384,13 @@ impl Manager {
                     .map(|a| a.name.clone())
                     .unwrap_or_default()
             };
+            let provider_of =
+                |idx: usize| accounts.get(idx).map(|a| a.provider).unwrap_or_default();
             let mut v: Vec<SessionSnapshot> = map
                 .iter()
                 .map(|(k, s)| {
                     let last_served_account = name_of(s.account_idx);
+                    let home = pins.get(k).copied().unwrap_or(s.account_idx);
                     let account = pins
                         .get(k)
                         .map_or_else(|| last_served_account.clone(), |&idx| name_of(idx));
@@ -371,6 +400,7 @@ impl Manager {
                         last_served_account,
                         requests: s.requests,
                         last_seen: ms_to_odt(s.last_seen_ms),
+                        provider: provider_of(home),
                         kind: s.kind,
                     }
                 })
@@ -391,6 +421,7 @@ impl Manager {
         StatsSnapshot {
             accounts: account_snaps,
             current,
+            current_by_provider,
             recent,
             sessions,
             wire_sessions,

@@ -8596,6 +8596,7 @@ mod tests {
         org: (Option<&str>, Option<&str>),
     ) -> AccountSnapshot {
         AccountSnapshot {
+            slot: 0,
             name: name.to_string(),
             // Anthropic unless the sample says otherwise: its one Codex row
             // overrides this after construction, as row 2 does `free_at`.
@@ -8992,6 +8993,7 @@ mod tests {
             StatsSnapshot {
                 accounts,
                 current: Some(0),
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
@@ -10086,6 +10088,7 @@ mod tests {
             StatsSnapshot {
                 accounts,
                 current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
@@ -10399,6 +10402,7 @@ mod tests {
             let snapshot = StatsSnapshot {
                 accounts: vec![row.clone()],
                 current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
@@ -10864,6 +10868,7 @@ mod tests {
     /// Bridge test #7.
     fn reserved_groups_snapshot() -> (StatsSnapshot, Vec<f64>) {
         let base = AccountSnapshot {
+            slot: 0,
             name: String::new(),
             provider: Provider::Anthropic,
             organization_type: None,
@@ -10923,6 +10928,7 @@ mod tests {
             StatsSnapshot {
                 accounts,
                 current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),

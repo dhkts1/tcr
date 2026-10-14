@@ -225,11 +225,12 @@ menu-bar item is the whole app, with no Dock icon and no window. Its icon shows 
 across the whole fleet rather than the worst account, because one used-up account in a rotating
 pool is the rotation working, not an alarm.
 
-TcrBar reads Codex accounts but does not tell them apart yet, a known limitation. Its "N of M
-ready" headline and the capacity glyph count a Codex account as if it were a Claude one, so a
-fleet whose Claude accounts are all spent still shows green while one Codex account is ready,
-and Claude Code still gets a 429. `tcr status --json` marks each Codex row
-`"provider": "codex"`, and the terminal dashboard tags it `[codex]`.
+TcrBar and the terminal dashboard both tell the two providers apart. TcrBar counts each pool on
+its own: the menu-bar count reads Claude first ("3/4 · 1/2"), the cup follows the emptier pool
+unless Settings pins it to one, the strip under the tabs gives each pool its own row, and the
+Accounts tab has a CLAUDE and a CODEX section. The dashboard's banner gives each provider its own
+segment (`CLAUDE 1/3 eligible │ CODEX 2/4 eligible`), and its account list a section each.
+`tcr status --json` marks each Codex row `"provider": "codex"`.
 
 The panel has four tabs. **Accounts** has one row per account, with a line for each quota window
 showing a bar, a percentage and the countdown to that window's reset. Each row also shows probe

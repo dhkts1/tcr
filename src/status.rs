@@ -660,9 +660,14 @@ impl StatusPayload {
         let accounts = self
             .accounts
             .into_iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(position, a)| {
                 thresholds.push(a.threshold);
                 AccountSnapshot {
+                    // The row's position in the document. The wire carries no slot, nothing
+                    // that renders a rebuilt snapshot reads one, and no key acts on a row of
+                    // it, so its position is the only honest value.
+                    slot: position,
                     name: a.name,
                     provider: a.provider,
                     organization_type: a.organization_type,
@@ -717,6 +722,7 @@ impl StatusPayload {
             StatsSnapshot {
                 accounts,
                 current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: self.sessions,
@@ -1980,6 +1986,7 @@ mod tests {
     fn snapshot_with_counters() -> StatsSnapshot {
         StatsSnapshot {
             accounts: vec![AccountSnapshot {
+                slot: 0,
                 name: "alice@example.com".to_string(),
                 provider: crate::provider::Provider::Anthropic,
                 organization_type: Some("claude_team".to_string()),
@@ -2020,6 +2027,7 @@ mod tests {
                 codex: Default::default(),
             }],
             current: Some(0),
+            current_by_provider: crate::stats::CurrentByProvider::default(),
             recent: Vec::new(),
             sessions: Vec::new(),
             wire_sessions: vec![tcr_status_wire::SessionRow {
