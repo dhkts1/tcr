@@ -365,11 +365,11 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     {
         Ok(config::AccountRemoval::Removed { .. }) => None,
         Ok(config::AccountRemoval::NoEntry) => Some(anyhow::anyhow!(
-            "'{name}' vanished from {} between load and write (concurrent edit?) — nothing was removed",
+            "'{name}' vanished from {} between load and write (concurrent edit?), so nothing was removed",
             config_path.display()
         )),
         Ok(config::AccountRemoval::Ambiguous) => Some(anyhow::anyhow!(
-            "more than one entry in {} carries '{name}''s identity — nothing was removed",
+            "more than one entry in {} carries '{name}''s identity, so nothing was removed",
             config_path.display()
         )),
         Err(err) => Some(err),
