@@ -112,17 +112,19 @@ struct AccountExitRow: View {
 /// Mac to choose and no "must" to set, and a picker offering them would be a
 /// control that cannot do what it says. The sentence comes from
 /// ``AccountExit/statement(for:exit:)``, which also says how to clear an exit
-/// locked to another Mac, the one exit that makes tcr refuse the account.
+/// locked to another Mac, the one exit that makes tcr refuse the account. That
+/// command is drawn as ``CommandProseText``: without its backticks, never broken
+/// inside `--no-must` or the account's name, and copied from the sentence's menu.
 struct AccountExitStatement: View {
     let text: String
 
     var body: some View {
-        Text(text)
+        CommandProseText(text: text, size: V4.muteSize)
             .font(V4.font(V4.muteSize))
             .foregroundStyle(Tok.mute)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.top, V4.quotaMarginTop)
-            .accessibilityLabel(text)
+            .accessibilityLabel(CommandProse.spoken(text))
     }
 }
 

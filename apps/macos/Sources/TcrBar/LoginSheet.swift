@@ -58,12 +58,23 @@ struct LoginSheet: View {
                     .foregroundStyle(Tok.ink)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // A Codex sheet names commands (`tcr run --codex`, the tcr inside TcrBar,
+            // the one a refusal says to retry): each is drawn whole and copied from the
+            // menu (``CommandProseText``). The Claude sheet is drawn as it always was.
             if let detail {
-                Text(detail)
-                    .font(V4.font(V4.dimSize))
-                    .foregroundStyle(Tok.inkDim)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if facts.request?.isCodex == true {
+                    CommandProseText(text: detail, size: V4.dimSize)
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.inkDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(detail)
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.inkDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             if case .choosing = phase {
                 Button(CodexSignInCopy.importLink) { onImportLink() }
@@ -83,10 +94,17 @@ struct LoginSheet: View {
             // Every notice tcr sent, in order and verbatim: none is dropped or cut,
             // so the sheet grows to hold them.
             ForEach(Array(facts.notices.enumerated()), id: \.offset) { _, notice in
-                Text(notice)
-                    .font(V4.font(V4.dimSize))
-                    .foregroundStyle(Tok.near)
-                    .fixedSize(horizontal: false, vertical: true)
+                if facts.request?.isCodex == true {
+                    CommandProseText(text: notice, size: V4.dimSize)
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.near)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text(notice)
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.near)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             buttons

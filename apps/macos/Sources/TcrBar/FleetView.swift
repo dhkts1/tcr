@@ -643,7 +643,9 @@ struct FleetView: View {
 
     /// The one Codex line, under the Claude one and built the same way: amber
     /// when it asks for action, dim when it only reports. Every input is what
-    /// this panel measured or the harness seeded. See ``CodexBanner``.
+    /// this panel measured or the harness seeded. See ``CodexBanner``. Its
+    /// commands are drawn as ``CommandProseText``: without their backticks,
+    /// never broken inside a path or a flag, and copied from the line's menu.
     @ViewBuilder
     private func codexBanner(_ fleet: Fleet) -> some View {
         if let banner = CodexBanner.current(
@@ -652,13 +654,13 @@ struct FleetView: View {
             peerSharing: peerSharingSeed ?? peers.snapshot.sharing,
             bundledTcrWithoutCLI: snapshotMode ? bundledTcrSeed : bundledTcrWithoutCLI)
         {
-            Text(banner.text)
+            CommandProseText(text: banner.text, size: V4.muteSize)
                 .font(V4.font(V4.muteSize))
                 .foregroundStyle(banner.tint == .near ? Tok.near : Tok.dim)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, V4.summaryPaddingSide)
                 .padding(.bottom, V4.summaryPaddingBottom)
-                .accessibilityLabel(banner.text)
+                .accessibilityLabel(CommandProse.spoken(banner.text))
         }
     }
 
