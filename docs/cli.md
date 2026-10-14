@@ -448,11 +448,22 @@ means running `tcr login` again, not editing anything back.
 
 **It disables the account on the running proxy first, then deletes it from the file**, the
 same live route `tcr disable` uses. So a removed account leaves rotation at once, with no
-restart. What happens depends on what the proxy answers:
+restart, and the proxy stops LISTING it the next time it reads the file, which every
+`tcr status` makes it do. TcrBar's row goes on its next poll.
+
+Everything the file could refuse (no such account, a name two rows share) is checked before
+the proxy is touched, and a write that fails after the disable puts the account back the way
+it was, so a failed `tcr remove` changes nothing. The delete edits the file's JSON in place,
+so a row the loader sets aside (an API-key row, a foreign `upstream`) does not block it and
+survives it byte for byte. Deleting the control account also drops `controlAccount`;
+deleting the last account writes `"claudeCodeImport": false`, so the next `tcr status` does
+not import this Mac's Claude Code login into the empty fleet.
+
+What happens depends on what the proxy answers:
 
 | the proxy | what `tcr remove` does |
 |---|---|
-| accepts the disable | deletes the entry from the file |
+| accepts the disable | deletes the entry from the file; if the proxy predates live removal it keeps listing the account as disabled until it restarts, and `tcr remove` says so on stderr |
 | is not running | deletes the entry from the file; there is nothing live to update |
 | rejects the api-key, or refuses the query (no match, or more than one) | exits with an error and changes nothing |
 | is too old to have the route | deletes the entry from the file and warns that the proxy will keep routing to the account until it restarts |

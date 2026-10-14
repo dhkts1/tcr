@@ -70,17 +70,16 @@ final class RemoveAccountCommandTests: XCTestCase {
     }
 }
 
-/// The mutation controller: in-flight tracking, failure surfacing, and the
-/// "stopped, stays listed until restart" note that never clears itself —
-/// same shape as `GroupControllerTests`.
+/// The mutation controller's defaults. What it records after a call is in
+/// `DeleteAccountPanelTests.swift`, which scripts the subprocess.
 @MainActor
 final class RemoveAccountControllerTests: XCTestCase {
 
     private let alice = AccountRef(name: "alice@example.com")
 
-    func testNeverRemovedByDefault() {
+    func testNoNoticeByDefault() {
         let controller = RemoveAccountController()
-        XCTAssertFalse(controller.needsRestart(alice))
+        XCTAssertNil(controller.notice(for: alice))
     }
 
     func testNoFailureByDefault() {

@@ -240,8 +240,40 @@ struct LineBox<Item: Identifiable, Row: View>: View {
         .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.cardFill))
         .overlay(
             RoundedRectangle(cornerRadius: V4.cardRadius)
-                .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth))
+                .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+        )
         .padding(.bottom, marginBottom)
+    }
+}
+
+/// What became of the last thing done to an account, under its line or card:
+/// a refused delete or group edit in `tcr`'s own words, or what `tcr` said
+/// while a delete succeeded (``AccountRowNotice``). Draws nothing when there is
+/// nothing to say, so a row with no notice keeps its height.
+///
+/// `.mute`'s size, wrapped rather than cut (a reason is useless with its end
+/// missing), in `Tok.spent` for a failure and `Tok.near` for a note, the two
+/// colours the rest of the panel already uses for those.
+struct RowNotices: View {
+    let notices: [AccountRowNotice]
+
+    var body: some View {
+        if !notices.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(notices) { notice in
+                    Text(notice.text)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(notice.tone == .failure ? Tok.spent : Tok.near)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help(notice.text)
+                        .accessibilityLabel(
+                            notice.tone == .failure
+                                ? "Failed: \(notice.text)" : notice.text)
+                }
+            }
+        }
     }
 }
 

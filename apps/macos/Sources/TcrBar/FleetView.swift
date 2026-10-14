@@ -811,20 +811,31 @@ struct FleetView: View {
                     hoverCard.rowLeft(rowID)
                     settleHoverCardSoon()
                 }
+            },
+            // Read here, on the panel's own controllers, because option H's
+            // rows never drew them: a refused delete looked like no click.
+            notices: { account in
+                AccountRowNotice.collect(
+                    deleteFailure: removeController.failure(for: account.ref),
+                    deleteNotice: removeController.notice(for: account.ref),
+                    groupFailure: groupController.failure(forAccount: account.ref),
+                    toggleFailure: accounts.failure(for: account.ref))
+            },
+            menu: { account in
+                // The row's own actions, from the ONE definition of them —
+                // `AccountRow`'s menu, rendered with no row around it. A second
+                // copy of that menu for the v4 card is a second thing to keep in
+                // step with `tcr`'s subcommands.
+                v4AccountRow(account, in: fleet, menuOnly: true)
+            },
+            actions: { account in
+                // The SAME definition again, drawn this time as the visible
+                // controls in the card's trailing slot. `.contextMenu` was the
+                // card's only interaction until now: seven per-account actions,
+                // two destructive, reachable by pointer alone.
+                v4AccountRow(account, in: fleet, actionsOnly: true)
             }
-        ) { account in
-            // The row's own actions, from the ONE definition of them —
-            // `AccountRow`'s menu, rendered with no row around it. A second
-            // copy of that menu for the v4 card is a second thing to keep in
-            // step with `tcr`'s subcommands.
-            v4AccountRow(account, in: fleet, menuOnly: true)
-        } actions: { account in
-            // The SAME definition again, drawn this time as the visible
-            // controls in the card's trailing slot. `.contextMenu` was the
-            // card's only interaction until now: seven per-account actions,
-            // two destructive, reachable by pointer alone.
-            v4AccountRow(account, in: fleet, actionsOnly: true)
-        }
+        )
     }
 
     /// One `AccountRow`, built exactly as the legacy panel builds it, rendering
@@ -4647,11 +4658,11 @@ struct AccountRow: View {
         if let verdict = accounts.verdict(for: account.ref, reportedDisabled: account.disabled) {
             parts.append(verdict.spokenLabel)
         }
-        // Same reason `removalNoticeLine` is drawn at all: a VoiceOver user
-        // gets no other signal that the delete landed but the row did not
-        // change, since nothing here re-derives the fleet from the config.
-        if removeController.needsRestart(account.ref) {
-            parts.append("removed from config and stopped, stays listed as disabled until the proxy restarts")
+        // Same reason `removalNoticeLine` is drawn at all: a delete that landed
+        // while the row stays listed (a proxy built before live removal) has
+        // no other signal, and `tcr`'s words are the reason.
+        if let notice = removeController.notice(for: account.ref) {
+            parts.append("delete: \(notice)")
         }
         return parts.joined(separator: ", ")
     }
@@ -4889,7 +4900,12 @@ struct AccountRow: View {
                 // not.
                 parkToggle(for: group)
                 Button("Remove from \(group)") {
-                    Task { await groupController.remove(account: account.ref, from: group) }
+                    Task {
+                        await groupController.remove(account: account.ref, from: group)
+                        // The proxy re-reads group membership on the poll
+                        // itself; asking now shows it without waiting one out.
+                        _ = await onChanged()
+                    }
                 }
                 Button("Delete group “\(group)” for everyone…") {
                     confirmDeleteGroup(group)
@@ -4900,6 +4916,7 @@ struct AccountRow: View {
                         for group in (account.groups ?? []) {
                             await groupController.remove(account: account.ref, from: group)
                         }
+                        _ = await onChanged()
                     }
                 }
             case .addToGroup:
@@ -5042,19 +5059,23 @@ struct AccountRow: View {
     /// actual default). Names the account, states the consequence in plain
     /// language (this is not reversible from the UI — the saved OAuth tokens
     /// are gone and getting the account back needs a fresh `tcr login`), and
-    /// states up front that the row stays listed as disabled until the proxy
-    /// restarts, even though the account itself stops serving right away.
+    /// says what the panel will show: the account stops serving and its row
+    /// goes, with no restart.
+    ///
+    /// A delete that lands polls at once rather than waiting out the poll
+    /// interval, so the row leaves while the person who clicked is still
+    /// looking. A refused one stays on the row with `tcr`'s reason
+    /// (``AccountRowNotice``).
     private func confirmDeleteAccount() {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Delete account “\(account.name)”?"
         alert.informativeText = """
             This removes “\(account.name)” and its saved credentials from the config. \
-            It is not reversible from here — getting it back means running `tcr login` \
+            It is not reversible from here: getting it back means running `tcr login` \
             again from scratch.
 
-            The account stops serving immediately, but this row stays listed here as \
-            disabled until the proxy restarts.
+            The account stops serving at once and leaves this list. No restart is needed.
             """
         let delete = alert.addButton(withTitle: "Delete Account")
         delete.hasDestructiveAction = true
@@ -5065,7 +5086,11 @@ struct AccountRow: View {
         delete.keyEquivalent = ""
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { await removeController.remove(account: account.ref) }
+        Task {
+            if case .accepted = await removeController.remove(account: account.ref) {
+                _ = await onChanged()
+            }
+        }
     }
 
     /// Shared by "Copy Account Name" and the per-group command copy — one
@@ -5546,33 +5571,22 @@ struct AccountRow: View {
         }
     }
 
-    /// Drawn after a successful ``RemoveAccountController/remove(account:org:)``
-    /// and never cleared while the panel stays open — the whole reason it
-    /// exists. `remove_account` now disables the account in the running proxy
-    /// before deleting it from the config, so the account itself stops
-    /// serving immediately — but this row keeps rendering exactly as it did
-    /// before, because nothing here re-derives the fleet from a config the
-    /// running proxy has not re-read, and the row's membership in the fleet
-    /// list is itself a boot-time snapshot (see ``RemoveAccountControl``'s
-    /// doc-comment). A silent success here is the exact bug this codebase
-    /// already lost an evening to for the enable/disable toggle — so this
-    /// line says what is actually true: stopped now, listed as disabled until
-    /// the next restart. It must not claim the row will disappear, because it
-    /// will not.
+    /// What `tcr` said while a delete of this row succeeded. A delete that
+    /// lands takes the row off the panel on the next poll, so this is drawn
+    /// only when the row is still here afterwards, and `tcr`'s words say why:
+    /// a proxy built before live removal keeps listing the row until it
+    /// restarts (see ``RemoveAccountCommand``'s doc-comment).
     ///
     /// `Tok.near`, matching `verdictLine`'s `.notHonoured`/`.spokeUp` tint:
     /// nothing failed — the delete landed — so this must not wear the error
     /// colour the line above reserves for a `tcr` failure.
     @ViewBuilder
     private var removalNoticeLine: some View {
-        if removeController.needsRestart(account.ref) {
-            Label(
-                "Removed from config and stopped. Stays listed as disabled until the proxy restarts.",
-                systemImage: "arrow.triangle.2.circlepath"
-            )
-            .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
-            .foregroundStyle(Tok.near)
-            .fixedSize(horizontal: false, vertical: true)
+        if let notice = removeController.notice(for: account.ref) {
+            Label(notice, systemImage: "arrow.triangle.2.circlepath")
+                .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
+                .foregroundStyle(Tok.near)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

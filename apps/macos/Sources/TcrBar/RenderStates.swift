@@ -219,7 +219,32 @@ enum RenderStates {
             // digits by accident of its own subject, and the strip's failure
             // is a width failure. See ``widestTabBadgesFleet``.
             ("23-widest-tab-badges", .loaded(widestTabBadgesFleet), false, nil),
+            // A delete `tcr` refused, and one that landed on a proxy too old
+            // to drop the row: each line under its own account, in `tcr`'s
+            // words. Option H's rows drew neither until 2026-10-14, so a
+            // refused "Delete Account…" looked like a click that did nothing.
+            // See ``removeControllerFixture(for:)``.
+            ("24-delete-outcomes", .loaded(fleet(healthyJSON)), false, nil),
         ]
+    }
+
+    /// The delete outcomes scene 24 draws; every other scene gets a controller
+    /// holding nothing, which draws no line, the panel's own default.
+    @MainActor
+    private static func removeControllerFixture(for sceneName: String) -> RemoveAccountController {
+        guard sceneName == "24-delete-outcomes" else { return RemoveAccountController() }
+        return .harness(
+            failures: [
+                AccountRef(name: "alice@example.com"): RemoveAccountCommand.Failure(
+                    exitCode: 1,
+                    message:
+                        "Error: the proxy running on :3456 refused this: no account matches 'alice@example.com' Nothing was changed."
+                )
+            ],
+            notices: [
+                AccountRef(name: "bob@example.com"):
+                    "[tcr] the proxy running on :3456 stopped routing to 'bob@example.com', but it predates live removal and keeps listing it as disabled until it restarts."
+            ])
     }
 
     /// Seeds for scene 22, the one scene that needs
@@ -663,7 +688,7 @@ enum RenderStates {
                 // directly for the two scenes that need it.
                 updater: updater,
                 groupController: GroupController(),
-                removeController: RemoveAccountController(),
+                removeController: removeControllerFixture(for: scene.name),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),

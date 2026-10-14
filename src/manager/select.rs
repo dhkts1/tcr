@@ -515,7 +515,18 @@ impl Manager {
         // and nowhere else", so when they disagree there is no account that
         // satisfies both, and the honest answer is the one a strict ask is
         // always owed. The caller's next rung is the 429 it already has.
-        if let Some(li) = self.locked_idx {
+        // A locked account deleted from the config is no lock at all: the next
+        // boot resolves `lockAccount` to nothing and rotates normally, so this
+        // process does the same now rather than serve a deleted account.
+        let locked = self.locked_idx.filter(|&li| {
+            !self
+                .accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .get(li)
+                .is_some_and(|a| a.removed)
+        });
+        if let Some(li) = locked {
             if let Some(g) = strict_group {
                 let in_group = {
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
