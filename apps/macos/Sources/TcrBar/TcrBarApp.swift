@@ -183,6 +183,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // app knows a Mac is asking to connect. This is what puts the mark on
         // the bar and what the notifier reads.
         shell.knocks.start()
+        // One read of `tcr setup status`, so the first opening of the panel
+        // already knows whether to ask "Send claude through tcr?". Each open
+        // re-reads it after showing, for the opening after that.
+        Task { await shell.claudeRoute.refresh() }
         // One attempt, once per process.
         //
         // This used to need a `didAttemptLaunchStart` flag because `onAppear`

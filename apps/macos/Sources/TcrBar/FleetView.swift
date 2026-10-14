@@ -30,6 +30,10 @@ struct FleetView: View {
     /// Deleting an account from each row's gear menu. See
     /// ``RemoveAccountController``.
     @ObservedObject var removeController: RemoveAccountController
+    /// The one-time "Send `claude` through tcr?" prompt. Whether it shows is
+    /// decided by the shell before the panel opens, never by this view. See
+    /// ``ClaudeRouteController``.
+    @ObservedObject var routeController: ClaudeRouteController
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -253,6 +257,7 @@ struct FleetView: View {
         updater: Updater,
         groupController: GroupController,
         removeController: RemoveAccountController,
+        routeController: ClaudeRouteController,
         startServerAtLaunch: Binding<Bool>,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
@@ -315,6 +320,7 @@ struct FleetView: View {
         self.updater = updater
         self.groupController = groupController
         self.removeController = removeController
+        self.routeController = routeController
         self._startServerAtLaunch = startServerAtLaunch
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
@@ -534,6 +540,26 @@ struct FleetView: View {
         }
     }
 
+    /// "Send `claude` through tcr?", drawn when the shell decided at open that
+    /// this opening shows it (``ClaudeRouteController/promptShown``). It is
+    /// never added or removed while the panel is open; answering swaps its
+    /// buttons for one line in the same space. See ``ClaudeRoutePromptView``.
+    @ViewBuilder
+    private var claudeRoutePrompt: some View {
+        if routeController.promptShown {
+            ClaudeRoutePromptView(
+                outcome: routeController.promptOutcome,
+                pending: routeController.pending,
+                onAnswer: { answer in
+                    if answer == .everyLaunch, !ClaudeRouteConfirm.everyLaunch() { return }
+                    Task { await routeController.answerPrompt(answer) }
+                }
+            )
+            .padding(.horizontal, V4.summaryPaddingSide)
+            .padding(.bottom, V4.summaryPaddingBottom)
+        }
+    }
+
     /// Is there a fleet to draw tabs over? `.loaded` with at least one account
     /// — the exact case ``v4Content`` gives a tab body to. Every other state
     /// (pending, tool missing, command failed, undecodable, empty fleet) falls
@@ -601,6 +627,7 @@ struct FleetView: View {
                 if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
+                claudeRoutePrompt
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
             // header at ``header`` has always carried and the v4 summary block
             // dropped: a server that predates the sessions wire reports no

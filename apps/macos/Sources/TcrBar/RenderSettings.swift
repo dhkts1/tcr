@@ -301,6 +301,7 @@ enum RenderSettings {
             panelDensityPreference: PanelDensityPreference(),
             groupController: GroupController(),
             updater: Updater(startingUpdater: false),
+            claudeRoute: ClaudeRouteController(pinned: .status(ClaudeRouteStatus(route: .shell))),
             onWhatsNew: {})
 
         // A fresh navigation object per capture, not `.shared` — so setting
