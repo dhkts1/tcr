@@ -3402,6 +3402,28 @@ fn render_sessions_json(supported: bool, sessions: &[tcr_status_wire::SessionRow
     serde_json::json!({ "supported": supported, "sessions": sessions }).to_string()
 }
 
+/// The `tcr sessions` text form: a `supported=… sessions=…` header, then one line per
+/// session, every line ending in a newline. A pure function, so a test can pin the bytes
+/// a person reads without a running proxy.
+fn render_sessions_text(supported: bool, sessions: &[tcr_status_wire::SessionRow]) -> String {
+    let mut out = format!("supported={supported} sessions={}\n", sessions.len());
+    for row in sessions {
+        out.push_str(&format!(
+            "session={} account={} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={:.4}\n",
+            row.session_id,
+            row.account.as_deref().unwrap_or("-"),
+            row.model.as_deref().unwrap_or("-"),
+            row.requests,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.tools.calls,
+            row.cost_usd,
+        ));
+    }
+    out
+}
+
 /// `tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the
 /// last hour.
 ///
@@ -3460,21 +3482,7 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
         // second contract to keep in step with the first.
         println!("{}", render_sessions_json(supported, &payload.sessions));
     } else {
-        println!("supported={supported} sessions={}", payload.sessions.len());
-        for row in &payload.sessions {
-            println!(
-                "session={} account={} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={:.4}",
-                row.session_id,
-                row.account.as_deref().unwrap_or("-"),
-                row.model.as_deref().unwrap_or("-"),
-                row.requests,
-                row.input_tokens,
-                row.output_tokens,
-                row.cache_read_tokens,
-                row.tools.calls,
-                row.cost_usd,
-            );
-        }
+        print!("{}", render_sessions_text(supported, &payload.sessions));
     }
     Ok(())
 }
@@ -7288,6 +7296,63 @@ mod tests {
     #[test]
     fn a_non_json_body_carries_no_sessions() {
         assert!(!payload_carries_sessions("not json at all"));
+    }
+
+    /// What `tcr sessions` prints for a Claude-only fleet, pinned before the sessions wire
+    /// learned about Codex: every later change must leave these bytes exactly as they are. The
+    /// rows are built from JSON holding only the keys a Claude session has always carried, so
+    /// the golden cannot lean on a field added after it. The second row's model has no price in
+    /// this build and prints `costUsd=0.0000`. That zero is a known defect, kept on purpose:
+    /// fixing it would change what a Claude-only fleet prints.
+    #[test]
+    fn claude_only_sessions_text_is_unchanged() {
+        let rows: Vec<tcr_status_wire::SessionRow> = serde_json::from_value(serde_json::json!([
+            {
+                "sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+                "account": "alice@example.com",
+                "model": "claude-opus-5",
+                "firstSeenMs": 1_767_223_200_000_i64,
+                "lastSeenMs": 1_767_225_597_000_i64,
+                "requests": 24,
+                "inputTokens": 180_000,
+                "outputTokens": 9_200,
+                "cacheReadTokens": 160_000,
+                "cacheCreationTokens": 12_000,
+                "tools": { "calls": 12 },
+                "costUsd": 1.2034,
+                "cacheTtlSecs": 3600
+            },
+            {
+                "sessionId": "22222222-2222-4222-8222-222222222222",
+                "account": "carol@example.com",
+                "model": "claude-opus-4-5",
+                "firstSeenMs": 1_767_225_000_000_i64,
+                "lastSeenMs": 1_767_225_060_000_i64,
+                "requests": 1,
+                "inputTokens": 10,
+                "outputTokens": 2
+            },
+            {
+                "sessionId": "33333333-3333-4333-8333-333333333333",
+                "firstSeenMs": 1_767_225_000_000_i64,
+                "lastSeenMs": 1_767_225_000_000_i64,
+                "requests": 1
+            }
+        ]))
+        .expect("session rows in today's shape");
+        assert_eq!(
+            render_sessions_text(true, &rows),
+            concat!(
+                "supported=true sessions=3\n",
+                "session=a1f3c2d4-0000-4000-8000-000000000001 account=alice@example.com model=claude-opus-5 requests=24 inputTokens=180000 outputTokens=9200 cacheReadTokens=160000 toolCalls=12 costUsd=1.2034\n",
+                "session=22222222-2222-4222-8222-222222222222 account=carol@example.com model=claude-opus-4-5 requests=1 inputTokens=10 outputTokens=2 cacheReadTokens=0 toolCalls=0 costUsd=0.0000\n",
+                "session=33333333-3333-4333-8333-333333333333 account=- model=- requests=1 inputTokens=0 outputTokens=0 cacheReadTokens=0 toolCalls=0 costUsd=0.0000\n",
+            )
+        );
+        assert_eq!(
+            render_sessions_text(false, &[]),
+            "supported=false sessions=0\n"
+        );
     }
 
     /// The document shape the Swift poller decodes. Written as literal text
