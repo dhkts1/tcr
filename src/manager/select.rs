@@ -3289,6 +3289,7 @@ mod revalidation_sticky_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3447,6 +3448,7 @@ mod sticky_divert_replay_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3619,6 +3621,7 @@ mod strict_group_door_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4115,6 +4118,7 @@ mod reserved_gate_agreement_tests {
                 seat_tier: None,
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -4286,6 +4290,7 @@ mod group_miss_tests {
                 seat_tier: None,
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -4496,6 +4501,7 @@ mod reset_urgency_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4753,6 +4759,7 @@ mod fable_last_resort_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -5134,6 +5141,7 @@ mod stale_pin_load_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -5357,6 +5365,7 @@ mod provider_filter_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }

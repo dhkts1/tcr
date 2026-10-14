@@ -146,9 +146,12 @@ tcr run --codex                    # an interactive codex session
 tcr run --codex -- exec "…"        # everything after -- goes to codex
 ```
 
-The binary is `codex` on `PATH` unless `TCR_CODEX_BIN` or `CODEX_BIN` names another
-([configuration.md](configuration.md#environment-overrides)), and the process exits with
-`codex`'s own exit code. The pool needs a Codex account to serve the session; add one with
+The binary is found by the search [`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own) uses, and the
+process exits with `codex`'s own exit code: `TCR_CODEX_BIN` or `CODEX_BIN` when set
+([configuration.md](configuration.md#environment-overrides)), else `codex` on `PATH`, else in the
+usual install directories. Unlike the login, it keeps the shell's `PATH` as it is. The pool needs a
+Codex account to serve the session; add one with
+[`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own), or import the one `codex` holds with
 [`tcr login --from-codex`](#--from-codex-importing-the-login-codex-already-has).
 
 **See-through, or not routed at all.** tcr has no base-URL route for `codex` yet. A pooled
@@ -205,10 +208,10 @@ Each reason, verbatim, and what it needs:
   TLS material` line carrying the error. A restart loads the material again, so it helps only
   once that cause is fixed.
 - `` the proxy on :<port> holds no Codex account, so it blind-tunnels chatgpt.com and codex keeps
-  its own login — add one with `tcr login --from-codex` ``. The proxy terminates `chatgpt.com`
+  its own login — add one with `tcr login --codex` ``. The proxy terminates `chatgpt.com`
   only while its pool holds a Codex account, in any state, disabled included, and tunnels it
   untouched otherwise, so the session would run on `codex`'s own login whatever the launch set.
-  Import one with [`tcr login --from-codex`](#--from-codex-importing-the-login-codex-already-has):
+  Add one with [`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own):
   a running proxy takes it at once and counts its Codex accounts on every `CONNECT`, so the next
   `tcr run --codex` is pooled with no restart.
 - `no readable CA at <path>`. The proxy intercepts `chatgpt.com` with a leaf it minted, but
@@ -290,20 +293,103 @@ at boot, avoids this.
 
 ## `tcr login`
 
-Runs the browser OAuth flow and adds the resulting account to the pool. With `--from-codex` it
-adds a Codex account instead, from the login the `codex` CLI already holds.
+Runs the browser OAuth flow and adds the resulting account to the pool. With `--codex` it signs
+in a Codex account instead, by running `codex login` in a folder of tcr's own; with `--from-codex`
+it imports the login the `codex` CLI already holds.
 
 | flag | type | default | effect |
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
-| `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
+| `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it. A Codex account is refused, before anything runs, without `--codex` or `--from-codex` |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
 | `--from-claude-code` | bool | `false` | add an account from the login the `claude` CLI on this machine already holds, instead of the browser flow — see below. A first run does this by itself |
 | `--from-codex` | bool | `false` | add a Codex account from the login the `codex` CLI on this machine already holds — see below. Refused together with `--token` or `--from-claude-code` |
+| `--codex` | bool | `false` | sign in a Codex account by running `codex login` in a throwaway folder of tcr's own, so the `codex` CLI keeps its own login — see below. Refused together with `--token`, `--from-claude-code` or `--from-codex` |
 | `--codex-home <dir>` | path | none | read `<dir>/auth.json` instead of `$CODEX_HOME/auth.json`; accepted only with `--from-codex` |
 | `--name <name>` | string | none | name this account explicitly instead of letting `login` mint a name for it; refused when another account already has that name |
-| `--non-interactive` | bool | `false` | drive the login from another program: never reads stdin, never opens the browser, reports progress as JSON lines — see below |
+| `--non-interactive` | bool | `false` | drive the login from another program: never reads stdin, never opens the browser itself (under `--codex`, `codex` opens it), reports progress as JSON lines — see below |
+
+### `--codex`: a Codex login of tcr's own
+
+```bash
+tcr login --codex
+tcr login --codex --account bob@example.com     # sign that Codex account in again
+```
+
+tcr runs `codex login` with `CODEX_HOME` set to a throwaway folder, `tcr-codex-login.*` beside
+the config file (mode `0700`), reads the login `codex` leaves there, deletes the folder, and
+imports the login the way [`--from-codex`](#--from-codex-importing-the-login-codex-already-has) does, workspace check
+included. `codex` does the OAuth in the browser, which it opens itself; the login it keeps for
+its own use is never touched, so the two never share a single-use refresh token, and the import's
+notice about that copy does not print here. A failed `codex login` (a non-zero exit, or no login
+left behind) writes nothing, and says how it ended; under `--non-interactive`, which passes
+`codex`'s own lines to stderr rather than to the terminal, it quotes the last of them too.
+
+The folder is deleted as soon as the login is read, before the workspace check goes out on the
+network, and on every way out tcr can see: a failed sign-in, a refusal, and a cancel. SIGTERM,
+SIGINT or SIGHUP (TcrBar's Cancel, Ctrl-C, a closed terminal) stops `codex login` and everything it
+started, deletes the folder and exits with 128 plus the signal's number. Only a SIGKILL of tcr can
+leave a folder behind, holding a live login; [architecture.md](architecture.md#files-on-disk)
+lists it.
+
+```
+$ tcr login --codex
+[tcr] signing in a Codex account: `codex login` runs in a folder of tcr's own, so the codex CLI keeps the login it has
+…  codex login's own output, passed through unchanged  …
+Saved account 'bob@example.com' to /Users/example/.config/teamclaude.json
+[tcr] 'bob@example.com' is a Codex account (ChatGPT Pro): Codex sessions started with `tcr run --codex` can use it
+[tcr] tcr intercepts chatgpt.com from now on: codex started with `tcr run --codex` is pooled; a codex that reaches this proxy some other way needs CODEX_CA_CERTIFICATE set to tcr's CA, or chatgpt.com in NO_PROXY to stay on its own login
+[tcr] codex needs a login of its own to start, even when pooled, and none is at /Users/example/.codex/auth.json: unless codex keeps its login in the keyring, run `codex login` once
+[tcr] warning: the tcr at /usr/local/bin/tcr (0.2.44) predates Codex accounts: update it before it next starts — it would read this login as a Claude account and send its token to Anthropic
+Logged in as 'bob@example.com'.
+```
+
+The plan in parentheses is the label `tcr status` shows, left out when the login names none.
+The account reaches the config the way every `tcr login` does, over a running proxy's live route
+or into the file; a running proxy that cannot store a Codex account refuses the sign-in before
+`codex` runs, as it refuses [`--from-codex`](#--from-codex-importing-the-login-codex-already-has).
+
+**Two guards, before anything runs.** `tcr login --account <a Codex account>` without `--codex`
+or `--from-codex` is refused, because plain `tcr login` signs in Claude accounts only, and
+`tcr login --codex --account <a Claude account>` is refused the other way round. Each names the
+command that does fit, opens no browser and writes nothing.
+
+**Identity on re-login.** `tcr login --codex --account <name>` signs that account in again only
+when the login that comes back is the same ChatGPT user in the same workspace; anything else
+writes nothing. A different user, which is what a browser already signed in as someone else
+returns, is refused naming both: sign out of chatgpt.com first, or use a private window, then
+retry. The same user in another workspace is refused naming both workspaces (the first eight
+characters of each id) and their plans: retry, and choose the account's workspace when ChatGPT
+asks which one to use. The check keys on the ChatGPT user id, never the email: a Codex account
+stores no email, and its name may be a `--name`.
+
+**Where it looks for `codex`.** One search serves `tcr login --codex` and `tcr run --codex`,
+in this order: `TCR_CODEX_BIN`, `CODEX_BIN`, `PATH`, then `~/.local/bin`,
+`~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, then the `bin` of npm's global prefix,
+which is `NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global` (tcr never runs
+npm). A set variable always decides and never falls through to the rest
+([configuration.md](configuration.md#environment-overrides)). With nothing found, the refusal names
+every place it searched. `codex login` runs with the directory `codex` was found in first on its
+`PATH`, then tcr's own `PATH`, then whichever of `/opt/homebrew/bin` and `/usr/local/bin` that
+lacks: an npm `codex` is a `#!/usr/bin/env node` launcher whose `node` sits beside it, and a
+TcrBar started from Finder has neither directory on its `PATH`.
+
+**The notices**, printed after the account is saved, each only when it holds:
+
+| notice | when |
+|---|---|
+| `tcr intercepts chatgpt.com from now on: …` | the config held no Codex account before this one |
+| `codex needs a login of its own to start, even when pooled, and none is at <path>: …` | there is no `auth.json` under `$CODEX_HOME`, or under `~/.codex` when `CODEX_HOME` is unset. Checked for existence, never read |
+| `warning: the tcr at <path> (<version>) predates Codex accounts: update it before it next starts — …` | a `tcr` at 0.2.45 or older is in reach: it would read this login as a Claude account and send its token to Anthropic |
+| `warning: the tcr at <path> (<version>) predates Codex accounts: update it — until then it refuses this config, …` | a `tcr` from 0.2.46 on whose `login --help` lacks `--from-codex` is in reach: it refuses the whole config |
+
+The older-`tcr` check runs `--version`, and `login --help` when it needs to, on every `tcr` on
+`PATH`, in the four directories above, and TcrBar's bundled one
+(`/Applications/TcrBar.app/Contents/MacOS/tcr`). It warns once per binary however many ways it is
+reached, never about the `tcr` running the check, and says nothing about a binary that does not
+answer within five seconds or whose version does not parse. `--from-codex` prints the same
+notices.
 
 ### `--non-interactive`: driving the login from another program
 
@@ -316,7 +402,9 @@ anything else that can read lines and open a URL. It changes four things and not
   otherwise prompt — is named with the same `unnamed` default an empty answer gives; pass
   `--name` to choose.
 * **The browser is not opened here.** The URL is printed instead and the caller opens it,
-  because only the caller can bring its own window forward afterwards.
+  because only the caller can bring its own window forward afterwards. The exception is
+  `--codex`: `codex login` opens the browser itself, and the `browser` event says so with
+  `"opened":true`, so the caller does not open it a second time.
 * **Progress is JSON, one object per line on stdout**, and nothing else is printed there:
 
   ```
@@ -325,13 +413,45 @@ anything else that can read lines and open a URL. It changes four things and not
   {"event":"saved","account":"alice@example.com"}
   ```
 
+  A Codex sign-in reads, keys sorted:
+
+  ```
+  {"event":"browser","opened":true,"url":"https://auth.openai.com/oauth/authorize?…"}
+  {"event":"waiting"}
+  {"event":"notice","text":"tcr intercepts chatgpt.com from now on: …"}
+  {"account":"bob@example.com","event":"saved","plan":"ChatGPT Pro","provider":"codex"}
+  ```
+
   A failure is `{"event":"error","reason":"…"}` on stdout instead of `saved`.
+
+  | event | keys | meaning |
+  |---|---|---|
+  | `browser` | `url`, and `opened` (only ever `true`) | the sign-in page; `opened` when it was opened for the caller already |
+  | `waiting` | none | waiting for the browser to come back |
+  | `notice` | `text` | one notice a terminal would print on stderr; every notice comes before `saved` or `error` |
+  | `saved` | `account`; on a Codex account also `provider` (`"codex"`) and `plan`, left out when the login names none | the account is saved under that name. A Claude account's line is unchanged |
+  | `error` | `reason`, and `code` when the refusal is one a caller can name | the login failed; nothing was written |
+
+  The codes:
+
+  | `code` | the refusal |
+  |---|---|
+  | `codex-fedramp` | the login's workspace is FedRAMP, which tcr cannot pool |
+  | `codex-routed` | the workspace check names another backend origin or a routing override |
+  | `codex-unconfirmed` | the workspace check could not confirm the workspace |
+  | `codex-missing` | no `codex` was found, or `TCR_CODEX_BIN` or `CODEX_BIN` names none |
+  | `codex-identity` | the login that came back is not the ChatGPT user and workspace of the `--account` named |
+  | `codex-login-failed` | `codex login` ended without leaving a login behind |
+  | `account-is-codex` | `--account` names a Codex account, without `--codex` or `--from-codex` |
+  | `account-is-claude` | `--codex --account` or `--from-codex --account` names a Claude account |
 * **A failure exits non-zero** with that same reason on ONE stderr line, rather than
   anyhow's indented multi-line chain. The 2-minute callback timeout is a failure like any
   other.
 
 It refuses to combine with `--token`, which reads the credential from stdin: that is the
-one input this mode has no way to supply.
+one input this mode has no way to supply. `--from-codex` and `--from-claude-code` honour it: each
+sends its import's notice as one `notice` line, a Codex import then the notices that hold, and
+then `saved` or `error`.
 
 **A login names the account itself, and never asks on the happy path.** The name is the
 profile's email when no other account carries it, and `email/<org-slug>` when one does —
@@ -538,8 +658,8 @@ zero accounts: never a non-zero exit, never a retry, and `--json` output is unch
 
 ### `--from-codex`: importing the login `codex` already has
 
-A Codex account is a ChatGPT login of OpenAI's `codex` CLI, and tcr has no browser flow of
-its own for one: it imports the login `codex` already holds.
+A Codex account is a ChatGPT login of OpenAI's `codex` CLI. `--from-codex` imports the login
+`codex` already holds; [`--codex`](#--codex-a-codex-login-of-tcrs-own) signs in one of tcr's own instead.
 
 ```bash
 codex login                 # once, if codex is not signed in yet
@@ -550,7 +670,8 @@ It reads `$CODEX_HOME/auth.json`, which is `~/.codex/auth.json` when `CODEX_HOME
 empty. Set `TCR_CODEX_AUTH` to a file path to read that file instead; a path that does not
 exist means "no Codex login on this machine". That file is where `codex` keeps its login by
 default, and the only place tcr looks: a login `codex` was told to keep in the system keyring
-instead (its `cli_auth_credentials_store` setting) is not read. A file holding an API-key
+instead (its `cli_auth_credentials_store` setting) is not read, and the error for a missing file
+says to use `tcr login --codex` for it, which needs no file. A file holding an API-key
 login, or one with no refresh token, is refused by name, because tcr pools ChatGPT logins
 only. Nothing here ever prints or logs a token.
 
@@ -566,8 +687,9 @@ answer that names another origin or override is refused, quoting it. One that na
 a check that cannot complete (no connection, a timeout, an HTTP error or a body that is not
 JSON), refuse the import too, saying why tcr could not confirm the workspace.
 
-**A second account** is signed in under a `CODEX_HOME` of its own, then imported from there.
-`codex` wants that directory to exist already:
+**A second account** is easiest with [`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own), which makes and
+deletes the folder by itself. By hand, it is signed in under a `CODEX_HOME` of its own, then
+imported from there. `codex` wants that directory to exist already:
 
 ```bash
 mkdir -p ~/.codex-second
@@ -585,8 +707,14 @@ either provider already holds that name, it becomes `<email>/codex`, then `<emai
 `email/<org-slug>`; so a ChatGPT login under the email your Claude login uses lands beside it
 as `alice@example.com/codex`. `--name` overrides all of that, and is refused when another
 account holds the name. A login whose id token carries no email needs `--name`. `--account
-<email>` refuses the import, with nothing written, unless the login carries that email: a
-guard against importing from the wrong `CODEX_HOME`.
+<name>` takes the name `tcr accounts` prints, or the login's email, and refuses the import, with
+nothing written, unless the login is that account's: a Codex account must be the same ChatGPT user
+in the same workspace, a Claude account is refused outright, and a name no account holds must be
+the login's email. It is a guard against importing from the wrong `CODEX_HOME`.
+
+**The folder.** The row records the folder it was imported from as `codexHome`
+([configuration.md](configuration.md#accounts)), so TcrBar can offer to import from it again; a
+login of tcr's own records none, and signing a row in with `--codex` removes the one it had.
 
 **Importing the same login again** updates its row in place and keeps the name the row is
 saved under, so a `--name` that differs from it is refused. It is refused outright when tcr
@@ -613,10 +741,12 @@ it does not, the row is already live as a Claude account, and the import fails n
 
 **The cost, stated on every import.** Each import prints one line on stderr carrying two
 notices, the first about the copy of the login the `codex` CLI keeps, the second about older
-proxies:
+proxies, then a line on using the account, then the notices of
+[`--codex`](#--codex-a-codex-login-of-tcrs-own) that hold:
 
 ```
 [tcr] imported as 'alice@example.com' (ChatGPT Pro); this copies the login the `codex` CLI itself uses, and Codex refresh tokens are single-use: the first time tcr refreshes it, the copy `codex` holds stops working and `codex` asks you to log in again, once, under `tcr run --codex` too. To avoid that, import a login made for tcr alone: `mkdir -p <dir>`, `CODEX_HOME=<dir> codex login`, then `tcr login --from-codex --codex-home <dir>`. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
+[tcr] start a pooled session with `tcr run --codex`
 ```
 
 The plan in parentheses is the label `tcr status` shows, left out when the login names no
@@ -624,7 +754,7 @@ plan. A pooled `tcr run --codex` session does not spare the copy `codex` holds: 
 credential on inference only, every other `/backend-api/` call goes up under the login `codex`
 holds, and `codex` refreshes that copy itself, near its expiry and on a 401. A login made for
 tcr alone, under a `CODEX_HOME` of its own as [above](#--from-codex-importing-the-login-codex-already-has),
-leaves the one you use with `codex` alone.
+leaves the one you use with `codex` alone, and [`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own) is that, done for you.
 
 **Upgrade every `tcr` before the first import.** A Codex row is written at
 `credentialVersion: 2` ([configuration.md](configuration.md#accounts)), which a `tcr` that
@@ -634,7 +764,7 @@ the file, and the recovery once one has refused it, are in
 [troubleshooting.md](troubleshooting.md#after-a-codex-import-an-older-proxy-refuses-to-load-the-config).
 
 **No first run imports it.** The first-run import above takes the `claude` CLI's login only. A
-Codex login enters the pool through `--from-codex` and nothing else.
+Codex login enters the pool through `--codex` or `--from-codex` and nothing else.
 
 **TcrBar** does not tell a Codex account from a Claude one yet; see the
 [known limitation](../README.md#watching-it).
@@ -1002,8 +1132,9 @@ The output stays a bare array of rows. A Codex account's row carries `"provider"
 Anthropic row carries no `provider` key at all, never `null`, so a client written before the key
 reads every Anthropic row exactly as before. On a Codex row `organizationType` is the ChatGPT plan,
 verbatim (`pro`, `plus`, `team`, …), `plan` is its label (`ChatGPT Pro`), and
-`rateLimitTier`, `seatTier`, `orgUuid` and `orgName` are `null`: a ChatGPT workspace is named by its
-account id alone. A plan word tcr does not know is labelled `ChatGPT` and the word as ChatGPT wrote
+`rateLimitTier`, `seatTier` and `orgName` are `null`. `orgUuid` is the ChatGPT workspace id, the one
+tcr sends as `chatgpt-account-id`, and is `null` on a row whose `accountUuid` still holds the
+workspace ([configuration.md](configuration.md#accounts) has that shape). A plan word tcr does not know is labelled `ChatGPT` and the word as ChatGPT wrote
 it (`edu` reads `ChatGPT edu`), unless the word already starts with `ChatGPT`. That plan is read
 from the login's token claims at import and kept current by the quota probe, whose `plan_type`
 names it on every probe: when the plan changes at ChatGPT (Plus to Pro, say), the new one is written
@@ -1034,6 +1165,8 @@ to say:
 | `limitReachedType` | string | why ChatGPT refused the account, verbatim: `rate_limit_reached`, or a credits or spend-cap kind. Present exactly while that refusal stands |
 | `spendControlReached` | `true`, or absent | the quota probe says the account's spend control is reached |
 | `credits` | `{hasCredits, unlimited, balance?}` | the account's credits, from the last response or probe that reported them. `balance` is verbatim (`"12.50"`), and absent when none was reported |
+| `loginError` | string | why the account's login died, from its last refresh: OpenAI's error code verbatim (`refresh_token_reused`, `refresh_token_expired`, `refresh_token_invalidated`, `invalid_grant`, …), or `http_401` for a 401 that named none. Present while the login is known dead; a successful refresh or a fresh login clears it |
+| `codexHome` | string, an absolute path | the folder the account's login was imported from (`--from-codex`). Absent for a login of tcr's own (`--codex`) and for a row imported before tcr recorded it |
 
 On a Codex row, `held` labels each window by that reported length: whole days read `{n}d`, whole
 hours `{n}h`, anything else `{n}m`, so a 30-day weekly window is held as `30d`. Without a length,

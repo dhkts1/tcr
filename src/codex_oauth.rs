@@ -122,7 +122,10 @@ pub async fn refresh_access_token_at(
     // broke would otherwise surface as a Transient body error after up to the whole timeout, and
     // a dead refresh token would be retried as a live one.
     if status.as_u16() == 401 {
-        return Err(OAuthError::AuthRejected { status: 401 });
+        return Err(OAuthError::AuthRejected {
+            status: 401,
+            code: None,
+        });
     }
     let body = response
         .bytes()
@@ -135,7 +138,12 @@ pub async fn refresh_access_token_at(
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case(c))
         }) {
-            return Err(OAuthError::AuthRejected { status: 400 });
+            // tcr's own spelling of the code, never the body's text ([`known_error_code`]), so
+            // it can be shown as why the login is dead (`AccountRuntime::login_error`).
+            return Err(OAuthError::AuthRejected {
+                status: 400,
+                code: code.as_deref().and_then(known_error_code),
+            });
         }
         let shown = match code.as_deref() {
             Some(code) => known_error_code(code).unwrap_or("unrecognised error code"),
@@ -199,6 +207,11 @@ pub struct IdClaims {
     pub email: Option<String>,
     pub chatgpt_account_id: Option<String>,
     pub chatgpt_plan_type: Option<String>,
+    /// The ChatGPT user the token belongs to: `chatgpt_user_id` under
+    /// `https://api.openai.com/auth`, else `user_id` there, where codex reads it (`openai/codex`
+    /// f82e365, `login/src/token_data.rs:71-105,142-147,174-198`). The account id names the
+    /// workspace; this names the person in it.
+    pub chatgpt_user_id: Option<String>,
     /// `chatgpt_account_is_fedramp`, under `https://api.openai.com/auth`: the login belongs to a
     /// FedRAMP workspace, and codex sends its requests with `X-OpenAI-Fedramp: true`
     /// (`openai/codex` f82e365, `login/src/token_data.rs:39-40,98`;
@@ -225,6 +238,7 @@ pub fn id_claims(jwt: &str) -> Option<IdClaims> {
         email: s(Some(&payload), "email").or_else(|| s(profile, "email")),
         chatgpt_account_id: s(auth, "chatgpt_account_id"),
         chatgpt_plan_type: s(auth, "chatgpt_plan_type"),
+        chatgpt_user_id: s(auth, "chatgpt_user_id").or_else(|| s(auth, "user_id")),
         chatgpt_account_is_fedramp: auth
             .and_then(|o| o.get("chatgpt_account_is_fedramp"))
             .and_then(serde_json::Value::as_bool)
@@ -292,6 +306,35 @@ mod tests {
     }
     fn id_jwt() -> String {
         format!("{JWT_HEADER}.{ID_PAYLOAD}.sig")
+    }
+
+    /// `{"https://api.openai.com/auth":{"user_id":"user-b"}}`: a token naming its user under the
+    /// fallback key only.
+    const USER_ID_ONLY_PAYLOAD: &str =
+        "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsidXNlcl9pZCI6InVzZXItYiJ9fQ";
+    /// `{"https://api.openai.com/auth":{}}`: a token naming no user at all.
+    const NO_USER_PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ";
+
+    /// The ChatGPT user is read where codex reads it (pr-facts, the access-token expiry row;
+    /// `openai/codex` f82e365, `login/src/token_data.rs:71-105,142-147,174-198`): the auth
+    /// namespace's `chatgpt_user_id`, else its `user_id`, else nothing.
+    ///
+    /// Watched red: without the claim, every case reads `None`.
+    #[test]
+    fn the_user_id_is_read_from_the_auth_namespace_with_its_fallback() {
+        let claims = |payload: &str| id_claims(&format!("{JWT_HEADER}.{payload}.sig"));
+        assert_eq!(
+            id_claims(&id_jwt()).and_then(|c| c.chatgpt_user_id),
+            Some("user-fake".to_string())
+        );
+        assert_eq!(
+            claims(USER_ID_ONLY_PAYLOAD).and_then(|c| c.chatgpt_user_id),
+            Some("user-b".to_string())
+        );
+        assert_eq!(
+            claims(NO_USER_PAYLOAD).and_then(|c| c.chatgpt_user_id),
+            None
+        );
     }
 
     #[test]
@@ -495,17 +538,26 @@ mod tests {
         let (url, _) = stub(400, r#"{"error":"invalid_grant"}"#).await;
         assert!(matches!(
             refresh_access_token_at(&client, "rt", &url).await,
-            Err(OAuthError::AuthRejected { status: 400 })
+            Err(OAuthError::AuthRejected {
+                status: 400,
+                code: Some("invalid_grant")
+            })
         ));
         let (url, _) = stub(400, r#"{"error":{"code":"refresh_token_reused"}}"#).await;
         assert!(matches!(
             refresh_access_token_at(&client, "rt", &url).await,
-            Err(OAuthError::AuthRejected { status: 400 })
+            Err(OAuthError::AuthRejected {
+                status: 400,
+                code: Some("refresh_token_reused")
+            })
         ));
         let (url, _) = stub(401, r#"{}"#).await;
         assert!(matches!(
             refresh_access_token_at(&client, "rt", &url).await,
-            Err(OAuthError::AuthRejected { status: 401 })
+            Err(OAuthError::AuthRejected {
+                status: 401,
+                code: None
+            })
         ));
         let (url, _) = stub(400, r#"{"error":"temporarily_unavailable"}"#).await;
         assert!(matches!(
@@ -681,7 +733,13 @@ mod tests {
         .await
         .expect("a 401 is classified from its status, not after a body that never arrives");
         assert!(
-            matches!(outcome, Err(OAuthError::AuthRejected { status: 401 })),
+            matches!(
+                outcome,
+                Err(OAuthError::AuthRejected {
+                    status: 401,
+                    code: None
+                })
+            ),
             "{outcome:?}"
         );
     }

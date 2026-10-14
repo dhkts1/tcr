@@ -123,8 +123,9 @@ Three details of the `codex` client shape that path. The citations are to
 - **The header swap.** `codex` sends its bearer together with the ChatGPT account the bearer
   belongs to, as a `chatgpt-account-id` header
   (`model-provider/src/bearer_auth_provider.rs:31-47`). tcr replaces both: the bearer with the
-  serving account's token, and the header with that account's id, its `accountUuid`. It
-  inserts the header when the client sent none, and drops it when the row has no id.
+  serving account's token, and the header with that account's workspace id, its `orgUuid`,
+  falling back to its `accountUuid` on a row that has no `orgUuid`. It inserts the header when
+  the client sent none, and drops it when the row has neither.
 - **The compressed body.** When it talks to the ChatGPT backend, `codex` compresses request
   bodies with zstd (`core/src/client.rs:1704-1713`; the feature is stable and on by default,
   `features/src/lib.rs:1411-1416`). tcr never rewrites a Codex body; an uncompressed one is
@@ -293,6 +294,7 @@ for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable i
 |---|---|---|
 | `~/.config/teamclaude.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one | `0600` |
 | `~/.config/.teamclaude.json.tcr-*.tmp` | Left behind when a config write is killed halfway. Same contents as the config, and nothing removes them for you | `0600` |
+| `~/.config/tcr-codex-login.*` | Beside the config file, and only while `tcr login --codex` runs: the `CODEX_HOME` it gives `codex login`, holding that sign-in's `auth.json` until tcr has read it. tcr deletes it on every way out it can see; a SIGKILL of tcr can leave one behind, holding a live ChatGPT login | directory `0700` |
 | `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem` | `0644`, `0600` |
 | `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts, its key, and the host list it was made for | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
@@ -367,7 +369,8 @@ Nothing below runs for you; there is no uninstall command for the CLI.
    preferences; `defaults delete io.github.dhkts1.tcrbar` clears them.
 4. **Delete the config.** `~/.config/teamclaude.json` holds working credentials for every
    account in the pool, and they stay valid after `tcr` is gone. Delete it, any
-   `.teamclaude.json.tcr-*.tmp` beside it, and the other `~/.config` files in the table above.
+   `.teamclaude.json.tcr-*.tmp` and `tcr-codex-login.*` folder beside it, and the other
+   `~/.config` files in the table above.
 5. **Delete the cache:** `~/.cache/teamclaude/` (or `$XDG_CACHE_HOME/teamclaude/`). Its logs
    name your accounts, and `session-wire.json` holds fragments of commands your sessions ran.
 6. **Undo what points at the proxy:** any `ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or

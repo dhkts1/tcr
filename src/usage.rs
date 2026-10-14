@@ -2717,6 +2717,75 @@ mod tests {
         );
     }
 
+    /// Two seats of one ChatGPT workspace are two accounts, and a replay tells their lines
+    /// apart: each Codex row names its user as the uuid and its workspace as the org, so each
+    /// line resolves to the seat that wrote it. The control is the shape a Codex row had before
+    /// the user was split from the workspace, the workspace as the uuid on both and no org: two
+    /// accounts carry that uuid, and a coin flip between them is refused, so both lines replay
+    /// as unresolved.
+    #[test]
+    fn ledger_replay_tells_two_seats_of_one_workspace_apart() {
+        const WORKSPACE: &str = "66666666-6666-4666-8666-666666666666";
+        let seat = |name: &str, uuid: &str, org: Option<&str>| LedgerAccount {
+            name: name.to_string(),
+            uuid: Some(uuid.to_string()),
+            org: org.map(str::to_string),
+            org_name: None,
+            provider: Provider::Codex,
+        };
+        let now = crate::now_ms();
+        for (tag, seats, want) in [
+            (
+                "seats-split",
+                [
+                    seat(
+                        "alice@example.com/codex",
+                        "55555555-5555-4555-8555-555555555555",
+                        Some(WORKSPACE),
+                    ),
+                    seat(
+                        "bob@example.com/codex",
+                        "77777777-7777-4777-8777-777777777777",
+                        Some(WORKSPACE),
+                    ),
+                ],
+                (2, 0),
+            ),
+            (
+                "seats-joined",
+                [
+                    seat("alice@example.com/codex", WORKSPACE, None),
+                    seat("bob@example.com/codex", WORKSPACE, None),
+                ],
+                (0, 2),
+            ),
+        ] {
+            let dir = scratch(tag);
+            let writer = tracker();
+            writer.attach_ledger(dir.clone(), 90, &seats, now);
+            record_as(&writer, 0, &seats[0], 3);
+            record_as(&writer, 1, &seats[1], 5);
+            assert!(writer.flush_ledger());
+
+            let replayed = tracker();
+            let report = replayed.attach_ledger(dir.clone(), 90, &seats, now);
+            assert_eq!((report.replayed, report.unresolved), want, "{tag}");
+            if want == (2, 0) {
+                assert_eq!(
+                    replayed.row(0, now, None).today.input_tokens,
+                    3,
+                    "alice's own line"
+                );
+                assert_eq!(
+                    replayed.row(1, now, None).today.input_tokens,
+                    5,
+                    "bob's own line"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// FINDING 1 (round 3). A re-login BACKFILLS a missing `org_uuid`
     /// (`Manager::add_or_update_account`), so `org_key` stops returning the org
     /// NAME and starts returning the uuid — half way through a day, on a routine

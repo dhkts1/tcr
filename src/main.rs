@@ -1334,14 +1334,21 @@ struct LoginArgs {
     /// Import the login the `codex` CLI already holds (`$CODEX_HOME/auth.json`,
     /// default `~/.codex/auth.json`; `TCR_CODEX_AUTH` names a file to read
     /// instead) as a Codex account — no value here. The account is named by the
-    /// login's email, or `<email>/codex` when another account holds that name;
-    /// with `--account <email>`, the login must carry that email or nothing is
-    /// written. The cost, printed on import: Codex refresh tokens are single-use
+    /// login's email, or `<email>/codex` when another account holds that name.
+    /// With `--account`, the login must be that account or nothing is written;
+    /// it takes the row name `tcr accounts` prints, or the login's email. The
+    /// cost, printed on import: Codex refresh tokens are single-use
     /// too, so the first time tcr refreshes this one, `codex` asks you to log in
     /// again once. A second account: `mkdir -p <dir>` and
     /// `CODEX_HOME=<dir> codex login`, then this with `--codex-home <dir>`.
     #[arg(long, conflicts_with_all = ["token", "from_claude_code"])]
     from_codex: bool,
+    /// Sign in a Codex (ChatGPT) account with a login of tcr's own: tcr runs `codex login` in a
+    /// throwaway folder, imports it, and deletes the folder, so the codex CLI's own login is not
+    /// touched. With --account, the login must be that row's user and workspace, or nothing is
+    /// written.
+    #[arg(long, conflicts_with_all = ["token", "from_claude_code", "from_codex"])]
+    codex: bool,
     /// Read `<DIR>/auth.json` instead of `$CODEX_HOME` / `~/.codex` (for a second login made
     /// with `mkdir -p <DIR>` and `CODEX_HOME=<DIR> codex login`).
     #[arg(long, requires = "from_codex", value_name = "DIR")]
@@ -6022,11 +6029,11 @@ const TCR_CLAUDE_BIN_ENV: &str = "TCR_CLAUDE_BIN";
 const CLAUDE_BIN_ENV: &str = "CLAUDE_BIN";
 
 /// Resolves which harness binary to launch, through an ordered pair of env
-/// keys: the pair documented at [`TCR_CLAUDE_BIN_ENV`] for `claude`, and the
-/// one at [`TCR_CODEX_BIN_ENV`] for `codex`. Named generally — "harness",
-/// not "claude" — because both binaries need this exact resolution order, so
-/// each is a pair of constants and a one-line call rather than a copy of this
-/// function.
+/// keys: the pair documented at [`TCR_CLAUDE_BIN_ENV`] for `claude`. Named
+/// generally — "harness", not "claude" — because it was written for any
+/// harness; today it serves `claude` only. `codex` is found by
+/// `codex_local::find_codex`, the one rule `tcr run --codex`, `tcr login
+/// --codex` and the doctor share, which also searches past `PATH`.
 fn resolve_harness_bin(specific_key: &str, legacy_key: &str, default: &str) -> String {
     resolve_harness_bin_from(
         std::env::var(specific_key).ok(),
@@ -6064,23 +6071,17 @@ fn claude_command() -> std::process::Command {
     std::process::Command::new(claude_bin())
 }
 
-/// `TCR_CODEX_BIN` overrides which `codex` binary `tcr run --codex` launches,
-/// taking priority over `CODEX_BIN`; neither set falls back to `codex` on
-/// `PATH`. The precedence and the empty-value-counts-as-unset rule are
-/// [`TCR_CLAUDE_BIN_ENV`]'s, through the same [`resolve_harness_bin`].
-const TCR_CODEX_BIN_ENV: &str = "TCR_CODEX_BIN";
-/// See [`TCR_CODEX_BIN_ENV`].
-const CODEX_BIN_ENV: &str = "CODEX_BIN";
-
-/// A fresh [`std::process::Command`] for the `codex` binary
-/// [`TCR_CODEX_BIN_ENV`] resolves to: [`claude_command`]'s twin for
-/// `tcr run --codex`.
-fn codex_command() -> std::process::Command {
-    std::process::Command::new(resolve_harness_bin(
-        TCR_CODEX_BIN_ENV,
-        CODEX_BIN_ENV,
-        "codex",
-    ))
+/// A fresh [`std::process::Command`] for the `codex` binary `tcr run --codex` launches:
+/// [`claude_command`]'s twin, resolved by `codex_local::find_codex`, the rule `tcr login
+/// --codex` and the doctor use too. `TCR_CODEX_BIN`, then `CODEX_BIN`, always decide when set;
+/// otherwise `PATH`, TcrBar's directories and npm's global prefix. A miss is the search's own
+/// sentence, so nothing has been printed or read yet when it bails. The child keeps the shell's
+/// `PATH` as it is: every command the agent runs inherits that `PATH`, so tcr must not reorder
+/// it.
+fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
+    let codex = teamclaude_rs::codex_local::find_codex()
+        .map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
+    Ok((std::process::Command::new(&codex.path), codex.path))
 }
 
 /// `tcr run [--codex] [-- args…]` — launch Claude Code, or `codex` with
@@ -6102,7 +6103,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     // Ahead of everything below that can spawn a process, `claude --version` included.
     refuse_group_with_codex(&args)?;
     if args.codex {
-        let mut cmd = codex_command();
+        let (mut cmd, codex) = codex_command()?;
         cmd.args(&args.args);
         mark_run_active(&mut cmd);
         // ONE read of the running proxy answers both "is it listening" and "does
@@ -6116,7 +6117,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         apply_codex_launch(&mut cmd, port, &launch);
         let status = cmd
             .status()
-            .context("failed to launch `codex` — is it on PATH?")?;
+            .with_context(|| format!("failed to launch `{}`", codex.display()))?;
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -6333,10 +6334,7 @@ fn codex_launch(
                     .iter()
                     .any(|row| row.provider == teamclaude_rs::provider::Provider::Codex)
                 {
-                    format!(
-                        "the proxy on :{port} holds no Codex account, so it blind-tunnels {host} \
-                         and codex keeps its own login — add one with `tcr login --from-codex`"
-                    )
+                    no_codex_account_reason(port, host)
                 } else if ca_is_file {
                     return Ok(CodexLaunch::SeeThrough {
                         ca: ca.to_path_buf(),
@@ -6364,6 +6362,15 @@ fn codex_launch(
         reason,
         unset: proxy_vars_at(port, inherited),
     })
+}
+
+/// Why `tcr run --codex` launches codex directly when the proxy holds no Codex account, and
+/// the command that adds one: a login of tcr's own, which leaves the codex CLI's login alone.
+fn no_codex_account_reason(port: u16, host: &str) -> String {
+    format!(
+        "the proxy on :{port} holds no Codex account, so it blind-tunnels {host} and codex keeps \
+         its own login — add one with `tcr login --codex`"
+    )
 }
 
 /// Carry out [`codex_launch`]'s decision on `cmd`, and print its notices.
@@ -6881,30 +6888,47 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 /// config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let ui = if args.non_interactive {
+        oauth::LoginUi::Machine
+    } else {
+        oauth::LoginUi::Terminal
+    };
     if args.from_claude_code {
-        let name = oauth::login_from_claude_code(
+        let result = oauth::login_from_claude_code(
             &config_path,
             args.force,
             args.name.as_deref(),
             args.account.as_deref(),
+            ui,
         )
         .await
-        .context("importing the Claude Code login failed")?;
-        println!("Logged in as '{name}'.");
-        return Ok(());
+        .context("importing the Claude Code login failed");
+        return finish_login(result, args.non_interactive);
     }
     if args.from_codex {
-        let name = oauth::login_from_codex(
+        let result = oauth::login_from_codex(
             &config_path,
             args.force,
             args.name.as_deref(),
             args.account.as_deref(),
             args.codex_home.as_deref(),
+            ui,
         )
         .await
-        .context("importing the Codex login failed")?;
-        println!("Logged in as '{name}'.");
-        return Ok(());
+        .context("importing the Codex login failed");
+        return finish_login(result, args.non_interactive);
+    }
+    if args.codex {
+        let result = teamclaude_rs::codex_cli_login::login(
+            &config_path,
+            args.force,
+            args.account.as_deref(),
+            args.name.as_deref(),
+            ui,
+        )
+        .await
+        .context("the Codex sign-in failed");
+        return finish_login(result, args.non_interactive);
     }
     if args.token {
         let name = oauth::login_with_token(
@@ -6918,11 +6942,6 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         println!("Logged in as '{name}'.");
         return Ok(());
     }
-    let ui = if args.non_interactive {
-        oauth::LoginUi::Machine
-    } else {
-        oauth::LoginUi::Terminal
-    };
     let result = oauth::login(
         &config_path,
         args.force,
@@ -6932,27 +6951,34 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     )
     .await
     .context("OAuth login failed");
-    let name = match result {
-        Ok(name) => name,
-        // A machine caller gets the failure the same way it got every other
-        // step — one JSON line on stdout — and the human-readable half on one
-        // stderr line rather than as anyhow's indented multi-line chain,
-        // which a GUI would have to render as a wall of text. Exits here
-        // rather than returning the error, because `main`'s reporter would
-        // print that chain on top of what was just said.
-        Err(error) if args.non_interactive => {
-            let reason = oauth::one_line_reason(&error);
-            println!("{}", oauth::LoginEvent::Error { reason: &reason }.line());
+    finish_login(result, args.non_interactive)
+}
+
+/// How every login ends: `Logged in as` in the terminal, nothing more in the machine form
+/// (whose stream already said it as `{"event":"saved",…}`).
+///
+/// A machine caller gets a failure the same way it got every other step — one JSON line on
+/// stdout, coded when it is a refusal a GUI titles by its code (`oauth::machine_error_line`) —
+/// and the human-readable half on one stderr line rather than as anyhow's indented multi-line
+/// chain, which a GUI would have to render as a wall of text. It exits here rather than
+/// returning the error, because `main`'s reporter would print that chain on top of what was
+/// just said.
+fn finish_login(result: anyhow::Result<String>, non_interactive: bool) -> anyhow::Result<()> {
+    match result {
+        Ok(name) => {
+            if !non_interactive {
+                println!("Logged in as '{name}'.");
+            }
+            Ok(())
+        }
+        Err(error) if non_interactive => {
+            let (line, reason) = oauth::machine_error_line(&error);
+            println!("{line}");
             eprintln!("{reason}");
             std::process::exit(1);
         }
-        Err(error) => return Err(error),
-    };
-    // The machine stream already said this, as `{"event":"saved",…}`.
-    if !args.non_interactive {
-        println!("Logged in as '{name}'.");
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 /// `tcr mint --account <name> | --group <name>` — mint a long-lived token for
@@ -8342,7 +8368,7 @@ mod tests {
                 true,
                 direct(
                     "the proxy on :3999 holds no Codex account, so it blind-tunnels chatgpt.com \
-                     and codex keeps its own login — add one with `tcr login --from-codex`",
+                     and codex keeps its own login — add one with `tcr login --codex`",
                 ),
             ),
             (
@@ -8614,6 +8640,93 @@ mod tests {
             if let Err(e) = Cli::try_parse_from(&argv) {
                 panic!("the warning tells the user to run `{command}`, which does not parse: {e}");
             }
+        }
+    }
+
+    /// Every `tcr` command a Codex login or launch tells someone to run parses: each production
+    /// string that names one in backticks is split on its backticks, and each span starting
+    /// `tcr ` goes through the real CLI parser, as does each command a refusal over a running
+    /// proxy echoes. A remedy naming a flag clap refuses sends its reader into a usage error.
+    ///
+    /// Watched red: one flag misspelled in one production string panics naming that span.
+    #[test]
+    fn codex_remedies_name_only_commands_that_parse() {
+        let workspace = oauth::codex_relogin_workspace_refusal(
+            Some("erin@example.com"),
+            "99999999-9999-4999-8999-999999999999",
+            Some("business"),
+            "work",
+            "88888888-8888-4888-8888-888888888888",
+            Some("pro"),
+        );
+        let strings = [
+            oauth::codex_account_login_refusal("bob@example.com/codex"),
+            oauth::claude_account_codex_login_refusal("alice@example.com"),
+            oauth::claude_account_codex_import_refusal("alice@example.com"),
+            oauth::codex_identity_refusal("carol@example.com", "erin@example.com/codex").reason,
+            workspace.reason,
+            no_codex_account_reason(3999, "chatgpt.com"),
+            oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
+            oauth::no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
+            teamclaude_rs::codex_cli_login::codex_login_saved_line(
+                "bob@example.com",
+                Some("ChatGPT Pro"),
+            ),
+            oauth::CODEX_IMPORT_RUN_LINE.to_string(),
+            oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
+        ];
+        let mut commands: Vec<String> = Vec::new();
+        for text in &strings {
+            let spans: Vec<&str> = text
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("tcr "))
+                .collect();
+            assert!(!spans.is_empty(), "names no tcr command: {text}");
+            commands.extend(spans.iter().map(|span| span.to_string()));
+        }
+        commands.extend(
+            [
+                oauth::LOGIN_COMMAND,
+                oauth::LOGIN_FROM_CODEX_COMMAND,
+                oauth::LOGIN_FROM_CLAUDE_CODE_COMMAND,
+                oauth::LOGIN_CODEX_COMMAND,
+            ]
+            .map(str::to_string),
+        );
+        for command in commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!(
+                    "a Codex remedy tells the user to run `{command}`, which does not parse: {e}"
+                );
+            }
+        }
+    }
+
+    /// `tcr login --help` carries `--codex` as a whole token, beside the tokens TcrBar already
+    /// probes for: `LoginCapability` decides between the in-app Codex sign-in and Terminal by
+    /// finding it, so a help that renamed it would silently send every Codex sign-in to
+    /// Terminal.
+    #[test]
+    fn login_help_lists_codex_as_a_whole_token() {
+        use clap::CommandFactory as _;
+        let mut cli = Cli::command();
+        let login = cli
+            .find_subcommand_mut("login")
+            .expect("tcr has a login subcommand");
+        let help = login.render_long_help().to_string();
+        for token in [
+            "--codex",
+            "--non-interactive",
+            "--from-codex",
+            "--codex-home",
+        ] {
+            assert!(
+                teamclaude_rs::codex_local::help_has_whole_token(&help, token),
+                "`tcr login --help` must carry {token} as a whole token:\n{help}"
+            );
         }
     }
 
@@ -9243,6 +9356,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }

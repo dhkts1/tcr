@@ -399,12 +399,12 @@ impl Manager {
     }
 }
 
-/// The quota facts a Codex row reports on the status wire, read off its quota: which windows the
+/// The Codex facts a Codex row reports on the status wire: from its quota, which windows the
 /// plan has (the probe's once any probe answered, else the headers'), each one's length, the
-/// refusal's kind while that refusal stands, the spend control and the credits.
+/// refusal's kind while that refusal stands, the spend control and the credits; and from the
+/// row itself, why its login is dead and the folder it was imported from.
 ///
 /// An Anthropic row keeps the defaults, whatever its quota holds, so its wire row gains no key.
-/// The login error and the import folder are not quota facts and stay at their defaults here.
 fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
     if a.provider != crate::provider::Provider::Codex {
         return crate::stats::CodexFacts::default();
@@ -417,7 +417,8 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
         limit_reached_type: a.quota.codex_limit_reached_type().map(str::to_string),
         spend_control_reached: a.quota.codex.spend_control_reached,
         credits: a.quota.codex.credits.clone(),
-        ..Default::default()
+        login_error: a.login_error.clone(),
+        codex_home: a.codex_home.clone(),
     }
 }
 

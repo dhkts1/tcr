@@ -437,6 +437,15 @@ pub struct AccountRuntime {
     pub rate_limited_until_ms: Option<i64>,
     /// What armed `rate_limited_until_ms`; read only to name the gate.
     pub hold_cause: HoldCause,
+    /// Why a Codex row's login is known dead: the OAuth code its last refresh was rejected with
+    /// (`refresh_token_reused`, `invalid_grant`, …), else `http_<status>`. Set by a rejected
+    /// refresh (`manager/refresh.rs`), cleared by a successful refresh or a re-login of the row
+    /// ([`Manager::add_or_update_account`]). Always `None` on an Anthropic row. Not persisted:
+    /// a restart forgets it, and the next refresh learns it again.
+    pub login_error: Option<String>,
+    /// [`config::Account::codex_home`]: the folder a Codex row's login was imported from, for
+    /// the status wire. A re-login replaces it with the submission's.
+    pub codex_home: Option<String>,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -766,6 +775,8 @@ impl AccountRuntime {
             last_served_ms: 0,
             rate_limited_until_ms: None,
             hold_cause: HoldCause::RateLimit,
+            login_error: None,
+            codex_home: account.codex_home.clone(),
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
@@ -2668,6 +2679,9 @@ impl Manager {
                     account.access_token = matched.access_token.clone();
                     account.refresh_token = matched.refresh_token.clone();
                     account.expires_at_ms = matched.expires_at.map(oauth::normalize_expires_at);
+                    // The folder too. `login_error` is left as it is, as `status` is: a restored
+                    // entry holds whatever tokens it held, and the next refresh decides.
+                    account.codex_home = matched.codex_home.clone();
                     changed.push(format!("{}: back in the config", account.name));
                     if fresh_control.as_deref() == Some(account.name.as_str()) {
                         let mut control = self.control_idx.write().expect("control lock poisoned");
@@ -3441,6 +3455,14 @@ impl Manager {
                             row.removed = false;
                             row.disabled = account.disabled.unwrap_or(false);
                         }
+                        // A Codex re-login brings a live login, so whatever killed the last one
+                        // no longer holds, and the folder it came from (or none, for a login
+                        // of tcr's own) is the submission's. Whatever the row's status was, so
+                        // neither sits inside the two conditions above.
+                        if account.provider == crate::provider::Provider::Codex {
+                            row.login_error = None;
+                            row.codex_home = account.codex_home.clone();
+                        }
                         // F6: the submitted type always wins — this route only
                         // ever carries a real credential, so a row whose stored
                         // type was stale (e.g. `"api"`) is corrected, or
@@ -3550,6 +3572,10 @@ impl Manager {
                             // silently drop an operator's exit-node pin.
                             egress: existing_pin.egress,
                             egress_strict: existing_pin.strict,
+                            // The row's folder, just set from the submission: a row revived
+                            // from a delete has no file entry left, so the write appends this
+                            // whole `target`, and the folder reaches the file only through it.
+                            codex_home: row.codex_home.clone(),
                             extra: serde_json::Map::new(),
                         };
                         Resolution::Updated {
@@ -3749,6 +3775,7 @@ impl Manager {
                         entry.access_token = for_disk.access_token.clone();
                         entry.refresh_token = for_disk.refresh_token.clone();
                         entry.expires_at = for_disk.expires_at;
+                        entry.codex_home = for_disk.codex_home.clone();
                     }
                 }
                 // No in-memory entry carries this identity either — the disk
@@ -3900,6 +3927,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4080,7 +4108,12 @@ mod tests {
                 _provider: crate::provider::Provider,
                 _refresh_token: String,
             ) -> RefreshFuture {
-                Box::pin(async { Err(OAuthError::AuthRejected { status: 400 }) })
+                Box::pin(async {
+                    Err(OAuthError::AuthRejected {
+                        status: 400,
+                        code: None,
+                    })
+                })
             }
         }
         let manager = build_manager_with_prober(
@@ -4996,6 +5029,318 @@ mod tests {
             ],
             "each probe carries its own row's provider, bearer and account id"
         );
+    }
+
+    /// **A Codex probe names the workspace.** A Codex row's `chatgpt-account-id` is its
+    /// workspace, `org_uuid`, since `account_uuid` became the ChatGPT user; a row saved before
+    /// that split carries the workspace in `account_uuid` and no `org_uuid`, and keeps sending
+    /// it. An Anthropic row's credential still names its `account_uuid`.
+    ///
+    /// Watched red: with the Codex arm reading `account_uuid`, bob's probe names his user.
+    #[tokio::test]
+    async fn a_codex_probe_names_the_workspace_and_falls_back_to_the_account_uuid() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let anthropic = Account {
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
+            org_uuid: Some("66666666-6666-4666-8666-666666666666".to_string()),
+            ..account("bob@example.com", 1)
+        };
+        let older = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("77777777-7777-4777-8777-777777777777".to_string()),
+            ..account("carol@example.com", 2)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![anthropic, codex, older]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RecordingProber {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        for idx in 0..3 {
+            manager.probe_account(idx).await;
+        }
+
+        let seen: Vec<_> = seen
+            .lock()
+            .expect("seen lock poisoned")
+            .iter()
+            .map(|c| (c.provider, c.account_id.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    crate::provider::Provider::Anthropic,
+                    Some("11111111-1111-4111-8111-111111111111".to_string()),
+                ),
+                (
+                    crate::provider::Provider::Codex,
+                    Some("66666666-6666-4666-8666-666666666666".to_string()),
+                ),
+                (
+                    crate::provider::Provider::Codex,
+                    Some("77777777-7777-4777-8777-777777777777".to_string()),
+                ),
+            ]
+        );
+    }
+
+    /// A refresher that rejects every refresh as `status` with `code`, the way a dead login is
+    /// rejected.
+    struct RejectsWith {
+        status: u16,
+        code: Option<&'static str>,
+    }
+    impl TokenRefresher for RejectsWith {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
+            let (status, code) = (self.status, self.code);
+            Box::pin(async move { Err(OAuthError::AuthRejected { status, code }) })
+        }
+    }
+
+    /// A refresher that rejects its first refresh as a reused token, and succeeds after.
+    struct RejectsOnce {
+        calls: Arc<AtomicUsize>,
+    }
+    impl TokenRefresher for RejectsOnce {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    Err(OAuthError::AuthRejected {
+                        status: 400,
+                        code: Some("refresh_token_reused"),
+                    })
+                } else {
+                    Ok(crate::oauth::Tokens {
+                        access_token: "at-fresh".to_string(),
+                        refresh_token: Some("rt-fresh".to_string()),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                }
+            })
+        }
+    }
+
+    fn codex_account(name: &str, priority: i64) -> Account {
+        Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
+            org_uuid: Some("66666666-6666-4666-8666-666666666666".to_string()),
+            ..account(name, priority)
+        }
+    }
+
+    /// **Why a Codex login is dead reaches the wire.** A refresh rejected with an OAuth code
+    /// records that code; one rejected with none records its status. The row goes to `error`
+    /// as any rejected row does. An Anthropic row rejected the same way records nothing, so
+    /// its wire row gains no key.
+    ///
+    /// Watched red: without the store in the rejection arm, the Codex row's error is `None`.
+    #[tokio::test]
+    async fn a_reused_refresh_token_surfaces_as_a_login_error() {
+        let login_error = |status: u16, code: Option<&'static str>, codex: bool| {
+            let row = if codex {
+                codex_account("bob@example.com", 0)
+            } else {
+                account("alice@example.com", 0)
+            };
+            let manager = build_manager(
+                config_with(vec![row]),
+                Arc::new(RejectsWith { status, code }),
+            );
+            async move {
+                manager.ensure_fresh_force(0).await;
+                assert_eq!(manager.account_status(0), Some(AccountStatus::Error));
+                let snap = manager.snapshot(OffsetDateTime::now_utc());
+                assert_eq!(snap.accounts[0].status, "error");
+                snap.accounts[0].codex.login_error.clone()
+            }
+        };
+        assert_eq!(
+            login_error(400, Some("refresh_token_reused"), true).await,
+            Some("refresh_token_reused".to_string())
+        );
+        assert_eq!(
+            login_error(401, None, true).await,
+            Some("http_401".to_string())
+        );
+        assert_eq!(
+            login_error(400, Some("refresh_token_reused"), false).await,
+            None,
+            "an Anthropic row records no login error"
+        );
+    }
+
+    /// **A live login clears it.** The next successful refresh clears the recorded error, and
+    /// so does a re-login of the row through `add_or_update_account`.
+    ///
+    /// Watched red: without the clear in `apply_refresh`, the reused-token error outlives the
+    /// refresh that proved the login alive.
+    #[tokio::test]
+    async fn a_successful_refresh_clears_the_login_error() {
+        let manager = build_manager(
+            config_with(vec![codex_account("bob@example.com", 0)]),
+            Arc::new(RejectsOnce {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let error_of = |manager: &Manager| {
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .codex
+                .login_error
+                .clone()
+        };
+        manager.ensure_fresh_force(0).await;
+        assert_eq!(error_of(&manager), Some("refresh_token_reused".to_string()));
+        assert!(
+            manager.ensure_fresh_force(0).await,
+            "the second refresh succeeds"
+        );
+        assert_eq!(error_of(&manager), None, "a refresh that worked clears it");
+
+        let relogin = build_manager(
+            config_with(vec![codex_account("bob@example.com", 0)]),
+            Arc::new(RejectsWith {
+                status: 400,
+                code: Some("refresh_token_reused"),
+            }),
+        );
+        relogin.ensure_fresh_force(0).await;
+        assert_eq!(error_of(&relogin), Some("refresh_token_reused".to_string()));
+        let fresh = Account {
+            access_token: "at-relogin".to_string(),
+            refresh_token: Some("rt-relogin".to_string()),
+            ..codex_account("bob@example.com", 0)
+        };
+        assert!(matches!(
+            relogin.add_or_update_account(fresh),
+            AddAccountOutcome::Updated { idx: 0, .. }
+        ));
+        assert_eq!(error_of(&relogin), None, "a re-login clears it");
+    }
+
+    /// **The folder rides the wire on Codex rows only.** A Codex row imported from a folder
+    /// echoes it; an Anthropic row has none to echo.
+    ///
+    /// Watched red: without the copy in `from_config`, the Codex row echoes nothing.
+    #[test]
+    fn the_snapshot_echoes_codex_home_on_codex_rows_only() {
+        let codex = Account {
+            codex_home: Some("/Users/example/.codex".to_string()),
+            ..codex_account("bob@example.com", 1)
+        };
+        let manager = build_manager(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(snap.accounts[0].codex.codex_home, None);
+        assert_eq!(
+            snap.accounts[1].codex.codex_home.as_deref(),
+            Some("/Users/example/.codex")
+        );
+    }
+
+    /// **A login revives a deleted Codex row with its new folder and no stale error.** A row
+    /// deleted while the proxy ran keeps its slot, parked; a login of the same identity brings
+    /// it back through `add_or_update_account`'s Updated arm, and the durable write appends the
+    /// whole row again, because the file has no entry left to update. Both of the row's Codex
+    /// facts must come from that login: no `login_error` (the login is live), and the
+    /// submission's folder, in the running proxy and in the file.
+    ///
+    /// Watched red twice: without the `login_error` clear, the revived row still reads
+    /// `refresh_token_reused`; without `codex_home` in the persisted row, the file's entry has
+    /// no `codexHome`.
+    #[tokio::test]
+    async fn a_relogin_of_a_deleted_codex_row_revives_it_with_its_folder_and_no_login_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teamclaude.json");
+        let alice = account("alice@example.com", 0);
+        let bob = Account {
+            codex_home: Some("/Users/example/.codex".to_string()),
+            ..codex_account("bob@example.com", 1)
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({ "accounts": [alice.clone()] }))
+                .expect("serialize"),
+        )
+        .expect("write the file");
+        let manager = Manager::new(
+            config_with(vec![alice, bob.clone()]),
+            Arc::new(RejectsWith {
+                status: 400,
+                code: Some("refresh_token_reused"),
+            }),
+            Arc::new(NoProber),
+            Arc::new(NoWarmer),
+            Some(path.clone()),
+        );
+
+        manager.ensure_fresh_force(1).await;
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(
+            before.accounts.iter().all(|a| a.name != "bob@example.com"),
+            "the file lacks bob, so the reload took him out"
+        );
+
+        let relogin = Account {
+            access_token: "at-bob-fresh".to_string(),
+            refresh_token: Some("rt-bob-fresh".to_string()),
+            codex_home: Some("/Users/example/.codex-b".to_string()),
+            ..bob
+        };
+        assert!(matches!(
+            manager.add_or_update_account(relogin),
+            AddAccountOutcome::Updated { idx: 1, .. }
+        ));
+
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        let bobs: Vec<_> = after
+            .accounts
+            .iter()
+            .filter(|a| a.name == "bob@example.com")
+            .collect();
+        assert_eq!(bobs.len(), 1, "bob is listed once");
+        assert!(!bobs[0].disabled, "a fresh login serves");
+        assert_eq!(bobs[0].codex.login_error, None);
+        assert_eq!(
+            bobs[0].codex.codex_home.as_deref(),
+            Some("/Users/example/.codex-b")
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let entry = doc["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .find(|a| a["name"] == "bob@example.com")
+            .expect("bob is back in the file");
+        assert_eq!(entry["codexHome"], "/Users/example/.codex-b");
     }
 
     /// **A row that is gone yields no credential, never an Anthropic one.** The provider

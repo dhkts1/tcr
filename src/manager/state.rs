@@ -299,6 +299,20 @@ impl Manager {
             .and_then(|a| a.account_uuid.clone())
     }
 
+    /// The ChatGPT account id a Codex row's requests and probes carry as `chatgpt-account-id`:
+    /// its workspace, the row's non-empty `org_uuid`, else its `account_uuid`, where a row
+    /// saved before the workspace was split from the user keeps that id. `None` for an index
+    /// that no longer exists, or a row with neither.
+    pub fn codex_account_id(&self, idx: usize) -> Option<String> {
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let row = accounts.get(idx)?;
+        row.org_uuid
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .or(row.account_uuid.as_deref())
+            .map(str::to_string)
+    }
+
     /// `None` only for an index that no longer exists.
     pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
         self.accounts

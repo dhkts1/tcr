@@ -294,10 +294,15 @@ impl Manager {
         idx: usize,
         access_token: String,
     ) -> Option<crate::probe::ProbeCredential> {
+        let provider = self.provider(idx)?;
+        let account_id = match provider {
+            crate::provider::Provider::Anthropic => self.account_uuid(idx),
+            crate::provider::Provider::Codex => self.codex_account_id(idx),
+        };
         Some(crate::probe::ProbeCredential {
-            provider: self.provider(idx)?,
+            provider,
             access_token,
-            account_id: self.account_uuid(idx),
+            account_id,
         })
     }
 

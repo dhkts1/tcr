@@ -159,9 +159,9 @@ gate above; it is not a credential anything downstream of the proxy needs.
 |---|---|---|---|---|
 | `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
 | `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and, on Anthropic, kept warm; `"apikey"` rows are quarantined at load, because tcr serves subscription logins only (a Claude subscription, or a Codex row's ChatGPT login), never API keys; any other string is a static-key account, kept as written |
-| `provider` | `"anthropic"` \| `"codex"` | `"anthropic"` | no | which upstream this credential belongs to. Absent means Anthropic, and the key is never written for an Anthropic row. A Codex row (`tcr login --from-codex` writes one) is refreshed against `auth.openai.com`, probed at `/backend-api/wham/usage`, never kept warm, and serves only Codex inference, `/backend-api/codex/responses`: a Claude request never reaches it, and a Codex request never reaches a Claude row |
-| `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token. For a Codex row it is the ChatGPT account id, sent as the `chatgpt-account-id` header instead of being spliced into the body |
-| `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
+| `provider` | `"anthropic"` \| `"codex"` | `"anthropic"` | no | which upstream this credential belongs to. Absent means Anthropic, and the key is never written for an Anthropic row. A Codex row (`tcr login --codex` and `tcr login --from-codex` write one) is refreshed against `auth.openai.com`, probed at `/backend-api/wham/usage`, never kept warm, and serves only Codex inference, `/backend-api/codex/responses`: a Claude request never reaches it, and a Codex request never reaches a Claude row |
+| `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token. For a Codex row it is the ChatGPT user id, spliced nowhere: what tcr sends is the workspace in `orgUuid` |
+| `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry. For a Codex row it is the ChatGPT workspace id, the login's ChatGPT account id, sent as the `chatgpt-account-id` header. A Codex row is that pair, user and workspace, so one person in two workspaces is two rows, and so are two seats of one workspace |
 | `orgName` | string | absent | no | organization display name; also what a duplicated `name` is renamed from (`Henry Token` → `henry-token`) |
 | `organizationType` | string | absent | no | the plan, verbatim as the provider names it, from which `tcr status` derives its `plan` label: `claude_max`, `claude_team`, `claude_pro`, … from Anthropic's profile endpoint, written at login and backfilled by the quota probe on a row that lacks it. For a Codex row it is the ChatGPT plan, verbatim (`pro`, `plus`, `team`, …): read from the login's `chatgpt_plan_type` claim at import, and kept current by the quota probe, which rewrites this key, and no other, when the plan changes. A word tcr does not know is labelled `ChatGPT {word}`, the word as ChatGPT wrote it (`edu` gives `ChatGPT edu`) |
 | `accessToken` | string | n/a | **yes** | the OAuth access token |
@@ -172,7 +172,17 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `disabled` | bool | absent → `false` | no | held out of rotation; this is the key `tcr disable` writes |
 | `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Not on a Codex account in this version: its pin is treated as a peer that cannot be reached, see `egressStrict`. Local to this file, never sent over the wire |
 | `egressStrict` | bool | `false` | no | what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
+| `codexHome` | string | absent | no | Codex rows only, written by `tcr`: the folder the login was imported from by `tcr login --from-codex`, as an absolute path, so TcrBar can offer to import from it again. A login of tcr's own (`tcr login --codex`) records none, and signing a row in that way removes the key |
 | `credentialVersion` | u64 | absent → backfilled on the next save | no | written by `tcr`, not by hand: `1` on an Anthropic row, `2` on a Codex row. A build refuses the whole file when a row carries a version above what it understands for that row's provider. Upgrade every `tcr` that may boot on the file before importing a Codex login: what an older one does with a Codex row is in [troubleshooting](troubleshooting.md#after-a-codex-import-an-older-proxy-refuses-to-load-the-config) |
+
+**A Codex row whose `accountUuid` holds the workspace id and that has no `orgUuid`** is the shape
+before the ChatGPT user was stored. It keeps serving, and tcr sends its `accountUuid` as the
+workspace. But no login matches it, neither a re-import nor `tcr login --codex --account`,
+because a login is matched on its ChatGPT user and workspace and the row names no user. To bring
+it to the current shape, `tcr remove` it, then add it again with `tcr login --codex` or
+`tcr login --from-codex`, in that order: a login added first finds its name held by another
+identity, and lands beside the old row as `<email>/codex`, while one added after the removal
+takes the old row's name back. A running proxy takes the removal live, with no restart.
 
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and, on
 Anthropic, keep-warm. tcr serves subscription logins only, a Claude subscription or a Codex
@@ -272,7 +282,8 @@ There are two throttle buckets, and they are keyed on different things.
 
 `accountThrottle` is the real limiter. Anthropic sets rate limits at the **organization**
 level, so pacing per org is what matches the thing actually being limited, and total capacity
-scales *with* the size of your account pool rather than being divided across it.
+scales *with* the size of your account pool rather than being divided across it. A Codex row's
+organization is its ChatGPT workspace, so the seats of one workspace share one bucket.
 
 `fleetThrottle` is insurance. It exists only in case something shared — an IP, a client id —
 is also limited, which nobody here has measured. Its burst sits above the per-organization
@@ -705,7 +716,8 @@ off. Check `tcr status` (`http1Only=` on the `source=` line, `http1Only` per row
 
 Four keys are not part of the config file; they are read from the process environment by
 `tcr run` (and by `--group`'s version check, which also launches `claude`) to decide which
-`claude` binary to run, or, with `--codex`, which `codex` binary. None of them exists in the
+`claude` binary to run, or, with `--codex`, which `codex` binary. `tcr login --codex` reads the
+two `codex` keys too, to pick the `codex` whose `codex login` it runs. None of them exists in the
 file above because none is a setting a config edit can change without a rebuild of the
 session's shell environment anyway.
 
@@ -713,15 +725,26 @@ session's shell environment anyway.
 |---|---|---|
 | `TCR_CLAUDE_BIN` | absent | path or name of the `claude` binary to launch, outranking `CLAUDE_BIN` |
 | `CLAUDE_BIN` | absent | same, as a fallback when `TCR_CLAUDE_BIN` is unset; kept for whatever already sets it outside `tcr` |
-| `TCR_CODEX_BIN` | absent | path or name of the `codex` binary `tcr run --codex` launches, outranking `CODEX_BIN` |
+| `TCR_CODEX_BIN` | absent | path or name of the `codex` binary `tcr run --codex` launches and `tcr login --codex` runs, outranking `CODEX_BIN` |
 | `CODEX_BIN` | absent | same, as a fallback when `TCR_CODEX_BIN` is unset |
 
-With neither of a pair set, the bare name, `claude` or `codex`, is resolved from `PATH`.
-**An empty value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does
+With neither of a pair set, `claude` is resolved from `PATH`. `codex` is found by one search
+that serves `tcr run --codex` and `tcr login --codex` alike: `PATH`, then `~/.local/bin`,
+`~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, then the `bin` of npm's global prefix,
+which is `NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global` (tcr never runs
+npm). **An empty value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does
 not silently win over a real `CLAUDE_BIN`, and two empty values fall all the way through to
-the `PATH` default.
+the default. A set `codex` key always decides and never falls through: a value with a `/` must be
+an executable file, a bare name must be one on `PATH`, and either failing is an error that names
+the key, rather than whatever other `codex` the search would have found.
 
-`tcr login --from-codex` reads two more, `CODEX_HOME` and `TCR_CODEX_AUTH`, to find the login
+Two more `codex` keys exist for tcr's own tests, and nothing else should set them.
+`TCR_CODEX_SEARCH_DIRS`, a colon-separated list, replaces every directory the search looks in
+after `PATH`, and the directories the older-`tcr` check of `tcr login --codex` and
+`--from-codex` scans. `TCR_BUNDLED_TCR` replaces the path of TcrBar's bundled `tcr` in that
+check, so setting it outside a test hides that `tcr` from the older-`tcr` warnings.
+
+`tcr login --from-codex` reads `CODEX_HOME` and `TCR_CODEX_AUTH` as well, to find the login
 it imports; they are documented with it in
 [cli.md](cli.md#--from-codex-importing-the-login-codex-already-has).
 

@@ -66,7 +66,7 @@ tcr status --json | jq -r '.[] | "\(.name)\t\(.gate)"'
 | `seven-day` | `7D 2d` | The weekly quota is at or over `switchThreshold`. | Wait for the reset shown. |
 | `fable-weekly` | `FABLE-7D` | The Fable weekly quota is at or over its threshold. It holds the account out for Fable requests only. `tcr status` reports the fleet as a request with no model in mind sees it, so it does not print this value today; read `sevenDayOiState` instead. | Nothing. The account keeps serving other models. |
 | `standard` | `STD` | An API-key account's token or request limit is at or over `switchThreshold`. It never applies to a subscription login, and tcr serves subscription accounts only, so you should not see it. | If you do, the config holds an API-key account. Take it out of the pool with `tcr remove <name>`. |
-| `login` | `LOGIN` | The account's refresh token was rejected, so it cannot get a working access token. tcr retries the refresh on a growing backoff, but only a new login replaces the token. | Log in again: `tcr login --account <name>`. |
+| `login` | `LOGIN` | The account's refresh token was rejected, so it cannot get a working access token. tcr retries the refresh on a growing backoff, but only a new login replaces the token. | Log in again: `tcr login --account <name>`. On a Codex account, `tcr login --codex --account <name>`, or `tcr login --from-codex --account <name>` to import it again from the folder it came from; its `loginError` in `tcr status --json` names why the login died (`refresh_token_reused`: another holder of the login refreshed it first). |
 | `rejected` | `REJECTED` | Anthropic marked the account `rejected` in its rate-limit headers. There is no reset time to count down to. It clears when the background quota probe sees a quota window start over. | Nothing. It clears on a probe after the window rolls. |
 | `disabled` | `OFF` | Someone ran `tcr disable` on it. | `tcr enable <name>`. |
 | `reserved` | `RESERVED` | The account is in a group marked reserved, so it only takes requests that ask for that group (`tcr run --group <group>`). `tcr status` reports the fleet as a request with no group sees it, so a reserved account reads `reserved` even while it serves its group's sessions. | Nothing, if you meant it. `tcr group unreserve <group>` opens it to all traffic. |
@@ -164,11 +164,14 @@ answers. Why tcr refuses rather than hand it the login, and why `--force` does n
 refusal, is in [`cli.md`](cli.md#--from-codex-importing-the-login-codex-already-has). Restart
 the proxy on this build at a quiet moment, then run `tcr login --from-codex` again. If TcrBar
 runs the proxy, [update TcrBar first](#the-fix-is-in-main-and-the-fix-is-in-the-process-serving-traffic-are-different-facts).
+`tcr login --codex` meets the same refusal before `codex login` runs, and its message names
+`tcr login --codex` as the command to run again.
 
 If the import instead fails saying the proxy stored the login as a Claude account, or did not
 say how it stored it, the row is already live, and on disk, as a Claude account, and its token
-may already have reached Anthropic: run the `tcr remove` the message names at once, then
-`codex login` again.
+may already have reached Anthropic: run the `tcr remove` the message names at once, then sign
+the account in afresh with `tcr login --codex`, which leaves the login the `codex` CLI holds
+alone (or `codex login`, then `tcr login --from-codex` again).
 
 ## After a Codex import an older proxy refuses to load the config
 
@@ -191,6 +194,49 @@ rows left are Anthropic rows at version 1, which it reads.
 load the Codex row as a Claude account and send its OpenAI tokens to Anthropic. That is why
 every `tcr` that may boot on this config has to be upgraded before a Codex login is imported,
 not after.
+
+**A Codex login warns about the older `tcr`s it can find.** Once the account is saved,
+`tcr login --codex` and `tcr login --from-codex` run `--version`, and `login --help` when they
+need to, on every `tcr` on `PATH`, in `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin` and
+`/usr/local/bin`, and on TcrBar's bundled one (`/Applications/TcrBar.app/Contents/MacOS/tcr`).
+Each one that predates Codex accounts gets one warning, naming the binary, its version and what
+it would do:
+
+```
+[tcr] warning: the tcr at /usr/local/bin/tcr (0.2.44) predates Codex accounts: update it before it next starts — it would read this login as a Claude account and send its token to Anthropic
+[tcr] warning: the tcr at /opt/homebrew/bin/tcr (1.1.18) predates Codex accounts: update it — until then it refuses this config, so every command it runs fails
+```
+
+The first is a `tcr` at 0.2.45 or older; the second, a later one whose `tcr login --help` has no
+`--from-codex`. Update the binary each warning names, or remove it if nothing uses it; for
+TcrBar's, update TcrBar. The check never warns about the `tcr` running it, and skips a binary
+that does not answer within five seconds or whose version it cannot read, so a missing warning
+is not proof that every `tcr` is current: a `tcr` anywhere else is not looked for.
+
+## `tcr login --codex` cannot find codex
+
+```
+could not find the codex CLI (searched TCR_CODEX_BIN, CODEX_BIN, PATH, /Users/example/.local/bin, /Users/example/.cargo/bin, /opt/homebrew/bin, /usr/local/bin, /Users/example/.npm-global/bin). Install it, or set TCR_CODEX_BIN to its path. Nothing was written.
+```
+
+Nothing ran and nothing was written. The list is every place tcr looked, in order: the two
+variables, `PATH`, the four directories TcrBar searches, and the `bin` of npm's global prefix
+(`NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global`). `tcr run --codex` uses the
+same search, and fails with the same sentence. The search goes past `PATH` because a TcrBar
+started from Finder runs with a `PATH` that holds none of the places `codex` is usually
+installed.
+
+A `codex` installed somewhere else, such as under nvm or asdf in a directory of its own version,
+is found by naming it: set `TCR_CODEX_BIN` to its path, the one `command -v codex` prints in a
+shell where `codex` works. A variable that is set always decides, and never falls through to the
+rest of the search, so a stale one is an error of its own:
+
+```
+TCR_CODEX_BIN is /Users/example/old/codex, which is not an executable file. Point it at the codex executable, or unset it. Nothing was written.
+```
+
+Fix the path, or unset the variable; `CODEX_BIN` is read the same way when `TCR_CODEX_BIN` is
+unset. The rules are in [configuration.md](configuration.md#environment-overrides).
 
 ## `tcr run --codex` says it is launching codex directly (not pooled)
 

@@ -2394,6 +2394,12 @@ struct AddAccountRequest {
     /// `add_account_request_carries_the_provider` pins it.
     #[serde(default)]
     provider: crate::provider::Provider,
+    /// The folder a Codex login was imported from ([`config::Account::codex_home`]), named for
+    /// the same seam reason as the plan fields above: without it the route drops the key, and a
+    /// live import records no folder while the file route does.
+    /// `add_account_request_carries_the_codex_home` pins it.
+    #[serde(default)]
+    codex_home: Option<String>,
 }
 
 /// The 200 body of [`ADD_ACCOUNT_PATH`]. Deserializable too — unit 3's CLI
@@ -2621,6 +2627,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         seat_tier: parsed.seat_tier,
         egress: crate::config::Egress::Local,
         egress_strict: false,
+        codex_home: parsed.codex_home,
         extra: serde_json::Map::new(),
     };
     // Captured before the move below: on an ambiguous match this is the ONLY
@@ -3919,11 +3926,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // the client's. codex sends its bearer with its own account's id (`openai/codex`
         // f82e365, `model-provider/src/bearer_auth_provider.rs:31-47`), so tcr keeps the two
         // one account's pair; what the backend makes of a mismatched pair is unmeasured.
-        // `account_uuid` holds that id for a Codex row.
+        // That id is the row's workspace, its `org_uuid`, else its `account_uuid` for a row
+        // saved before the two were split (`Manager::codex_account_id`).
         let upstream_headers = match provider {
             crate::provider::Provider::Anthropic => build_upstream_headers(&req_headers, &token),
             crate::provider::Provider::Codex => {
-                let id = manager.account_uuid(idx);
+                let id = manager.codex_account_id(idx);
                 build_codex_upstream_headers(&req_headers, &token, id.as_deref())
             }
         };
@@ -7668,6 +7676,7 @@ mod tests {
             seat_tier: Some("team_standard".to_string()),
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let body = serde_json::to_string(&account).expect("serialize the account login sends");
@@ -7716,6 +7725,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let body = serde_json::to_string(&account).expect("serialize the account an import sends");
@@ -7776,6 +7786,7 @@ mod tests {
                 seat_tier: None,
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             }],
             group_settings: std::collections::HashMap::new(),
@@ -10652,6 +10663,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         Config {
@@ -12344,6 +12356,38 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A live Codex add that names the folder its login came from lands it on the running row
+    /// and in the file, as the file route does: the route mirrors `config::Account`'s wire
+    /// shape field by field, so a field missing here is silently dropped.
+    ///
+    /// Watched red: without the request field, the row and the file carry no folder.
+    #[tokio::test]
+    async fn add_account_request_carries_the_codex_home() {
+        let (manager, path) = control_manager("codex-home", None);
+        let (status, _, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","provider":"codex","accountUuid":"55555555-5555-4555-8555-555555555555","orgUuid":"66666666-6666-4666-8666-666666666666","accessToken":"at-carol","refreshToken":"rt-carol","expiresAt":9999999999999,"codexHome":"/Users/example/.codex"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let carol = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.name == "carol@example.com")
+            .expect("carol is in the running proxy");
+        assert_eq!(
+            carol.codex.codex_home.as_deref(),
+            Some("/Users/example/.codex")
+        );
+        let on_disk = account_in_file(&path, 2).expect("the appended entry");
+        assert_eq!(on_disk["name"], "carol@example.com");
+        assert_eq!(on_disk["codexHome"], "/Users/example/.codex");
+        std::fs::remove_file(&path).ok();
+    }
+
     /// An `apikey` account is refused here with a stamped 400, by the same rule
     /// `config::load` quarantines a file row by: tcr does not serve API-key
     /// accounts. Neither the live rotation nor the file changes.
@@ -12963,6 +13007,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let resp = client
@@ -19854,6 +19899,46 @@ mod tests {
             Some("s-1"),
             "every other header still rides along"
         );
+    }
+
+    /// A Codex row's `chatgpt-account-id` is its workspace: `orgUuid`, now that `accountUuid`
+    /// holds the ChatGPT user. A row saved before that split carries the workspace in
+    /// `accountUuid` and no `orgUuid`, and still sends it.
+    ///
+    /// Watched red: with the header read from `account_uuid`, the split row sends its user.
+    #[tokio::test]
+    async fn the_account_header_comes_from_org_uuid_and_falls_back_to_account_uuid() {
+        const USER: &str = "55555555-5555-4555-8555-555555555555";
+        const WORKSPACE: &str = "66666666-6666-4666-8666-666666666666";
+        for (org_uuid, sent) in [(Some(WORKSPACE), WORKSPACE), (None, USER)] {
+            let anthropic_echo = CapturingUpstream::spawn().await;
+            let codex_echo = CapturingUpstream::spawn().await;
+            let mut config = codex_fleet(&anthropic_echo.url, &codex_echo.url);
+            config.accounts[1].account_uuid = Some(USER.to_string());
+            config.accounts[1].org_uuid = org_uuid.map(str::to_string);
+            let manager = Manager::with_live_refresher(config, None);
+            let (status, body) = drive(
+                manager,
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("chatgpt-account-id", CODEX_CLIENT_ID),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let seen = codex_echo.last_request();
+            assert_eq!(seen.header("authorization"), Some("Bearer at-bob"));
+            assert_eq!(
+                seen.header("chatgpt-account-id"),
+                Some(sent),
+                "org_uuid {org_uuid:?}"
+            );
+        }
     }
 
     /// A client that names no account still reaches the origin naming ours.

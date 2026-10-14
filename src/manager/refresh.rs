@@ -140,7 +140,7 @@ impl Manager {
                 tracing::info!(account = %name, "token refreshed");
                 true
             }
-            Err(oauth::OAuthError::AuthRejected { status }) => {
+            Err(oauth::OAuthError::AuthRejected { status, code }) => {
                 tracing::error!(account = %name, status, "refresh token rejected — re-login needed");
                 if let Some(a) = self
                     .accounts
@@ -149,6 +149,13 @@ impl Manager {
                     .get_mut(idx)
                 {
                     a.status = AccountStatus::Error;
+                    // Why a Codex login is dead, for the status wire: the OAuth code when the
+                    // rejection named one, else the status it came back with. An Anthropic row
+                    // keeps none, so its wire row gains no key.
+                    if a.provider == crate::provider::Provider::Codex {
+                        a.login_error =
+                            Some(code.map_or_else(|| format!("http_{status}"), str::to_string));
+                    }
                 }
                 // A REJECTED refresh is the one signal that this credential may truly
                 // be dead — back off before the next recovery attempt (first rejection
@@ -264,6 +271,8 @@ impl Manager {
             }
             account.error_retry_after_ms = None;
             account.error_backoff_ms = 0;
+            // A login that just refreshed is not dead, whatever the last rejection said.
+            account.login_error = None;
         }
     }
 

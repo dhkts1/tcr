@@ -360,6 +360,7 @@ pub fn probe(
         seat_tier: None,
         egress: crate::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }

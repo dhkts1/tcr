@@ -149,6 +149,7 @@ fn account(i: usize) -> Account {
         seat_tier: None,
         egress: teamclaude_rs::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }

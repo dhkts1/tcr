@@ -25,6 +25,11 @@
 //! * `codexUpstream` in the config the test writes → a stub on loopback ([`spawn_codex_upstream`]).
 //!   Before it writes, the import asks `codexUpstream` where the login's workspace is served
 //!   (`codex_login::check_workspace_routing`), and the default is the real chatgpt.com.
+//! * `PATH` and `TCR_CODEX_SEARCH_DIRS` → empty directories inside the tempdir, and
+//!   `TCR_BUNDLED_TCR` → a path that does not exist ([`pinned_tcr`]). After it writes, the import
+//!   asks every `tcr` it can see for its version, to warn about one that predates Codex accounts,
+//!   and `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications` are not under a scratch `HOME`:
+//!   without these, a test would run the developer's own `tcr`.
 //!
 //! The fixture's JWTs are put together at run time from a header and a payload, as the unit tests
 //! in `src/codex_oauth.rs` put theirs together: the dotted form written out whole is what a secret
@@ -139,21 +144,39 @@ fn login_from_codex(home: &Path, config: &Path, auth: Option<&Path>, extra: &[&s
         .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"))
 }
 
-/// The [`Command`] [`login_from_codex`] runs, for a test that has one more variable to set on it.
-fn codex_command(home: &Path, config: &Path, auth: Option<&Path>, extra: &[&str]) -> Command {
-    let bin = env!("CARGO_BIN_EXE_tcr");
-    let mut command = Command::new(bin);
+/// The built `tcr`, pinned as the module doc says: `HOME` the scratch dir; the Claude Code
+/// login a file that does not exist (never an empty value, which reads as unset and falls
+/// through to the login Keychain); `PATH` and the search directories empty; no bundled `tcr`;
+/// and no `CODEX_HOME`, `XDG_CACHE_HOME` or `TCR_CODEX_AUTH`.
+fn pinned_tcr(home: &Path) -> Command {
+    let empty_path = home.join("empty-path");
+    let empty_search = home.join("empty-search");
+    for dir in [&empty_path, &empty_search] {
+        std::fs::create_dir_all(dir).expect("creating an empty directory in the scratch HOME");
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
     command
-        .args(["login", "--from-codex", "--config"])
-        .arg(config)
-        .args(extra)
         .env("HOME", home)
         .env(
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-claude-code-login.json"),
         )
+        .env("PATH", &empty_path)
+        .env("TCR_CODEX_SEARCH_DIRS", &empty_search)
+        .env("TCR_BUNDLED_TCR", home.join("no-bundled-tcr"))
         .env_remove("CODEX_HOME")
-        .env_remove("XDG_CACHE_HOME");
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("TCR_CODEX_AUTH");
+    command
+}
+
+/// The [`Command`] [`login_from_codex`] runs, for a test that has one more variable to set on it.
+fn codex_command(home: &Path, config: &Path, auth: Option<&Path>, extra: &[&str]) -> Command {
+    let mut command = pinned_tcr(home);
+    command
+        .args(["login", "--from-codex", "--config"])
+        .arg(config)
+        .args(extra);
     match auth {
         Some(path) => command.env("TCR_CODEX_AUTH", path),
         None => command.env_remove("TCR_CODEX_AUTH"),
@@ -202,7 +225,11 @@ fn from_codex_imports_a_codex_row_with_provider_identity_and_plan() {
     let row = &accounts[0];
     assert_eq!(row["name"], "alice@example.com");
     assert_eq!(row["provider"], "codex");
-    assert_eq!(row["accountUuid"], "11111111-1111-4111-8111-111111111111");
+    assert_eq!(row["accountUuid"], "user-fake", "the ChatGPT user");
+    assert_eq!(
+        row["orgUuid"], "11111111-1111-4111-8111-111111111111",
+        "the workspace"
+    );
     assert_eq!(row["organizationType"], "pro");
     assert_eq!(row["expiresAt"], 1_800_000_000_000_i64);
     assert_eq!(row["refreshToken"], "rt-fake-codex");
@@ -460,4 +487,324 @@ fn from_codex_names_the_plan_the_way_status_does() {
         "stderr: {stderr}"
     );
     assert_no_token_in(&out);
+}
+
+/// base64url (RFC 4648, section 5), no padding: the encoding a JWT's parts use.
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
+        for i in 0..=chunk.len() {
+            out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A JWT whose payload is `payload`, put together at run time.
+fn jwt(payload: &serde_json::Value) -> String {
+    format!(
+        "{JWT_HEADER}.{}.sig",
+        base64url(payload.to_string().as_bytes())
+    )
+}
+
+/// The `auth.json` a ChatGPT login of `email`, ChatGPT user `user`, in `workspace` on `plan`
+/// leaves behind.
+fn auth_json_for(email: &str, user: &str, workspace: &str, plan: &str) -> String {
+    let auth = serde_json::json!({
+        "chatgpt_account_id": workspace,
+        "chatgpt_plan_type": plan,
+        "chatgpt_user_id": user,
+    });
+    serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": jwt(&serde_json::json!({
+                "exp": 1_800_000_000_i64,
+                "email": email,
+                "https://api.openai.com/auth": auth,
+            })),
+            "access_token": jwt(&serde_json::json!({
+                "exp": 1_800_000_000_i64,
+                "https://api.openai.com/auth": auth,
+            })),
+            "refresh_token": format!("rt-fake-{email}"),
+            "account_id": workspace,
+        },
+        "last_refresh": "2026-10-03T06:44:00.000000Z",
+    })
+    .to_string()
+}
+
+/// Two seats of one ChatGPT workspace import as two rows: the row is keyed on the ChatGPT user
+/// as well as the workspace, so bob's login lands beside alice's instead of over it.
+///
+/// Watched red: keyed on the workspace alone, bob's import updates alice's row.
+#[test]
+fn two_seats_of_one_workspace_import_as_two_rows() {
+    const WORKSPACE: &str = "66666666-6666-4666-8666-666666666666";
+    const SEATS_WORKSPACE: &str = r#"{"accounts":{"66666666-6666-4666-8666-666666666666":{"workspace_backend_origin":"NO_CONSTRAINT","account_routing_override":"NO_CONSTRAINT","plan_type":"business"}}}"#;
+    let (home, config, _answered) = scratch_home_answering("[]", SEATS_WORKSPACE);
+    for (email, user) in [
+        ("alice@example.com", "55555555-5555-4555-8555-555555555555"),
+        ("bob@example.com", "77777777-7777-4777-8777-777777777777"),
+    ] {
+        let auth = home.path().join(format!("{email}.json"));
+        std::fs::write(&auth, auth_json_for(email, user, WORKSPACE, "business"))
+            .expect("writing the fake auth.json");
+        let out = login_from_codex(home.path(), &config, Some(&auth), &[]);
+        assert!(
+            out.status.success(),
+            "{email}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let accounts = accounts_of(&config);
+    let seats: Vec<(&str, &str, &str)> = accounts
+        .iter()
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap_or_default(),
+                row["accountUuid"].as_str().unwrap_or_default(),
+                row["orgUuid"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seats,
+        [
+            (
+                "alice@example.com",
+                "55555555-5555-4555-8555-555555555555",
+                WORKSPACE
+            ),
+            (
+                "bob@example.com",
+                "77777777-7777-4777-8777-777777777777",
+                WORKSPACE
+            ),
+        ]
+    );
+    assert!(accounts.iter().all(|row| row["provider"] == "codex"));
+}
+
+/// An import records the folder its login came from, absolute: `--codex-home <dir>`'s
+/// directory, or the directory of the file `TCR_CODEX_AUTH` names.
+///
+/// Watched red: without the folder passed to the import, neither row has `codexHome`.
+#[test]
+fn the_import_writes_codex_home() {
+    let canonical = |path: &Path| std::fs::canonicalize(path).expect("the folder exists");
+
+    let (home, config) = scratch_home("[]");
+    let second = home.path().join("second-codex-login");
+    std::fs::create_dir_all(&second).expect("creating the scratch codex home");
+    std::fs::write(second.join("auth.json"), fake_codex_auth_json())
+        .expect("writing the fake auth.json");
+    let mut command = codex_command(
+        home.path(),
+        &config,
+        None,
+        &["--codex-home", "second-codex-login"],
+    );
+    let out = command
+        .current_dir(home.path())
+        .output()
+        .expect("spawning the built tcr binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recorded = accounts_of(&config)[0]["codexHome"]
+        .as_str()
+        .expect("the row records its folder")
+        .to_string();
+    assert!(
+        Path::new(&recorded).is_absolute(),
+        "a relative --codex-home is recorded absolute: {recorded}"
+    );
+    assert_eq!(canonical(Path::new(&recorded)), canonical(&second));
+
+    let (home, config) = scratch_home("[]");
+    let elsewhere = home.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("creating the scratch folder");
+    let auth = elsewhere.join("codex-auth.json");
+    std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
+    let out = login_from_codex(home.path(), &config, Some(&auth), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        accounts_of(&config)[0]["codexHome"],
+        elsewhere.display().to_string(),
+        "the directory of the file TCR_CODEX_AUTH names"
+    );
+}
+
+/// Every non-empty stdout line, parsed as JSON.
+fn events(out: &Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("stdout line is not one JSON object ({err}): {line}"))
+        })
+        .collect()
+}
+
+/// `--from-codex --non-interactive` speaks the login protocol: the import's cost as one
+/// `notice`, then each notice that holds (here the first-account one: codex has a login of its
+/// own and no older `tcr` is in reach), then `saved` with the provider and the plan, and no
+/// prose on stdout. A refused import prints one coded `error` line, and the same reason on one
+/// stderr line.
+///
+/// Watched red: with `saved` emitted before the notices, the third line is a notice.
+#[test]
+fn from_codex_non_interactive_emits_saved_notice_and_error() {
+    let (home, config) = scratch_home("[]");
+    let codex_home = home.path().join(".codex");
+    std::fs::create_dir_all(&codex_home).expect("creating the scratch ~/.codex");
+    std::fs::write(codex_home.join("auth.json"), "").expect("codex's own login, present");
+    let auth = home.path().join("codex-auth.json");
+    std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
+
+    let out = login_from_codex(home.path(), &config, Some(&auth), &["--non-interactive"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let consequence = format!(
+        "{} {}",
+        teamclaude_rs::oauth::CODEX_IMPORT_CONSEQUENCE,
+        teamclaude_rs::oauth::CODEX_IMPORT_OLDER_PROXY
+    );
+    assert_eq!(
+        events(&out),
+        [
+            serde_json::json!({"event": "notice", "text": consequence}),
+            serde_json::json!({
+                "event": "notice",
+                "text": teamclaude_rs::oauth::CODEX_FIRST_ACCOUNT_NOTICE
+            }),
+            serde_json::json!({
+                "account": "alice@example.com",
+                "event": "saved",
+                "plan": "ChatGPT Pro",
+                "provider": "codex"
+            }),
+        ]
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Logged in as"),
+        "no prose on stdout"
+    );
+    assert_no_token_in(&out);
+
+    const ROUTED: &str = r#"{"accounts":{"11111111-1111-4111-8111-111111111111":{"workspace_backend_origin":"https://gov.chatgpt.com","account_routing_override":"NO_CONSTRAINT"}}}"#;
+    let (home, config, _answered) = scratch_home_answering("[]", ROUTED);
+    let auth = home.path().join("codex-auth.json");
+    std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
+    let out = login_from_codex(home.path(), &config, Some(&auth), &["--non-interactive"]);
+    assert_eq!(out.status.code(), Some(1));
+    let lines = events(&out);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["event"], "error");
+    assert_eq!(lines[0]["code"], "codex-routed");
+    let reason = lines[0]["reason"].as_str().expect("a reason").to_string();
+    assert!(
+        reason.starts_with(
+            "this Codex login's ChatGPT workspace is not served at https://chatgpt.com"
+        ) && reason.contains("https://gov.chatgpt.com")
+            && reason.ends_with("Nothing was written."),
+        "{reason}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim_end(),
+        reason,
+        "the same reason, as one stderr line"
+    );
+}
+
+/// `--from-claude-code --non-interactive` speaks the login protocol too: here, one uncoded
+/// `error` line, its reason the whole chain, and nothing written.
+///
+/// The override is what makes "no Claude Code login" true on a developer's Mac. Without it,
+/// the read asks the login Keychain for the developer's real Claude Code login, and the
+/// success path would send that token to api.anthropic.com and write the real account into
+/// this test's config and output. CI cannot catch a missing override, because a runner has no
+/// such Keychain item. So this never runs without the override, and its failure is watched by
+/// breaking production instead: with the Claude import's machine error sent back to prose,
+/// stdout holds no JSON line.
+///
+/// The success path stays untested by design: the profile URL is a constant nothing overrides,
+/// and no test may reach it.
+#[test]
+fn from_claude_code_non_interactive_emits_its_events() {
+    let (home, config) = scratch_home("[]");
+    let before = std::fs::read(&config).expect("the scratch config is there");
+    assert!(
+        !home.path().join("no-claude-code-login.json").exists(),
+        "the override names a file that does not exist"
+    );
+    let out = pinned_tcr(home.path())
+        .args([
+            "login",
+            "--from-claude-code",
+            "--non-interactive",
+            "--config",
+        ])
+        .arg(&config)
+        .output()
+        .expect("spawning the built tcr binary");
+    assert_eq!(out.status.code(), Some(1));
+    let lines = events(&out);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["event"], "error");
+    assert!(lines[0].get("code").is_none(), "{}", lines[0]);
+    let reason = lines[0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with(
+            "importing the Claude Code login failed: no Claude Code login found on this machine"
+        ),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(
+        std::fs::read(&config).expect("the scratch config is still there"),
+        before,
+        "nothing was written"
+    );
+}
+
+/// The terminal form of an import ends by saying how to use the account: the line after the
+/// import line names `tcr run --codex`.
+#[test]
+fn the_text_import_adds_the_run_codex_line() {
+    let (home, config) = scratch_home("[]");
+    let auth = home.path().join("codex-auth.json");
+    std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
+    let out = login_from_codex(home.path(), &config, Some(&auth), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let imported = lines
+        .iter()
+        .position(|line| line.starts_with("[tcr] imported as 'alice@example.com'"))
+        .unwrap_or_else(|| panic!("no import line: {stderr}"));
+    assert_eq!(
+        lines.get(imported + 1).copied(),
+        Some("[tcr] start a pooled session with `tcr run --codex`"),
+        "{stderr}"
+    );
 }

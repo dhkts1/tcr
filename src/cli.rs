@@ -6189,6 +6189,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -6333,6 +6334,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let applied = post_add_account(&config, &account)
@@ -6390,6 +6392,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let err = post_add_account(&config, &account)

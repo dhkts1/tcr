@@ -829,3 +829,180 @@ async fn remove_from_group_shows_on_the_next_poll() {
         "{rows:?}"
     );
 }
+
+// --- Codex rows: a ChatGPT user in a workspace -------------------------------------
+
+/// A Codex row in the shape an import writes: `accountUuid` the ChatGPT user, `orgUuid` the
+/// workspace, plus any `extra` keys.
+fn codex(name: &str, user: &str, workspace: &str, extra: &str) -> String {
+    oauth(
+        name,
+        &format!(
+            r#", "provider": "codex", "credentialVersion": 2, "accountUuid": "{user}",
+               "orgUuid": "{workspace}" {extra}"#
+        ),
+    )
+}
+
+/// One delete takes one seat, and only that one: the Claude twin of the same person stays
+/// (another provider), the other seat of the same workspace stays (another ChatGPT user), and
+/// the same user's other workspace stays (another workspace).
+#[tokio::test]
+async fn a_codex_delete_takes_only_that_seat() {
+    let fleet = boot(
+        &[
+            oauth(
+                "alice@example.com",
+                r#", "accountUuid": "11111111-1111-4111-8111-111111111111""#,
+            ),
+            codex(
+                "alice@example.com/codex",
+                "55555555-5555-4555-8555-555555555555",
+                "66666666-6666-4666-8666-666666666666",
+                "",
+            ),
+            codex(
+                "bob@example.com",
+                "77777777-7777-4777-8777-777777777777",
+                "66666666-6666-4666-8666-666666666666",
+                "",
+            ),
+            codex(
+                "erin@example.com",
+                "88888888-8888-4888-8888-888888888888",
+                "99999999-9999-4999-8999-999999999999",
+                "",
+            ),
+            codex(
+                "work",
+                "88888888-8888-4888-8888-888888888888",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "",
+            ),
+        ]
+        .join(","),
+        "",
+        true,
+    )
+    .await;
+    delete_and_expect(
+        &fleet,
+        "alice@example.com/codex",
+        &[
+            "alice@example.com",
+            "bob@example.com",
+            "erin@example.com",
+            "work",
+        ],
+    )
+    .await;
+    delete_and_expect(
+        &fleet,
+        "work",
+        &["alice@example.com", "bob@example.com", "erin@example.com"],
+    )
+    .await;
+}
+
+/// A Codex row saved before the ChatGPT user was split from the workspace (the workspace in
+/// `accountUuid`, no `orgUuid`) is matched by no login of the new shape, so a login after its
+/// delete adds a row of its own, serving, with its folder. Deleted again, the same login
+/// revives that row in place, with the folder it brings and no login error.
+#[tokio::test]
+async fn an_old_shape_codex_row_is_replaced_live_and_comes_back_after_a_delete() {
+    let fleet = boot(
+        &[
+            oauth("dana@example.com", ""),
+            oauth(
+                "carol@example.com",
+                r#", "provider": "codex", "credentialVersion": 2,
+                   "accountUuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb""#,
+            ),
+        ]
+        .join(","),
+        "",
+        true,
+    )
+    .await;
+    delete_and_expect(&fleet, "carol@example.com", &["dana@example.com"]).await;
+
+    let login = |codex_home: &str| -> teamclaude_rs::config::Account {
+        serde_json::from_str(&codex(
+            "carol@example.com",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            &format!(r#", "codexHome": "{codex_home}""#),
+        ))
+        .expect("a Codex login")
+    };
+    assert!(matches!(
+        fleet
+            .manager
+            .add_or_update_account(login("/Users/example/.codex")),
+        teamclaude_rs::manager::AddAccountOutcome::Added { .. }
+    ));
+    let rows = poll(&fleet).await;
+    assert_eq!(names(&rows), vec!["dana@example.com", "carol@example.com"]);
+    assert_eq!(rows[1]["disabled"], false, "{rows:?}");
+    assert_eq!(rows[1]["codexHome"], "/Users/example/.codex", "{rows:?}");
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fleet.config).unwrap()).unwrap();
+    let carols: Vec<&Value> = doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "carol@example.com")
+        .collect();
+    assert_eq!(carols.len(), 1, "{doc}");
+    assert_eq!(
+        carols[0]["accountUuid"],
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    );
+    assert_eq!(carols[0]["orgUuid"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+
+    delete_and_expect(&fleet, "carol@example.com", &["dana@example.com"]).await;
+    assert!(matches!(
+        fleet
+            .manager
+            .add_or_update_account(login("/Users/example/.codex-b")),
+        teamclaude_rs::manager::AddAccountOutcome::Updated { .. }
+    ));
+    let rows = poll(&fleet).await;
+    assert_eq!(names(&rows), vec!["dana@example.com", "carol@example.com"]);
+    assert_eq!(rows[1]["disabled"], false, "{rows:?}");
+    assert_eq!(rows[1]["codexHome"], "/Users/example/.codex-b", "{rows:?}");
+    assert!(rows[1].get("loginError").is_none(), "{rows:?}");
+}
+
+/// A Codex row taken out of the file by hand and put back with another folder comes back with
+/// the file's folder: the file's row is the truth again.
+#[tokio::test]
+async fn a_codex_row_restored_by_hand_takes_the_files_codex_home() {
+    let fleet = boot(
+        &[
+            codex(
+                "erin@example.com",
+                "88888888-8888-4888-8888-888888888888",
+                "99999999-9999-4999-8999-999999999999",
+                r#", "codexHome": "/Users/example/.codex""#,
+            ),
+            oauth("dana@example.com", ""),
+        ]
+        .join(","),
+        "",
+        true,
+    )
+    .await;
+    let original = std::fs::read_to_string(&fleet.config).unwrap();
+    let mut doc: Value = serde_json::from_str(&original).unwrap();
+    let mut erin = doc["accounts"].as_array_mut().unwrap().remove(0);
+    std::fs::write(&fleet.config, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    assert_eq!(names(&poll(&fleet).await), vec!["dana@example.com"]);
+
+    erin["codexHome"] = Value::from("/Users/example/.codex-b");
+    doc["accounts"].as_array_mut().unwrap().insert(0, erin);
+    std::fs::write(&fleet.config, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    let rows = poll(&fleet).await;
+    assert_eq!(names(&rows), vec!["erin@example.com", "dana@example.com"]);
+    assert_eq!(rows[0]["codexHome"], "/Users/example/.codex-b", "{rows:?}");
+}

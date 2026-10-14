@@ -70,6 +70,11 @@ pub struct CodexLogin {
     /// The ChatGPT account (workspace) id: `tokens.account_id`, else the id token's claim, else
     /// the access token's.
     pub account_id: Option<String>,
+    /// The ChatGPT user: the id token's `chatgpt_user_id` (else its `user_id`), else the access
+    /// token's ([`crate::codex_oauth::IdClaims::chatgpt_user_id`]). With [`Self::account_id`] it
+    /// is the login's identity: one person in two workspaces, and two seats of one workspace,
+    /// are two accounts.
+    pub user_id: Option<String>,
     pub email: Option<String>,
     /// `plus`, `pro`, … — shown back to the user on import and stored as the row's plan.
     pub plan_type: Option<String>,
@@ -95,6 +100,7 @@ impl std::fmt::Debug for CodexLogin {
                 &format_args!("<redacted, {} bytes>", self.refresh_token.len()),
             )
             .field("account_id", &self.account_id)
+            .field("user_id", &self.user_id)
             .field("email", &self.email)
             .field("plan_type", &self.plan_type)
             .field("expires_at_ms", &self.expires_at_ms)
@@ -253,6 +259,7 @@ pub fn parse_auth_json(text: &str) -> anyhow::Result<Option<CodexLogin>> {
             .filter(|a| !a.is_empty())
             .or(id.chatgpt_account_id)
             .or(access.chatgpt_account_id),
+        user_id: id.chatgpt_user_id.or(access.chatgpt_user_id),
         email: id.email,
         plan_type: id.chatgpt_plan_type.or(access.chatgpt_plan_type),
         access_token,

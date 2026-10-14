@@ -354,6 +354,13 @@ pub struct Account {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub egress_strict: bool,
+    /// The folder a Codex row's login was imported from (`tcr login --from-codex`, the auth
+    /// file's directory, absolute), so TcrBar can offer to re-import from it. Absent for a login
+    /// of tcr's own (`tcr login --codex`), which shares no folder and so leaves nothing to
+    /// re-import from, and on every Anthropic row, so an Anthropic-only config re-saves without
+    /// the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
     /// Any per-account keys we do not model (e.g. `models`, `upstream`, `sx`).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -4277,6 +4284,21 @@ fn merge_account(
                         );
                     }
                 }
+                // A Codex row's folder is OVERWRITTEN, never backfilled: a re-import from
+                // another folder moves it, and a re-sign with a login of tcr's own leaves no
+                // folder to point at, so `None` removes the key. A backfill would keep the
+                // first folder forever, and TcrBar would go on offering to re-import from it.
+                // An Anthropic submission leaves the entry's key alone.
+                if account.provider == crate::provider::Provider::Codex {
+                    match &account.codex_home {
+                        Some(folder) => {
+                            entry.insert("codexHome".to_string(), Value::String(folder.clone()));
+                        }
+                        None => {
+                            entry.remove("codexHome");
+                        }
+                    }
+                }
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
                 if !present(entry, "accountUuid") {
                     if let Some(uuid) = &account.account_uuid {
@@ -7655,6 +7677,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -7875,6 +7898,7 @@ mod tests {
             seat_tier: None,
             egress: Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: Map::new(),
         }
     }
@@ -7959,6 +7983,149 @@ mod tests {
         assert!(
             !after.contains("codexUpstream"),
             "a whole-config save must not materialise the default codexUpstream:\n{after}"
+        );
+    }
+
+    /// An Anthropic-only config re-saves with no `codexHome` key, through the row writer and
+    /// the whole-config writer alike: the folder is a Codex fact, and an Anthropic row never
+    /// has one.
+    ///
+    /// Watched red: serializing the field with no `skip_serializing_if` writes
+    /// `"codexHome": null` onto alice.
+    #[test]
+    fn an_anthropic_only_config_resaves_without_codex_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        let original = r#"{
+  "proxy": {
+    "port": 3999
+  },
+  "accounts": [
+    {
+      "name": "alice@example.com",
+      "type": "oauth",
+      "accessToken": "at-a",
+      "refreshToken": "rt-a",
+      "expiresAt": 1789000000000
+    }
+  ]
+}"#;
+        std::fs::write(&path, original).unwrap();
+        let (config, _) = load_or_init(&path).expect("loads");
+        assert_eq!(config.accounts[0].codex_home, None);
+        assert!(!config.accounts[0].extra.contains_key("codexHome"));
+        save_account(&path, &config.accounts[0]).expect("saves the row");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("codexHome"),
+            "the row writer adds no codexHome"
+        );
+        save_settings(&path, &config).expect("saves the whole config");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("codexHome"),
+            "the whole-config writer adds no codexHome"
+        );
+        let mut whole = config.clone();
+        whole.accounts[0].access_token = "at-b".to_string();
+        save(&path, &whole).expect("writes the whole document");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("codexHome"),
+            "nor does a full rewrite"
+        );
+    }
+
+    /// A Codex row's folder loads into its field, not into `extra`, and survives a save and a
+    /// reload unchanged.
+    ///
+    /// Watched red: without the field, the key lives in `extra` and the struct reads `None`.
+    #[test]
+    fn codex_home_round_trips_on_codex_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "bob@example.com", "type": "oauth", "provider": "codex",
+                  "accountUuid": "55555555-5555-4555-8555-555555555555",
+                  "orgUuid": "66666666-6666-4666-8666-666666666666",
+                  "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1789000000000,
+                  "credentialVersion": 2, "codexHome": "/Users/example/.codex" }
+            ] }"#,
+        )
+        .unwrap();
+        let (config, _) = load_or_init(&path).expect("loads");
+        let row = &config.accounts[0];
+        assert_eq!(row.codex_home.as_deref(), Some("/Users/example/.codex"));
+        assert!(
+            !row.extra.contains_key("codexHome"),
+            "a field, not an extra key"
+        );
+        save(&path, &config).expect("saves");
+        let (again, _) = load_or_init(&path).expect("reloads");
+        assert_eq!(again.accounts[0].codex_home, row.codex_home);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["accounts"][0]["codexHome"], "/Users/example/.codex");
+    }
+
+    /// The folder is the latest login's, never the first's: a Codex save with a folder writes
+    /// it over the old one, and a save with none (a login of tcr's own) removes the key, so
+    /// TcrBar stops offering to re-import from a folder this row no longer came from.
+    ///
+    /// Watched red: without the overwrite in `merge_account`'s update, both saves leave
+    /// `/Users/example/.codex` in place.
+    #[test]
+    fn a_codex_save_without_codex_home_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "bob@example.com", "type": "oauth", "provider": "codex",
+                  "accountUuid": "55555555-5555-4555-8555-555555555555",
+                  "orgUuid": "66666666-6666-4666-8666-666666666666",
+                  "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1789000000000,
+                  "credentialVersion": 2, "codexHome": "/Users/example/.codex" }
+            ] }"#,
+        )
+        .unwrap();
+        let (config, _) = load_or_init(&path).expect("loads");
+        let codex_home_on_disk = |path: &Path| -> Value {
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            doc["accounts"][0]
+                .get("codexHome")
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+
+        let moved = Account {
+            access_token: "at-b2".to_string(),
+            codex_home: Some("/Users/example/.codex-b".to_string()),
+            ..config.accounts[0].clone()
+        };
+        assert!(matches!(
+            save_account(&path, &moved).unwrap(),
+            AccountWrite::Updated
+        ));
+        assert_eq!(codex_home_on_disk(&path), "/Users/example/.codex-b");
+
+        let own = Account {
+            access_token: "at-b3".to_string(),
+            codex_home: None,
+            ..config.accounts[0].clone()
+        };
+        assert!(matches!(
+            save_account(&path, &own).unwrap(),
+            AccountWrite::Updated
+        ));
+        assert_eq!(
+            codex_home_on_disk(&path),
+            Value::Null,
+            "a save with no folder removes the key"
         );
     }
 

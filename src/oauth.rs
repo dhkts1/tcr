@@ -56,8 +56,15 @@ pub struct Tokens {
 /// sidelines the account (dead refresh token), [`OAuthError::Transient`] does not.
 #[derive(Debug, thiserror::Error)]
 pub enum OAuthError {
+    /// `code` is the OAuth error code that named the rejection, when the endpoint gave one tcr
+    /// recognises (`refresh_token_reused`, `invalid_grant`, …), and only ever one of tcr's own
+    /// static spellings, never the body's text. A Codex row keeps it as the reason its login is
+    /// dead (`AccountRuntime::login_error`); the Anthropic refresher never sets it.
     #[error("token refresh rejected by auth (HTTP {status}) — re-login needed")]
-    AuthRejected { status: u16 },
+    AuthRejected {
+        status: u16,
+        code: Option<&'static str>,
+    },
     #[error("token refresh failed transiently: {0}")]
     Transient(String),
 }
@@ -196,7 +203,10 @@ pub async fn refresh_access_token_at(
                 continue;
             }
             if matches!(code, 400 | 401 | 403) {
-                return Err(OAuthError::AuthRejected { status: code });
+                return Err(OAuthError::AuthRejected {
+                    status: code,
+                    code: None,
+                });
             }
             let detail = response.text().await.unwrap_or_default();
             return Err(OAuthError::Transient(format!("HTTP {code}: {detail}")));
@@ -309,6 +319,12 @@ impl TokenRefresher for LiveRefresher {
 /// (`tcr status`, `tcr accounts --probe`) meets an already-expired token.
 pub const NO_REFRESH_MESSAGE: &str = "offline snapshot never refreshes — token expired; check the running server's TUI or re-run after tcr login";
 
+/// [`NO_REFRESH_MESSAGE`]'s twin for a Codex account, whose remedy is a different command:
+/// `tcr login` signs in Claude accounts only. `<name>` is written literally, because the
+/// message is built before anyone knows which row it is about. It reaches a tracing event only,
+/// never a person, so offline `tcr status` shows such a row as `probe=error`.
+pub const NO_REFRESH_CODEX_MESSAGE: &str = "offline snapshot never refreshes — token expired; check the running server's TUI or re-run after `tcr login --codex --account <name>`";
+
 /// A refresher that NEVER contacts the OAuth token endpoint: every attempt fails
 /// with [`NO_REFRESH_MESSAGE`] (a *transient* error, so it never falsely sidelines
 /// the credential as dead). Injected by [`crate::cli::snapshot_offline`] so a
@@ -322,10 +338,14 @@ pub struct NoRefresh;
 impl TokenRefresher for NoRefresh {
     fn refresh(
         &self,
-        _provider: crate::provider::Provider,
+        provider: crate::provider::Provider,
         _refresh_token: String,
     ) -> RefreshFuture {
-        Box::pin(async { Err(OAuthError::Transient(NO_REFRESH_MESSAGE.to_string())) })
+        let message = match provider {
+            crate::provider::Provider::Anthropic => NO_REFRESH_MESSAGE,
+            crate::provider::Provider::Codex => NO_REFRESH_CODEX_MESSAGE,
+        };
+        Box::pin(async move { Err(OAuthError::Transient(message.to_string())) })
     }
 }
 
@@ -414,8 +434,8 @@ fn prose(message: std::fmt::Arguments<'_>) {
 
 impl LoginUi {
     /// Point [`PROSE`] at this mode for the rest of the process. Called once,
-    /// at the top of [`login`].
-    fn install(self) {
+    /// at the top of [`login`] and of every other login entry point.
+    pub(crate) fn install(self) {
         PROSE.store(
             self == LoginUi::Terminal,
             std::sync::atomic::Ordering::Relaxed,
@@ -429,7 +449,7 @@ impl LoginUi {
 
     /// Emit one progress event, or nothing at all in [`LoginUi::Terminal`]
     /// (which narrates in prose instead — see [`LoginUi::say`]).
-    fn emit(self, event: LoginEvent<'_>) {
+    pub(crate) fn emit(self, event: LoginEvent<'_>) {
         if self == LoginUi::Machine {
             println!("{}", event.line());
         }
@@ -462,6 +482,23 @@ pub enum LoginEvent<'a> {
     Saved { account: &'a str },
     /// The login failed, and this is the whole reason, on one line.
     Error { reason: &'a str },
+    /// The authorize URL, with the browser already open on it: codex opened it itself, so the
+    /// caller opens nothing. Never written with `opened: false`; a URL the caller must open is
+    /// [`LoginEvent::Browser`].
+    BrowserOpened { url: &'a str },
+    /// A sentence for the person signing in, shown verbatim, one paragraph each; never a
+    /// failure. Every notice comes before `saved` or `error`.
+    Notice { text: &'a str },
+    /// A Codex account is written: the name it was written under, and its plan as `tcr status`
+    /// names it (`ChatGPT Pro`). No `plan` key when the plan is unknown. A Claude save stays
+    /// [`LoginEvent::Saved`], whose line carries neither key.
+    SavedCodex {
+        account: &'a str,
+        plan: Option<&'a str>,
+    },
+    /// A refusal the caller titles by its code ([`LoginRefusal`]); the reason is carried
+    /// verbatim. A failure with no code stays [`LoginEvent::Error`].
+    Refused { code: &'a str, reason: &'a str },
 }
 
 impl LoginEvent<'_> {
@@ -481,10 +518,159 @@ impl LoginEvent<'_> {
             LoginEvent::Error { reason } => {
                 serde_json::json!({ "event": "error", "reason": reason })
             }
+            LoginEvent::BrowserOpened { url } => {
+                serde_json::json!({ "event": "browser", "opened": true, "url": url })
+            }
+            LoginEvent::Notice { text } => serde_json::json!({ "event": "notice", "text": text }),
+            LoginEvent::SavedCodex { account, plan } => {
+                let mut value = serde_json::json!({
+                    "account": account,
+                    "event": "saved",
+                    "provider": crate::provider::Provider::Codex.as_str(),
+                });
+                if let Some(plan) = plan {
+                    value["plan"] = serde_json::Value::from(*plan);
+                }
+                value
+            }
+            LoginEvent::Refused { code, reason } => {
+                serde_json::json!({ "code": code, "event": "error", "reason": reason })
+            }
         };
         value.to_string()
     }
 }
+
+/// A login refusal a caller can title by its code (`codex-identity`, `account-is-codex`, …):
+/// the `--non-interactive` error event carries `code` and this reason, verbatim and without the
+/// context chain, so a GUI shows tcr's words and decides nothing from them
+/// ([`machine_error_line`]). Its `Display` is the reason alone, so a refusal reads the same in
+/// the terminal as it did before it carried a code.
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub struct LoginRefusal {
+    pub code: &'static str,
+    pub reason: String,
+}
+
+impl LoginRefusal {
+    /// The login belongs to a FedRAMP ChatGPT workspace, which tcr does not pool.
+    pub const CODEX_FEDRAMP: &'static str = "codex-fedramp";
+    /// The workspace check placed the login's workspace somewhere other than chatgpt.com.
+    pub const CODEX_ROUTED: &'static str = "codex-routed";
+    /// The workspace check could not complete, so the workspace is unconfirmed.
+    pub const CODEX_UNCONFIRMED: &'static str = "codex-unconfirmed";
+    /// No `codex` executable was found, or a variable naming one names none.
+    pub const CODEX_MISSING: &'static str = "codex-missing";
+    /// The ChatGPT login that came back is not the row `--account` named.
+    pub const CODEX_IDENTITY: &'static str = "codex-identity";
+    /// `codex login` ended without leaving a login behind.
+    pub const CODEX_LOGIN_FAILED: &'static str = "codex-login-failed";
+    /// `tcr login --account` named a Codex row, which only a Codex login can sign in.
+    pub const ACCOUNT_IS_CODEX: &'static str = "account-is-codex";
+    /// `--codex` or `--from-codex` with `--account` named a Claude row.
+    pub const ACCOUNT_IS_CLAUDE: &'static str = "account-is-claude";
+
+    /// The `--non-interactive` error line this refusal is.
+    pub fn line(&self) -> String {
+        LoginEvent::Refused {
+            code: self.code,
+            reason: &self.reason,
+        }
+        .line()
+    }
+}
+
+/// The `--non-interactive` error line for `error`, and the one-line reason the same failure
+/// prints on stderr.
+///
+/// A [`LoginRefusal`] anywhere in the chain gives its coded line, with its own reason and none of
+/// the context a caller wrapped it in: the reason is tcr's whole sentence, written to be shown
+/// as it is. Anything else gives the uncoded line it always gave, its reason flattened from the
+/// whole chain by [`one_line_reason`].
+pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LoginRefusal>())
+    {
+        Some(refusal) => {
+            let reason = refusal
+                .reason
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let line = LoginEvent::Refused {
+                code: refusal.code,
+                reason: &reason,
+            }
+            .line();
+            (line, reason)
+        }
+        None => {
+            let reason = one_line_reason(error);
+            let line = LoginEvent::Error { reason: &reason }.line();
+            (line, reason)
+        }
+    }
+}
+
+/// Printed once a Codex account is saved into a config that held no Codex row before, in any
+/// state, enabled, disabled or needing a re-login: the save is the moment tcr starts terminating
+/// `chatgpt.com` for every codex that reaches it, because the proxy intercepts that host exactly
+/// while its pool holds a Codex account (`mitm::handle_connect`). A codex started with
+/// `tcr run --codex` trusts tcr's CA and is pooled; any other codex sent through this proxy meets
+/// a certificate it does not trust, and needs the CA or `NO_PROXY` to keep working.
+pub const CODEX_FIRST_ACCOUNT_NOTICE: &str =
+    "tcr intercepts chatgpt.com from now on: codex started \
+    with `tcr run --codex` is pooled; a codex that reaches this proxy some other way needs \
+    CODEX_CA_CERTIFICATE set to tcr's CA, or chatgpt.com in NO_PROXY to stay on its own login";
+
+/// The warning for a `tcr` at `path`, reporting `version`, that is 0.2.45 or older: it predates
+/// the `credentialVersion` check, so it would read a Codex row as a Claude account and send its
+/// OpenAI token to Anthropic the next time it starts on this config.
+pub fn older_tcr_reads_codex_as_claude_notice(path: &Path, version: &str) -> String {
+    format!(
+        "the tcr at {} ({version}) predates Codex accounts: update it before it next starts — it \
+         would read this login as a Claude account and send its token to Anthropic",
+        path.display()
+    )
+}
+
+/// The warning for a `tcr` at `path`, reporting `version`, from 0.2.46 on that still lacks
+/// `--from-codex`: it checks `credentialVersion`, so it refuses a config holding a Codex row
+/// outright, and every command it runs on this config fails until it is updated.
+pub fn older_tcr_refuses_config_notice(path: &Path, version: &str) -> String {
+    format!(
+        "the tcr at {} ({version}) predates Codex accounts: update it — until then it refuses \
+         this config, so every command it runs fails",
+        path.display()
+    )
+}
+
+/// The notice for a codex with no login of its own at `path` (an existence check, never a
+/// read): tcr re-credentials a pooled codex's requests, but codex itself still has to start
+/// signed in. A login kept in the system keyring (codex's `keyring` and `auto` stores) is
+/// invisible to tcr, which is why the sentence leaves that case open.
+pub fn codex_has_no_login_notice(path: &Path) -> String {
+    format!(
+        "codex needs a login of its own to start, even when pooled, and none is at {}: unless \
+         codex keeps its login in the keyring, run `codex login` once",
+        path.display()
+    )
+}
+
+/// The line `tcr login --from-codex` prints after its import lines in the terminal: how to use
+/// the account it just saved.
+pub const CODEX_IMPORT_RUN_LINE: &str = "[tcr] start a pooled session with `tcr run --codex`";
+
+/// The command each login entry point names when it tells someone to run it again.
+pub const LOGIN_COMMAND: &str = "tcr login";
+/// See [`LOGIN_COMMAND`].
+pub const LOGIN_FROM_CODEX_COMMAND: &str = "tcr login --from-codex";
+/// See [`LOGIN_COMMAND`].
+pub const LOGIN_FROM_CLAUDE_CODE_COMMAND: &str = "tcr login --from-claude-code";
+/// See [`LOGIN_COMMAND`].
+pub const LOGIN_CODEX_COMMAND: &str = "tcr login --codex";
 
 /// Flatten an error and its whole `anyhow` context chain onto ONE line.
 ///
@@ -1172,6 +1358,7 @@ pub fn upsert_account(
                 seat_tier: profile.seat_tier.clone(),
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             });
             Ok(())
@@ -1208,7 +1395,7 @@ fn login_target_port(config_path: &Path) -> u16 {
 /// What `login()` should do with the finished credential, decided purely from
 /// the incumbent detected on the guarded port, whether a probe already
 /// confirmed THAT incumbent carries the live account-add route, and
-/// `--force`. Returned by [`login_guard_refusal`].
+/// `--force`. Returned by [`login_guard_refusal_for`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoginRoute {
     /// No live proxy on the port at all — the historical file-only login,
@@ -1264,11 +1451,17 @@ enum LoginRoute {
 /// `takeover_decision` and `incumbents_to_signal` are both hardened against
 /// exactly that signal; a message that ADVISES it would walk around both. So
 /// an embedded incumbent is told to be quit, not killed.
-fn login_guard_refusal(
+///
+/// The refusal names `command`, the login that was run (`tcr login`,
+/// `tcr login --from-codex`, `tcr login --codex`, …), as the one to run again
+/// once the server is stopped: telling someone who ran an import to run
+/// `tcr login` sends them into the browser flow they did not ask for.
+fn login_guard_refusal_for(
     incumbent: Option<singleton::Incumbent>,
     has_add_route: bool,
     port: u16,
     force: bool,
+    command: &str,
 ) -> LoginRoute {
     // `has_add_route` is checked BEFORE `force`, deliberately: a confirmed
     // route wins even against the escape hatch. Checking `force` first (the
@@ -1287,10 +1480,10 @@ fn login_guard_refusal(
             let pid = incumbent.pid;
             LoginRoute::Refuse(match incumbent.kind {
                 singleton::ProxyKind::TcrEmbedded => format!(
-                    "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — that pid is the HOST APPLICATION serving the proxy in-process, so do not signal it: quit the host application (killing it skips its shutdown and loses the session pin map), run 'tcr login', then start it again. Re-run with --force to log in anyway."
+                    "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — that pid is the HOST APPLICATION serving the proxy in-process, so do not signal it: quit the host application (killing it skips its shutdown and loses the session pin map), run '{command}', then start it again. Re-run with --force to log in anyway."
                 ),
                 singleton::ProxyKind::Tcr | singleton::ProxyKind::LegacyJs => format!(
-                    "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — stop it (kill {pid}, or Ctrl-C in its terminal), run 'tcr login', then restart 'tcr server'. Re-run with --force to log in anyway."
+                    "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — stop it (kill {pid}, or Ctrl-C in its terminal), run '{command}', then restart 'tcr server'. Re-run with --force to log in anyway."
                 ),
             })
         }
@@ -1371,6 +1564,7 @@ async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider
         seat_tier: None,
         egress: crate::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     };
     let (answer, providers) = crate::cli::post_add_account_with_providers(config, &probe).await;
@@ -1418,20 +1612,47 @@ async fn login_route(
     port: u16,
     force: bool,
 ) -> anyhow::Result<LoginRoute> {
-    login_route_with_providers(config_path, incumbent, port, force)
+    login_route_for(config_path, incumbent, port, force, LOGIN_COMMAND).await
+}
+
+/// [`login_guard_refusal_for`] for plain `tcr login`, whose refusal says `run 'tcr login'`. The
+/// guard's own tests pin the decision through it.
+#[cfg(test)]
+fn login_guard_refusal(
+    incumbent: Option<singleton::Incumbent>,
+    has_add_route: bool,
+    port: u16,
+    force: bool,
+) -> LoginRoute {
+    login_guard_refusal_for(incumbent, has_add_route, port, force, LOGIN_COMMAND)
+}
+
+/// [`login_route`] for the login `command` names (`tcr login --from-claude-code`, …), which a
+/// refusal tells the user to run again ([`login_guard_refusal_for`]).
+async fn login_route_for(
+    config_path: &Path,
+    incumbent: Option<singleton::Incumbent>,
+    port: u16,
+    force: bool,
+    command: &str,
+) -> anyhow::Result<LoginRoute> {
+    login_route_with_providers(config_path, incumbent, port, force, command)
         .await
         .map(|(route, _)| route)
 }
 
 /// [`login_route`], plus the providers the probe's answer advertised
 /// ([`probe_add_route`]). Every decision is `login_route`'s; the list rides
-/// along for the one caller that must refuse a live server unable to store its
-/// provider, `import_codex_login`.
+/// along for the callers that must refuse a live server unable to store their
+/// provider: `import_codex_login`, and `tcr login --codex` before codex runs
+/// ([`codex_login_route_check`]). `command` is the login that was run, which a
+/// refusal names ([`login_guard_refusal_for`]).
 async fn login_route_with_providers(
     config_path: &Path,
     incumbent: Option<singleton::Incumbent>,
     port: u16,
     force: bool,
+    command: &str,
 ) -> anyhow::Result<(LoginRoute, Vec<crate::provider::Provider>)> {
     let config = load_or_default(config_path)?;
     let (capability, providers) = probe_add_route(&config).await;
@@ -1451,8 +1672,8 @@ async fn login_route_with_providers(
                 config_path.display()
             );
         }
-        AddCapability::Present => login_guard_refusal(incumbent, true, port, force),
-        AddCapability::Absent => login_guard_refusal(incumbent, false, port, force),
+        AddCapability::Present => login_guard_refusal_for(incumbent, true, port, force, command),
+        AddCapability::Absent => login_guard_refusal_for(incumbent, false, port, force, command),
         // Bridge item D: something holds the port but answered unusably —
         // first-hand evidence at least as strong as `incumbent`, so this
         // refuses REGARDLESS of what `incumbent` separately concluded, never
@@ -1982,12 +2203,18 @@ fn tokens_from_claude_code_login(login: crate::claude_code_login::ClaudeCodeLogi
 /// on a first run: same read, same write path, and it is the way back in after
 /// a deliberate `tcr remove` (the auto path refuses to re-import a fleet the
 /// user emptied on purpose).
+///
+/// `ui` decides how it speaks, as it does for [`login`]: the terminal gets the import line on
+/// stderr, and [`LoginUi::Machine`] gets the import's cost as one `notice` event and then
+/// `saved`, each exactly once, with no prose on stdout.
 pub async fn login_from_claude_code(
     config_path: &Path,
     force: bool,
     name: Option<&str>,
     account: Option<&str>,
+    ui: LoginUi,
 ) -> anyhow::Result<String> {
+    ui.install();
     let Some(login) = crate::claude_code_login::read_claude_code_login()? else {
         bail!(
             "no Claude Code login found on this machine — nothing was written. Log in with the \
@@ -2002,14 +2229,22 @@ pub async fn login_from_claude_code(
         name,
         account,
         login,
-        LoginUi::Terminal,
+        ui,
     )
     .await?
     .ok_or_else(|| anyhow::anyhow!("the import skipped a non-empty fleet it was told to accept"))?;
-    eprintln!(
-        "[tcr] imported as '{saved}'{}; {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
-        plan_suffix(subscription_type.as_deref())
-    );
+    match ui {
+        LoginUi::Terminal => eprintln!(
+            "[tcr] imported as '{saved}'{}; {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
+            plan_suffix(subscription_type.as_deref())
+        ),
+        LoginUi::Machine => {
+            ui.emit(LoginEvent::Notice {
+                text: CLAUDE_CODE_IMPORT_CONSEQUENCE,
+            });
+            ui.emit(LoginEvent::Saved { account: &saved });
+        }
+    }
     Ok(saved)
 }
 
@@ -2025,31 +2260,117 @@ pub async fn login_from_claude_code(
 /// it a login without this process's environment deciding which one.
 /// [`CODEX_IMPORT_CONSEQUENCE`] and [`CODEX_IMPORT_OLDER_PROXY`] print on every
 /// import.
+///
+/// The row records the folder the login was read from (`codexHome`, the auth file's
+/// directory, made absolute), so TcrBar can offer to re-import from it. `ui` decides how the
+/// import speaks: the terminal gets its lines on stderr, then [`CODEX_IMPORT_RUN_LINE`], then
+/// each notice that holds ([`crate::codex_local::codex_notices`]); [`LoginUi::Machine`] gets the
+/// import's cost as one `notice` event, then those notices as events, then `saved` with the
+/// provider and the plan. Nothing is said before the import is written, so a refusal is the
+/// only line a refused import prints.
 pub async fn login_from_codex(
     config_path: &Path,
     force: bool,
     name: Option<&str>,
     account: Option<&str>,
     codex_home: Option<&Path>,
+    ui: LoginUi,
 ) -> anyhow::Result<String> {
+    ui.install();
     let path = crate::codex_login::auth_path(codex_home)?;
     let Some(login) = crate::codex_login::read_codex_login(&path)? else {
-        bail!(
-            "no Codex login found at {} — nothing was written. Log in with `codex login` first \
-             (for a second account: `mkdir -p <dir>`, `CODEX_HOME=<dir> codex login`, then `tcr \
-             login --from-codex --codex-home <dir>`).",
-            path.display()
-        );
+        bail!("{}", no_codex_login_message(&path));
     };
-    let plan = login.plan_type.clone();
-    let saved = import_codex_login(config_path, force, name, account, login).await?;
-    // The plan as `tcr status` names it (`ChatGPT Pro`), not the raw claim (`pro`).
-    eprintln!(
-        "[tcr] imported as '{saved}'{}; {CODEX_IMPORT_CONSEQUENCE} {CODEX_IMPORT_OLDER_PROXY}",
-        tcr_status_wire::codex_plan_label(plan.as_deref())
-            .map_or_else(String::new, |label| format!(" ({label})"))
-    );
+    let folder = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let folder = std::path::absolute(folder)
+        .with_context(|| format!("making {} absolute", folder.display()))?;
+    let plan = tcr_status_wire::codex_plan_label(login.plan_type.as_deref());
+    let first = holds_no_codex_row(config_path)?;
+    let saved = import_codex_login(config_path, force, name, account, login, Some(&folder)).await?;
+    let notices = crate::codex_local::codex_notices(first);
+    match ui {
+        LoginUi::Terminal => {
+            // The plan as `tcr status` names it (`ChatGPT Pro`), not the raw claim (`pro`).
+            eprintln!(
+                "[tcr] imported as '{saved}'{}; {CODEX_IMPORT_CONSEQUENCE} {CODEX_IMPORT_OLDER_PROXY}",
+                plan.as_deref()
+                    .map_or_else(String::new, |label| format!(" ({label})"))
+            );
+            eprintln!("{CODEX_IMPORT_RUN_LINE}");
+            say_codex_notices(ui, &notices);
+        }
+        LoginUi::Machine => {
+            let consequence = format!("{CODEX_IMPORT_CONSEQUENCE} {CODEX_IMPORT_OLDER_PROXY}");
+            ui.emit(LoginEvent::Notice { text: &consequence });
+            say_codex_notices(ui, &notices);
+            ui.emit(LoginEvent::SavedCodex {
+                account: &saved,
+                plan: plan.as_deref(),
+            });
+        }
+    }
     Ok(saved)
+}
+
+/// What `tcr login --from-codex` says when there is no login at `path`: how to make one, and,
+/// last, that a login codex keeps in the system keyring (its `keyring` and `auto` stores) has no
+/// file tcr can read, which `tcr login --codex` does not need.
+pub fn no_codex_login_message(path: &Path) -> String {
+    format!(
+        "no Codex login found at {} — nothing was written. Log in with `codex login` first (for \
+         a second account: `mkdir -p <dir>`, `CODEX_HOME=<dir> codex login`, then `tcr login \
+         --from-codex --codex-home <dir>`). If codex keeps this login in the system keyring, \
+         which tcr does not read, use tcr login --codex instead, which needs no file.",
+        path.display()
+    )
+}
+
+/// Whether the config at `config_path` holds no Codex row in any state: enabled, disabled or
+/// needing a re-login all count. Read before a Codex save, it decides
+/// [`CODEX_FIRST_ACCOUNT_NOTICE`].
+pub(crate) fn holds_no_codex_row(config_path: &Path) -> anyhow::Result<bool> {
+    Ok(!load_or_default(config_path)?
+        .accounts
+        .iter()
+        .any(|row| row.provider == crate::provider::Provider::Codex))
+}
+
+/// Say each of `notices`, in order: a `notice` event apiece in [`LoginUi::Machine`]; a stderr
+/// line apiece in the terminal, on the `[tcr] ` rung or, for a warning, `[tcr] warning: `.
+pub(crate) fn say_codex_notices(ui: LoginUi, notices: &[crate::codex_local::CodexNotice]) {
+    for notice in notices {
+        match ui {
+            LoginUi::Machine => ui.emit(LoginEvent::Notice { text: &notice.text }),
+            LoginUi::Terminal if notice.warning => eprintln!("[tcr] warning: {}", notice.text),
+            LoginUi::Terminal => eprintln!("[tcr] {}", notice.text),
+        }
+    }
+}
+
+/// The route check `tcr login --codex` runs before codex does, so a proxy that cannot take the
+/// login refuses it before the person spends a browser sign-in on it: the route, as every login
+/// checks it, and on the live route the provider gate [`import_codex_login`] applies, naming
+/// `tcr login --codex` as the command to run again.
+pub(crate) async fn codex_login_route_check(config_path: &Path, force: bool) -> anyhow::Result<()> {
+    let port = login_target_port(config_path);
+    let incumbent = singleton::live_proxy_server(port);
+    let pid = incumbent.map(|incumbent| incumbent.pid);
+    let (route, providers) =
+        login_route_with_providers(config_path, incumbent, port, force, LOGIN_CODEX_COMMAND)
+            .await?;
+    if let LoginRoute::Refuse(msg) = route {
+        bail!("{}", msg);
+    }
+    if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
+        bail!(
+            "{}",
+            codex_live_route_refusal(port, pid, LOGIN_CODEX_COMMAND)
+        );
+    }
+    Ok(())
 }
 
 /// The write half of `tcr login --from-codex`: everything after the read, given
@@ -2065,8 +2386,13 @@ pub async fn login_from_codex(
 ///    carries `chatgpt_account_is_fedramp` ([`crate::codex_login::CodexLogin::is_fedramp`]),
 ///    so codex marks its requests `X-OpenAI-Fedramp` and may route them away from
 ///    chatgpt.com, where tcr would send them.
-/// 1. `account` (`--account`) against the login's email — a guard against
-///    importing the wrong `CODEX_HOME`.
+/// 1. `account` (`--account`) — a guard against importing the wrong `CODEX_HOME`.
+///    A name that is a row, exactly as `tcr accounts` prints it, must be a Codex
+///    row this login is ([`crate::identity::same_identity`] against the row
+///    [`codex_account_row`] would write); a Claude row is refused with
+///    [`LoginRefusal::ACCOUNT_IS_CLAUDE`], since no Codex login re-signs it. A
+///    name that is no row must be the login's email. All of it before the route
+///    probe, so a refusal asks nothing of anyone.
 /// 2. The route.
 /// 3. **The provider gate.** On the LIVE route the server must have named
 ///    `codex` among the providers it can store ([`crate::proxy::PROVIDERS_HEADER`],
@@ -2074,7 +2400,7 @@ pub async fn login_from_codex(
 ///    accounts: it would drop the row's `provider`, store this login as a Claude
 ///    account and from then on send its OpenAI tokens to Anthropic — a row a later
 ///    restart does not heal. Refused, and `--force` does not get past it: a confirmed
-///    live route is never traded for the file ([`login_guard_refusal`]), and the file
+///    live route is never traded for the file ([`login_guard_refusal_for`]), and the file
 ///    would not help either — at its next start that server refuses it if it has the
 ///    `credentialVersion` check, and reads the login as a Claude account if it predates it.
 /// 4. **The row this login already is** ([`existing_codex_row`]), if any. A
@@ -2090,18 +2416,67 @@ pub async fn login_from_codex(
 ///    backend origin or by a residency override is refused, and so is any check that
 ///    cannot complete: tcr sends every pooled Codex request to `codexUpstream`, so it pools
 ///    only a login served there. Then the write.
-async fn import_codex_login(
+///
+/// `codex_home` is the folder the login was read from, recorded on the row as `codexHome`;
+/// `None` for a login of tcr's own, which leaves no folder to re-import from.
+pub(crate) async fn import_codex_login(
     config_path: &Path,
     force: bool,
     name: Option<&str>,
     account: Option<&str>,
     login: crate::codex_login::CodexLogin,
+    codex_home: Option<&Path>,
+) -> anyhow::Result<String> {
+    import_codex_login_as(
+        LOGIN_FROM_CODEX_COMMAND,
+        config_path,
+        force,
+        name,
+        account,
+        login,
+        codex_home,
+    )
+    .await
+}
+
+/// [`import_codex_login`], for the login `command` names, which a refusal tells the user to run
+/// again: `tcr login --codex` writes through here too.
+pub(crate) async fn import_codex_login_as(
+    command: &str,
+    config_path: &Path,
+    force: bool,
+    name: Option<&str>,
+    account: Option<&str>,
+    login: crate::codex_login::CodexLogin,
+    codex_home: Option<&Path>,
 ) -> anyhow::Result<String> {
     if login.is_fedramp {
-        bail!("{CODEX_FEDRAMP_REFUSAL}");
+        return Err(LoginRefusal {
+            code: LoginRefusal::CODEX_FEDRAMP,
+            reason: CODEX_FEDRAMP_REFUSAL.to_string(),
+        }
+        .into());
     }
     if let Some(wanted) = account {
-        if login.email.as_deref() != Some(wanted) {
+        let config = load_or_default(config_path)?;
+        let is_this_login = match crate::identity::match_one(&config.accounts, wanted) {
+            crate::identity::Match::One(idx) => {
+                let row = &config.accounts[idx];
+                if row.provider != crate::provider::Provider::Codex {
+                    return Err(LoginRefusal {
+                        code: LoginRefusal::ACCOUNT_IS_CLAUDE,
+                        reason: claude_account_codex_import_refusal(&row.name),
+                    }
+                    .into());
+                }
+                codex_login_is_row(row, &login)
+            }
+            crate::identity::Match::None => login.email.as_deref() == Some(wanted),
+            crate::identity::Match::Ambiguous(names) => {
+                bail!("{}", crate::cli::ambiguous_query_message(wanted, &names))
+            }
+        };
+        if !is_this_login {
             bail!("the Codex login on this machine is not '{wanted}'; nothing was written.");
         }
     }
@@ -2109,12 +2484,12 @@ async fn import_codex_login(
     let incumbent = singleton::live_proxy_server(port);
     let pid = incumbent.map(|incumbent| incumbent.pid);
     let (route, providers) =
-        login_route_with_providers(config_path, incumbent, port, force).await?;
+        login_route_with_providers(config_path, incumbent, port, force, command).await?;
     if let LoginRoute::Refuse(msg) = route {
         bail!("{}", msg);
     }
     if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
-        bail!("{}", codex_live_route_refusal(port, pid));
+        bail!("{}", codex_live_route_refusal(port, pid, command));
     }
     let config = load_or_default(config_path)?;
     let resolved_name = match existing_codex_row(&config, &login) {
@@ -2138,6 +2513,7 @@ async fn import_codex_login(
         None => mint_codex_login_name(
             &config,
             login.email.as_deref(),
+            login.user_id.as_deref(),
             login.account_id.as_deref(),
             name,
         )?,
@@ -2153,13 +2529,13 @@ async fn import_codex_login(
     if let Err(refusal) =
         crate::codex_login::check_workspace_routing(&client, &config.codex_upstream, &login).await
     {
-        bail!("{}", codex_workspace_refusal(refusal));
+        return Err(codex_workspace_refusal(refusal).into());
     }
     finish_login_account(
         config_path,
         route,
         &config,
-        codex_account_row(resolved_name, login),
+        codex_account_row(resolved_name, login, codex_home),
     )
     .await
 }
@@ -2172,43 +2548,52 @@ const CODEX_FEDRAMP_REFUSAL: &str = "this Codex login belongs to a FedRAMP ChatG
      written.";
 
 /// [`import_codex_login`]'s refusal of a login the workspace check did not clear
-/// ([`crate::codex_login::check_workspace_routing`]).
-fn codex_workspace_refusal(refusal: crate::codex_login::WorkspaceRefusal) -> String {
+/// ([`crate::codex_login::check_workspace_routing`]), coded by which way it failed: a
+/// workspace served elsewhere, or a check that could not complete.
+fn codex_workspace_refusal(refusal: crate::codex_login::WorkspaceRefusal) -> LoginRefusal {
     match refusal {
-        crate::codex_login::WorkspaceRefusal::NotPoolable(said) => format!(
-            "this Codex login's ChatGPT workspace is not served at https://chatgpt.com with no \
-             routing of its own ({said}): codex sends that workspace's traffic to its own \
-             backend, or routes it by residency, and tcr pools a Codex login only at \
-             https://chatgpt.com. Nothing was written."
-        ),
-        crate::codex_login::WorkspaceRefusal::Unconfirmed(why) => format!(
-            "tcr could not confirm that this Codex login's ChatGPT workspace is served at \
-             https://chatgpt.com ({why}), and imports a Codex login only once that check \
-             answers: a FedRAMP or data-residency workspace must not be pooled. Nothing was \
-             written."
-        ),
+        crate::codex_login::WorkspaceRefusal::NotPoolable(said) => LoginRefusal {
+            code: LoginRefusal::CODEX_ROUTED,
+            reason: format!(
+                "this Codex login's ChatGPT workspace is not served at https://chatgpt.com with no \
+                 routing of its own ({said}): codex sends that workspace's traffic to its own \
+                 backend, or routes it by residency, and tcr pools a Codex login only at \
+                 https://chatgpt.com. Nothing was written."
+            ),
+        },
+        crate::codex_login::WorkspaceRefusal::Unconfirmed(why) => LoginRefusal {
+            code: LoginRefusal::CODEX_UNCONFIRMED,
+            reason: format!(
+                "tcr could not confirm that this Codex login's ChatGPT workspace is served at \
+                 https://chatgpt.com ({why}), and imports a Codex login only once that check \
+                 answers: a FedRAMP or data-residency workspace must not be pooled. Nothing was \
+                 written."
+            ),
+        },
     }
 }
 
 /// [`import_codex_login`]'s refusal of a live proxy that did not name `codex`
 /// among the providers it can store. `pid` is the incumbent process detection
-/// found on the port, when it found one.
-fn codex_live_route_refusal(port: u16, pid: Option<u32>) -> String {
+/// found on the port, when it found one; `command` is the login that was run,
+/// named as the one to run again.
+fn codex_live_route_refusal(port: u16, pid: Option<u32>, command: &str) -> String {
     let pid = pid.map_or_else(|| "pid unknown".to_string(), |pid| format!("pid {pid}"));
     format!(
         "the proxy on :{port} ({pid}) predates Codex accounts and would store this login as a \
          Claude account and send its token to Anthropic — nothing was written. Restart the proxy \
-         on this build (update TcrBar first if it supervises the proxy), then re-run `tcr login \
-         --from-codex`. --force does not get past this: it never trades a confirmed live route \
-         for a file write, and that proxy would refuse the file at its next start, or read it the \
-         same way if it is older still."
+         on this build (update TcrBar first if it supervises the proxy), then re-run `{command}`. \
+         --force does not get past this: it never trades a confirmed live route for a file \
+         write, and that proxy would refuse the file at its next start, or read it the same way \
+         if it is older still."
     )
 }
 
 /// The row of `config` this Codex login already is, resolved the way the write
 /// resolves its row: [`crate::identity::resolve`] over a Codex probe carrying the
-/// login's email and ChatGPT account id, so only a Codex row can match. `None`
-/// when no row is this login, and when two are — a tie the write refuses itself.
+/// login's email, its ChatGPT user and its workspace, so only a Codex row of that
+/// user in that workspace can match. `None` when no row is this login, and when
+/// two are — a tie the write refuses itself.
 fn existing_codex_row<'a>(
     config: &'a Config,
     login: &crate::codex_login::CodexLogin,
@@ -2216,8 +2601,8 @@ fn existing_codex_row<'a>(
     let this_login = crate::identity::probe(
         crate::provider::Provider::Codex,
         login.email.as_deref().unwrap_or_default(),
+        login.user_id.clone(),
         login.account_id.clone(),
-        None,
         None,
     );
     match crate::identity::resolve(config.accounts.iter().enumerate(), &this_login) {
@@ -2234,17 +2619,25 @@ fn holds_newer_credential(stored: Option<i64>, import: Option<i64>) -> bool {
     matches!((stored, import), (Some(stored), Some(import)) if stored > import)
 }
 
-/// The config row a Codex login becomes: `provider: codex`, the ChatGPT account
-/// id as its identity (`accountUuid`, which [`crate::identity::same_identity`]
-/// compares within one provider) and the plan as its `organizationType`. No org
-/// fields: a ChatGPT workspace is named by its account id alone.
-fn codex_account_row(name: String, login: crate::codex_login::CodexLogin) -> Account {
+/// The config row a Codex login becomes: `provider: codex`, its identity a ChatGPT
+/// user plus a workspace — the user (`chatgpt_user_id`) as `accountUuid` and the
+/// workspace (the ChatGPT account id, which tcr sends as `chatgpt-account-id`) as
+/// `orgUuid`, the pair [`crate::identity::same_identity`] compares within one
+/// provider — and the plan as its `organizationType`. So one person in two
+/// workspaces is two accounts, and so are two seats of one workspace: each pair
+/// holds its own token and its own quota. No org name: a workspace is named by its
+/// id alone. `codex_home` is the folder the login was imported from, when it was.
+fn codex_account_row(
+    name: String,
+    login: crate::codex_login::CodexLogin,
+    codex_home: Option<&Path>,
+) -> Account {
     Account {
         name,
         account_type: crate::config::AccountType::OAuth,
         provider: crate::provider::Provider::Codex,
-        account_uuid: login.account_id,
-        org_uuid: None,
+        account_uuid: login.user_id,
+        org_uuid: login.account_id,
         org_name: None,
         access_token: login.access_token,
         refresh_token: Some(login.refresh_token),
@@ -2258,8 +2651,19 @@ fn codex_account_row(name: String, login: crate::codex_login::CodexLogin) -> Acc
         seat_tier: None,
         egress: crate::config::Egress::Local,
         egress_strict: false,
+        codex_home: codex_home.map(|folder| folder.display().to_string()),
         extra: serde_json::Map::new(),
     }
+}
+
+/// Whether `login` is the account `row` holds, by the rule the write resolves its row by:
+/// [`crate::identity::same_identity`] against the row [`codex_account_row`] would write, so a
+/// Codex row of the same ChatGPT user in the same workspace.
+pub(crate) fn codex_login_is_row(row: &Account, login: &crate::codex_login::CodexLogin) -> bool {
+    crate::identity::same_identity(
+        row,
+        &codex_account_row(row.name.clone(), login.clone(), None),
+    )
 }
 
 /// The name a Codex import writes under.
@@ -2271,25 +2675,27 @@ fn codex_account_row(name: String, login: crate::codex_login::CodexLogin) -> Acc
 /// file (`config::migrate_duplicate_names`).
 ///
 /// Free means free FOR THIS LOGIN: no row holds the name, or the row holding it
-/// is this same Codex account by [`crate::identity::same_identity`], the rule
-/// the write itself resolves its row by. So a re-import of the same login keeps
-/// its name and updates its row in place, while a second ChatGPT account under
-/// the same email (a personal and a Team workspace) gets a name of its own: the
-/// write would ADD that row, and two rows of one name is the state
-/// `migrate_duplicate_names` exists to repair. `--force` does not waive this —
-/// it overrides a running proxy's refusal, and no route makes a shared name safe.
+/// is this same Codex account by [`crate::identity::same_identity`] (its ChatGPT
+/// user, `user_id`, in its workspace, `workspace_id`), the rule the write itself
+/// resolves its row by. So a re-import of the same login keeps its name and
+/// updates its row in place, while the same email in a second workspace (a
+/// personal and a Team workspace) gets a name of its own: the write would ADD
+/// that row, and two rows of one name is the state `migrate_duplicate_names`
+/// exists to repair. `--force` does not waive this — it overrides a running
+/// proxy's refusal, and no route makes a shared name safe.
 fn mint_codex_login_name(
     config: &Config,
     email: Option<&str>,
-    account_id: Option<&str>,
+    user_id: Option<&str>,
+    workspace_id: Option<&str>,
     name: Option<&str>,
 ) -> anyhow::Result<String> {
     let free = |candidate: &str| {
         let this_login = crate::identity::probe(
             crate::provider::Provider::Codex,
             candidate,
-            account_id.map(str::to_string),
-            None,
+            user_id.map(str::to_string),
+            workspace_id.map(str::to_string),
             None,
         );
         config
@@ -2412,7 +2818,14 @@ async fn import_claude_code_login(
     ui.install();
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
-    let route = login_route(config_path, incumbent, port, force).await?;
+    let route = login_route_for(
+        config_path,
+        incumbent,
+        port,
+        force,
+        LOGIN_FROM_CLAUDE_CODE_COMMAND,
+    )
+    .await?;
     if let LoginRoute::Refuse(msg) = route {
         bail!("{}", msg);
     }
@@ -2458,13 +2871,13 @@ enum ImportInto {
 }
 
 /// What `tcr login --account` says to a row that is not a Claude account, before it does
-/// anything else ([`refuse_a_non_claude_row`]): the row, why `tcr login` cannot sign it in, how
-/// to refresh it instead, and that nothing was changed.
-fn codex_account_login_refusal(name: &str) -> String {
+/// anything else ([`refuse_a_non_claude_row`]): the row, why `tcr login` cannot sign it in, the
+/// two commands that can (a login of tcr's own, or a re-import), and that nothing was written.
+pub fn codex_account_login_refusal(name: &str) -> String {
     format!(
-        "'{name}' is a Codex account; `tcr login` signs in Claude accounts only. Refresh it with \
-         `tcr login --from-codex` (add `--codex-home <dir>` if you imported it from one; run \
-         `codex login` there first if codex's own login is dead too). Nothing was changed."
+        "'{name}' is a Codex account; `tcr login` signs in Claude accounts only. Sign it in again \
+         with `tcr login --codex --account {name}`, or re-import it with `tcr login --from-codex \
+         --account {name}`. Nothing was written."
     )
 }
 
@@ -2476,7 +2889,97 @@ fn codex_account_login_refusal(name: &str) -> String {
 fn refuse_a_non_claude_row(account: &Account) -> anyhow::Result<()> {
     match account.provider {
         crate::provider::Provider::Anthropic => Ok(()),
-        crate::provider::Provider::Codex => bail!("{}", codex_account_login_refusal(&account.name)),
+        crate::provider::Provider::Codex => Err(LoginRefusal {
+            code: LoginRefusal::ACCOUNT_IS_CODEX,
+            reason: codex_account_login_refusal(&account.name),
+        }
+        .into()),
+    }
+}
+
+/// What `tcr login --codex --account` says to a Claude row: a ChatGPT sign-in can never confirm
+/// it, so it is refused before codex runs, naming the command that can.
+pub fn claude_account_codex_login_refusal(name: &str) -> String {
+    format!(
+        "'{name}' is a Claude account; `tcr login --codex` signs in Codex accounts only. Sign it \
+         in again with `tcr login --account {name}`. Nothing was written."
+    )
+}
+
+/// What `tcr login --from-codex --account` says to a Claude row, before the route probe and any
+/// write: a Codex import can never re-sign it.
+pub fn claude_account_codex_import_refusal(name: &str) -> String {
+    format!(
+        "'{name}' is a Claude account; `tcr login --from-codex` imports Codex accounts only. Sign \
+         it in again with `tcr login --account {name}`. Nothing was written."
+    )
+}
+
+/// The row `tcr login --codex --account <query>` re-signs: `query` resolved by the rule every
+/// verb's `--account` uses ([`crate::cli::resolve_account`], an exact row name), refused with
+/// [`LoginRefusal::ACCOUNT_IS_CLAUDE`] when it names a Claude row. Runs before anything else the
+/// login does, so a refusal spawns nothing and writes nothing.
+pub fn codex_relogin_target(config: &Config, query: &str) -> anyhow::Result<usize> {
+    let idx = crate::cli::resolve_account(&config.accounts, query)?;
+    let row = &config.accounts[idx];
+    match row.provider {
+        crate::provider::Provider::Codex => Ok(idx),
+        crate::provider::Provider::Anthropic => Err(LoginRefusal {
+            code: LoginRefusal::ACCOUNT_IS_CLAUDE,
+            reason: claude_account_codex_login_refusal(&row.name),
+        }
+        .into()),
+    }
+}
+
+/// The refusal of a `tcr login --codex --account <name>` whose ChatGPT login came back as
+/// someone else: `got` is that login's email (or a stand-in when it has none). The browser
+/// is the usual cause, already signed in to chatgpt.com as another person, which is the remedy
+/// it names.
+pub fn codex_identity_refusal(got: &str, name: &str) -> LoginRefusal {
+    LoginRefusal {
+        code: LoginRefusal::CODEX_IDENTITY,
+        reason: format!(
+            "the ChatGPT login that came back is {got}, not the one '{name}' holds. Sign out of \
+             chatgpt.com in the browser first, or use a private window, then retry `tcr login \
+             --codex --account {name}`. Nothing was written."
+        ),
+    }
+}
+
+/// The refusal of a `tcr login --codex --account <name>` whose login is the row's own ChatGPT
+/// user in another workspace: the same person, so both workspaces are known and differ, and the
+/// remedy is to pick the row's workspace when ChatGPT asks.
+///
+/// `email` is the login's (or `None`); `got` and `want` are the login's and the row's workspace
+/// ids, shown as their first 8 hex digits; each plan is a raw plan word, labelled the way
+/// `tcr status` labels it, and its parenthesis is dropped when it is unknown.
+pub fn codex_relogin_workspace_refusal(
+    email: Option<&str>,
+    got: &str,
+    got_plan: Option<&str>,
+    name: &str,
+    want: &str,
+    want_plan: Option<&str>,
+) -> LoginRefusal {
+    let short =
+        |id: &str| -> String { id.chars().filter(char::is_ascii_hexdigit).take(8).collect() };
+    let plan = |raw: Option<&str>| {
+        tcr_status_wire::codex_plan_label(raw)
+            .map_or_else(String::new, |label| format!(" ({label})"))
+    };
+    LoginRefusal {
+        code: LoginRefusal::CODEX_IDENTITY,
+        reason: format!(
+            "the ChatGPT login that came back is {} in ChatGPT workspace {}{}, but '{name}' holds \
+             workspace {}{}. Retry `tcr login --codex --account {name}` and choose that workspace \
+             when ChatGPT asks which one to use. Nothing was written.",
+            email.unwrap_or("the same ChatGPT user"),
+            short(got),
+            plan(got_plan),
+            short(want),
+            plan(want_plan),
+        ),
     }
 }
 
@@ -2966,6 +3469,7 @@ async fn finish_login(
         seat_tier: profile.seat_tier,
         egress: crate::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     };
     finish_login_account(config_path, route, config, account).await
@@ -2977,7 +3481,7 @@ async fn finish_login(
 ///
 /// Shares [`config::load_or_init`] with every other verb rather than keeping a
 /// second copy of the missing-file rule here.
-fn load_or_default(config_path: &Path) -> anyhow::Result<Config> {
+pub(crate) fn load_or_default(config_path: &Path) -> anyhow::Result<Config> {
     let (config, _created) = config::load_or_init(config_path).context("load config for login")?;
     Ok(config)
 }
@@ -3155,6 +3659,113 @@ mod tests {
                 "event": "error",
                 "reason": "the proxy on :3456 rejected the api-key"
             })
+        );
+    }
+
+    /// The three Claude lines, byte for byte. A Codex login adds keys to its own lines
+    /// (`opened`, `provider`, `plan`, `code`), and none of them may reach a Claude line, which
+    /// TcrBar and every older parser read exactly as they read them before Codex accounts.
+    ///
+    /// Watched red: rendering `Saved` through the Codex arm adds `provider` to alice's line.
+    #[test]
+    fn claude_saved_event_is_unchanged() {
+        assert_eq!(
+            LoginEvent::Saved {
+                account: "alice@example.com"
+            }
+            .line(),
+            r#"{"account":"alice@example.com","event":"saved"}"#
+        );
+        assert_eq!(
+            LoginEvent::Browser {
+                url: "https://claude.ai/oauth/authorize?code=true"
+            }
+            .line(),
+            r#"{"event":"browser","url":"https://claude.ai/oauth/authorize?code=true"}"#
+        );
+        assert_eq!(
+            LoginEvent::Error { reason: "x" }.line(),
+            r#"{"event":"error","reason":"x"}"#
+        );
+    }
+
+    /// The Codex events, against the fixture TcrBar's decoder is tested on
+    /// (`apps/macos/Tests/Fixtures/codex-login-events.jsonl`): producer and consumer are pinned to
+    /// one file, so neither can drift from the other. Compared as parsed values, because key
+    /// order is serde's and no parser cares.
+    ///
+    /// Watched red: one word of the first-account notice changed fails on fixture line 3.
+    #[test]
+    fn codex_login_events_match_the_fixture() {
+        let fixture = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("apps/macos/Tests/Fixtures/codex-login-events.jsonl"),
+        )
+        .expect("the committed fixture");
+        let want: Vec<serde_json::Value> = fixture
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each fixture line is one JSON object"))
+            .collect();
+        assert_eq!(want.len(), 5, "{fixture}");
+        let produced = [
+            LoginEvent::BrowserOpened {
+                url: "https://auth.openai.com/oauth/authorize?client_id=app_EXAMPLE&state=EXAMPLE",
+            }
+            .line(),
+            LoginEvent::Waiting.line(),
+            LoginEvent::Notice {
+                text: CODEX_FIRST_ACCOUNT_NOTICE,
+            }
+            .line(),
+            LoginEvent::SavedCodex {
+                account: "bob@example.com",
+                plan: Some("ChatGPT Pro"),
+            }
+            .line(),
+            codex_identity_refusal("carol@example.com", "erin@example.com/codex").line(),
+        ];
+        for (index, (line, want)) in produced.iter().zip(&want).enumerate() {
+            let got: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
+            assert_eq!(&got, want, "fixture line {}", index + 1);
+        }
+        assert!(
+            !LoginEvent::SavedCodex {
+                account: "bob@example.com",
+                plan: None
+            }
+            .line()
+            .contains("plan"),
+            "no plan key when the plan is unknown"
+        );
+    }
+
+    /// A refusal's machine line carries its code and its own reason, without the context a
+    /// caller wrapped it in; any other failure keeps today's uncoded line, its whole chain
+    /// flattened onto it.
+    ///
+    /// Watched red: rendering every error through the plain arm loses the code and prefixes
+    /// the context.
+    #[test]
+    fn a_refusal_keeps_its_code_and_its_reason_verbatim() {
+        let refused = anyhow::Error::from(LoginRefusal {
+            code: "codex-routed",
+            reason: "r".into(),
+        })
+        .context("importing the Codex login failed");
+        assert_eq!(
+            machine_error_line(&refused),
+            (
+                r#"{"code":"codex-routed","event":"error","reason":"r"}"#.to_string(),
+                "r".to_string()
+            )
+        );
+        let plain = anyhow!("boom").context("OAuth login failed");
+        assert_eq!(
+            machine_error_line(&plain),
+            (
+                r#"{"event":"error","reason":"OAuth login failed: boom"}"#.to_string(),
+                "OAuth login failed: boom".to_string()
+            )
         );
     }
 
@@ -4879,20 +5490,21 @@ mod tests {
         (dir, path)
     }
 
-    /// `tcr login --account` on a Codex row is refused before the browser sign-in starts,
-    /// naming the row, and nothing is written. The sign-in is Anthropic's, and the identity it
-    /// returns can never confirm a Codex row, so going on ended in "sign out and retry" with
+    /// `tcr login --account` on a Codex row is refused before the browser sign-in starts and
+    /// before any event, naming the row and the two commands that can sign it in, with the code
+    /// a GUI titles it by, and nothing is written. The sign-in is Anthropic's, and the identity
+    /// it returns can never confirm a Codex row, so going on ended in "sign out and retry" with
     /// the same command, every time.
     ///
-    /// Watched red: without the refusal, `login` starts the sign-in and waits for its callback
-    /// until the timeout below fires.
+    /// Watched red: without the refusal, or with it moved below `authorize_and_wait`, `login`
+    /// starts the sign-in and waits for its callback until the timeout below fires.
     #[tokio::test]
     async fn a_relogin_of_a_codex_row_is_refused_before_the_browser_opens() {
         let (_dir, path) = claude_and_codex_rows().await;
         let before = std::fs::read(&path).unwrap();
 
         let err = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(5),
             login(
                 &path,
                 false,
@@ -4904,20 +5516,51 @@ mod tests {
         .await
         .expect("refused before the sign-in, which would wait for its callback")
         .expect_err("`tcr login` cannot sign in a Codex row");
-        let text = err.to_string();
-        assert!(
-            text.contains("'bob@example.com/codex' is a Codex account")
-                && text.contains("`tcr login` signs in Claude accounts only")
-                && text.contains("Nothing was changed"),
-            "{text}"
+        let refusal = err
+            .downcast_ref::<LoginRefusal>()
+            .expect("a refusal a GUI can title by its code");
+        assert_eq!(refusal.code, "account-is-codex");
+        assert_eq!(
+            refusal.reason,
+            "'bob@example.com/codex' is a Codex account; `tcr login` signs in Claude accounts \
+             only. Sign it in again with `tcr login --codex --account bob@example.com/codex`, or \
+             re-import it with `tcr login --from-codex --account bob@example.com/codex`. Nothing \
+             was written."
         );
-        assert!(
-            text.contains("Refresh it with `tcr login --from-codex`")
-                && text.contains("`--codex-home <dir>`")
-                && text.contains("`codex login`"),
-            "the refusal names the way to refresh the row: {text}"
-        );
+        assert_eq!(err.to_string(), refusal.reason);
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+    }
+
+    /// `tcr login --codex --account` resolves its row first: a Codex row is the target, a Claude
+    /// row is refused with the code a GUI titles it by, before codex runs, and a name no row has
+    /// is the error every `--account` gives it.
+    ///
+    /// Watched red: without the provider check, the Claude row resolves to `Ok(0)`.
+    #[tokio::test]
+    async fn login_codex_account_on_a_claude_row_is_refused_before_any_event() {
+        let (_dir, path) = claude_and_codex_rows().await;
+        let config = load_or_default(&path).unwrap();
+
+        let err = codex_relogin_target(&config, "alice@example.com")
+            .expect_err("a Claude row is never re-signed by a ChatGPT login");
+        let refusal = err.downcast_ref::<LoginRefusal>().expect("a coded refusal");
+        assert_eq!(refusal.code, "account-is-claude");
+        assert_eq!(
+            refusal.reason,
+            "'alice@example.com' is a Claude account; `tcr login --codex` signs in Codex \
+             accounts only. Sign it in again with `tcr login --account alice@example.com`. \
+             Nothing was written."
+        );
+        assert_eq!(
+            codex_relogin_target(&config, "bob@example.com/codex").unwrap(),
+            1
+        );
+        assert_eq!(
+            codex_relogin_target(&config, "nobody@example.com")
+                .unwrap_err()
+                .to_string(),
+            "no account matches 'nobody@example.com'"
+        );
     }
 
     /// The identity check refuses a Codex row by name too, for `--from-claude-code --account`,
@@ -5158,6 +5801,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let rotate_config = load_or_default(&path).unwrap();
@@ -5366,6 +6010,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -5470,6 +6115,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -5659,6 +6305,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -6098,6 +6745,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -6254,6 +6902,8 @@ mod tests {
 
     const CODEX_ACCOUNT_A: &str = "11111111-1111-4111-8111-111111111111";
     const CODEX_ACCOUNT_B: &str = "22222222-2222-4222-8222-222222222222";
+    /// The ChatGPT user of alice's login, in workspace [`CODEX_ACCOUNT_A`].
+    const CODEX_USER_A: &str = "55555555-5555-4555-8555-555555555555";
 
     /// A config holding exactly these rows, each `(name, provider, account id)`.
     fn config_with_rows(rows: &[(&str, crate::provider::Provider, Option<&str>)]) -> Config {
@@ -6279,6 +6929,7 @@ mod tests {
                 &empty,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_A),
+                None,
                 None
             )
             .unwrap(),
@@ -6290,6 +6941,7 @@ mod tests {
                 &anthropic,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_A),
+                None,
                 None
             )
             .unwrap(),
@@ -6310,6 +6962,7 @@ mod tests {
                 &codex,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_A),
+                None,
                 None
             )
             .unwrap(),
@@ -6328,6 +6981,7 @@ mod tests {
                 &beside,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_A),
+                None,
                 None
             )
             .unwrap(),
@@ -6338,11 +6992,11 @@ mod tests {
     #[test]
     fn mint_codex_login_name_requires_a_name_when_the_token_has_no_email() {
         let empty = config_with_rows(&[]);
-        let err = mint_codex_login_name(&empty, None, Some(CODEX_ACCOUNT_A), None)
+        let err = mint_codex_login_name(&empty, None, Some(CODEX_ACCOUNT_A), None, None)
             .expect_err("no email and no --name is no name");
         assert!(err.to_string().contains("--name"), "{err}");
         assert_eq!(
-            mint_codex_login_name(&empty, None, Some(CODEX_ACCOUNT_A), Some("work")).unwrap(),
+            mint_codex_login_name(&empty, None, Some(CODEX_ACCOUNT_A), None, Some("work")).unwrap(),
             "work"
         );
     }
@@ -6360,6 +7014,7 @@ mod tests {
                 &first,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_B),
+                None,
                 None
             )
             .unwrap(),
@@ -6378,6 +7033,7 @@ mod tests {
                 &suffixed,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_B),
+                None,
                 None
             )
             .unwrap(),
@@ -6400,6 +7056,7 @@ mod tests {
                 &config,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_A),
+                None,
                 Some(taken),
             )
             .expect_err("another account's name must be refused");
@@ -6415,6 +7072,7 @@ mod tests {
                 &own,
                 Some("alice@example.com"),
                 Some(CODEX_ACCOUNT_A),
+                None,
                 Some("work")
             )
             .unwrap(),
@@ -6443,7 +7101,7 @@ mod tests {
         ));
         let seed = format!(
             r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
-                {{ "name": "alice@example.com", "type": "oauth", "accountUuid": "{CODEX_ACCOUNT_A}",
+                {{ "name": "alice@example.com", "type": "oauth", "accountUuid": "{CODEX_USER_A}",
                   "accessToken": "at-alice", "refreshToken": "rt-alice",
                   "expiresAt": 1893456000000, "priority": 0 }}
             ] }}"#
@@ -6459,6 +7117,7 @@ mod tests {
             access_token: "at-codex".to_string(),
             refresh_token: "rt-codex".to_string(),
             account_id: Some(CODEX_ACCOUNT_A.to_string()),
+            user_id: Some(CODEX_USER_A.to_string()),
             email: Some("alice@example.com".to_string()),
             plan_type: Some("pro".to_string()),
             expires_at_ms: Some(1_800_000_000_000),
@@ -6468,6 +7127,7 @@ mod tests {
         let name = mint_codex_login_name(
             &config,
             login.email.as_deref(),
+            login.user_id.as_deref(),
             login.account_id.as_deref(),
             None,
         )
@@ -6477,7 +7137,7 @@ mod tests {
             &path,
             LoginRoute::Live,
             &config,
-            codex_account_row(name, login),
+            codex_account_row(name, login, None),
         )
         .await
         .unwrap();
@@ -6512,7 +7172,8 @@ mod tests {
         assert_eq!(rows[1]["name"], "alice@example.com/codex");
         assert_eq!(rows[1]["provider"], "codex");
         assert_eq!(rows[1]["accessToken"], "at-codex");
-        assert_eq!(rows[1]["accountUuid"], CODEX_ACCOUNT_A);
+        assert_eq!(rows[1]["accountUuid"], CODEX_USER_A, "the ChatGPT user");
+        assert_eq!(rows[1]["orgUuid"], CODEX_ACCOUNT_A, "the workspace");
 
         std::fs::remove_file(&path).ok();
     }
@@ -6530,6 +7191,7 @@ mod tests {
             access_token: access_token.to_string(),
             refresh_token: refresh_token.to_string(),
             account_id: Some(CODEX_ACCOUNT_A.to_string()),
+            user_id: Some(CODEX_USER_A.to_string()),
             email: Some("alice@example.com".to_string()),
             plan_type: Some("pro".to_string()),
             expires_at_ms: Some(expires_at_ms),
@@ -6718,6 +7380,7 @@ mod tests {
                 None,
                 None,
                 alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+                None,
             )
             .await
             .expect_err("a proxy that predates Codex accounts must refuse the import");
@@ -6781,6 +7444,7 @@ mod tests {
             None,
             None,
             alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
         )
         .await
         .expect("a server that names codex takes the import live");
@@ -6814,6 +7478,7 @@ mod tests {
                 None,
                 None,
                 alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+                None,
             )
             .await
             .expect_err("an add not confirmed as Codex must fail loudly");
@@ -6845,7 +7510,7 @@ mod tests {
             &unconstrained_upstream().await,
             &format!(
                 r#"[{{ "name": "alice@example.com/codex", "provider": "codex",
-                      "accountUuid": "{CODEX_ACCOUNT_A}", "accessToken": "at-old",
+                      "accountUuid": "{CODEX_USER_A}", "orgUuid": "{CODEX_ACCOUNT_A}", "accessToken": "at-old",
                       "refreshToken": "rt-old", "expiresAt": 1700000000000 }}]"#
             ),
         );
@@ -6856,6 +7521,7 @@ mod tests {
             None,
             None,
             alice_codex_login(1_800_000_000_000, "at-new", "rt-new"),
+            None,
         )
         .await
         .expect("a re-import updates its row");
@@ -6877,6 +7543,7 @@ mod tests {
             Some("work"),
             None,
             alice_codex_login(1_900_000_000_000, "at-newer", "rt-newer"),
+            None,
         )
         .await
         .expect_err("a --name that is not the row's name renames nothing and is refused");
@@ -6900,7 +7567,7 @@ mod tests {
             &unconstrained_upstream().await,
             &format!(
                 r#"[{{ "name": "alice@example.com", "provider": "codex",
-                      "accountUuid": "{CODEX_ACCOUNT_A}", "accessToken": "at-live",
+                      "accountUuid": "{CODEX_USER_A}", "orgUuid": "{CODEX_ACCOUNT_A}", "accessToken": "at-live",
                       "refreshToken": "rt-old", "expiresAt": 1900000000000 }}]"#
             ),
         );
@@ -6912,6 +7579,7 @@ mod tests {
             None,
             None,
             alice_codex_login(1_800_000_000_000, "at-stale", "rt-stale"),
+            None,
         )
         .await
         .expect_err("an older credential must not overwrite tcr's newer one");
@@ -6928,6 +7596,7 @@ mod tests {
             None,
             None,
             alice_codex_login(2_000_000_000_000, "at-fresh", "rt-fresh"),
+            None,
         )
         .await
         .expect("a newer login still replaces tcr's");
@@ -6958,6 +7627,7 @@ mod tests {
             None,
             Some("bob@example.com"),
             alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
         )
         .await
         .expect_err("alice's login must not be imported as bob");
@@ -6993,6 +7663,7 @@ mod tests {
             None,
             Some("alice@example.com"),
             alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
         )
         .await
         .expect("alice's own login is imported");
@@ -7022,7 +7693,7 @@ mod tests {
         let mut login = alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex");
         login.is_fedramp = true;
 
-        let err = import_codex_login(&path, true, None, None, login)
+        let err = import_codex_login(&path, true, None, None, login, None)
             .await
             .expect_err("a FedRAMP login must not be imported");
         let text = err.to_string();
@@ -7071,6 +7742,7 @@ mod tests {
                 None,
                 None,
                 alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+                None,
             )
             .await
             .expect_err("a routed workspace must not be imported");
@@ -7113,6 +7785,7 @@ mod tests {
             None,
             None,
             alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
         )
         .await
         .expect_err("a routed workspace must not be imported over the live route");
@@ -7168,6 +7841,7 @@ mod tests {
                 None,
                 None,
                 alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+                None,
             )
             .await
             .expect_err("an unconfirmed workspace must not be imported");
@@ -7245,6 +7919,7 @@ mod tests {
             None,
             None,
             alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
         )
         .await
         .expect_err("a redirected workspace check must not clear the login");
@@ -7285,6 +7960,7 @@ mod tests {
             None,
             None,
             alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
         )
         .await
         .expect("a workspace served at chatgpt.com is imported");
@@ -7350,5 +8026,295 @@ mod tests {
             "the config must be left byte-for-byte alone"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- refusals a GUI titles by their code -----------------------------------------
+
+    /// The three import refusals carry their codes, read back through the error a caller holds,
+    /// and read exactly as they always did: the routed, unconfirmed and FedRAMP tests above
+    /// still pass on `err.to_string()`.
+    ///
+    /// Watched red: with the refusals back to plain `bail!`s, no `LoginRefusal` is in the chain.
+    #[tokio::test]
+    async fn the_codex_import_refusals_carry_their_codes() {
+        let code_of = |err: &anyhow::Error| match err.downcast_ref::<LoginRefusal>() {
+            Some(refusal) => refusal.code,
+            None => panic!("no coded refusal in: {err:#}"),
+        };
+
+        let (_dir, path) =
+            import_config(released_port().await, &unconstrained_upstream().await, "[]");
+        let mut login = alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex");
+        login.is_fedramp = true;
+        let err = import_codex_login(&path, false, None, None, login, None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), "codex-fedramp");
+        assert!(err.to_string().contains("FedRAMP"), "{err}");
+
+        let (upstream, _) = accounts_check_stub(
+            200,
+            &workspace_answer("https://gov.chatgpt.com", "NO_CONSTRAINT"),
+        )
+        .await;
+        let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+        let err = import_codex_login(
+            &path,
+            false,
+            None,
+            None,
+            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code_of(&err), "codex-routed");
+        assert!(
+            err.to_string()
+                .contains("not served at https://chatgpt.com"),
+            "{err}"
+        );
+
+        let (upstream, _) = accounts_check_stub(500, "{}").await;
+        let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+        let err = import_codex_login(
+            &path,
+            false,
+            None,
+            None,
+            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code_of(&err), "codex-unconfirmed");
+        assert!(err.to_string().contains("could not confirm"), "{err}");
+    }
+
+    /// `--from-codex --account` takes the row name `tcr accounts` prints, as every other verb's
+    /// `--account` does, and still takes the login's email. A name that is a Claude row is
+    /// refused before the route probe and any write: no Codex import re-signs it. A name that is
+    /// no row keeps the email check and its words.
+    ///
+    /// Watched red: comparing the email alone refuses the row name as "not
+    /// 'alice@example.com/codex'".
+    #[tokio::test]
+    async fn from_codex_account_accepts_the_row_name() {
+        let (_dir, path) = import_config(
+            released_port().await,
+            &unconstrained_upstream().await,
+            &format!(
+                r#"[{{ "name": "alice@example.com/codex", "provider": "codex",
+                      "accountUuid": "{CODEX_USER_A}", "orgUuid": "{CODEX_ACCOUNT_A}",
+                      "accessToken": "at-old", "refreshToken": "rt-old",
+                      "expiresAt": 1700000000000 }}]"#
+            ),
+        );
+        let saved = import_codex_login(
+            &path,
+            false,
+            None,
+            Some("alice@example.com/codex"),
+            alice_codex_login(1_800_000_000_000, "at-new", "rt-new"),
+            None,
+        )
+        .await
+        .expect("the row name is accepted");
+        assert_eq!(saved, "alice@example.com/codex");
+        let rows = |path: &Path| -> Vec<serde_json::Value> {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            doc["accounts"].as_array().unwrap().clone()
+        };
+        let written = rows(&path);
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written[0]["accessToken"], "at-new");
+
+        let saved = import_codex_login(
+            &path,
+            false,
+            None,
+            Some("alice@example.com"),
+            alice_codex_login(1_900_000_000_000, "at-newer", "rt-newer"),
+            None,
+        )
+        .await
+        .expect("the login's email is still accepted");
+        assert_eq!(saved, "alice@example.com/codex");
+        assert_eq!(rows(&path)[0]["accessToken"], "at-newer");
+
+        let before = std::fs::read(&path).unwrap();
+        let err = import_codex_login(
+            &path,
+            false,
+            None,
+            Some("erin@example.com"),
+            alice_codex_login(2_000_000_000_000, "at-x", "rt-x"),
+            None,
+        )
+        .await
+        .expect_err("a name that is no row and not the login's email");
+        assert_eq!(
+            err.to_string(),
+            "the Codex login on this machine is not 'erin@example.com'; nothing was written."
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+
+        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
+        let (upstream, checks) =
+            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (_dir, claude) = import_config(
+            port,
+            &upstream,
+            r#"[{ "name": "dana@example.com", "accessToken": "at-dana" }]"#,
+        );
+        let before = std::fs::read(&claude).unwrap();
+        let err = import_codex_login(
+            &claude,
+            false,
+            None,
+            Some("dana@example.com"),
+            alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex"),
+            None,
+        )
+        .await
+        .expect_err("a Claude row is never re-signed by a Codex import");
+        let refusal = err.downcast_ref::<LoginRefusal>().expect("a coded refusal");
+        assert_eq!(refusal.code, "account-is-claude");
+        assert_eq!(
+            refusal.reason,
+            "'dana@example.com' is a Claude account; `tcr login --from-codex` imports Codex \
+             accounts only. Sign it in again with `tcr login --account dana@example.com`. \
+             Nothing was written."
+        );
+        assert_eq!(
+            std::fs::read(&claude).unwrap(),
+            before,
+            "nothing was written"
+        );
+        assert!(
+            probes.lock().unwrap().is_empty(),
+            "not even the route probe"
+        );
+        assert!(checks.lock().unwrap().is_empty(), "no workspace check");
+    }
+
+    // --- remedies that name the right command ------------------------------------------
+
+    /// An offline snapshot never refreshes; for a Codex row its remedy names the command that
+    /// signs a Codex account in again, and the Anthropic remedy is the one it always was.
+    ///
+    /// Watched red: one message for both providers names `tcr login` for a Codex row.
+    #[tokio::test]
+    async fn the_offline_expired_token_remedy_names_tcr_login_codex() {
+        let err = NoRefresh
+            .refresh(
+                crate::provider::Provider::Codex,
+                "rt-never-sent".to_string(),
+            )
+            .await
+            .expect_err("NoRefresh never refreshes");
+        assert!(matches!(err, OAuthError::Transient(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("token refresh failed transiently: {NO_REFRESH_CODEX_MESSAGE}")
+        );
+        assert!(
+            NO_REFRESH_CODEX_MESSAGE.contains("re-run after `tcr login --codex --account <name>`"),
+            "{NO_REFRESH_CODEX_MESSAGE}"
+        );
+        let claude = NoRefresh
+            .refresh(
+                crate::provider::Provider::Anthropic,
+                "rt-never-sent".to_string(),
+            )
+            .await
+            .expect_err("NoRefresh never refreshes");
+        assert_eq!(
+            claude.to_string(),
+            format!("token refresh failed transiently: {NO_REFRESH_MESSAGE}")
+        );
+    }
+
+    /// A refusal over a running proxy names the login that was run as the one to run again,
+    /// for both kinds of incumbent; plain `tcr login` still says `run 'tcr login'`.
+    ///
+    /// Watched red: with `'tcr login'` written into the message, the import's refusal sends
+    /// its user to the browser flow.
+    #[test]
+    fn the_running_proxy_refusal_echoes_the_command_that_was_run() {
+        for kind in [singleton::ProxyKind::Tcr, singleton::ProxyKind::TcrEmbedded] {
+            let msg = expect_refuse(login_guard_refusal_for(
+                incumbent(kind),
+                false,
+                3456,
+                false,
+                "tcr login --from-codex",
+            ));
+            assert!(
+                msg.contains("run 'tcr login --from-codex'"),
+                "{kind:?}: {msg}"
+            );
+            let plain = expect_refuse(login_guard_refusal(incumbent(kind), false, 3456, false));
+            assert!(plain.contains("run 'tcr login',"), "{kind:?}: {plain}");
+        }
+        let live = codex_live_route_refusal(3456, Some(4242), LOGIN_CODEX_COMMAND);
+        assert!(
+            live.contains("then re-run `tcr login --codex`. --force does not get past this"),
+            "{live}"
+        );
+    }
+
+    /// With no login file, `--from-codex` says how to make one, and, last, that a login codex
+    /// keeps in the system keyring has no file to import, which `tcr login --codex` does not need.
+    ///
+    /// Watched red: the message without its last sentence.
+    #[test]
+    fn a_keyring_held_codex_login_names_the_keyring() {
+        assert_eq!(
+            no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
+            "no Codex login found at /Users/example/.codex/auth.json — nothing was written. Log \
+             in with `codex login` first (for a second account: `mkdir -p <dir>`, \
+             `CODEX_HOME=<dir> codex login`, then `tcr login --from-codex --codex-home <dir>`). If \
+             codex keeps this login in the system keyring, which tcr does not read, use tcr login \
+             --codex instead, which needs no file."
+        );
+    }
+
+    /// The same ChatGPT user in another workspace names both workspaces by their first 8 hex,
+    /// each with its plan in parentheses, and drops a parenthesis whose plan is unknown.
+    #[test]
+    fn codex_relogin_workspace_refusal_drops_unknown_plans() {
+        let named = codex_relogin_workspace_refusal(
+            Some("erin@example.com"),
+            "99999999-9999-4999-8999-999999999999",
+            Some("business"),
+            "work",
+            "88888888-8888-4888-8888-888888888888",
+            Some("pro"),
+        );
+        assert_eq!(named.code, "codex-identity");
+        assert_eq!(
+            named.reason,
+            "the ChatGPT login that came back is erin@example.com in ChatGPT workspace 99999999 \
+             (ChatGPT Business), but 'work' holds workspace 88888888 (ChatGPT Pro). Retry `tcr \
+             login --codex --account work` and choose that workspace when ChatGPT asks which one \
+             to use. Nothing was written."
+        );
+        let unknown = codex_relogin_workspace_refusal(
+            None,
+            "99999999-9999-4999-8999-999999999999",
+            None,
+            "work",
+            "88888888-8888-4888-8888-888888888888",
+            None,
+        );
+        assert_eq!(
+            unknown.reason,
+            "the ChatGPT login that came back is the same ChatGPT user in ChatGPT workspace \
+             99999999, but 'work' holds workspace 88888888. Retry `tcr login --codex --account \
+             work` and choose that workspace when ChatGPT asks which one to use. Nothing was \
+             written."
+        );
     }
 }

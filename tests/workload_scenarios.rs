@@ -120,6 +120,7 @@ fn account(name: &str, priority: i64) -> Account {
         seat_tier: None,
         egress: teamclaude_rs::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }
