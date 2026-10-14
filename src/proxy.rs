@@ -6147,7 +6147,7 @@ fn usage_record(
         None if parsed.cache_creation > 0 && extended_ttl() => parsed.cache_creation,
         None => 0,
     };
-    crate::usage::UsageRecord::from_quota_input(
+    let mut record = crate::usage::UsageRecord::from_quota_input(
         crate::now_ms(),
         model,
         session,
@@ -6160,7 +6160,11 @@ fn usage_record(
         cache_1h,
         parsed.cache_read,
         parsed.output,
-    )
+    );
+    // A Codex turn's reasoning tokens (always 0 on an Anthropic turn), for the ledger line's
+    // `rt` and every usage bucket's `reasoningTokens`.
+    record.reasoning = parsed.reasoning;
+    record
 }
 
 /// What [`usage_from_json`] reads off a non-streamed body: the JSON twin of [`SseParse`]'s
@@ -20402,6 +20406,86 @@ mod tests {
             ["claude-opus-5"],
             "alice's Anthropic turn (polls: {polls})"
         );
+    }
+
+    /// A Codex turn's reasoning tokens reach its account's usage buckets, still inside output.
+    /// An Anthropic turn's buckets carry none.
+    #[tokio::test]
+    async fn codex_usage_records_its_reasoning_tokens() {
+        let codex_url = spawn_fixed_origin(
+            "text/event-stream",
+            concat!(
+                "event: response.completed\n",
+                r#"data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.1-codex","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":100},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":10}}}}"#,
+                "\n\n",
+            ),
+        )
+        .await;
+        let anthropic_url = spawn_fixed_origin(
+            "text/event-stream",
+            concat!(
+                "event: message_start\n",
+                r#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":7,"output_tokens":1}}}"#,
+                "\n\n",
+                "event: message_stop\n",
+                r#"data: {"type":"message_stop"}"#,
+                "\n\n",
+            ),
+        )
+        .await;
+        let manager = Manager::with_live_refresher(codex_fleet(&anthropic_url, &codex_url), None);
+        let codex = [
+            ("authorization", "Bearer client-own"),
+            ("content-type", "application/json"),
+        ];
+        let anthropic = [("content-type", "application/json")];
+        for (path, headers, body) in [
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                &codex[..],
+                r#"{"input":[]}"#,
+            ),
+            (
+                "/v1/messages",
+                &anthropic[..],
+                r#"{"model":"claude-opus-5","messages":[]}"#,
+            ),
+        ] {
+            let (status, bytes) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                path,
+                Some(loopback_peer()),
+                headers,
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        // Booked by the tee's detached task, which can finish after the client reads EOF.
+        let last_hour = |idx: usize| {
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[idx]
+                .usage
+                .as_ref()
+                .map(|usage| usage.last_hour)
+                .unwrap_or_default()
+        };
+        let mut polls = 0u32;
+        while (last_hour(1).requests == 0 || last_hour(0).requests == 0) && polls < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            polls += 1;
+        }
+        assert_eq!(
+            (last_hour(1).reasoning_tokens, last_hour(1).output_tokens),
+            (10, 40),
+            "bob's Codex turn (polls: {polls})"
+        );
+        assert_eq!(last_hour(0).reasoning_tokens, 0, "alice's Anthropic turn");
     }
 
     /// **A non-streamed Codex turn is booked with Codex's own field names.** Its body is a bare

@@ -61,24 +61,29 @@ never the shipped value.
 
 ## `pricing` and `usageRetentionDays`
 
-`tcr status --json` reports what each account's traffic **would have cost on Anthropic's API**. The
-accounts are subscriptions, so nothing here is a bill; it is the only unit that compares across
-accounts, models and days.
+`tcr status --json` reports what each account's traffic **would have cost at the API list price of
+its model's own provider**. The accounts are subscriptions, so nothing here is a bill; it is the only
+unit that compares across accounts, models and days.
 
 Prices come from a table built into the binary (`src/pricing.rs`), matched by longest prefix so a
 dated id like `claude-haiku-4-5-20251001` resolves to its family. A model the table has no published
 rate for is reported as `costUsd: null` with `unpricedRequests` counting it — never as `$0.00`, which
-would be a spend nobody measured presented as one.
+would be a spend nobody measured presented as one. No OpenAI model has a built-in price, so a Codex
+account's traffic is unpriced until `pricing` names its model, and `tcr sessions` and `tcr wrap`
+print `n/a` for it, never `$0.00`.
 
 `pricing` is how you add or change a rate. Keys are a model id or any prefix of one; `input` and
 `output` are USD per million tokens and both are required. The three cache dimensions default to the
 same multipliers the built-in table uses — cache read 0.1x input, a 5-minute cache write 1.25x, a
-1-hour cache write 2x — and can be set explicitly:
+1-hour cache write 2x — except that for an OpenAI model id (`gpt-…` or `codex-…`) both cache writes
+default to 1.0x input, because codex reports a cache write inside its input tokens and OpenAI adds no
+write premium. Each can be set explicitly:
 
 ```json
 "pricing": {
   "claude-sonnet-4-5": { "input": 3, "output": 15 },
-  "claude-opus-5": { "input": 5, "output": 25, "cacheRead": 0.5 }
+  "claude-opus-5": { "input": 5, "output": 25, "cacheRead": 0.5 },
+  "gpt-5.1-codex": { "input": 1.25, "output": 10 }
 }
 ```
 
@@ -86,9 +91,10 @@ An override beats the built-in table outright, even when its key is the shorter 
 wrote down is what this proxy should believe.
 
 `usageRetentionDays` bounds the ledger under `~/.cache/teamclaude/usage/`, one `<UTC-date>.jsonl` file
-per day at roughly 2 MB per 17k requests. Files older than this are deleted once, at boot. Only today's
-and yesterday's are ever read back (that is what makes a restart keep the day's totals); the rest are
-history for you to grep.
+per day at roughly 2 MB per 17k requests. Files older than this are deleted once, at boot. Boot reads
+back today's and yesterday's files (that is what makes a restart keep the day's totals), and, when the
+fleet holds a Codex account, the six before them too, which is what keeps a Codex account's weekly
+window across a restart; the rest are history for you to grep.
 
 Lines are written by a dedicated thread, off the request path, so a stalled disk costs accounting and
 never latency. A clean shutdown drains that thread's queue and waits for it to close the file, so the
@@ -101,7 +107,9 @@ day presented afterwards as a measured one.
 `0` is the floor, and it keeps today AND yesterday: those two files are what the boot replay reads, and
 the pruner never deletes them whatever this is set to. It has to be both — on a UTC+3 machine the first
 three hours of the local day live in yesterday's UTC-named file, so deleting it would cost the second
-restart of the day those hours, silently and while still reporting them as measured.
+restart of the day those hours, silently and while still reporting them as measured. A fleet holding a
+Codex account keeps today and the seven days before it whatever this says, for the same reason: those
+are the files the boot replay reads to rebuild the weekly window.
 
 **"Today" is the local calendar day of the machine the server runs on**, resolved per record against
 that record's own instant, so a day boundary is correct across a daylight-saving change. Ledger FILE

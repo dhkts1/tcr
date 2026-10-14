@@ -1078,12 +1078,14 @@ tcr status --json | jq '.[] | {name, today: .usage.today.costUsd, hour: .usage.l
 | key | shape | what it is |
 |---|---|---|
 | `usage.today` | totals | the **local calendar day** of the machine the server runs on |
-| `usage.window` | totals + `since` | this account's current 5-hour quota window, read from Anthropic's own reset header. `null` when that reset is unknown, because then the window's start cannot be named |
+| `usage.window` | totals + `since` | this account's current 5-hour quota window, read from its provider's own reset header: Anthropic's for a Claude account, Codex's for a Codex one. `null` when that reset is unknown, because then the window's start cannot be named |
+| `usage.sevenDayWindow` | totals + `since` | a Codex account's current weekly quota window. `since` is the weekly reset minus the window's length, which is seven days unless the plan reports another, and the totals are what the account spent since. Absent on a Claude row, and when the weekly reset is unknown. `usage.window` stays the 5-hour window |
 | `usage.lastHour` | totals | the trailing 60 minutes — burn rate is `lastHour.costUsd` per hour, by definition |
 | `usage.todayByModel` | `{model: totals}` | `today`, split by model id |
 
 Each totals object carries `requests`, `inputTokens` (BASE input — see below), `cacheCreationTokens`,
-`cacheCreation1hTokens`, `cacheReadTokens`, `outputTokens`, `costUsd` and `unpricedRequests`.
+`cacheCreation1hTokens`, `cacheReadTokens`, `outputTokens`, `costUsd` and `unpricedRequests`, and
+`reasoningTokens`: a Codex turn's reasoning tokens, already inside `outputTokens`, absent when zero.
 
 `cacheCreationTokens` is ALL cache creation, both TTLs — the same quantity the row-level key of that
 name carries, so the two never mean different things in one row. `cacheCreation1hTokens` is the
@@ -1099,7 +1101,9 @@ much was spent WRITING it.
 
 **`costUsd` is API list price, not a bill.** These accounts are subscriptions; nothing here is
 charged. The figure answers "what would this traffic have cost on the API", which is the only unit
-that compares across accounts, models and days. When a model has no published rate in this build,
+that compares across accounts, models and days. The price is the model's own provider's list price.
+No OpenAI model has a built-in rate, so a Codex account's buckets read `costUsd: null` until `pricing`
+names its model. When a model has no published rate in this build,
 `costUsd` is `null` and `unpricedRequests` counts the requests missing from the figure — a partial
 total says so rather than passing itself off as the whole. Add a rate with `pricing` in the config
 ([configuration.md](configuration.md#pricing-and-usageretentiondays)).
@@ -1115,7 +1119,8 @@ rebuilt on merge while the live process keeps serving until someone restarts it.
 row says which.
 
 Totals survive a restart: each served request is appended to `~/.cache/teamclaude/usage/`, and boot
-replays the day back in. Fleet-wide totals are not a field — sum the rows.
+replays the day back in, and the last seven days when the fleet holds a Codex account, so the weekly
+window survives a restart too. Fleet-wide totals are not a field — sum the rows.
 
 ### The `sessions` array on `GET /_tcr/status`
 
@@ -1404,6 +1409,17 @@ pricing overrides — never for accounts, so a removed account's traffic still s
 the name it was recorded under. `--json` emits the same numbers as one object instead of the
 plain-text layout.
 
+When the period holds a Codex ledger line, the report also prints a second totals line, which counts
+the Codex requests no price covers, and a `by provider` block (`claude`, `codex`) before the
+per-model breakdown. No OpenAI model has a built-in price, so Codex traffic is unpriced until
+`pricing` names its model ([configuration.md](configuration.md#pricing-and-usageretentiondays)).
+Beside every cost that a bucket's unpriced requests leave out, the report says so:
+`cost=n/a (42 unpriced)` when none of the bucket's requests was priced, and
+`cost=$7.20 (+12 unpriced)` when some were, never `cost=$0.00` for Codex traffic. The comparison's
+cost then says `(priced requests only)`.
+A Claude-only ledger prints exactly what it always has, and an unpriced Claude model still shows
+`$0.00`.
+
 "Day" here is the UTC calendar day a ledger line's own file is named after — the same day
 `tcr status`'s `--json` `usage` object writes to and `attach_ledger`'s boot replay reads — not
 the local day `today` on that object uses, and cost is the same API list-price figure `tcr
@@ -1420,6 +1436,16 @@ $ jq -s '{requests: length, inputTokens: (map(.i) | add)}' ~/.cache/teamclaude/u
   "inputTokens": 812000
 }
 ```
+
+A line a Codex account served also carries `"p":"codex"`, and `rt`, its reasoning tokens (already
+inside `o`), when there are any; an Anthropic line carries neither key. A line written before tcr
+recorded `p` is filed by its model id: `gpt-` and `codex-` ids go to codex, every other to claude. A
+`note: N older ledger line(s) carry no provider; filed by model id` line says how many lines were
+filed that way.
+
+`--json` carries `unpricedRequests` on the totals and on every bucket, absent at 0, and `byProvider`
+only when the period holds a Codex line. `costUsd` stays the priced floor: the unpriced requests are
+counted beside it, never added to it as zero.
 
 Example (fake data):
 
@@ -1452,6 +1478,49 @@ sessions: 38 distinct; top 3 by requests:
   session 5566778899001122334 requests=95
 
 compared with the previous 7 day(s): cost=+12% requests=-3%
+```
+
+A mixed ledger (fake data). The `#` annotations are not part of the output: each gives its line's
+own arithmetic. The cache-hit ratio is over all prompt input, which is uncached input plus cache
+writes plus cache reads, and each change is against the previous period's figures.
+
+```
+$ tcr wrap
+tcr wrap: last 7 day(s), 2026-10-07 to 2026-10-13 (UTC)
+
+totals requests=2200 input=14100000 output=1200000 cacheWrite=3000000 cacheRead=41000000 cost=$105.06 cacheHitRatio=70.6%  # 41000000 cache-read tokens of 58100000 prompt tokens
+totals unpriced=400 (Codex requests with no price; the cost above covers priced requests only)
+
+by provider:
+  claude                       requests=1800     cost=$105.06
+  codex                        requests=400      cost=n/a (400 unpriced)
+
+by model (sorted by cost):
+  claude-opus-5                requests=1200     cost=$96.00
+  claude-sonnet-5              requests=600      cost=$9.06
+  gpt-5.1-codex                requests=400      cost=n/a (400 unpriced)
+
+by account (sorted by requests):
+  alice@example.com            requests=1200     cost=$76.53
+  frank@example.com            requests=600      cost=$28.53
+  bob@example.com/codex        requests=400      cost=n/a (400 unpriced)
+
+by day (busiest marked *):
+  2026-10-07   requests=280      cost=$13.06 (+60 unpriced)
+  2026-10-08   requests=300      cost=$14.01 (+60 unpriced)
+  2026-10-09   requests=340      cost=$16.56 (+60 unpriced)
+  2026-10-10 * requests=420      cost=$20.06 (+80 unpriced)
+  2026-10-11   requests=310      cost=$14.96 (+50 unpriced)
+  2026-10-12   requests=260      cost=$12.41 (+40 unpriced)
+  2026-10-13   requests=290      cost=$14.01 (+50 unpriced)
+
+sessions: 31 distinct; top 3 by requests:
+  session 1111111111111111111 requests=240
+  session 2222222222222222222 requests=180
+  session 3333333333333333333 requests=150
+
+compared with the previous 7 day(s): cost=+12% (priced requests only) requests=+30%  # cost (105.06 - 93.86)/93.86, requests (2200 - 1692)/1692
+note: 120 older ledger line(s) carry no provider; filed by model id
 ```
 
 ---

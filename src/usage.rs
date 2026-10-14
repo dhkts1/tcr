@@ -10,7 +10,7 @@
 //! serving account, and reads the REAL 5-hour window off Anthropic's headers.
 //! Aggregating here at request time makes a poll a lookup instead of a sweep.
 //!
-//! # The two structures
+//! # The three structures
 //!
 //! * A **360-slot ring of per-minute buckets** per account — six hours, which
 //!   covers any 5-hour window plus the trailing hour with room to spare. A slot
@@ -18,9 +18,14 @@
 //!   rather than read as current, and the ring never needs sweeping.
 //! * A **today accumulator** per account, keyed by the local calendar day. It is
 //!   NOT derived from the ring: a day is 24 hours and the ring is six.
+//! * A **weekly accumulator** per Codex account, of per-minute totals over the
+//!   last seven days: the source of `usage.sevenDayWindow`, whose window reaches
+//!   back past both the ring's six hours and midnight. Only Codex records land
+//!   in it.
 //!
-//! Both are keyed by model, because "what did opus cost me today" is the
-//! question, and a per-model split cannot be recovered from a total afterwards.
+//! The ring and the day are keyed by model, because "what did opus cost me
+//! today" is the question, and a per-model split cannot be recovered from a
+//! total afterwards. The week answers one total per window, so it keeps none.
 //!
 //! # Minute granularity
 //!
@@ -37,8 +42,10 @@
 //! `~/.cache/teamclaude/usage/<UTC-date>.jsonl` (directory `0700`, files `0600`
 //! — the same posture as the session-affinity pin file and the log directory),
 //! and boot replays today's and yesterday's files back through the same
-//! recording path. Keys are one or two characters on purpose: ~110 bytes a line
-//! at ~17k requests a day is ~2 MB, against 40-66 MB/day for the tracing log.
+//! recording path, and the seven days before today when the fleet holds a Codex
+//! account, so its weekly window survives a restart too. Keys are one or two
+//! characters on purpose: ~110 bytes a line at ~17k requests a day is ~2 MB,
+//! against 40-66 MB/day for the tracing log.
 //!
 //! # The ledger write is not on the request path
 //!
@@ -118,12 +125,18 @@ use tcr_status_wire::{UsageRow, UsageTotals, UsageWindow};
 use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::pricing::{cost_nanos, PricingTable};
+use crate::provider::Provider;
 
 /// Minutes held in the ring: six hours, so a 5-hour window plus the trailing
 /// hour is always fully covered.
 const RING_MINUTES: i64 = 360;
 /// The 5-hour quota window, in milliseconds — the span `window` reports over.
 pub const FIVE_HOURS_MS: i64 = 5 * 60 * 60 * 1000;
+/// One week. The longest window the weekly accumulator answers for, and how far back a
+/// fleet holding a Codex account replays and keeps its ledger.
+pub const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// [`WEEK_MS`] in minutes, the accumulator's key unit.
+const WEEK_MINUTES: i64 = WEEK_MS / 60_000;
 /// The trailing span `last_hour` reports over.
 pub const ONE_HOUR_MS: i64 = 60 * 60 * 1000;
 /// Bucket key for a request whose body carried no parseable `model`.
@@ -187,6 +200,12 @@ pub struct UsageRecord {
     pub cache_1h: u64,
     pub cache_read: u64,
     pub output: u64,
+    /// Which provider served the request. `Manager::record_usage` stamps it from the serving
+    /// account, and the boot replay from the account a line resolves to. Every record
+    /// [`Self::from_quota_input`] builds starts as Anthropic.
+    pub provider: Provider,
+    /// A Codex turn's reasoning tokens, already inside `output`. 0 for every Anthropic turn.
+    pub reasoning: u64,
 }
 
 impl UsageRecord {
@@ -234,6 +253,8 @@ impl UsageRecord {
             cache_1h,
             cache_read,
             output,
+            provider: Provider::Anthropic,
+            reasoning: 0,
         }
     }
 
@@ -265,6 +286,9 @@ struct Totals {
     output: u64,
     cost_nanos: u64,
     unpriced_requests: u64,
+    /// Reasoning tokens, a part of `output` that only a Codex turn reports. 0 in every
+    /// bucket that holds no reasoning Codex turn.
+    reasoning: u64,
 }
 
 impl Totals {
@@ -277,6 +301,7 @@ impl Totals {
         self.output += other.output;
         self.cost_nanos += other.cost_nanos;
         self.unpriced_requests += other.unpriced_requests;
+        self.reasoning += other.reasoning;
     }
 
     /// Project onto the wire shape. `costUsd` is `None` when the bucket served
@@ -306,7 +331,7 @@ impl Totals {
             output_tokens: self.output,
             cost_usd,
             unpriced_requests: self.unpriced_requests,
-            reasoning_tokens: 0,
+            reasoning_tokens: self.reasoning,
         }
     }
 }
@@ -327,6 +352,10 @@ struct AccountUsage {
     /// The local calendar day `today` holds, or `None` before the first record.
     day: Option<Date>,
     today: BTreeMap<String, Totals>,
+    /// A Codex account's per-minute totals over the last week, keyed by minute (`ms / 60_000`):
+    /// the source of its weekly window, which reaches back past the ring's six hours and past
+    /// midnight. Only Codex records land here, and it never holds more than a week.
+    week: BTreeMap<i64, Totals>,
 }
 
 impl Default for AccountUsage {
@@ -335,6 +364,7 @@ impl Default for AccountUsage {
             ring: vec![MinuteBucket::default(); RING_MINUTES as usize],
             day: None,
             today: BTreeMap::new(),
+            week: BTreeMap::new(),
         }
     }
 }
@@ -459,6 +489,13 @@ pub(crate) struct LedgerLine {
     /// name, but only while that name is unique.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) g: Option<String>,
+    /// The provider, written for a Codex line only (`"codex"`) and omitted for an Anthropic one,
+    /// as `u` and `g` are omitted when empty, so a Claude-only ledger's lines do not change. A
+    /// string, not [`Provider`], so a line from a later tcr naming a provider this one does not
+    /// know still parses. A line written before this key existed has none, and is filed by its
+    /// model id ([`line_provider`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) p: Option<String>,
     #[serde(default)]
     pub(crate) m: Option<String>,
     #[serde(default)]
@@ -468,6 +505,16 @@ pub(crate) struct LedgerLine {
     pub(crate) c1: u64,
     pub(crate) r: u64,
     pub(crate) o: u64,
+    /// A Codex turn's reasoning tokens, already inside `o`; omitted at 0. Not `r`: that key is
+    /// the cache-read count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) rt: u64,
+}
+
+/// For `#[serde(skip_serializing_if)]` on [`LedgerLine::rt`]: a line with no reasoning tokens
+/// writes no key, so an Anthropic line is byte for byte what it was.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Parse one day's ledger file into its lines, skipping blank lines and
@@ -494,6 +541,35 @@ pub(crate) fn parse_ledger_file(path: &Path) -> (Vec<LedgerLine>, usize) {
         }
     }
     (lines, malformed)
+}
+
+/// The provider a ledger line belongs to: the one its `p` names, when this build knows it;
+/// otherwise the one its model id names. An OpenAI id (`gpt-…`, `codex-…`) is Codex, and
+/// every other is Anthropic. A line with no `p` was written before the key existed. If such
+/// a line is Codex and its model id starts with neither prefix, it reads as Anthropic.
+/// [`filed_by_model_id`] lets a report say how many lines it filed on the model id's word.
+pub(crate) fn line_provider(line: &LedgerLine) -> Provider {
+    line.p
+        .as_deref()
+        .and_then(Provider::from_name)
+        .unwrap_or_else(|| {
+            if line
+                .m
+                .as_deref()
+                .is_some_and(crate::pricing::is_openai_model_id)
+            {
+                Provider::Codex
+            } else {
+                Provider::Anthropic
+            }
+        })
+}
+
+/// Whether `line` carries no provider and its model id files it under Codex: a Codex line
+/// written before the ledger recorded `p`. An Anthropic line never carries `p`, so a line
+/// this rule files as Anthropic cannot be told from one that is.
+pub(crate) fn filed_by_model_id(line: &LedgerLine) -> bool {
+    line.p.is_none() && line_provider(line) == Provider::Codex
 }
 
 /// What the writer thread receives. A `Flush` is a rendezvous: the writer
@@ -826,6 +902,10 @@ pub struct LedgerAccount {
     /// written after carries the uuid — and both name the same org. `None` when
     /// the account has no org name, and equal to `org` when it has no org uuid.
     pub org_name: Option<String>,
+    /// The account's provider. It decides how a line that resolves to this account is
+    /// counted (a Codex record also fills the weekly window), and whether boot must replay
+    /// the week: a fleet holding a Codex account does.
+    pub provider: Provider,
 }
 
 /// Per-account usage buckets, the pricing table, and the ledger.
@@ -1045,6 +1125,7 @@ impl UsageTracker {
             output: record.output,
             cost_nanos: 0,
             unpriced_requests: 0,
+            reasoning: record.reasoning,
         };
         match price {
             Some(price) => {
@@ -1101,6 +1182,22 @@ impl UsageTracker {
                 add_into(&mut account.today, &model, &totals);
             }
         }
+
+        // The week, for a Codex record only. Pruned here, against the newest minute held, so it
+        // never holds more than a week.
+        if record.provider == Provider::Codex {
+            account.week.entry(minute).or_default().add(&totals);
+            let newest = account
+                .week
+                .last_key_value()
+                .map_or(minute, |(&held, _)| held);
+            while let Some(oldest) = account.week.first_entry() {
+                if *oldest.key() >= newest - WEEK_MINUTES {
+                    break;
+                }
+                oldest.remove();
+            }
+        }
     }
 
     /// Record one served request: queue the ledger line, update the buckets.
@@ -1129,6 +1226,7 @@ impl UsageTracker {
                 a: account_name.to_string(),
                 u: account_uuid.map(str::to_string),
                 g: account_org.map(str::to_string),
+                p: (!record.provider.is_anthropic()).then(|| record.provider.as_str().to_string()),
                 m: record.model.clone(),
                 s: record.session,
                 i: record.input,
@@ -1136,6 +1234,7 @@ impl UsageTracker {
                 c1: record.cache_1h,
                 r: record.cache_read,
                 o: record.output,
+                rt: record.reasoning,
             };
             if let Some(ledger) = self.ledger.lock().expect("ledger lock poisoned").as_ref() {
                 ledger.queue(line);
@@ -1145,8 +1244,10 @@ impl UsageTracker {
     }
 
     /// Attach `dir` as this tracker's ledger: replay today's and yesterday's UTC
-    /// files back through the recording path, prune files older than
-    /// `retention_days`, then start appending.
+    /// files back through the recording path, plus the six before them when the
+    /// fleet holds a Codex account, whose weekly window reaches back that far;
+    /// then prune files older than `retention_days`, never below what was
+    /// replayed; then start appending.
     ///
     /// Replay happens BEFORE the writer is armed, so a replayed line is never
     /// written back into the file it came from.
@@ -1159,15 +1260,26 @@ impl UsageTracker {
     ) -> ReplayReport {
         let mut report = ReplayReport::default();
         let today = ledger_date(now_ms);
-        let yesterday = ledger_date(now_ms - 86_400_000);
-        for date in [yesterday, today] {
+        // A Codex row's weekly window reaches back seven days, so a fleet holding a Codex account
+        // replays the eight UTC files its lines can be in (today and the seven before it), oldest
+        // first, and never prunes one of them. A Claude-only fleet replays yesterday and today and
+        // prunes as it always has.
+        let holds_codex = accounts.iter().any(|a| a.provider == Provider::Codex);
+        let days_back: i64 = if holds_codex { 7 } else { 1 };
+        for back in (0..=days_back).rev() {
+            let date = ledger_date(now_ms - back * 86_400_000);
             self.replay_file(
                 &dir.join(format!("{}.jsonl", date_string(date))),
                 accounts,
                 &mut report,
             );
         }
-        report.pruned = prune(&dir, today, retention_days);
+        let keep_days = if holds_codex {
+            retention_days.max(7)
+        } else {
+            retention_days
+        };
+        report.pruned = prune(&dir, today, keep_days);
         // Replay ran synchronously, above and before this point, so a replayed
         // line can never be written back into the file it came from — and it
         // runs before the listener binds, which is why the one blocking read
@@ -1236,6 +1348,12 @@ impl UsageTracker {
                     cache_1h: line.c1,
                     cache_read: line.r,
                     output: line.o,
+                    // The account the line resolves to is the truth, including for a Codex
+                    // line written before the ledger recorded `p`.
+                    provider: accounts
+                        .get(idx)
+                        .map_or(Provider::Anthropic, |a| a.provider),
+                    reasoning: line.rt,
                 },
             );
             report.replayed += 1;
@@ -1243,9 +1361,12 @@ impl UsageTracker {
     }
 
     /// This account's usage as of `now_ms`. `five_hour_reset_ms` is the
-    /// account's own window reset as read from Anthropic's headers; `None`
-    /// there means the window's start cannot be named, so `window` is `null`
-    /// rather than a guessed span.
+    /// account's own 5-hour window reset, as its provider reported it on a
+    /// response's rate-limit headers or to the quota probe: Anthropic's for a
+    /// Claude account, and Codex's own for a Codex one. `None` there means the
+    /// window's start cannot be named, so `window` is `null` rather than a
+    /// guessed span. The row never names the weekly window:
+    /// [`Self::seven_day_window`] answers for that, and only Codex records reach it.
     pub fn row(&self, idx: usize, now_ms: i64, five_hour_reset_ms: Option<i64>) -> UsageRow {
         let mut accounts = self.accounts.lock().expect("usage lock poisoned");
         let Some(account) = ensure_account(&mut accounts, idx) else {
@@ -1288,6 +1409,38 @@ impl UsageTracker {
             today_by_model,
             seven_day_window: None,
         }
+    }
+
+    /// What account `idx` spent in a weekly window that opened `length_ms` before `reset_ms`:
+    /// the weekly accumulator summed from the window's opening minute to `now_ms`'s, the same
+    /// minute granularity `window` uses. `None` when the window opened more than [`WEEK_MS`]
+    /// before `now_ms`, further back than the accumulator holds, so a partial sum is never
+    /// reported as the whole window. Only Codex records reach the accumulator.
+    pub fn seven_day_window(
+        &self,
+        idx: usize,
+        now_ms: i64,
+        reset_ms: i64,
+        length_ms: i64,
+    ) -> Option<UsageWindow> {
+        let since = reset_ms - length_ms;
+        if since < now_ms - WEEK_MS {
+            return None;
+        }
+        let mut accounts = self.accounts.lock().expect("usage lock poisoned");
+        let account = ensure_account(&mut accounts, idx)?;
+        let (from, to) = (since.div_euclid(60_000), now_ms.div_euclid(60_000));
+        let mut totals = Totals::default();
+        // A window that has not opened yet sums nothing, and `range` must not see from > to.
+        if from <= to {
+            for (_, minute_totals) in account.week.range(from..=to) {
+                totals.add(minute_totals);
+            }
+        }
+        Some(UsageWindow {
+            since,
+            totals: totals.to_wire(),
+        })
     }
 }
 
@@ -1397,6 +1550,9 @@ fn range(account: &AccountUsage, since_ms: i64, now_ms: i64) -> Totals {
 /// replayed": on a UTC+3 machine the first three hours of the local day live in
 /// yesterday's UTC-named file, so pruning it costs the second restart of the
 /// day those hours — silently, and still presented as measured.
+///
+/// A fleet holding a Codex account passes at least seven days, so the weekly
+/// window's files survive the pruner too.
 fn prune(dir: &Path, today: Date, retention_days: u32) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -1674,6 +1830,232 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
     }
 
+    /// A Codex line says so, with `"p":"codex"`, and adds its reasoning tokens as `rt` when there
+    /// are any. An Anthropic line carries neither key, so a Claude-only ledger's lines are byte
+    /// for byte what they were. `rt` is never `r`: that one is the cache-read count.
+    #[test]
+    fn the_ledger_writes_p_and_rt_only_for_codex() {
+        let dir = scratch("provider-keys");
+        let now = crate::now_ms();
+        let tracker = tracker();
+        tracker.attach_ledger(
+            dir.clone(),
+            90,
+            &[named("alice@example.com"), named("bob@example.com/codex")],
+            now,
+        );
+        let base = |model: &str| {
+            UsageRecord::from_quota_input(now, Some(model.to_string()), None, 100, 0, 0, 40, 5)
+        };
+        let codex = |reasoning: u64| UsageRecord {
+            provider: Provider::Codex,
+            reasoning,
+            ..base("gpt-5.1-codex")
+        };
+        tracker.record(0, &base("claude-opus-5"), "alice@example.com", None, None);
+        tracker.record(1, &codex(7), "bob@example.com/codex", None, None);
+        tracker.record(1, &codex(0), "bob@example.com/codex", None, None);
+        assert!(tracker.flush_ledger(), "the writer answered the flush");
+        let text =
+            std::fs::read_to_string(dir.join(format!("{}.jsonl", date_string(ledger_date(now)))))
+                .expect("today's file");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            format!(
+                r#"{{"t":{now},"a":"alice@example.com","m":"claude-opus-5","s":null,"i":60,"c5":0,"c1":0,"r":40,"o":5}}"#
+            ),
+            "an Anthropic line is the line written before this change"
+        );
+        let reasoned: serde_json::Value = serde_json::from_str(lines[1]).expect("a JSON line");
+        assert_eq!(
+            (
+                reasoned["p"].as_str(),
+                reasoned["rt"].as_u64(),
+                reasoned["r"].as_u64()
+            ),
+            (Some("codex"), Some(7), Some(40))
+        );
+        let quiet: serde_json::Value = serde_json::from_str(lines[2]).expect("a JSON line");
+        assert_eq!(quiet["p"], "codex");
+        assert!(quiet.get("rt").is_none(), "no reasoning, no key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A line written before the ledger knew its provider still parses, as no provider and no
+    /// reasoning tokens. `p` and `rt` are optional, so every day file on disk stays readable,
+    /// and an older tcr reads a new line too, since `LedgerLine` refuses no unknown key.
+    #[test]
+    fn ledger_lines_without_p_or_rt_still_parse() {
+        let dir = scratch("pre-provider");
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let path = dir.join("2026-01-01.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"t":1767225600000,"a":"alice@example.com","m":"claude-opus-5","i":1,"c5":0,"c1":0,"r":0,"o":2}"#,
+                "\n",
+                r#"{"t":1767225600000,"a":"bob@example.com/codex","p":"codex","m":"gpt-5.1-codex","i":1,"c5":0,"c1":0,"r":3,"o":2,"rt":1}"#,
+                "\n",
+            ),
+        )
+        .expect("write a day file");
+        let (lines, malformed) = parse_ledger_file(&path);
+        assert_eq!((lines.len(), malformed), (2, 0));
+        assert_eq!((lines[0].p.as_deref(), lines[0].rt), (None, 0));
+        assert_eq!(
+            (lines[1].p.as_deref(), lines[1].rt, lines[1].r),
+            (Some("codex"), 1, 3),
+            "rt is reasoning; r stays the cache read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One live Codex account with no org.
+    fn codex_named(name: &str) -> LedgerAccount {
+        LedgerAccount {
+            name: name.to_string(),
+            provider: Provider::Codex,
+            ..LedgerAccount::default()
+        }
+    }
+
+    /// A Codex account's weekly window survives a restart. Boot replays the eight UTC day
+    /// files a seven-day window can reach back into, and the pruner keeps them whatever the
+    /// retention says. The window sums what the account spent since it opened, at minute
+    /// granularity. A window that opened before the oldest minute the accumulator holds is not
+    /// reported at all. The control: a Claude-only fleet replays and prunes exactly as before.
+    #[test]
+    fn the_weekly_window_replays_across_day_files() {
+        let dir = scratch("weekly");
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let now: i64 = 1_800_000_000_000; // 2027-01-15T08:00:00Z
+        let day: i64 = 86_400_000;
+        let bob = "bob@example.com/codex";
+        let line = |t: i64, a: &str, m: &str| {
+            format!(r#"{{"t":{t},"a":"{a}","m":"{m}","i":100,"c5":0,"c1":0,"r":50,"o":10,"rt":4}}"#)
+        };
+        let mut files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (t, count) in [
+            (now - 8 * day, 1),
+            (now - 6 * day, 2),
+            (now - 3 * day, 2),
+            (now - day, 2),
+            (now - 3_600_000, 2),
+        ] {
+            for _ in 0..count {
+                files
+                    .entry(date_string(ledger_date(t)))
+                    .or_default()
+                    .push(line(t, bob, "gpt-5.1-codex"));
+            }
+        }
+        files
+            .entry(date_string(ledger_date(now)))
+            .or_default()
+            .push(line(now - 60_000, "alice@example.com", "claude-opus-5"));
+        for (date, lines) in &files {
+            std::fs::write(dir.join(format!("{date}.jsonl")), lines.join("\n") + "\n")
+                .expect("write a day file");
+        }
+
+        let tracker = tracker();
+        let report = tracker.attach_ledger(
+            dir.clone(),
+            0,
+            &[named("alice@example.com"), codex_named(bob)],
+            now,
+        );
+        assert_eq!(
+            (report.replayed, report.unresolved, report.malformed),
+            (9, 0, 0),
+            "bob's eight lines inside the week and alice's one; the line from eight days ago is not read"
+        );
+        assert_eq!(
+            report.pruned, 1,
+            "with retention 0, only the file older than the week goes"
+        );
+
+        let reset = now + day;
+        let week = tracker
+            .seven_day_window(1, now, reset, WEEK_MS)
+            .expect("a seven-day window");
+        assert_eq!(week.since, reset - WEEK_MS);
+        let t = week.totals;
+        assert_eq!(
+            (
+                t.requests,
+                t.input_tokens,
+                t.cache_read_tokens,
+                t.output_tokens,
+                t.reasoning_tokens,
+                t.unpriced_requests,
+                t.cost_usd
+            ),
+            (8, 800, 400, 80, 32, 8, None)
+        );
+        let short = tracker
+            .seven_day_window(1, now, reset, 3 * day)
+            .expect("a three-day window");
+        assert_eq!(
+            short.totals.requests, 4,
+            "only the lines since it opened, two days ago"
+        );
+        assert!(
+            tracker.seven_day_window(1, now, reset, 9 * day).is_none(),
+            "it opened eight days ago, before the oldest minute the week holds"
+        );
+
+        let claude_only = self::tracker();
+        let report = claude_only.attach_ledger(
+            dir.clone(),
+            0,
+            &[named("alice@example.com"), named(bob)],
+            now,
+        );
+        assert_eq!(
+            report.replayed, 5,
+            "yesterday's and today's files only, as before"
+        );
+        assert_eq!(
+            report.pruned, 2,
+            "every file older than yesterday goes, as before"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Codex account's 5-hour `window` is still the ring every Claude row reads. The weekly
+    /// accumulator sits beside it, and `usage.window` is never repointed at the week. Its
+    /// boundary is a Claude row's: 4h58m in, 5h01m out.
+    #[test]
+    fn the_five_hour_window_is_unchanged() {
+        let tracker = tracker();
+        let now = 1_800_000_000_000;
+        let codex = |ts: i64| UsageRecord {
+            provider: Provider::Codex,
+            ..record(ts, "gpt-5.1-codex", 100)
+        };
+        for ts in [
+            now - (4 * 60 + 58) * 60_000,
+            now - (5 * 60 + 1) * 60_000,
+            now - 2 * 86_400_000,
+        ] {
+            tracker.record_in_memory(1, &codex(ts));
+        }
+        let row = tracker.row(1, now, Some(now + 60_000));
+        assert_eq!(row.window.expect("a 5-hour window").totals.requests, 1);
+        assert_eq!(row.last_hour.requests, 0);
+        assert!(
+            row.seven_day_window.is_none(),
+            "the row alone never names the week"
+        );
+        let week = tracker
+            .seven_day_window(1, now, now + 86_400_000, WEEK_MS)
+            .expect("a week");
+        assert_eq!(week.totals.requests, 3);
+    }
+
     /// A ledger line naming an account this config no longer has is dropped,
     /// not attributed to whoever now sits at that index.
     #[test]
@@ -1892,6 +2274,7 @@ mod tests {
             a: "alice@example.com".to_string(),
             u: None,
             g: None,
+            p: None,
             m: None,
             s: None,
             i: 1,
@@ -1899,6 +2282,7 @@ mod tests {
             c1: 0,
             r: 0,
             o: 0,
+            rt: 0,
         };
 
         let mut ledger = Ledger {
@@ -2317,6 +2701,7 @@ mod tests {
             // `org_key`: the uuid when there is one, else the name.
             org: Some(org_uuid.unwrap_or(org_name).to_string()),
             org_name: Some(org_name.to_string()),
+            provider: Provider::Anthropic,
         }
     }
 

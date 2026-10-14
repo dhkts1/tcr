@@ -33,6 +33,17 @@
 //! not the local calendar day `tcr status`'s `today` uses. That is also what
 //! makes every number in this report reproducible with one `jq` command over
 //! the files directly — see `docs/cli.md`.
+//!
+//! # Codex lines
+//!
+//! A line's provider is its `p`, or, for a line written before `p` existed, its
+//! model id's ([`crate::usage::line_provider`]). A Codex bucket no price covers
+//! prints `n/a` with its unpriced count, never `$0.00`: no OpenAI model has a
+//! built-in price ([`crate::pricing`]), so a zero there would be a figure
+//! nobody measured. The `by provider` block, the second totals line, the
+//! unpriced annotations and `(priced requests only)` print only when the period
+//! holds a Codex line, so a Claude-only ledger's report is byte for byte what it
+//! was.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,6 +52,7 @@ use serde::Serialize;
 use time::Date;
 
 use crate::pricing::{cost_nanos, PricingOverride, PricingTable};
+use crate::provider::Provider;
 use crate::usage::{self, LedgerLine};
 
 /// How many of the longest-running sessions to list.
@@ -61,6 +73,10 @@ struct Agg {
     cache_write: u64,
     cache_read: u64,
     cost_nanos: u64,
+    /// The Codex lines no price covers, which `cost_nanos` leaves out. An unpriced
+    /// Claude line is not counted, so a Claude-only bucket prints the figure it
+    /// always has.
+    unpriced: u64,
 }
 
 impl Agg {
@@ -70,8 +86,12 @@ impl Agg {
         self.output += line.o;
         self.cache_write += line.c5 + line.c1;
         self.cache_read += line.r;
-        if let Some(price) = line.m.as_deref().and_then(|m| pricing.lookup(m)) {
-            self.cost_nanos += cost_nanos(&price, line.i, line.c5, line.c1, line.r, line.o);
+        match line.m.as_deref().and_then(|m| pricing.lookup(m)) {
+            Some(price) => {
+                self.cost_nanos += cost_nanos(&price, line.i, line.c5, line.c1, line.r, line.o);
+            }
+            None if usage::line_provider(line) == Provider::Codex => self.unpriced += 1,
+            None => {}
         }
     }
 
@@ -91,6 +111,10 @@ pub struct Totals {
     pub cache_write_tokens: u64,
     pub cache_read_tokens: u64,
     pub cost_usd: f64,
+    /// Codex requests in the period that no price covers, which `cost_usd` leaves out. Absent
+    /// at 0, so a Claude-only report's JSON is byte for byte what it was.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unpriced_requests: u64,
     /// The share of all prompt tokens that were read from cache:
     /// `cache_read / (input + cache_write + cache_read)`, so always within
     /// 0..=1. `input_tokens` here is the ledger's UNCACHED input, so dividing by
@@ -114,6 +138,7 @@ impl From<Agg> for Totals {
             cache_write_tokens: agg.cache_write,
             cache_read_tokens: agg.cache_read,
             cost_usd: agg.cost_usd(),
+            unpriced_requests: agg.unpriced,
             cache_hit_ratio: if prompt == 0 {
                 None
             } else {
@@ -123,12 +148,32 @@ impl From<Agg> for Totals {
     }
 }
 
+/// For `#[serde(skip_serializing_if)]` on every `unpriced_requests`: a report with no
+/// unpriced Codex request writes no such key, which keeps a Claude-only report's JSON
+/// byte for byte what it was.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// One provider's share of the period, for the `by provider` block: `claude` or `codex`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRow {
+    pub provider: String,
+    pub requests: u64,
+    pub cost_usd: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unpriced_requests: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRow {
     pub model: String,
     pub requests: u64,
     pub cost_usd: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unpriced_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +182,8 @@ pub struct AccountRow {
     pub account: String,
     pub requests: u64,
     pub cost_usd: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unpriced_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +192,8 @@ pub struct DayRow {
     pub date: String,
     pub requests: u64,
     pub cost_usd: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unpriced_requests: u64,
     /// Whether this is the busiest day (most requests) in the period. At most
     /// one row carries `true`; a tie is broken by the earliest date, so the
     /// mark never moves depending on map iteration order.
@@ -188,6 +237,10 @@ pub struct WrapReport {
     pub since: String,
     pub until: String,
     pub totals: Totals,
+    /// Requests and cost per provider that served in the period, present only when the period
+    /// holds a Codex line: a Claude-only report has no such key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by_provider: Option<Vec<ProviderRow>>,
     /// Sorted by cost, highest first.
     pub by_model: Vec<ModelRow>,
     /// Sorted by requests, highest first.
@@ -204,6 +257,11 @@ pub struct WrapReport {
     /// current period's files. Counted, never fatal — see
     /// [`crate::usage::parse_ledger_file`].
     pub malformed_lines: usize,
+    /// Current-period lines with no provider that their model id filed under Codex, which
+    /// are lines written before the ledger recorded one. Said in the text's `note:` line
+    /// only, so `--json` gains no key.
+    #[serde(skip)]
+    pub lines_filed_by_model_id: usize,
 }
 
 /// `n` UTC dates ending at (and including) `end`, ascending.
@@ -214,8 +272,11 @@ fn dates_ending_at(end: Date, n: u32) -> Vec<Date> {
         .collect()
 }
 
-/// Read one period's files into `model`/`account`/`day`/`sessions`, and fold
-/// every line into `total`. Returns the malformed-line count over the period.
+/// Read one period's files into `model`/`account`/`day`/`sessions`, fold every
+/// line into `total`, and into `providers` by the provider it belongs to (0 is
+/// claude, 1 is codex; [`usage::line_provider`]). `filed_by_model_id` counts the
+/// lines with no provider that their model id filed under Codex. Returns the
+/// malformed-line count over the period.
 #[allow(clippy::too_many_arguments)]
 fn accumulate(
     dir: &Path,
@@ -226,6 +287,8 @@ fn accumulate(
     account: &mut BTreeMap<String, Agg>,
     day: &mut BTreeMap<Date, Agg>,
     sessions: &mut BTreeMap<u64, u64>,
+    providers: &mut [Agg; 2],
+    filed_by_model_id: &mut usize,
 ) -> usize {
     let mut malformed = 0;
     for date in dates {
@@ -248,6 +311,14 @@ fn accumulate(
             if let Some(session) = line.s {
                 *sessions.entry(session).or_default() += 1;
             }
+            providers[match usage::line_provider(line) {
+                Provider::Anthropic => 0,
+                Provider::Codex => 1,
+            }]
+            .add(pricing, line);
+            if usage::filed_by_model_id(line) {
+                *filed_by_model_id += 1;
+            }
         }
     }
     malformed
@@ -268,6 +339,8 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
     let mut account_agg: BTreeMap<String, Agg> = BTreeMap::new();
     let mut day_agg: BTreeMap<Date, Agg> = BTreeMap::new();
     let mut sessions: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut providers = [Agg::default(); 2];
+    let mut lines_filed_by_model_id = 0;
     let malformed_lines = accumulate(
         dir,
         &current_dates,
@@ -277,6 +350,8 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
         &mut account_agg,
         &mut day_agg,
         &mut sessions,
+        &mut providers,
+        &mut lines_filed_by_model_id,
     );
 
     let mut previous_total = Agg::default();
@@ -284,6 +359,8 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
     let mut unused_account = BTreeMap::new();
     let mut unused_day = BTreeMap::new();
     let mut unused_sessions = BTreeMap::new();
+    let mut unused_providers = [Agg::default(); 2];
+    let mut unused_filed_by_model_id = 0;
     accumulate(
         dir,
         &previous_dates,
@@ -293,7 +370,24 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
         &mut unused_account,
         &mut unused_day,
         &mut unused_sessions,
+        &mut unused_providers,
+        &mut unused_filed_by_model_id,
     );
+
+    // One row per provider that served, claude first, and only when the period holds a
+    // Codex line: a Claude-only report has no `by provider` block and no `byProvider` key.
+    let by_provider = (providers[1].requests > 0).then(|| {
+        [("claude", providers[0]), ("codex", providers[1])]
+            .into_iter()
+            .filter(|(_, agg)| agg.requests > 0)
+            .map(|(provider, agg)| ProviderRow {
+                provider: provider.to_string(),
+                requests: agg.requests,
+                cost_usd: agg.cost_usd(),
+                unpriced_requests: agg.unpriced,
+            })
+            .collect()
+    });
 
     let mut by_model: Vec<ModelRow> = model_agg
         .into_iter()
@@ -301,6 +395,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
             model,
             requests: agg.requests,
             cost_usd: agg.cost_usd(),
+            unpriced_requests: agg.unpriced,
         })
         .collect();
     by_model.sort_by(|a, b| {
@@ -316,6 +411,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
             account,
             requests: agg.requests,
             cost_usd: agg.cost_usd(),
+            unpriced_requests: agg.unpriced,
         })
         .collect();
     by_account.sort_by(|a, b| {
@@ -334,6 +430,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
             date: usage::date_string(date),
             requests: agg.requests,
             cost_usd: agg.cost_usd(),
+            unpriced_requests: agg.unpriced,
             busiest: Some(date) == busiest_date,
         })
         .collect();
@@ -362,6 +459,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
         since: usage::date_string(current_dates[0]),
         until: usage::date_string(today),
         totals,
+        by_provider,
         by_model,
         by_account,
         by_day,
@@ -370,6 +468,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
         previous,
         comparison,
         malformed_lines,
+        lines_filed_by_model_id,
     }
 }
 
@@ -400,30 +499,75 @@ fn fmt_ratio(ratio: Option<f64>) -> String {
     }
 }
 
-/// Render the report as the plain-text terminal output — no colour, no line
-/// wider than 100 columns.
+/// A bucket's `cost=` value. With no unpriced Codex request it is the dollar figure it
+/// always was, `$0.00` for an unpriced Claude model included: that zero is a known defect,
+/// kept as is. With some, it never prints a zero nobody measured. It prints `n/a` and the
+/// count when nothing was priced, and the priced part plus the count otherwise.
+fn fmt_cost(cost_usd: f64, unpriced: u64) -> String {
+    if unpriced == 0 {
+        format!("${cost_usd:.2}")
+    } else if cost_usd > 0.0 {
+        format!("${cost_usd:.2} (+{unpriced} unpriced)")
+    } else {
+        format!("n/a ({unpriced} unpriced)")
+    }
+}
+
+/// Render the report as the plain-text terminal output, with no colour. The first totals line
+/// carries every token count and can pass 100 columns; the lines a Codex period adds, and the
+/// bucket rows beside them, stay under 100 columns at seven-digit counts and five-digit dollar
+/// figures.
 pub fn render_text(report: &WrapReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "tcr wrap: last {} day(s), {} to {} (UTC)\n\n",
         report.days, report.since, report.until
     ));
+    // `n/a` only when the period has unpriced Codex requests and nothing in it was priced:
+    // that zero was never measured. Every other period prints the dollar figure it always has.
+    let total_cost = if report.totals.unpriced_requests > 0 && report.totals.cost_usd <= 0.0 {
+        "n/a".to_string()
+    } else {
+        format!("${:.2}", report.totals.cost_usd)
+    };
     out.push_str(&format!(
-        "totals requests={} input={} output={} cacheWrite={} cacheRead={} cost=${:.2} cacheHitRatio={}\n\n",
+        "totals requests={} input={} output={} cacheWrite={} cacheRead={} cost={} cacheHitRatio={}\n",
         report.totals.requests,
         report.totals.input_tokens,
         report.totals.output_tokens,
         report.totals.cache_write_tokens,
         report.totals.cache_read_tokens,
-        report.totals.cost_usd,
+        total_cost,
         fmt_ratio(report.totals.cache_hit_ratio),
     ));
+    if report.by_provider.is_some() && report.totals.unpriced_requests > 0 {
+        out.push_str(&format!(
+            "totals unpriced={} (Codex requests with no price; the cost above covers priced requests only)\n",
+            report.totals.unpriced_requests
+        ));
+    }
+    out.push('\n');
+
+    if let Some(rows) = &report.by_provider {
+        out.push_str("by provider:\n");
+        for row in rows {
+            out.push_str(&format!(
+                "  {:<28} requests={:<8} cost={}\n",
+                row.provider,
+                row.requests,
+                fmt_cost(row.cost_usd, row.unpriced_requests)
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str("by model (sorted by cost):\n");
     for row in &report.by_model {
         out.push_str(&format!(
-            "  {:<28} requests={:<8} cost=${:.2}\n",
-            row.model, row.requests, row.cost_usd
+            "  {:<28} requests={:<8} cost={}\n",
+            row.model,
+            row.requests,
+            fmt_cost(row.cost_usd, row.unpriced_requests)
         ));
     }
     out.push('\n');
@@ -431,8 +575,10 @@ pub fn render_text(report: &WrapReport) -> String {
     out.push_str("by account (sorted by requests):\n");
     for row in &report.by_account {
         out.push_str(&format!(
-            "  {:<28} requests={:<8} cost=${:.2}\n",
-            row.account, row.requests, row.cost_usd
+            "  {:<28} requests={:<8} cost={}\n",
+            row.account,
+            row.requests,
+            fmt_cost(row.cost_usd, row.unpriced_requests)
         ));
     }
     out.push('\n');
@@ -440,11 +586,11 @@ pub fn render_text(report: &WrapReport) -> String {
     out.push_str("by day (busiest marked *):\n");
     for row in &report.by_day {
         out.push_str(&format!(
-            "  {} {} requests={:<8} cost=${:.2}\n",
+            "  {} {} requests={:<8} cost={}\n",
             row.date,
             if row.busiest { "*" } else { " " },
             row.requests,
-            row.cost_usd
+            fmt_cost(row.cost_usd, row.unpriced_requests)
         ));
     }
     out.push('\n');
@@ -462,16 +608,32 @@ pub fn render_text(report: &WrapReport) -> String {
     }
     out.push('\n');
 
+    // The cost comparison covers priced requests only once either period has a Codex request
+    // no price covers; said only when the period holds a Codex line.
+    let priced_only = report.by_provider.is_some()
+        && report.comparison.cost_change.is_some()
+        && report.totals.unpriced_requests + report.previous.unpriced_requests > 0;
     out.push_str(&format!(
-        "compared with the previous {} day(s): cost={} requests={}\n",
+        "compared with the previous {} day(s): cost={}{} requests={}\n",
         report.days,
         fmt_pct(report.comparison.cost_change),
+        if priced_only {
+            " (priced requests only)"
+        } else {
+            ""
+        },
         fmt_pct(report.comparison.requests_change),
     ));
     if report.malformed_lines > 0 {
         out.push_str(&format!(
             "note: {} malformed ledger line(s) were skipped, not fatal\n",
             report.malformed_lines
+        ));
+    }
+    if report.lines_filed_by_model_id > 0 {
+        out.push_str(&format!(
+            "note: {} older ledger line(s) carry no provider; filed by model id\n",
+            report.lines_filed_by_model_id
         ));
     }
     out
@@ -805,5 +967,376 @@ mod tests {
             serde_json::to_string(&report).expect("the report serializes"),
             r#"{"days":2,"since":"2026-09-05","until":"2026-09-06","totals":{"requests":4,"inputTokens":2500010,"outputTokens":150010,"cacheWriteTokens":0,"cacheReadTokens":100000,"costUsd":14.02,"cacheHitRatio":0.038461390533113336},"byModel":[{"model":"claude-opus-5","requests":2,"costUsd":12.5},{"model":"claude-sonnet-5","requests":1,"costUsd":1.52},{"model":"claude-opus-4-5","requests":1,"costUsd":0.0}],"byAccount":[{"account":"alice@example.com","requests":2,"costUsd":12.5},{"account":"bob@example.com","requests":1,"costUsd":1.52},{"account":"carol@example.com","requests":1,"costUsd":0.0}],"byDay":[{"date":"2026-09-05","requests":3,"costUsd":9.02,"busiest":true},{"date":"2026-09-06","requests":1,"costUsd":5.0,"busiest":false}],"distinctSessions":3,"topSessions":[{"session":1,"requests":2},{"session":2,"requests":1},{"session":3,"requests":1}],"previous":{"requests":1,"inputTokens":1000000,"outputTokens":0,"cacheWriteTokens":0,"cacheReadTokens":0,"costUsd":5.0,"cacheHitRatio":0.0},"comparison":{"costChange":1.8039999999999998,"requestsChange":3.0},"malformedLines":1}"#
         );
+    }
+
+    /// A mixed ledger. alice's Claude traffic falls on the same days as the Claude-only
+    /// ledger's, with an earlier day costing $5.00. Beside it are three lines on bob's Codex
+    /// account, for a model this build cannot price. Returns the report's clock.
+    fn mixed_ledger(dir: &Path) -> i64 {
+        let day = |d: u8| {
+            noon_ms(
+                Date::from_calendar_date(2026, time::Month::September, d).expect("a calendar date"),
+            )
+        };
+        let (t3, t5, t6) = (day(3), day(5), day(6));
+        let codex = |t: i64| {
+            format!(
+                r#"{{"t":{t},"a":"bob@example.com/codex","p":"codex","m":"gpt-5.1-codex","s":4,"i":1000,"c5":0,"c1":0,"r":500,"o":100}}"#
+            )
+        };
+        write_day(
+            dir,
+            "2026-09-03",
+            &[&format!(
+                r#"{{"t":{t3},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":1000000,"c5":0,"c1":0,"r":0,"o":0}}"#
+            )],
+        );
+        write_day(
+            dir,
+            "2026-09-05",
+            &[
+                &format!(
+                    r#"{{"t":{t5},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":1000000,"c5":0,"c1":0,"r":0,"o":100000}}"#
+                ),
+                &codex(t5),
+                &codex(t5),
+            ],
+        );
+        write_day(
+            dir,
+            "2026-09-06",
+            &[
+                &codex(t6),
+                &format!(
+                    r#"{{"t":{t6},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":1000000,"c5":0,"c1":0,"r":0,"o":0}}"#
+                ),
+            ],
+        );
+        t6
+    }
+
+    /// One price for `gpt-5.1-codex`, at $1.25 in and $10 out per million tokens.
+    fn gpt_pricing() -> PricingTable {
+        PricingTable::new(BTreeMap::from([(
+            "gpt-5.1-codex".to_string(),
+            PricingOverride {
+                input: 1.25,
+                output: 10.0,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                cache_read: None,
+            },
+        )]))
+    }
+
+    /// A Codex bucket no price covers reads `cost=n/a` and its unpriced count, never `$0.00`.
+    /// A bucket mixing priced and unpriced requests prints the priced part and the count it
+    /// leaves out. The period gains a second totals line, the `by provider` block, and
+    /// `(priced requests only)` on its cost comparison.
+    #[test]
+    fn a_codex_bucket_reads_cost_na_with_its_unpriced_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = mixed_ledger(tmp.path());
+        let text = render_text(&build_report(tmp.path(), 2, now, &PricingTable::default()));
+        assert_eq!(
+            text,
+            concat!(
+                "tcr wrap: last 2 day(s), 2026-09-05 to 2026-09-06 (UTC)\n",
+                "\n",
+                "totals requests=5 input=2003000 output=100300 cacheWrite=0 cacheRead=1500 cost=$12.50 cacheHitRatio=0.1%\n", // 1500 cache-read tokens of 2004500 prompt tokens
+                "totals unpriced=3 (Codex requests with no price; the cost above covers priced requests only)\n",
+                "\n",
+                "by provider:\n",
+                "  claude                       requests=2        cost=$12.50\n",
+                "  codex                        requests=3        cost=n/a (3 unpriced)\n",
+                "\n",
+                "by model (sorted by cost):\n",
+                "  claude-opus-5                requests=2        cost=$12.50\n",
+                "  gpt-5.1-codex                requests=3        cost=n/a (3 unpriced)\n",
+                "\n",
+                "by account (sorted by requests):\n",
+                "  bob@example.com/codex        requests=3        cost=n/a (3 unpriced)\n",
+                "  alice@example.com            requests=2        cost=$12.50\n",
+                "\n",
+                "by day (busiest marked *):\n",
+                "  2026-09-05 * requests=3        cost=$7.50 (+2 unpriced)\n",
+                "  2026-09-06   requests=2        cost=$5.00 (+1 unpriced)\n",
+                "\n",
+                "sessions: 2 distinct; top 2 by requests:\n",
+                "  session 4 requests=3\n",
+                "  session 1 requests=2\n",
+                "\n",
+                "compared with the previous 2 day(s): cost=+150% (priced requests only) requests=+400%\n", // cost (12.50 - 5.00)/5.00, requests (5 - 1)/1
+            )
+        );
+        assert!(!text.contains("$0.00"));
+    }
+
+    /// A Codex model priced by an override prints dollars on every surface, with the count of
+    /// the requests no price covers beside them: `cost=$x (+n unpriced)`. Never `$0.00`.
+    #[test]
+    fn a_priced_codex_bucket_prints_dollars_and_its_unpriced_tail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let t6 = noon_ms(
+            Date::from_calendar_date(2026, time::Month::September, 6).expect("a calendar date"),
+        );
+        let line = |model: &str, input: u64| {
+            format!(
+                r#"{{"t":{t6},"a":"bob@example.com/codex","p":"codex","m":"{model}","s":5,"i":{input},"c5":0,"c1":0,"r":0,"o":0}}"#
+            )
+        };
+        write_day(
+            tmp.path(),
+            "2026-09-06",
+            &[
+                &line("gpt-5.1-codex", 1_000_000),
+                &line("gpt-5.1-codex", 1_000_000),
+                &line("codex-mini-latest", 1_000),
+            ],
+        );
+        let text = render_text(&build_report(tmp.path(), 1, t6, &gpt_pricing()));
+        assert_eq!(
+            text,
+            concat!(
+                "tcr wrap: last 1 day(s), 2026-09-06 to 2026-09-06 (UTC)\n",
+                "\n",
+                "totals requests=3 input=2001000 output=0 cacheWrite=0 cacheRead=0 cost=$2.50 cacheHitRatio=0.0%\n", // 0 cache-read tokens of 2001000 prompt tokens
+                "totals unpriced=1 (Codex requests with no price; the cost above covers priced requests only)\n",
+                "\n",
+                "by provider:\n",
+                "  codex                        requests=3        cost=$2.50 (+1 unpriced)\n",
+                "\n",
+                "by model (sorted by cost):\n",
+                "  gpt-5.1-codex                requests=2        cost=$2.50\n",
+                "  codex-mini-latest            requests=1        cost=n/a (1 unpriced)\n",
+                "\n",
+                "by account (sorted by requests):\n",
+                "  bob@example.com/codex        requests=3        cost=$2.50 (+1 unpriced)\n",
+                "\n",
+                "by day (busiest marked *):\n",
+                "  2026-09-06 * requests=3        cost=$2.50 (+1 unpriced)\n",
+                "\n",
+                "sessions: 1 distinct; top 1 by requests:\n",
+                "  session 5 requests=3\n",
+                "\n",
+                "compared with the previous 1 day(s): cost=n/a requests=n/a\n",
+            )
+        );
+    }
+
+    /// The `by provider` block prints only when the period holds a Codex line. With every Codex
+    /// line priced, it prints without the unpriced lines: no second totals line, no
+    /// annotation, no `(priced requests only)`. A Claude-only ledger prints none of it.
+    #[test]
+    fn the_by_provider_block_prints_only_with_codex_lines() {
+        let claude_dir = tempfile::tempdir().expect("tempdir");
+        let now = claude_only_ledger(claude_dir.path());
+        let report = build_report(claude_dir.path(), 2, now, &PricingTable::default());
+        assert!(report.by_provider.is_none());
+        let text = render_text(&report);
+        for absent in [
+            "by provider:",
+            "unpriced",
+            "priced requests only",
+            "filed by model id",
+        ] {
+            assert!(
+                !text.contains(absent),
+                "a Claude-only report says nothing of {absent:?}"
+            );
+        }
+
+        let priced_dir = tempfile::tempdir().expect("tempdir");
+        let day = |d: u8| {
+            noon_ms(Date::from_calendar_date(2026, time::Month::September, d).expect("a date"))
+        };
+        let line = |t: i64| {
+            format!(
+                r#"{{"t":{t},"a":"bob@example.com/codex","p":"codex","m":"gpt-5.1-codex","s":6,"i":1000000,"c5":0,"c1":0,"r":0,"o":0}}"#
+            )
+        };
+        write_day(priced_dir.path(), "2026-09-04", &[&line(day(4))]);
+        write_day(
+            priced_dir.path(),
+            "2026-09-06",
+            &[&line(day(6)), &line(day(6))],
+        );
+        let text = render_text(&build_report(priced_dir.path(), 2, day(6), &gpt_pricing()));
+        assert!(
+            text.contains(
+                "by provider:\n  codex                        requests=2        cost=$2.50\n\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("unpriced"), "{text}");
+        assert!(
+            text.contains("compared with the previous 2 day(s): cost=+100% requests=+100%\n"), // cost (2.50 - 1.25)/1.25, requests (2 - 1)/1
+            "{text}"
+        );
+    }
+
+    /// A line written before the ledger recorded its provider is filed by its model id.
+    /// `gpt-…` and `codex-…` go to codex, and the report says how many lines it filed that way.
+    /// A line that names `p` is filed by it, whatever its model id; an Anthropic line carries
+    /// no `p` and is not counted. The count is text only: `--json` gains no key for it.
+    #[test]
+    fn lines_without_a_provider_are_filed_by_model_id_and_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let t6 = noon_ms(
+            Date::from_calendar_date(2026, time::Month::September, 6).expect("a calendar date"),
+        );
+        let old = |account: &str, model: &str, session: u64| {
+            format!(
+                r#"{{"t":{t6},"a":"{account}","m":"{model}","s":{session},"i":10,"c5":0,"c1":0,"r":0,"o":1}}"#
+            )
+        };
+        write_day(
+            tmp.path(),
+            "2026-09-06",
+            &[
+                &old("bob@example.com/codex", "gpt-5.1-codex", 7),
+                &old("bob@example.com/codex", "codex-mini-latest", 7),
+                &old("bob@example.com/codex", "gpt-5.1-codex-max", 7),
+                &old("alice@example.com", "claude-opus-5", 8),
+                &format!(
+                    r#"{{"t":{t6},"a":"dana@example.com/codex","p":"codex","m":"o4-mini","s":9,"i":10,"c5":0,"c1":0,"r":0,"o":1}}"#
+                ),
+            ],
+        );
+        let report = build_report(tmp.path(), 1, t6, &PricingTable::default());
+        assert_eq!(report.lines_filed_by_model_id, 3);
+        let providers: Vec<(&str, u64)> = report
+            .by_provider
+            .as_deref()
+            .expect("the period holds Codex lines")
+            .iter()
+            .map(|row| (row.provider.as_str(), row.requests))
+            .collect();
+        assert_eq!(providers, [("claude", 1), ("codex", 4)]);
+        assert!(render_text(&report)
+            .ends_with("note: 3 older ledger line(s) carry no provider; filed by model id\n"));
+        assert!(!serde_json::to_string(&report)
+            .expect("serializes")
+            .contains("iledByModelId"));
+    }
+
+    /// `unpricedRequests` rides on the totals and every bucket of `--json`, and is absent at
+    /// 0. A Claude row in a mixed report, and the whole of a Claude-only one, carry no such key.
+    /// `costUsd` stays the priced floor.
+    #[test]
+    fn wrap_json_skips_unpriced_requests_at_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = mixed_ledger(tmp.path());
+        let json = serde_json::to_value(build_report(tmp.path(), 2, now, &PricingTable::default()))
+            .expect("serializes");
+        assert_eq!(json["totals"]["unpricedRequests"], 3);
+        assert_eq!(json["totals"]["costUsd"], 12.5, "the priced floor");
+        assert!(
+            json["previous"].get("unpricedRequests").is_none(),
+            "the earlier period was all priced"
+        );
+        assert!(
+            json["byModel"][0].get("unpricedRequests").is_none(),
+            "claude-opus-5"
+        );
+        assert_eq!(json["byModel"][1]["unpricedRequests"], 3, "gpt-5.1-codex");
+        assert_eq!(
+            json["byAccount"][0]["unpricedRequests"], 3,
+            "bob@example.com/codex"
+        );
+        assert_eq!(json["byDay"][0]["unpricedRequests"], 2);
+
+        let claude_dir = tempfile::tempdir().expect("tempdir");
+        let now = claude_only_ledger(claude_dir.path());
+        let compact = serde_json::to_string(&build_report(
+            claude_dir.path(),
+            2,
+            now,
+            &PricingTable::default(),
+        ))
+        .expect("serializes");
+        assert!(!compact.contains("unpricedRequests"));
+    }
+
+    /// `byProvider` appears only when the period holds a Codex line, right after `totals`, one
+    /// row per provider that served, in the text block's order.
+    #[test]
+    fn wrap_json_adds_by_provider_only_with_codex() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = mixed_ledger(tmp.path());
+        let report = build_report(tmp.path(), 2, now, &PricingTable::default());
+        let compact = serde_json::to_string(&report).expect("serializes");
+        let at = |key: &str| {
+            compact
+                .find(key)
+                .unwrap_or_else(|| panic!("{key} in {compact}"))
+        };
+        assert!(
+            at("\"totals\"") < at("\"byProvider\"") && at("\"byProvider\"") < at("\"byModel\"")
+        );
+        assert_eq!(
+            serde_json::to_value(&report).expect("serializes")["byProvider"],
+            serde_json::json!([
+                { "provider": "claude", "requests": 2, "costUsd": 12.5 },
+                { "provider": "codex", "requests": 3, "costUsd": 0.0, "unpricedRequests": 3 }
+            ])
+        );
+
+        let claude_dir = tempfile::tempdir().expect("tempdir");
+        let now = claude_only_ledger(claude_dir.path());
+        let compact = serde_json::to_string(&build_report(
+            claude_dir.path(),
+            2,
+            now,
+            &PricingTable::default(),
+        ))
+        .expect("serializes");
+        assert!(!compact.contains("byProvider"));
+    }
+
+    /// Every line a Codex period adds, and every bucket row with its unpriced count beside the
+    /// cost, stays under 100 columns. The test uses seven-digit counts and five-digit dollar
+    /// figures. The first totals line is left out: it is the line a Claude-only report has
+    /// always printed, and its token counts already take it past 100 columns on this ledger's
+    /// own figures.
+    #[test]
+    fn every_line_stays_under_100_columns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = mixed_ledger(tmp.path());
+        let mut report = build_report(tmp.path(), 2, now, &PricingTable::default());
+        const BIG: u64 = 9_999_999;
+        report.totals.unpriced_requests = BIG;
+        for row in report.by_provider.iter_mut().flatten() {
+            (row.requests, row.unpriced_requests, row.cost_usd) = (BIG, BIG, 99_999.99);
+        }
+        for row in &mut report.by_model {
+            (row.requests, row.unpriced_requests, row.cost_usd) = (BIG, BIG, 99_999.99);
+        }
+        for row in &mut report.by_account {
+            (row.requests, row.unpriced_requests, row.cost_usd) = (BIG, BIG, 99_999.99);
+        }
+        for row in &mut report.by_day {
+            (row.requests, row.unpriced_requests, row.cost_usd) = (BIG, BIG, 99_999.99);
+        }
+        report.lines_filed_by_model_id = BIG as usize;
+        report.malformed_lines = BIG as usize;
+        let text = render_text(&report);
+        assert!(
+            text.contains("totals unpriced=9999999 ("),
+            "the widest line is in the run:\n{text}"
+        );
+        let first_totals = |line: &&str| line.starts_with("totals requests=");
+        assert_eq!(
+            text.lines().filter(first_totals).count(),
+            1,
+            "only the first totals line is left out"
+        );
+        for line in text.lines().filter(|line| !first_totals(line)) {
+            assert!(
+                line.chars().count() < 100,
+                "{} columns: {line}",
+                line.chars().count()
+            );
+        }
     }
 }

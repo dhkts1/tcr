@@ -139,11 +139,15 @@ impl Manager {
     /// Deliberately does NOT touch the request counter: a client request retried
     /// across accounts reaches this once per upstream RESPONSE, and counting
     /// requests here is bug #4. That count happens in [`Manager::record_served`].
-    pub fn record_usage(&self, idx: usize, record: crate::usage::UsageRecord) {
+    pub fn record_usage(&self, idx: usize, mut record: crate::usage::UsageRecord) {
         let (name, (uuid, org)) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
+                    // The serving account's provider, which files the ledger line (`p`) and
+                    // puts a Codex record in the weekly window. Read under the lock that
+                    // already resolves its identity.
+                    record.provider = account.provider;
                     account.input_tokens += record.input_total();
                     account.output_tokens += record.output;
                     account.cache_read_tokens += record.cache_read;
@@ -182,8 +186,11 @@ impl Manager {
     }
 
     /// Attach `dir` as the usage ledger: replay today's and yesterday's files
-    /// back through the recording path so a restart does not lose the day, prune
-    /// day files past `retention_days`, then start appending.
+    /// back through the recording path so a restart does not lose the day (and
+    /// the week before them too when the fleet holds a Codex account, so its
+    /// weekly window survives as well), prune day files past `retention_days`,
+    /// then start appending. Each account's provider goes to the ledger with its
+    /// identity: it decides whether the week is replayed.
     ///
     /// Only the SERVING process calls this. Returns what the replay found so the
     /// caller can log whether the day was restored or genuinely started at zero.
@@ -207,21 +214,29 @@ impl Manager {
                 org: crate::identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref())
                     .map(str::to_string),
                 org_name: a.org_name.clone().filter(|s| !s.is_empty()),
+                provider: a.provider,
             })
             .collect();
         self.usage
             .attach_ledger(dir, retention_days, &accounts, crate::now_ms())
     }
 
-    /// This account's usage row as of `now_ms` — see
-    /// [`crate::usage::UsageTracker::row`].
+    /// This account's usage row as of `now_ms` (see [`crate::usage::UsageTracker::row`]), plus a
+    /// Codex row's weekly window. `seven_day` is the weekly reset and the window's length, both
+    /// in milliseconds, and `None` leaves `seven_day_window` absent.
     pub(super) fn usage_row(
         &self,
         idx: usize,
         now_ms: i64,
         five_hour_reset_ms: Option<i64>,
+        seven_day: Option<(i64, i64)>,
     ) -> tcr_status_wire::UsageRow {
-        self.usage.row(idx, now_ms, five_hour_reset_ms)
+        let mut row = self.usage.row(idx, now_ms, five_hour_reset_ms);
+        row.seven_day_window = seven_day.and_then(|(reset_ms, length_ms)| {
+            self.usage
+                .seven_day_window(idx, now_ms, reset_ms, length_ms)
+        });
+        row
     }
 
     /// The configured usage-ledger retention, in days
