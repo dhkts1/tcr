@@ -714,4 +714,96 @@ mod tests {
         assert!(report.by_model.is_empty());
         assert!(report.by_day.is_empty());
     }
+
+    /// The Claude-only ledger the wrap goldens read: two current days and one earlier day,
+    /// three Claude accounts, a Claude model this build has no price for, and one line that
+    /// is not JSON. Returns the report's clock, noon UTC on the last day.
+    fn claude_only_ledger(dir: &Path) -> i64 {
+        let day = |d: u8| {
+            noon_ms(
+                Date::from_calendar_date(2026, time::Month::September, d).expect("a calendar date"),
+            )
+        };
+        let (t3, t5, t6) = (day(3), day(5), day(6));
+        write_day(
+            dir,
+            "2026-09-03",
+            &[&format!(
+                r#"{{"t":{t3},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":1000000,"c5":0,"c1":0,"r":0,"o":0}}"#
+            )],
+        );
+        write_day(
+            dir,
+            "2026-09-05",
+            &[
+                &format!(
+                    r#"{{"t":{t5},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":1000000,"c5":0,"c1":0,"r":0,"o":100000}}"#
+                ),
+                &format!(
+                    r#"{{"t":{t5},"a":"bob@example.com","m":"claude-sonnet-5","s":2,"i":500000,"c5":0,"c1":0,"r":100000,"o":50000}}"#
+                ),
+                &format!(
+                    r#"{{"t":{t5},"a":"carol@example.com","m":"claude-opus-4-5","s":3,"i":10,"c5":0,"c1":0,"r":0,"o":10}}"#
+                ),
+            ],
+        );
+        write_day(
+            dir,
+            "2026-09-06",
+            &[
+                &format!(
+                    r#"{{"t":{t6},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":1000000,"c5":0,"c1":0,"r":0,"o":0}}"#
+                ),
+                "not json at all",
+            ],
+        );
+        t6
+    }
+
+    /// What `tcr wrap` prints for a Claude-only ledger, text and JSON, pinned before the report
+    /// learned about Codex: every later change must leave these bytes exactly as they are. The
+    /// ledger carries a Claude model this build has no price for, and its rows print
+    /// `cost=$0.00`. That zero is a known defect, kept on purpose: fixing it changes what a
+    /// Claude-only ledger prints. The JSON is compared in compact form; `--json` pretty-prints
+    /// the same keys in the same order.
+    #[test]
+    fn claude_only_wrap_is_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = claude_only_ledger(tmp.path());
+        let report = build_report(tmp.path(), 2, now, &PricingTable::default());
+        assert_eq!(
+            render_text(&report),
+            concat!(
+                "tcr wrap: last 2 day(s), 2026-09-05 to 2026-09-06 (UTC)\n",
+                "\n",
+                "totals requests=4 input=2500010 output=150010 cacheWrite=0 cacheRead=100000 cost=$14.02 cacheHitRatio=3.8%\n", // 100000 cache-read tokens of 2600010 prompt tokens
+                "\n",
+                "by model (sorted by cost):\n",
+                "  claude-opus-5                requests=2        cost=$12.50\n",
+                "  claude-sonnet-5              requests=1        cost=$1.52\n",
+                "  claude-opus-4-5              requests=1        cost=$0.00\n",
+                "\n",
+                "by account (sorted by requests):\n",
+                "  alice@example.com            requests=2        cost=$12.50\n",
+                "  bob@example.com              requests=1        cost=$1.52\n",
+                "  carol@example.com            requests=1        cost=$0.00\n",
+                "\n",
+                "by day (busiest marked *):\n",
+                "  2026-09-05 * requests=3        cost=$9.02\n",
+                "  2026-09-06   requests=1        cost=$5.00\n",
+                "\n",
+                "sessions: 3 distinct; top 3 by requests:\n",
+                "  session 1 requests=2\n",
+                "  session 2 requests=1\n",
+                "  session 3 requests=1\n",
+                "\n",
+                "compared with the previous 2 day(s): cost=+180% requests=+300%\n", // cost (14.02 - 5.00)/5.00, requests (4 - 1)/1
+                "note: 1 malformed ledger line(s) were skipped, not fatal\n",
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&report).expect("the report serializes"),
+            r#"{"days":2,"since":"2026-09-05","until":"2026-09-06","totals":{"requests":4,"inputTokens":2500010,"outputTokens":150010,"cacheWriteTokens":0,"cacheReadTokens":100000,"costUsd":14.02,"cacheHitRatio":0.038461390533113336},"byModel":[{"model":"claude-opus-5","requests":2,"costUsd":12.5},{"model":"claude-sonnet-5","requests":1,"costUsd":1.52},{"model":"claude-opus-4-5","requests":1,"costUsd":0.0}],"byAccount":[{"account":"alice@example.com","requests":2,"costUsd":12.5},{"account":"bob@example.com","requests":1,"costUsd":1.52},{"account":"carol@example.com","requests":1,"costUsd":0.0}],"byDay":[{"date":"2026-09-05","requests":3,"costUsd":9.02,"busiest":true},{"date":"2026-09-06","requests":1,"costUsd":5.0,"busiest":false}],"distinctSessions":3,"topSessions":[{"session":1,"requests":2},{"session":2,"requests":1},{"session":3,"requests":1}],"previous":{"requests":1,"inputTokens":1000000,"outputTokens":0,"cacheWriteTokens":0,"cacheReadTokens":0,"costUsd":5.0,"cacheHitRatio":0.0},"comparison":{"costChange":1.8039999999999998,"requestsChange":3.0},"malformedLines":1}"#
+        );
+    }
 }
