@@ -1120,17 +1120,30 @@ replays the day back in. Fleet-wide totals are not a field — sum the rows.
 ### The `sessions` array on `GET /_tcr/status`
 
 Reachable via the raw `/_tcr/status` endpoint, not the CLI's own array output: one entry per Claude
-Code session seen in the last hour, each carrying its tool-call stats (`tools.running`, the pending
-calls; `tools.slowest`, the ten slowest completed ones). `tools.running` entries for an `Agent` or
-`Task` tool call carry the subagent's description in `commandHead` (prefixed with its type when
-Claude Code sent one), and `tools.subagentsRunning` is that count precomputed, so a panel can show
-"2 subagents" without scanning the list itself.
+Code or Codex session seen in the last hour, each carrying its tool-call stats (`tools.running`, the
+pending calls; `tools.slowest`, the ten slowest completed ones). `tools.running` entries for an
+`Agent` or `Task` tool call carry the subagent's description in `commandHead` (prefixed with its
+type when Claude Code sent one), and `tools.subagentsRunning` is that count precomputed, so a panel
+can show "2 subagents" without scanning the list itself.
 
 Each session also carries `tools.byTool` (a per-tool-name breakdown: calls, errors, a median
 duration over a bounded reservoir, and `overOneMinute`) and `reqPerMinute` (30 wall-clock minutes
 of request counts, oldest first, decaying to zeros as the session goes idle); the payload's
 top-level `sessionsSummary` is the same `byTool` shape summed across every session server-side, so
 a panel's fleet-wide headline never disagrees with the per-session rows by re-summing them itself.
+
+A Codex session's id is the `session-id` header codex sends on every turn, and its row carries
+`provider: "codex"`, a key absent on a Claude Code session. `unpricedRequests` counts its requests
+no price covers, and `costUsd` stays the priced part (0.0 when none was priced); `reasoningTokens`
+counts its reasoning tokens, which are already inside `outputTokens`. Both keys are absent at 0.
+Its tool calls fill the same `tools` keys: each runs from the end of the response that asked for it
+until tcr serves the next request on the same session, and a running call carries `timeoutSeconds`
+when it named its own timeout. A request tcr answers itself is not counted and closes nothing. After
+an upstream 403, tcr holds that account out for 120 seconds, and while no other Codex account can
+serve, tcr answers the session's requests itself, except that a request arriving in the hold's last
+20 seconds waits until the account frees. Either way the calls keep running, and their time
+includes that wait. A Codex call is never counted as an error or a timeout, because the request
+that closes it carries its output in a body tcr does not read.
 
 ### The `mitm` object on `GET /_tcr/status`
 
@@ -1229,10 +1242,12 @@ A settings file that exists and cannot be parsed is reported on its own `problem
 read as "sets nothing": it is the likeliest place for the answer to be hiding, and skipping it
 quietly would let `doctor` name the wrong source with confidence.
 
-`requests10m` is how many requests this proxy served in the last ten minutes, summed from the
-per-minute sparklines on `/_tcr/status` (`reqPerMinute`, documented under `tcr status`). It reads
-`none` when no proxy answered, which is a different fact from `0`: a proxy that is up and idle is
-healthy, and only the first of those is exit **3**.
+`requests10m` is how many requests Claude Code sent through this proxy in the last ten minutes,
+summed from the per-minute sparklines of the Claude sessions on `/_tcr/status` (`reqPerMinute`,
+documented under `tcr status`). Codex sessions are left out, because a proxy busy with codex says
+nothing about whether Claude Code reaches it. It reads `none` when no proxy answered, which is a
+different fact from `0`: a proxy that is up and idle is healthy, and only the first of those is
+exit **3**.
 
 `portHolder` is whoever is listening on the port, by pid and process name, from the same listener
 enumeration `tcr server` uses to decide a takeover. It answers the case the verdict line cannot:
@@ -1291,6 +1306,19 @@ anything in it. A proxy built before sessions existed and a completely idle one 
 rows, and the panel has a different sentence for each, so the two must stay distinguishable. The
 rows themselves are the same `SessionRow` shape `tcr status --json`'s payload documents above,
 verbatim.
+
+```
+$ tcr sessions
+supported=true sessions=2
+session=a1f3c2d4-0000-4000-8000-000000000001 account=alice@example.com model=claude-opus-5 requests=24 inputTokens=180000 outputTokens=9200 cacheReadTokens=160000 toolCalls=12 costUsd=1.2034
+session=019a3c5e-0000-7000-8000-000000000002 account=bob@example.com/codex provider=codex model=gpt-5.1-codex requests=7 inputTokens=95000 outputTokens=4100 cacheReadTokens=80000 toolCalls=3 costUsd=n/a reasoningTokens=1200
+```
+
+A Codex line carries ` provider=codex` after the account. No built-in price covers an OpenAI model,
+so its `costUsd=` reads `n/a` until a [`pricing`](configuration.md#pricing-and-usageretentiondays)
+entry covers one of its requests, then the priced part with the count it leaves out
+(`costUsd=0.4200 unpricedRequests=3`). ` reasoningTokens=` prints when the model reasoned. A Claude
+line keeps its figure as it always has, `0.0000` for a model this build has no price for included.
 
 `tcr status --json` is unchanged and still emits a bare array of accounts. The `supported` flag has
 nowhere to live in an array, which is why this is a separate verb rather than a flag on `status`.

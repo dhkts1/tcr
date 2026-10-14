@@ -747,6 +747,17 @@ fn prefix_session_key(
     Some(hasher.finish())
 }
 
+/// The conversation a Codex request names in its `session-id` header, trimmed; `None` when
+/// the header is absent, not ASCII, or blank. One reader for the two places that key on it:
+/// session affinity's tier 0 ([`stable_session_key`]) and the wire session `handle` records.
+fn codex_session_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(crate::provider::CODEX_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// Derive a STABLE affinity key from the client's most durable identity, so a
 /// session survives reconnects on one account (warm prompt cache). Priority:
 ///
@@ -834,12 +845,7 @@ fn stable_session_key(
     // one conversation, and one key shared by N sessions must not collapse them onto one
     // account, the same reason `metadata.user_id` outranks it on loopback.
     if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
-        if let Some(sid) = headers
-            .get(crate::provider::CODEX_SESSION_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(sid) = codex_session_id(headers) {
             return Some((stable_hash("sid:", sid), SessionKind::Stable));
         }
     }
@@ -3039,6 +3045,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             ),
         }
     };
+    // A Codex request names its conversation in the `session-id` header, the key affinity
+    // already pins on. Its body is usually zstd, so the peek above read nothing from it, and
+    // the header is the one place a Codex turn says which session it belongs to.
+    let wire_session_id = if provider == crate::provider::Provider::Codex {
+        codex_session_id(&req_headers).map(str::to_string)
+    } else {
+        wire_session_id
+    };
     // Whether THIS request targets a Fable model — the same classification
     // selection uses (`select.rs`). Threaded into every fleet-exhausted 429 so the
     // `retry-after` hint reflects the Fable-scoped weekly gate for a Fable request
@@ -4733,14 +4747,24 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
         // `None`. Cloned, not moved: the usage-recording arms below (streamed and
         // non-streamed) still need `account_name`/`request_model`/`wire_session_id`.
-        manager.record_wire_session(
-            wire_session_id.as_deref(),
-            account_name.clone(),
-            request_model.clone(),
-            served_at,
-            &wire_tool_uses,
-            &wire_tool_results,
-        );
+        // A Codex request carries no tool events in its body (a zstd body is never read), and its
+        // arrival closes the calls its session's previous response started.
+        if provider == crate::provider::Provider::Codex {
+            manager.record_codex_wire_session(
+                wire_session_id.as_deref(),
+                account_name.clone(),
+                served_at,
+            );
+        } else {
+            manager.record_wire_session(
+                wire_session_id.as_deref(),
+                account_name.clone(),
+                request_model.clone(),
+                served_at,
+                &wire_tool_uses,
+                &wire_tool_results,
+            );
+        }
         manager.push_log(RequestLogEntry {
             time: served_at,
             method: method.to_string(),
@@ -4830,6 +4854,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     stream_error,
                     tool_uses: response_tool_uses,
                     bound_tokens,
+                    codex_tool_calls,
                 } = parse_sse_usage(byte_stream, provider).await;
                 // Who minted the account-bound tokens in this turn. Recorded before anything
                 // else the parse learned, because it is the only one of them that changes how a
@@ -4840,10 +4865,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // just ended, so the client is beginning them as this line runs. Outside the
                 // usage guard below on purpose: a turn that emitted tool calls but reported
                 // no usage still has tools running.
+                let stream_ended = OffsetDateTime::now_utc();
                 manager_side.record_wire_session_tool_uses(
                     wire_session_id_for_usage.as_deref(),
-                    OffsetDateTime::now_utc(),
+                    stream_ended,
                     &response_tool_uses,
+                );
+                // The Codex twin: the calls this turn's finished output items asked for,
+                // running from the same instant with their own timeouts. Empty on an
+                // Anthropic stream.
+                manager_side.record_codex_wire_session_calls(
+                    wire_session_id_for_usage.as_deref(),
+                    stream_ended,
+                    &codex_tool_calls,
                 );
                 if parsed.input_total > 0 || parsed.output > 0 {
                     // The REQUEST's model whenever its body named one. `response_model` is set
@@ -4871,15 +4905,31 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         output_tokens = parsed.output,
                         "request usage"
                     );
-                    manager_side.record_wire_session_usage(
-                        wire_session_id_for_usage.as_deref(),
-                        record.model.as_deref(),
-                        record.input,
-                        record.cache_5m,
-                        record.cache_1h,
-                        record.cache_read,
-                        record.output,
-                    );
+                    // A Codex session also keeps the turn's reasoning tokens, and its model is
+                    // the one the ledger files the turn under: the stream's, in practice, since
+                    // a Codex body is usually zstd and names none tcr can read.
+                    if provider == crate::provider::Provider::Codex {
+                        manager_side.record_codex_wire_session_usage(
+                            wire_session_id_for_usage.as_deref(),
+                            record.model.as_deref(),
+                            record.input,
+                            record.cache_5m,
+                            record.cache_1h,
+                            record.cache_read,
+                            record.output,
+                            parsed.reasoning,
+                        );
+                    } else {
+                        manager_side.record_wire_session_usage(
+                            wire_session_id_for_usage.as_deref(),
+                            record.model.as_deref(),
+                            record.input,
+                            record.cache_5m,
+                            record.cache_1h,
+                            record.cache_read,
+                            record.output,
+                        );
+                    }
                     manager_side.record_usage(idx, record);
                 }
                 // Sibling of the usage guard above, not nested in it: an error
@@ -5104,15 +5154,30 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     output_tokens = parsed.output,
                     "request usage"
                 );
-                manager.record_wire_session_usage(
-                    wire_session_id.as_deref(),
-                    record.model.as_deref(),
-                    record.input,
-                    record.cache_5m,
-                    record.cache_1h,
-                    record.cache_read,
-                    record.output,
-                );
+                // No Codex tool calls are read here: codex streams its turns, so a
+                // non-streamed Responses object comes only from a client that is not codex.
+                if provider == crate::provider::Provider::Codex {
+                    manager.record_codex_wire_session_usage(
+                        wire_session_id.as_deref(),
+                        record.model.as_deref(),
+                        record.input,
+                        record.cache_5m,
+                        record.cache_1h,
+                        record.cache_read,
+                        record.output,
+                        parsed.reasoning,
+                    );
+                } else {
+                    manager.record_wire_session_usage(
+                        wire_session_id.as_deref(),
+                        record.model.as_deref(),
+                        record.input,
+                        record.cache_5m,
+                        record.cache_1h,
+                        record.cache_read,
+                        record.output,
+                    );
+                }
                 manager.record_usage(idx, record);
             }
         } else {
@@ -5921,6 +5986,10 @@ struct ParsedUsage {
     /// ephemeral_1h: 0}` — and reading that 0 as "no data" hands the whole
     /// write to the request's 1h flag and prices it at 2x instead of 1.25x.
     cache_creation_1h: Option<u64>,
+    /// A Codex turn's reasoning tokens (`output_tokens_details.reasoning_tokens`): the part
+    /// of `output` its model spent reasoning, already counted inside `output`. Always 0 for
+    /// an Anthropic turn, whose usage reports no such split.
+    reasoning: u64,
 }
 
 /// Extract the cache-read + cache-creation components of a `usage` object,
@@ -6159,6 +6228,7 @@ fn usage_from_json(bytes: &[u8], provider: crate::provider::Provider) -> JsonPar
             cache_read,
             cache_creation,
             cache_creation_1h,
+            reasoning: 0,
         },
         model: None,
     }
@@ -6174,7 +6244,8 @@ struct CodexSseParse {
 /// A Codex `usage` object in the ledger's shape. `input_tokens` INCLUDES both cache parts,
 /// `input_tokens_details.cached_tokens` (read from the cache) and
 /// `input_tokens_details.cache_write_tokens` (written to it), and `output_tokens` includes
-/// reasoning (`openai/codex` `codex-api/src/sse/responses.rs:105-160`). The one reader for
+/// reasoning, with `output_tokens_details.reasoning_tokens` naming how much (`openai/codex`
+/// `codex-api/src/sse/responses.rs:105-160`). The one reader for
 /// both places a Codex turn reports its usage, a stream's terminal event
 /// ([`codex_terminal_usage`]) and a non-streamed Responses object ([`usage_from_json`]), so
 /// the two cannot disagree.
@@ -6191,6 +6262,9 @@ fn codex_parsed_usage(usage: &Value) -> ParsedUsage {
         // the question to `usage_record`'s fallback, which reads the REQUEST's Anthropic
         // `cache_control` ttl, and that is no evidence about a Codex body.
         cache_creation_1h: Some(0),
+        reasoning: usage
+            .get("output_tokens_details")
+            .map_or(0, |d| get(d, "reasoning_tokens")),
     }
 }
 
@@ -6393,9 +6467,11 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 /// `error`, whose shape is OpenAI's. A Codex stream's usage is its terminal
 /// `response.completed` / `response.incomplete` event alone, read by [`codex_terminal_usage`],
 /// which also yields the model: a Codex request body is usually zstd, and the stream is the
-/// place tcr reads a Codex turn's model. Its failures are classified by the same
-/// rules as Anthropic's, in Codex's vocabulary. A `response.failed` event is recorded under its
-/// `response.error.code` and an `error` event under its nested `error.code`
+/// place tcr reads a Codex turn's model. A finished output item that is a tool call
+/// (`response.output_item.done`, read by [`crate::session_wire::codex_tool_call_from_item`])
+/// becomes one of [`SseParse::codex_tool_calls`]. The stream's failures are classified by the
+/// same rules as Anthropic's, in Codex's vocabulary. A `response.failed` event is recorded
+/// under its `response.error.code` and an `error` event under its nested `error.code`
 /// ([`codex_error_kind`]), the first one winning; `response.incomplete` is not a failure here,
 /// because the turn's tokens were spent and are counted. A Codex turn ends in
 /// `response.completed`, `response.incomplete` or `response.failed`, and a stream that ends
@@ -6427,6 +6503,7 @@ where
     let mut open_tool_blocks: std::collections::HashMap<u64, OpenToolBlock> =
         std::collections::HashMap::new();
     let mut tool_uses: Vec<crate::session_wire::ToolUseEvent> = Vec::new();
+    let mut codex_tool_calls = Vec::new();
     // Account-bound tokens this turn minted — the message id, every server-tool id, every
     // thinking signature, every redacted-thinking payload. See `crate::bound_tokens`.
     let mut bound_tokens: Vec<MintedToken> = Vec::new();
@@ -6468,6 +6545,18 @@ where
                     stream_error = Some(codex_error_kind(value.get("error")));
                 }
                 _ => {}
+            }
+            // A tool call the client runs: a finished output item only, never the
+            // `response.output_item.added` that announces one before its arguments are complete.
+            if value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && codex_tool_calls.len() < crate::session_wire::PENDING_TOOL_CAP
+            {
+                if let Some(call) = value
+                    .get("item")
+                    .and_then(crate::session_wire::codex_tool_call_from_item)
+                {
+                    codex_tool_calls.push(call);
+                }
             }
             continue;
         }
@@ -6694,6 +6783,7 @@ where
         stream_error,
         tool_uses,
         bound_tokens,
+        codex_tool_calls,
     }
 }
 
@@ -6761,6 +6851,10 @@ struct SseParse {
     tool_uses: Vec<crate::session_wire::ToolUseEvent>,
     /// Every account-bound token the turn minted — see [`crate::bound_tokens`].
     bound_tokens: Vec<MintedToken>,
+    /// Every tool call a Codex stream's finished output items asked for, in stream order, at
+    /// most `PENDING_TOOL_CAP` of them; always empty on an Anthropic stream, whose calls are
+    /// `tool_uses`.
+    codex_tool_calls: Vec<crate::session_wire::CodexToolCall>,
 }
 
 /// One `tool_use` content block being assembled across SSE events — see [`parse_sse_usage`].
@@ -8948,6 +9042,364 @@ mod tests {
         parse_sse_usage(stream, crate::provider::Provider::Codex).await
     }
 
+    /// A Codex turn's reasoning tokens are read off the same usage object as the rest, under
+    /// `output_tokens_details.reasoning_tokens`, from a stream's closing event and from a
+    /// non-streamed Responses object alike. They stay inside `output`, which is what the
+    /// model billed. An Anthropic body has none.
+    #[test]
+    fn codex_reasoning_tokens_parse_from_the_response() {
+        let streamed =
+            codex_usage_from_event(CODEX_COMPLETED).expect("a completed event has usage");
+        assert_eq!((streamed.usage.reasoning, streamed.usage.output), (10, 40));
+        let body = br#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-6-astra","output":[],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":110}}"#;
+        let json = usage_from_json(body, crate::provider::Provider::Codex);
+        assert_eq!((json.usage.reasoning, json.usage.output), (5, 10));
+        let anthropic = usage_from_json(
+            br#"{"usage":{"input_tokens":7,"output_tokens":3}}"#,
+            crate::provider::Provider::Anthropic,
+        );
+        assert_eq!(anthropic.usage.reasoning, 0);
+    }
+
+    /// A finished `function_call` item in a Codex stream is a tool call the client is about
+    /// to run. The tee turns it into a running call on the request's session, headed by the
+    /// command it runs and carrying its own timeout (`timeout_ms` in whole seconds). The call
+    /// is a one-shot `exec_command`, the only schema whose arguments carry a timeout, which
+    /// codex offers when managed requirements turn unified exec off. Only the finished item
+    /// counts: `response.output_item.added`, which announces the same call, is not a second
+    /// call, and arguments are read from the finished item only.
+    #[tokio::test]
+    async fn a_codex_function_call_starts_a_running_tool_with_its_timeout() {
+        const STREAM: &str = concat!(
+            "event: response.output_item.added\n",
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec_command","arguments":""}}"#,
+            "\n\n",
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"cargo build\",\"timeout_ms\":120000}"}}"#,
+            "\n\n",
+            "event: response.completed\n",
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.1-codex","usage":{"input_tokens":12,"output_tokens":3}}}"#,
+            "\n\n",
+        );
+        let parsed = parse_codex_stream(STREAM).await;
+        assert_eq!(
+            parsed.codex_tool_calls,
+            vec![crate::session_wire::CodexToolCall {
+                event: crate::session_wire::ToolUseEvent {
+                    id: "call_1".to_string(),
+                    name: Some("exec_command".to_string()),
+                    command_head: Some("cargo build".to_string()),
+                    command_class: Some(crate::session_wire::CommandClass::Build),
+                },
+                timeout_seconds: Some(120),
+            }]
+        );
+
+        // The same stream through the handler starts the call on the request's session.
+        let codex_url = spawn_fixed_origin("text/event-stream", STREAM).await;
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+                ("session-id", "sess-tool"),
+            ],
+            r#"{"input":[]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        // Started by the tee's detached task, which can finish after the client reads EOF.
+        let running = || -> Vec<tcr_status_wire::RunningToolRow> {
+            manager
+                .snapshot(OffsetDateTime::now_utc())
+                .wire_sessions
+                .into_iter()
+                .find(|row| row.session_id == "sess-tool")
+                .map(|row| row.tools.running)
+                .unwrap_or_default()
+        };
+        let mut polls = 0u32;
+        while running().is_empty() && polls < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            polls += 1;
+        }
+        let running = running();
+        assert_eq!(running.len(), 1, "polls: {polls}");
+        assert_eq!(
+            (
+                running[0].tool.as_str(),
+                running[0].command_head.as_deref(),
+                running[0].command_class.as_deref(),
+                running[0].timeout_seconds
+            ),
+            (
+                "exec_command",
+                Some("cargo build"),
+                Some("build"),
+                Some(120)
+            )
+        );
+    }
+
+    /// A local shell call and an `exec_command` both run a command line, so both are headed
+    /// and classified by the normalizer a Claude `Bash` call goes through: `git push` reads as
+    /// a network round trip whichever client ran it. The argv a local shell call wraps its
+    /// script in (`bash -lc <script>`) is unwrapped first; codex parses that item, though it
+    /// never offers the tool. The default interactive `exec_command` names no timeout: its
+    /// `yield_time_ms` is a yield interval, so that call carries none. An output item that is
+    /// no tool call is skipped.
+    #[tokio::test]
+    async fn a_codex_local_shell_call_is_a_shell_command() {
+        let parsed = parse_codex_stream(concat!(
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"local_shell_call","id":"lsh_1","call_id":"call_2","status":"completed","action":{"type":"exec","command":["bash","-lc","git push origin main"],"timeout_ms":30000}}}"#,
+            "\n\n",
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_3","call_id":"call_3","name":"exec_command","arguments":"{\"cmd\":\"cargo test -p example\",\"yield_time_ms\":10000}"}}"#,
+            "\n\n",
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","output_index":2,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}"#,
+            "\n\n",
+            "event: response.completed\n",
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.1-codex","usage":{"input_tokens":12,"output_tokens":3}}}"#,
+            "\n\n",
+        ))
+        .await;
+        use crate::session_wire::CommandClass;
+        // (call id, tool, head, class, timeout)
+        type Call<'a> = (
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<CommandClass>,
+            Option<u64>,
+        );
+        let calls: Vec<Call> = parsed
+            .codex_tool_calls
+            .iter()
+            .map(|c| {
+                (
+                    c.event.id.as_str(),
+                    c.event.name.as_deref(),
+                    c.event.command_head.as_deref(),
+                    c.event.command_class,
+                    c.timeout_seconds,
+                )
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "call_2",
+                    Some("local_shell_call"),
+                    Some("git push origin main"),
+                    Some(CommandClass::GitNet),
+                    Some(30)
+                ),
+                (
+                    "call_3",
+                    Some("exec_command"),
+                    Some("cargo test -p example"),
+                    Some(CommandClass::Build),
+                    None
+                ),
+            ]
+        );
+    }
+
+    /// The Codex item read lives in the Codex branch alone. An Anthropic stream's `tool_use`
+    /// blocks come out exactly as before, with no Codex call beside them, and a Codex-shaped
+    /// event on an Anthropic stream is no call of either kind.
+    #[tokio::test]
+    async fn anthropic_tool_parsing_is_unchanged() {
+        let stream_text = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":7,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cargo build\"}"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(stream_text))]);
+        let parsed = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        assert!(
+            parsed.codex_tool_calls.is_empty(),
+            "an Anthropic stream carries no Codex call"
+        );
+        let heads: Vec<(&str, Option<&str>)> = parsed
+            .tool_uses
+            .iter()
+            .map(|t| (t.id.as_str(), t.command_head.as_deref()))
+            .collect();
+        assert_eq!(heads, vec![("toolu_1", Some("cargo build"))]);
+    }
+
+    /// A Codex request's session is the one its `session-id` header names, trimmed: the
+    /// header session affinity pins on. A Codex body is usually zstd, so the header is the
+    /// one place a Codex turn says which conversation it belongs to. The row is a Codex one,
+    /// attributed to the account that served it. On an Anthropic request the header names
+    /// nothing, because its session comes from `metadata.user_id` as before, and a blank
+    /// header names no session at all.
+    #[tokio::test]
+    async fn the_codex_session_id_header_names_the_wire_session() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let codex_echo = CapturingUpstream::spawn().await;
+        let manager =
+            Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_echo.url), None);
+        let codex = |sid: &'static str| {
+            [
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+                ("session-id", sid),
+            ]
+        };
+        for (path, headers, body) in [
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                codex("  s-1  "),
+                r#"{"input":[]}"#,
+            ),
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                codex("   "),
+                r#"{"input":[]}"#,
+            ),
+            (
+                "/v1/messages",
+                [
+                    ("content-type", "application/json"),
+                    ("anthropic-version", "2023-06-01"),
+                    ("session-id", "s-2"),
+                ],
+                r#"{"model":"claude-opus-5","messages":[]}"#,
+            ),
+        ] {
+            let (status, bytes) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                path,
+                Some(loopback_peer()),
+                &headers,
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        // Recorded at the terminal outcome, before the response is built: nothing to wait for.
+        let rows = manager.snapshot(OffsetDateTime::now_utc()).wire_sessions;
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["s-1"],
+            "the blank header and the Anthropic request name no session"
+        );
+        assert_eq!(rows[0].provider.as_deref(), Some("codex"));
+        assert_eq!(rows[0].account.as_deref(), Some("bob@example.com/codex"));
+        assert_eq!(rows[0].requests, 1);
+    }
+
+    /// A Codex request tcr answers itself is no request on its session. tcr answers a request
+    /// itself when every upstream answer was a 403, and again when a request meets the hold
+    /// that 403 arms (`REFUSED_HOLD_SECONDS`) while no other Codex account can serve, unless
+    /// the hold is about to end and the request waits it out instead. Such a request never
+    /// reaches the terminal outcome: it is not counted on its session and closes none of the
+    /// calls the session's last response started, as a Claude `tool_result` in such a request
+    /// closes nothing. The calls close on the next request tcr serves.
+    #[tokio::test]
+    async fn a_codex_request_tcr_answers_itself_closes_no_call() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let (codex_origin, attempts) = spawn_counted_upstream(vec![Some(raw_403())]).await;
+        let manager = Manager::with_live_refresher(
+            codex_fleet(&anthropic_echo.url, &format!("http://{codex_origin}")),
+            None,
+        );
+        let started = OffsetDateTime::now_utc();
+        manager.record_codex_wire_session(
+            Some("sess-held"),
+            Some("bob@example.com/codex".to_string()),
+            started,
+        );
+        manager.record_codex_wire_session_calls(
+            Some("sess-held"),
+            started,
+            &[crate::session_wire::CodexToolCall {
+                event: crate::session_wire::ToolUseEvent {
+                    id: "call_1".to_string(),
+                    name: Some("exec_command".to_string()),
+                    command_head: Some("cargo test".to_string()),
+                    command_class: Some(crate::session_wire::CommandClass::Build),
+                },
+                timeout_seconds: None,
+            }],
+        );
+        // The first meets the upstream 403, which holds bob; the second meets the hold.
+        for attempt in ["the upstream 403", "the hold it arms"] {
+            let (status, body) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                    ("session-id", "sess-held"),
+                ],
+                r#"{"input":[]}"#,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "{attempt}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the hold answered the second request: it never reached the origin"
+        );
+        let row = manager
+            .snapshot(OffsetDateTime::now_utc())
+            .wire_sessions
+            .into_iter()
+            .find(|row| row.session_id == "sess-held")
+            .expect("the session the test seeded");
+        assert_eq!(
+            row.requests, 1,
+            "a request tcr answers itself is not counted"
+        );
+        assert_eq!(
+            (row.tools.calls, row.tools.running.len()),
+            (0, 1),
+            "call_1 still runs: nothing tcr answered itself closed it"
+        );
+    }
+
     /// **The terminal-type gate.** A `response.failed` event is no usage, whatever it carries:
     /// this one is [`CODEX_COMPLETED`] with nothing changed but its type, usage block and all,
     /// so only the gate in [`codex_terminal_usage`] keeps it out of the ledger.
@@ -9388,6 +9840,7 @@ mod tests {
             cache_read: 500,
             cache_creation: 0,
             cache_creation_1h: None,
+            reasoning: 0,
         };
         let record = usage_record(&nothing_cached, None, None, || {
             asked += 1;
@@ -9424,6 +9877,7 @@ mod tests {
             cache_read: 0,
             cache_creation: 900,
             cache_creation_1h: Some(400),
+            reasoning: 0,
         };
         let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || {
             panic!("the request body must not be parsed when the response reported its split")

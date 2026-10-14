@@ -244,7 +244,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::session_wire::{RunningTool, SlowTool, ToolStats};
+    use crate::provider::Provider;
+    use crate::session_wire::{ModelTokenTally, RunningTool, SlowTool, ToolStats};
 
     fn tmp(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -274,6 +275,7 @@ mod tests {
             req_per_minute: Default::default(),
             by_model: Default::default(),
             cache_ttl_secs: None,
+            ..Default::default()
         }
     }
 
@@ -379,6 +381,7 @@ mod tests {
                 started_ms: now - 500,
                 command_head: Some("until grep -q ready log; do sleep 1; done".to_string()),
                 command_class: Some(crate::session_wire::CommandClass::Wait),
+                timeout_seconds: None,
             },
         );
         let mut sessions = HashMap::new();
@@ -387,6 +390,66 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("read back the file as a string");
         assert!(raw.contains("until grep -q ready log"));
+    }
+
+    /// The new keys are additive. A file written before a session knew its provider, its
+    /// reasoning tokens or a model tally's request count still loads, as the Anthropic
+    /// session it was, with zeros, instead of taking the whole file down. An Anthropic
+    /// session writes no `provider` key at all, and a Codex session round-trips every new key.
+    #[test]
+    fn sessions_persisted_without_the_new_keys_still_load() {
+        let path = tmp("pre-codex");
+        let now = 1_000_000;
+        let mut before = session("alice@example.com", now, 2);
+        before.by_model.insert(
+            "claude-sonnet-5".to_string(),
+            ModelTokenTally {
+                input: 5,
+                ..Default::default()
+            },
+        );
+        let mut old = serde_json::to_value(&before).expect("a session serializes");
+        let fields = old.as_object_mut().expect("a session is an object");
+        assert!(
+            fields.get("provider").is_none(),
+            "an Anthropic session writes no provider key"
+        );
+        fields.remove("reasoning_tokens");
+        fields["by_model"]["claude-sonnet-5"]
+            .as_object_mut()
+            .expect("a tally is an object")
+            .remove("requests");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "version": FORMAT_VERSION, "savedAtMs": now, "sessions": { "sess-old": old } })
+                .to_string(),
+        )
+        .expect("write a file in the old shape");
+        let report = load(&path, now, RESTORE_TTL_MS);
+        assert_eq!(report.degraded, None);
+        let restored = &report.sessions["sess-old"];
+        assert_eq!(restored.provider, Provider::Anthropic);
+        assert_eq!(restored.reasoning_tokens, 0);
+        assert_eq!(restored.by_model["claude-sonnet-5"].requests, 0);
+        assert_eq!(restored.by_model["claude-sonnet-5"].input, 5);
+
+        let mut codex = session("bob@example.com/codex", now, 3);
+        codex.provider = Provider::Codex;
+        codex.reasoning_tokens = 1_200;
+        codex.by_model.insert(
+            "gpt-5.1-codex".to_string(),
+            ModelTokenTally {
+                requests: 7,
+                ..Default::default()
+            },
+        );
+        let mut sessions = HashMap::new();
+        sessions.insert("sess-codex".to_string(), codex);
+        save(&path, &sessions, now).expect("save");
+        let back = &load(&path, now, RESTORE_TTL_MS).sessions["sess-codex"];
+        assert_eq!(back.provider, Provider::Codex);
+        assert_eq!(back.reasoning_tokens, 1_200);
+        assert_eq!(back.by_model["gpt-5.1-codex"].requests, 7);
     }
 
     /// A session whose last request was longer ago than the TTL is dropped at

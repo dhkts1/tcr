@@ -3404,24 +3404,52 @@ fn render_sessions_json(supported: bool, sessions: &[tcr_status_wire::SessionRow
 
 /// The `tcr sessions` text form: a `supported=… sessions=…` header, then one line per
 /// session, every line ending in a newline. A pure function, so a test can pin the bytes
-/// a person reads without a running proxy.
+/// a person reads without a running proxy. A Codex row adds ` provider=codex` after its
+/// account and ` reasoningTokens=` when non-zero, and prints its cost through
+/// [`session_cost`], while a Claude row prints exactly as before.
 fn render_sessions_text(supported: bool, sessions: &[tcr_status_wire::SessionRow]) -> String {
     let mut out = format!("supported={supported} sessions={}\n", sessions.len());
     for row in sessions {
         out.push_str(&format!(
-            "session={} account={} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={:.4}\n",
+            "session={} account={}{} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={}{}\n",
             row.session_id,
             row.account.as_deref().unwrap_or("-"),
+            row.provider
+                .as_deref()
+                .map(|p| format!(" provider={p}"))
+                .unwrap_or_default(),
             row.model.as_deref().unwrap_or("-"),
             row.requests,
             row.input_tokens,
             row.output_tokens,
             row.cache_read_tokens,
             row.tools.calls,
-            row.cost_usd,
+            session_cost(row),
+            if row.reasoning_tokens > 0 {
+                format!(" reasoningTokens={}", row.reasoning_tokens)
+            } else {
+                String::new()
+            },
         ));
     }
     out
+}
+
+/// The value of `costUsd=` on a `tcr sessions` line. A Claude row prints its list-price
+/// figure as it always has, `0.0000` for a model this build cannot price included. A Codex
+/// row never prints a zero nobody measured. It reads `n/a` until one of its requests is
+/// priced, then the priced part, with the count it leaves out while some still are not.
+fn session_cost(row: &tcr_status_wire::SessionRow) -> String {
+    if row.provider.is_none() || (row.cost_usd > 0.0 && row.unpriced_requests == 0) {
+        format!("{:.4}", row.cost_usd)
+    } else if row.cost_usd > 0.0 {
+        format!(
+            "{:.4} unpricedRequests={}",
+            row.cost_usd, row.unpriced_requests
+        )
+    } else {
+        "n/a".to_string()
+    }
 }
 
 /// `tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the
@@ -7352,6 +7380,51 @@ mod tests {
         assert_eq!(
             render_sessions_text(false, &[]),
             "supported=false sessions=0\n"
+        );
+    }
+
+    /// A Codex session's line names its provider after the account and never prints a cost
+    /// nobody measured: `costUsd=n/a` while no request was priced, including before its first
+    /// response finished; the priced part and the count it leaves out when only some were; the
+    /// plain figure when all were. Reasoning tokens print when there are any.
+    #[test]
+    fn a_codex_session_line_carries_provider_and_its_unpriced_figures() {
+        let codex =
+            |id: &str, cost: f64, unpriced: u64, reasoning: u64| -> tcr_status_wire::SessionRow {
+                serde_json::from_value(serde_json::json!({
+                    "sessionId": id,
+                    "account": "bob@example.com/codex",
+                    "provider": "codex",
+                    "model": "gpt-5.1-codex",
+                    "firstSeenMs": 1_767_224_880_000_i64,
+                    "lastSeenMs": 1_767_225_599_000_i64,
+                    "requests": 7,
+                    "inputTokens": 95_000,
+                    "outputTokens": 4_100,
+                    "cacheReadTokens": 80_000,
+                    "tools": { "calls": 3 },
+                    "costUsd": cost,
+                    "unpricedRequests": unpriced,
+                    "reasoningTokens": reasoning
+                }))
+                .expect("a Codex session row")
+            };
+        let rows = [
+            codex("019a3c5e-0000-7000-8000-000000000002", 0.0, 7, 1_200),
+            codex("44444444-4444-4444-8444-444444444444", 0.42, 3, 0),
+            codex("55555555-5555-4555-8555-555555555555", 1.5, 0, 0),
+            codex("66666666-6666-4666-8666-666666666666", 0.0, 0, 0),
+        ];
+        let tail = "account=bob@example.com/codex provider=codex model=gpt-5.1-codex requests=7 inputTokens=95000 outputTokens=4100 cacheReadTokens=80000 toolCalls=3";
+        assert_eq!(
+            render_sessions_text(true, &rows),
+            format!(
+                "supported=true sessions=4\n\
+                 session=019a3c5e-0000-7000-8000-000000000002 {tail} costUsd=n/a reasoningTokens=1200\n\
+                 session=44444444-4444-4444-8444-444444444444 {tail} costUsd=0.4200 unpricedRequests=3\n\
+                 session=55555555-5555-4555-8555-555555555555 {tail} costUsd=1.5000\n\
+                 session=66666666-6666-4666-8666-666666666666 {tail} costUsd=n/a\n"
+            )
         );
     }
 

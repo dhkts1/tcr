@@ -29,6 +29,12 @@
 //! request carries a `tool_use` and its `tool_result` together, so the request side alone can
 //! never show a tool still running.
 //!
+//! A Codex session is keyed on codex's `session-id` header, not on `metadata.user_id`. Its
+//! calls come from the response stream's finished output items
+//! ([`codex_tool_call_from_item`]), run from the stream's end, and close when the session's
+//! next request arrives ([`WireSessionTracker::record_codex_request`]). None of its request
+//! bodies is read.
+//!
 //! `command_head` (capped to 120 chars; the per-tool shape is on
 //! [`ToolUseEvent::command_head`]) is held in this in-memory table and is never written to
 //! `~/.cache/teamclaude/logs` or any other log file — the same
@@ -58,7 +64,8 @@ pub struct ToolUseEvent {
     pub id: String,
     pub name: Option<String>,
     /// What this call is DOING, for the panel row that would otherwise print the bare tool
-    /// name. Built by [`tool_use_event_from_block`], always capped at [`COMMAND_HEAD_MAX`]
+    /// name. Built by [`tool_use_event_from_block`] for a Claude call and by
+    /// [`codex_tool_call_from_item`] for a Codex one, always capped at [`COMMAND_HEAD_MAX`]
     /// characters:
     ///
     /// - `Bash` — the NORMALIZED first 120 characters of `input.command`, see
@@ -1480,6 +1487,132 @@ pub fn tool_use_event_from_block(
     }
 }
 
+/// One tool call a Codex response asked for: the event every tool row is built from, plus
+/// the call's own timeout, which a Claude `tool_use` never carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexToolCall {
+    pub event: ToolUseEvent,
+    /// The call's `timeout_ms` in whole seconds, rounded up; `None` when its arguments
+    /// named no timeout, or a zero one.
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Most bytes of a function call's `arguments` string that [`codex_tool_call_from_item`]
+/// decodes. Only a 120-character head is ever displayed, so this is display slack, as the
+/// proxy's own cap is for a streamed Claude `tool_use` input. A larger call still counts,
+/// under its bare tool name and with no timeout.
+const CODEX_ARGUMENTS_CAP: usize = 64 * 1024;
+
+/// The tool call one finished Codex output item asked for, or `None` for an item that is
+/// no tool call (a message, a reasoning item) or names no call id. Item and argument names
+/// are `openai/codex`'s at f82e365:
+/// - the finished item under `item` of a `response.output_item.done` event
+///   (`codex-api/src/sse/responses.rs:159-168,344-360,366-376`);
+/// - the `function_call`, `custom_tool_call` and `local_shell_call` shapes
+///   (`protocol/src/models.rs:1024-1027,1082-1123,1167-1187`; `core/src/tools/router.rs:257-309`);
+/// - the interactive `exec_command`'s `cmd` and `yield_time_ms`
+///   (`core/src/tools/handlers/shell_spec.rs:24-115`), and the one-shot `exec_command`'s
+///   `timeout_ms` (`core/src/tools/spec_plan.rs:1276-1284`;
+///   `core/src/tools/handlers/unified_exec/exec_command.rs:103-108,126-138`);
+/// - `wait_agent`'s `timeout_ms` (`core/src/tools/handlers/multi_agents_spec.rs:287-313`), and
+///   apply_patch as a freeform tool (`core/src/tools/handlers/apply_patch_spec.rs:9-28`).
+///
+/// - A `function_call` names its tool and carries its arguments as a JSON object encoded
+///   in a string; a `custom_tool_call` (codex's freeform tools, apply_patch among them)
+///   carries raw text instead; a `local_shell_call` is a command line in `action` (codex
+///   parses that item, though at f82e365 it never offers the tool).
+/// - A shell command (`exec_command`'s `cmd`, or a local shell call's argv) is headed and
+///   classified by [`normalize_bash_command`], the normalizer a Claude `Bash` call goes
+///   through, so one command reads the same whichever client ran it. Every other tool is
+///   headed by its bare name, as an unlisted Claude tool is. A freeform call's `input` (for
+///   apply_patch, the whole patch) is never read.
+/// - `timeout_ms` from an `exec_command`'s arguments or a local shell call's action becomes
+///   whole seconds, rounded up. Without it, or with a zero one, the call carries no
+///   timeout, never a guessed one. Only the one-shot `exec_command`, which codex offers
+///   when managed requirements turn unified exec off, carries one: the default interactive
+///   `exec_command` has none, and its `yield_time_ms` is a yield interval, never read here.
+///   Another tool's `timeout_ms` is not read either: `wait_agent`'s bounds a wait on
+///   sub-agents, not a command.
+pub fn codex_tool_call_from_item(item: &Value) -> Option<CodexToolCall> {
+    // A fn, not a closure: a closure cannot tie its returned borrow to its argument's.
+    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        value.get(key).and_then(Value::as_str)
+    }
+    let (id, name, arguments) = match text(item, "type")? {
+        "function_call" => (
+            text(item, "call_id")?,
+            text(item, "name")?.to_string(),
+            text(item, "arguments")
+                .filter(|raw| raw.len() <= CODEX_ARGUMENTS_CAP)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok()),
+        ),
+        "custom_tool_call" => (
+            text(item, "call_id")?,
+            text(item, "name")?.to_string(),
+            None,
+        ),
+        "local_shell_call" => (
+            text(item, "call_id").or_else(|| text(item, "id"))?,
+            "local_shell_call".to_string(),
+            item.get("action").cloned(),
+        ),
+        _ => return None,
+    };
+    let command = match name.as_str() {
+        "exec_command" => arguments
+            .as_ref()
+            .and_then(|args| text(args, "cmd"))
+            .map(str::to_string),
+        "local_shell_call" => arguments
+            .as_ref()
+            .and_then(|args| args.get("command"))
+            .and_then(shell_script),
+        _ => None,
+    };
+    let (command_head, command_class) = match command {
+        Some(command) => {
+            let (head, class) = normalize_bash_command(&command);
+            (Some(head), Some(class))
+        }
+        None => (Some(name.chars().take(COMMAND_HEAD_MAX).collect()), None),
+    };
+    // A command's own deadline only: `wait_agent` also names a `timeout_ms`, and it is no
+    // command timeout.
+    let timeout_seconds = arguments
+        .as_ref()
+        .filter(|_| matches!(name.as_str(), "exec_command" | "local_shell_call"))
+        .and_then(|args| args.get("timeout_ms"))
+        .and_then(Value::as_u64)
+        .map(|ms| ms.div_ceil(1000))
+        .filter(|s| *s > 0);
+    Some(CodexToolCall {
+        event: ToolUseEvent {
+            id: id.to_string(),
+            name: Some(name),
+            command_head,
+            command_class,
+        },
+        timeout_seconds,
+    })
+}
+
+/// The script an argv runs: the last word of `<shell> -c <script>` or
+/// `<shell> -lc <script>` for `bash`, `sh` or `zsh` (by base name), which is how a shell
+/// call wraps one, and the argv joined by spaces otherwise. `None` for an empty argv or
+/// one that is not an array of strings.
+fn shell_script(argv: &Value) -> Option<String> {
+    let words: Vec<&str> = argv.as_array()?.iter().filter_map(Value::as_str).collect();
+    match words.as_slice() {
+        [] => None,
+        [shell, "-c" | "-lc", script]
+            if matches!(shell.rsplit('/').next(), Some("bash" | "sh" | "zsh")) =>
+        {
+            Some((*script).to_string())
+        }
+        _ => Some(words.join(" ")),
+    }
+}
+
 /// The host part of a URL. Hand-rolled rather than adding a URL crate for one display field:
 /// drop the scheme, cut at the first `/`, `?` or `#`, then drop any `user@` credentials prefix
 /// (which is exactly the part that must never reach a panel row). A string carrying none of
@@ -1513,6 +1646,11 @@ pub struct RunningTool {
     #[serde(default)]
     pub command_head: Option<String>,
     pub command_class: Option<CommandClass>,
+    /// The call's own deadline in whole seconds, when its arguments named one (a Codex call's
+    /// `timeout_ms`, which only codex's one-shot `exec_command` carries). `None` for every
+    /// Claude call: its deadline belongs to the tool, not to the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// One completed tool call, for the "ten slowest" list — and, with the same fields, for
@@ -1685,6 +1823,10 @@ pub struct ModelTokenTally {
     pub cache_1h: u64,
     pub cache_read: u64,
     pub output: u64,
+    /// How many usage records this tally holds, so a session can say how many of its requests
+    /// no price covers. `#[serde(default)]` so a cache file written before it still loads.
+    #[serde(default)]
+    pub requests: u64,
 }
 
 /// One session's row.
@@ -1722,6 +1864,19 @@ pub struct WireSession {
     /// field existed still loads.
     #[serde(default)]
     pub cache_ttl_secs: Option<u32>,
+    /// Which provider's client this session is: Codex for a session named by codex's
+    /// `session-id` header, Anthropic for every other. Persisted with a default, so a cache
+    /// file written before this field existed loads as the Anthropic sessions it holds, and
+    /// skipped when Anthropic, so a Claude-only fleet's file keeps its shape.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider::Provider::is_anthropic"
+    )]
+    pub provider: crate::provider::Provider,
+    /// A Codex session's reasoning tokens: the part of `output_tokens` its model spent
+    /// reasoning, already counted inside it. 0 on every Anthropic session.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 /// Tools whose `tool_use` block is the LAST content block of a turn, so the client never sends
@@ -1857,49 +2012,61 @@ impl WireSessionTracker {
         }
 
         for tu in tool_uses {
-            Self::insert_running(&mut entry.tools, tu, previous_response_end_ms);
+            Self::insert_running(&mut entry.tools, tu, previous_response_end_ms, None);
         }
 
         for tr in tool_results {
             if let Some(running) = entry.tools.running.remove(&tr.id) {
-                let seconds = (now_ms - running.started_ms).max(0) as f64 / 1000.0;
-                entry.tools.calls += 1;
-                if tr.is_error {
-                    entry.tools.errors += 1;
-                }
-                if seconds >= 60.0 {
-                    entry.tools.over_one_minute += 1;
-                }
-                entry
-                    .tools
-                    .by_tool
-                    .entry(running.tool.clone())
-                    .or_default()
-                    .record(seconds, tr.is_error);
-                let completed = SlowTool {
-                    tool: running.tool,
-                    seconds,
-                    command_head: running.command_head,
-                    command_class: running.command_class,
-                    ended_ms: now_ms,
-                };
-                if tr.timed_out {
-                    entry.tools.timeouts += 1;
-                    // The class if the classifier gave this call one, the tool's own name
-                    // otherwise — so the map sums to `timeouts` for every tool, not just
-                    // the `Bash` calls that have a class.
-                    let key = completed
-                        .command_class
-                        .map_or_else(|| completed.tool.clone(), |c| c.as_str().to_string());
-                    *entry.tools.timeouts_by_class.entry(key).or_insert(0) += 1;
-                    entry.tools.timed_out.insert(0, completed.clone());
-                    entry.tools.timed_out.truncate(TIMED_OUT_CAP);
-                }
-                Self::insert_slowest(&mut entry.tools.slowest, completed);
+                Self::complete_call(&mut entry.tools, running, now_ms, tr.is_error, tr.timed_out);
             }
         }
 
         self.evict_over_cap();
+    }
+
+    /// Fold one finished call into its session's aggregates: the counts, the tool's bucket,
+    /// the timeout tallies and the slowest list. Shared by a Claude `tool_result` and a Codex
+    /// session's next request, so the two can never count a call differently.
+    fn complete_call(
+        tools: &mut ToolStats,
+        running: RunningTool,
+        now_ms: i64,
+        is_error: bool,
+        timed_out: bool,
+    ) {
+        let seconds = (now_ms - running.started_ms).max(0) as f64 / 1000.0;
+        tools.calls += 1;
+        if is_error {
+            tools.errors += 1;
+        }
+        if seconds >= 60.0 {
+            tools.over_one_minute += 1;
+        }
+        tools
+            .by_tool
+            .entry(running.tool.clone())
+            .or_default()
+            .record(seconds, is_error);
+        let completed = SlowTool {
+            tool: running.tool,
+            seconds,
+            command_head: running.command_head,
+            command_class: running.command_class,
+            ended_ms: now_ms,
+        };
+        if timed_out {
+            tools.timeouts += 1;
+            // The class if the classifier gave this call one, the tool's own name
+            // otherwise — so the map sums to `timeouts` for every tool, not just
+            // the `Bash` calls that have a class.
+            let key = completed
+                .command_class
+                .map_or_else(|| completed.tool.clone(), |c| c.as_str().to_string());
+            *tools.timeouts_by_class.entry(key).or_insert(0) += 1;
+            tools.timed_out.insert(0, completed.clone());
+            tools.timed_out.truncate(TIMED_OUT_CAP);
+        }
+        Self::insert_slowest(&mut tools.slowest, completed);
     }
 
     /// Add token counts learned from a response's usage — a separate call because usage is
@@ -1926,25 +2093,43 @@ impl WireSessionTracker {
         output: u64,
     ) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
-            entry.input_tokens += base_input;
-            entry.cache_creation_tokens += cache_5m + cache_1h;
+            Self::add_usage(
+                entry, model, base_input, cache_5m, cache_1h, cache_read, output,
+            );
             if cache_1h > 0 {
                 entry.cache_ttl_secs = Some(3600);
             } else if cache_5m > 0 {
                 entry.cache_ttl_secs = Some(300);
             }
-            entry.output_tokens += output;
-            entry.cache_read_tokens += cache_read;
-            let tally = entry
-                .by_model
-                .entry(model.unwrap_or(UNKNOWN_MODEL).to_string())
-                .or_default();
-            tally.input += base_input;
-            tally.cache_5m += cache_5m;
-            tally.cache_1h += cache_1h;
-            tally.cache_read += cache_read;
-            tally.output += output;
         }
+    }
+
+    /// The token half of a response's usage, shared by [`Self::record_usage`] and
+    /// [`Self::record_codex_usage`]: the session's totals and its per-model tally, which also
+    /// counts the usage record, so a session can say how many of its requests no price covers.
+    fn add_usage(
+        entry: &mut WireSession,
+        model: Option<&str>,
+        base_input: u64,
+        cache_5m: u64,
+        cache_1h: u64,
+        cache_read: u64,
+        output: u64,
+    ) {
+        entry.input_tokens += base_input;
+        entry.cache_creation_tokens += cache_5m + cache_1h;
+        entry.output_tokens += output;
+        entry.cache_read_tokens += cache_read;
+        let tally = entry
+            .by_model
+            .entry(model.unwrap_or(UNKNOWN_MODEL).to_string())
+            .or_default();
+        tally.input += base_input;
+        tally.cache_5m += cache_5m;
+        tally.cache_1h += cache_1h;
+        tally.cache_read += cache_read;
+        tally.output += output;
+        tally.requests += 1;
     }
 
     /// Insert tool calls parsed from the RESPONSE this session's last request produced, as
@@ -1970,7 +2155,77 @@ impl WireSessionTracker {
     ) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             for tu in tool_uses {
-                Self::insert_running(&mut entry.tools, tu, now_ms);
+                Self::insert_running(&mut entry.tools, tu, now_ms, None);
+            }
+        }
+    }
+
+    /// Count one Codex request on `session_id`, creating it as a Codex session, and close
+    /// every call its previous response started.
+    ///
+    /// The close is the request's arrival. The request carries those calls' outputs in a body
+    /// that is usually zstd and is never read here, so its arrival is all there is to measure
+    /// by. Each call completes as a Claude `tool_result` completes one ([`Self::complete_call`]),
+    /// timed to `now_ms`, as neither an error nor a timeout, which tcr cannot see. Calls close
+    /// oldest first, so two that end together always sort the same way. Only this session's
+    /// calls close: the request names this session and no other.
+    pub fn record_codex_request(&mut self, session_id: &str, account: Option<String>, now_ms: i64) {
+        self.record_request(session_id, account, None, now_ms, &[], &[]);
+        if let Some(entry) = self.sessions.get_mut(session_id) {
+            entry.provider = crate::provider::Provider::Codex;
+            let mut open: Vec<(String, RunningTool)> = entry.tools.running.drain().collect();
+            open.sort_by(|a, b| {
+                a.1.started_ms
+                    .cmp(&b.1.started_ms)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (_, running) in open {
+                Self::complete_call(&mut entry.tools, running, now_ms, false, false);
+            }
+        }
+    }
+
+    /// Start the tool calls a Codex response asked for, as running from `now_ms` (the instant
+    /// its stream ended), each with its own timeout. The Codex twin of
+    /// [`Self::record_response_tool_uses`]: it never counts a request, moves `last_seen_ms`,
+    /// or creates a session.
+    pub fn record_codex_tool_calls(
+        &mut self,
+        session_id: &str,
+        now_ms: i64,
+        calls: &[CodexToolCall],
+    ) {
+        if let Some(entry) = self.sessions.get_mut(session_id) {
+            for call in calls {
+                Self::insert_running(&mut entry.tools, &call.event, now_ms, call.timeout_seconds);
+            }
+        }
+    }
+
+    /// Add one Codex response's usage. It keeps the same totals and per-model tally as
+    /// [`Self::record_usage`], with three differences. It stamps no cache TTL, because the 300 s
+    /// and 3600 s tiers are Anthropic's prompt cache. It keeps the reasoning tokens, which are
+    /// already inside `output`. And the usage's model names the session, because a Codex
+    /// request body is usually zstd, so the request named no model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_codex_usage(
+        &mut self,
+        session_id: &str,
+        model: Option<&str>,
+        base_input: u64,
+        cache_5m: u64,
+        cache_1h: u64,
+        cache_read: u64,
+        output: u64,
+        reasoning: u64,
+    ) {
+        if let Some(entry) = self.sessions.get_mut(session_id) {
+            Self::add_usage(
+                entry, model, base_input, cache_5m, cache_1h, cache_read, output,
+            );
+            entry.reasoning_tokens += reasoning;
+            if let Some(model) = model {
+                entry.model = Some(model.to_string());
             }
         }
     }
@@ -1979,7 +2234,12 @@ impl WireSessionTracker {
     /// is reached. An id already running is left ALONE — its recorded start is the earlier and
     /// therefore truer one (the response-side insert), and a later request replaying the same
     /// block must not reset the clock.
-    fn insert_running(tools: &mut ToolStats, tu: &ToolUseEvent, started_ms: i64) {
+    fn insert_running(
+        tools: &mut ToolStats,
+        tu: &ToolUseEvent,
+        started_ms: i64,
+        timeout_seconds: Option<u64>,
+    ) {
         if tools.running.contains_key(&tu.id) {
             return;
         }
@@ -2010,6 +2270,7 @@ impl WireSessionTracker {
                 started_ms,
                 command_head: tu.command_head.clone(),
                 command_class: tu.command_class,
+                timeout_seconds,
             },
         );
     }
@@ -2732,6 +2993,221 @@ mod tests {
         let head = uses[0].command_head.as_deref().expect("a head");
         assert_eq!(head.chars().count(), COMMAND_HEAD_MAX);
         assert!(head.starts_with("Read /tmp/aaa"));
+    }
+
+    /// What `session-wire.json` keeps of a Codex call stays inside what docs/architecture.md's
+    /// Files on disk table promises, "up to 120 characters of each slow or running tool call's
+    /// command": an `apply_patch` (a freeform `custom_tool_call` whose `input` is the raw patch)
+    /// is headed by its tool's name, never by the patch, and a long shell command is cut by the
+    /// same normalizer, to the same length, as a Claude `Bash` command.
+    #[test]
+    fn an_apply_patch_call_keeps_its_name_never_its_patch() {
+        let patch = codex_tool_call_from_item(&serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "call_1",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Update File: /Users/example/src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"
+        }))
+        .expect("a freeform tool call is a call");
+        assert_eq!(
+            (
+                patch.event.command_head.as_deref(),
+                patch.event.command_class,
+                patch.timeout_seconds
+            ),
+            (Some("apply_patch"), None, None)
+        );
+        let long = codex_tool_call_from_item(&serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_2",
+            "name": "exec_command",
+            "arguments": serde_json::json!({ "cmd": format!("cargo test {}", "x".repeat(400)) }).to_string()
+        }))
+        .expect("an exec_command call");
+        let head = long.event.command_head.expect("a shell command has a head");
+        assert!(head.chars().count() <= COMMAND_HEAD_MAX, "{head}");
+    }
+
+    /// A Codex call's `timeout_ms` becomes whole seconds, rounded up, so a sub-second deadline
+    /// never reads as no deadline at all; a zero one is no timeout. Only the one-shot
+    /// `exec_command` names a command timeout: the interactive one's `yield_time_ms` is a yield
+    /// interval, and `wait_agent`'s `timeout_ms` bounds a wait on sub-agents, so neither call
+    /// carries one.
+    #[test]
+    fn a_codex_timeout_is_whole_seconds_rounded_up() {
+        let timeout_of = |name: &str, arguments: serde_json::Value| {
+            codex_tool_call_from_item(&serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": name,
+                "arguments": arguments.to_string()
+            }))
+            .expect("a function call is a call")
+            .timeout_seconds
+        };
+        let one_shot = |ms: u64| {
+            timeout_of(
+                "exec_command",
+                serde_json::json!({ "cmd": "cargo build", "timeout_ms": ms }),
+            )
+        };
+        assert_eq!(one_shot(500), Some(1));
+        assert_eq!(one_shot(0), None);
+        assert_eq!(one_shot(120_000), Some(120));
+        assert_eq!(
+            timeout_of(
+                "exec_command",
+                serde_json::json!({ "cmd": "cargo build", "yield_time_ms": 10_000 })
+            ),
+            None,
+            "a yield interval is no timeout"
+        );
+        assert_eq!(
+            timeout_of(
+                "wait_agent",
+                serde_json::json!({ "targets": ["agent_1"], "timeout_ms": 30_000 })
+            ),
+            None,
+            "a wait on sub-agents is no command timeout"
+        );
+    }
+
+    /// A Codex tool call as the stream parse hands it over.
+    fn codex_call(id: &str, tool: &str, head: &str, timeout_seconds: Option<u64>) -> CodexToolCall {
+        CodexToolCall {
+            event: ToolUseEvent {
+                id: id.to_string(),
+                name: Some(tool.to_string()),
+                command_head: Some(head.to_string()),
+                command_class: Some(CommandClass::Build),
+            },
+            timeout_seconds,
+        }
+    }
+
+    /// A Codex call closes when the NEXT request on its session arrives. That request carries
+    /// the call's output, in a body tcr does not read, so its arrival is the close. The call
+    /// lands in the counts, its tool's bucket and the slowest list as a Claude call does, and
+    /// as neither an error nor a timeout, which tcr never saw.
+    #[test]
+    fn the_next_request_on_the_session_closes_its_codex_tools() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_codex_request("sess-c", Some("bob@example.com/codex".to_string()), 1_000);
+        tracker.record_codex_tool_calls(
+            "sess-c",
+            2_000,
+            &[codex_call(
+                "call_1",
+                "exec_command",
+                "cargo test",
+                Some(120),
+            )],
+        );
+        let (_, open) = &tracker.snapshot(2_000)[0];
+        assert_eq!(open.provider, crate::provider::Provider::Codex);
+        assert_eq!(open.tools.running["call_1"].timeout_seconds, Some(120));
+
+        tracker.record_codex_request("sess-c", None, 6_000);
+        let (_, closed) = &tracker.snapshot(6_000)[0];
+        assert!(
+            closed.tools.running.is_empty(),
+            "the next request closed the call"
+        );
+        assert_eq!(
+            (
+                closed.tools.calls,
+                closed.tools.errors,
+                closed.tools.timeouts
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(closed.tools.by_tool["exec_command"].calls, 1);
+        assert_eq!(closed.tools.slowest.len(), 1);
+        assert_eq!(closed.tools.slowest[0].seconds, 4.0);
+        assert_eq!(closed.tools.slowest[0].ended_ms, 6_000);
+        assert_eq!(
+            closed.tools.slowest[0].command_head.as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(closed.requests, 2);
+        assert_eq!(
+            closed.account.as_deref(),
+            Some("bob@example.com/codex"),
+            "a request that names no account keeps the one already known"
+        );
+    }
+
+    /// The close is per session: a request on one `session-id` never closes another
+    /// session's calls, however many codex runs share the proxy. A call whose arguments
+    /// named no timeout carries none.
+    #[test]
+    fn a_request_on_another_session_closes_nothing() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_codex_request("sess-a", None, 1_000);
+        tracker.record_codex_tool_calls(
+            "sess-a",
+            2_000,
+            &[codex_call("call_1", "exec_command", "cargo build", None)],
+        );
+        tracker.record_codex_request("sess-b", None, 3_000);
+        let sessions: std::collections::HashMap<String, WireSession> =
+            tracker.snapshot(3_000).into_iter().collect();
+        assert_eq!(
+            sessions["sess-a"].tools.running.len(),
+            1,
+            "sess-b's request left it running"
+        );
+        assert_eq!(sessions["sess-a"].tools.calls, 0);
+        assert_eq!(
+            sessions["sess-a"].tools.running["call_1"].timeout_seconds,
+            None
+        );
+    }
+
+    /// A Codex session never gets a cache TTL: the 300 s and 3600 s tiers are Anthropic's
+    /// prompt cache, and a Codex cache write is neither, though it is still counted. The
+    /// usage's model names the session, its reasoning tokens are kept, and its model tally
+    /// counts the request. The same write on a Claude session still stamps its tier.
+    #[test]
+    fn codex_sessions_get_no_cache_ttl() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_codex_request("sess-codex", None, 1_000);
+        tracker.record_codex_usage(
+            "sess-codex",
+            Some("gpt-5.1-codex"),
+            1_000,
+            500,
+            0,
+            2_000,
+            40,
+            12,
+        );
+        tracker.record_request("sess-claude", None, None, 1_000, &[], &[]);
+        tracker.record_usage(
+            "sess-claude",
+            Some("claude-opus-5"),
+            1_000,
+            500,
+            0,
+            2_000,
+            40,
+        );
+        let sessions: std::collections::HashMap<String, WireSession> =
+            tracker.snapshot(1_000).into_iter().collect();
+        let codex = &sessions["sess-codex"];
+        assert_eq!(codex.cache_ttl_secs, None);
+        assert_eq!(
+            codex.cache_creation_tokens, 500,
+            "the write is still counted"
+        );
+        assert_eq!(codex.reasoning_tokens, 12);
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(codex.by_model["gpt-5.1-codex"].requests, 1);
+        assert_eq!(sessions["sess-claude"].cache_ttl_secs, Some(300), "control");
+        assert_eq!(
+            sessions["sess-claude"].provider,
+            crate::provider::Provider::Anthropic
+        );
     }
 
     #[test]

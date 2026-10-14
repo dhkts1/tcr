@@ -155,6 +155,28 @@ ledger as Claude traffic. The built-in price table holds Claude models only, so 
 count as unpriced (`costUsd: null`, counted in `unpricedRequests`) unless
 [`pricing`](configuration.md#pricing-and-usageretentiondays) names the model.
 
+**Sessions and tool calls.** The `session-id` header names a Codex request's session: it is the
+key affinity pins on, and the session `tcr sessions` and TcrBar's Sessions tab list, marked
+`provider: "codex"`. The body is never read, so the session's model is the one its stream names,
+and its cost is unpriced unless `pricing` names the model. Each finished output item
+(`response.output_item.done`) that is a function call, a freeform-tool call or a local shell call
+becomes a running call when its stream ends. Its head is the command it runs, through the same
+normalizer as a Claude `Bash` call, or its tool's name, and it carries `timeoutSeconds` when its
+arguments name `timeout_ms`, which only the one-shot `exec_command` does. The next request on the
+same `session-id` closes it, and only a request tcr serves: that request carries the call's
+output, in a body tcr cannot read. A request tcr answers itself closes nothing, for example a
+refusal, or a request that meets an upstream 403's hold on the only Codex account (one that meets
+the hold's last 20 seconds waits it out instead, and closes the calls if it is then served); a
+Claude `tool_result` in such a request behaves the same way. So a call's duration is measured, but
+whether it failed or timed out is not, and nothing is inferred about what codex is doing in
+between. The citations are to `openai/codex@f82e365`, under `codex-rs/`: the finished item under
+`item` in `codex-api/src/sse/responses.rs:159-168,344-360`; the `function_call`,
+`custom_tool_call` and `local_shell_call` shapes in
+`protocol/src/models.rs:1024-1027,1082-1123,1167-1187`; `exec_command`'s `cmd` in
+`core/src/tools/handlers/shell_spec.rs:24-115`; and the one-shot schema's `timeout_ms` in
+`core/src/tools/spec_plan.rs:1276-1284` and
+`core/src/tools/handlers/unified_exec/exec_command.rs:103-108,126-138`.
+
 **When no Codex account can serve,** the 429 is shaped for `codex` rather than for Claude Code,
 on the principle the Claude 429 follows: a quota is the user's limit, and a hold is not. When
 the Codex account that frees soonest is out on a usage limit, a five-hour or weekly window or a

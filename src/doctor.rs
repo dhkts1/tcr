@@ -342,28 +342,40 @@ pub fn port_holder(port: u16) -> Option<PortHolder> {
 }
 
 /// Requests this proxy served in the last `minutes` wall-clock minutes, summed
-/// over every live session's per-minute sparkline
+/// over every live Claude session's per-minute sparkline
 /// ([`tcr_status_wire::SessionRow::req_per_minute`], 30 entries, oldest first).
 ///
 /// The sparkline rather than [`crate::status::AccountStatus::requests`]: that
 /// counter is cumulative since the server booted, so it answers "has this proxy
 /// ever served anything", and a route that broke an hour ago would still read
 /// as healthy.
+///
+/// A Codex session (`provider` set) is left out, because its traffic says nothing
+/// about Claude's route and counting it would read a broken route as healthy.
 pub fn requests_in_window(payload: &StatusPayload, minutes: usize) -> u64 {
     payload
         .sessions
         .iter()
-        .map(|session| {
-            let minutes = session.req_per_minute.len().min(minutes);
-            session
-                .req_per_minute
-                .iter()
-                .rev()
-                .take(minutes)
-                .map(|&requests| u64::from(requests))
-                .sum::<u64>()
-        })
+        .filter(|session| session.provider.is_none())
+        .map(|session| session_requests_in_window(session, minutes))
         .sum()
+}
+
+/// One session's requests in the newest `minutes` of its sparkline
+/// ([`tcr_status_wire::SessionRow::req_per_minute`]); a sparkline shorter than
+/// the window counts what it has.
+pub(crate) fn session_requests_in_window(
+    session: &tcr_status_wire::SessionRow,
+    minutes: usize,
+) -> u64 {
+    let minutes = session.req_per_minute.len().min(minutes);
+    session
+        .req_per_minute
+        .iter()
+        .rev()
+        .take(minutes)
+        .map(|&requests| u64::from(requests))
+        .sum::<u64>()
 }
 
 /// Everything `tcr doctor` prints, decided.
@@ -762,6 +774,21 @@ mod tests {
     fn a_short_or_absent_sparkline_counts_what_it_has() {
         let payload = payload_with(vec![session(vec![1, 2]), session(Vec::new())]);
         assert_eq!(requests_in_window(&payload, REQUEST_WINDOW_MINUTES), 3);
+    }
+
+    /// `requests10m` answers "is Claude Code reaching this proxy", so it counts Claude sessions
+    /// only. A proxy busy with codex says nothing about Claude's route, and counting its
+    /// sessions would read a broken Claude route as healthy.
+    #[test]
+    fn requests_in_the_window_count_claude_sessions_only() {
+        let mut claude = vec![0u16; 30];
+        claude[29] = 5;
+        let mut codex_traffic = vec![0u16; 30];
+        codex_traffic[29] = 7;
+        let mut codex = session(codex_traffic);
+        codex.provider = Some("codex".to_string());
+        let payload = payload_with(vec![session(claude), codex]);
+        assert_eq!(requests_in_window(&payload, REQUEST_WINDOW_MINUTES), 5);
     }
 
     fn report_for(url: &str, source: BaseUrlSource, requests: Option<u64>) -> Report {

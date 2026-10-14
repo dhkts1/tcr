@@ -726,3 +726,89 @@ async fn a_codex_usage_limit_reports_the_refusing_window_on_status_json() {
         );
     }
 }
+
+/// One Codex session through the real binary: two turns naming the same `session-id` are one
+/// session on `tcr sessions`, attributed to the Codex account that served them, filed under the
+/// model the stream named, unpriced instead of priced at zero, with no Anthropic cache TTL. The
+/// text line names the provider and prints `costUsd=n/a`.
+///
+/// Watched red: write `provider: None` for every row in `Manager::wire_sessions_snapshot`'s
+/// projection and the JSON row's `provider` reads null.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_turn_records_one_codex_session_live() {
+    let (upstream, codex_upstream, _ledger) = spawn_origins().await;
+    let server = start_server(&upstream, &codex_upstream).await;
+    let base = server.base();
+    let client = client();
+    for turn in 1..=2 {
+        let resp = client
+            .post(format!("{base}/backend-api/codex/responses"))
+            .header("authorization", "Bearer client-own")
+            .header("session-id", "sess-live")
+            .header("content-type", "application/json")
+            .body(r#"{"input":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "turn {turn}");
+        // Read the stream to its end, as codex does, so the tee sees the closing event.
+        resp.bytes().await.unwrap();
+    }
+    // The usage half is booked by the tee's detached task after the stream ends: poll.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let session = loop {
+        let out = server.tcr(&["sessions", "--json"]).await;
+        assert!(
+            out.status.success(),
+            "tcr sessions --json: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("sessions --json is JSON");
+        let row = doc["sessions"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["sessionId"] == "sess-live"))
+            .cloned();
+        if let Some(row) = row.filter(|row| row["outputTokens"] == 80) {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never showed both turns' usage: {doc}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(session["provider"], "codex");
+    assert_eq!(
+        session["account"], "alice@example.com/codex",
+        "both turns pinned to the first pick"
+    );
+    assert_eq!(
+        session["model"], "gpt-6-astra",
+        "the stream named it; the body named none"
+    );
+    assert_eq!(session["requests"], 2);
+    assert_eq!(session["unpricedRequests"], 2);
+    assert_eq!(session["costUsd"], 0.0);
+    assert_eq!(
+        session["inputTokens"], 400,
+        "base input: 1200 less the 1000 cached, twice"
+    );
+    assert_eq!(session["cacheReadTokens"], 2000);
+    assert!(
+        session.get("cacheTtlSecs").is_none(),
+        "no Anthropic cache TTL on a Codex session"
+    );
+    assert!(
+        session.get("reasoningTokens").is_none(),
+        "the stub's turns carry no reasoning"
+    );
+    let text = server.tcr(&["sessions"]).await;
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains(
+            "session=sess-live account=alice@example.com/codex provider=codex model=gpt-6-astra requests=2 inputTokens=400 outputTokens=80 cacheReadTokens=2000 toolCalls=0 costUsd=n/a\n"
+        ),
+        "{stdout}"
+    );
+}
