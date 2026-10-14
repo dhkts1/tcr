@@ -410,22 +410,44 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// The integer a [`PriorityArg`] means against `config`'s accounts.
+/// The integer a [`PriorityArg`] means against `config`'s accounts of `provider`.
 ///
 /// `--first` = `min(0, existing priorities) - 1`; `--last` =
 /// `max(0, existing priorities) + 1`; an explicit `N` is verbatim. The `0` seed
 /// guarantees a relative move always crosses the default tier even when every
 /// existing priority sits on the same side of it.
-fn priority_value(config: &Config, priority: PriorityArg) -> i64 {
+///
+/// "Existing" means the priorities of `provider`'s accounts, the row's own: Claude
+/// and Codex accounts rotate apart, since neither serves the other's requests,
+/// so a Codex account's priority says nothing about where a Claude account sits.
+/// In a fleet with no Codex account that is every account, as it always was.
+fn priority_value(config: &Config, provider: Provider, priority: PriorityArg) -> i64 {
     let existing = config
         .accounts
         .iter()
+        .filter(|a| a.provider == provider)
         .filter_map(|a| a.priority)
         .chain(std::iter::once(0));
     match priority {
         PriorityArg::N(n) => n,
         PriorityArg::First => existing.min().unwrap_or(0) - 1,
         PriorityArg::Last => existing.max().unwrap_or(0) + 1,
+    }
+}
+
+/// What `tcr priority` prints once the value is set: `Set priority of '{name}'
+/// to {value}.`, except that a Codex account moved with `--first` or `--last`
+/// says which end of the Codex rotation it now holds, since that is the only
+/// rotation the move was taken against.
+fn priority_message(name: &str, value: i64, provider: Provider, arg: PriorityArg) -> String {
+    let plain = || format!("Set priority of '{name}' to {value}.");
+    match provider {
+        Provider::Anthropic => plain(),
+        Provider::Codex => match arg {
+            PriorityArg::First => crate::provider_guard::codex_priority_line(name, value, true),
+            PriorityArg::Last => crate::provider_guard::codex_priority_line(name, value, false),
+            PriorityArg::N(_) => plain(),
+        },
     }
 }
 
@@ -449,8 +471,9 @@ pub async fn set_priority(
     priority: PriorityArg,
 ) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    resolve_account(&config.accounts, query)?;
-    let value = priority_value(&config, priority);
+    let idx = resolve_account(&config.accounts, query)?;
+    let provider = config.accounts[idx].provider;
+    let value = priority_value(&config, provider, priority);
 
     match post_set_priority(&config, query, value).await {
         Ok(applied) => {
@@ -460,7 +483,10 @@ pub async fn set_priority(
                     applied.name
                 )
             })?;
-            println!("Set priority of '{}' to {value}.", applied.name);
+            println!(
+                "{}",
+                priority_message(&applied.name, value, provider, priority)
+            );
             return Ok(());
         }
         // Nothing is listening: the file is the whole truth.
@@ -487,7 +513,7 @@ pub async fn set_priority(
                 config.proxy.port,
                 crate::proxy::PRIORITY_PATH,
             );
-            println!("Set priority of '{name}' to {value}.");
+            println!("{}", priority_message(&name, value, provider, priority));
             return Ok(());
         }
         Err(other) => {
@@ -497,13 +523,13 @@ pub async fn set_priority(
                 config.proxy.port,
                 other.why(),
             );
-            println!("Set priority of '{name}' to {value}.");
+            println!("{}", priority_message(&name, value, provider, priority));
             return Ok(());
         }
     }
 
     let name = write_priority(config_path, query, value)?;
-    println!("Set priority of '{name}' to {value}.");
+    println!("{}", priority_message(&name, value, provider, priority));
     Ok(())
 }
 
@@ -587,6 +613,25 @@ fn control_account_group_notice(config: &Config, account: &str, group: &str) -> 
     ))
 }
 
+/// The warning [`add_to_group`] prints when the account being labelled is a
+/// Codex account. Modelled on [`control_account_group_notice`], and pure for the
+/// same reason: the notice is the whole of this fix, so a test asserts its text
+/// rather than capturing stderr.
+///
+/// The label is right to write: it is how `tcr group park` reaches the account,
+/// and it shows in `tcr status`. What it never does is route, because no Codex
+/// request carries a group, and while the group is reserved the account serves
+/// nothing at all. `None` for a Claude row, which is every ordinary add.
+fn codex_group_add_notice(target: &Account, group: &str) -> Option<String> {
+    match target.provider {
+        Provider::Anthropic => None,
+        Provider::Codex => Some(crate::provider_guard::codex_group_add_warning(
+            &target.name,
+            group,
+        )),
+    }
+}
+
 /// `tcr group add <group> <account>` — label `account` with `group`.
 ///
 /// Resolves through [`find_account_by_name`], which applies exactly the rule
@@ -636,6 +681,11 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     // `GroupCommand::classify`'s `spoke` arm, which exists for exactly this
     // "exit 0 but you should read something" case.
     if let Some(notice) = control_account_group_notice(&config, &target.name, group) {
+        eprintln!("{notice}");
+    }
+    // The same warn-don't-refuse rule for a Codex account, whose label parks it
+    // but never routes to it. TcrBar shows the stderr of a successful add.
+    if let Some(notice) = codex_group_add_notice(target, group) {
         eprintln!("{notice}");
     }
     let outcome = config::save_group_membership(config_path, target, group, true)
@@ -752,6 +802,132 @@ pub fn remove_from_group(
     Ok(())
 }
 
+/// What `tcr group reserve` prints, decided before anything is written. Every
+/// line is built by [`plan_reserve`], so a test reads the exact words without
+/// capturing a stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservePlan {
+    /// Printed on stderr before the success line when `--force` reserved a group
+    /// that holds Codex accounts.
+    force_warning: Option<String>,
+    /// The first stdout line when the reservation was written.
+    reserved_line: String,
+    /// The one stdout line when the group was already reserved.
+    already_line: String,
+    /// Printed on stderr after the success line when few accounts are left.
+    low_count_warning: Option<String>,
+}
+
+/// The safety rail and the lines of `tcr group reserve <group>`, or the refusal
+/// to print instead. Pure: it reads `config` and decides; nothing is written.
+///
+/// A fleet with no Codex account ([`Config::holds_codex`]) runs the rail and
+/// the words it always has: refuse when the reservation would leave zero
+/// enabled, unreserved accounts, warn below three. `force` changes nothing
+/// there.
+///
+/// A fleet holding a Codex account counts each provider apart, because neither
+/// serves the other's traffic, and checks two things in order:
+/// 1. **The Claude rail.** Refused when the reservation takes the enabled,
+///    unreserved Claude accounts from at least one to none. A fleet that had no
+///    such account has no Claude pool to protect, so it is not refused. `force`
+///    never lifts this.
+/// 2. **The Codex members.** Refused without `force` when the group holds a
+///    Codex account, in any state: no Codex session can ask for a group, so a
+///    reserved group's Codex members serve nothing (a disabled one is stranded
+///    the moment it is enabled). This runs on an already-reserved group too, as
+///    the rail does. With `force` it proceeds and warns.
+///
+/// The success lines then count what is left per provider, and warn when one
+/// or two Claude accounts are left of a pool that had any.
+fn plan_reserve(config: &Config, group: &str, force: bool) -> Result<ReservePlan, String> {
+    let mut reserved_after = config.reserved_group_names();
+    reserved_after.insert(group.to_string());
+    let sorted_reserved = || -> Vec<String> {
+        config
+            .reserved_group_names()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+
+    if !config.holds_codex() {
+        let remaining = config.unreserved_enabled_count(&reserved_after);
+        if remaining == 0 {
+            let currently_reserved = sorted_reserved();
+            let advice = if currently_reserved.is_empty() {
+                "every enabled account belongs to this group".to_string()
+            } else {
+                format!("unreserve one of: {} first", currently_reserved.join(", "))
+            };
+            return Err(format!(
+                "reserving '{group}' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. {advice}. Nothing changed."
+            ));
+        }
+        return Ok(ReservePlan {
+            force_warning: None,
+            reserved_line: format!(
+                "group '{group}' reserved. {remaining} unreserved enabled account(s) remain."
+            ),
+            already_line: format!(
+                "group '{group}' is already reserved; nothing changed. {remaining} unreserved enabled account(s) remain."
+            ),
+            low_count_warning: (remaining < 3).then(|| {
+                format!(
+                    "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
+                )
+            }),
+        });
+    }
+
+    let claude_before =
+        config.unreserved_enabled_count_for(&config.reserved_group_names(), Provider::Anthropic);
+    let claude_after = config.unreserved_enabled_count_for(&reserved_after, Provider::Anthropic);
+    let codex_after = config.unreserved_enabled_count_for(&reserved_after, Provider::Codex);
+
+    if claude_before >= 1 && claude_after == 0 {
+        let every_claude_in_group = config
+            .accounts
+            .iter()
+            .filter(|a| a.provider == Provider::Anthropic && !a.disabled.unwrap_or(false))
+            .all(|a| a.in_group(group));
+        let advice = if every_claude_in_group {
+            "every enabled Claude account belongs to this group".to_string()
+        } else {
+            format!("unreserve one of: {} first", sorted_reserved().join(", "))
+        };
+        return Err(crate::provider_guard::reserve_leaves_no_claude(
+            group,
+            codex_after,
+            &advice,
+        ));
+    }
+
+    let codex_members: Vec<&str> = config
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Codex && a.in_group(group))
+        .map(|a| a.name.as_str())
+        .collect();
+    if !codex_members.is_empty() && !force {
+        return Err(crate::provider_guard::reserve_strands_codex(
+            group,
+            &codex_members,
+        ));
+    }
+
+    let remaining = crate::provider_guard::reserve_remaining(claude_after, codex_after);
+    Ok(ReservePlan {
+        force_warning: (!codex_members.is_empty())
+            .then(|| crate::provider_guard::reserve_force_warning(group, &codex_members)),
+        reserved_line: format!("group '{group}' reserved. {remaining}"),
+        already_line: format!("group '{group}' is already reserved; nothing changed. {remaining}"),
+        low_count_warning: (claude_before >= 1 && claude_after < 3)
+            .then(|| crate::provider_guard::reserve_few_claude_left(claude_after)),
+    })
+}
+
 /// `tcr group reserve <group>` — mark `group` reserved: from the next
 /// restart, an account carrying it is off-limits to traffic that did not ask
 /// for one of its groups.
@@ -761,37 +937,30 @@ pub fn remove_from_group(
 /// change would leave zero unreserved ENABLED accounts, and warns (but
 /// proceeds) below three. Idempotent: reserving an already-reserved group
 /// succeeds and says so.
+///
+/// The verb without `--force`: [`reserve_group_with`] with `force` false.
 pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    reserve_group_with(config_path, group, false)
+}
+
+/// `tcr group reserve <group> [--force]`: [`plan_reserve`], then the write,
+/// then the lines the plan holds. A refusal is returned before the write, so it
+/// leaves the config byte-identical.
+pub fn reserve_group_with(config_path: &Path, group: &str, force: bool) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
     let config = load_config(config_path)?;
-
-    let mut reserved_after = config.reserved_group_names();
-    reserved_after.insert(group.to_string());
-    let remaining = config.unreserved_enabled_count(&reserved_after);
-    if remaining == 0 {
-        let currently_reserved: Vec<String> = config
-            .reserved_group_names()
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let advice = if currently_reserved.is_empty() {
-            "every enabled account belongs to this group".to_string()
-        } else {
-            format!("unreserve one of: {} first", currently_reserved.join(", "))
-        };
-        bail!(
-            "reserving '{group}' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. {advice}. Nothing changed."
-        );
-    }
+    let plan = plan_reserve(&config, group, force).map_err(anyhow::Error::msg)?;
 
     let outcome = config::save_group_reserved(config_path, group, true)
         .with_context(|| format!("save config at {}", config_path.display()))?;
     match outcome {
         config::GroupReserveWrite::Updated => {
-            println!("group '{group}' reserved. {remaining} unreserved enabled account(s) remain.");
+            if let Some(warning) = &plan.force_warning {
+                eprintln!("{warning}");
+            }
+            println!("{}", plan.reserved_line);
             // Say what reserving actually does, at the one moment an operator is
             // guaranteed to be reading. The second half is the surprising one: it
             // can make a `--group` request WAIT or 429 where it used to be served
@@ -803,15 +972,16 @@ pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
             println!(
                 "  · a --group {group} request with no member free now waits or returns 429 rather than using another account"
             );
-            if remaining < 3 {
-                eprintln!(
-                    "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
-                );
+            if let Some(warning) = &plan.low_count_warning {
+                eprintln!("{warning}");
             }
             println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupReserveWrite::Unchanged => {
-            println!("group '{group}' is already reserved; nothing changed. {remaining} unreserved enabled account(s) remain.");
+            if let Some(warning) = &plan.force_warning {
+                eprintln!("{warning}");
+            }
+            println!("{}", plan.already_line);
         }
     }
     Ok(())
@@ -1100,8 +1270,39 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
     (groups, ungrouped)
 }
 
-/// Whether a group can serve an inference request at all, as opposed to merely
-/// existing with members and a colour.
+/// The one reason a group can exist and still route nothing, spelled ONCE.
+/// Both `ls` surfaces render this same token — a text `route_block=` field and a
+/// JSON `routeBlock` value — so a script keying on one cannot be surprised by
+/// the other. Two spellings of one fact is how they drift.
+const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
+
+/// The other reason, spelled once the same way: every member is a Codex
+/// account, and no Codex request carries a group, so a Claude session asking
+/// for this group has nobody to be served by.
+const ROUTE_BLOCK_CODEX_ONLY: &str = "codex-only";
+
+/// The provider of the account named `name`, by exact name (names are unique
+/// across a config). `None` for a name no row carries.
+fn provider_of(config: &Config, name: &str) -> Option<Provider> {
+    config
+        .accounts
+        .iter()
+        .find(|account| account.name == name)
+        .map(|account| account.provider)
+}
+
+/// How many of `members` are Codex accounts: the `codex_members=` field of
+/// `tcr group ls`, and its `codexMembers` key.
+fn codex_member_count(config: &Config, members: &[&str]) -> usize {
+    members
+        .iter()
+        .filter(|member| provider_of(config, member) == Some(Provider::Codex))
+        .count()
+}
+
+/// Why a group cannot serve an inference request at all, as opposed to merely
+/// existing with members and a colour: `None` when it routes, or the token that
+/// names the reason.
 ///
 /// **This mirrors a runtime rule and must not drift from it.** The authority is
 /// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
@@ -1114,22 +1315,33 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
 /// compute, since it reads the file and not the running proxy. If the exclusion
 /// rule changes there, this changes with it.
 ///
+/// A Codex member never counts toward routing, because no Codex request carries
+/// a group: the question here is whether a Claude session asking for the group
+/// can be served, and only its Claude members can serve one. So the rule runs
+/// over the Claude members alone, and a group with none reads
+/// [`ROUTE_BLOCK_CODEX_ONLY`] (the runtime's `GroupMiss::OtherProviderOnly`). In
+/// a fleet with no Codex account every member is a Claude member, and the
+/// answer is the one this always gave.
+///
 /// Deliberately NOT a general health check: an account that is merely disabled or
 /// rate-limited right now still counts as routable here, because that is
 /// transient and this line is about the group's permanent shape.
-/// The one reason a group can exist and still route nothing, spelled ONCE.
-/// Both `ls` surfaces render this same token — a text `route_block=` field and a
-/// JSON `routeBlock` value — so a script keying on one cannot be surprised by
-/// the other. Two spellings of one fact is how they drift.
-const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
-
-fn group_routes(config: &Config, group: &str, members: &[&str]) -> bool {
-    match config.control_account.as_ref().map(|c| c.name()) {
-        Some(control) => {
-            members.iter().any(|member| *member != control) || config.group_allows_control(group)
-        }
-        None => !members.is_empty(),
+fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&'static str> {
+    let anthropic: Vec<&str> = members
+        .iter()
+        .copied()
+        .filter(|member| provider_of(config, member) == Some(Provider::Anthropic))
+        .collect();
+    if anthropic.is_empty() {
+        return Some(ROUTE_BLOCK_CODEX_ONLY);
     }
+    let routes = match config.control_account.as_ref().map(|c| c.name()) {
+        Some(control) => {
+            anthropic.iter().any(|member| *member != control) || config.group_allows_control(group)
+        }
+        None => true,
+    };
+    (!routes).then_some(ROUTE_BLOCK_CONTROL_ONLY)
 }
 
 /// `tcr group ls` text: one greppable line per group, then `ungrouped`.
@@ -1140,12 +1352,18 @@ fn render_groups_text(config: &Config) -> String {
     let mut out = String::new();
     for (group, members) in &groups {
         let (color, source) = config.group_color(group);
-        let routes = group_routes(config, group, members);
+        let route_block = group_route_block(config, group, members);
+        let codex_members = codex_member_count(config, members);
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
+            "group {group:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
             members.len(),
             members.join(","),
+            if codex_members > 0 {
+                format!(" codex_members={codex_members}")
+            } else {
+                String::new()
+            },
             if config.is_group_reserved(group) {
                 "yes"
             } else {
@@ -1161,11 +1379,10 @@ fn render_groups_text(config: &Config) -> String {
             } else {
                 "no"
             },
-            if routes { "yes" } else { "no" },
-            if routes {
-                String::new()
-            } else {
-                format!(" route_block={ROUTE_BLOCK_CONTROL_ONLY}")
+            if route_block.is_none() { "yes" } else { "no" },
+            match route_block {
+                None => String::new(),
+                Some(block) => format!(" route_block={block}"),
             },
             source.as_str(),
         );
@@ -1182,23 +1399,29 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
         .iter()
         .map(|(group, members)| {
             let (color, source) = config.group_color(group);
-            let routes = group_routes(config, group, members);
-            serde_json::json!({
+            let route_block = group_route_block(config, group, members);
+            let mut row = serde_json::json!({
                 "group": group,
                 "accounts": members.len(),
                 "members": members,
                 "reserved": config.is_group_reserved(group),
                 "parked": config.is_group_parked(group),
                 "allowsControl": config.group_allows_control(group),
-                "routes": routes,
-                "routeBlock": if routes {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(ROUTE_BLOCK_CONTROL_ONLY.to_string())
+                "routes": route_block.is_none(),
+                "routeBlock": match route_block {
+                    None => serde_json::Value::Null,
+                    Some(block) => serde_json::Value::String(block.to_string()),
                 },
                 "color": color,
                 "colorSource": source.as_str(),
-            })
+            });
+            // Only when there is one, so a group with no Codex member, which is
+            // every group of a fleet with no Codex account, carries no new key.
+            let codex_members = codex_member_count(config, members);
+            if codex_members > 0 {
+                row["codexMembers"] = serde_json::json!(codex_members);
+            }
+            row
         })
         .collect();
     let out = serde_json::json!({ "groups": rows, "ungrouped": ungrouped });
@@ -1789,12 +2012,41 @@ fn write_control_account(
 /// `None` leaves that half alone: an operator who says `--must` and nothing
 /// else is changing the strictness of a pin they already chose, and re-sending
 /// a pin they did not name would be this function inventing one.
+///
+/// # A Codex account always leaves from this Mac
+///
+/// No Mac carries a Codex request in this version, so a pin to another Mac is
+/// one the exit path can never honour: a loose one is ignored, and a strict one
+/// refuses every request routed to the account. Both halves that would make
+/// such a pin, `--exits-from <peer>` and `--must`, are therefore refused on a
+/// Codex row before anything is written ([`provider_guard`]). `--exits-from
+/// local` and `--no-must` stay allowed, so a pin written before this refusal
+/// existed can still be cleared.
+///
+/// The check reads the file with [`load_config`], never [`load_for_edit`],
+/// whose running-proxy warning [`edit_account`] already prints. A query the
+/// check cannot resolve, or a file it cannot read, is left to [`edit_account`],
+/// so those errors read exactly as they always have.
+///
+/// [`provider_guard`]: crate::provider_guard::provider_guard
 pub fn set_account_egress(
     config_path: &Path,
     query: &str,
     egress: Option<config::Egress>,
     strict: Option<bool>,
 ) -> anyhow::Result<(String, config::EgressPin)> {
+    let pins_away = matches!(egress, Some(config::Egress::Via(_))) || strict == Some(true);
+    if pins_away {
+        if let Ok(config) = load_config(config_path) {
+            if let Ok(idx) = resolve_account(&config.accounts, query) {
+                crate::provider_guard::provider_guard(
+                    &config.accounts[idx],
+                    crate::provider_guard::ClaudeOnlyVerb::ExitFromPeer,
+                )
+                .map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
     edit_account(config_path, query, |config, idx| {
         if let Some(egress) = egress {
             config.accounts[idx].egress = egress;
@@ -4154,6 +4406,129 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// Two Claude and two Codex accounts with these priorities, parsed in memory:
+    /// no file, and nothing to dial.
+    fn priority_fleet(alice: i64, carol: i64, bob: i64, dana: i64) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a", "priority": alice },
+                { "name": "carol@example.com", "accessToken": "at-c", "priority": carol },
+                { "name": "bob@example.com/codex", "provider": "codex", "accessToken": "at-b",
+                  "priority": bob },
+                { "name": "dana@example.com/codex", "provider": "codex", "accessToken": "at-d",
+                  "priority": dana }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// `--first` and `--last` take the min and max over the row's OWN provider,
+    /// with the same `0` seed: Claude and Codex accounts rotate apart. A Codex
+    /// row's relative move names the end of the Codex rotation it now holds; an
+    /// explicit value, and any Claude move, prints the line it always printed.
+    #[test]
+    fn priority_first_and_last_stay_within_the_rows_provider() {
+        let fleet = priority_fleet(1, -1, 4, -4);
+        assert_eq!(
+            priority_value(&fleet, Provider::Anthropic, PriorityArg::First),
+            -2,
+            "a min over both providers would give -5"
+        );
+        assert_eq!(
+            priority_value(&fleet, Provider::Anthropic, PriorityArg::Last),
+            2,
+            "a max over both providers would give 5"
+        );
+
+        let fleet = priority_fleet(6, -6, 2, -2);
+        assert_eq!(
+            priority_value(&fleet, Provider::Codex, PriorityArg::First),
+            -3
+        );
+        assert_eq!(
+            priority_value(&fleet, Provider::Codex, PriorityArg::Last),
+            3
+        );
+
+        assert_eq!(
+            priority_message(
+                "bob@example.com/codex",
+                -3,
+                Provider::Codex,
+                PriorityArg::First
+            ),
+            "Set priority of 'bob@example.com/codex' to -3, the front of the Codex rotation."
+        );
+        assert_eq!(
+            priority_message(
+                "bob@example.com/codex",
+                3,
+                Provider::Codex,
+                PriorityArg::Last
+            ),
+            "Set priority of 'bob@example.com/codex' to 3, the back of the Codex rotation."
+        );
+        assert_eq!(
+            priority_message(
+                "bob@example.com/codex",
+                5,
+                Provider::Codex,
+                PriorityArg::N(5)
+            ),
+            "Set priority of 'bob@example.com/codex' to 5."
+        );
+        assert_eq!(
+            priority_message(
+                "alice@example.com",
+                -2,
+                Provider::Anthropic,
+                PriorityArg::First
+            ),
+            "Set priority of 'alice@example.com' to -2."
+        );
+    }
+
+    /// `tcr priority <codex row> --first` writes the value worked out over the
+    /// Codex rows: `set_priority` hands `priority_value` the row's provider, which
+    /// the pure test above cannot see. On a port nothing serves, so the live half
+    /// finds no proxy and the file is the whole truth.
+    #[tokio::test]
+    async fn priority_on_a_codex_row_writes_its_own_providers_value() {
+        let port = dead_port().await;
+        let json = serde_json::json!({
+            "proxy": { "port": port },
+            "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 6 },
+                { "name": "carol@example.com", "type": "oauth", "accessToken": "at-c",
+                  "priority": -6 },
+                { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+                  "accessToken": "at-b", "credentialVersion": 2, "priority": 2 },
+                { "name": "dana@example.com/codex", "provider": "codex", "type": "oauth",
+                  "accessToken": "at-d", "credentialVersion": 2, "priority": -2 }
+            ]
+        })
+        .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["proxy"]["port"], serde_json::json!(port));
+        assert_ne!(
+            parsed["proxy"]["port"],
+            serde_json::json!(3456),
+            "never the port a live proxy serves on"
+        );
+        let path = write_config("priority-codex", &json);
+
+        set_priority(&path, "bob@example.com/codex", PriorityArg::First)
+            .await
+            .expect("no proxy answers, so the file is written");
+        assert_eq!(
+            load(&path).accounts[2].priority,
+            Some(-3),
+            "min(0, the Codex rows' 2 and -2) - 1; over every row it would be -7"
+        );
+        fs::remove_file(&path).ok();
+    }
+
     // --- group ---------------------------------------------------------
 
     /// Three accounts: alice in two groups, bob in one (shared with alice),
@@ -4582,6 +4957,157 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    // --- group reserve in a fleet holding Codex accounts ----------------------
+
+    /// alice is the only Claude account, and she is in `orchard`; bob and dana
+    /// are enabled Codex accounts in no group.
+    const ONE_CLAUDE_TWO_CODEX: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "groups": ["orchard"] },
+        { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-b", "credentialVersion": 2 },
+        { "name": "dana@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-d", "credentialVersion": 2 }
+      ]
+    }"#;
+
+    /// `orchard` holds alice (Claude) and bob (Codex); carol (Claude) and dana
+    /// (Codex) are in no group.
+    const ORCHARD_HOLDS_CODEX: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "groups": ["orchard"] },
+        { "name": "carol@example.com", "type": "oauth", "accessToken": "at-c" },
+        { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-b", "credentialVersion": 2, "groups": ["orchard"] },
+        { "name": "dana@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-d", "credentialVersion": 2 }
+      ]
+    }"#;
+
+    /// The rail counts Claude accounts: reserving the group that holds the only
+    /// Claude account leaves two Codex accounts unreserved, and they cannot serve
+    /// a Claude session, so it is refused. `--force` does not lift it, and the
+    /// refusal leaves the file byte-identical.
+    #[test]
+    fn reserving_the_last_claude_account_counts_claude_only() {
+        let refusal = "reserving 'orchard' would leave 0 unreserved enabled Claude accounts — Claude could serve no unrequested traffic, and the 2 Codex account(s) left cannot serve it. every enabled Claude account belongs to this group. Nothing changed.";
+        let path = write_config("reserve-last-claude", ONE_CLAUDE_TWO_CODEX);
+        let config = load(&path);
+        assert_eq!(
+            plan_reserve(&config, "orchard", false),
+            Err(refusal.to_string())
+        );
+        assert_eq!(
+            plan_reserve(&config, "orchard", true),
+            Err(refusal.to_string()),
+            "--force lifts only the Codex-members refusal, never the Claude rail"
+        );
+
+        let before = fs::read(&path).unwrap();
+        let err = reserve_group_with(&path, "orchard", true).expect_err("the rail refuses");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        fs::remove_file(&path).ok();
+    }
+
+    /// A group holding a Codex account is refused without `--force`, because a
+    /// Codex session cannot ask for a group: while it is reserved, its Codex
+    /// members serve nothing. The remedy names the first of them.
+    #[test]
+    fn reserving_a_group_with_codex_members_needs_force() {
+        let refusal = "reserving 'orchard' strands its Codex account(s) bob@example.com/codex: a Codex session cannot ask for a group, so while 'orchard' is reserved they serve nothing. Remove them first (`tcr group rm orchard bob@example.com/codex`), or pass --force to reserve it anyway. Nothing changed.";
+        let path = write_config("reserve-codex-members", ORCHARD_HOLDS_CODEX);
+        assert_eq!(
+            plan_reserve(&load(&path), "orchard", false),
+            Err(refusal.to_string())
+        );
+
+        let before = fs::read(&path).unwrap();
+        let err = reserve_group_with(&path, "orchard", false).expect_err("refused without --force");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        fs::remove_file(&path).ok();
+    }
+
+    /// `--force` reserves it and says, per provider, what is left: one Claude
+    /// account and one Codex account stay unreserved, and one Claude account is
+    /// few enough to warn about. The already-reserved line ends with the same
+    /// clause, and the Codex-members refusal still applies to a group that is
+    /// already reserved.
+    #[test]
+    fn force_reserve_warns_and_counts_per_provider() {
+        let path = write_config("reserve-force", ORCHARD_HOLDS_CODEX);
+        let plan = plan_reserve(&load(&path), "orchard", true).expect("--force reserves it");
+        assert_eq!(
+            plan.force_warning,
+            Some("warning: 'orchard' holds the Codex account(s) bob@example.com/codex. A Codex session cannot ask for a group, so while 'orchard' is reserved they serve nothing — `tcr group rm orchard bob@example.com/codex` returns one to the pool.".to_string())
+        );
+        assert_eq!(
+            plan.reserved_line,
+            "group 'orchard' reserved. 1 unreserved enabled Claude account(s) and 1 Codex account(s) remain."
+        );
+        assert_eq!(
+            plan.already_line,
+            "group 'orchard' is already reserved; nothing changed. 1 unreserved enabled Claude account(s) and 1 Codex account(s) remain."
+        );
+        assert_eq!(
+            plan.low_count_warning,
+            Some("warning: only 1 unreserved enabled Claude account(s) remain — ordinary (unrequested) Claude traffic may starve.".to_string())
+        );
+
+        reserve_group_with(&path, "orchard", true).expect("--force writes the reservation");
+        assert!(load(&path).is_group_reserved("orchard"));
+
+        let before = fs::read(&path).unwrap();
+        assert!(
+            reserve_group_with(&path, "orchard", false).is_err(),
+            "an already-reserved group holding a Codex account still needs --force"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        reserve_group_with(&path, "orchard", true).expect("and with it, it is already reserved");
+        fs::remove_file(&path).ok();
+    }
+
+    /// A fleet with no Codex account keeps every word the reserve verb printed
+    /// before Codex accounts existed, and `--force` changes nothing in it.
+    #[test]
+    fn a_claude_only_fleets_reserve_sentence_is_unchanged() {
+        let zero_path = write_config("reserve-claude-only-zero", ALL_IN_ONE_GROUP);
+        let all_in_one = load(&zero_path);
+        let refusal = "reserving 'codereview' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. every enabled account belongs to this group. Nothing changed.";
+        assert_eq!(
+            plan_reserve(&all_in_one, "codereview", false),
+            Err(refusal.to_string())
+        );
+        assert_eq!(
+            plan_reserve(&all_in_one, "codereview", true),
+            Err(refusal.to_string())
+        );
+
+        let grouped_path = write_config("reserve-claude-only", GROUPED_ACCOUNTS);
+        let grouped = load(&grouped_path);
+        let plan = plan_reserve(&grouped, "codereview", false).expect("carol stays unreserved");
+        assert_eq!(
+            plan,
+            ReservePlan {
+                force_warning: None,
+                reserved_line: "group 'codereview' reserved. 1 unreserved enabled account(s) remain."
+                    .to_string(),
+                already_line: "group 'codereview' is already reserved; nothing changed. 1 unreserved enabled account(s) remain."
+                    .to_string(),
+                low_count_warning: Some(
+                    "warning: only 1 unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
+                        .to_string()
+                ),
+            }
+        );
+        assert_eq!(plan_reserve(&grouped, "codereview", true), Ok(plan));
+        fs::remove_file(&zero_path).ok();
+        fs::remove_file(&grouped_path).ok();
+    }
+
     // --- group park / unpark ------------------------------------------------
 
     /// Mirrors [`reserve_then_unreserve_round_trips_and_is_idempotent`]:
@@ -4969,6 +5495,196 @@ mod tests {
             write_control_account(&path, Some("alice@example.com")).unwrap(),
             Some("alice@example.com".to_string()),
             "control: the Anthropic row is set"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- the exit lock on a Codex account -------------------------------------
+
+    /// alice (Claude) and bob (Codex) on a port nothing serves: an edit asks
+    /// whether a server is running on the config's port, and without one that is
+    /// 3456, where a live tcr may be serving. `bob_extra` is merged into bob's row.
+    async fn alice_and_codex_bob(tag: &str, bob_extra: serde_json::Value) -> std::path::PathBuf {
+        let port = dead_port().await;
+        let mut bob = serde_json::json!({
+            "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+            "accessToken": "at-b", "refreshToken": "rt-b", "credentialVersion": 2
+        });
+        if let (Some(row), Some(extra)) = (bob.as_object_mut(), bob_extra.as_object()) {
+            row.extend(extra.clone());
+        }
+        let json = serde_json::json!({
+            "proxy": { "port": port },
+            "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a" },
+                bob
+            ]
+        });
+        assert_ne!(json["proxy"]["port"], serde_json::json!(3456));
+        write_config(tag, &json.to_string())
+    }
+
+    /// `tcr peer account <codex> --exits-from <peer>` is refused, and so is
+    /// `--must` on its own, which would make an old pin strict: a Codex request
+    /// always leaves from this Mac. Each refusal leaves the file byte-identical,
+    /// and the same pin on a Claude row is written as it always was.
+    #[tokio::test]
+    async fn exits_from_a_peer_is_refused_on_a_codex_row() {
+        let refusal = "'bob@example.com/codex' is a Codex account, and a Codex request always leaves from this Mac, so it cannot exit from another Mac. Nothing was changed.";
+        let path = alice_and_codex_bob("egress-codex", serde_json::json!({})).await;
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let before = fs::read(&path).unwrap();
+
+        let err = set_account_egress(
+            &path,
+            "bob@example.com/codex",
+            Some(config::Egress::Via(peer)),
+            None,
+        )
+        .expect_err("a Codex account cannot be pinned to another Mac");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+
+        let err = set_account_egress(&path, "bob@example.com/codex", None, Some(true))
+            .expect_err("--must alone would make an old pin strict");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+
+        let (name, pin) = set_account_egress(
+            &path,
+            "alice@example.com",
+            Some(config::Egress::Via(peer)),
+            None,
+        )
+        .expect("control: a Claude row is pinned as before");
+        assert_eq!(name, "alice@example.com");
+        assert_eq!(pin.egress, config::Egress::Via(peer));
+        fs::remove_file(&path).ok();
+    }
+
+    /// `--exits-from local --no-must` stays allowed on a Codex row, so a pin
+    /// written before the refusal existed can still be cleared.
+    #[tokio::test]
+    async fn exits_from_local_still_clears_an_old_codex_pin() {
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let path = alice_and_codex_bob(
+            "egress-codex-clear",
+            serde_json::json!({ "egress": format!("via {}", peer.to_wire()), "egressStrict": true }),
+        )
+        .await;
+        assert_eq!(
+            load(&path).accounts[1].egress_pin(),
+            config::EgressPin {
+                egress: config::Egress::Via(peer),
+                strict: true
+            },
+            "the fixture carries the old strict pin"
+        );
+
+        set_account_egress(
+            &path,
+            "bob@example.com/codex",
+            Some(config::Egress::Local),
+            Some(false),
+        )
+        .expect("local and --no-must clear the old pin");
+        assert_eq!(
+            load(&path).accounts[1].egress_pin(),
+            config::EgressPin {
+                egress: config::Egress::Local,
+                strict: false
+            }
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- groups and Codex accounts --------------------------------------------
+
+    /// `tcr group add` on a Codex account says on stderr what the label does and
+    /// does not do, and still writes it: the label parks the account, and the
+    /// command's idempotent exit-0 contract with TcrBar is unchanged.
+    #[tokio::test]
+    async fn group_add_on_a_codex_row_warns_on_stderr() {
+        let path = alice_and_codex_bob("group-add-codex", serde_json::json!({})).await;
+        let config = load(&path);
+        assert_eq!(
+            codex_group_add_notice(&config.accounts[1], "orchard"),
+            Some("warning: 'bob@example.com/codex' is a Codex account. A Codex session cannot ask for a group, so 'orchard' labels it and can park it, but never routes to it; while 'orchard' is reserved, it serves nothing.".to_string())
+        );
+        assert_eq!(
+            codex_group_add_notice(&config.accounts[0], "orchard"),
+            None,
+            "a Claude row is an ordinary add"
+        );
+
+        add_to_group(&path, "orchard", "bob@example.com/codex")
+            .expect("the label is written all the same");
+        assert!(load(&path).accounts[1].in_group("orchard"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr group ls` counts a group's Codex members apart, and `routes=` keeps
+    /// meaning "a Claude session asking for this group can be served": it counts
+    /// Claude members only, because no Codex request carries a group. A group of
+    /// Codex members alone says why it routes nothing, and a group with no Codex
+    /// member reads exactly as it always did.
+    #[test]
+    fn group_ls_counts_codex_members_and_routes_counts_anthropic_only() {
+        let path = write_config(
+            "group-ls-codex",
+            r#"{
+              "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "groups": ["mixed", "solo"] },
+                { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+                  "accessToken": "at-b", "credentialVersion": 2, "groups": ["mixed", "lab"] }
+              ]
+            }"#,
+        );
+        let config = load(&path);
+
+        let text = render_groups_text(&config);
+        let line = |group: &str| -> String {
+            text.lines()
+                .find(|line| line.starts_with(&format!("group {group} ")))
+                .unwrap_or_else(|| panic!("a line for {group}: {text}"))
+                .to_string()
+        };
+        let mixed = line("mixed");
+        assert!(
+            mixed.contains(" members=alice@example.com,bob@example.com/codex codex_members=1 "),
+            "{mixed}"
+        );
+        assert!(mixed.contains(" routes=yes "), "{mixed}");
+        let lab = line("lab");
+        assert!(lab.contains(" codex_members=1 "), "{lab}");
+        assert!(lab.contains(" routes=no route_block=codex-only "), "{lab}");
+        let solo = line("solo");
+        assert!(!solo.contains("codex_members"), "{solo}");
+        assert!(solo.contains(" routes=yes "), "{solo}");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
+        let row = |name: &str| -> serde_json::Value {
+            value["groups"]
+                .as_array()
+                .expect("groups array")
+                .iter()
+                .find(|r| r["group"] == name)
+                .expect("group row")
+                .clone()
+        };
+        assert_eq!(row("mixed")["codexMembers"], serde_json::json!(1));
+        assert_eq!(row("mixed")["routes"], serde_json::json!(true));
+        assert_eq!(row("mixed")["routeBlock"], serde_json::Value::Null);
+        assert_eq!(row("lab")["codexMembers"], serde_json::json!(1));
+        assert_eq!(row("lab")["routes"], serde_json::json!(false));
+        assert_eq!(row("lab")["routeBlock"], serde_json::json!("codex-only"));
+        assert!(
+            row("solo").get("codexMembers").is_none(),
+            "a group with no Codex member carries no new key: {}",
+            row("solo")
         );
         fs::remove_file(&path).ok();
     }

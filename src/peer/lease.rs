@@ -3340,11 +3340,18 @@ pub struct LentTo {
 /// Which accounts each of this node's grants lends from, keyed by account
 /// label: the `lentTo` block of `tcr peer ls --json`.
 ///
-/// `accounts` is `(name, groups)` per local account, the name `tcr status`
-/// prints for it, and the groups it is in. Passed in rather than read off a
-/// `Manager` for the reason every other pure function in this file is: the
-/// decision being made is scope membership, and it is testable without a
-/// fleet.
+/// `accounts` is `(name, groups, provider)` per local account, the name `tcr
+/// status` prints for it, the groups it is in, and whose account it is. Passed
+/// in rather than read off a `Manager` for the reason every other pure function
+/// in this file is: the decision being made is scope membership, and it is
+/// testable without a fleet.
+///
+/// **A Codex account is never in the map, under any scope.** No lease draws on
+/// one: `Manager::lendable_fraction` and the serve path both skip every account
+/// that is not a Claude account, because lending a Codex account over the mesh
+/// is not something this version does. A Codex card reading "Lent to …" would
+/// promise a lease that spends nothing of it, so a Codex account is skipped
+/// before the scope is even asked about, whatever the scope says.
 ///
 /// **The map is keyed by that name, and membership is decided on the SANITIZED
 /// label.** The two are the same string for every account whose name is
@@ -3372,14 +3379,20 @@ pub struct LentTo {
 /// they lent cannot re-lend it.
 pub fn lent_to(
     store: &PeerStore,
-    accounts: &[(String, Vec<String>)],
+    accounts: &[(String, Vec<String>, crate::provider::Provider)],
 ) -> std::collections::BTreeMap<String, Vec<LentTo>> {
     store.reload_if_changed();
     let mut out: std::collections::BTreeMap<String, Vec<LentTo>> =
         std::collections::BTreeMap::new();
     for row in store.peers() {
         for grant in &row.lend {
-            for (name, groups) in accounts {
+            for (name, groups, provider) in accounts {
+                // No lease draws on a Codex account, so none is lent to anyone,
+                // whatever the scope says. See this function's doc.
+                match provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => continue,
+                }
                 // The sanitized label decides membership, the name is the key.
                 // See this function's doc. `unwrap_or_default` gives the
                 // empty string for a name that is not a label, which

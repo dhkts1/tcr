@@ -201,6 +201,18 @@ The peer carrying the traffic sees only where the bytes are going, never what is
 it carries them blind. The exit lock itself lives on the account, in the main config file, and
 is never sent over the wire.
 
+A Codex account always leaves from this Mac: no Mac carries a Codex request in this version.
+So `tcr peer account <account> --exits-from <peer>` is refused on a Codex account, and so is
+`--must`, which would make a pin it already has strict; the refusal changes nothing.
+`--exits-from local` and `--no-must` still work on one, so a pin written before this refusal
+existed can be cleared. Such an old pin, if it is not strict, is inert, and `tcr peer ls`
+lists it that way. If it is strict, tcr refuses every request routed to the account until it
+is cleared, and `tcr peer ls` says that instead, with the command that clears it.
+
+For the same reason, `tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex
+account (`--scope account:<label>`), and change nothing. A zero fraction, `--list`, `--revoke`
+and `--relend` still work, so an old lease that names one can be cleared.
+
 ## The network key: an opt-in password for the mesh
 
 On an open office network, discovery and pairing requests are visible to every Mac that can

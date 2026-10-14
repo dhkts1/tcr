@@ -42,6 +42,7 @@ use teamclaude_rs::peer::config::{
 };
 use teamclaude_rs::peer::lease::{self, Ledger, PeerLeaseProvider, RelayRefusal};
 use teamclaude_rs::peer::serve;
+use teamclaude_rs::provider::Provider;
 
 /// **The scrub.** A SERVE frame carries neither `authorization` nor
 /// `x-api-key`, because the borrower removes both before the frame is written.
@@ -4741,6 +4742,100 @@ fn a_lend_end_is_parsed_from_a_duration_or_a_clock_against_an_injected_now() {
     }
 }
 
+/// **`lentTo` never names a Codex account, under any scope**: no lease draws on
+/// one, so a Codex card must not read "Lent to".
+///
+/// Three Macs hold one grant each: `all`, `group:work` and
+/// `account:codex-fake`. Every one of them would reach `codex-fake` by scope
+/// alone, which is what makes its absence the assertion that means something.
+/// The control flips the same account to a Claude one, and it then appears
+/// under all three.
+///
+/// Watch it fail by dropping the provider skip in `lent_to`: `codex-fake` then
+/// has a line under every scope.
+#[test]
+fn lent_to_skips_codex_accounts_under_every_scope() {
+    let dir = tempfile::tempdir().expect("a temp home");
+    let peers = dir.path().join("tcr-peers.json");
+
+    let scoped = |scope: tcr_peer_wire::LendScope| {
+        let mut grant = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
+        grant.scope = scope;
+        grant
+    };
+    let mut all = lender_row_for(
+        PeerId([41_u8; 32]),
+        vec![scoped(tcr_peer_wire::LendScope::All)],
+    );
+    all.label = "all-mac".to_string();
+    let mut group = lender_row_for(
+        PeerId([42_u8; 32]),
+        vec![scoped(tcr_peer_wire::LendScope::Group("work".to_string()))],
+    );
+    group.label = "group-mac".to_string();
+    let mut named = lender_row_for(
+        PeerId([43_u8; 32]),
+        vec![scoped(tcr_peer_wire::LendScope::Accounts(vec![
+            "codex-fake".to_string(),
+        ]))],
+    );
+    named.label = "named-mac".to_string();
+    write_peers(&peers, vec![all, group, named]);
+    let store = PeerStore::open(&peers).expect("the peers file");
+
+    let lender = (
+        "lender-fake".to_string(),
+        vec!["work".to_string()],
+        Provider::Anthropic,
+    );
+    let lent = lease::lent_to(
+        &store,
+        &[
+            lender.clone(),
+            (
+                "codex-fake".to_string(),
+                vec!["work".to_string()],
+                Provider::Codex,
+            ),
+        ],
+    );
+    let on_lender: Vec<&str> = lent
+        .get("lender-fake")
+        .expect("the Claude account is lent")
+        .iter()
+        .map(|row| row.peer.as_str())
+        .collect();
+    assert_eq!(
+        on_lender,
+        ["all-mac", "group-mac"],
+        "the `all` and `group:work` grants reach the Claude account: {lent:?}"
+    );
+    assert!(
+        !lent.contains_key("codex-fake"),
+        "no grant reaches a Codex account, whatever its scope says: {lent:?}"
+    );
+
+    // The control: the same account, as a Claude account, is under all three.
+    let lent = lease::lent_to(
+        &store,
+        &[
+            lender,
+            (
+                "codex-fake".to_string(),
+                vec!["work".to_string()],
+                Provider::Anthropic,
+            ),
+        ],
+    );
+    let on_flipped: Vec<&str> = lent
+        .get("codex-fake")
+        .expect("as a Claude account it is lent")
+        .iter()
+        .map(|row| row.peer.as_str())
+        .collect();
+    assert_eq!(on_flipped, ["all-mac", "group-mac", "named-mac"]);
+}
+
 /// **`lentTo`, per account label, from the lender's own grants and no wire** :
 /// the read-only, time-bounded view of a lease from the account's side.
 ///
@@ -4774,8 +4869,12 @@ fn lent_to_names_every_mac_a_grant_lends_one_account_to() {
 
     let store = PeerStore::open(&peers).expect("the peers file");
     let accounts = vec![
-        ("lender-fake".to_string(), vec!["work".to_string()]),
-        ("spare-fake".to_string(), Vec::new()),
+        (
+            "lender-fake".to_string(),
+            vec!["work".to_string()],
+            Provider::Anthropic,
+        ),
+        ("spare-fake".to_string(), Vec::new(), Provider::Anthropic),
     ];
     let lent = lease::lent_to(&store, &accounts);
 
@@ -5317,8 +5416,12 @@ fn lent_to_carries_the_real_scope_the_real_end_and_whether_it_has_passed() {
     let store = PeerStore::open(&peers).expect("the peers file opens");
 
     let accounts = vec![
-        ("lender-fake".to_string(), vec!["work".to_string()]),
-        ("spare-fake".to_string(), Vec::new()),
+        (
+            "lender-fake".to_string(),
+            vec!["work".to_string()],
+            Provider::Anthropic,
+        ),
+        ("spare-fake".to_string(), Vec::new(), Provider::Anthropic),
     ];
     let lent = lease::lent_to(&store, &accounts);
 
@@ -5393,6 +5496,113 @@ fn cli_peers_file(dir: &Path) -> (PathBuf, String) {
     row.label = "attic-nuc".to_string();
     write_peers(&peers, vec![row]);
     (peers, node.to_wire())
+}
+
+/// **`tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex
+/// account, exit 1, and write nothing**, through the binary an operator and the
+/// panel run.
+///
+/// Codex accounts stay on this Mac: no lease draws on one, so a grant scoped to
+/// one would advertise a capability that is not there. The match is the one
+/// the serve path uses for `account:` scopes, the sanitized label. The Codex
+/// row's name is a label, the way `tcr login --codex --name work` writes one:
+/// an email name never reaches this check, because the scope parser refuses an
+/// `@` first.
+///
+/// Clearing stays allowed, so an old lease that names one can still go: a zero
+/// fraction on both verbs, and `--list`. A config that cannot be read skips the
+/// check, as `tcr peer ls` does. The control is the Claude row, which lends as
+/// it always did.
+///
+/// Watch it fail by dropping the guard call: the run exits 0 and writes the
+/// peers file.
+#[test]
+fn peer_lend_and_share_on_refuse_a_codex_scope() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (peers, node) = cli_peers_file(dir.path());
+    let config = dir.path().join("teamclaude.json");
+    std::fs::write(
+        &config,
+        r#"{"accounts":[
+             {"name":"work-fake","accessToken":"not-a-real-token"},
+             {"name":"work","provider":"codex","accessToken":"not-a-real-token",
+              "credentialVersion":2}
+           ]}"#,
+    )
+    .expect("the config fixture writes");
+    let refusal = "'work' is a Codex account, and Codex accounts stay on this Mac: only a Claude account can be lent. Nothing was changed.";
+    let run = |config: &Path, args: &[&str]| -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+            .arg("peer")
+            .args(args)
+            .args(["--peers", peers.to_str().expect("a utf-8 path")])
+            .args(["--config", config.to_str().expect("a utf-8 path")])
+            .output()
+            .unwrap_or_else(|err| panic!("spawn tcr peer {args:?}: {err}"))
+    };
+    let peers_before = std::fs::read(&peers).expect("the peers file reads");
+    let config_before = std::fs::read(&config).expect("the config reads");
+
+    for args in [
+        &["lend", &node, "--scope", "account:work"][..],
+        &["lend", &node, "--scope", "account:work-fake,work"],
+        &["share", "on", "--scope", "account:work"],
+    ] {
+        let out = run(&config, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} is refused: {stderr}{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            stderr.contains(refusal),
+            "{args:?} says why, in the refusal's own words: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&peers).expect("the peers file reads"),
+            peers_before,
+            "{args:?} wrote nothing to the peers file"
+        );
+        assert_eq!(
+            std::fs::read(&config).expect("the config reads"),
+            config_before,
+            "{args:?} wrote nothing to the config"
+        );
+    }
+
+    // Clearing an old grant that names it stays allowed on both verbs.
+    for args in [
+        &["lend", &node, "--scope", "account:work", "--fraction", "0"][..],
+        &["share", "on", "--scope", "account:work", "--fraction", "0"],
+        &["lend", &node, "--list"],
+    ] {
+        let out = run(&config, args);
+        assert!(
+            out.status.success(),
+            "{args:?} still works: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A config that cannot be read skips the check rather than failing the verb.
+    let missing = dir.path().join("no-such-config.json");
+    let out = run(&missing, &["lend", &node, "--scope", "account:work"]);
+    assert!(
+        out.status.success(),
+        "a missing config skips the check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!missing.exists(), "and creates no config either");
+
+    // The control: the Claude row lends as before.
+    let out = run(&config, &["lend", &node, "--scope", "account:work-fake"]);
+    assert!(
+        out.status.success(),
+        "a Claude account is lent: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// **`tcr peer lend --scope group:work` adds a SECOND lease rather than
@@ -8007,7 +8217,10 @@ fn a_lent_to_row_carries_the_wire_id_of_the_mac_it_names() {
     write_peers(&peers, vec![one, two]);
 
     let store = PeerStore::open(&peers).expect("the peers file");
-    let lent = lease::lent_to(&store, &[("lender-fake".to_string(), Vec::new())]);
+    let lent = lease::lent_to(
+        &store,
+        &[("lender-fake".to_string(), Vec::new(), Provider::Anthropic)],
+    );
     let rows = lent
         .get("lender-fake")
         .expect("an `all` grant covers every local account");

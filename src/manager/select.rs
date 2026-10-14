@@ -122,6 +122,12 @@ pub(super) enum GroupMiss {
     /// not allowed to select. Serves nothing until `allowControlAccount` is set
     /// on the group or `controlPooled` is set fleet-wide.
     OnlyControl,
+    /// Accounts carry the label, but none of them belongs to this request's
+    /// provider: a Claude request to a group of Codex accounts, or the reverse.
+    /// No retry fixes it, because Claude and Codex accounts never serve each
+    /// other's requests; only an account of the request's provider joining the
+    /// group does.
+    OtherProviderOnly,
     /// Members exist and are selectable in principle, but every one is held out
     /// right now by a hard gate: disabled, errored, rate-limited, over its
     /// switch threshold, model-blocked, or reserved away from this caller.
@@ -138,6 +144,7 @@ impl GroupMiss {
         match self {
             Self::Unknown => "no-such-group",
             Self::OnlyControl => "control-account-only",
+            Self::OtherProviderOnly => "other-provider-only",
             Self::AllGated => "all-members-unavailable",
             Self::Paced => "all-members-paced",
         }
@@ -150,6 +157,9 @@ impl GroupMiss {
             Self::Unknown => "no configured account carries the requested group",
             Self::OnlyControl => {
                 "the requested group's only member is the control account, which inference never selects — no request will ever route to this group until another account joins it, the control account is cleared, or the group opts in with `tcr group allow-control <g>`"
+            }
+            Self::OtherProviderOnly => {
+                "the requested group has no account of this request's provider: Claude and Codex accounts never serve each other's requests"
             }
             Self::AllGated => "every account in the requested group is currently unavailable",
             Self::Paced => "every account in the requested group is paced out",
@@ -2347,6 +2357,12 @@ impl Manager {
     /// control-injected `pool_tried` — a member that is only in the set because
     /// of the injection must be attributed to [`GroupMiss::OnlyControl`], not
     /// silently counted as "already tried".
+    ///
+    /// Every arm after [`GroupMiss::Unknown`] reads only the members of the
+    /// request's own `provider`: the others could never have served it, so a
+    /// group holding none of them is [`GroupMiss::OtherProviderOnly`], and a
+    /// Codex member beside the excluded control account does not hide that the
+    /// control exclusion is the reason.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn classify_group_miss(
         accounts: &[AccountRuntime],
@@ -2371,6 +2387,23 @@ impl Manager {
             .collect();
         if members.is_empty() {
             return GroupMiss::Unknown;
+        }
+        // Narrowed to the request's provider: a Claude request is never served
+        // by a Codex account, nor the reverse, so a member of the other provider
+        // is no candidate and must not be what the reason describes. By provider
+        // ONLY: a row deleted from the file keeps its slot (`removed`) and its old
+        // groups until a restart, and dropping it here would have a fleet with no
+        // Codex account name a provider it does not have.
+        let members: Vec<usize> = members
+            .into_iter()
+            .filter(|idx| {
+                accounts
+                    .get(*idx)
+                    .is_some_and(|account| account.provider == provider)
+            })
+            .collect();
+        if members.is_empty() {
+            return GroupMiss::OtherProviderOnly;
         }
         if members.iter().all(|idx| Some(*idx) == control_excluded) {
             return GroupMiss::OnlyControl;
@@ -4358,6 +4391,67 @@ mod group_miss_tests {
         assert_eq!(
             classify(&accounts, None, &pacing, "research"),
             GroupMiss::Paced
+        );
+    }
+
+    /// `account`, as a Codex account.
+    fn codex_account(name: &str, groups: &[&str]) -> AccountRuntime {
+        let mut runtime = account(name, groups, false);
+        runtime.provider = crate::provider::Provider::Codex;
+        runtime
+    }
+
+    /// A Claude request to a group whose only member is a Codex account is not
+    /// a busy group: no Claude request will ever be served there, because Claude
+    /// and Codex accounts never serve each other's requests. The reason says
+    /// that, rather than "every account in the requested group is currently
+    /// unavailable", which reads as something time will fix.
+    #[test]
+    fn a_claude_request_to_a_codex_only_group_is_other_provider_only() {
+        let accounts = [
+            account("worker@example.com", &["dev"], false),
+            codex_account("bob@example.com/codex", &["lab"]),
+        ];
+        let miss = classify(&accounts, None, &PacingConfig::default(), "lab");
+        assert_eq!(miss, GroupMiss::OtherProviderOnly, "{miss:?}");
+        assert_eq!(miss.as_str(), "other-provider-only");
+        assert_eq!(
+            miss.explain(),
+            "the requested group has no account of this request's provider: Claude and Codex accounts never serve each other's requests"
+        );
+    }
+
+    /// A group holding the excluded control account and a Codex account is,
+    /// to a Claude request, a group holding only the control account: the Codex
+    /// member is not a candidate, so the reason is the control exclusion.
+    #[test]
+    fn a_control_plus_codex_group_is_only_control() {
+        let accounts = [
+            account("gil@example.com", &["research"], false),
+            codex_account("bob@example.com/codex", &["research"]),
+            account("worker@example.com", &[], false),
+        ];
+        assert_eq!(
+            classify(&accounts, Some(0), &PacingConfig::default(), "research"),
+            GroupMiss::OnlyControl
+        );
+    }
+
+    /// A row deleted from the file keeps its rotation slot and its old groups
+    /// until a restart. The narrowing is by provider only, so such a slot still
+    /// counts as a member of its own provider: a fleet with no Codex account,
+    /// whose group's only member was just deleted, keeps answering "unavailable"
+    /// and never names a provider it does not have.
+    #[test]
+    fn a_group_holding_only_a_removed_claude_slot_is_all_gated() {
+        let mut accounts = [
+            account("gone@example.com", &["lab"], true),
+            account("worker@example.com", &[], false),
+        ];
+        accounts[0].removed = true;
+        assert_eq!(
+            classify(&accounts, None, &PacingConfig::default(), "lab"),
+            GroupMiss::AllGated
         );
     }
 }

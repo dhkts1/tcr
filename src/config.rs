@@ -1458,6 +1458,44 @@ impl Config {
             })
             .count()
     }
+
+    /// Whether any account in this config is a Codex account, in any state
+    /// (disabled, grouped, pinned, or not).
+    ///
+    /// The gate every Codex-aware CLI sentence sits behind: a fleet for which
+    /// this is false is Claude-only, and prints exactly what it printed before
+    /// Codex accounts existed. Reads [`Self::accounts`], so a row the loader set
+    /// aside never counts, and neither does one already deleted from the file.
+    pub fn holds_codex(&self) -> bool {
+        self.accounts
+            .iter()
+            .any(|a| a.provider == crate::provider::Provider::Codex)
+    }
+
+    /// [`Self::unreserved_enabled_count`], counting only `provider`'s accounts.
+    ///
+    /// The two pools are counted apart because neither can serve the other's
+    /// traffic: a Claude session is never served by a Codex account, so a
+    /// reservation that leaves only Codex accounts unreserved leaves Claude's
+    /// unrequested traffic with nothing, however many accounts remain.
+    pub fn unreserved_enabled_count_for(
+        &self,
+        reserved: &HashSet<String>,
+        provider: crate::provider::Provider,
+    ) -> usize {
+        self.accounts
+            .iter()
+            .filter(|a| a.provider == provider)
+            .filter(|a| !a.disabled.unwrap_or(false))
+            .filter(|a| {
+                a.groups
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .all(|g| !reserved.contains(g))
+            })
+            .count()
+    }
 }
 
 /// The default config path: `$HOME/.config/teamclaude.json`.

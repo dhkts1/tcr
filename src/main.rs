@@ -653,6 +653,12 @@ mod peer_cli {
         /// shows.
         #[arg(long, default_value = "all")]
         pub scope: String,
+        /// Path to the main config (default: `teamclaude.json` in the config
+        /// directory). Read only when `--scope account:` names accounts, to
+        /// refuse a label that is a Codex account's; a config that is missing
+        /// or unreadable skips that check.
+        #[arg(long)]
+        pub config: Option<PathBuf>,
     }
 
     /// The wire's three windows, as an operator types them.
@@ -729,8 +735,10 @@ mod peer_cli {
         #[arg(long, value_enum)]
         pub mode: Option<PeerLendMode>,
         /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory). Read only by `--mode hand`, to refuse a grant every
-        /// account in its scope is strictly pinned away from.
+        /// directory). Read by `--mode hand`, to refuse a grant every account
+        /// in its scope is strictly pinned away from, and when `--scope
+        /// account:` names accounts, to refuse a label that is a Codex
+        /// account's.
         #[arg(long)]
         pub config: Option<PathBuf>,
         /// Lend for a duration (`2h`, `90m`, `3d`), after which this Mac stops
@@ -1131,6 +1139,9 @@ struct GroupReserveArgs {
     config: Option<PathBuf>,
     /// The group label to reserve.
     group: String,
+    /// Reserve the group even though it holds Codex accounts, which then serve nothing while it stays reserved.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args)]
@@ -1646,6 +1657,75 @@ fn peer_ls_handed_key_until(
 /// with `local`, for the reason the `lentTo` map gives: the panel hides the
 /// line when there is nothing to say, and a map of every account saying
 /// "local" is a list the reader has to filter before it means anything.
+/// `tcr peer lend` and `tcr peer share on`: refuse a scope that names a Codex
+/// account, before anything is written.
+///
+/// Codex accounts stay on this Mac: no lease draws on one
+/// (`Manager::lend_candidates` skips them), so a grant scoped to one would
+/// advertise a capability that is not there. A row is named when a scope label
+/// equals `sanitize_label` of its name, the match the serve path's
+/// `scope_restriction` makes for an `account:` scope. Only such a scope names
+/// rows, so nothing is read for `all` or `group:`. A config that is missing or
+/// unreadable skips the check, as `tcr peer ls` treats one, rather than failing
+/// a verb about the peers file. The refusal is
+/// [`teamclaude_rs::provider_guard::provider_guard`]'s, in the words every
+/// Claude-only refusal uses.
+fn refuse_a_lend_scope_naming_codex(
+    scope: &tcr_peer_wire::LendScope,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let tcr_peer_wire::LendScope::Accounts(labels) = scope else {
+        return Ok(());
+    };
+    let path = config_path.map_or_else(config::default_path, Path::to_path_buf);
+    let Ok(main) = config::load(&path) else {
+        return Ok(());
+    };
+    for account in &main.accounts {
+        let named =
+            tcr_peer_wire::sanitize_label(&account.name).is_ok_and(|label| labels.contains(&label));
+        if named {
+            teamclaude_rs::provider_guard::provider_guard(
+                account,
+                teamclaude_rs::provider_guard::ClaudeOnlyVerb::Lend,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(())
+}
+
+/// The text form of `tcr peer ls`: one line per Codex account whose exit lock
+/// names a peer, saying what that pin really does.
+///
+/// A Codex request always leaves from this Mac, because no Mac carries one in
+/// this version, and `tcr peer account` no longer writes such a pin. One written
+/// before it refused can still be on the row, though, and it does one of two
+/// things. A pin that is not strict is inert: the exit path warns and sends the
+/// request from here. A strict one is not inert at all: the exit path refuses
+/// every request routed to the account (`src/peer/egress.rs`, its Codex arm),
+/// so its line says so and names the command that clears it.
+///
+/// A Claude account's pin is a real one and is not listed here, and nothing is
+/// listed for a Codex account left on `local`. `--json` is unchanged: its
+/// `exits` map already carries every pin.
+fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
+    accounts
+        .iter()
+        .filter(|account| account.provider == teamclaude_rs::provider::Provider::Codex)
+        .filter_map(|account| {
+            let pin = account.egress_pin();
+            let peer = pin.egress.peer()?;
+            let why = if pin.strict {
+                teamclaude_rs::provider_guard::refused_exit_suffix(&account.name)
+            } else {
+                teamclaude_rs::provider_guard::INERT_EXIT_SUFFIX.to_string()
+            };
+            Some(format!("{}  exits={}{why}", account.name, peer.display()))
+        })
+        .collect()
+}
+
 fn peer_ls_exits(
     accounts: &[config::Account],
     peers: &[teamclaude_rs::peer::config::PeerRow],
@@ -1839,6 +1919,27 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let state_path = peer_state_path(&peers_path);
             let state = peer::state::load(&state_path, peer::pair::now_ms())?;
 
+            // The main config, read once for both forms: the JSON form keys its
+            // `lentTo` block by account label and reads each account's exit
+            // lock, and the text form lists the Codex exit pins.
+            //
+            // A missing or unreadable config is an EMPTY list and not a
+            // failure: `tcr peer ls` is about the peers file, and an operator
+            // running it on a Mac with no accounts configured still wants the
+            // pinned rows.
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_accounts: Vec<config::Account> = match config::load(&config_path) {
+                Ok(config) => config.accounts,
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        path = %config_path.display(),
+                        "peer ls: no account labels to key `lentTo` by"
+                    );
+                    Vec::new()
+                }
+            };
+
             if a.json {
                 // The clock the two derived keys are answered against, taken
                 // ONCE for the whole listing: two rows read a second apart
@@ -1882,33 +1983,20 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 // is what the panel matches its account card against; `lent_to`
                 // keys the map on it and sanitizes it itself for the scope
                 // match, so an `account:<label>` scope still reaches exactly
-                // the accounts a `--scope` could name and nothing else.
-                //
-                // A missing or unreadable config is an EMPTY map and not a
-                // failure: `tcr peer ls` is about the peers file, and an
-                // operator running it on a Mac with no accounts configured
-                // still wants the pinned rows.
-                let config_path = a.config.unwrap_or_else(config::default_path);
-                let config_accounts: Vec<config::Account> = match config::load(&config_path) {
-                    Ok(config) => config.accounts,
-                    Err(err) => {
-                        tracing::debug!(
-                            error = %err,
-                            path = %config_path.display(),
-                            "peer ls: no account labels to key `lentTo` by"
-                        );
-                        Vec::new()
-                    }
-                };
-                let accounts: Vec<(String, Vec<String>)> = config_accounts
-                    .iter()
-                    .map(|account| {
-                        (
-                            account.name.clone(),
-                            account.groups.clone().unwrap_or_default(),
-                        )
-                    })
-                    .collect();
+                // the accounts a `--scope` could name and nothing else. The
+                // provider rides along so `lent_to` can leave a Codex account
+                // out: no lease draws on one.
+                let accounts: Vec<(String, Vec<String>, teamclaude_rs::provider::Provider)> =
+                    config_accounts
+                        .iter()
+                        .map(|account| {
+                            (
+                                account.name.clone(),
+                                account.groups.clone().unwrap_or_default(),
+                                account.provider,
+                            )
+                        })
+                        .collect();
                 let lent_to = peer::lease::lent_to(&store, &accounts);
                 let masked: Vec<status::PeerLsRow> = rows
                     .into_iter()
@@ -1997,6 +2085,12 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         "{}  {}  found {age_secs}s ago, not trusted",
                         found.address, name
                     );
+                }
+                // A Codex account's exit pin, after the rows and before the
+                // summary. Only a fleet holding a Codex account with a pin that
+                // names a peer prints one, so every other listing is unchanged.
+                for line in peer_ls_inert_exit_lines(&config_accounts) {
+                    println!("{line}");
                 }
                 // Greppable, `key: value`-shaped, and printed even at zero:
                 // "pending=0" is a fact an operator can act on and a missing
@@ -2088,6 +2182,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         );
                         return Ok(());
                     }
+                    // A scope that names a Codex account is refused here, before
+                    // anything is written, as `peer lend` refuses it. The zero
+                    // fraction above stays allowed, so an old grant that names
+                    // one can still be removed.
+                    refuse_a_lend_scope_naming_codex(&scope, a.config.as_deref())?;
                     // AN END THAT HAS ALREADY PASSED IS REFUSED, BEFORE
                     // ANYTHING IS WRITTEN. This verb keeps the end, the mode
                     // and the schedule an operator set per peer, which is
@@ -2896,6 +2995,15 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     until.map_or("none".to_string(), |at| at.to_string())
                 );
                 return Ok(());
+            }
+
+            // A SCOPE THAT NAMES A CODEX ACCOUNT IS REFUSED, before anything is
+            // written: no lease draws on one (`refuse_a_lend_scope_naming_codex`).
+            // A zero fraction is a removal and stays allowed, as --list,
+            // --revoke and --relend above do, so an old lease that names one can
+            // still be cleared.
+            if a.fraction > 0.0 {
+                refuse_a_lend_scope_naming_codex(&scope, a.config.as_deref())?;
             }
 
             // A HAND grant is refused when every account it could draw on is
@@ -5157,6 +5265,7 @@ mod peer_grant_tests {
                 ttl: 600,
                 max_inflight: 2,
                 scope: "all".to_string(),
+                config: None,
             }),
         })
         .await
@@ -5184,6 +5293,7 @@ mod peer_grant_tests {
                 ttl: 600,
                 max_inflight: 2,
                 scope: "all".to_string(),
+                config: None,
             }),
         })
         .await
@@ -5243,6 +5353,7 @@ mod peer_grant_tests {
                 ttl: 600,
                 max_inflight: 2,
                 scope: "all".to_string(),
+                config: None,
             }),
         };
         let refusal = run_peer(share_on(peers_path.clone()))
@@ -5674,7 +5785,7 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         }
         GroupAction::Reserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::reserve_group(&config_path, &a.group)
+            cli::reserve_group_with(&config_path, &a.group, a.force)
         }
         GroupAction::Unreserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
@@ -6436,6 +6547,20 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
     configured.dedup();
 
     if configured.contains(&group) {
+        // The session this launches is a Claude session, and only a Claude
+        // account can serve one: a group whose every member is a Codex account
+        // would route it nowhere. Only a fleet holding a Codex account can have
+        // such a group, since a label exists only while some account carries it.
+        let has_claude = config.accounts.iter().any(|account| {
+            account.provider == teamclaude_rs::provider::Provider::Anthropic
+                && account.in_group(group)
+        });
+        if !has_claude {
+            anyhow::bail!(
+                "{}",
+                teamclaude_rs::provider_guard::group_has_no_claude(group)
+            );
+        }
         return Ok(());
     }
     if configured.is_empty() {
@@ -8492,6 +8617,134 @@ mod tests {
         }
     }
 
+    /// The `tcr group` argv TcrBar sends still parses, unchanged: the panel shells
+    /// out to these shapes and never passes `--force`, which is additive. A
+    /// reserve without it is not forced; with it, it is.
+    #[test]
+    fn the_group_argv_tcrbar_sends_is_unchanged() {
+        for argv in [
+            &["tcr", "group", "add", "orchard", "alice@example.com"][..],
+            &["tcr", "group", "rm", "orchard", "alice@example.com"],
+            &["tcr", "group", "rm", "orchard", "--all"],
+            &["tcr", "group", "park", "orchard"],
+            &["tcr", "group", "unpark", "orchard"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(argv) {
+                panic!("TcrBar sends {argv:?}, which no longer parses: {e}");
+            }
+        }
+
+        let reserve = |argv: &[&str]| -> GroupReserveArgs {
+            match Cli::try_parse_from(argv) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Group(GroupArgs {
+                            action: GroupAction::Reserve(args),
+                        })),
+                    ..
+                }) => args,
+                Ok(_) => panic!("{argv:?} parsed to something other than a reserve"),
+                Err(e) => panic!("{argv:?} does not parse: {e}"),
+            }
+        };
+        let plain = reserve(&["tcr", "group", "reserve", "orchard"]);
+        assert_eq!(plain.group, "orchard");
+        assert!(!plain.force, "TcrBar's reserve is never forced");
+        let forced = reserve(&["tcr", "group", "reserve", "orchard", "--force"]);
+        assert_eq!(forced.group, "orchard");
+        assert!(forced.force);
+    }
+
+    /// Every `tcr` command the Codex refusals and notes tell an operator to run
+    /// is one this binary accepts, read out of the sentences themselves as they
+    /// are printed: a remedy that clap rejects is itself an error, which is how
+    /// the restart hint above once went wrong.
+    #[test]
+    fn every_command_a_codex_refusal_names_parses() {
+        use teamclaude_rs::provider_guard;
+        let sentences = [
+            provider_guard::reserve_strands_codex(
+                "orchard",
+                &["bob@example.com/codex", "dana@example.com/codex"],
+            ),
+            provider_guard::reserve_force_warning("orchard", &["bob@example.com/codex"]),
+            provider_guard::refused_exit_suffix("bob@example.com/codex"),
+        ];
+        let mut named: Vec<Vec<String>> = Vec::new();
+        for sentence in &sentences {
+            let commands: Vec<&str> = sentence
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("tcr "))
+                .collect();
+            assert_eq!(
+                commands.len(),
+                1,
+                "each sentence names one command to run: {sentence}"
+            );
+            for command in commands {
+                let argv: Vec<&str> = command.split_whitespace().collect();
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    panic!(
+                        "`{sentence}` tells the user to run `{command}`, which does not parse: {e}"
+                    );
+                }
+                named.push(argv.iter().map(|word| word.to_string()).collect());
+            }
+        }
+
+        // Both reserve sentences name the remove that takes the first Codex
+        // member out of the group, and it parses as exactly that.
+        for argv in &named[..2] {
+            assert_eq!(
+                argv,
+                &["tcr", "group", "rm", "orchard", "bob@example.com/codex"]
+            );
+            match Cli::try_parse_from(argv) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Group(GroupArgs {
+                            action: GroupAction::Rm(rm),
+                        })),
+                    ..
+                }) => {
+                    assert_eq!(rm.group, "orchard");
+                    assert_eq!(rm.account.as_deref(), Some("bob@example.com/codex"));
+                    assert!(!rm.all);
+                }
+                _ => panic!("{argv:?} is not a group rm"),
+            }
+        }
+        // The strict exit pin's remedy clears it: back to local, and not strict.
+        assert_eq!(
+            named[2],
+            [
+                "tcr",
+                "peer",
+                "account",
+                "bob@example.com/codex",
+                "--exits-from",
+                "local",
+                "--no-must"
+            ]
+        );
+        match Cli::try_parse_from(&named[2]) {
+            Ok(Cli {
+                command:
+                    Some(Command::Peer(peer_cli::PeerArgs {
+                        action: peer_cli::PeerAction::Account(account),
+                    })),
+                ..
+            }) => {
+                assert_eq!(account.account, "bob@example.com/codex");
+                assert_eq!(account.exits_from.as_deref(), Some("local"));
+                assert!(account.no_must && !account.must);
+            }
+            _ => panic!("{:?} is not a peer account", named[2]),
+        }
+    }
+
     /// Each flag alone still parses — the deprecated one is accepted, as promised
     /// to the scripts and launch agents that already pass it.
     #[test]
@@ -9103,6 +9356,98 @@ mod tests {
         assert!(
             err.to_string().contains("control character"),
             "the error must name the character class at fault: {err}"
+        );
+    }
+
+    /// `tcr run --group` launches a CLAUDE session, and no Codex account can
+    /// serve one: a group whose every member is a Codex account is refused before
+    /// anything launches, while a group that also holds a Claude account launches
+    /// as before.
+    #[test]
+    fn run_group_with_no_claude_member_is_refused() {
+        let mut config = default_config();
+        config.accounts = vec![
+            account_with_groups("alice", Some(&["review"])),
+            config::Account {
+                provider: teamclaude_rs::provider::Provider::Codex,
+                ..account_with_groups("bob-codex", Some(&["lab", "review"]))
+            },
+        ];
+        let err = validate_group(&config, "lab").expect_err("lab holds no Claude account");
+        assert_eq!(
+            err.to_string(),
+            "group 'lab' has no Claude account (its members are Codex accounts, which a Claude session cannot use) — nothing launched."
+        );
+        assert!(validate_group(&config, "review").is_ok());
+    }
+
+    /// `spillToPool` does not lift that refusal. With it, every request of such a
+    /// session would fall back to the whole pool, so the session would run and
+    /// never once be served by the group it asked for. The launch-time check
+    /// already treats a label no account carries the same way, spill or not, and
+    /// a group with no Claude account is that, to a Claude session.
+    #[test]
+    fn run_group_refuses_a_codex_only_group_even_when_it_spills_to_the_pool() {
+        let mut config = default_config();
+        config.accounts = vec![
+            account_with_groups("alice", Some(&["review"])),
+            config::Account {
+                provider: teamclaude_rs::provider::Provider::Codex,
+                ..account_with_groups("bob-codex", Some(&["lab"]))
+            },
+        ];
+        config.group_settings.insert(
+            "lab".to_string(),
+            config::GroupSettings {
+                spill_to_pool: true,
+                ..Default::default()
+            },
+        );
+        assert!(config.group_allows_spill("lab") && !config.is_group_reserved("lab"));
+        let err = validate_group(&config, "lab")
+            .expect_err("spilling does not give lab a Claude account");
+        assert_eq!(
+            err.to_string(),
+            teamclaude_rs::provider_guard::group_has_no_claude("lab")
+        );
+    }
+
+    /// `tcr peer ls` lists a Codex account's exit pin with what it really does:
+    /// a loose pin is inert, because a Codex request always leaves from this Mac,
+    /// and a strict one refuses every request routed to the account, so its line
+    /// names the command that clears it. A Claude pin, and a Codex account left
+    /// local, get no line.
+    #[test]
+    fn peer_ls_marks_a_codex_exit_pin_inert() {
+        use teamclaude_rs::provider::Provider;
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let pinned = |name: &str, provider: Provider, strict: bool| config::Account {
+            provider,
+            egress: config::Egress::Via(peer),
+            egress_strict: strict,
+            ..account_with_groups(name, None)
+        };
+        let accounts = vec![
+            pinned("bob@example.com/codex", Provider::Codex, false),
+            pinned("carol@example.com/codex", Provider::Codex, true),
+            pinned("alice@example.com", Provider::Anthropic, false),
+            config::Account {
+                provider: Provider::Codex,
+                ..account_with_groups("dana@example.com/codex", None)
+            },
+        ];
+        assert_eq!(
+            peer_ls_inert_exit_lines(&accounts),
+            vec![
+                format!(
+                    "bob@example.com/codex  exits={} (inert: Codex accounts always leave from this Mac)",
+                    peer.display()
+                ),
+                format!(
+                    "carol@example.com/codex  exits={} (refused: a Codex account cannot exit from another Mac, so tcr refuses every request routed to it; clear it with `tcr peer account carol@example.com/codex --exits-from local --no-must`)",
+                    peer.display()
+                ),
+            ]
         );
     }
 

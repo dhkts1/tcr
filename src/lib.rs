@@ -42,6 +42,7 @@ pub mod peer;
 pub mod pricing;
 pub mod probe;
 pub mod provider;
+pub mod provider_guard;
 pub mod proxy;
 pub mod quota;
 pub mod schedule;

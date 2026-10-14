@@ -492,6 +492,7 @@ below in force: `groupSettings.<label>.allowControlAccount` for one group, and
 ```
 group research accounts=1 members=gil@example.com reserved=no parked=no routes=no route_block=control-account-only ...
 group dev      accounts=2 members=a@example.com,b@example.com reserved=no parked=no routes=yes ...
+group lab      accounts=1 members=bob@example.com/codex codex_members=1 reserved=no parked=no routes=no route_block=codex-only ...
 ```
 
 `routes=no` means the group exists and serves nothing. Four ways out: add a second, ordinary
@@ -499,6 +500,14 @@ account to the group; move the control account elsewhere with `tcr control --cle
 one group use it with `tcr group allow-control <label>`; or let the whole pool use it with
 `controlPooled`. `tcr group add` prints the same warning at the moment you create the
 situation.
+
+`routes=` answers whether a Claude session asking for the group can be served by it, so it
+counts Claude accounts only: no Codex request carries a group. A group with a Codex member
+gains `codex_members=<n>` right after `members=`, and a group whose members are all Codex
+accounts reads `routes=no route_block=codex-only`. `--json` carries the same two facts, as
+`codexMembers` (present only when above zero) and `routeBlock: "codex-only"`. A fleet with no
+Codex account lists exactly what it always did. What a Codex member of a group does and does
+not do is [below](#codex-accounts-in-a-group-labelled-and-parked-never-routed).
 
 Reserving solves a different problem, and is no longer the only way to get strictness — every
 group is strict on its own exhaustion by default now, `reserved` or not. `tcr group reserve
@@ -549,6 +558,28 @@ Two things it deliberately is not:
 - **Not a per-account write.** Parking never touches `accounts[].disabled`, so unparking does
   not re-enable a member you benched by hand: that row stays disabled until `tcr enable`
   says otherwise, and `tcr status` keeps reporting it as `disabled` rather than `parked`.
+
+### Codex accounts in a group: labelled and parked, never routed
+
+A Codex account can carry a group label, and the label does two things: `tcr group park`
+reaches it, and `tcr status` shows it. It never routes. No Codex request carries a group, so a
+Codex account is picked for Codex traffic as if it had no label at all. The group verbs say so:
+
+- **`tcr group add <label> <codex account>`** writes the label and prints a warning on stderr
+  saying what the label does and does not do. It still exits 0.
+- **`tcr group reserve <label>`** counts Claude accounts for its safety rail: it refuses when
+  the reservation would leave no enabled, unreserved Claude account, however many Codex
+  accounts remain, because they cannot serve a Claude session. It also refuses a group that
+  holds a Codex account, in any state, because while the group is reserved its Codex members
+  serve nothing; the refusal names them and the `tcr group rm` that takes one out. `--force`
+  reserves it anyway, warns on stderr, and the success line counts what is left per provider
+  (`… 1 unreserved enabled Claude account(s) and 1 Codex account(s) remain.`). `--force` never
+  lifts the Claude rail. Either refusal leaves the file as it was.
+- **`tcr run --group <label>`** refuses a group with no Claude account, since a Claude session
+  cannot use any of its members, and launches nothing. `spillToPool` does not lift this: the
+  check runs at launch, as the one that refuses a label no account carries does.
+
+A fleet with no Codex account sees none of this: every verb prints what it always printed.
 
 ## `controlIdentity`: the client must BE the control account
 

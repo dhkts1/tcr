@@ -753,11 +753,18 @@ Sets rotation priority. **Lower value is preferred.** Flags: `--first`, `--last`
 | form | effect |
 |---|---|
 | `tcr priority alice@example.com 5` | writes `5` verbatim |
-| `tcr priority alice@example.com --first` | `min(0, all existing priorities) - 1` |
-| `tcr priority alice@example.com --last` | `max(0, all existing priorities) + 1` |
+| `tcr priority alice@example.com --first` | `min(0, existing priorities of the account's own provider) - 1` |
+| `tcr priority alice@example.com --last` | `max(0, existing priorities of the account's own provider) + 1` |
 
 The `0` seed in those relative forms guarantees the move crosses the default tier even when
 every existing priority sits on the same side of it.
+
+Claude and Codex accounts rotate apart, since neither serves the other's requests, so the
+relative forms read only the priorities of the account's own provider; in a fleet with no Codex
+account, that is every account. On a Codex account, `--first` and `--last` say which end of
+the Codex rotation it now holds: `Set priority of '<name>' to <n>, the front of the Codex
+rotation.` (or `the back`). An explicit `N`, and any move of a Claude account, prints
+`Set priority of '<name>' to <n>.` as before.
 
 The positional value conflicts with `--first`/`--last`, and `--first` conflicts with
 `--last`. There is no default: omitting all three is a runtime error,
@@ -815,6 +822,39 @@ current enough: every refresh the proxy performs is written straight back to the
 The token is a credential. Pipe it (`tcr token alice@example.com | pbcopy`); do not paste
 it into a chat, a ticket, or a command line that lands in shell history. TcrBar's
 right-click **Copy Access Token** runs exactly this and puts stdout on the pasteboard.
+
+---
+
+## `tcr mint`
+
+Mints a long-lived (365-day) token for an existing Claude account, or for every account
+carrying a group label, and puts the result on the clipboard. Nothing is stored: the config
+file is read and never written, so this command exports a token and keeps nothing.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--account <name>` | string | none | mint for one account, by its exact name (see "Account resolution" above) |
+| `--group <label>` | string | none | mint for every account carrying this group label, one at a time |
+| `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
+
+Exactly one of `--account` and `--group` is required; a group no account carries is an error.
+For each account, `tcr mint` prints an authorize URL on stderr; you sign in as that account
+and paste back the `code#state` the page shows. The exchange is checked against the account
+it was minted for: a token issued for a different email, or for any lifetime other than the
+365 days asked for, is discarded and never reaches the clipboard. The clipboard gets one
+`<name>`, tab, `<token>` line per account that minted.
+
+stdout is a report, never a token: one line per account, `<name>`, tab, `OK`, tab, `<days>d`,
+tab, `<org>` for a mint, or `<name>`, tab, `REFUSED`, tab, `<reason>`. A last line counts them:
+`<minted>/<n> minted`. The exit code is 0 when every Claude account it targeted minted, and 1
+otherwise, so a program driving it can tell.
+
+**A Codex account cannot mint.** Only a Claude account has a long-lived token to mint.
+`--account` naming a Codex account is refused before any URL is printed, and changes nothing.
+A `--group` mint skips its Codex members: each gets its own line, `<name>`, tab, `REFUSED`,
+tab, `Codex account (tcr mint is Claude-only)`, none of it reaches the clipboard, and the
+tally counts it apart, as in `2/2 minted · 1 Codex account skipped`. A skipped member is not
+a failed mint, so it does not change the exit code.
 
 ---
 
@@ -1468,11 +1508,22 @@ the name column when the beacon carried none. The summary line carries `found=<n
 are shown) and `not-shown=<n>` (how many this Mac is holding back past the twelve-row cap, the
 `abuse-resistance.md` display limit).
 
+A Codex account whose exit lock names a peer gets a line of its own, after the found rows and
+before the summary: `<account>  exits=<peer short id>`, then why the pin does what it does. A
+Codex request always leaves from this Mac, so a pin that is not strict changes nothing, and
+the line ends ` (inert: Codex accounts always leave from this Mac)`. A strict pin (`--must`)
+is not inert: tcr refuses every request routed to that account until the pin is cleared, so
+the line says so and names the command that clears it, `tcr peer account <name> --exits-from
+local --no-must`. `tcr peer account` no longer writes either pin on a Codex account (see
+[peers.md](peers.md#exit-lock-keeping-an-account-on-one-ip)); these lines are for one written
+before it refused. The `--json` document is unchanged, and its `lentTo` block never names a
+Codex account, because no lease draws on one.
+
 | flag | type | default | effect |
 |---|---|---|---|
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
 | `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, and no `node` at all, because a found row carries no key to pin |
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read for the account labels the `lentTo` block is keyed by. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty instead of failing the listing |
+| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read for the account labels the `lentTo` block is keyed by, and for the Codex exit pins the text form lists. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty and lists no pins, instead of failing the listing |
 
 ### `tcr peer find <on\|off>`
 
@@ -1521,9 +1572,15 @@ Turns account sharing on or off for every currently trusted peer, at a default l
 | `--ttl <secs>` | int | `600` | how long a granted lease lives before it needs renewing |
 | `--max-inflight <n>` | int | `2` | how many borrowed requests may be in flight at once against one lease. `0` mints leases that refuse every request, which is what writing `0` asks for |
 | `--scope <scope>` | string | `all` | what the DEFAULT lease draws from: `all`, `group:<name>`, or `account:<label>[,<label>]`. Written onto every pinned Mac and recorded as `defaultLend`, which the Sharing defaults sheet shows |
+| `--config <path>` | path | `~/.config/teamclaude.json` | main config, read only when `--scope account:` names accounts, to refuse a label that is a Codex account's. A config that is missing or unreadable skips that check |
 
 `tcr peer share on` with no flags mints exactly one grant per trusted peer: 10% of the weekly
 window (`7d`), a 600-second lease, at most 2 requests in flight, drawn from every account.
+
+A scope that names a Codex account (`--scope account:<label>`, with the label `tcr status`
+prints for it) is refused before anything is written: Codex accounts stay on this Mac, so
+only a Claude account can be lent. `--fraction 0` is still allowed, so an old grant that names
+one can be removed.
 
 Run again over a grant that already exists for the same window and scope, it **keeps that
 grant's mode, its end date and its daily hours** and changes only what you passed. Those three
@@ -1679,6 +1736,7 @@ this is the per-Mac sheet's **Lend from** list.
 | `--days <mon,tue,...>` | string | every day | only open the lease on these days of the week, read against the day the window starts |
 | `--mode <serve\|hand>` | enum | keeps the replaced grant's mode, or `serve` for a new one | `serve` sends the borrower's requests over this Mac and out on this Mac's IP; this Mac reads them. `hand` gives the borrower a short-lived access token instead, over the paired session, so the borrower sends the request on its own IP and this Mac never reads it. Omitted on a replace keeps the mode already in force, so editing a hand grant's fraction cannot quietly turn it back into `serve` |
 | `--list` | bool | `false` | list this peer's leases instead of changing them, one greppable line each, with the lease id `--revoke` and `--relend` take |
+| `--config <path>` | path | `~/.config/teamclaude.json` | main config, read by `--mode hand` to check the scope's exit locks, and when `--scope account:` names accounts, to refuse a label that is a Codex account's. A config that is missing or unreadable skips the second check |
 | `--revoke <lease-id>` | string | none | take one lease away, by the id `--list` printed. The other leases this Mac holds are untouched |
 | `--relend <lease-id>` | string | none | put an ended lease back to work, with a new `--for`/`--until` or with no end at all |
 
@@ -1699,6 +1757,11 @@ A `hand` grant is refused outright, before anything is written, when every accou
 covers has `egressStrict` on: that pin says the account's requests leave through one named Mac
 or not at all, and a borrower sending on its OWN IP can never be that Mac. Lend it as
 `--mode serve` instead, or clear the pin on an account the scope covers first.
+
+A scope that names a Codex account (`--scope account:<label>`) is refused too, before anything
+is written: Codex accounts stay on this Mac, so only a Claude account can be lent. A zero
+fraction, `--list`, `--revoke` and `--relend` are still allowed, so an old lease that names one
+can be cleared.
 
 ### `tcr peer status`
 

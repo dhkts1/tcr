@@ -26,6 +26,7 @@ use serde::Deserialize;
 use crate::config::{self, Account};
 use crate::identity;
 use crate::oauth;
+use crate::provider_guard::{self, ClaudeOnlyVerb};
 
 /// Authorize endpoint used by `tcr mint`. Measured against the live endpoint
 /// (`docs/design/long-lived-tokens.md`) — distinct from [`oauth::AUTHORIZE_URL`],
@@ -181,6 +182,19 @@ enum MintOutcome {
     /// Network/parse/stdin failure — the exchange never produced a response to
     /// check identity against.
     Failed(String),
+    /// A Codex member of a `--group` mint, skipped without opening a URL: only a
+    /// Claude account can mint a long-lived token. Reported on its own line and
+    /// counted apart in the tally, so a skip is never read as a failed mint.
+    SkippedCodex,
+}
+
+/// What `tcr mint` does with one account it was pointed at.
+#[derive(Debug, Clone, Copy)]
+enum MintTarget<'a> {
+    /// A Claude account: open its URL, wait for the paste, exchange, check.
+    Mint(&'a Account),
+    /// A Codex member of a `--group` mint: reported as skipped, never minted.
+    SkipCodex(&'a Account),
 }
 
 /// One account's mint attempt: the account name it was minted for, and what
@@ -242,6 +256,99 @@ fn select_group_accounts<'a>(accounts: &'a [Account], group: &str) -> Vec<&'a Ac
     accounts.iter().filter(|a| a.in_group(group)).collect()
 }
 
+/// Which accounts a `tcr mint` run targets, and what it does with each, before
+/// anything is printed or read from stdin.
+///
+/// Pure, so the provider rules are testable without a URL or a paste:
+/// - `--account` naming a Codex row is refused outright, with
+///   [`provider_guard::provider_guard`]'s sentence, before any URL;
+/// - `--group` keeps every member, in config order, and marks a Codex member
+///   [`MintTarget::SkipCodex`], so the report names it rather than dropping it.
+///
+/// The selection and its two refusals (a group no account carries, and both or
+/// neither flag) are exactly what they were before Codex accounts existed.
+fn plan_mint<'a>(
+    accounts: &'a [Account],
+    account: Option<&str>,
+    group: Option<&str>,
+) -> anyhow::Result<Vec<MintTarget<'a>>> {
+    match (account, group) {
+        (Some(query), None) => {
+            let idx = crate::cli::resolve_account(accounts, query)?;
+            let row = &accounts[idx];
+            provider_guard::provider_guard(row, ClaudeOnlyVerb::Mint)
+                .map_err(anyhow::Error::msg)?;
+            Ok(vec![MintTarget::Mint(row)])
+        }
+        (None, Some(group)) => {
+            let matches = select_group_accounts(accounts, group);
+            if matches.is_empty() {
+                anyhow::bail!("no account carries group '{group}'");
+            }
+            Ok(matches
+                .into_iter()
+                .map(
+                    |row| match provider_guard::provider_guard(row, ClaudeOnlyVerb::Mint) {
+                        Ok(()) => MintTarget::Mint(row),
+                        Err(_) => MintTarget::SkipCodex(row),
+                    },
+                )
+                .collect())
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            anyhow::bail!("provide exactly one of --account or --group")
+        }
+    }
+}
+
+/// The summary line after the per-account report: `{minted}/{n} minted`, where
+/// `n` counts the Claude accounts targeted, plus ` · {k} Codex account(s)
+/// skipped` only when a group mint skipped any. A fleet with no Codex account
+/// never skips one, so its line is exactly what it always was.
+fn tally_line(results: &[MintResult]) -> String {
+    let tally = MintTally::of(results);
+    let mut line = format!("{}/{} minted", tally.minted, tally.targeted);
+    if tally.skipped > 0 {
+        let noun = if tally.skipped == 1 {
+            "account"
+        } else {
+            "accounts"
+        };
+        line.push_str(&format!(" · {} Codex {noun} skipped", tally.skipped));
+    }
+    line
+}
+
+/// The three counts a mint run reports and decides its exit code by. One
+/// counting, so the printed tally and the exit code cannot disagree about what
+/// a skipped Codex member is.
+struct MintTally {
+    /// Accounts that minted cleanly.
+    minted: usize,
+    /// Accounts a mint was attempted for: every result but a skipped Codex one.
+    targeted: usize,
+    /// Codex members a group mint skipped.
+    skipped: usize,
+}
+
+impl MintTally {
+    fn of(results: &[MintResult]) -> Self {
+        let skipped = results
+            .iter()
+            .filter(|r| matches!(r.outcome, MintOutcome::SkippedCodex))
+            .count();
+        let minted = results
+            .iter()
+            .filter(|r| matches!(r.outcome, MintOutcome::Minted { .. }))
+            .count();
+        Self {
+            minted,
+            targeted: results.len() - skipped,
+            skipped,
+        }
+    }
+}
+
 /// Assemble the WHOLE clipboard block: one `<account name>\t<token>` line per
 /// successfully minted account, in the order minted. Accounts that failed,
 /// mismatched identity, or mismatched lifetime contribute no line — their
@@ -289,6 +396,11 @@ fn format_report_line(result: &MintResult) -> String {
             )
         }
         MintOutcome::Failed(err) => format!("{}\tREFUSED\t{err}", result.account_name),
+        MintOutcome::SkippedCodex => format!(
+            "{}\tREFUSED\t{}",
+            result.account_name,
+            provider_guard::MINT_SKIP_REASON
+        ),
     }
 }
 
@@ -359,8 +471,15 @@ fn copy_to_clipboard(block: &str) -> anyhow::Result<()> {
 /// `tcr mint --account <name> | --group <name>` — mint a long-lived token for
 /// one account or every account carrying a group label, sequentially, and put
 /// the successfully-minted tokens on the clipboard. Returns `Ok(true)` only
-/// when every targeted account minted cleanly; the caller turns `Ok(false)`
-/// into a non-zero exit so a UI driving this can surface the failure.
+/// when every targeted Claude account minted cleanly; the caller turns
+/// `Ok(false)` into a non-zero exit so a UI driving this can surface the
+/// failure.
+///
+/// A Codex account cannot mint (see [`provider_guard`]): `--account` naming one
+/// is refused before any URL is printed, and a `--group` mint skips its Codex
+/// members by name, each on its own `REFUSED` line, counted apart in the tally
+/// and kept off the clipboard. A skipped member is not a failed mint, so it
+/// does not make the exit non-zero.
 ///
 /// Reads the config but never writes it: mint stores nothing
 /// (`docs/design/long-lived-tokens.md`; the operator explicitly chose
@@ -372,37 +491,26 @@ pub async fn run_mint(
 ) -> anyhow::Result<bool> {
     let (cfg, _created) = config::load_or_init(config_path).context("load config for mint")?;
 
-    let targets: Vec<&Account> = match (account, group) {
-        (Some(query), None) => {
-            let idx = crate::cli::resolve_account(&cfg.accounts, query)?;
-            vec![&cfg.accounts[idx]]
-        }
-        (None, Some(group)) => {
-            let matches = select_group_accounts(&cfg.accounts, group);
-            if matches.is_empty() {
-                anyhow::bail!("no account carries group '{group}'");
-            }
-            matches
-        }
-        (Some(_), Some(_)) | (None, None) => {
-            anyhow::bail!("provide exactly one of --account or --group")
-        }
-    };
+    let targets = plan_mint(&cfg.accounts, account, group)?;
 
     let mut results = Vec::with_capacity(targets.len());
     for target in targets {
-        let login_hint = identity::email_of(&target.name).to_string();
-        results.push(mint_one(&target.name, &login_hint).await);
+        match target {
+            MintTarget::Mint(row) => {
+                let login_hint = identity::email_of(&row.name).to_string();
+                results.push(mint_one(&row.name, &login_hint).await);
+            }
+            MintTarget::SkipCodex(row) => results.push(MintResult {
+                account_name: row.name.clone(),
+                outcome: MintOutcome::SkippedCodex,
+            }),
+        }
     }
 
     for result in &results {
         println!("{}", format_report_line(result));
     }
-    let minted = results
-        .iter()
-        .filter(|r| matches!(r.outcome, MintOutcome::Minted { .. }))
-        .count();
-    println!("{minted}/{} minted", results.len());
+    println!("{}", tally_line(&results));
 
     let block = assemble_clipboard_block(&results);
     if !block.is_empty() {
@@ -411,7 +519,8 @@ pub async fn run_mint(
 
     wait_for_return_on_a_tty();
 
-    Ok(minted == results.len())
+    let tally = MintTally::of(&results);
+    Ok(tally.minted == tally.targeted)
 }
 
 /// Hold the process open after the summary when stdin is a TTY, so a `--group`
@@ -609,5 +718,149 @@ mod tests {
 
         let idx = crate::cli::resolve_account(&accounts, "carol@example.com").unwrap();
         assert_eq!(accounts[idx].name, "carol@example.com");
+    }
+
+    // --- Codex accounts ------------------------------------------------
+
+    /// [`account`], as a Codex row: `"provider": "codex"`.
+    fn codex_account(name: &str, groups: &[&str]) -> Account {
+        let mut row = account(name, groups);
+        row.provider = crate::provider::Provider::Codex;
+        row
+    }
+
+    /// Each target as `(what mint does with it, the account's name)`, so a plan
+    /// can be compared whole.
+    fn shape<'a>(targets: &[MintTarget<'a>]) -> Vec<(&'static str, &'a str)> {
+        targets
+            .iter()
+            .map(|target| match target {
+                MintTarget::Mint(row) => ("mint", row.name.as_str()),
+                MintTarget::SkipCodex(row) => ("skip-codex", row.name.as_str()),
+            })
+            .collect()
+    }
+
+    fn minted(name: &str, token: &str) -> MintResult {
+        MintResult {
+            account_name: name.to_string(),
+            outcome: MintOutcome::Minted {
+                token: token.to_string(),
+                org: "Org".to_string(),
+                granted_secs: 31_536_000,
+            },
+        }
+    }
+
+    fn skipped(name: &str) -> MintResult {
+        MintResult {
+            account_name: name.to_string(),
+            outcome: MintOutcome::SkippedCodex,
+        }
+    }
+
+    /// `tcr mint --account` on a Codex row is refused with the guard's sentence
+    /// before any URL is printed, and the config file is left as it was.
+    ///
+    /// The pure plan is asserted FIRST on purpose: without the guard the test
+    /// fails there, before `run_mint` could print a URL or wait on stdin for a
+    /// paste nobody will type.
+    #[tokio::test]
+    async fn mint_account_on_a_codex_row_refuses_before_any_url_and_writes_nothing() {
+        let refusal = "'bob@example.com/codex' is a Codex account, and only a Claude account can mint a long-lived token. Nothing was changed.";
+        let accounts = vec![
+            account("alice@example.com", &[]),
+            codex_account("bob@example.com/codex", &[]),
+        ];
+
+        let err = plan_mint(&accounts, Some("bob@example.com/codex"), None)
+            .expect_err("a Codex row has no long-lived token to mint");
+        assert_eq!(err.to_string(), refusal);
+
+        let plan = plan_mint(&accounts, Some("alice@example.com"), None)
+            .expect("a Claude row still mints");
+        assert_eq!(shape(&plan), vec![("mint", "alice@example.com")]);
+
+        // The same refusal through the verb itself, on a real file. The Codex row
+        // carries the version every Codex row is written at, so the load stamps
+        // nothing either.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "accounts": [
+                    { "name": "alice@example.com", "accessToken": "t", "refreshToken": "r" },
+                    { "name": "bob@example.com/codex", "provider": "codex", "accessToken": "t",
+                      "refreshToken": "r", "credentialVersion": 2 }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("the config fixture writes");
+        let before = std::fs::read(&path).expect("the config reads");
+        let err = run_mint(&path, Some("bob@example.com/codex"), None)
+            .await
+            .expect_err("the verb refuses the Codex row too");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(
+            std::fs::read(&path).expect("the config reads back"),
+            before,
+            "a refused mint leaves the config byte-identical"
+        );
+    }
+
+    /// `tcr mint --group` keeps every member in config order and skips the Codex
+    /// one by name: its own `REFUSED` line, nothing on the clipboard, and a tally
+    /// that counts it apart from the Claude accounts it minted.
+    #[test]
+    fn mint_group_skips_codex_members_and_counts_them_apart() {
+        let accounts = vec![
+            account("alice@example.com", &["team"]),
+            codex_account("bob@example.com/codex", &["team"]),
+            account("carol@example.com", &["team"]),
+        ];
+        let plan = plan_mint(&accounts, None, Some("team")).expect("the group has members");
+        assert_eq!(
+            shape(&plan),
+            vec![
+                ("mint", "alice@example.com"),
+                ("skip-codex", "bob@example.com/codex"),
+                ("mint", "carol@example.com"),
+            ]
+        );
+
+        let results = vec![
+            minted("alice@example.com", "tok-a"),
+            skipped("bob@example.com/codex"),
+            minted("carol@example.com", "tok-c"),
+        ];
+        assert_eq!(
+            format_report_line(&results[1]),
+            "bob@example.com/codex\tREFUSED\tCodex account (tcr mint is Claude-only)"
+        );
+        assert_eq!(
+            assemble_clipboard_block(&results),
+            "alice@example.com\ttok-a\ncarol@example.com\ttok-c"
+        );
+        assert_eq!(tally_line(&results), "2/2 minted · 1 Codex account skipped");
+
+        // The controls: a fleet with no Codex member prints today's tally, and
+        // the noun is plural for any count but one.
+        let claude_only = vec![
+            minted("alice@example.com", "tok-a"),
+            minted("carol@example.com", "tok-c"),
+        ];
+        assert_eq!(tally_line(&claude_only), "2/2 minted");
+        let two_skipped = vec![
+            minted("alice@example.com", "tok-a"),
+            skipped("bob@example.com/codex"),
+            skipped("dana@example.com/codex"),
+            minted("carol@example.com", "tok-c"),
+        ];
+        assert_eq!(
+            tally_line(&two_skipped),
+            "2/2 minted · 2 Codex accounts skipped"
+        );
     }
 }
