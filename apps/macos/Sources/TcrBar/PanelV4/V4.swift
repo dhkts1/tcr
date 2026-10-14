@@ -77,6 +77,14 @@ enum V4 {
     static let tabIconBox: CGFloat = 14
     static let tabIconStroke: CGFloat = 1.8
     static let tabGap: CGFloat = 6
+    /// The least room between a tab's pill edge and its content, on both
+    /// sides, on every tab. Without it a tab wider than its quarter of the
+    /// strip ("Sessions" with a badge) drew its pill flush against the icon
+    /// and the badge while "Accts" kept the leftover of its quarter as room.
+    /// 4 is what the strip can pay at its widest counts (`Sessions 120`,
+    /// `Tools 12`): eight insets on top of the four contents still fit, and
+    /// `SegmentedTabsFitTests` fails if they stop fitting.
+    static let tabInset: CGFloat = 4
     static let badgeRadius: CGFloat = 9
     static let badgePaddingH: CGFloat = 6
     static let badgeFillAlpha: Double = 0.14
