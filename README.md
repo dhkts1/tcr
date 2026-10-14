@@ -238,7 +238,13 @@ response: `tcr` is missing, a poll is failing, the fleet is empty, or the read i
 <details>
 <summary>The full fleet view, and the terminal dashboard</summary>
 
-<img src="assets/tcrbar-panel-fleet.png" alt="TcrBar panel listing a full fleet of accounts" width="400">
+<p>
+  <img src="assets/tcrbar-panel-fleet.png" alt="TcrBar panel listing a full fleet of accounts, one line each under a strip of every account" width="400">
+  <img src="assets/tcrbar-panel-hover.png" alt="TcrBar panel with an account's card open on hover" width="400">
+</p>
+
+Every account is one line. Point at a line, or at its segment in the strip, to open its card; right-click an
+account and choose Keep Card Open to leave it open.
 
 ![tcr live TUI](assets/tui-demo.gif)
 
