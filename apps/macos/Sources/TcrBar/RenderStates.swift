@@ -613,6 +613,12 @@ enum RenderStates {
                 if renderControl(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        for scene in tabStripScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderTabStrip(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
 
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
@@ -2291,6 +2297,67 @@ enum RenderStates {
             // panel sizes itself from a GeometryReader preference and
             // `ImageRenderer` performs no second layout pass.
             .fixedSize()
+    }
+
+    // MARK: - The tab strip at its badge extremes
+
+    /// One strip, one selection, one set of counts.
+    private struct TabStripScene {
+        let name: String
+        let selected: PanelTab
+        let badges: [PanelTab: Int]
+    }
+
+    /// The strip alone, at every badge extreme and two selections, so
+    /// `apps/macos/scripts/check-tab-strip-still.swift` can prove that nothing in it
+    /// moves when a count changes: every PNG of one selection must match the
+    /// no-badge one outside the badge corners (Gil, 2026-10-14: "avoid layout
+    /// shifts"). `100` draws the cap, `99+`.
+    private static var tabStripScenes: [TabStripScene] {
+        let sets: [(name: String, count: Int?)] = [
+            ("none", nil), ("1", 1), ("9", 9), ("10", 10), ("99", 99), ("cap", 100),
+        ]
+        var out: [TabStripScene] = []
+        for selected in [PanelTab.accounts, .sessions] {
+            for set in sets {
+                var badges: [PanelTab: Int] = [:]
+                if let count = set.count {
+                    badges = [.sessions: count, .tools: count, .peers: count]
+                }
+                out.append(
+                    TabStripScene(
+                        name: "70-tab-strip-\(selected.rawValue)-\(set.name)",
+                        selected: selected, badges: badges))
+            }
+            out.append(
+                TabStripScene(
+                    name: "70-tab-strip-\(selected.rawValue)-mixed",
+                    selected: selected, badges: [.sessions: 120, .tools: 3, .peers: 1]))
+        }
+        return out
+    }
+
+    @MainActor
+    private static func renderTabStrip(
+        _ scene: TabStripScene, appearance: Appearance, into directory: URL
+    ) -> Bool {
+        UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key)
+        PanelDensityPreference.setAccountCount(13)
+        return withDrawingAppearance(appearance.nsAppearance) {
+            let view =
+                SegmentedTabs(
+                    tabs: PanelTab.allCases, selected: scene.selected, badges: scene.badges,
+                    onSelect: { _ in }
+                )
+                .padding(.top, V4.panelPaddingTop)
+                .padding(.horizontal, V4.panelPaddingSide)
+                .frame(width: V4.panelWidth)
+                .background(Tok.panel)
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+                .fixedSize()
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
     }
 
     // MARK: - Settings > Peers controls
