@@ -119,6 +119,93 @@ final class SegmentedTabsFitTests: XCTestCase {
                 + "width, which is what made \"Sessions\" break in two")
     }
 
+    /// Every tab keeps at least `V4.tabInset` between its pill edge and its
+    /// content, on both sides, at the widest counts the strip is measured at
+    /// above. Equal quarters cannot give it there: "Sessions 120" is wider
+    /// than a quarter, so before this its pill ended exactly at its badge.
+    func testEveryTabKeepsTheInsetAtTheWidestCounts() throws {
+        try assertEveryTabKeepsTheInset(sessions: 120, tools: 12)
+    }
+
+    /// The counts Gil saw the defect at (2026-10-14): "Sessions 5" selected,
+    /// pill flush against the icon and the badge, "Tools 3" starting where it
+    /// ended.
+    func testEveryTabKeepsTheInsetAtSessionsFiveToolsThree() throws {
+        try assertEveryTabKeepsTheInset(sessions: 5, tools: 3)
+    }
+
+    /// The Accts-selected panel with no badges looks as it did: four equal
+    /// quarters, because every tab's content and its insets fit a quarter.
+    /// A layout that sized every tab from its content would pass the inset
+    /// tests and still move every pill on the panel people look at most.
+    func testWithoutBadgesTheStripKeepsFourEqualQuarters() throws {
+        let contents = try contentWidths(sessions: nil, tools: nil)
+        let quarter = try allottedSegmentWidth(tabCount: 4)
+        let widths = TabStripFit.widths(
+            contentWidths: contents.map(\.width), inset: try token("tabInset"),
+            available: try stripContentWidth())
+        for (tab, width) in zip(contents, widths) {
+            XCTAssertEqual(
+                width, quarter, accuracy: 0.01,
+                "\"\(tab.label)\" is \(width) pt wide, not its \(quarter) pt quarter, with no badges")
+        }
+    }
+
+    /// The view lays the strip out with ``TabStripFit`` and `V4.tabInset`, so
+    /// the arithmetic the three tests above check is the arithmetic drawn.
+    func testTheStripIsLaidOutByTabStripFit() throws {
+        let source = try panelSource("PanelV4/SegmentedTabs.swift")
+        XCTAssertTrue(
+            source.contains("TabStripFit.widths("),
+            "SegmentedTabs no longer sizes its tabs with TabStripFit.widths")
+        XCTAssertTrue(
+            source.contains("inset: V4.tabInset"),
+            "SegmentedTabs no longer passes V4.tabInset to TabStripFit")
+    }
+
+    private func assertEveryTabKeepsTheInset(
+        sessions: Int, tools: Int, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let inset = try token("tabInset")
+        let available = try stripContentWidth()
+        let contents = try contentWidths(sessions: sessions, tools: tools)
+        let widths = TabStripFit.widths(
+            contentWidths: contents.map(\.width), inset: inset, available: available)
+        XCTAssertEqual(widths.count, contents.count, file: file, line: line)
+        XCTAssertLessThanOrEqual(
+            widths.reduce(0, +), available + 0.01,
+            "the tabs want \(widths.reduce(0, +)) pt of the strip's \(available) pt",
+            file: file, line: line)
+        for (tab, width) in zip(contents, widths) {
+            let room = (width - tab.width) / 2
+            XCTAssertGreaterThanOrEqual(
+                room, inset - 0.01,
+                "\"\(tab.label)\" at Sessions \(sessions), Tools \(tools): its content runs to "
+                    + "\(String(format: "%.1f", room)) pt from its pill edge, under the "
+                    + "\(inset) pt inset (pill \(String(format: "%.1f", width)) pt, content "
+                    + "\(String(format: "%.1f", tab.width)) pt)",
+                file: file, line: line)
+        }
+    }
+
+    /// The four tabs' content widths, in the strip's order.
+    private func contentWidths(sessions: Int?, tools: Int?) throws -> [(label: String, width: CGFloat)] {
+        let accounts = try panelTabTitle("accounts")
+        let sessionsLabel = try panelTabTitle("sessions")
+        let toolsLabel = try panelTabTitle("tools")
+        return [
+            (accounts, try idealSegmentWidth(label: accounts, badge: nil)),
+            (sessionsLabel, try idealSegmentWidth(label: sessionsLabel, badge: sessions)),
+            (toolsLabel, try idealSegmentWidth(label: toolsLabel, badge: tools)),
+            ("Peers", try idealSegmentWidth(label: "Peers", badge: nil)),
+        ]
+    }
+
+    /// The strip's width for its four tabs, after its padding and three gaps.
+    private func stripContentWidth() throws -> CGFloat {
+        try allottedSegmentWidth(tabCount: 4) * 4
+    }
+
     /// `[label: idealWidth]` for the four segments — the three real tabs plus
     /// the literal "Peers" stand-in (see the class doc-comment).
     private func idealWidths(accountsLabel: String) throws -> [String: CGFloat] {
