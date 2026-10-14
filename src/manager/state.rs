@@ -165,12 +165,21 @@ impl Manager {
     /// other provider's first. The proxy asks its "is the rotation spent" and "how many accounts
     /// are exhausted" questions of this and not of the fleet-wide [`Self::account_count`], so a
     /// mixed fleet answers an Anthropic request exactly as its Anthropic half alone would.
+    ///
+    /// A slot deleted while this process runs ([`AccountRuntime::removed`]) still counts for
+    /// Anthropic, as it always has, so a Claude client's answers do not move. It does not count
+    /// for Codex: every Codex path (the listener's per-CONNECT interception of `chatgpt.com`, the
+    /// Codex 429s, and the route `tcr status` words from the accounts a status document lists,
+    /// which leave a deleted one out) counts the same live accounts. Otherwise a live delete of
+    /// the last Codex account would leave the listener terminating `chatgpt.com` until a restart,
+    /// while `tcr status` said it blind-tunnels it.
     pub fn provider_account_count(&self, provider: crate::provider::Provider) -> usize {
         self.accounts
             .read()
             .expect("accounts lock poisoned")
             .iter()
             .filter(|a| a.provider == provider)
+            .filter(|a| provider == crate::provider::Provider::Anthropic || !a.removed)
             .count()
     }
 

@@ -78,7 +78,11 @@ Past the reset the row keeps that window, with no time, until the next quota pro
 window rolled. A refusal no full window explains, for credits or a spend cap, reads `hold` while
 the hold tcr set for it lasts, or `refused` if an upstream 403 holds the account. A quota probe
 ends the refusal when it sees a window roll or reads the account allowed again. The details are
-in [`cli.md`](cli.md#codex-rows-on---json).
+in [`cli.md`](cli.md#codex-rows-on---json). When an upstream 403 refuses a Codex account and no
+other Codex account can take the request, `codex` gets tcr's answer for a refused login, which
+names the account and `tcr login --codex --account <name>`
+([`cli.md`](cli.md#--codex-launching-codex-through-the-pool)), and its requests during the
+120-second hold get a 429 it retries.
 
 ## A response that breaks partway through is not moved to another account
 
@@ -261,10 +265,21 @@ instead (`tcr run` points the sessions it launches at the right one by itself).
 
 ## Codex works but `tcr status` shows no Codex traffic
 
-Then `codex` is running on its own login, around the pool. A session started with
-`tcr run --codex` said so when it launched: look for the
-`[tcr] launching codex directly (not pooled): …` line in that terminal, and
-[`cli.md`](cli.md#--codex-launching-codex-through-the-pool) has each reason and its fix. A
+Then either `codex` runs on its own login, around the pool, or tcr is refusing it. Start from
+the line `tcr status` prints above its header: `codexVerdict: codex is not pooled: <reason>` (`verdict:` in a fleet
+of Codex accounts alone) says why the proxy cannot pool `codex`, in the words
+`tcr run --codex` uses, and [`cli.md`](cli.md#--codex-launching-codex-through-the-pool) has
+each reason and its fix. A session started with `tcr run --codex` said the same when it
+launched, on its `[tcr] launching codex directly (not pooled): …` line.
+
+With no such line, the proxy can pool `codex`, so look at the two notes `tcr status` prints on
+stderr. `note codex-refusals` means `codex` did reach the pool and tcr refused it with a 429,
+because no Codex account could serve: the Codex rows say why each is out. `note codex-unpooled`
+means requests reached tcr from a login that names a FedRAMP or data-residency routing of its
+own, which tcr relays on that login's credential, never pooled. Both count the last ten minutes,
+and a restart of the proxy empties them.
+
+With neither note, `codex` is not reaching tcr at all. A
 `codex` you start yourself is pooled only when the proxy variable it reads for `https://` aims
 at this proxy (`HTTPS_PROXY`, else `ALL_PROXY`, in either case), it trusts tcr's CA (through
 `CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`, or the system store), no `NO_PROXY` entry exempts

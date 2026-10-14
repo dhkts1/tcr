@@ -250,6 +250,8 @@ pub struct StatusPayload {
     /// snapshot of `codexUpstream`, sent only when it is not the default
     /// (`https://chatgpt.com`). `None` is the default, or an OLD server that
     /// predates the key; either way the CLI names no other upstream.
+    /// `from_snapshot` leaves it `None` and the serving process fills it, as
+    /// with [`Self::mitm`].
     ///
     /// `#[serde(default, skip_serializing_if)]` and, like [`Self::mitm`], NOT a
     /// [`STATUS_KIND`] bump: an OLD client skips the unknown key, and a NEW

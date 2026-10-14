@@ -19,10 +19,10 @@ use clap::{Parser, Subcommand};
 use teamclaude_rs::cli::{self, validate_group_label_chars, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::peer;
-use teamclaude_rs::proxy::GROUP_HEADER_NAME;
+use teamclaude_rs::proxy::{self, GROUP_HEADER_NAME};
 use teamclaude_rs::{
-    affinity, build_info, config_keys, demo, mint, mitm, oauth, server, singleton, status, tui,
-    update,
+    affinity, build_info, codex_route, config_keys, demo, mint, mitm, oauth, server, singleton,
+    status, tui, update,
 };
 
 #[derive(Parser)]
@@ -6114,6 +6114,13 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         let launch = codex_launch(&args, port, &live, &ca, ca.is_file(), &|var| {
             std::env::var(var).ok()
         })?;
+        // Pooled, but the pool may have no account free: say so before the banner, from the
+        // same read, so a session that will be refused is not a surprise.
+        if let (CodexLaunch::SeeThrough { .. }, Ok(payload)) = (&launch, &live) {
+            if let Some(line) = codex_pool_preflight(payload, time::OffsetDateTime::now_utc()) {
+                eprintln!("{line}");
+            }
+        }
         apply_codex_launch(&mut cmd, port, &launch);
         let status = cmd
             .status()
@@ -6168,6 +6175,16 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     }
 
     if cli::proxy_is_up(port) {
+        // A config that holds Codex accounts and no Claude one may be a proxy that refuses this
+        // whole session: read its accounts, once, only then. A Claude-only or mixed config pays
+        // no read and prints nothing new.
+        if holds_only_codex(&config) {
+            if let Ok(payload) = cli::fetch_live_status(&config).await {
+                if let Some(warning) = no_claude_account_warning(port, &payload) {
+                    eprintln!("{warning}");
+                }
+            }
+        }
         if let Some(notice) = withheld_api_key_notice(
             config.proxy.api_key.is_some(),
             std::env::var_os("ANTHROPIC_API_KEY").is_some(),
@@ -6285,13 +6302,13 @@ impl CodexLaunch {
 /// # Rows
 ///
 /// * `--group` is refused before anything launches (`refuse_group_with_codex`).
-/// * Pooled only when the proxy reports a tcr-minted leaf that intercepts
-///   `chatgpt.com`, lists a Codex account, and its CA is on disk. The proxy
-///   terminates `chatgpt.com` only while its pool holds a Codex account, so
-///   without one listed (in any state, as the proxy counts them) the launch is
-///   direct, and codex keeps its own login.
-/// * Direct otherwise, saying why. Only a proxy that predates the status key
-///   is told to restart: a JS leaf, or MITM off, survives any restart.
+/// * Pooled exactly when [`codex_route::codex_route`] says so: the proxy
+///   reports a tcr-minted leaf that intercepts `chatgpt.com`, lists a Codex
+///   account (in any state, as the proxy counts them), and its CA is on disk.
+///   `tcr status` words the same decision, so the two never disagree.
+/// * Direct otherwise, with the route's reason. Only a proxy that predates the
+///   status key is told to restart: a JS leaf, or MITM off, survives any
+///   restart.
 ///
 /// Every direct launch also drops the inherited proxy variables that point at
 /// this tcr ([`proxy_vars_at`]), so a tcr that is down, or not intercepting,
@@ -6306,71 +6323,100 @@ fn codex_launch(
     inherited: &dyn Fn(&str) -> Option<String>,
 ) -> anyhow::Result<CodexLaunch> {
     refuse_group_with_codex(args)?;
-    let host = mitm_codex_host();
-    let reason = match status {
-        Err(cli::LiveStatusError::NoServer) => format!("proxy not listening on :{port}"),
-        Err(err) => format!("could not read the running proxy's status ({})", err.why()),
-        Ok(payload) => match &payload.mitm {
-            None => format!(
-                "the proxy on :{port} (build {}) predates Codex interception — restart it on \
-                 this build at a quiet moment",
-                payload.build.sha
-            ),
-            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_JS => format!(
-                "the proxy on :{port} is serving the JS teamclaude leaf, which covers \
-                 api.anthropic.com only and is never re-minted — a restart will not change \
-                 this; see docs/troubleshooting.md"
-            ),
-            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_NONE => format!(
-                "the proxy on :{port} is running without MITM: its TLS material failed to load \
-                 at boot — see its log"
-            ),
-            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_MINTED && mitm.intercepts(host) => {
-                // The proxy terminates `chatgpt.com` only while its pool holds a Codex account,
-                // in any state (`mitm::handle_connect`), so with none listed it blind-tunnels
-                // the launch whatever its leaf covers.
-                if !payload
-                    .accounts
-                    .iter()
-                    .any(|row| row.provider == teamclaude_rs::provider::Provider::Codex)
-                {
-                    no_codex_account_reason(port, host)
-                } else if ca_is_file {
-                    return Ok(CodexLaunch::SeeThrough {
-                        ca: ca.to_path_buf(),
-                        no_proxy: no_proxy_rewrites(host, inherited),
-                    });
-                } else {
-                    format!("no readable CA at {}", ca.display())
-                }
-            }
-            Some(mitm) if mitm.leaf == status::MitmStatus::LEAF_MINTED => format!(
-                "the proxy on :{port} serves a leaf it minted but does not intercept {host} (it \
-                 intercepts [{}])",
-                mitm.intercepted_hosts.join(", ")
-            ),
-            // A leaf kind this build does not know is a different build's, and nothing it
-            // reports can be read as tcr's own minted leaf: launched direct, saying so.
-            Some(mitm) => format!(
-                "the proxy on :{port} (build {}) reports a leaf this build does not know ({:?}) \
-                 — run tcr run --codex from the same build as the proxy",
-                payload.build.sha, mitm.leaf
-            ),
-        },
-    };
+    let route = codex_route::codex_route(
+        status.as_ref(),
+        port,
+        ca,
+        ca_is_file,
+        status
+            .as_ref()
+            .map_or(0, codex_route::listed_codex_accounts),
+    );
+    if route.pooled {
+        return Ok(CodexLaunch::SeeThrough {
+            ca: ca.to_path_buf(),
+            no_proxy: no_proxy_rewrites(mitm_codex_host(), inherited),
+        });
+    }
     Ok(CodexLaunch::Direct {
-        reason,
+        reason: route.reason.unwrap_or_default(),
         unset: proxy_vars_at(port, inherited),
     })
 }
 
-/// Why `tcr run --codex` launches codex directly when the proxy holds no Codex account, and
-/// the command that adds one: a login of tcr's own, which leaves the codex CLI's login alone.
-fn no_codex_account_reason(port: u16, host: &str) -> String {
-    format!(
-        "the proxy on :{port} holds no Codex account, so it blind-tunnels {host} and codex keeps \
-         its own login — add one with `tcr login --codex`"
-    )
+/// The line `tcr run --codex` prints before its banner when the running proxy pools codex but
+/// no Codex account in its pool can serve right now: why each is out, worded as tcr's own 429
+/// lists its gates but in Codex words ([`proxy::describe_codex_gates`]), and when the first one
+/// frees ([`proxy::at_utc`]), or that none reports when. `None` when a Codex account is in
+/// rotation, or when the pool holds none (the launch already said so).
+///
+/// A row held by an upstream hold or 403 that carries ChatGPT's own refusal
+/// (`limitReachedType`) is counted as refused by ChatGPT: the refusal outlasts the hold, and is
+/// why the account stays out.
+fn codex_pool_preflight(
+    payload: &status::StatusPayload,
+    now: time::OffsetDateTime,
+) -> Option<String> {
+    use teamclaude_rs::stats::GateReason;
+    let codex: Vec<&status::AccountStatus> = payload
+        .accounts
+        .iter()
+        .filter(|row| row.provider == teamclaude_rs::provider::Provider::Codex)
+        .collect();
+    if codex.is_empty() || codex.iter().any(|row| row.gate == GateReason::Ok) {
+        return None;
+    }
+    let mut tally: std::collections::BTreeMap<GateReason, usize> =
+        std::collections::BTreeMap::new();
+    for row in &codex {
+        let gate = match row.gate {
+            GateReason::Hold | GateReason::Refused if row.limit_reached_type.is_some() => {
+                GateReason::Rejected
+            }
+            gate => gate,
+        };
+        *tally.entry(gate).or_default() += 1;
+    }
+    let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+    let soonest = codex
+        .iter()
+        .filter_map(|row| row.free_at_ms)
+        .filter(|&at_ms| at_ms > now_ms)
+        .min()
+        .and_then(|at_ms| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000).ok()
+        });
+    let tail = match soonest {
+        Some(at) => format!("the soonest frees at {}", proxy::at_utc(at, now)),
+        None => "none reports when it frees".to_string(),
+    };
+    Some(format!(
+        "[tcr] no Codex account can serve right now{} — {tail}",
+        proxy::describe_codex_gates(&tally)
+    ))
+}
+
+/// Does `config` hold a Codex account and no Claude account, in any state? Only then does
+/// `tcr run` ask the running proxy whether it holds a Claude account.
+fn holds_only_codex(config: &Config) -> bool {
+    let holds = |provider| config.accounts.iter().any(|a| a.provider == provider);
+    holds(teamclaude_rs::provider::Provider::Codex)
+        && !holds(teamclaude_rs::provider::Provider::Anthropic)
+}
+
+/// The warning `tcr run` prints for a claude session when the running proxy on `port` holds
+/// Codex accounts and no Claude account: every request this session sends will be refused.
+/// `None` when the proxy lists any Claude account, or no account at all.
+fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Option<String> {
+    let holds = |provider| payload.accounts.iter().any(|row| row.provider == provider);
+    (holds(teamclaude_rs::provider::Provider::Codex)
+        && !holds(teamclaude_rs::provider::Provider::Anthropic))
+    .then(|| {
+        format!(
+            "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
+             every request from this session — add one with `tcr login`"
+        )
+    })
 }
 
 /// Carry out [`codex_launch`]'s decision on `cmd`, and print its notices.
@@ -7646,6 +7692,7 @@ mod tests {
     use super::*;
     use build_info::StandDownBuild;
     use std::os::unix::fs::PermissionsExt as _;
+    use teamclaude_rs::codex_route::no_codex_account_reason;
 
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
@@ -8219,6 +8266,175 @@ mod tests {
             .collect()
     }
 
+    /// One row of [`status_with_rows`]: a provider, a name, a gate, and optionally a `freeAtMs`
+    /// and a `limitReachedType`.
+    type WireRow<'a> = (&'a str, &'a str, &'a str, Option<i64>, Option<&'a str>);
+
+    /// A running proxy's status, parsed from the wire, holding `rows`.
+    fn status_with_rows(rows: &[WireRow]) -> status::StatusPayload {
+        let accounts: Vec<serde_json::Value> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (provider, name, gate, free_at_ms, limit_reached))| {
+                let mut row = serde_json::json!({
+                    "name": name, "priority": i, "status": "active",
+                    "disabled": *gate == "disabled", "requests": 0, "inputTokens": 0,
+                    "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+                    "probeStatus": "ok", "quotaState": "normal", "gate": gate, "threshold": 0.9,
+                });
+                if *provider == "codex" {
+                    row["provider"] = serde_json::json!("codex");
+                }
+                if let Some(at) = free_at_ms {
+                    row["freeAtMs"] = serde_json::json!(at);
+                }
+                if let Some(kind) = limit_reached {
+                    row["limitReachedType"] = serde_json::json!(kind);
+                }
+                row
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "kind": status::STATUS_KIND,
+            "accounts": accounts,
+            "build": {"sha": "abc1234"},
+        }))
+        .expect("a status payload")
+    }
+
+    /// 2026-10-14T00:00:00Z.
+    fn preflight_now() -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(1_791_936_000).expect("a valid instant")
+    }
+
+    /// **`tcr run --codex` says, before its banner, when no Codex account can serve**: why each
+    /// is out, as tcr's own 429 lists its gates but in Codex words, and when the first frees.
+    /// One Codex account in rotation, or none in the pool at all, says nothing.
+    #[test]
+    fn the_run_codex_preflight_names_the_gates_and_the_soonest_return() {
+        let payload = status_with_rows(&[
+            ("anthropic", "alice@example.com", "ok", None, None),
+            (
+                "codex",
+                "carol@example.com/codex",
+                "seven-day",
+                Some(1_792_072_800_000),
+                None,
+            ),
+            ("codex", "erin@example.com/codex", "login", None, None),
+        ]);
+        assert_eq!(
+            codex_pool_preflight(&payload, preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 in the weekly window, 1 needing \
+                 re-login — the soonest frees at 2026-10-15 14:00:00 UTC"
+            )
+        );
+
+        // An account held by an upstream 403 is out for a short hold, which is then the
+        // soonest return, under a day away, so the clock alone.
+        let payload = status_with_rows(&[
+            (
+                "codex",
+                "carol@example.com/codex",
+                "seven-day",
+                Some(1_792_072_800_000),
+                None,
+            ),
+            ("codex", "erin@example.com/codex", "login", None, None),
+            (
+                "codex",
+                "frank@example.com/codex",
+                "refused",
+                Some(1_791_936_090_000),
+                None,
+            ),
+        ]);
+        assert_eq!(
+            codex_pool_preflight(&payload, preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 refused upstream (403), 1 in the \
+                 weekly window, 1 needing re-login — the soonest frees at 00:01:30 UTC"
+            )
+        );
+
+        let serving = status_with_rows(&[
+            (
+                "codex",
+                "carol@example.com/codex",
+                "seven-day",
+                Some(1_792_072_800_000),
+                None,
+            ),
+            ("codex", "dana@example.com/codex", "ok", None, None),
+        ]);
+        assert_eq!(codex_pool_preflight(&serving, preflight_now()), None);
+        let claude_only =
+            status_with_rows(&[("anthropic", "alice@example.com", "login", None, None)]);
+        assert_eq!(codex_pool_preflight(&claude_only, preflight_now()), None);
+    }
+
+    /// When no Codex account reports when it frees, the line says so rather than naming a time.
+    /// An account whose hold sits over ChatGPT's own refusal is counted as refused by ChatGPT:
+    /// the refusal outlasts the hold, and is why it stays out.
+    ///
+    /// Watched red: with a disabled row counted as able to serve, this pool says nothing.
+    #[test]
+    fn the_run_codex_preflight_says_none_reports_when_it_frees() {
+        let mut rows = vec![
+            ("codex", "erin@example.com/codex", "login", None, None),
+            ("codex", "gil@example.com/codex", "disabled", None, None),
+        ];
+        assert_eq!(
+            codex_pool_preflight(&status_with_rows(&rows), preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 needing re-login, 1 disabled — \
+                 none reports when it frees"
+            )
+        );
+        rows.push((
+            "codex",
+            "hal@example.com/codex",
+            "hold",
+            None,
+            Some("rate_limit_reached"),
+        ));
+        assert_eq!(
+            codex_pool_preflight(&status_with_rows(&rows), preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 needing re-login, 1 refused by \
+                 ChatGPT, 1 disabled — none reports when it frees"
+            )
+        );
+    }
+
+    /// **`tcr run` warns a Claude session that the running proxy holds no Claude account**, and
+    /// so will refuse every request it sends. Any Claude account, or an empty pool, says
+    /// nothing.
+    #[test]
+    fn run_warns_when_the_proxy_holds_no_claude_account() {
+        let codex_only = status_with_rows(&[
+            ("codex", "bob@example.com/codex", "ok", None, None),
+            ("codex", "dana@example.com/codex", "disabled", None, None),
+        ]);
+        assert_eq!(
+            no_claude_account_warning(3999, &codex_only).as_deref(),
+            Some(
+                "[tcr] warning: the proxy on :3999 holds no Claude account, so it will refuse \
+                 every request from this session — add one with `tcr login`"
+            )
+        );
+        let mixed = status_with_rows(&[
+            ("anthropic", "alice@example.com", "disabled", None, None),
+            ("codex", "bob@example.com/codex", "ok", None, None),
+        ]);
+        assert_eq!(no_claude_account_warning(3999, &mixed), None);
+        assert_eq!(
+            no_claude_account_warning(3999, &status_with_rows(&[])),
+            None
+        );
+    }
+
     /// Every row of `tcr run --codex`'s launch decision ([`codex_launch`]): the
     /// launch it picks, and the exact notice it prints. Each row inherits an
     /// `HTTPS_PROXY` aimed at this tcr, so every direct row must drop it, the
@@ -8273,7 +8489,7 @@ mod tests {
                 CODEX_RUN,
                 Err(cli::LiveStatusError::NoServer),
                 true,
-                direct("proxy not listening on :3999"),
+                direct("no proxy answered on 127.0.0.1:3999"),
             ),
             (
                 "no answer",

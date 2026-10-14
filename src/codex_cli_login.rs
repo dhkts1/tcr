@@ -207,7 +207,12 @@ async fn sign_in(
         None,
     )
     .await?;
-    let notices = crate::codex_local::codex_notices(first);
+    let first_account = if first {
+        Some(oauth::read_first_codex_account_notice(config_path).await)
+    } else {
+        None
+    };
+    let notices = crate::codex_local::codex_notices(first_account);
     match ui {
         LoginUi::Machine => {
             oauth::say_codex_notices(ui, &notices);

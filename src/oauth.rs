@@ -2290,7 +2290,12 @@ pub async fn login_from_codex(
     let plan = tcr_status_wire::codex_plan_label(login.plan_type.as_deref());
     let first = holds_no_codex_row(config_path)?;
     let saved = import_codex_login(config_path, force, name, account, login, Some(&folder)).await?;
-    let notices = crate::codex_local::codex_notices(first);
+    let first_account = if first {
+        Some(read_first_codex_account_notice(config_path).await)
+    } else {
+        None
+    };
+    let notices = crate::codex_local::codex_notices(first_account);
     match ui {
         LoginUi::Terminal => {
             // The plan as `tcr status` names it (`ChatGPT Pro`), not the raw claim (`pro`).
@@ -2336,6 +2341,62 @@ pub(crate) fn holds_no_codex_row(config_path: &Path) -> anyhow::Result<bool> {
         .accounts
         .iter()
         .any(|row| row.provider == crate::provider::Provider::Codex))
+}
+
+/// What a Codex save says when the config held no Codex row before it: whether tcr pools codex
+/// from now on. [`CODEX_FIRST_ACCOUNT_NOTICE`] only when the proxy's leaf takes `chatgpt.com`:
+/// the running proxy reports a leaf it minted that intercepts it, or nothing listens on `port`
+/// and the next boot mints such a leaf because the JS teamclaude leaf is not on disk
+/// (`js_leaf_on_disk`). Otherwise `codex is not pooled: {reason}`, the sentence `tcr status`
+/// prints after `codexVerdict:`, with [`crate::codex_route::codex_route`]'s reason over the same
+/// read, so it never claims what an unread proxy does.
+///
+/// Keyed on the leaf, not on the route's `pooled`: a running server may not have admitted the
+/// new row yet, and the route over its payload would then say it holds no Codex account.
+pub fn first_codex_account_notice(
+    live: &Result<crate::status::StatusPayload, crate::cli::LiveStatusError>,
+    port: u16,
+    ca: &Path,
+    ca_readable: bool,
+    js_leaf_on_disk: bool,
+) -> String {
+    let leaf_takes_chatgpt = match live {
+        Ok(payload) => payload.mitm.as_ref().is_some_and(|mitm| {
+            mitm.leaf == crate::status::MitmStatus::LEAF_MINTED
+                && mitm.intercepts(crate::provider::CODEX_HOST)
+        }),
+        Err(crate::cli::LiveStatusError::NoServer) => !js_leaf_on_disk,
+        Err(_) => false,
+    };
+    let codex_rows = live
+        .as_ref()
+        .map_or(0, crate::codex_route::listed_codex_accounts);
+    let route = crate::codex_route::codex_route(live.as_ref(), port, ca, ca_readable, codex_rows);
+    match route.reason {
+        Some(reason) if !leaf_takes_chatgpt => format!("codex is not pooled: {reason}"),
+        _ => CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
+    }
+}
+
+/// [`first_codex_account_notice`] over one read of the proxy the config at `config_path` names,
+/// tcr's CA, and the JS teamclaude leaf's files: `teamclaude-leaf.pem` and `teamclaude-leaf.key`
+/// beside the default config, the pair `mitm::load_tls_in` serves first when both are there.
+/// Existence checks, never a read of either file.
+///
+/// It follows a save that already happened, so it cannot fail the login: a config it cannot read
+/// is read as the default one, as [`login_target_port`] reads it.
+pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> String {
+    let config = config::load(config_path).unwrap_or_else(|_| {
+        serde_json::from_str("{}").expect("empty object is a valid default config")
+    });
+    let live = crate::cli::fetch_live_status(&config).await;
+    let ca = crate::mitm::minted_ca_path();
+    let dir = config::default_path()
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let js_leaf_on_disk =
+        dir.join("teamclaude-leaf.pem").is_file() && dir.join("teamclaude-leaf.key").is_file();
+    first_codex_account_notice(&live, config.proxy.port, &ca, ca.is_file(), js_leaf_on_disk)
 }
 
 /// Say each of `notices`, in order: a `notice` event apiece in [`LoginUi::Machine`]; a stderr
@@ -8315,6 +8376,98 @@ mod tests {
              99999999, but 'work' holds workspace 88888888. Retry `tcr login --codex --account \
              work` and choose that workspace when ChatGPT asks which one to use. Nothing was \
              written."
+        );
+    }
+
+    /// A running proxy's status read, as `cli::fetch_live_status` hands it over: parsed from the
+    /// wire, listing no Codex row (the server may not have admitted the new one yet), with the
+    /// listener `mitm` reports.
+    fn live_proxy_reporting(
+        mitm: serde_json::Value,
+    ) -> Result<crate::status::StatusPayload, crate::cli::LiveStatusError> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "kind": crate::status::STATUS_KIND,
+            "accounts": [],
+            "build": {"sha": "abc1234"},
+            "mitm": mitm,
+        }))
+        .expect("a status payload"))
+    }
+
+    const NOTICE_PORT: u16 = 3999;
+
+    fn notice_ca() -> &'static Path {
+        Path::new("/tmp/tcr-run-test/tcr-ca.pem")
+    }
+
+    /// A proxy serving the JS teamclaude leaf never intercepts chatgpt.com, so the first Codex
+    /// account is told codex is not pooled, and why, never that tcr intercepts chatgpt.com from
+    /// now on. The same holds before any proxy runs when the JS leaf is on disk, because the
+    /// next boot serves it.
+    ///
+    /// Watched red: with the first-account notice keyed on the config's count alone, the
+    /// JS-leaf proxy gets "tcr intercepts chatgpt.com from now on".
+    #[test]
+    fn a_js_leaf_proxy_gets_the_not_pooled_notice() {
+        let js = live_proxy_reporting(
+            serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"}),
+        );
+        assert_eq!(
+            first_codex_account_notice(&js, NOTICE_PORT, notice_ca(), true, false),
+            "codex is not pooled: the proxy on :3999 is serving the JS teamclaude leaf, which \
+             covers api.anthropic.com only and is never re-minted — a restart will not change \
+             this; see docs/troubleshooting.md"
+        );
+        assert_eq!(
+            first_codex_account_notice(
+                &Err(crate::cli::LiveStatusError::NoServer),
+                NOTICE_PORT,
+                notice_ca(),
+                true,
+                true,
+            ),
+            "codex is not pooled: no proxy answered on 127.0.0.1:3999",
+            "nothing listens, and the JS leaf on disk is what the next boot serves"
+        );
+        assert_eq!(
+            first_codex_account_notice(
+                &Err(crate::cli::LiveStatusError::NoAnswer(
+                    "the server did not answer within 5s".to_string()
+                )),
+                NOTICE_PORT,
+                notice_ca(),
+                true,
+                false,
+            ),
+            "codex is not pooled: could not read the running proxy's status (the server did not \
+             answer within 5s)",
+            "a proxy that could not be read is not claimed to intercept anything"
+        );
+    }
+
+    /// A proxy whose minted leaf intercepts chatgpt.com takes the first Codex account's traffic
+    /// from now on, though its status, read right after the save, may not list the new row yet:
+    /// the notice keys on the leaf, not on the route. So does a released port with no JS leaf on
+    /// disk, where the next boot mints such a leaf.
+    #[test]
+    fn a_minted_chatgpt_leaf_gets_the_first_account_notice() {
+        let minted = live_proxy_reporting(serde_json::json!({
+            "interceptedHosts": ["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+            "leaf": "minted",
+        }));
+        assert_eq!(
+            first_codex_account_notice(&minted, NOTICE_PORT, notice_ca(), true, false),
+            CODEX_FIRST_ACCOUNT_NOTICE
+        );
+        assert_eq!(
+            first_codex_account_notice(
+                &Err(crate::cli::LiveStatusError::NoServer),
+                NOTICE_PORT,
+                notice_ca(),
+                false,
+                false,
+            ),
+            CODEX_FIRST_ACCOUNT_NOTICE
         );
     }
 }

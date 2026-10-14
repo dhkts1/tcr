@@ -2618,7 +2618,9 @@ impl StatusSource {
 /// like a real sha.
 ///
 /// It renders no Codex route or traffic: every Codex row comes out without
-/// `codexRoute` and `codexTraffic`, as from a CLI that predates them.
+/// `codexRoute` and `codexTraffic`, as from a CLI that predates them. `tcr status
+/// --json` itself renders through [`render_accounts_json_at`], with both.
+#[cfg(test)]
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
     thresholds: &[f64],
@@ -3600,8 +3602,25 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     // not on the route at all).
     let mut served_recently: Option<u64> = None;
 
+    // ONE read of the running proxy, and the Codex route and traffic are taken from it before
+    // the snapshot consumes it. The text form words the route whatever the read gave (offline,
+    // that no proxy answered); `--json` carries the route and the traffic only from a live read.
+    let live_read = fetch_live_status(&config).await;
+    let ca = crate::mitm::minted_ca_path();
+    let ca_readable = ca.is_file();
+    let codex_route = crate::codex_route::codex_route(
+        live_read.as_ref(),
+        proxy_port,
+        &ca,
+        ca_readable,
+        live_read
+            .as_ref()
+            .map_or(0, crate::codex_route::listed_codex_accounts),
+    );
+    let (wire_route, wire_traffic) = codex_wire_facts(&live_read, proxy_port, &ca, ca_readable);
+
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
-        match fetch_live_status(&config).await {
+        match live_read {
             Ok(payload) => {
                 served_recently = Some(crate::doctor::requests_in_window(
                     &payload,
@@ -3671,7 +3690,8 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     if json {
         println!(
             "{}",
-            render_accounts_json(
+            render_accounts_json_at(
+                OffsetDateTime::now_utc(),
                 &snapshot,
                 &thresholds,
                 source,
@@ -3679,6 +3699,8 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 http1_only,
                 control.as_deref(),
                 &group_colors,
+                wire_route.as_ref(),
+                wire_traffic.as_ref(),
             )
         );
     } else {
@@ -3701,13 +3723,79 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 http1_only,
                 group_colors: &group_colors,
                 claude_verdict,
+                codex_route: Some(&codex_route),
             })
         );
+        // What tcr did with codex lately goes to stderr, below the account lines it points at,
+        // and only for a fleet that holds a Codex account.
+        if holds_provider(&snapshot, Provider::Codex) {
+            if let Some(traffic) = &wire_traffic {
+                for line in codex_traffic_notes(traffic) {
+                    eprintln!("{line}");
+                }
+            }
+        }
     }
     if !check {
         return Ok(0);
     }
     Ok(StatusCheck::of(&snapshot).exit_code())
+}
+
+/// Does the fleet hold an account of `provider`, in any state?
+fn holds_provider(snapshot: &StatsSnapshot, provider: Provider) -> bool {
+    snapshot.accounts.iter().any(|a| a.provider == provider)
+}
+
+/// The fleet's Codex route and traffic, as `tcr status --json` repeats them on every Codex row:
+/// from a live read only. A read that was not live (nothing listening, no answer, an answer
+/// this build cannot use) gives neither, so `--json` never claims a route it did not read, nor
+/// counts a server it could not ask.
+fn codex_wire_facts(
+    live: &Result<StatusPayload, LiveStatusError>,
+    port: u16,
+    ca: &Path,
+    ca_readable: bool,
+) -> (
+    Option<tcr_status_wire::CodexRoute>,
+    Option<tcr_status_wire::CodexTraffic>,
+) {
+    match live {
+        Ok(payload) => (
+            Some(crate::codex_route::codex_route(
+                Ok(payload),
+                port,
+                ca,
+                ca_readable,
+                crate::codex_route::listed_codex_accounts(payload),
+            )),
+            payload.codex_traffic.clone(),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// The stderr notes `tcr status` prints about what the proxy did with codex in the last ten
+/// minutes, each only when its count is above zero: the 429s tcr answered codex with itself,
+/// and the requests it relayed unpooled because they named a routing of their own.
+pub(crate) fn codex_traffic_notes(traffic: &tcr_status_wire::CodexTraffic) -> Vec<String> {
+    let mut notes = Vec::new();
+    if traffic.refused_10m > 0 {
+        notes.push(format!(
+            "[tcr] note codex-refusals: refused_10m={} last_type={} — tcr answered codex with a \
+             429 because no Codex account could serve; see the Codex rows above",
+            traffic.refused_10m,
+            traffic.last_refusal.as_deref().unwrap_or("unknown"),
+        ));
+    }
+    if traffic.unpooled_10m > 0 {
+        notes.push(format!(
+            "[tcr] note codex-unpooled: relayed_10m={} — requests from a FedRAMP or \
+             residency-routed ChatGPT login ran on their own credential, unpooled",
+            traffic.unpooled_10m,
+        ));
+    }
+    notes
 }
 
 /// What `tcr status` prints on stdout in its text form, in order: a route verdict when there is
@@ -3722,15 +3810,38 @@ pub(crate) struct StatusText<'a> {
     pub group_colors: &'a std::collections::BTreeMap<String, String>,
     /// `crate::doctor::Report::verdict()` when Claude's route has a problem (`exit_code() != 0`).
     pub claude_verdict: Option<String>,
+    /// Whether the running proxy pools codex ([`crate::codex_route::codex_route`]), worded above
+    /// the header when the fleet holds a Codex account and codex is not pooled.
+    pub codex_route: Option<&'a tcr_status_wire::CodexRoute>,
 }
 
 /// The bytes of `tcr status`'s text form, [`StatusText`]'s lines in order, each ending in a
 /// newline.
 pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
     let mut out = String::new();
-    if let Some(verdict) = &text.claude_verdict {
-        out.push_str(verdict);
-        out.push('\n');
+    let holds_claude = holds_provider(text.snapshot, Provider::Anthropic);
+    // Claude's route is this fleet's question only while it holds a Claude account, or none
+    // at all (the empty fleet keeps the verdict it always had). A Codex-only fleet is not
+    // told about a route none of its accounts use.
+    if holds_claude || text.snapshot.accounts.is_empty() {
+        if let Some(verdict) = &text.claude_verdict {
+            out.push_str(verdict);
+            out.push('\n');
+        }
+    }
+    // Codex's route second, so Claude's verdict keeps the first line. Keyed `verdict:` in a
+    // Codex-only fleet, where it is the only verdict there is.
+    let unpooled = text
+        .codex_route
+        .filter(|route| !route.pooled)
+        .and_then(|route| route.reason.as_deref());
+    if let (Some(reason), true) = (unpooled, holds_provider(text.snapshot, Provider::Codex)) {
+        let key = if holds_claude {
+            "codexVerdict"
+        } else {
+            "verdict"
+        };
+        out.push_str(&format!("{key}: codex is not pooled: {reason}\n"));
     }
     // One greppable `source=` line above the account lines, in the same
     // key=value idiom, so the provenance is visible without --json.
@@ -9011,6 +9122,8 @@ mod tests {
             http1_only: false,
             group_colors: &group_colors,
             claude_verdict: claude_verdict.map(str::to_string),
+            // Not pooled, and a Claude-only fleet still prints no Codex line.
+            codex_route: Some(&js_leaf_route()),
         })
     }
 
@@ -9059,6 +9172,272 @@ mod tests {
              account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
              probe=never stream_errors=0 disabled\n"
         );
+    }
+
+    /// The Claude verdict the text-form tests print above the header.
+    const CLAUDE_VERDICT: &str = "verdict: this proxy is not on Claude's route: \
+                                  /Users/example/.claude/settings.json sets \
+                                  https://gateway.example.com";
+
+    /// The JS-leaf route's reason, as `tcr run --codex` words it for a proxy on :3999.
+    const JS_LEAF_REASON: &str = "the proxy on :3999 is serving the JS teamclaude leaf, which \
+                                  covers api.anthropic.com only and is never re-minted — a \
+                                  restart will not change this; see docs/troubleshooting.md";
+
+    /// The status read of a proxy on :3999, as `fetch_live_status` hands it over: parsed from
+    /// the wire, with `mitm` as given, `codex_rows` Codex accounts and `traffic` as its counts.
+    fn live_payload(
+        mitm: serde_json::Value,
+        codex_rows: usize,
+        traffic: Option<serde_json::Value>,
+    ) -> StatusPayload {
+        let accounts: Vec<serde_json::Value> = (0..codex_rows)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("codex{i}@example.com/codex"), "provider": "codex",
+                    "priority": i, "status": "active", "disabled": false, "requests": 0,
+                    "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
+                    "cacheCreationTokens": 0, "probeStatus": "ok", "quotaState": "normal",
+                    "gate": "ok", "threshold": 0.9,
+                })
+            })
+            .collect();
+        let mut wire = serde_json::json!({
+            "kind": STATUS_KIND,
+            "accounts": accounts,
+            "build": {"sha": "abc1234"},
+            "mitm": mitm,
+        });
+        if let Some(traffic) = traffic {
+            wire["codex_traffic"] = traffic;
+        }
+        serde_json::from_value(wire).expect("a status payload")
+    }
+
+    fn route_test_ca() -> &'static Path {
+        Path::new("/tmp/tcr-run-test/tcr-ca.pem")
+    }
+
+    /// The route of a proxy on :3999 serving the JS teamclaude leaf: not pooled.
+    fn js_leaf_route() -> tcr_status_wire::CodexRoute {
+        let payload = live_payload(
+            serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"}),
+            1,
+            None,
+        );
+        crate::codex_route::codex_route(Ok(&payload), 3999, route_test_ca(), true, 1)
+    }
+
+    fn pooled_route() -> tcr_status_wire::CodexRoute {
+        tcr_status_wire::CodexRoute {
+            pooled: true,
+            ..Default::default()
+        }
+    }
+
+    /// `tcr status`'s text form over `snapshot`, as the golden renders it, with the Claude
+    /// verdict and the Codex route given.
+    fn status_text_of(
+        snapshot: &StatsSnapshot,
+        claude_verdict: Option<&str>,
+        codex_route: &tcr_status_wire::CodexRoute,
+    ) -> String {
+        let build = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        render_status_text(&StatusText {
+            snapshot,
+            source: StatusSource::Live,
+            server_build: Some(&build),
+            client_build: &build,
+            http1_only: false,
+            group_colors: &std::collections::BTreeMap::new(),
+            claude_verdict: claude_verdict.map(str::to_string),
+            codex_route: Some(codex_route),
+        })
+    }
+
+    /// **A fleet that holds a Codex account is told, above the header, when codex is not
+    /// pooled**, keyed `codexVerdict:` beside Claude's own verdict, which keeps the first line.
+    /// A pooled route prints nothing.
+    #[test]
+    fn the_codex_verdict_prints_only_with_a_codex_account_not_pooled() {
+        // The contract sample: four Anthropic rows and a disabled Codex row.
+        let (snapshot, _) = status_contract_snapshot();
+        let js = js_leaf_route();
+        let text = status_text_of(&snapshot, None, &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("codexVerdict: codex is not pooled: {JS_LEAF_REASON}")
+        );
+        assert!(lines[1].starts_with("status source="), "{text}");
+
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], CLAUDE_VERDICT, "Claude's verdict stays first");
+        assert_eq!(
+            lines[1],
+            format!("codexVerdict: codex is not pooled: {JS_LEAF_REASON}")
+        );
+        assert!(lines[2].starts_with("status source="), "{text}");
+
+        let text = status_text_of(&snapshot, None, &pooled_route());
+        assert!(text.starts_with("status source="), "{text}");
+        assert!(!text.contains("codex is not pooled"), "{text}");
+    }
+
+    /// **A Codex-only fleet is not told about Claude's route**, which none of its accounts
+    /// uses: its one verdict is codex's, keyed `verdict:`. A pooled route leaves the header
+    /// first, and an empty fleet keeps Claude's verdict as it always had it.
+    ///
+    /// Watched red: with Claude's verdict printed whatever the fleet holds, the Codex-only
+    /// fleet opens with Claude's route.
+    #[test]
+    fn the_claude_verdict_is_skipped_in_a_codex_only_fleet() {
+        let (mut snapshot, _) = status_contract_snapshot();
+        snapshot
+            .accounts
+            .retain(|row| row.provider == Provider::Codex);
+        let js = js_leaf_route();
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("verdict: codex is not pooled: {JS_LEAF_REASON}")
+        );
+        assert!(lines[1].starts_with("status source="), "{text}");
+        assert!(
+            !text.contains("this proxy is not on Claude's route"),
+            "{text}"
+        );
+
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &pooled_route());
+        assert!(text.starts_with("status source="), "{text}");
+
+        snapshot.accounts.clear();
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], CLAUDE_VERDICT, "an empty fleet keeps it");
+        assert!(lines[1].starts_with("status source="), "{text}");
+        assert!(!text.contains("codex is not pooled"), "{text}");
+    }
+
+    /// **The stderr notes say what tcr did with codex in the last ten minutes**, each only
+    /// when its count is above zero.
+    #[test]
+    fn status_prints_the_codex_traffic_notes_on_stderr() {
+        let traffic = tcr_status_wire::CodexTraffic {
+            refused_10m: 12,
+            last_refusal: Some("usage_limit_reached".into()),
+            last_refusal_at_ms: Some(1),
+            unpooled_10m: 3,
+        };
+        assert_eq!(
+            codex_traffic_notes(&traffic),
+            [
+                "[tcr] note codex-refusals: refused_10m=12 last_type=usage_limit_reached — tcr \
+                 answered codex with a 429 because no Codex account could serve; see the Codex \
+                 rows above",
+                "[tcr] note codex-unpooled: relayed_10m=3 — requests from a FedRAMP or \
+                 residency-routed ChatGPT login ran on their own credential, unpooled",
+            ]
+        );
+        assert!(
+            codex_traffic_notes(&tcr_status_wire::CodexTraffic::default()).is_empty(),
+            "nothing to say"
+        );
+        let refused_only = tcr_status_wire::CodexTraffic {
+            unpooled_10m: 0,
+            ..traffic
+        };
+        let notes = codex_traffic_notes(&refused_only);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("[tcr] note codex-refusals:"),
+            "{notes:?}"
+        );
+    }
+
+    /// **`--json` carries a Codex route only from a live read.** Nothing listening, no answer,
+    /// or one this build cannot use: none of them is a route, so no row claims one.
+    #[test]
+    fn the_route_is_absent_offline() {
+        for live in [
+            Err(LiveStatusError::NoServer),
+            Err(LiveStatusError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            )),
+            Err(LiveStatusError::Unusable(
+                "HTTP 401 Unauthorized".to_string(),
+            )),
+        ] {
+            let facts = codex_wire_facts(&live, 3999, route_test_ca(), true);
+            assert_eq!(facts, (None, None), "{live:?}");
+        }
+    }
+
+    /// **The route and the traffic ride the Codex rows only**: the same on every Codex row, and
+    /// on no Anthropic row, whose bytes stay what they were.
+    #[test]
+    fn route_and_traffic_ride_only_codex_rows() {
+        let live = Ok(live_payload(
+            serde_json::json!({
+                "interceptedHosts": ["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+                "leaf": "minted",
+            }),
+            1,
+            Some(serde_json::json!({
+                "refused10m": 2,
+                "lastRefusal": "pool_unavailable",
+                "lastRefusalAtMs": 1_767_225_000_000_i64,
+                "unpooled10m": 0,
+            })),
+        ));
+        let (route, traffic) = codex_wire_facts(&live, 3999, route_test_ca(), true);
+        assert_eq!(route, Some(pooled_route()));
+        assert_eq!(traffic.as_ref().map(|t| t.refused_10m), Some(2));
+
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let build = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let rendered = render_accounts_json_at(
+            OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("a valid instant"),
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            Some(&build),
+            false,
+            None,
+            &std::collections::BTreeMap::new(),
+            route.as_ref(),
+            traffic.as_ref(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rendered).expect("an array");
+        assert_eq!(rows.len(), 5);
+        let mut anthropic = 0;
+        for row in &rows {
+            if row["name"] == "bob@example.com/codex" {
+                assert_eq!(
+                    row["codexRoute"],
+                    serde_json::to_value(&route).expect("a route")
+                );
+                assert_eq!(
+                    row["codexTraffic"],
+                    serde_json::to_value(&traffic).expect("the traffic")
+                );
+            } else {
+                anthropic += 1;
+                assert!(row.get("codexRoute").is_none(), "{row}");
+                assert!(row.get("codexTraffic").is_none(), "{row}");
+            }
+        }
+        assert_eq!(anthropic, 4);
     }
 
     /// The fixture is only worth pinning if it is *representative*: a sample

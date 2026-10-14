@@ -116,6 +116,19 @@ A value **you** exported is inherited untouched: an explicit choice wins, and it
 escape hatch for a `claude` with no claude.ai login of its own, which does need some
 credential to start. The process exits with `claude`'s own exit code.
 
+**A proxy that holds no Claude account.** When the config holds a Codex account and no Claude
+account, in any state, `tcr run` asks the running proxy once which accounts it holds before it
+launches `claude`, and warns when that proxy lists Codex accounts and no Claude one, since it
+will refuse every request the session sends:
+
+```
+[tcr] warning: the proxy on :3456 holds no Claude account, so it will refuse every request from this session — add one with `tcr login`
+```
+
+A config that holds a Claude account makes no such read and prints nothing new, and a status that
+cannot be read prints nothing. So a proxy started from another config, or whose accounts changed
+since, can miss the warning.
+
 In see-through mode the routing environment also carries `CODEX_CA_CERTIFICATE`, naming the
 same CA as `NODE_EXTRA_CA_CERTS`. Claude Code ignores it. It is there for a `codex` that a
 Claude Code tool or plugin starts inside the session: that process inherits the proxy
@@ -170,6 +183,22 @@ launch says so on stderr:
 [tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem
 ```
 
+**When no Codex account can serve right now.** A pooled launch whose running proxy reports no
+Codex account able to serve says so first, from the same read, and then launches as usual, since
+an account may free while `codex` starts:
+
+```
+[tcr] no Codex account can serve right now: 1 in the weekly window, 1 needing re-login — the soonest frees at 2026-10-15 14:00:00 UTC
+```
+
+It counts the pool's Codex accounts by why each is out, in the words tcr's own 429 lists them
+with, but in Codex terms: an account ChatGPT refused reads `refused by ChatGPT`, and so does one
+held by an upstream hold or 403 while that refusal stands, since the refusal outlasts the hold;
+one in a reserved group reads `unreachable in a reserved group`, since a Codex request carries no
+group that could reach it; one held by an upstream 403 alone reads `refused upstream (403)`. The
+time is when the first of them frees, with the date in front when that is a day or more away.
+When none reports one, the line ends `— none reports when it frees`.
+
 **The running proxy decides.** The launcher reads the running proxy's `/_tcr/status` document
 once, and pools the session only when that proxy reports a leaf it minted itself that intercepts
 `chatgpt.com`, lists a Codex account, and that leaf's CA file is on disk. It never decides from
@@ -178,12 +207,15 @@ whose TLS material failed to load, does not intercept what the files on disk wou
 other case launches `codex` directly, on its own login, with one line saying why:
 
 ```
-[tcr] launching codex directly (not pooled): proxy not listening on :3456
+[tcr] launching codex directly (not pooled): no proxy answered on 127.0.0.1:3456
 ```
 
+`tcr status` words the same decision, from the same function, above its header
+([`codexVerdict:`](#tcr-status)), and its `--json` rows carry it as `codexRoute`
+([Codex rows on `--json`](#codex-rows-on---json)), so the launch and the status never disagree.
 Each reason, verbatim, and what it needs:
 
-- `proxy not listening on :<port>`. Start the proxy, then run `tcr run --codex` again.
+- `no proxy answered on 127.0.0.1:<port>`. Start the proxy, then run `tcr run --codex` again.
 - `could not read the running proxy's status (<why>)`. Something holds the port, but its status
   could not be read, and `<why>` says what failed. `HTTP 401 Unauthorized — the proxy api-key
   in the config was rejected` means `proxy.apiKey` in the config is not the running proxy's,
@@ -271,11 +303,33 @@ With none eligible, `codex` gets a 429 shaped for it, in one of three kinds:
   a dead login, or an account disabled, parked or reserved. It carries `resets_in_seconds` but
   no `resets_at`, and the same `retry-after` a Claude client gets, and `codex` retries it after
   that wait, up to five times, instead of ending the turn.
-- `no_codex_account`, whose message names `tcr login --from-codex`, when the config holds none.
-  tcr does not intercept `chatgpt.com` then, so a `codex` meets this one only on a tunnel opened
-  while the pool still held an account, or by sending to tcr's listener directly. `codex` shows
-  it only as a generic retry-limit error, without its message; tcr's log says that no Codex
-  account is configured, and `tcr login --from-codex` adds one.
+- `no_codex_account`, whose message names `tcr login --codex`, when the pool holds none. An
+  account deleted while the proxy runs no longer counts. tcr does not intercept `chatgpt.com`
+  then, so a `codex` meets this one only on a tunnel opened while the pool still held an account,
+  or by sending to tcr's listener directly. `codex` shows it only as a generic retry-limit error,
+  without its message; tcr's log says that no Codex account is configured, and that
+  `tcr login --codex` adds one.
+
+Every one of these 429s is tcr's own, and is counted: `tcr status` notes them on stderr, and
+`codexTraffic` carries the count on `--json` ([Codex rows on `--json`](#codex-rows-on---json)).
+
+**A Codex login refused upstream.** When ChatGPT answers 403 to a pooled account's credential,
+tcr tries the next Codex account. When every account it tried was refused, `codex` gets a 403, in
+its own error envelope, with no `retry-after`, whose message names each refused account, in the
+order they were refused, and the command that signs it in again:
+
+```
+{"error":{"type":"proxy_error","code":"credential_refused","message":"ChatGPT refused bob@example.com/codex's login — sign it in again with `tcr login --codex --account bob@example.com/codex` or TcrBar's Re-login…"}}
+```
+
+A 403, because it leaves `codex`'s own login alone: a 401 is the one status that makes `codex`
+reload its `auth.json` and refresh its token, which would spend that login on a refusal that is
+tcr's. `codex` retries the 403 a few times, showing the message with each `Reconnecting…` line,
+and tcr's log names the same command for each refused account. The refused account is then held
+for 120 seconds and reads `refused` on `tcr status`. While it is held and no other Codex account
+can take a request, `codex`'s requests get the retryable `pool_unavailable` 429, which
+`codexTraffic` counts, rather than the refusal again. A Claude client's answer to the same
+refusal is unchanged: a 502.
 
 The request path in full is in [architecture.md](architecture.md#codex-requests).
 
@@ -379,7 +433,8 @@ TcrBar started from Finder has neither directory on its `PATH`.
 
 | notice | when |
 |---|---|
-| `tcr intercepts chatgpt.com from now on: …` | the config held no Codex account before this one |
+| `tcr intercepts chatgpt.com from now on: …` | the config held no Codex account before this one, and the proxy will intercept `chatgpt.com`: the running proxy serves a leaf it minted that covers it, or none is running and the JS teamclaude leaf (`teamclaude-leaf.pem` and `.key` beside the config) is not on disk, so the next one mints such a leaf. The leaf files are checked for existence, never read |
+| `codex is not pooled: <reason>` | the config held no Codex account before this one, and the proxy will not intercept `chatgpt.com`. The reason is the one `tcr run --codex` prints ([the reasons](#--codex-launching-codex-through-the-pool)): what the running proxy reported, that its status could not be read, or that no proxy answered and the JS leaf on disk is what the next one will serve |
 | `codex needs a login of its own to start, even when pooled, and none is at <path>: …` | there is no `auth.json` under `$CODEX_HOME`, or under `~/.codex` when `CODEX_HOME` is unset. Checked for existence, never read |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it before it next starts — …` | a `tcr` at 0.2.45 or older is in reach: it would read this login as a Claude account and send its token to Anthropic |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it — until then it refuses this config, …` | a `tcr` from 0.2.46 on whose `login --help` lacks `--from-codex` is in reach: it refuses the whole config |
@@ -1009,6 +1064,39 @@ add one` on stderr and exits **0**: stdout stays the ordinary empty table (`[]` 
 caller piping it into `jq` — TcrBar's panel among them — decodes an empty fleet rather than a
 failure. The same line and the same exit code come from `tcr accounts`.
 
+**Above the header,** the text form prints a verdict line for each route that has a problem,
+Claude's first:
+
+```
+verdict: this proxy is not on Claude's route: /Users/example/.claude/settings.json sets https://gateway.example.com
+codexVerdict: codex is not pooled: the proxy on :3456 is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md
+```
+
+- **Claude's `verdict:`** prints when Claude Code is routed elsewhere, or routed here with
+  nothing answering ([`tcr doctor`](#tcr-doctor)'s exit 2 or 3), and only while the fleet holds a
+  Claude account or no account at all: a fleet of Codex accounts alone is not told about a route
+  none of its accounts uses.
+- **The Codex line** prints when the fleet holds a Codex account, in any state, and
+  `tcr run --codex` would not pool `codex`. It reads `codex is not pooled:` and the reason
+  `tcr run --codex` prints, word for word
+  ([the reasons](#--codex-launching-codex-through-the-pool)), so read offline it says that no
+  proxy answered. It is keyed `codexVerdict:` in a fleet that also holds a Claude account, and
+  `verdict:` in a Codex-only fleet, where it is the only verdict.
+
+**On stderr,** in the text form only, a fleet that holds a Codex account gets a note for each
+thing the running proxy did with `codex` in the last ten minutes, each only while its count is
+above zero: the 429s tcr answered `codex` with itself, with the latest one's type, and the
+requests it relayed on the client's own credential because they named a routing of their own.
+
+```
+[tcr] note codex-refusals: refused_10m=12 last_type=usage_limit_reached — tcr answered codex with a 429 because no Codex account could serve; see the Codex rows above
+[tcr] note codex-unpooled: relayed_10m=3 — requests from a FedRAMP or residency-routed ChatGPT login ran on their own credential, unpooled
+```
+
+The counts are `codexTraffic`'s ([Codex rows on `--json`](#codex-rows-on---json)). The verdict
+lines and the notes print the same with and without `--check`, and never change its exit code:
+`codex` not being pooled is not a failed probe.
+
 ### `--check`: an exit code for scripts
 
 Without the flag, `tcr status` exits **0** whatever the probes said. With it, the output is the
@@ -1167,6 +1255,39 @@ to say:
 | `credits` | `{hasCredits, unlimited, balance?}` | the account's credits, from the last response or probe that reported them. `balance` is verbatim (`"12.50"`), and absent when none was reported |
 | `loginError` | string | why the account's login died, from its last refresh: OpenAI's error code verbatim (`refresh_token_reused`, `refresh_token_expired`, `refresh_token_invalidated`, `invalid_grant`, …), or `http_401` for a 401 that named none. Present while the login is known dead; a successful refresh or a fresh login clears it |
 | `codexHome` | string, an absolute path | the folder the account's login was imported from (`--from-codex`). Absent for a login of tcr's own (`--codex`) and for a row imported before tcr recorded it |
+| `codexRoute` | `{pooled, code?, reason?, upstream?}` | whether `tcr run --codex` would pool `codex` through the running proxy, the same on every Codex row (below). Absent when the read was not live |
+| `codexTraffic` | `{refused10m, lastRefusal?, lastRefusalAtMs?, unpooled10m}` | what the running proxy did with `codex` in the last ten minutes, the same on every Codex row (below). Absent when the read was not live, or the proxy predates the counts |
+
+`codexRoute` is the decision `tcr run --codex` acts on, worked out by this command from the
+running proxy's own report of what it intercepts and from tcr's CA on disk. `pooled: true`
+carries no `code` and no `reason`. Otherwise `code` says why, and `reason` is the sentence the
+launch prints, verbatim:
+
+| `code` | `reason` |
+|---|---|
+| `no-proxy` | `no proxy answered on 127.0.0.1:<port>` |
+| `status-unreadable` | `could not read the running proxy's status (<why>)` |
+| `predates` | `the proxy on :<port> (build <sha>) predates Codex interception — restart it on this build at a quiet moment` |
+| `js-leaf` | `the proxy on :<port> is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md` |
+| `mitm-off` | `the proxy on :<port> is running without MITM: its TLS material failed to load at boot — see its log` |
+| `no-codex-account` | `` the proxy on :<port> holds no Codex account, so it blind-tunnels chatgpt.com and codex keeps its own login — add one with `tcr login --codex` `` |
+| `no-ca` | `no readable CA at <path>` |
+| `leaf-missing-host` | `the proxy on :<port> serves a leaf it minted but does not intercept chatgpt.com (it intercepts [<hosts>])` |
+| `unknown-leaf` | `the proxy on :<port> (build <sha>) reports a leaf this build does not know ("<leaf>") — run tcr run --codex from the same build as the proxy` |
+
+They are tried in that order, and the first that holds wins; what each needs is under
+[`--codex`](#--codex-launching-codex-through-the-pool). `--json` carries a route only from a
+live read, so `no-proxy` and `status-unreadable` appear only in the text form's
+[`codexVerdict:`](#tcr-status) line. `upstream` is present when the proxy sends Codex requests
+somewhere other than the default `https://chatgpt.com` (`codexUpstream`), pooled or not.
+
+`codexTraffic` counts, over the last ten minutes, the 429s tcr answered a Codex request with
+itself (`refused10m`), whatever their type, and the Codex requests it relayed on the client's
+own credential, unpooled, because they named a FedRAMP or data-residency routing of their own
+(`unpooled10m`). `lastRefusal` is the latest 429's `error.type` (`no_codex_account`,
+`usage_limit_reached` or `pool_unavailable`) and `lastRefusalAtMs` when it was sent; both are
+present exactly while `refused10m` is above zero. The counts live in the proxy's memory, so a
+restart empties them until the next refusal.
 
 On a Codex row, `held` labels each window by that reported length: whole days read `{n}d`, whole
 hours `{n}h`, anything else `{n}m`, so a 30-day weekly window is held as `30d`. Without a length,
@@ -1419,7 +1540,9 @@ logs the same keys once at boot. Only top-level keys are checked; per-account an
 not.
 
 `tcr status` prints this verdict line **first**, and only when it is exit 2 or 3, so a glance at the
-fleet cannot show healthy accounts while Claude Code talks to something else. The `--json` form of
+fleet cannot show healthy accounts while Claude Code talks to something else. It prints only while
+the fleet holds a Claude account or no account at all, and in a fleet that also holds a Codex
+account a Codex verdict can follow it ([`tcr status`](#tcr-status)). The `--json` form of
 `status` is untouched: it stays a bare array.
 
 ---

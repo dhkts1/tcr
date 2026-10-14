@@ -283,6 +283,32 @@ until some account frees, which is what the body text always claimed would happe
 Raising the cap above 60 would restore the immediate death. Lowering it only costs extra
 round trips.
 
+**Counting what tcr refused codex.** The proxy keeps two ten-minute counts for Codex requests,
+each in ten one-minute buckets in memory, and reports them on its status document as
+`codex_traffic`. One is bumped by every 429 tcr sends a Codex request itself (no Codex account,
+a pool out on a usage limit, or one that cannot serve for now), recording the body's error type.
+The other is bumped by every Codex request relayed on the client's own credential because it
+named a FedRAMP or data-residency routing of its own; a bookkeeping call is relayed for its path
+and is not counted. `tcr status` prints both as notes, and its `--json` rows carry them. A
+restart empties both until the next refusal.
+
+**A pool with no account for the request's provider.** A Claude request to a pool that holds
+Codex accounts and no Claude account gets the same 429 as before, but its message says
+``No Claude account is configured in tcr; run `tcr login` to add one.`` rather than
+"All 0 accounts exhausted". A Codex request to a pool with no Codex account gets
+`no_codex_account`, whose message names `tcr login --codex`. An account deleted while the proxy
+runs no longer counts as a Codex account; it still counts toward a Claude request's
+"All N accounts", as it always has.
+
+**A refused credential.** When every account a request tried was refused by an upstream 403,
+the answer is no 429, since waiting will not help. A Claude client gets a 502 naming the
+accounts. A Codex client gets a 403 in its own error envelope, naming each refused account and
+`tcr login --codex --account <name>`: a 401 would make `codex` reload and refresh its own login,
+and a 403 leaves that login alone. Either way the refused account is held for 120 seconds, so
+the answer reaches a client at most once per hold. A Codex request inside the hold, with no
+other account to take it, gets the retryable `pool_unavailable` 429, which is counted as one;
+one that arrives in the hold's last 20 seconds waits it out instead.
+
 ## Files on disk
 
 `tcr` keeps two directories. The config directory is always `$HOME/.config`: it does not

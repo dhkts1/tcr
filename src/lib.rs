@@ -26,6 +26,7 @@ pub mod codex_local;
 pub mod codex_login;
 pub mod codex_oauth;
 pub mod codex_probe;
+pub mod codex_route;
 pub mod config;
 pub mod config_keys;
 pub mod control_identity;

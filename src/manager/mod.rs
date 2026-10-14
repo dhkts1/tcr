@@ -1182,6 +1182,13 @@ pub struct Manager {
     /// means this process loaded no TLS material, which [`Self::mitm_status`]
     /// reports as MITM off.
     mitm: std::sync::OnceLock<crate::status::MitmStatus>,
+    /// The Codex 429s this process sent itself in the last ten minutes, and the latest one
+    /// ([`Self::note_codex_refusal`], [`Self::codex_traffic`]). A leaf lock, never held with
+    /// another. In memory only: a restart empties it.
+    codex_refused: Mutex<CodexRefusals>,
+    /// The Codex requests relayed unpooled for their own routing in the last ten minutes
+    /// ([`Self::note_codex_unpooled`]). A leaf lock, never held with another. In memory only.
+    codex_unpooled: Mutex<MinuteRing>,
     /// The config file's mtime as of the last successful (or unmodified-since)
     /// [`Self::reload_groups_if_changed`] check. `None` before the first check.
     /// Guarded by `config_write` at every access — see that lock's doc and
@@ -1661,6 +1668,8 @@ impl Manager {
             spill_groups: RwLock::new(spill_groups),
             group_colors: RwLock::new(group_colors),
             mitm: std::sync::OnceLock::new(),
+            codex_refused: Mutex::new(CodexRefusals::default()),
+            codex_unpooled: Mutex::new(MinuteRing::default()),
             groups_reload_mtime: Mutex::new(None),
             pacing,
             account_throttle,
@@ -3830,6 +3839,102 @@ impl Manager {
                 );
                 AddPersist::WriteFailed
             }
+        }
+    }
+}
+
+/// How many one-minute buckets a [`MinuteRing`] holds: the minutes it counts back.
+const TRAFFIC_RING_MINUTES: i64 = 10;
+
+/// A count over the last ten minutes, in ten one-minute buckets keyed by the minute
+/// (`now_ms / 60_000`). A bucket counts only while its minute is one of the last ten, so a
+/// quiet stretch empties the count with no sweep; a bump that lands on a slot holding an
+/// older minute resets it first.
+#[derive(Debug, Default)]
+struct MinuteRing {
+    buckets: [(i64, u64); TRAFFIC_RING_MINUTES as usize],
+}
+
+impl MinuteRing {
+    fn bump(&mut self, now_ms: i64) {
+        let minute = now_ms.div_euclid(60_000);
+        let slot = &mut self.buckets[minute.rem_euclid(TRAFFIC_RING_MINUTES) as usize];
+        if slot.0 != minute {
+            *slot = (minute, 0);
+        }
+        slot.1 += 1;
+    }
+
+    fn count(&self, now_ms: i64) -> u64 {
+        let minute = now_ms.div_euclid(60_000);
+        self.buckets
+            .iter()
+            .filter(|(at, _)| *at <= minute && minute - *at < TRAFFIC_RING_MINUTES)
+            .map(|(_, n)| n)
+            .sum()
+    }
+}
+
+/// The Codex 429s this process sent itself: their ten-minute count, and the latest one's
+/// error `type` and when it was sent.
+#[derive(Debug, Default)]
+struct CodexRefusals {
+    ring: MinuteRing,
+    last: Option<(String, i64)>,
+}
+
+impl Manager {
+    /// Count a 429 this process answered a Codex request with itself, `error_type` being its
+    /// body's `error.type` (`no_codex_account`, `usage_limit_reached` or `pool_unavailable`).
+    /// Fed by `proxy::exhausted_response`'s Codex arms.
+    pub fn note_codex_refusal(&self, error_type: &str, now_ms: i64) {
+        let mut refused = self
+            .codex_refused
+            .lock()
+            .expect("codex_refused lock poisoned");
+        refused.ring.bump(now_ms);
+        refused.last = Some((error_type.to_string(), now_ms));
+    }
+
+    /// Count a Codex request relayed on the client's own credential, unpooled, because it named
+    /// a routing of its own (`x-openai-account-routing-override` or `x-openai-fedramp`).
+    pub fn note_codex_unpooled(&self, now_ms: i64) {
+        self.codex_unpooled
+            .lock()
+            .expect("codex_unpooled lock poisoned")
+            .bump(now_ms);
+    }
+
+    /// What this process did with Codex requests in the ten minutes before `now_ms`: the 429s
+    /// it sent itself, and the requests it relayed unpooled. The latest refusal's type and time
+    /// are reported only while the refused count is above zero, so the wire never pairs a zero
+    /// count with a stale type.
+    ///
+    /// Both counts live in memory and a restart empties them: until the next refusal, a
+    /// restarted proxy reports none, though codex may still be failing.
+    pub fn codex_traffic(&self, now_ms: i64) -> tcr_status_wire::CodexTraffic {
+        let (refused_10m, last) = {
+            let refused = self
+                .codex_refused
+                .lock()
+                .expect("codex_refused lock poisoned");
+            let count = refused.ring.count(now_ms);
+            (count, refused.last.clone().filter(|_| count > 0))
+        };
+        let unpooled_10m = self
+            .codex_unpooled
+            .lock()
+            .expect("codex_unpooled lock poisoned")
+            .count(now_ms);
+        let (last_refusal, last_refusal_at_ms) = match last {
+            Some((error_type, at_ms)) => (Some(error_type), Some(at_ms)),
+            None => (None, None),
+        };
+        tcr_status_wire::CodexTraffic {
+            refused_10m,
+            last_refusal,
+            last_refusal_at_ms,
+            unpooled_10m,
         }
     }
 }
@@ -15825,5 +15930,58 @@ mod tests {
             Some(0),
             "a non-Fable request still serves the Fable-exhausted account"
         );
+    }
+
+    /// A manager with no account, for the Codex traffic counts, which no account owns.
+    fn traffic_manager() -> Arc<Manager> {
+        build_manager(
+            config_with(Vec::new()),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+    }
+
+    /// The refused count covers the last ten minutes, by the minute: a 429 drops out once ten
+    /// whole minutes have passed since the minute it was sent in. The latest refusal's type and
+    /// time ride with the count, and go when it reaches zero, so the wire never pairs a zero
+    /// count with a stale type.
+    ///
+    /// Watched red: summing all ten buckets whatever their minute keeps the first refusal in
+    /// the count at the tenth minute.
+    #[test]
+    fn the_refused_ring_counts_ten_minutes_of_codex_429s() {
+        // 2026-01-01T00:00:00Z, on a minute boundary.
+        let t0: i64 = 1_767_225_600_000;
+        let manager = traffic_manager();
+        manager.note_codex_refusal("usage_limit_reached", t0);
+        manager.note_codex_refusal("pool_unavailable", t0 + 300_000);
+        assert_eq!(
+            manager.codex_traffic(t0 + 599_000),
+            tcr_status_wire::CodexTraffic {
+                refused_10m: 2,
+                last_refusal: Some("pool_unavailable".into()),
+                last_refusal_at_ms: Some(t0 + 300_000),
+                unpooled_10m: 0,
+            }
+        );
+        assert_eq!(manager.codex_traffic(t0 + 600_000).refused_10m, 1);
+        let emptied = manager.codex_traffic(t0 + 900_000);
+        assert_eq!(emptied.refused_10m, 0);
+        assert_eq!(emptied.last_refusal, None);
+        assert_eq!(emptied.last_refusal_at_ms, None);
+    }
+
+    /// The unpooled count covers the same ten minutes, by the same minute buckets.
+    #[test]
+    fn the_unpooled_ring_counts_routed_relays() {
+        let t0: i64 = 1_767_225_600_000;
+        let manager = traffic_manager();
+        for _ in 0..3 {
+            manager.note_codex_unpooled(t0);
+        }
+        assert_eq!(manager.codex_traffic(t0 + 599_000).unpooled_10m, 3);
+        assert_eq!(manager.codex_traffic(t0 + 600_000).unpooled_10m, 0);
+        assert_eq!(manager.codex_traffic(t0 + 599_000).refused_10m, 0);
     }
 }

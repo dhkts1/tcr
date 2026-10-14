@@ -727,6 +727,77 @@ async fn a_codex_usage_limit_reports_the_refusing_window_on_status_json() {
     }
 }
 
+/// The route and the refusals, through the real binary: with both Codex accounts disabled, a
+/// Codex request is refused by tcr itself, and `tcr status --json` then repeats on each Codex
+/// row the same route and the same ten-minute counts, read off the server's own status. The
+/// scratch HOME's server mints its own leaf, which covers chatgpt.com, and the CLI reads the CA
+/// it wrote there, so the route is pooled and names the non-default Codex origin. The Anthropic
+/// row carries neither key, and `tcr status`'s text form notes the refusal on stderr.
+///
+/// Watched red: with the production half of this change set aside, the Codex rows carry neither
+/// key.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_json_reports_the_route_and_the_refusals_live() {
+    let (upstream, codex_upstream, _ledger) = spawn_origins().await;
+    let server = start_server(&upstream, &codex_upstream).await;
+    for name in ["alice@example.com/codex", "bob@example.com/codex"] {
+        server.disable(name).await;
+    }
+    let resp = client()
+        .post(format!("{}/backend-api/codex/responses", server.base()))
+        .header("authorization", "Bearer client-own")
+        .header("session-id", "s")
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
+
+    let rows = server.status_rows().await;
+    let codex: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row["provider"] == "codex")
+        .collect();
+    assert_eq!(codex.len(), 2, "{rows:?}");
+    let traffic = &codex[0]["codexTraffic"];
+    assert_eq!(traffic["refused10m"], 1, "{traffic}");
+    assert_eq!(traffic["lastRefusal"], "pool_unavailable", "{traffic}");
+    assert!(traffic["lastRefusalAtMs"].is_i64(), "{traffic}");
+    assert_eq!(traffic["unpooled10m"], 0, "{traffic}");
+    assert_eq!(
+        codex[0]["codexRoute"],
+        serde_json::json!({"pooled": true, "upstream": codex_upstream}),
+        "{}",
+        server.log()
+    );
+    assert_eq!(codex[1]["codexTraffic"], codex[0]["codexTraffic"]);
+    assert_eq!(codex[1]["codexRoute"], codex[0]["codexRoute"]);
+    let carol = rows
+        .iter()
+        .find(|row| row["name"] == "carol@example.com")
+        .expect("carol row");
+    assert!(carol.get("codexRoute").is_none(), "{carol}");
+    assert!(carol.get("codexTraffic").is_none(), "{carol}");
+
+    let out = server.tcr(&["status"]).await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.lines().any(|line| line
+            == "[tcr] note codex-refusals: refused_10m=1 last_type=pool_unavailable — tcr \
+                answered codex with a 429 because no Codex account could serve; see the Codex \
+                rows above"),
+        "{stderr}"
+    );
+}
+
 /// One Codex session through the real binary: two turns naming the same `session-id` are one
 /// session on `tcr sessions`, attributed to the Codex account that served them, filed under the
 /// model the stream named, unpriced instead of priced at zero, with no Anthropic cache TTL. The
