@@ -99,6 +99,97 @@ final class ToolCallLabelTests: XCTestCase {
             "10m 2s · 0s left")
     }
 
+    // MARK: - The tool word on a row
+
+    /// A row names a codex call's tool by the kind its BY TOOL bucket names: codex's own
+    /// names do not fit beside a running call's ring, time and `no Kill`, and a cut
+    /// `exec_c…` reads as nothing. Any other codex tool keeps its name, and a Claude call
+    /// keeps its own, whatever it is called.
+    func testACodexRowNamesItsToolInAWordThatFits() {
+        for tool in ["shell", "exec_command", "local_shell_call"] {
+            XCTAssertEqual(ToolCallLabel.rowWord(forTool: tool, provider: .codex), "shell", tool)
+            XCTAssertEqual(ToolCallLabel.category(forTool: tool, provider: .codex), "Codex shell")
+        }
+        XCTAssertEqual(ToolCallLabel.rowWord(forTool: "apply_patch", provider: .codex), "edit")
+        XCTAssertEqual(
+            ToolCallLabel.rowWord(forTool: "update_plan", provider: .codex), "update_plan")
+        for tool in ["Bash", "Agent", "Read", "exec_command"] {
+            XCTAssertEqual(ToolCallLabel.rowWord(forTool: tool, provider: .anthropic), tool)
+        }
+    }
+
+    // MARK: - SLOWEST TODAY's timeout
+
+    /// SLOWEST TODAY judges a Claude call by the Bash tool's 600 s, as it always has, and a
+    /// codex call by its own timeout. codex's default `exec_command` names none and has none,
+    /// so a codex call that ran ten minutes or more under it keeps its duration: "timed out",
+    /// spoken "killed at the 600 second timeout", would be false. A one-shot call that ran
+    /// into its own timeout says so.
+    func testACodexCallIsJudgedByItsOwnTimeout() {
+        let interactive = SessionToolEntry(
+            sessionId: "s", call: ToolCall(tool: "exec_command", seconds: 900), provider: .codex)
+        XCTAssertNil(ToolCallLabel.judgedTimeout(for: interactive, bashTimeout: 600))
+        let none = ToolCallLabel.judgedTimeout(for: interactive, bashTimeout: 600)
+        XCTAssertEqual(ToolCallLabel.pill(seconds: 900, timeout: none), "15m 0s")
+        XCTAssertFalse(ToolCallLabel.timedOut(seconds: 900, timeout: none))
+        XCTAssertNil(ToolCallLabel.spoken(seconds: 900, timeout: none))
+
+        let oneShot = SessionToolEntry(
+            sessionId: "s", call: ToolCall(tool: "exec_command", seconds: 120, timeoutSeconds: 120),
+            provider: .codex)
+        let own = ToolCallLabel.judgedTimeout(for: oneShot, bashTimeout: 600)
+        XCTAssertEqual(own, 120)
+        XCTAssertEqual(ToolCallLabel.pill(seconds: 120, timeout: own), "timed out")
+        XCTAssertEqual(
+            ToolCallLabel.spoken(seconds: 120, timeout: own),
+            "ran 2m 0s, killed at the 120 second timeout")
+        XCTAssertEqual(ToolCallLabel.pill(seconds: 700, timeout: own), "timed out")
+
+        for tool in ["Bash", "Agent", "Read"] {
+            let claude = SessionToolEntry(sessionId: "s", call: ToolCall(tool: tool, seconds: 600))
+            XCTAssertEqual(ToolCallLabel.judgedTimeout(for: claude, bashTimeout: 600), 600, tool)
+        }
+    }
+
+    /// Pinned at the source, because the row is a view this bundle cannot build: SLOWEST
+    /// TODAY's pill, its colour and its spoken value all read the call's judged timeout, and
+    /// none of them the Bash figure directly.
+    func testSlowestTodayJudgesEachCallByItsJudgedTimeout() throws {
+        let source = try fleetViewSource()
+        let start = try XCTUnwrap(
+            source.range(of: "private func slowestToolItem(_ entry: SessionToolEntry)"),
+            "no slowestToolItem — update this test")
+        let end = try XCTUnwrap(
+            source.range(of: "private func timedOutItem(", range: start.upperBound..<source.endIndex))
+        let item = source[start.upperBound..<end.lowerBound]
+            .components(separatedBy: .whitespacesAndNewlines).joined()
+        XCTAssertTrue(
+            item.contains("ToolCallLabel.judgedTimeout(for:entry,bashTimeout:bashTimeoutSeconds)"),
+            "SLOWEST TODAY no longer judges a call by its own timeout")
+        XCTAssertFalse(
+            item.contains("timeout:bashTimeoutSeconds)"),
+            "SLOWEST TODAY judges a call against the Bash timeout directly again, so a codex "
+                + "call with no timeout reads timed out at 600 s")
+    }
+
+    /// Pinned at the source: every Tools-tab row, running, slowest or timed out, names its
+    /// tool through the one row word, so the three lists never name a call two ways.
+    func testEveryToolRowNamesItsToolByTheRowWord() throws {
+        let source = try fleetViewSource()
+        let sharedItem = try XCTUnwrap(
+            source.range(of: "private func toolItem<Trailing: View>("),
+            "no toolItem — update this test")
+        let itemEnd = try XCTUnwrap(
+            source.range(
+                of: "private func sectionHeading(", range: sharedItem.upperBound..<source.endIndex))
+        XCTAssertTrue(
+            source[sharedItem.upperBound..<itemEnd.lowerBound]
+                .components(separatedBy: .whitespacesAndNewlines).joined()
+                .contains(
+                    "ToolCallLabel.rowWord(forTool:entry.call.tool,provider:entry.provider)"),
+            "the Tools tab's rows no longer name a codex call's tool in a word that fits")
+    }
+
     // MARK: - Categories
 
     /// codex's shell tools file under one bucket and its patch tool under another, each named
@@ -129,5 +220,16 @@ final class ToolCallLabelTests: XCTestCase {
         XCTAssertEqual(
             ToolCallLabel.categoryOrder,
             ["Bash", "Agent", "Read/Grep/Edit", "Codex shell", "Codex edit", "Codex other"])
+    }
+
+    /// FleetView.swift, which the test target cannot build, read as text.
+    private func fleetViewSource() throws -> String {
+        try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()  // TcrBarTests
+                .deletingLastPathComponent()  // Tests
+                .deletingLastPathComponent()  // apps/macos
+                .appendingPathComponent("Sources/TcrBar/FleetView.swift"),
+            encoding: .utf8)
     }
 }

@@ -45,12 +45,30 @@ public enum ToolCallLabel {
         return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
     }
 
-    /// Was this call killed at the timeout, rather than merely slow?
+    /// Was this call killed at the timeout, rather than merely slow? Never,
+    /// for a call with no timeout (`nil`), however long it ran.
     ///
     /// `>=`, not `==`: the wire reports the call's own elapsed seconds and a
     /// kill lands a hair past the deadline it was measured against.
-    public static func timedOut(seconds: Double, timeout: Double) -> Bool {
-        seconds >= timeout
+    public static func timedOut(seconds: Double, timeout: Double?) -> Bool {
+        guard let timeout else { return false }
+        return seconds >= timeout
+    }
+
+    /// The timeout SLOWEST TODAY judges a finished call against, or `nil` for a
+    /// call that had none this build knows of, which no duration makes "timed out".
+    ///
+    /// A Claude call keeps `bashTimeout`, the Bash tool's 600 s, which this list
+    /// has always judged every Claude call by. A codex call is judged by its own
+    /// cap (``ToolCall/timeoutCap(bashTimeout:)``, the figure its ring filled
+    /// toward while it ran): a one-shot `exec_command` names a timeout, and codex's
+    /// default `exec_command` has none at all, so a codex call that ran ten minutes
+    /// under it was not killed at anything.
+    public static func judgedTimeout(for entry: SessionToolEntry, bashTimeout: Double) -> Double? {
+        switch entry.provider {
+        case .anthropic: return bashTimeout
+        case .codex: return entry.call.timeoutCap(bashTimeout: bashTimeout)
+        }
     }
 
     /// The pill's printed text.
@@ -68,14 +86,14 @@ public enum ToolCallLabel {
     /// 60 pt column, and widening the column that far takes 78 pt from the
     /// command the row is about. `timed out` alone needs ~76 pt, which fits
     /// `V4.trailingColumnWidth` (96 pt), the width this tab already declares.
-    public static func pill(seconds: Double, timeout: Double) -> String {
+    public static func pill(seconds: Double, timeout: Double?) -> String {
         timedOut(seconds: seconds, timeout: timeout) ? "timed out" : duration(seconds)
     }
 
     /// The pill's accessibility value, and the same sentence as its tooltip —
     /// `nil` for a call that simply ran, whose pill already speaks its duration.
-    public static func spoken(seconds: Double, timeout: Double) -> String? {
-        guard timedOut(seconds: seconds, timeout: timeout) else { return nil }
+    public static func spoken(seconds: Double, timeout: Double?) -> String? {
+        guard let timeout, timedOut(seconds: seconds, timeout: timeout) else { return nil }
         return "ran \(duration(seconds)), killed at the \(Int(timeout)) second timeout"
     }
 
@@ -90,13 +108,31 @@ public enum ToolCallLabel {
     /// render of this layout printed "9m 43s · 17s left" beside an Agent call
     /// with no ring).
     ///
-    /// The clause says "left" rather than "to timeout" because the row is
-    /// already under a section head that states the 600s timeout out loud, and
-    /// the shorter word fits beside the elapsed time in the trailing column.
+    /// The clause says "left" rather than "to timeout" because only a row with
+    /// a ring prints it, and the ring already names what it fills toward, on
+    /// its help and in its spoken value: the Bash tool's 600s, or the timeout a
+    /// codex call named. The section head carries a count alone. The shorter
+    /// word also fits beside the elapsed time in the trailing column.
     public static func running(elapsed: Double?, remaining: Double?, warnWithin: Double) -> String {
         let age = elapsed.map(duration) ?? ""
         guard let remaining, remaining <= warnWithin else { return age }
         return "\(age) · \(Int(max(0, remaining.rounded())))s left"
+    }
+
+    /// The word a row names its call's tool by, after the session's name: a Claude call's
+    /// own tool name, and a codex call's kind, `shell` or `edit`, the word its BY TOOL
+    /// bucket (``category(forTool:provider:)``) names it by.
+    ///
+    /// codex's own names are long: beside a running call's ring, its time and `no Kill`,
+    /// `exec_command` was cut to `exec_c…`, which names nothing. Any other codex tool keeps
+    /// its own name, which is the only word there is for it.
+    public static func rowWord(forTool tool: String, provider: Provider) -> String {
+        guard provider == .codex else { return tool }
+        switch tool {
+        case "shell", "exec_command", "local_shell_call": return "shell"
+        case "apply_patch": return "edit"
+        default: return tool
+        }
     }
 
     /// The BY TOOL buckets, in the order the line lists them: Claude's three, then codex's.

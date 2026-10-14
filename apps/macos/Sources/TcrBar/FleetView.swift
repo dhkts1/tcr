@@ -2716,13 +2716,16 @@ struct FleetView: View {
             trailing: {
                 if let seconds = entry.call.seconds {
                     // A killed call says so in WORDS, never red against grey
-                    // alone, and the spoken value says it too.
-                    let spoken = ToolCallLabel.spoken(
-                        seconds: seconds, timeout: bashTimeoutSeconds)
-                    let timedOut = ToolCallLabel.timedOut(
-                        seconds: seconds, timeout: bashTimeoutSeconds)
+                    // alone, and the spoken value says it too. Judged against
+                    // the call's own timeout: the Bash tool's 600s for a Claude
+                    // call, and for a codex call the timeout it named, or none,
+                    // so it never reads "timed out" at a limit it did not have.
+                    let timeout = ToolCallLabel.judgedTimeout(
+                        for: entry, bashTimeout: bashTimeoutSeconds)
+                    let spoken = ToolCallLabel.spoken(seconds: seconds, timeout: timeout)
+                    let timedOut = ToolCallLabel.timedOut(seconds: seconds, timeout: timeout)
                     V4Pill(
-                        text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
+                        text: ToolCallLabel.pill(seconds: seconds, timeout: timeout),
                         role: timedOut ? .bad : .neutral,
                         uppercased: timedOut
                     )
@@ -2767,9 +2770,11 @@ struct FleetView: View {
                         .layoutPriority(1)
                     // ` · Bash`, REPLACED by ` · 640% · 2.1G` once a process
                     // is matched. The tool word goes rather than the figure
-                    // because this row's tool is already said by the ring
-                    // (only a Bash call has one), by the ✕ (only a Bash call
-                    // can be killed) and by the hover text, which is
+                    // because this row's tool is already said by the ring (a
+                    // codex call that names a timeout draws one too, but only
+                    // a Bash call is ever matched to a process, so a ring
+                    // beside no tool word is a Bash call's), by the ✕ (only a
+                    // Bash call can be killed) and by the hover text, which is
                     // `pid 48765 · Bash · 640% cpu` — the pid and the unit
                     // being what you check after deciding, not while scanning.
                     //
@@ -2782,7 +2787,10 @@ struct FleetView: View {
                     // 11 for the figure. The point that buys is also what made
                     // the line fit with the session name whole.
                     if meta.isEmpty {
-                        MuteText(text: " · \(entry.call.tool)")
+                        MuteText(
+                            text: " · "
+                                + ToolCallLabel.rowWord(
+                                    forTool: entry.call.tool, provider: entry.provider))
                     } else {
                         StatText(text: meta)
                             .help(metaHover ?? "")
@@ -2827,13 +2835,16 @@ struct FleetView: View {
         return String(sessionId.prefix(8))
     }
 
-    /// The Bash tool's own timeout — the one denominator this build knows,
-    /// and the reason `docs/design/panel-tabs.md` names 600s specifically:
-    /// "The ten slowest calls today all sit at 600s: the Bash tool's own
-    /// timeout." A non-Bash running call has no known denominator and draws
-    /// no ring, per finding 5's own fix ("state the denominator … set to the
-    /// third ring") — inventing one for a tool this build has no timeout
-    /// figure for would be the same overclaim finding 5 exists to remove.
+    /// The Bash tool's own timeout — the denominator for a Claude `Bash` call,
+    /// whose wire names none, and the reason `docs/design/panel-tabs.md` names
+    /// 600s specifically: "The ten slowest calls today all sit at 600s: the
+    /// Bash tool's own timeout." A codex call that names its own timeout fills
+    /// toward that instead (``ToolCall/timeoutCap(bashTimeout:)``), and SLOWEST
+    /// TODAY judges it by that (``ToolCallLabel/judgedTimeout(for:bashTimeout:)``).
+    /// Any other running call has no known denominator and draws no ring, per
+    /// finding 5's own fix ("state the denominator … set to the third ring") —
+    /// inventing one for a tool this build has no timeout figure for would be
+    /// the same overclaim finding 5 exists to remove.
     private var bashTimeoutSeconds: Double { V4.toolTimeoutSeconds }
 
     /// How many running calls the tab draws before its disclosure button —
