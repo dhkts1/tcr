@@ -3763,6 +3763,89 @@ fn find_account_entry<'a>(
         .ok_or(DisabledWrite::NoEntry)
 }
 
+/// The top-level key that tells the empty-fleet Claude Code import to leave
+/// this config alone. Absent means the import may run; `false` means a person
+/// emptied the fleet on purpose (see [`remove_account_entry`]). Read out of
+/// [`Config::extra`] by [`Config::refuses_claude_code_import`].
+pub const CLAUDE_CODE_IMPORT_KEY: &str = "claudeCodeImport";
+
+impl Config {
+    /// Whether this config said "do not import this machine's Claude Code
+    /// login into me", which a delete of the last account writes. Without it,
+    /// the next `tcr status` (the panel polls it every few seconds) finds an
+    /// empty fleet and imports the login again, so a delete of the last
+    /// account undid itself one poll later.
+    pub fn refuses_claude_code_import(&self) -> bool {
+        self.extra.get("claudeCodeImport") == Some(&Value::Bool(false))
+    }
+}
+
+/// What [`remove_account_entry`] did to the on-disk document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRemoval {
+    /// The entry is gone and the file was rewritten.
+    Removed {
+        /// `controlAccount` named the removed entry and was dropped with it.
+        control_cleared: bool,
+        /// The removed entry was the last one, so the file now also carries
+        /// [`CLAUDE_CODE_IMPORT_KEY`] `false`.
+        fleet_emptied: bool,
+    },
+    /// Nothing on disk carries that identity. Nothing was written.
+    NoEntry,
+    /// More than one entry carries it. Nothing was written.
+    Ambiguous,
+}
+
+/// Delete the ONE `accounts` entry carrying `target`'s identity from the file at
+/// `path`, leaving every other key and every other entry exactly as written.
+///
+/// The raw-document shape of [`save_disabled`] and [`save_group_membership`],
+/// never a `Config` round trip. A round trip cannot write back an entry the
+/// loader quarantined (an API-key row, a `type` that is not a string, a foreign
+/// `upstream`), which is why the CLI's load-edit-save path refuses any file
+/// holding one; deleting through it refused EVERY delete on such a fleet. This
+/// path never deserializes the other entries, so they survive byte for byte.
+///
+/// Two more keys are kept true to the removal in the same write, so the file
+/// and the running proxy cannot disagree afterwards:
+///
+/// - `controlAccount`, when it names the removed entry, is dropped. The running
+///   proxy stops treating a removed row as the control account at once; left
+///   in the file, the name would quietly make a later login of the same name
+///   the control account again.
+/// - When the removed entry was the last one, [`CLAUDE_CODE_IMPORT_KEY`] is
+///   written `false` (see [`Config::refuses_claude_code_import`]).
+pub fn remove_account_entry(path: &Path, target: &Account) -> Result<AccountRemoval, ConfigError> {
+    let mut doc = read_document(path)?;
+    let index = match locate_account_entry(&doc, target) {
+        EntryMatch::One(index) => index,
+        EntryMatch::None => return Ok(AccountRemoval::NoEntry),
+        EntryMatch::Many => return Ok(AccountRemoval::Ambiguous),
+    };
+    let Some(entries) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+        // `locate_account_entry` only answers `One` for a real array.
+        return Ok(AccountRemoval::NoEntry);
+    };
+    entries.remove(index);
+    let fleet_emptied = entries.is_empty();
+    let names_target = doc
+        .get("controlAccount")
+        .and_then(|raw| serde_json::from_value::<ControlAccountRef>(raw.clone()).ok())
+        .is_some_and(|control| control.name() == target.name);
+    if names_target {
+        doc.remove("controlAccount");
+    }
+    if fleet_emptied {
+        doc.insert(CLAUDE_CODE_IMPORT_KEY.to_string(), Value::Bool(false));
+    }
+    write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    Ok(AccountRemoval::Removed {
+        control_cleared: names_target,
+        fleet_emptied,
+    })
+}
+
 /// What a targeted [`save_account`] upsert did to the on-disk document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountWrite {

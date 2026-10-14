@@ -83,6 +83,7 @@ const KNOWN_KEYS: &[KnownKey] = &[
     key("cacheTtlRewrite", KeyKind::ReadFromExtra),
     key("throttleExemptNoise", KeyKind::ReadFromExtra),
     key("divertBudget", KeyKind::ReadFromExtra),
+    key("claudeCodeImport", KeyKind::ReadFromExtra),
     key("routes", KeyKind::Teamclaude),
     key("sx", KeyKind::Teamclaude),
     key("logDir", KeyKind::Teamclaude),

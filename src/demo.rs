@@ -48,6 +48,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         org_name: Some("Demo Org".to_string()),
         priority,
         disabled: false,
+        removed: false,
         groups: Vec::new(),
         // A believable default plan, overridden per row below so the demo shows
         // the mix a real fleet has — which is the whole reason the plan is on

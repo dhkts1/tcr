@@ -1994,7 +1994,11 @@ async fn import_claude_code_login(
     // probe above can take a while against a server that is still booting.
     // Another `tcr` process may have imported in that gap, and minting a name
     // against its row would add the same login a second time.
-    if into == ImportInto::EmptyFleetOnly && !config.accounts.is_empty() {
+    // A fleet emptied by `tcr remove` says so in the file; refilling it here
+    // would undo that delete on the next poll.
+    if into == ImportInto::EmptyFleetOnly
+        && (!config.accounts.is_empty() || config.refuses_claude_code_import())
+    {
         return Ok(None);
     }
     let profile = fetch_profile(&tokens.access_token).await;

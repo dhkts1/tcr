@@ -309,6 +309,19 @@ pub struct AccountRuntime {
     pub org_name: Option<String>,
     pub priority: i64,
     pub disabled: bool,
+    /// The config file no longer holds this account: it was deleted (`tcr
+    /// remove`, TcrBar's "Delete Account…", or a hand edit) while this process
+    /// ran. Set and cleared ONLY by [`Manager::reload_groups_if_changed`], which
+    /// compares the rotation with the file every time it re-reads it.
+    ///
+    /// A removed row keeps its slot, because a rotation index is held all over
+    /// this process (pins, the control index, sessions, in-flight guards) and
+    /// nothing may shift under them. It is parked (`disabled`), left out of
+    /// every snapshot (so `tcr status` and the panel stop listing it), never
+    /// the control or locked account, and invisible to name resolution. Before
+    /// this existed the row stayed listed until a restart, so a delete of a
+    /// row that was already parked changed nothing anyone could see.
+    pub removed: bool,
     /// Mirrors [`config::Account::groups`], normalized to an owned `Vec` (empty
     /// when the config carried no `groups` key) so [`Manager::eligible`] can test
     /// membership without an `Option` at every call site.
@@ -612,6 +625,24 @@ impl crate::identity::Queryable for AccountRuntime {
     }
 }
 
+/// [`crate::identity::match_one`] over the rotation, blind to rows deleted
+/// from the config ([`AccountRuntime::removed`]). A deleted row keeps its slot,
+/// so without this a query could still park, prioritise or promote it, and a
+/// re-login under the same name would read as ambiguous.
+fn match_listed(accounts: &[AccountRuntime], query: &str) -> crate::identity::Match {
+    let hits: Vec<usize> = crate::identity::match_accounts(accounts, query)
+        .into_iter()
+        .filter(|&idx| !accounts[idx].removed)
+        .collect();
+    match hits.as_slice() {
+        [] => crate::identity::Match::None,
+        [only] => crate::identity::Match::One(*only),
+        many => crate::identity::Match::Ambiguous(
+            many.iter().map(|&idx| accounts[idx].name.clone()).collect(),
+        ),
+    }
+}
+
 /// What [`Manager::set_disabled_by_query`] did.
 ///
 /// `Applied` carries the RESOLVED name plus the durable half's fate, which the
@@ -700,6 +731,7 @@ impl AccountRuntime {
             org_name: account.org_name.clone(),
             priority: account.priority.unwrap_or(0),
             disabled: account.disabled.unwrap_or(false),
+            removed: false,
             groups: account.groups.clone().unwrap_or_default(),
             organization_type: account.organization_type.clone(),
             rate_limit_tier: account.rate_limit_tier.clone(),
@@ -2151,8 +2183,11 @@ impl Manager {
 
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
     /// `parked`, `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
-    /// the last check — the fix for group edits appearing to do nothing.
-    /// Called from a natural
+    /// the last check — the fix for group edits appearing to do nothing. The
+    /// same pass also follows the file's account LIST: an account it gained is
+    /// admitted, and one it lost is marked [`AccountRuntime::removed`], which is
+    /// what makes a delete leave the running proxy and the panel without a
+    /// restart. Called from a natural
     /// cadence point ([`Self::select_with_group`], [`Self::select_revalidation`],
     /// [`Self::snapshot`]) rather than a dedicated watcher thread — one more
     /// background task is one more thing to keep alive, and every one of
@@ -2321,7 +2356,8 @@ impl Manager {
         }
         {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-            for account in accounts.iter_mut() {
+            let fresh_control = fresh.control_account.as_ref().map(|c| c.name().to_string());
+            for (idx, account) in accounts.iter_mut().enumerate() {
                 let probe = crate::identity::probe(
                     &account.name,
                     account.account_uuid.clone(),
@@ -2333,8 +2369,45 @@ impl Manager {
                     .iter()
                     .find(|a| crate::identity::same_identity(&probe, a))
                 else {
+                    // The file no longer holds this account: it was deleted.
+                    // Parked in memory only (there is no entry left to write
+                    // the flag into) and dropped from every snapshot; see
+                    // `AccountRuntime::removed`.
+                    if !account.removed {
+                        account.removed = true;
+                        account.disabled = true;
+                        changed.push(format!("{}: removed from the config", account.name));
+                        // A deleted account is not the control account: its
+                        // routing bypasses `disabled` on purpose, so leaving the
+                        // index would keep control traffic on the deleted row.
+                        // Same lock order as `probeable_indices`: accounts, then
+                        // control.
+                        let mut control = self.control_idx.write().expect("control lock poisoned");
+                        if *control == Some(idx) {
+                            *control = None;
+                            changed
+                                .push(format!("{}: no longer the control account", account.name));
+                        }
+                    }
                     continue;
                 };
+                if account.removed {
+                    // Back in the file (an undone hand edit, a login that wrote
+                    // the file): the file's row is the truth again, credentials
+                    // and bench flag included.
+                    account.removed = false;
+                    account.disabled = matched.disabled.unwrap_or(false);
+                    account.access_token = matched.access_token.clone();
+                    account.refresh_token = matched.refresh_token.clone();
+                    account.expires_at_ms = matched.expires_at.map(oauth::normalize_expires_at);
+                    changed.push(format!("{}: back in the config", account.name));
+                    if fresh_control.as_deref() == Some(account.name.as_str()) {
+                        let mut control = self.control_idx.write().expect("control lock poisoned");
+                        if control.is_none() {
+                            *control = Some(idx);
+                        }
+                    }
+                }
                 let new_groups = matched.groups.clone().unwrap_or_default();
                 if new_groups != account.groups {
                     changed.push(format!(
@@ -2346,10 +2419,10 @@ impl Manager {
             }
 
             // Admit an account the file gained since boot (or the last reload)
-            // — APP-35. Never touches or removes an account already in
-            // `accounts`; that is `save_tokens`'s removal semantics
-            // (`config.rs`'s doc-comment on it) and stays out of scope here.
-            // The identity match is the same probe the loop above uses, just
+            // — APP-35. Never touches an account already in `accounts`: one
+            // the file LOST was marked `removed` by the loop above, in place,
+            // and one that came back was revived there too, so neither is
+            // admitted a second time here. The identity match is the same probe the loop above uses, just
             // run in the opposite direction: does any LOADED account already
             // own this fresh entry?
             //
@@ -2569,7 +2642,7 @@ impl Manager {
     pub fn set_disabled_by_query(&self, query: &str, disabled: bool) -> SetDisabledOutcome {
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            match crate::identity::match_one(&accounts[..], query) {
+            match match_listed(&accounts[..], query) {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
@@ -2595,7 +2668,7 @@ impl Manager {
     /// [`Self::set_disabled_by_query`] uses, for the same reason.
     pub fn set_priority_by_query(&self, query: &str, priority: i64) -> SetPriorityOutcome {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        let idx = match crate::identity::match_one(&accounts[..], query) {
+        let idx = match match_listed(&accounts[..], query) {
             crate::identity::Match::One(idx) => idx,
             crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
             crate::identity::Match::Ambiguous(names) => {
@@ -2673,6 +2746,7 @@ impl Manager {
             .read()
             .expect("accounts lock poisoned")
             .get(idx)
+            .filter(|a| !a.removed)
             .map(|a| a.name.clone())
     }
 
@@ -2817,7 +2891,7 @@ impl Manager {
         };
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            match crate::identity::match_one(&accounts[..], query) {
+            match match_listed(&accounts[..], query) {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetControlOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
@@ -3063,6 +3137,16 @@ impl Manager {
                         // rotation early.
                         if row.status == AccountStatus::Error {
                             row.status = AccountStatus::Active;
+                        }
+                        // A login of an account deleted while this process ran
+                        // lands on the deleted row's slot (same identity) and
+                        // brings it back as the login asked for it, not parked
+                        // the way the delete left it. The durable write below
+                        // puts the row back in the file, so the next reload
+                        // agrees.
+                        if row.removed {
+                            row.removed = false;
+                            row.disabled = account.disabled.unwrap_or(false);
                         }
                         // F6: the submitted type always wins — this route only
                         // ever carries a real credential, so a row whose stored
@@ -10884,8 +10968,10 @@ mod tests {
             "a write that never landed must not be reflected in memory"
         );
         // The runtime row still flips — the bench takes effect NOW, it just is not
-        // durable, which is exactly what the caller is told.
-        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled);
+        // durable, which is exactly what the caller is told. Read off the row
+        // itself, not a snapshot: this file never held `acct-a`, so a snapshot's
+        // reload marks the row removed and lists nothing.
+        assert!(manager.accounts.read().unwrap()[0].disabled);
         std::fs::remove_file(&path).ok();
 
         // Ambiguous — two disk entries share the identity, so none may be chosen.

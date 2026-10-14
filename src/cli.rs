@@ -133,7 +133,8 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
 /// leaves `config` exactly as it came in and the caller prints the ordinary
 /// empty-fleet hint.
 async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -> Config {
-    if !config.accounts.is_empty() {
+    // A fleet a delete emptied stays empty: see `Config::refuses_claude_code_import`.
+    if !config.accounts.is_empty() || config.refuses_claude_code_import() {
         return config;
     }
     if crate::oauth::auto_import_claude_code_login(config_path)
@@ -289,75 +290,122 @@ fn edit_account<T>(
 /// reasons as `set_enabled` — see its doc-comment — sharpened: a removal
 /// applied on top of a live disagreement cannot be undone by re-adding, since
 /// the account's credentials are gone from the file being edited.
+///
+/// The file half is [`config::remove_account_entry`], a raw-document delete,
+/// so a quarantined row elsewhere in the file no longer blocks it. The parked
+/// row then LEAVES the running proxy the next time that proxy reads the file
+/// (`Manager::reload_groups_if_changed`, which every status request runs
+/// first), so the panel's next poll no longer lists it.
 pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<()> {
-    if let Ok(config) = config::load(config_path) {
-        match post_set_disabled(&config, query, true).await {
-            Ok(_) => {
-                let removed = edit_account(config_path, query, |config, idx| {
-                    config.accounts.remove(idx).name
-                })?;
-                println!("Removed account '{removed}'.");
-                return Ok(());
-            }
-            // Nothing is listening: no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and refused our key. Deleting the record now
-            // would leave the running proxy still rotating an account that no
-            // longer exists on disk — worse than the disable case, because
-            // there is no record left to reconcile against on restart.
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+    // Everything the FILE could refuse is checked before the running proxy is
+    // touched. The live step parks the account, and parking is a side effect:
+    // run first, a delete the file then refused (it used to refuse any file
+    // holding one quarantined row) left the account parked and still listed,
+    // which from the panel reads as "delete did nothing" and, tried again on a
+    // now-parked row, as "delete does not work on parked accounts".
+    let config = load_config(config_path)?;
+    if let Some(why) = &config.rename_write_error {
+        bail!(
+            "config at {} holds accounts sharing a name, and the rename that would fix it could \
+             not be written back ({why}) — so nothing was changed. Fix the file's permissions, or \
+             give each row its own name by hand, and retry.",
+            config_path.display()
+        );
+    }
+    let idx = resolve_account(&config.accounts, query)?;
+    let target = config.accounts[idx].clone();
+    let name = target.name.clone();
+
+    let live = post_set_disabled(&config, &name, true).await;
+    let parked_live = live.is_ok();
+    let warning = match live {
+        Ok(_) => None,
+        // Nothing is listening: no live rotation to disagree with the file.
+        Err(LiveControlError::NoServer) => None,
+        // A server is there and refused our key. Deleting the record now
+        // would leave the running proxy still rotating an account that no
+        // longer exists on disk — worse than the disable case, because
+        // there is no record left to reconcile against on restart.
+        Err(LiveControlError::Unauthorized) => {
+            bail!(
+                "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                config.proxy.port,
+                config_path.display()
+            );
+        }
+        // The route resolved our query to nothing, or to more than one
+        // account. The file's own resolution could land on a different
+        // row than the server matched — a removal applied to the wrong
+        // account is unrecoverable, so this bails rather than falling back.
+        Err(LiveControlError::Rejected(message)) => {
+            bail!(
+                "the proxy running on :{} refused this: {message} Nothing was changed.",
+                config.proxy.port
+            );
+        }
+        // An older tcr with no account-control route. The file half is all
+        // we can do; say loudly that the proxy keeps using the account
+        // until it restarts.
+        Err(LiveControlError::NoRoute) => Some(format!(
+            "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{name}' until it restarts. {}",
+            config.proxy.port,
+            crate::proxy::DISABLED_PATH,
+            RESTART_HINT,
+        )),
+        // It answered something we cannot use, or did not answer at all.
+        Err(other) => Some(format!(
+            "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP routing to '{name}' until it restarts.",
+            config.proxy.port,
+            other.why(),
+        )),
+    };
+
+    let failed = match config::remove_account_entry(config_path, &target)
+        .with_context(|| format!("save config at {}", config_path.display()))
+    {
+        Ok(config::AccountRemoval::Removed { .. }) => None,
+        Ok(config::AccountRemoval::NoEntry) => Some(anyhow::anyhow!(
+            "'{name}' vanished from {} between load and write (concurrent edit?), so nothing was removed",
+            config_path.display()
+        )),
+        Ok(config::AccountRemoval::Ambiguous) => Some(anyhow::anyhow!(
+            "more than one entry in {} carries '{name}''s identity, so nothing was removed",
+            config_path.display()
+        )),
+        Err(err) => Some(err),
+    };
+    if let Some(err) = failed {
+        // The proxy parked it a moment ago and the delete did not happen: put
+        // it back the way it was, so a failed delete changes nothing.
+        if parked_live && target.disabled != Some(true) {
+            if let Err(undo) = post_set_disabled(&config, &name, false).await {
+                return Err(err.context(format!(
+                    "the delete failed after the proxy on :{} had parked '{name}', and un-parking it failed too ({}), so it stays parked",
                     config.proxy.port,
-                    config_path.display()
-                );
+                    undo.why()
+                )));
             }
-            // The route resolved our query to nothing, or to more than one
-            // account. The file's own resolution could land on a different
-            // row than the server matched — a removal applied to the wrong
-            // account is unrecoverable, so this bails rather than falling back.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // An older tcr with no account-control route. The file half is all
-            // we can do; say loudly that the proxy keeps using the account
-            // until it restarts.
-            Err(LiveControlError::NoRoute) => {
-                let removed = edit_account(config_path, query, |config, idx| {
-                    config.accounts.remove(idx).name
-                })?;
+        }
+        return Err(err);
+    }
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    // The running proxy drops a row the file no longer holds the next time it
+    // reads the file, which a status request does first. Ask it once, so a
+    // proxy built before it could do that is NAMED here, on the stderr TcrBar
+    // shows on the row, rather than leaving the row listed with no reason.
+    if parked_live {
+        if let Ok(payload) = fetch_live_status(&config).await {
+            if payload.accounts.iter().any(|a| a.name == name) {
                 eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{removed}' until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::DISABLED_PATH,
-                    RESTART_HINT,
+                    "[tcr] the proxy running on :{} stopped routing to '{name}', but it predates live removal and keeps listing it as disabled until it restarts. {}",
+                    config.proxy.port, RESTART_HINT,
                 );
-                println!("Removed account '{removed}'.");
-                return Ok(());
-            }
-            // It answered something we cannot use, or did not answer at all.
-            Err(other) => {
-                let removed = edit_account(config_path, query, |config, idx| {
-                    config.accounts.remove(idx).name
-                })?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP routing to '{removed}' until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                );
-                println!("Removed account '{removed}'.");
-                return Ok(());
             }
         }
     }
-
-    let removed = edit_account(config_path, query, |config, idx| {
-        config.accounts.remove(idx).name
-    })?;
-    println!("Removed account '{removed}'.");
+    println!("Removed account '{name}'.");
     Ok(())
 }
 
@@ -3582,13 +3630,25 @@ mod tests {
 
         remove_account(&path, "alice@example.com").await.unwrap();
 
-        // 1. THE RUNNING ROTATION: parked immediately, not just at next boot.
+        // 1. THE RUNNING ROTATION: out of it at once, not at next boot. It is
+        // no longer listed (the snapshot re-reads the file first), and no pick
+        // lands on it even though it has the better priority.
         let live = manager.snapshot(OffsetDateTime::now_utc());
-        assert_eq!(live.accounts[0].name, "alice@example.com");
-        assert!(
-            live.accounts[0].disabled,
-            "the account is parked IN THE SERVING PROCESS before deletion"
+        let listed: Vec<&str> = live.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            listed,
+            vec!["bob@example.com"],
+            "the serving process dropped it"
         );
+        let picked = manager.select(
+            &std::collections::HashSet::new(),
+            OffsetDateTime::now_utc(),
+            None,
+            None,
+            "/v1/messages",
+            None,
+        );
+        assert_eq!(picked, Some(1), "the deleted account never serves again");
 
         // 2. …and the file no longer carries the record at all.
         let config = load(&path);

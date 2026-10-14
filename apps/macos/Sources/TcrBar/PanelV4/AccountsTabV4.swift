@@ -59,6 +59,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     var keptOpen = KeptOpenCards()
     /// The pointer entering (`true`) or leaving a line, by row identity.
     var onHoverLine: (String, Bool) -> Void = { _, _ in }
+    /// What became of the last action on each account, drawn under its line
+    /// or card (``RowNotices``). Empty for every account by default.
+    var notices: (Account) -> [AccountRowNotice] = { _ in [] }
     /// The row's own actions, as a context menu — the SECOND route to them,
     /// from the one definition in ``AccountRow``.
     @ViewBuilder var menu: (Account) -> Menu
@@ -145,8 +148,11 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     marginBottom: V4.lineBoxMarginBottom)
             }
             ForEach(cards) { row in
-                card(row, shape: .full)
-                    .padding(.bottom, V4.lineBoxMarginBottom)
+                VStack(alignment: .leading, spacing: 0) {
+                    card(row, shape: .full)
+                    RowNotices(notices: notices(row.account))
+                }
+                .padding(.bottom, V4.lineBoxMarginBottom)
             }
         }
         // The first block under the tab strip collapses its margin into the
@@ -186,13 +192,17 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// floating copy of itself; pointing at its strip segment lights it the
     /// way a line is lit, in `.hov`'s fill.
     private func keptOpenCard(_ row: FleetSectionRow, grouped: Bool) -> some View {
-        AccountHoverCardContent(
-            row: row, shape: grouped ? .compact : .full, now: now, snapshotMode: snapshotMode,
-            lit: litAccount == row.account.id
-        ) {
-            actions(row.account)
-        } menu: {
-            menu(row.account)
+        VStack(alignment: .leading, spacing: 0) {
+            AccountHoverCardContent(
+                row: row, shape: grouped ? .compact : .full, now: now,
+                snapshotMode: snapshotMode,
+                lit: litAccount == row.account.id
+            ) {
+                actions(row.account)
+            } menu: {
+                menu(row.account)
+            }
+            RowNotices(notices: notices(row.account))
         }
     }
 
@@ -217,19 +227,27 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
             marginBottom: marginBottom
         ) { row in
             switch form(row) {
+            // The notices sit inside the hovered span, so a hover card hangs
+            // below them rather than over the reason a click did not work.
             case .liveLine:
-                AccountLineRow(
-                    account: row.account, now: now, isControl: row.isControl,
-                    snapshotMode: snapshotMode, nameWidth: nameWidth
-                ) { menu(row.account) }
+                VStack(alignment: .leading, spacing: 0) {
+                    AccountLineRow(
+                        account: row.account, now: now, isControl: row.isControl,
+                        snapshotMode: snapshotMode, nameWidth: nameWidth
+                    ) { menu(row.account) }
+                    RowNotices(notices: notices(row.account))
+                }
                 .hoverableLine(row, hovered: lit(row), bleed: .zero) {
                     onHoverLine(row.id, $0)
                 }
             case .waitingLine:
-                WaitingLineRow(
-                    account: row.account, band: row.band, now: now,
-                    isControl: row.isControl, snapshotMode: snapshotMode
-                ) { menu(row.account) }
+                VStack(alignment: .leading, spacing: 0) {
+                    WaitingLineRow(
+                        account: row.account, band: row.band, now: now,
+                        isControl: row.isControl, snapshotMode: snapshotMode
+                    ) { menu(row.account) }
+                    RowNotices(notices: notices(row.account))
+                }
                 .hoverableLine(
                     row, hovered: lit(row), bleed: V4.waitBoxPaddingH
                 ) { onHoverLine(row.id, $0) }
@@ -405,10 +423,13 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     .padding(.top, V4.groupCardGap)
                 }
                 ForEach(Array(cards.enumerated()), id: \.element.id) { index, row in
-                    card(row, shape: .compact)
-                        .padding(.top, V4.groupCardGap)
-                        .padding(
-                            .bottom, index == cards.count - 1 && closes ? V4.groupCardGap : 0)
+                    VStack(alignment: .leading, spacing: 0) {
+                        card(row, shape: .compact)
+                        RowNotices(notices: notices(row.account))
+                    }
+                    .padding(.top, V4.groupCardGap)
+                    .padding(
+                        .bottom, index == cards.count - 1 && closes ? V4.groupCardGap : 0)
                 }
             }
             if isCollapsible(section) {
