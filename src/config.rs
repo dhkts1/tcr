@@ -105,26 +105,37 @@ fn default_pacing() -> PacingConfig {
 /// Default PER-ORGANIZATION outbound throttle: ON. Absent `accountThrottle` key →
 /// these values; `"accountThrottle": {}` → off (escape hatch).
 ///
-/// **This loosens instantaneous per-identity burst. Say so plainly.** Sustained
-/// rate is unchanged — 350ms is the interval a single identity was already held
-/// to, so an organization still sends at most one request per 350ms in the steady
-/// state. But `burst` rises 4 → 8, which means a burst CONCENTRATED on one
-/// organization now admits 8 instantly where it admitted 4. An 8-wide burst on
-/// one org cost `(8-4)*350 = 1400ms` before this change and costs 0 after.
+/// **The burst is sized for an agent wave, not for one turn.** The sustained rate
+/// is unchanged: one send per 350ms per organization. `burst` went 4 → 8 so that
+/// one Claude Code turn (inference + `count_tokens` + a telemetry batch, roughly
+/// 4-6 requests) passes untaxed, then 8 → 24 on 2026-10-12 because 8 still taxed
+/// fan-out: a wave of subagents pinned to one account, or a batch of new sessions
+/// whose startup calls (`/api/claude_code/settings`, `policy_limits`) all go to the
+/// control account. Replaying 575k logged sends (five days, 18 accounts) through
+/// this GCRA: at `burst: 8`, 0.4% of `/v1/messages` sends waited, the worst a
+/// 25-wide wave on one account whose last send waited at least 4.1s. At
+/// `burst: 24`, with the fleet ceiling at 32, none did. The replay works from
+/// completion timestamps, which are smoother than arrivals, so its waits are
+/// lower bounds.
 ///
-/// That is a deliberate trade, not an oversight: one Claude Code turn fires
-/// roughly 4-6 requests (inference + `count_tokens` + a telemetry batch), and at
-/// `burst: 4` the tail of a single turn paid a 350ms tax. It is on the record in
-/// `tests/throttle_exempt.rs::shipped_tuning_passes_one_turn_untaxed`, which
-/// fails if anyone reverts the burst without meaning to.
+/// **Why the looser burst is not expected to draw 429s.** Over the same five days
+/// Anthropic returned 55 "would exceed your account's rate limit" 429s, all on
+/// `/v1/messages`. In the 60s before each one, that account had sent a median of
+/// 39 requests, against the ~179 a minute this bucket allows; and one account ran
+/// at the full 350ms rate for a minute (187 sends) with no 429. Whatever trips
+/// those 429s, it is not request count.
 ///
-/// The FAN-OUT speedup does not come from this. It comes from the bucket being
-/// per-org rather than shared, so capacity scales *with* the account pool instead
-/// of being divided across it — a spread burst is free at `burst: 4` too.
+/// `tests/throttle_exempt.rs::shipped_tuning_passes_an_agent_wave_untaxed` holds
+/// the 24, and `shipped_tuning_still_paces_beyond_one_wave` proves the bucket
+/// still paces past it. Both read this function's values, not a copy.
+///
+/// The speedup for a burst SPREAD across accounts does not come from this. It
+/// comes from the bucket being per-org rather than shared, so capacity grows with
+/// the account pool; a spread burst is free at any of these sizes.
 fn default_account_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(350),
-        burst: Some(8),
+        burst: Some(24),
     }
 }
 
@@ -137,26 +148,94 @@ fn default_account_throttle() -> ThrottleConfig {
 /// genuinely unknown — see [`ThrottleConfig`]'s note on what the evidence does and
 /// does not show.
 ///
-/// **It is tuned so it can actually fire.** An earlier draft set `burst: 24`,
-/// ~14x above observed traffic, which made it unable to engage under any load the
-/// fleet realistically produces — insurance priced never to pay out is not
-/// insurance. `burst: 16` still leaves a 12-wide agent fan-out completely untaxed
-/// (the case this whole change exists to fix) while engaging on a genuine runaway,
-/// which is also the shape a shared-source abuse detector would key on. Sustained
-/// headroom is unchanged and large: measured 2026-08-26 the fleet sustained
-/// 0.69 req/s across 13 accounts, against this ceiling's 10 req/s.
+/// **It is tuned so it can actually fire.** Insurance priced never to pay out is
+/// not insurance, so the burst sits near the fleet's real peaks rather than far
+/// above them. It shipped at 16 and went to 32 on 2026-10-12 for a structural
+/// reason: the ceiling has to sit ABOVE the per-org burst
+/// ([`default_account_throttle`], 24), or a one-account wave that the per-org
+/// bucket admits gets held here instead. In the replay described there, per-org 24
+/// under a ceiling of 16 still held 92 inference sends. At 32 the ceiling still
+/// fires on real traffic: the same replay held 4 sends in five days, and the
+/// fleet's busiest 1s and 2.8s windows reached 36 and 49 sends. Sustained
+/// headroom is unchanged and large: the fleet averaged 1.5 req/s over those five
+/// days, against this ceiling's 10 req/s.
 ///
 /// `tests/throttle_exempt.rs::shipped_fleet_ceiling_can_actually_fire` is the
-/// guard: it drives a 24-wide runaway and asserts the ceiling engages. A ceiling
+/// guard: it drives a 48-wide runaway and asserts the ceiling engages. A ceiling
 /// never observed firing is indistinguishable from an absent one.
 fn default_fleet_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(100),
-        burst: Some(16),
+        burst: Some(32),
     }
 }
-fn default_account_type() -> String {
-    "oauth".to_string()
+/// What kind of credential an account row holds: its `type` key, parsed once
+/// here at the serde boundary. No other code spells the strings.
+///
+/// An absent `type` is [`AccountType::OAuth`], as it always was. A string
+/// tcr does not know is kept VERBATIM in [`AccountType::Unrecognized`]: the
+/// row loads exactly as it did when `type` was a plain `String` (served with
+/// its `accessToken`, never refreshed, probed or warmed, because only OAuth
+/// rows are), and a save writes the same string back, so a value another tool
+/// wrote survives tcr touching the file. A `type` that is not a string at all
+/// is quarantined at load ([`Unusable::UnreadableType`]) rather than failing
+/// the whole file.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "AccountTypeWire", into = "AccountTypeWire")]
+pub enum AccountType {
+    /// A Claude subscription login: an OAuth access token, usually with a
+    /// refresh token.
+    #[default]
+    OAuth,
+    /// A console API key. tcr does not serve these: a file row of this type is
+    /// quarantined at load ([`Unusable::ApiKeyAccount`]) and the live-add
+    /// route refuses one.
+    ApiKey,
+    /// Any other string, held as written.
+    Unrecognized(String),
+}
+
+impl AccountType {
+    /// Only OAuth rows are refreshed, probed and warmed.
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuth)
+    }
+}
+
+/// The on-disk spelling of [`AccountType`]: a known name, or any other string.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum AccountTypeWire {
+    Known(KnownAccountType),
+    Unrecognized(String),
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum KnownAccountType {
+    #[serde(rename = "oauth")]
+    OAuth,
+    #[serde(rename = "apikey")]
+    ApiKey,
+}
+
+impl From<AccountTypeWire> for AccountType {
+    fn from(wire: AccountTypeWire) -> Self {
+        match wire {
+            AccountTypeWire::Known(KnownAccountType::OAuth) => Self::OAuth,
+            AccountTypeWire::Known(KnownAccountType::ApiKey) => Self::ApiKey,
+            AccountTypeWire::Unrecognized(raw) => Self::Unrecognized(raw),
+        }
+    }
+}
+
+impl From<AccountType> for AccountTypeWire {
+    fn from(kind: AccountType) -> Self {
+        match kind {
+            AccountType::OAuth => Self::Known(KnownAccountType::OAuth),
+            AccountType::ApiKey => Self::Known(KnownAccountType::ApiKey),
+            AccountType::Unrecognized(raw) => Self::Unrecognized(raw),
+        }
+    }
 }
 
 /// Proxy-level settings (`proxy` object in the file).
@@ -187,8 +266,8 @@ impl Default for ProxyConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub name: String,
-    #[serde(rename = "type", default = "default_account_type")]
-    pub account_type: String,
+    #[serde(rename = "type", default)]
+    pub account_type: AccountType,
     /// Which upstream this credential belongs to. Absent means Anthropic, which is what every
     /// account was before this key existed. Skipped on save when Anthropic for the same reason
     /// `egress` is skipped when local: a save rewrites every row, and an upgrade's first save
@@ -1044,13 +1123,13 @@ pub struct Config {
     #[serde(default = "default_pacing")]
     pub pacing: PacingConfig,
     /// Per-ORGANIZATION outbound throttle — the primary limiter. Absent →
-    /// [`default_account_throttle`] (ON: `minSpacingMs: 350, burst: 8`). Set
+    /// [`default_account_throttle`] (ON: `minSpacingMs: 350, burst: 24`). Set
     /// `"accountThrottle": {}` to disable it (all knobs `None`). Read at boot.
     #[serde(default = "default_account_throttle")]
     pub account_throttle: ThrottleConfig,
     /// Fleet-wide ceiling across every organization — insurance, not the primary
     /// limiter. Absent → [`default_fleet_throttle`] (ON: `minSpacingMs: 100,
-    /// burst: 16`). Set `"fleetThrottle": {}` to disable it. Read at boot.
+    /// burst: 32`). Set `"fleetThrottle": {}` to disable it. Read at boot.
     ///
     /// Disabling BOTH is what the old `"throttle": {}` escape hatch used to mean.
     /// Neither key on its own leaves the proxy unthrottled — that asymmetry is why
@@ -1514,7 +1593,79 @@ fn credential_version_of(entry: &Value) -> Result<Option<u64>, ()> {
     }
 }
 
-fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
+/// Why [`unusable_account`] refused an `accounts[]` entry.
+#[derive(Debug, PartialEq)]
+enum Unusable {
+    /// `accessToken` is absent or empty.
+    MissingAccessToken,
+    /// The entry's `type` is [`AccountType::ApiKey`]. tcr does not serve
+    /// API-key accounts (it would send the key as a Bearer token, which the
+    /// API refuses), so the row is set aside however it is filled in. Before
+    /// this variant, such a row written in the shape it asks for (`apiKey`, no
+    /// `accessToken`) failed the WHOLE load with `missing field accessToken`.
+    ApiKeyAccount,
+    /// The entry's `type` is present but not a string, so it cannot be an
+    /// [`AccountType`]. Holds the raw value, for the warning.
+    UnreadableType(String),
+    /// The entry carries its own `upstream` (the teamclaude row shape for a
+    /// third-party vendor) whose host is neither Anthropic's API nor the host
+    /// this config forwards to. tcr ignores a per-account `upstream` and sends
+    /// every account's token to the config's one upstream as a Bearer
+    /// (`proxy::build_upstream_headers`), so loading this row would hand the
+    /// vendor's key to a host it was never issued for.
+    ///
+    /// "The config's one upstream" is per provider: a Codex row's token goes to
+    /// `codexUpstream` (`proxy::build_codex_upstream_headers`), so a Codex row is
+    /// held to Codex's hosts, its default and `codexUpstream`'s, and an
+    /// Anthropic row to Anthropic's. Holds the raw value, for the warning, and
+    /// the provider whose hosts it was held to.
+    ForeignUpstream {
+        upstream: String,
+        provider: crate::provider::Provider,
+    },
+}
+
+/// The host Anthropic serves its API on, parsed from [`default_upstream`] so
+/// the two can never disagree.
+fn anthropic_api_host() -> Option<String> {
+    reqwest::Url::parse(&default_upstream())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+/// The host Codex is served on by default, parsed from
+/// [`default_codex_upstream`] so the two can never disagree, as
+/// [`anthropic_api_host`] is from [`default_upstream`].
+fn codex_default_host() -> Option<String> {
+    upstream_host(&default_codex_upstream())
+}
+
+/// The lowercased host of `raw`, or `None` when it does not parse as a URL
+/// with a host. Compared by host, never by substring, so
+/// `https://api.anthropic.com.example.net` is not mistaken for Anthropic.
+fn upstream_host(raw: &str) -> Option<String> {
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+/// `own_upstream_host` is the host of the config's top-level `upstream` (the
+/// one every Anthropic account is actually forwarded to); a per-account
+/// `upstream` on that host, or on Anthropic's API host, loads normally. Any
+/// other value, including one that is not a string or not a URL, is
+/// [`Unusable::ForeignUpstream`]: a key whose destination cannot be shown to
+/// be one tcr sends to is not sent at all.
+///
+/// A Codex row is held to its own provider's pair instead:
+/// `own_codex_upstream_host`, the host of `codexUpstream` (where every Codex
+/// account is forwarded), and Codex's default host. Held to Anthropic's pair,
+/// every Codex row naming its own upstream would be quarantined, and one
+/// naming Anthropic's API would load and send its OpenAI key to `codexUpstream`.
+fn unusable_account(
+    entry: &Value,
+    own_upstream_host: Option<&str>,
+    own_codex_upstream_host: Option<&str>,
+) -> Option<(String, Unusable)> {
     let name = entry
         .get("name")
         .and_then(Value::as_str)
@@ -1526,18 +1677,53 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty())
     };
-    let is_apikey = entry.get("type").and_then(Value::as_str) == Some("apikey");
-    if is_apikey {
-        if has_nonempty("apiKey") {
-            None
-        } else {
-            Some((name, "apiKey"))
-        }
-    } else if has_nonempty("accessToken") {
-        None
-    } else {
-        Some((name, "accessToken"))
+    // Parsed through `AccountType`'s own serde, so the type names are spelled
+    // in exactly one place.
+    let account_type = match entry.get("type") {
+        None => AccountType::default(),
+        Some(raw) => match AccountType::deserialize(raw) {
+            Ok(account_type) => account_type,
+            Err(_) => return Some((name, Unusable::UnreadableType(raw.to_string()))),
+        },
+    };
+    if matches!(account_type, AccountType::ApiKey) {
+        return Some((name, Unusable::ApiKeyAccount));
     }
+    if !has_nonempty("accessToken") {
+        return Some((name, Unusable::MissingAccessToken));
+    }
+    if let Some(upstream) = entry.get("upstream") {
+        let host = upstream.as_str().and_then(upstream_host);
+        // The row's provider, read as every matcher over the raw document reads
+        // it. A value this build does not know is held to Anthropic's hosts, the
+        // rule every row had before providers existed; should it survive this,
+        // the typed parse refuses the file over that provider anyway.
+        let provider = entry
+            .as_object()
+            .and_then(provider_of_entry)
+            .unwrap_or_default();
+        let (default_host, own_host) = match provider {
+            crate::provider::Provider::Anthropic => (anthropic_api_host(), own_upstream_host),
+            crate::provider::Provider::Codex => (codex_default_host(), own_codex_upstream_host),
+        };
+        let allowed = host
+            .as_deref()
+            .is_some_and(|host| Some(host) == default_host.as_deref() || Some(host) == own_host);
+        if !allowed {
+            let shown = match upstream.as_str() {
+                Some(raw) => raw.to_string(),
+                None => upstream.to_string(),
+            };
+            return Some((
+                name,
+                Unusable::ForeignUpstream {
+                    upstream: shown,
+                    provider,
+                },
+            ));
+        }
+    }
+    None
 }
 
 /// Load and parse the config at `path`.
@@ -1559,6 +1745,13 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 /// crashing the fleet. Every `Account` that survives into memory still has a
 /// real, non-empty credential — the 142 call sites reading `access_token` as a
 /// plain `String` are entitled to assume that.
+///
+/// The same quarantine covers an entry whose own `upstream` names a
+/// third-party host ([`Unusable::ForeignUpstream`]): its token is that
+/// vendor's key, and tcr would send it to its one configured upstream (for a
+/// Codex row, `codexUpstream`). It also covers an API-key row
+/// ([`Unusable::ApiKeyAccount`]), which tcr does not serve, and a row whose
+/// `type` is not a string ([`Unusable::UnreadableType`]).
 ///
 /// If every account entry is unusable, that is still an error (an empty fleet
 /// booting silently is its own bug) — reported through the same
@@ -1705,19 +1898,70 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     // below writes by that index, so it must be the on-disk one.
     let mut file_index = Vec::new();
 
+    // The host every account is forwarded to: the file's own top-level
+    // `upstream`, or the default when the key is absent (what serde fills in
+    // below).
+    let own_upstream_host = match doc.get("upstream").and_then(Value::as_str) {
+        Some(raw) => upstream_host(raw),
+        None => upstream_host(&default_upstream()),
+    };
+    // The same for every Codex account: the file's `codexUpstream`, or its
+    // default.
+    let own_codex_upstream_host = match doc.get("codexUpstream").and_then(Value::as_str) {
+        Some(raw) => upstream_host(raw),
+        None => codex_default_host(),
+    };
+
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
         let had_accounts = !accounts.is_empty();
         let mut position = 0usize;
         accounts.retain(|entry| {
             let index = position;
             position += 1;
-            match unusable_account(entry) {
+            match unusable_account(
+                entry,
+                own_upstream_host.as_deref(),
+                own_codex_upstream_host.as_deref(),
+            ) {
             None => {
                 file_index.push(index);
                 true
             }
-            Some((name, reason)) => {
-                tracing::warn!(account = %name, missing = reason, "No token for \"{name}\", skipping");
+            Some((name, Unusable::MissingAccessToken)) => {
+                tracing::warn!(account = %name, missing = "accessToken", "No token for \"{name}\", skipping");
+                quarantined.push(name);
+                false
+            }
+            Some((name, Unusable::ApiKeyAccount)) => {
+                tracing::warn!(
+                    account = %name,
+                    "Account \"{name}\" is an API-key account; tcr does not serve API-key accounts, skipping"
+                );
+                quarantined.push(name);
+                false
+            }
+            Some((name, Unusable::UnreadableType(raw))) => {
+                tracing::warn!(
+                    account = %name,
+                    account_type = %raw,
+                    "Account \"{name}\" has a \"type\" that is not a string ({raw}); skipping"
+                );
+                quarantined.push(name);
+                false
+            }
+            Some((name, Unusable::ForeignUpstream { upstream, provider })) => {
+                match provider {
+                    crate::provider::Provider::Anthropic => tracing::warn!(
+                        account = %name,
+                        upstream = %upstream,
+                        "Account \"{name}\" names a non-Anthropic upstream ({upstream}); tcr would send its key to its own upstream instead, skipping"
+                    ),
+                    crate::provider::Provider::Codex => tracing::warn!(
+                        account = %name,
+                        upstream = %upstream,
+                        "Codex account \"{name}\" names an upstream that is not its Codex upstream ({upstream}); tcr would send its key to its own codexUpstream instead, skipping"
+                    ),
+                }
                 quarantined.push(name);
                 false
             }
@@ -1725,7 +1969,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         if had_accounts && accounts.is_empty() {
             return Err(ConfigError::Parse(
                 <serde_json::Error as serde::de::Error>::custom(format!(
-                    "no usable accounts remain after skipping {} without a credential: {}",
+                    "no usable accounts remain after skipping {} (no credential, an API-key account, an unreadable type, or a non-Anthropic upstream): {}",
                     quarantined.len(),
                     quarantined.join(", ")
                 )),
@@ -3775,6 +4019,89 @@ fn find_account_entry<'a>(
         .ok_or(DisabledWrite::NoEntry)
 }
 
+/// The top-level key that tells the empty-fleet Claude Code import to leave
+/// this config alone. Absent means the import may run; `false` means a person
+/// emptied the fleet on purpose (see [`remove_account_entry`]). Read out of
+/// [`Config::extra`] by [`Config::refuses_claude_code_import`].
+pub const CLAUDE_CODE_IMPORT_KEY: &str = "claudeCodeImport";
+
+impl Config {
+    /// Whether this config said "do not import this machine's Claude Code
+    /// login into me", which a delete of the last account writes. Without it,
+    /// the next `tcr status` (the panel polls it every few seconds) finds an
+    /// empty fleet and imports the login again, so a delete of the last
+    /// account undid itself one poll later.
+    pub fn refuses_claude_code_import(&self) -> bool {
+        self.extra.get("claudeCodeImport") == Some(&Value::Bool(false))
+    }
+}
+
+/// What [`remove_account_entry`] did to the on-disk document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRemoval {
+    /// The entry is gone and the file was rewritten.
+    Removed {
+        /// `controlAccount` named the removed entry and was dropped with it.
+        control_cleared: bool,
+        /// The removed entry was the last one, so the file now also carries
+        /// [`CLAUDE_CODE_IMPORT_KEY`] `false`.
+        fleet_emptied: bool,
+    },
+    /// Nothing on disk carries that identity. Nothing was written.
+    NoEntry,
+    /// More than one entry carries it. Nothing was written.
+    Ambiguous,
+}
+
+/// Delete the ONE `accounts` entry carrying `target`'s identity from the file at
+/// `path`, leaving every other key and every other entry exactly as written.
+///
+/// The raw-document shape of [`save_disabled`] and [`save_group_membership`],
+/// never a `Config` round trip. A round trip cannot write back an entry the
+/// loader quarantined (an API-key row, a `type` that is not a string, a foreign
+/// `upstream`), which is why the CLI's load-edit-save path refuses any file
+/// holding one; deleting through it refused EVERY delete on such a fleet. This
+/// path never deserializes the other entries, so they survive byte for byte.
+///
+/// Two more keys are kept true to the removal in the same write, so the file
+/// and the running proxy cannot disagree afterwards:
+///
+/// - `controlAccount`, when it names the removed entry, is dropped. The running
+///   proxy stops treating a removed row as the control account at once; left
+///   in the file, the name would quietly make a later login of the same name
+///   the control account again.
+/// - When the removed entry was the last one, [`CLAUDE_CODE_IMPORT_KEY`] is
+///   written `false` (see [`Config::refuses_claude_code_import`]).
+pub fn remove_account_entry(path: &Path, target: &Account) -> Result<AccountRemoval, ConfigError> {
+    let mut doc = read_document(path)?;
+    let index = match locate_account_entry(&doc, target) {
+        EntryMatch::One(index) => index,
+        EntryMatch::None => return Ok(AccountRemoval::NoEntry),
+        EntryMatch::Many => return Ok(AccountRemoval::Ambiguous),
+    };
+    let Some(entries) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+        // `locate_account_entry` only answers `One` for a real array.
+        return Ok(AccountRemoval::NoEntry);
+    };
+    entries.remove(index);
+    let fleet_emptied = entries.is_empty();
+    let names_target = doc
+        .get("controlAccount")
+        .and_then(|raw| serde_json::from_value::<ControlAccountRef>(raw.clone()).ok())
+        .is_some_and(|control| control.name() == target.name);
+    if names_target {
+        doc.remove("controlAccount");
+    }
+    if fleet_emptied {
+        doc.insert(CLAUDE_CODE_IMPORT_KEY.to_string(), Value::Bool(false));
+    }
+    write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    Ok(AccountRemoval::Removed {
+        control_cleared: names_target,
+        fleet_emptied,
+    })
+}
+
 /// What a targeted [`save_account`] upsert did to the on-disk document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountWrite {
@@ -3895,7 +4222,7 @@ fn merge_account(
                 // for this one write.
                 entry.insert(
                     "type".to_string(),
-                    Value::String(account.account_type.clone()),
+                    serde_json::to_value(&account.account_type)?,
                 );
                 // `provider` is stamped beside `type`, with Anthropic spelled as
                 // the ABSENT key — the same rule `skip_serializing_if` gives the
@@ -4220,6 +4547,15 @@ mod tests {
 
     // --- credentialVersion 2: a Codex row is refused by every older build ----
 
+    /// The `credentialVersion` a loaded account carries in memory, read the way
+    /// `load` reads a row's ([`credential_version_of`]). Not through a literal
+    /// `.extra.get(…)`: this is an ACCOUNT's own `extra` map, and the drift scan in
+    /// `config_keys` reads every such literal as a key of the top-level
+    /// `Config::extra`, which `credentialVersion` is not.
+    fn version_in_memory(account: &Account) -> Result<Option<u64>, ()> {
+        credential_version_of(&Value::Object(account.extra.clone()))
+    }
+
     /// A Codex row at `credentialVersion` 2, which every Codex row is written at,
     /// loads, and a whole-file save keeps it at 2.
     #[test]
@@ -4398,13 +4734,13 @@ mod tests {
 
         let config = load(&path).unwrap();
         assert_eq!(
-            config.accounts[0].extra.get("credentialVersion"),
-            Some(&json!(2)),
+            version_in_memory(&config.accounts[0]),
+            Ok(Some(2)),
             "a Codex row is backfilled to 2"
         );
         assert_eq!(
-            config.accounts[1].extra.get("credentialVersion"),
-            Some(&json!(1)),
+            version_in_memory(&config.accounts[1]),
+            Ok(Some(1)),
             "an Anthropic row is backfilled to 1, as before"
         );
         let saved = tmp_path("cred-version-codex-missing-saved");
@@ -4435,14 +4771,11 @@ mod tests {
 
         let config = load(&path).unwrap();
         assert_eq!(
-            config.accounts[0].extra.get("credentialVersion"),
-            Some(&json!(2)),
+            version_in_memory(&config.accounts[0]),
+            Ok(Some(2)),
             "the load raises a Codex row to 2"
         );
-        assert_eq!(
-            config.accounts[1].extra.get("credentialVersion"),
-            Some(&json!(1))
-        );
+        assert_eq!(version_in_memory(&config.accounts[1]), Ok(Some(1)));
 
         // The disk still says 1 until a write touches the row: a rotation does.
         save_tokens(&path, &config).unwrap();
@@ -4526,8 +4859,8 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// An `apikey` account with no `apiKey` is unusable by the same rule an
-    /// `oauth` account with no `accessToken` is — skipped, not fatal.
+    /// An `apikey` account with no `apiKey` at all is skipped, not fatal: tcr
+    /// sets aside every API-key row, filled in or not.
     #[test]
     fn load_skips_apikey_account_missing_api_key() {
         let path = tmp_path("load-skip-apikey");
@@ -4600,6 +4933,316 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// An `apikey` row in the shape the loader itself asks for (`apiKey`, no
+    /// `accessToken`) used to fail the WHOLE load with `missing field
+    /// accessToken`, taking every other account down with it. tcr does not
+    /// serve API-key accounts, so the row is quarantined like any other
+    /// unusable row and the rest of the config loads.
+    #[test]
+    fn load_quarantines_an_api_key_account() {
+        let path = tmp_path("load-quarantine-apikey");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","apiKey":"sk-ant-api-fake"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("one API-key row must not fail the whole load");
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
+        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// An `apikey` row is set aside even when it also carries an
+    /// `accessToken`: tcr would send that value as a Bearer, which is not how
+    /// an API key authenticates.
+    #[test]
+    fn load_quarantines_an_api_key_account_that_also_has_an_access_token() {
+        let path = tmp_path("load-quarantine-apikey-token");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"key","type":"apikey","accessToken":"sk-ant-api-fake"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"]);
+        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A `type` that is not a string cannot be an `AccountType`. It used to
+    /// fail the whole load; now only that row is set aside.
+    #[test]
+    fn load_quarantines_an_account_whose_type_is_not_a_string() {
+        let path = tmp_path("load-quarantine-type-number");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"odd","type":5,"accessToken":"b"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"]);
+        assert_eq!(config.quarantined_accounts, vec!["odd".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The type names parse to their variants, an absent `type` is OAuth, and
+    /// a string tcr does not know loads as it did when the field was a plain
+    /// `String` and is written back exactly as the user wrote it, so a value
+    /// another tool wrote survives a tcr save.
+    #[test]
+    fn account_type_parses_known_names_and_round_trips_an_unknown_one() {
+        let path = tmp_path("load-account-type-round-trip");
+        fs::write(
+            &path,
+            r#"{"accounts":[
+                 {"name":"plain","accessToken":"a"},
+                 {"name":"named","type":"oauth","accessToken":"b"},
+                 {"name":"other","type":"OAuth-Legacy","accessToken":"c"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(config.quarantined_accounts.is_empty());
+        let types: Vec<&AccountType> = config.accounts.iter().map(|a| &a.account_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                &AccountType::OAuth,
+                &AccountType::OAuth,
+                &AccountType::Unrecognized("OAuth-Legacy".to_string()),
+            ]
+        );
+        assert!(config.accounts[0].account_type.is_oauth());
+        assert!(!config.accounts[2].account_type.is_oauth());
+
+        let out = tmp_path("load-account-type-round-trip-out");
+        save(&out, &config).unwrap();
+        let value = read_json(&out);
+        assert_eq!(value["accounts"][1]["type"], "oauth");
+        assert_eq!(value["accounts"][2]["type"], "OAuth-Legacy");
+        assert_eq!(
+            serde_json::to_value(AccountType::ApiKey).unwrap(),
+            serde_json::json!("apikey")
+        );
+        fs::remove_file(&path).ok();
+        fs::remove_file(&out).ok();
+    }
+
+    /// #474's parsed `type` beside the `provider` key. A Codex row, with no `type` or
+    /// with `"type": "oauth"`, loads as an OAuth Codex account (so it is refreshed and
+    /// probed, at its own provider's endpoints) and is never set aside as an API-key
+    /// row or an unknown type, while the API-key row beside it is quarantined and the
+    /// file still loads. A whole-file save keeps both Codex rows at the
+    /// `credentialVersion` every build that cannot tell providers apart refuses.
+    ///
+    /// Watched red: cap every row at version 1, main's check, and the whole file is
+    /// refused over the Codex rows' 2.
+    #[test]
+    fn a_codex_row_loads_as_codex_beside_a_quarantined_api_key_row() {
+        use crate::provider::Provider;
+        let path = tmp_path("load-codex-beside-apikey");
+        fs::write(
+            &path,
+            r#"{"accounts":[
+                 {"name":"key","type":"apikey","apiKey":"sk-ant-api-fake"},
+                 {"name":"bare","provider":"codex","accessToken":"at-b","credentialVersion":2},
+                 {"name":"typed","provider":"codex","type":"oauth","accessToken":"at-t",
+                  "credentialVersion":2}
+               ]}"#,
+        )
+        .unwrap();
+
+        let config =
+            load(&path).expect("an API-key row must not fail a file that also holds Codex rows");
+        assert_eq!(config.quarantined_accounts, vec!["key".to_string()]);
+        let loaded: Vec<(&str, Provider, &AccountType)> = config
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.provider, &a.account_type))
+            .collect();
+        assert_eq!(
+            loaded,
+            vec![
+                ("bare", Provider::Codex, &AccountType::OAuth),
+                ("typed", Provider::Codex, &AccountType::OAuth),
+            ]
+        );
+        assert!(config.accounts.iter().all(|a| a.account_type.is_oauth()));
+
+        let saved = tmp_path("load-codex-beside-apikey-saved");
+        save(&saved, &config).unwrap();
+        let value = read_json(&saved);
+        for row in 0..2 {
+            assert_eq!(value["accounts"][row]["provider"], json!("codex"));
+            assert_eq!(value["accounts"][row]["type"], json!("oauth"));
+            assert_eq!(value["accounts"][row]["credentialVersion"], json!(2));
+        }
+        fs::remove_file(&path).ok();
+        fs::remove_file(&saved).ok();
+    }
+
+    /// The credential-version refusal runs BEFORE #474's quarantine and is never
+    /// softened into one: an Anthropic row at 2, or a Codex row at 3, still refuses
+    /// the whole file while an API-key row beside it is merely set aside. Quarantining
+    /// the over-version row instead would let the rest of the file load around a
+    /// credential shape this build does not understand for that row's provider.
+    ///
+    /// Watched red: let every row carry up to 2, the Codex ceiling, and the
+    /// Anthropic case loads.
+    #[test]
+    fn a_credential_version_refusal_still_refuses_the_file_beside_an_api_key_row() {
+        for (label, over) in [
+            (
+                "an Anthropic row at 2",
+                r#"{"name":"alice@example.com","accessToken":"at-a","credentialVersion":2}"#,
+            ),
+            (
+                "a Codex row at 3",
+                r#"{"name":"bob@example.com","provider":"codex","accessToken":"at-b","credentialVersion":3}"#,
+            ),
+        ] {
+            let path = tmp_path("refuse-beside-apikey");
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"accounts":[
+                         {{"name":"key","type":"apikey","apiKey":"sk-ant-api-fake"}},
+                         {{"name":"ok","accessToken":"at-ok"}},
+                         {over}
+                       ]}}"#
+                ),
+            )
+            .unwrap();
+            let err = load(&path).expect_err(label);
+            assert!(
+                err.to_string().contains("refusing to load"),
+                "{label}: the file is refused, not quarantined around: {err}"
+            );
+            fs::remove_file(&path).ok();
+        }
+    }
+
+    /// A teamclaude-style row whose `upstream` names a third-party host
+    /// carries that vendor's key, and tcr forwards every account to its one
+    /// configured upstream with the row's token as a Bearer. Such a row is
+    /// quarantined at load, like a row with no token: it never serves, the
+    /// other accounts load, and the load itself does not fail.
+    #[test]
+    fn load_quarantines_a_foreign_upstream_account() {
+        let path = tmp_path("load-foreign-upstream");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"vendor","type":"oauth","accessToken":"sk-x","upstream":"https://api.example.net/anthropic"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"], "only `ok` may be usable");
+        assert_eq!(config.quarantined_accounts, vec!["vendor".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The host is compared after parsing, not by substring: a host that only
+    /// starts with Anthropic's name is still foreign.
+    #[test]
+    fn load_quarantines_a_lookalike_anthropic_upstream() {
+        let path = tmp_path("load-lookalike-upstream");
+        fs::write(
+            &path,
+            r#"{"accounts":[{"name":"ok","accessToken":"a"},{"name":"vendor","accessToken":"sk-x","upstream":"https://api.anthropic.com.example.net/v1"}]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "ok");
+        assert_eq!(config.quarantined_accounts, vec!["vendor".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// An `upstream` naming Anthropic's own API host, or the host this file
+    /// already forwards to, still loads as a normal account.
+    #[test]
+    fn load_keeps_an_anthropic_or_own_upstream_account() {
+        let path = tmp_path("load-anthropic-upstream");
+        fs::write(
+            &path,
+            r#"{"upstream":"http://127.0.0.1:9000","accounts":[
+                 {"name":"direct","accessToken":"a","upstream":"https://api.anthropic.com"},
+                 {"name":"stub","accessToken":"b","upstream":"http://127.0.0.1:9000/"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["direct", "stub"]);
+        assert!(config.quarantined_accounts.is_empty());
+        fs::remove_file(&path).ok();
+    }
+
+    /// The per-account `upstream` check is per provider, because a Codex row's token
+    /// goes to `codexUpstream` and never to the top-level `upstream`. A Codex row
+    /// naming Codex's default host, or the configured `codexUpstream` (a loopback
+    /// stub, as every in-process Codex test configures it), loads; one naming
+    /// Anthropic's API is set aside, as is an Anthropic row naming chatgpt.com. A
+    /// Codex row with no `upstream` of its own, the shape `tcr login --from-codex`
+    /// writes, loads whatever `codexUpstream` says, exactly as before the check.
+    ///
+    /// Watched red: hold every row to Anthropic's pair, as the check alone did, and
+    /// `default` and `stub` are quarantined while `crossed` loads.
+    #[test]
+    fn load_holds_a_codex_rows_own_upstream_to_the_codex_hosts() {
+        use crate::provider::Provider;
+        let path = tmp_path("load-codex-own-upstream");
+        fs::write(
+            &path,
+            r#"{"codexUpstream":"http://127.0.0.1:9100","accounts":[
+                 {"name":"claude","accessToken":"a"},
+                 {"name":"plain","provider":"codex","accessToken":"b","credentialVersion":2},
+                 {"name":"default","provider":"codex","accessToken":"c","credentialVersion":2,
+                  "upstream":"https://chatgpt.com"},
+                 {"name":"stub","provider":"codex","accessToken":"d","credentialVersion":2,
+                  "upstream":"http://127.0.0.1:9100/"},
+                 {"name":"crossed","provider":"codex","accessToken":"e","credentialVersion":2,
+                  "upstream":"https://api.anthropic.com"},
+                 {"name":"claude-at-openai","accessToken":"f","upstream":"https://chatgpt.com"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        let loaded: Vec<(&str, Provider)> = config
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.provider))
+            .collect();
+        assert_eq!(
+            loaded,
+            vec![
+                ("claude", Provider::Anthropic),
+                ("plain", Provider::Codex),
+                ("default", Provider::Codex),
+                ("stub", Provider::Codex),
+            ],
+            "a Codex row naming a Codex host loads, as Codex"
+        );
+        assert_eq!(
+            config.quarantined_accounts,
+            vec!["crossed".to_string(), "claude-at-openai".to_string()],
+            "a row naming the OTHER provider's host is set aside"
+        );
+        fs::remove_file(&path).ok();
+    }
+
     /// `quarantined_accounts` is `#[serde(skip)]`: a `Config` carrying names in
     /// it must not write them anywhere on `save()`, and a hand-edited file
     /// carrying a same-named key must not be read into it either — the field
@@ -4658,7 +5301,7 @@ mod tests {
         assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
         assert_eq!(config.account_throttle.effective_burst(), 4);
         assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
-        assert_eq!(config.fleet_throttle.effective_burst(), 16);
+        assert_eq!(config.fleet_throttle.effective_burst(), 32);
 
         fs::remove_file(&path).ok();
     }
@@ -5187,10 +5830,18 @@ mod tests {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
         assert!(config.account_throttle.is_active());
         assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
-        assert_eq!(config.account_throttle.effective_burst(), 8);
+        assert_eq!(config.account_throttle.effective_burst(), 24);
         assert!(config.fleet_throttle.is_active());
         assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
-        assert_eq!(config.fleet_throttle.effective_burst(), 16);
+        assert_eq!(config.fleet_throttle.effective_burst(), 32);
+        // The ceiling must admit at least one full per-org burst, or a one-account
+        // wave the per-org bucket lets through is held by the fleet bucket instead.
+        assert!(
+            config.fleet_throttle.effective_burst() > config.account_throttle.effective_burst(),
+            "fleet burst {} must exceed per-org burst {}",
+            config.fleet_throttle.effective_burst(),
+            config.account_throttle.effective_burst()
+        );
     }
 
     #[test]
@@ -6949,7 +7600,7 @@ mod tests {
     fn full_account(name: &str, access_token: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -7169,7 +7820,7 @@ mod tests {
     fn account_fixture(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,

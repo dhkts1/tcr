@@ -45,6 +45,23 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     var onSetExit: (String, AccountExit.Route, Bool) -> Void = { _, _, _ in }
     /// Opens a lender's sheet in Settings > Peers.
     var onOpenLender: (String) -> Void = { _ in }
+    /// The row whose hover card is showing (``FleetSectionRow/id``), whose
+    /// line draws `.hov`'s fill. The card itself hangs from the panel root
+    /// (`AccountHoverCard.swift`), not from here.
+    var hoveredRow: String? = nil
+    /// The account whose segment the pointer is on in the strip above the list
+    /// (unit H3), by ``Account/id``: every line of that account draws `.hov`'s
+    /// fill, as a hovered line does, and no hover card opens.
+    var litAccount: String? = nil
+    /// The accounts whose card the operator keeps open ("Keep Card Open" in
+    /// the row's right-click menu): each draws its hover card's content in
+    /// its own place in its box, and opens no floating card.
+    var keptOpen = KeptOpenCards()
+    /// The pointer entering (`true`) or leaving a line, by row identity.
+    var onHoverLine: (String, Bool) -> Void = { _, _ in }
+    /// What became of the last action on each account, drawn under its line
+    /// or card (``RowNotices``). Empty for every account by default.
+    var notices: (Account) -> [AccountRowNotice] = { _ in [] }
     /// The row's own actions, as a context menu — the SECOND route to them,
     /// from the one definition in ``AccountRow``.
     @ViewBuilder var menu: (Account) -> Menu
@@ -60,40 +77,247 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
 
     /// How many accounts a parked group shows before its "Show N more accounts"
     /// button — round 2's approved mockup draws two of HENRY-TOKEN's five
-    /// ("Show 3 more accounts"), one fewer than round 1's three, now that the
-    /// group's own header line carries the worst-of figures the extra card
-    /// used to be the only way to see.
+    /// ("Show 3 more accounts"), one fewer than round 1's three. Each of the
+    /// two is one line now, saying its own week used.
     static var parkedVisibleRows: Int { 2 }
 
+    /// ``Fleet/accountsTabSections(pinning:expandedGroups:)``, the order the
+    /// strip's segments read too.
     private var sections: [FleetSection] {
-        let all = fleet.sectionsInDisplayOrder(pinning: controlName)
-        let loose = all.filter { $0.group == .ungrouped }
-        let named = all.filter { $0.group != .ungrouped }
-        return loose + named.filter { !isSummarised($0) } + named.filter { isSummarised($0) }
+        fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
     }
 
     /// A group the operator has not opened and that the fleet says collapses by
     /// default: one line, its tally, and a button.
     private func isSummarised(_ section: FleetSection) -> Bool {
-        section.collapsesByDefault && !expandedGroups.contains(section.group.token)
+        section.isSummarised(expandedGroups: expandedGroups)
+    }
+
+    /// The strip over this tab (unit H3): one segment per account, in the
+    /// order this view draws its rows, from the same sections, caps and forms.
+    static func strip(
+        fleet: Fleet, controlName: String?, expandedGroups: Set<String>,
+        lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit],
+        keptOpen: KeptOpenCards, now: Date
+    ) -> FleetStrip {
+        // A kept-open card is drawn in its line's own place, so only the tall
+        // card moves a row to the end of its section.
+        let rows = fleet.accountsTabSections(pinning: controlName, expandedGroups: expandedGroups)
+            .rowsInDrawOrder(expandedGroups: expandedGroups, parkedCap: parkedVisibleRows) {
+                form($0, lentTo: lentTo, exits: exits, keptOpen: keptOpen) == .card
+            }
+        return FleetStrip(drawnRows: rows, now: now)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
                 if section.group == .ungrouped {
-                    ForEach(Array(section.rows.enumerated()), id: \.element.id) { row, account in
-                        card(account, shape: .full)
-                            .padding(
-                                .top,
-                                index == 0 && row == 0
-                                    ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
-                    }
+                    looseLines(section, first: index == 0)
                 } else {
                     group(section, first: index == 0)
                 }
             }
         }
+    }
+
+    /// The ungrouped accounts of one band, one line each (option H, Gil
+    /// 2026-10-14): live ones in a box with no heading, out-of-tokens and
+    /// parked ones under a band heading that counts them.
+    ///
+    /// The heading is drawn here although ``Array/soleGroupInBand(at:)``
+    /// suppresses it in the legacy panel. That rule exists so a band heading
+    /// never stacks over a group legend that already names the band; an
+    /// ungrouped section has no legend, so without this heading a waiting
+    /// line would sit under nothing that says why it is waiting.
+    ///
+    /// An account carrying a lease line or an exit picker keeps today's full
+    /// card instead of a line (``FleetSectionRow/form(carriesLease:carriesExit:)``
+    /// has the ruling and its reason).
+    @ViewBuilder
+    private func looseLines(_ section: FleetSection, first: Bool) -> some View {
+        let lines = section.rows.filter { form($0) != .card }
+        let cards = section.rows.filter { form($0) == .card }
+        VStack(alignment: .leading, spacing: 0) {
+            if section.band != .live {
+                BandHeading(section: section, now: now)
+            }
+            if !lines.isEmpty {
+                lineRuns(
+                    lines, band: section.band, grouped: false,
+                    marginBottom: V4.lineBoxMarginBottom)
+            }
+            ForEach(cards) { row in
+                VStack(alignment: .leading, spacing: 0) {
+                    card(row, shape: .full)
+                    RowNotices(notices: notices(row.account))
+                }
+                .padding(.bottom, V4.lineBoxMarginBottom)
+            }
+        }
+        // The first block under the tab strip collapses its margin into the
+        // strip's, as a card there always has.
+        .padding(.top, first ? V4.marginAfterStrip(V4.cardGap) : .zero)
+    }
+
+    /// The one-line rows of a section, with each kept-open account's card in
+    /// its own place among them (``Swift/Array/lineRuns(isKeptOpen:)``): the
+    /// lines before it close their box, the card follows at the box's width,
+    /// and the lines after it open a new box. The stretches stand apart by the
+    /// gap the boxes and cards already keep where they sit, and the last one
+    /// takes `marginBottom`. With nothing kept open this is the one box, as
+    /// before.
+    private func lineRuns(
+        _ rows: [FleetSectionRow], band: FleetBand, grouped: Bool, marginBottom: CGFloat
+    ) -> some View {
+        let runs = rows.lineRuns { form($0) == .keptOpenCard }
+        let gap = grouped ? V4.groupCardGap : V4.lineBoxMarginBottom
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(runs.enumerated()), id: \.element.id) { index, run in
+                let bottom = index == runs.count - 1 ? marginBottom : gap
+                switch run {
+                case .lines(let lines):
+                    lineBox(lines, band: band, grouped: grouped, marginBottom: bottom)
+                case .keptOpen(let row):
+                    keptOpenCard(row, grouped: grouped)
+                        .padding(.bottom, bottom)
+                }
+            }
+        }
+    }
+
+    /// A kept-open account: its hover card's content, from the same view the
+    /// floating card draws (``AccountHoverCardContent``), so the two cannot
+    /// drift. It publishes no hover anchor, so pointing at it opens no
+    /// floating copy of itself; pointing at its strip segment lights it the
+    /// way a line is lit, in `.hov`'s fill.
+    private func keptOpenCard(_ row: FleetSectionRow, grouped: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            AccountHoverCardContent(
+                row: row, shape: grouped ? .compact : .full, now: now,
+                snapshotMode: snapshotMode,
+                lit: litAccount == row.account.id
+            ) {
+                actions(row.account)
+            } menu: {
+                menu(row.account)
+            }
+            RowNotices(notices: notices(row.account))
+        }
+    }
+
+    /// One box of one-line rows, the same box on the tab and inside a group:
+    /// the live line or the waiting line, each with its hover card (unit H2).
+    ///
+    /// A line is hovered and anchored by its ROW's identity, not by its
+    /// account's name: an account in two groups draws two lines, and keyed by
+    /// name the card would hang from whichever line published last and both
+    /// lines would draw the hover fill.
+    ///
+    /// A live line's name column is the panel's one column
+    /// (``liveNameColumn``), less the group's padding inside a group box, so
+    /// its bars start at the same x as the lines above and below it.
+    private func lineBox(
+        _ rows: [FleetSectionRow], band: FleetBand, grouped: Bool, marginBottom: CGFloat
+    ) -> some View {
+        let nameWidth = liveNameColumn - (grouped ? V4.lineRoom.groupInset : 0)
+        return LineBox(
+            items: rows,
+            paddingH: band == .live ? V4.liveBoxPaddingH : V4.waitBoxPaddingH,
+            marginBottom: marginBottom
+        ) { row in
+            switch form(row) {
+            // The notices sit inside the hovered span, so a hover card hangs
+            // below them rather than over the reason a click did not work.
+            case .liveLine:
+                VStack(alignment: .leading, spacing: 0) {
+                    AccountLineRow(
+                        account: row.account, now: now, isControl: row.isControl,
+                        snapshotMode: snapshotMode, nameWidth: nameWidth
+                    ) { menu(row.account) }
+                    RowNotices(notices: notices(row.account))
+                }
+                .hoverableLine(row, hovered: lit(row), bleed: .zero) {
+                    onHoverLine(row.id, $0)
+                }
+            case .waitingLine:
+                VStack(alignment: .leading, spacing: 0) {
+                    WaitingLineRow(
+                        account: row.account, band: row.band, now: now,
+                        isControl: row.isControl, snapshotMode: snapshotMode
+                    ) { menu(row.account) }
+                    RowNotices(notices: notices(row.account))
+                }
+                .hoverableLine(
+                    row, hovered: lit(row), bleed: V4.waitBoxPaddingH
+                ) { onHoverLine(row.id, $0) }
+            case .card, .keptOpenCard:
+                // Never reached: the callers pass only rows whose form is a
+                // line, and draw the cards themselves (``lineRuns``).
+                EmptyView()
+            }
+        }
+    }
+
+    /// The name column of a live line outside a group, ONE for the whole panel
+    /// (lead ruling on H1b, 2026-10-14). Measured over the live lines that are
+    /// drawn: a group closed to its summary line has none, and counting its
+    /// members would truncate the names on screen to make room for lines that
+    /// are not.
+    ///
+    /// The signals of the same lines size the column at the right, and what a
+    /// short one leaves goes to the names (lead ruling, 2026-10-14).
+    private var liveNameColumn: CGFloat {
+        var loose: [String] = []
+        var grouped: [String]?
+        var signals: [String] = []
+        for section in sections where !isSummarised(section) {
+            for row in section.rows where form(row) == .liveLine {
+                let name = AccountName.localPart(row.account.name)
+                if section.group == .ungrouped {
+                    loose.append(name)
+                } else {
+                    grouped = (grouped ?? []) + [name]
+                }
+                signals.append(row.account.liveSignal(now: now).text)
+            }
+        }
+        return AccountLineFit.nameColumn(
+            looseNames: loose, groupedNames: grouped, signals: signals, bar: V4.lineBarWidth,
+            V4.lineRoom, V4.lineMetrics)
+    }
+
+    /// Which form this row takes, from what only this view knows: whether the
+    /// account carries a lease line or an exit row.
+    private func form(_ row: FleetSectionRow) -> AccountRowForm {
+        Self.form(row, lentTo: lentTo, exits: exits, keptOpen: keptOpen)
+    }
+
+    private static func form(
+        _ row: FleetSectionRow, lentTo: [String: [PeerLentToEntry]],
+        exits: [String: AccountExit], keptOpen: KeptOpenCards
+    ) -> AccountRowForm {
+        row.form(
+            carriesLease: !PeerLease.leases(forAccountLabel: row.account.name, in: lentTo)
+                .isEmpty,
+            carriesExit: PeerLease.exit(forAccountLabel: row.account.name, in: exits) != nil,
+            keptOpen: keptOpen)
+    }
+
+    /// Whether `account` draws the tall card whatever the operator chooses
+    /// (a lease line or an exit row), so its menu offers no "Keep Card Open":
+    /// that card is open already.
+    static func keepsTallCard(
+        _ account: Account, lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit]
+    ) -> Bool {
+        !PeerLease.leases(forAccountLabel: account.name, in: lentTo).isEmpty
+            || PeerLease.exit(forAccountLabel: account.name, in: exits) != nil
+    }
+
+    /// Whether a line draws `.hov`'s fill: its own hover card is showing, or
+    /// the pointer is on its account's segment in the strip.
+    private func lit(_ row: FleetSectionRow) -> Bool {
+        hoveredRow == row.id || litAccount == row.account.id
     }
 
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
@@ -168,34 +392,44 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     }
                 }
             } else {
-                // The parked group's own one-line header
-                // (`docs/design/panel-tabs-mockup.html`'s `.grpsum.tally`
-                // under `HENRY-TOKEN · PARKED · 5`): a dot per state, then the
-                // spend and worst-of figures. Drawn for EVERY wholly-parked
-                // section, capped or fully expanded — the mockup draws it
-                // while still showing two of its five member cards, so this
-                // is not the collapsed-group summary above; that one
-                // REPLACES the cards, this one sits above them.
-                if section.isWhollyParked {
-                    parkedHeader(section)
-                        .padding(.top, V4.groupCardGap)
+                // No summary line over a parked group's lines any more (lead
+                // ruling on H1b, 2026-10-14): it said "worst 5h N% · 7d N%"
+                // over lines that each show their own week, and Gil called
+                // explanatory lines over rows "not needed". The legend still
+                // says PARKED and how many.
+                //
+                // One line per account, in the box the tab's own lines use
+                // (option H, lead ruling on H1b 2026-10-14); an account with a
+                // lease line or an exit row keeps its card, after the lines,
+                // as on the tab.
+                //
+                // `.grp .card{margin:6px 0}` — EVERY item, the first included,
+                // and the line box counts as one. Its top margin does not
+                // collapse into the group's own 12 pt padding, so the first
+                // item sits 18 pt under the stroke; giving it nothing put it
+                // at 11 pt. The LAST item carries the same margin on its OWN
+                // bottom, but only when nothing else follows it: `GroupBox`'s
+                // own bottom padding (4 pt) plus this 6 pt closes the box at
+                // the mockup's 10, and a disclosure row right below gets the
+                // 6 pt instead, so the two never stack into 12.
+                let lines = visible.filter { form($0) != .card }
+                let cards = visible.filter { form($0) == .card }
+                let closes = !isCollapsible(section)
+                if !lines.isEmpty {
+                    lineRuns(
+                        lines, band: section.band, grouped: true,
+                        marginBottom: cards.isEmpty && closes ? V4.groupCardGap : 0
+                    )
+                    .padding(.top, V4.groupCardGap)
                 }
-                // `.grp .card{margin:6px 0}` — EVERY card, the first included.
-                // Its top margin does not collapse into the group's own 12 pt
-                // padding, so the first card sits 18 pt under the stroke; giving
-                // the first card nothing put it at 11 pt. The LAST card carries
-                // the same margin on its OWN bottom, but only when nothing else
-                // follows it: `GroupBox`'s own bottom padding (4 pt) plus this
-                // 6 pt closes the box at the mockup's 10, and a disclosure row
-                // right below the cards gets the 6 pt instead, so the two never
-                // stack into 12.
-                ForEach(Array(visible.enumerated()), id: \.element.id) { index, row in
-                    card(row, shape: .compact)
-                        .padding(.top, V4.groupCardGap)
-                        .padding(
-                            .bottom,
-                            index == visible.count - 1 && !isCollapsible(section)
-                                ? V4.groupCardGap : 0)
+                ForEach(Array(cards.enumerated()), id: \.element.id) { index, row in
+                    VStack(alignment: .leading, spacing: 0) {
+                        card(row, shape: .compact)
+                        RowNotices(notices: notices(row.account))
+                    }
+                    .padding(.top, V4.groupCardGap)
+                    .padding(
+                        .bottom, index == cards.count - 1 && closes ? V4.groupCardGap : 0)
                 }
             }
             if isCollapsible(section) {
@@ -247,46 +481,6 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         if expanded { return "Show fewer accounts" }
         if isSummarised(section) { return section.expandButtonLabel }
         return "Show \(hidden) more \(hidden == 1 ? "account" : "accounts")"
-    }
-
-    /// ONE 11pt line (`docs/design/panel-tabs-mockup.html`'s `.grpsum.tally`):
-    /// a dot+count per state ``FleetSection/breakdown`` reports — the same
-    /// array the collapsed-group summary above draws its pills from, so the
-    /// two headers cannot disagree about one section's tally — then
-    /// ``FleetSection/parkedStatsLine``, dropped entirely when empty (a group
-    /// whose members carry no spend and no quota reading at all).
-    ///
-    /// Each dot's colour is ``pillRole(_:)``'s own tint, the same mapping the
-    /// pill it replaced used — `ok` green, `near` amber, `unmeasured` blue,
-    /// same as the mockup's own three states in this fixture, and every other
-    /// kind by the same rule. Each carries ``FleetTally/label`` ("3 ok") as
-    /// both its hover and its spoken name — a coloured dot says nothing on
-    /// its own to a reader who cannot see colour.
-    @ViewBuilder
-    private func parkedHeader(_ section: FleetSection) -> some View {
-        HStack(spacing: 4) {
-            ForEach(section.breakdown, id: \.kind.token) { tally in
-                HStack(spacing: 3) {
-                    Circle()
-                        .fill(pillRole(tally.kind).tint)
-                        .frame(width: V4.tallyDotSize, height: V4.tallyDotSize)
-                    Text("\(tally.count)")
-                        .font(V4.font(V4.muteSize))
-                        .foregroundStyle(Tok.mute)
-                }
-                .help(tally.label)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(tally.label)
-            }
-            if !section.parkedStatsLine.isEmpty {
-                Text("· \(section.parkedStatsLine)")
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            Spacer(minLength: 0)
-        }
     }
 
     private func pillRole(_ kind: FleetTally.Kind) -> V4Pill.Role {

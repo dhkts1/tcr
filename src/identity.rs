@@ -343,7 +343,7 @@ pub fn probe(
 ) -> Account {
     Account {
         name: name.to_string(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         provider,
         account_uuid,
         org_uuid,

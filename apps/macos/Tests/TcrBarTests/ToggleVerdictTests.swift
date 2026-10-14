@@ -87,12 +87,12 @@ final class ToggleVerdictTests: XCTestCase {
     /// The other warning that died at the process boundary: an older proxy with no
     /// control route, where only the config file changed. Its readback is
     /// `notHonoured` — the live proxy still reports the old value — and the notice
-    /// is the only place the remedy (`tcr restart`) is named, so it has to survive
+    /// is the only place the remedy (how to restart the proxy) is named, so it has to survive
     /// beside the verdict rather than being replaced by it.
     func testANoticeAndANotHonouredReadbackBothSurvive() {
         let tooOld =
             "[tcr] WARNING: the proxy running on :3456 is too old to accept live account "
-            + "control, so only the config file was changed. Run `tcr restart` ..."
+            + "control, so only the config file was changed. Restart it when ..."
         let verdict = ToggleReadback.verdict(
             requestedEnabled: false, account: alice, readback: fleet(false), notice: tooOld)
         XCTAssertEqual(verdict, .spokeUp(notice: tooOld, about: .notHonoured(requestedEnabled: false)))

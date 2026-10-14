@@ -82,6 +82,9 @@ impl Manager {
             .read()
             .expect("accounts lock poisoned")
             .iter()
+            // The same rows `Self::snapshot` lists, in the same order: the
+            // status endpoint zips the two by position.
+            .filter(|a| !a.removed)
             .map(|a| a.switch_threshold.unwrap_or(self.global_threshold))
             .collect()
     }
@@ -156,9 +159,18 @@ impl Manager {
         };
         // (2) UNDER THE ACCOUNTS LOCK: everything below resolves indices to names.
         let accounts = self.accounts.read().expect("accounts lock poisoned");
+        // A row deleted from the config while this process ran keeps its slot
+        // (see `AccountRuntime::removed`) and is left out of everything a
+        // reader sees. `current` is re-counted over the rows that remain, so
+        // it still indexes `accounts` below.
+        let current = (*self.current.lock().expect("current lock poisoned")).and_then(|idx| {
+            (!accounts.get(idx)?.removed)
+                .then(|| accounts[..idx].iter().filter(|a| !a.removed).count())
+        });
         let account_snaps = accounts
             .iter()
             .enumerate()
+            .filter(|(_, a)| !a.removed)
             .map(|(idx, a)| {
                 let five_hour = a.quota.five_hour.map(|w| w.effective(now));
                 let seven_day = a.quota.seven_day.map(|w| w.effective(now));
@@ -257,6 +269,7 @@ impl Manager {
                         .and_then(ms_to_odt),
                     probe_status: a.probe_status,
                     last_probe: a.last_probe_ms.and_then(ms_to_odt),
+                    quota_updated_at: a.quota.updated_at,
                     probe_error: a.probe_error.clone(),
                     quota_state,
                     gate,
@@ -348,7 +361,7 @@ impl Manager {
 
         StatsSnapshot {
             accounts: account_snaps,
-            current: *self.current.lock().expect("current lock poisoned"),
+            current,
             recent,
             sessions,
             wire_sessions,

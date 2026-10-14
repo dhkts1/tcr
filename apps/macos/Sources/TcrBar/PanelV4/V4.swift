@@ -77,6 +77,14 @@ enum V4 {
     static let tabIconBox: CGFloat = 14
     static let tabIconStroke: CGFloat = 1.8
     static let tabGap: CGFloat = 6
+    /// The least room between a tab's pill edge and its content, on both
+    /// sides, on every tab. Without it a tab wider than its quarter of the
+    /// strip ("Sessions" with a badge) drew its pill flush against the icon
+    /// and the badge while "Accts" kept the leftover of its quarter as room.
+    /// 4 is what the strip can pay at its widest counts (`Sessions 120`,
+    /// `Tools 12`): eight insets on top of the four contents still fit, and
+    /// `SegmentedTabsFitTests` fails if they stop fitting.
+    static let tabInset: CGFloat = 4
     static let badgeRadius: CGFloat = 9
     static let badgePaddingH: CGFloat = 6
     static let badgeFillAlpha: Double = 0.14
@@ -587,13 +595,138 @@ enum V4 {
         max(own, segMarginBottom) - segMarginBottom
     }
 
-    // MARK: - Peers tab literals
+    // MARK: - One-line account rows (option H: `.slim`, `.wline`, `.bandhead`)
 
-    /// The small circle in an account row's parked-tally breakdown
-    /// (`AccountsTabV4.parkedHeader`): one dot per kind of parked exit,
-    /// beside its count. Not ``dotSize`` (8): that is the freshness dot's own
-    /// size, a different circle in a different card.
-    static let tallyDotSize: CGFloat = 7
+    /// `.slim{min-height:26px}` at 13 pt type: the name's line box plus 8. Written
+    /// as that sum rather than as 26 so Comfortable's 15 pt name gets the same
+    /// 8 pt of air instead of a row its own text overflows.
+    static var lineRowHeight: CGFloat { lineHeight(nameSize) + lineRowAir }
+    static let lineRowAir: CGFloat = 8
+    /// `.wline{min-height:22px}`: a waiting line is 4 pt shorter than a live one,
+    /// because it carries no bars.
+    static var waitRowHeight: CGFloat { lineHeight(nameSize) + waitRowAir }
+    static let waitRowAir: CGFloat = 4
+    /// `.sbox{padding:2px 8px}` and `.wbox{padding:2px 10px}`.
+    static let lineBoxPaddingV: CGFloat = 2
+    static let liveBoxPaddingH: CGFloat = 8
+    static let waitBoxPaddingH: CGFloat = 10
+    /// `.sbox,.wbox{margin:0 0 8px}`. The band heading's own `margin-top:8`
+    /// collapses into it, so the heading adds no top margin of its own.
+    static let lineBoxMarginBottom: CGFloat = 8
+    /// `.slim{gap:7px}`, `.wline{gap:8px}`, `.sc{gap:4px}`.
+    static let liveLineGap: CGFloat = 7
+    static let waitLineGap: CGFloat = 8
+    static let lineMeterGap: CGFloat = 4
+    /// `.slim .ln{width:54px}` (clipped with an ellipsis) and
+    /// `.wline .ln{min-width:64px}`.
+    /// The live name column is this at the least and grows to the widest name
+    /// only as far as the line leaves room (``AccountLineFit``): four
+    /// `member-N` names all read `mem…` at 54, which names nobody.
+    static let liveNameWidth: CGFloat = 54
+    static let waitNameMinWidth: CGFloat = 64
+    /// `.sl{width:14px}`, `.mbar{width:32px;height:6px}`, `.mp{width:33px}`.
+    /// The label and percent columns are at least these, and wide enough for
+    /// "5h"/"7d" and "100%" at the panel's type size.
+    static let lineLabelWidth: CGFloat = 14
+    static let lineBarMaxWidth: CGFloat = 32
+    static let lineBarHeight: CGFloat = 6
+    static let linePercentWidth: CGFloat = 33
+    /// `.dot{width:8px}`. The same disc as ``dotSize``, named for this row so
+    /// a change to the Sessions dot does not resize every account.
+    static let lineDotSize: CGFloat = 8
+    /// `.lr{font-size:11.5px}`: half a point over the mute size at either
+    /// density.
+    static var lineSignalSize: CGFloat { muteSize + lineSignalStep }
+    /// The room held for a live line's signal: the 56 pt option H leaves it at
+    /// 372 pt. A longer signal still draws in whatever the row has left, and
+    /// truncates only past that.
+    static let lineSignalIdealWidth: CGFloat = 56
+    static let lineSignalStep: CGFloat = 0.5
+    /// The live line's tokens at this density's type sizes, for
+    /// ``AccountLineFit``. Read on each draw, so a density change re-measures.
+    static var lineMetrics: AccountLineFit.Metrics {
+        AccountLineFit.Metrics(
+            dot: lineDotSize, gap: liveLineGap, meterGap: lineMeterGap,
+            labelMinWidth: lineLabelWidth, percentMinWidth: linePercentWidth,
+            signalWidth: lineSignalIdealWidth, nameMinWidth: liveNameWidth,
+            barMaxWidth: lineBarMaxWidth, nameSize: nameSize, labelSize: muteSize,
+            percentSize: dimSize, signalSize: lineSignalSize)
+    }
+    /// A live line's width in the tab's own box, and a group's padding, which
+    /// a line inside a group box loses on each side.
+    static var lineRoom: AccountLineFit.Room {
+        AccountLineFit.Room(
+            looseWidth: panelWidth - 2 * panelPaddingSide - 2 * liveBoxPaddingH,
+            groupInset: groupPaddingSide)
+    }
+    /// The ONE bar width for every live line in the panel (lead ruling on H1b,
+    /// 2026-10-14): option H's 32, or less if a grouped line could not fit both
+    /// labels and "100%" twice at this density.
+    static var lineBarWidth: CGFloat { AccountLineFit.barWidth(lineRoom, lineMetrics) }
+    /// `.slim+.slim{border-top:1px solid rgba(57,62,67,.6)}`: the hairline at
+    /// 60 %, between rows only.
+    static let lineDividerAlpha: Double = 0.6
+    /// `.bandhead{margin:8px 4px 4px; gap:6px; font-size:11px; font-weight:700;
+    /// letter-spacing:.1em}`.
+    static let bandHeadPaddingH: CGFloat = 4
+    static let bandHeadMarginBottom: CGFloat = 4
+    static let bandHeadGap: CGFloat = 6
+    static let bandHeadSize: CGFloat = 11
+    static let bandHeadTracking: CGFloat = 0.1 * 11
+    static let bandHeadTailTracking: CGFloat = 0.02 * 11
+
+    // MARK: - Hover card (option H: `.hcard`, `.hov`)
+
+    /// `.hcard{left:10px;right:10px}`: the card spans the panel less its own
+    /// side padding, the width every box on the Accounts tab has.
+    static var hoverCardInset: CGFloat { panelPaddingSide }
+    /// `rr.bottom + 4` / `rr.top - h - 4`: the card stands 4 pt off its row.
+    static let hoverCardGap: CGFloat = 4
+    /// `box-shadow:0 10px 28px rgba(0,0,0,.65)`. SwiftUI's shadow radius is
+    /// about half a CSS blur.
+    static let hoverCardShadowRadius: CGFloat = 14
+    static let hoverCardShadowY: CGFloat = 10
+    /// The shadow's black, per appearance. Dark keeps option H's `.65`. Light
+    /// is lighter (lead ruling on H1b, 2026-10-14: ".65 is too heavy in light
+    /// mode"): on the light panel a `.65` black reads as a smudge around the
+    /// card, where on the dark one it is barely darker than the panel.
+    static func hoverCardShadowAlpha(_ scheme: ColorScheme) -> Double {
+        scheme == .dark ? hoverCardShadowAlphaDark : hoverCardShadowAlphaLight
+    }
+    static let hoverCardShadowAlphaDark: Double = 0.65
+    static let hoverCardShadowAlphaLight: Double = 0.25
+    /// How long a leave waits before the card goes, so the pointer can cross
+    /// from the row onto the card without the card vanishing under it.
+    static let hoverCardGraceSeconds: Double = 0.15
+
+    // MARK: - The strip over the Accounts tab (option H: `.hsum`, `.hstrip`, `.hseg`)
+
+    /// `.hsum.htop{margin:0 4px 8px}`. The bottom is the tab bar's own
+    /// ``segMarginBottom`` (8 at Compact, as the frame draws it), so the first
+    /// block of the list collapses into it through ``marginAfterStrip(_:)``
+    /// exactly as it collapsed into the tab bar before the strip came between.
+    static let stripPaddingSide: CGFloat = 4
+    static var stripMarginBottom: CGFloat { segMarginBottom }
+    /// `.hsum .hl:first-child{font-size:13.5px}`: half a point over the
+    /// summary size at either density.
+    static var stripHeadlineSize: CGFloat { summarySize + stripHeadlineStep }
+    static let stripHeadlineStep: CGFloat = 0.5
+    /// `.hl{gap:6px}`.
+    static let stripHeadlineGap: CGFloat = 6
+    /// `.hstrip{gap:2px;height:14px;margin:5px 0 5px}`, `.hseg{border-radius:3px}`.
+    static let stripHeight: CGFloat = 14
+    static let stripGap: CGFloat = 2
+    static let stripMarginV: CGFloat = 5
+    static let stripSegmentRadius: CGFloat = 3
+    /// `.hseg.spent{background:rgba(234,90,86,.55)}`, `.hseg.off{background:
+    /// rgba(148,146,141,.3)}`: the whole segment washed, no fill.
+    static let stripSpentAlpha: Double = 0.55
+    static let stripOffAlpha: Double = 0.3
+    /// `.hseg.on{box-shadow:0 0 0 2px var(--ink)}`: a 2 pt ring OUTSIDE the
+    /// segment, drawn as an overlay so pointing at one changes no size.
+    static let stripRingWidth: CGFloat = 2
+
+    // MARK: - Peers tab literals
 
     /// The width of the frame around the row's "more" ellipsis glyph
     /// (`PeersTabV4.rowMenuLabel`); the height is ``PeersTabV4/hitTarget``.

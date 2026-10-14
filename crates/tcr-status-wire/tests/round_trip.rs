@@ -157,3 +157,39 @@ fn fable_weekly_pair_round_trips_and_decodes_absent() {
         "missing sevenDayOiResetAtMs decodes as None, not a decode error"
     );
 }
+
+/// `quotaUpdatedAtMs`, the time of the newest quota reading from a probe or
+/// from response headers, round trips through [`AccountStatusRow`], and a row
+/// from an older server that never sent the key still decodes, as `None`.
+#[test]
+fn quota_updated_at_round_trips_and_decodes_absent() {
+    let committed =
+        std::fs::read_to_string(fixture_path()).expect("committed contract fixture is readable");
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&committed).expect("fixture is a bare JSON array");
+
+    let present = rows
+        .iter()
+        .find(|r| r["quotaUpdatedAtMs"].is_i64())
+        .expect("fixture carries a row with a numeric quotaUpdatedAtMs")
+        .clone();
+    let decoded = AccountStatusRow::from_value(present.clone()).expect("row decodes");
+    assert_eq!(
+        decoded.quota_updated_at_ms,
+        present["quotaUpdatedAtMs"].as_i64()
+    );
+    let reencoded = serde_json::to_value(&decoded).expect("row re-encodes");
+    assert_eq!(reencoded["quotaUpdatedAtMs"], present["quotaUpdatedAtMs"]);
+
+    let mut older = present;
+    older
+        .as_object_mut()
+        .expect("row is an object")
+        .remove("quotaUpdatedAtMs");
+    let decoded =
+        AccountStatusRow::from_value(older).expect("a row missing quotaUpdatedAtMs still decodes");
+    assert_eq!(
+        decoded.quota_updated_at_ms, None,
+        "missing quotaUpdatedAtMs decodes as None, not a decode error"
+    );
+}

@@ -1354,7 +1354,7 @@ mod tests {
 
         m.add_account(crate::config::Account {
             name: "bob@example.com/codex".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: crate::provider::Provider::Codex,
             account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
             org_uuid: None,
@@ -1723,7 +1723,7 @@ mod tests {
             http1_only: false,
             accounts: vec![crate::config::Account {
                 name: "dummy".to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,

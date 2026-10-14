@@ -1,4 +1,5 @@
 import SwiftUI
+import TcrBarCore
 
 /// `.seg` / `.tab` / `.badge` — a real tablist of real buttons.
 ///
@@ -20,7 +21,7 @@ struct SegmentedTabs: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: V4.segGap) {
+        TabStripLayout(spacing: V4.segGap, inset: V4.tabInset) {
             ForEach(tabs, id: \.self) { tab in
                 item(tab)
             }
@@ -52,23 +53,23 @@ struct SegmentedTabs: View {
                     .frame(width: V4.tabIconBox, height: V4.tabIconBox)
                 // ONE line, at its own width, never a share of the strip.
                 //
-                // Each item carries `.frame(maxWidth: .infinity)` below, so
-                // four of them split the strip into equal 84.25 pt quarters.
-                // Measured at the system font, "Sessions" beside a two-digit
-                // badge wants 106.2 pt of that quarter and so broke into
-                // `Sess` over `ions` on the released panel. Nothing in the
-                // strip's own tokens can pay for it: taking `segGap` to zero
-                // returns 2.25 pt, and a smaller badge font is larger than
-                // the one already used.
+                // Equal quarters of the strip are 84.25 pt. Measured at the
+                // system font, "Sessions" beside a two-digit badge wants
+                // 106.2 pt and so broke into `Sess` over `ions` on the
+                // released panel. Nothing in the strip's own tokens can pay
+                // for it: taking `segGap` to zero returns 2.25 pt, and a
+                // smaller badge font is larger than the one already used.
                 //
                 // Their own widths fit with room to spare: the four together
                 // want 303.8 pt of the strip's 337, even at `Sessions 120`
-                // and `Tools 12`. `fixedSize` is what asks for that ideal
-                // width instead of accepting the quarter, `lineLimit(1)`
-                // is what makes a label that somehow still cannot fit
-                // ellipsise rather than grow the strip a second line, and
-                // `SegmentedTabsFitTests` is what fails if a longer label
-                // ever spends the slack.
+                // and `Tools 12`, which leaves enough for `V4.tabInset` on
+                // each side of each tab (`TabStripLayout` below hands those
+                // widths out). `fixedSize` is what reports that ideal width
+                // to the layout instead of accepting a smaller one,
+                // `lineLimit(1)` is what makes a label that somehow still
+                // cannot fit ellipsise rather than grow the strip a second
+                // line, and `SegmentedTabsFitTests` is what fails if a longer
+                // label ever spends the slack.
                 Text(tab.title)
                     .font(V4.font(V4.tabLabelSize, .semibold))
                     .tracking(V4.tabLabelTracking)
@@ -112,5 +113,57 @@ struct SegmentedTabs: View {
         .buttonStyle(V4PressStyle(cornerRadius: V4.tabRadius))
         .accessibilityLabel(badges[tab].map { "\(tab.title), \($0)" } ?? tab.title)
         .accessibilityAddTraits(isOn ? [.isSelected] : [])
+    }
+}
+
+/// Lays the tabs out side by side at ``TabStripFit``'s widths: equal quarters
+/// when every tab's content and its insets fit one, otherwise each tab's own
+/// content plus `inset` on both sides, with only the leftover shared.
+///
+/// An `HStack` of `.frame(maxWidth: .infinity)` items cannot do this: it
+/// offers each item an equal share, and an item whose content is wider than
+/// its share takes exactly its content width, so its pill ends at its badge
+/// (Gil, 2026-10-14: "the buttons for sessions has no padding"). Each item
+/// here still fills the width it is given and centres its content in it, so
+/// the room on each side is half of what its width leaves over its content.
+private struct TabStripLayout: Layout {
+    let spacing: CGFloat
+    let inset: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let widths = widths(in: proposal.width, subviews: subviews)
+        let height =
+            zip(subviews, widths)
+            .map { subview, width in
+                subview.sizeThatFits(ProposedViewSize(width: width, height: proposal.height)).height
+            }
+            .max() ?? 0
+        return CGSize(width: widths.reduce(0, +) + gaps(subviews), height: height)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        var x = bounds.minX
+        for (subview, width) in zip(subviews, widths(in: bounds.width, subviews: subviews)) {
+            subview.place(
+                at: CGPoint(x: x, y: bounds.midY), anchor: .leading,
+                proposal: ProposedViewSize(width: width, height: bounds.height))
+            x += width + spacing
+        }
+    }
+
+    /// Each tab's width in a strip `width` wide. With no width to share (an
+    /// ideal-size or unbounded proposal) each tab asks for its content and
+    /// its two insets.
+    private func widths(in width: CGFloat?, subviews: Subviews) -> [CGFloat] {
+        let contents = subviews.map { $0.sizeThatFits(.unspecified).width }
+        guard let width, width.isFinite else { return contents.map { $0 + inset * 2 } }
+        return TabStripFit.widths(
+            contentWidths: contents, inset: inset, available: width - gaps(subviews))
+    }
+
+    private func gaps(_ subviews: Subviews) -> CGFloat {
+        spacing * CGFloat(max(subviews.count - 1, 0))
     }
 }

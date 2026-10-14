@@ -53,8 +53,12 @@ const TOP_SESSIONS: usize = 3;
 #[derive(Debug, Clone, Copy, Default)]
 struct Agg {
     requests: u64,
+    /// Uncached input only: the ledger's `i`, which `cost_nanos` prices at the
+    /// base input rate apart from the cache writes and reads beside it.
     input: u64,
     output: u64,
+    /// Both cache-write lengths, `c5 + c1`.
+    cache_write: u64,
     cache_read: u64,
     cost_nanos: u64,
 }
@@ -64,6 +68,7 @@ impl Agg {
         self.requests += 1;
         self.input += line.i;
         self.output += line.o;
+        self.cache_write += line.c5 + line.c1;
         self.cache_read += line.r;
         if let Some(price) = line.m.as_deref().and_then(|m| pricing.lookup(m)) {
             self.cost_nanos += cost_nanos(&price, line.i, line.c5, line.c1, line.r, line.o);
@@ -83,26 +88,36 @@ pub struct Totals {
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_write_tokens: u64,
     pub cache_read_tokens: u64,
     pub cost_usd: f64,
-    /// `cache_read_tokens / input_tokens`, or `None` when `input_tokens` is 0
-    /// — nothing served is not a measured 0% hit rate. Same honest-null idiom
-    /// `cli.rs::cache_hit_ratio` uses for `tcr status`.
+    /// The share of all prompt tokens that were read from cache:
+    /// `cache_read / (input + cache_write + cache_read)`, so always within
+    /// 0..=1. `input_tokens` here is the ledger's UNCACHED input, so dividing by
+    /// it alone, as this once did, printed 120827.3% for a 30-day window whose
+    /// real hit rate was 97.6%. The denominator is the same total prompt that
+    /// `cli.rs::cache_hit_ratio` divides by for `tcr status`, whose
+    /// `input_tokens` already includes the cached tokens.
+    ///
+    /// `None` when that total is 0: nothing served is not a measured 0% hit
+    /// rate. Same honest-null idiom `tcr status` uses.
     pub cache_hit_ratio: Option<f64>,
 }
 
 impl From<Agg> for Totals {
     fn from(agg: Agg) -> Self {
+        let prompt = agg.input + agg.cache_write + agg.cache_read;
         Self {
             requests: agg.requests,
             input_tokens: agg.input,
             output_tokens: agg.output,
+            cache_write_tokens: agg.cache_write,
             cache_read_tokens: agg.cache_read,
             cost_usd: agg.cost_usd(),
-            cache_hit_ratio: if agg.input == 0 {
+            cache_hit_ratio: if prompt == 0 {
                 None
             } else {
-                Some(agg.cache_read as f64 / agg.input as f64)
+                Some(agg.cache_read as f64 / prompt as f64)
             },
         }
     }
@@ -394,10 +409,11 @@ pub fn render_text(report: &WrapReport) -> String {
         report.days, report.since, report.until
     ));
     out.push_str(&format!(
-        "totals requests={} input={} output={} cacheRead={} cost=${:.2} cacheHitRatio={}\n\n",
+        "totals requests={} input={} output={} cacheWrite={} cacheRead={} cost=${:.2} cacheHitRatio={}\n\n",
         report.totals.requests,
         report.totals.input_tokens,
         report.totals.output_tokens,
+        report.totals.cache_write_tokens,
         report.totals.cache_read_tokens,
         report.totals.cost_usd,
         fmt_ratio(report.totals.cache_hit_ratio),
@@ -653,6 +669,34 @@ mod tests {
         let report = build_report(tmp.path(), 1, noon_ms(day), &PricingTable::default());
         assert_eq!(report.totals.requests, 1, "the good line is still counted");
         assert_eq!(report.malformed_lines, 1);
+    }
+
+    /// The hit rate is the share of the WHOLE prompt read from cache, so it
+    /// stays within 0..=1. The ledger's `i` is uncached input only, and
+    /// dividing cache reads by it alone printed 120827.3% for a real 30-day
+    /// window whose hit rate was 97.6%.
+    #[test]
+    fn cache_hit_ratio_is_a_share_of_the_whole_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let day = Date::from_calendar_date(2026, time::Month::September, 5).unwrap();
+        write_day(
+            tmp.path(),
+            "2026-09-05",
+            &[format!(
+                r#"{{"t":{},"a":"alice@example.com","m":"claude-opus-5","s":1,"i":100,"c5":60,"c1":40,"r":800,"o":10}}"#,
+                noon_ms(day)
+            )
+            .as_str()],
+        );
+        let report = build_report(tmp.path(), 1, noon_ms(day), &PricingTable::default());
+        assert_eq!(report.totals.input_tokens, 100);
+        assert_eq!(report.totals.cache_write_tokens, 100, "c5 + c1");
+        assert_eq!(report.totals.cache_read_tokens, 800);
+        assert_eq!(
+            report.totals.cache_hit_ratio,
+            Some(0.8),
+            "800 read of 1000 prompt tokens, not 800 / 100"
+        );
     }
 
     /// An empty ledger directory (no traffic at all) reports honest zeroes and

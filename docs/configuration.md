@@ -30,8 +30,11 @@ writes the account for you. Hand-editing is for the *settings* keys below.
 
 The document deserializes into `Config` with `#[serde(rename_all = "camelCase")]`, so every
 key is camelCase. Unmodelled keys are preserved verbatim across a load→save round trip
-rather than dropped, but seven of them are also *read*, and are documented in their own
-section below.
+rather than dropped, but eight of them are also *read*, and are documented in their own
+section below. Because a misspelled key is kept and does nothing, `tcr doctor` names every
+top-level key this build does not recognise, with its nearest known spelling, and the server logs
+them once at boot ([`tcr doctor`](cli.md#config-keys-tcr-does-not-recognise)). The list of known
+keys is `src/config_keys.rs`.
 
 ## Top level
 
@@ -42,8 +45,8 @@ section below.
 | `codexUpstream` | string | `"https://chatgpt.com"` | no | where Codex accounts' requests are sent, where their quota probe goes, where `tcr login --from-codex` checks a login's workspace before importing it, and where every other request under `/backend-api/` is relayed, under the client's own bearer when it sent one; written to the file only when it differs from the default. Their token refresh goes to `https://auth.openai.com` whatever this says |
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account |
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
-| `accountThrottle` | object | `{minSpacingMs: 350, burst: 8}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
-| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 16}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
+| `accountThrottle` | object | `{minSpacingMs: 350, burst: 24}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
+| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 32}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL of one provider's pooled traffic to one account by `name`; the other provider's pooled requests get a 429, see below |
 | `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"warn"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
@@ -147,7 +150,7 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
-| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and, on Anthropic, kept warm; anything else is a static-key account |
+| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and, on Anthropic, kept warm; `"apikey"` rows are quarantined at load, because tcr serves subscription logins only (a Claude subscription, or a Codex row's ChatGPT login), never API keys; any other string is a static-key account, kept as written |
 | `provider` | `"anthropic"` \| `"codex"` | `"anthropic"` | no | which upstream this credential belongs to. Absent means Anthropic, and the key is never written for an Anthropic row. A Codex row (`tcr login --from-codex` writes one) is refreshed against `auth.openai.com`, probed at `/backend-api/wham/usage`, never kept warm, and serves only Codex inference, `/backend-api/codex/responses`: a Claude request never reaches it, and a Codex request never reaches a Claude row |
 | `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token. For a Codex row it is the ChatGPT account id, sent as the `chatgpt-account-id` header instead of being spliced into the body |
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
@@ -164,7 +167,10 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `credentialVersion` | u64 | absent → backfilled on the next save | no | written by `tcr`, not by hand: `1` on an Anthropic row, `2` on a Codex row. A build refuses the whole file when a row carries a version above what it understands for that row's provider. Upgrade every `tcr` that may boot on the file before importing a Codex login: what an older one does with a Codex row is in [troubleshooting](troubleshooting.md#after-a-codex-import-an-older-proxy-refuses-to-load-the-config) |
 
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and, on
-Anthropic, keep-warm; any other value is treated as a static key.
+Anthropic, keep-warm. tcr serves subscription logins only, a Claude subscription or a Codex
+row's ChatGPT login, never API keys, so an `"apikey"` row is quarantined at load with a
+warning, and the rest of the config loads. Any other string is treated as a static key and
+written back exactly as it was; a `type` that is not a string quarantines its row.
 
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
@@ -252,17 +258,18 @@ There are two throttle buckets, and they are keyed on different things.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `accountThrottle.minSpacingMs` | u64 | **`350`** with the key absent | no | steady-state emission interval **per organization** |
-| `accountThrottle.burst` | u32 | **`8`** with the key absent | no | sends admitted instantly after that org has been idle |
+| `accountThrottle.burst` | u32 | **`24`** with the key absent | no | sends admitted instantly after that org has been idle |
 | `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across **every** org combined |
-| `fleetThrottle.burst` | u32 | **`16`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
+| `fleetThrottle.burst` | u32 | **`32`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
 
 `accountThrottle` is the real limiter. Anthropic sets rate limits at the **organization**
 level, so pacing per org is what matches the thing actually being limited, and total capacity
 scales *with* the size of your account pool rather than being divided across it.
 
 `fleetThrottle` is insurance. It exists only in case something shared — an IP, a client id —
-is also limited, which nobody here has measured. It is set far above observed traffic so it
-does not bind in normal use.
+is also limited, which nobody here has measured. Its burst sits above the per-organization
+burst, so it never holds back a wave that bucket lets through, and near the fleet's real peaks,
+so it still engages on a runaway.
 
 > **This replaced a single fleet-wide `throttle` key.** A config still carrying `throttle` is
 > **migrated automatically at load** — the file self-heals the first time the server boots
@@ -288,7 +295,7 @@ These are the keys in the file where leaving one out and writing an empty object
 *opposite* things, and it surprises everyone:
 
 - `accountThrottle` **absent** → `default_account_throttle()` → **ON** at
-  `minSpacingMs: 350, burst: 8`. Same for `fleetThrottle` → `100` / `16`.
+  `minSpacingMs: 350, burst: 24`. Same for `fleetThrottle` → `100` / `32`.
 - `"accountThrottle": {}` **present and empty** → every knob deserializes to `None` →
   `is_active()` is false → that bucket is **OFF**.
 
@@ -320,14 +327,14 @@ unchanged from the value already running in production, and only the fleet ceili
 
 ## Keys read from the unmodelled map
 
-These seven are not fields of `Config`. They land in the flattened `extra` map and are read
+These eight are not fields of `Config`. They land in the flattened `extra` map and are read
 back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
 They are fully live config with a caller in the boot or request path, not compatibility
 leftovers.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; `<= 0` disables probing |
+| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; halved for an account held out by its own quota; at most 20 probes per account in any trailing hour; `<= 0` disables probing |
 | `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task |
 
 ### Both cadences are random per account, not a fleet sweep
@@ -346,6 +353,17 @@ Consequences worth knowing before you tune either number:
   than re-anchoring the fleet's phase on boot time.
 - A single account's gap between probes is never the number you configured; it is a fresh
   draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
+- An account at or over its switch threshold, or one upstream answered `rejected`, is probed
+  around HALF the cadence (`105..=195s` at the default). It is out of rotation, so no served
+  response refreshes its quota and only a probe sees its window roll. An account serving
+  traffic is not probed any faster: every response's headers already rewrite the same
+  windows a probe reads.
+- No account is probed more than 20 times in any trailing 60 minutes, whatever the cadence.
+  The usage endpoint's budget was measured by claude-swap at about 28 to 30 requests per
+  identity in a trailing hour, not a refilling bucket. A `quotaProbeSeconds` under 180 is
+  therefore held to that cap rather than run as configured. The boot sweep, a probe's one
+  `401` retry and `tcr accounts --probe` are not counted, which is why the cap sits well
+  under the measured figure.
 - The probe (not keep-warm) still does ONE whole-fleet sweep at boot, spaced 350 ms, so the
   bars populate immediately instead of after a random offset.
 - Randomness is drawn from a SplitMix64 generator seeded once from the boot clock. There is
@@ -354,9 +372,10 @@ Consequences worth knowing before you tune either number:
 | `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
-| `cacheTtlRewrite` | bool | **on when every account is OAuth, off if any is an API key** | no | rewrite every `cache_control` breakpoint to `"ttl":"1h"` before forwarding. Measured 2026-10-06: a 1h write costs a subscription's 5-hour window what a 5m write does and a read costs it nothing visible, so the hour is free and spares the full re-write after a 5-60 minute idle gap. An API-key account is billed at the published rates, where a 1h write is 2x input against 1.25x, so a fleet holding one forwards bodies as sent unless this is set `true`. `tcr wrap` still prices 1h writes at the API's 2x, so its dollar figure rises while a subscription's quota does not |
+| `cacheTtlRewrite` | bool | **on unless some account's `type` is a string tcr does not recognize** | no | rewrite every `cache_control` breakpoint to `"ttl":"1h"` before forwarding. Measured 2026-10-06: a 1h write costs a subscription's 5-hour window what a 5m write does and a read costs it nothing visible, so the hour is free and spares the full re-write after a 5-60 minute idle gap. A row of an unrecognized `type` is a static key tcr cannot classify and may be billed at the published rates, where a 1h write is 2x input against 1.25x, so a fleet holding one forwards bodies as sent unless this is set `true`. An `apikey` row cannot turn it off, because it never loads. `tcr wrap` still prices 1h writes at the API's 2x, so its dollar figure rises while a subscription's quota does not |
 | `throttleExemptNoise` | bool | **`false`** (OFF) | no | let `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) skip the **per-org** bucket instead of queueing behind inference. It still pays `fleetThrottle`, so exempt traffic is never entirely unpaced. Only a request with **no client bearer** is classified at all — one that carries its own is relayed under it and never enters a bucket (see [`controlIdentity`](#controlidentity-the-client-must-be-the-control-account)) |
 | `divertBudget` | u32 | **`0`** (unlimited) | no | max distinct destination accounts one session may be diverted to inside a single hold episode; `0` = unlimited, today's behaviour byte-for-byte |
+| `claudeCodeImport` | bool | absent (import allowed) | no | `false` stops an empty fleet from importing this Mac's Claude Code login on its own. `tcr remove` writes it when it deletes the last account, so the next `tcr status` (TcrBar polls it every few seconds) does not put the login straight back. `tcr login --from-claude-code` still imports |
 
 ### `sessionAffinity` also pins identity-less loopback requests
 

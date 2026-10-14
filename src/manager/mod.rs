@@ -83,6 +83,31 @@ const REQUEST_LOG_CAPACITY: usize = 200;
 /// pinned out for hours with no live request to clear the hold (finding #5).
 const MAX_RATE_LIMIT_HOLD_SECONDS: i64 = 3600;
 
+/// How long an upstream 403 holds the refused account out of rotation. Short on
+/// purpose: a 403 can be about one model or one request, not the whole account,
+/// so it must not bench a healthy account for long. Without any hold, though,
+/// least-recently-selected rotation brings the account straight back and every
+/// next request pays the same refused round trip. Longer than the exhaustion
+/// soft-wait ceiling (under 60 s in proxy.rs), so a fleet that is refused
+/// everywhere is not waited on as if it were a brief park. Kept clearly under
+/// [`CACHE_WARM_HOLD_SECS`], so a session pinned to the account keeps its pin
+/// and diverts request by request (`Manager::hold_clears_while_warm`) rather
+/// than being re-keyed over what may be one refused request; a value at the
+/// boundary would flip between the two a few milliseconds after arming.
+pub(crate) const REFUSED_HOLD_SECONDS: i64 = 120;
+
+/// Why [`AccountRuntime::rate_limited_until_ms`] is armed. Both causes hold the
+/// account out of selection the same way; the cause only decides what the
+/// account's gate reads ([`GateReason::Hold`] or [`GateReason::Refused`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HoldCause {
+    /// A 429 rate-limit hold ([`Manager::mark_rate_limited`]).
+    #[default]
+    RateLimit,
+    /// An upstream 403 refusing our credential ([`Manager::mark_refused`]).
+    Refused,
+}
+
 /// The dividing line between a rate-limit hold a session should WAIT OUT on its
 /// pinned account and one long enough that re-keying is the cheaper trade:
 /// **Anthropic's default ephemeral prompt-cache TTL, 5 minutes.**
@@ -272,7 +297,7 @@ impl AccountStatus {
 #[derive(Debug, Clone)]
 pub struct AccountRuntime {
     pub name: String,
-    pub account_type: String,
+    pub account_type: config::AccountType,
     /// Which upstream this credential belongs to; copied from `config::Account::provider` at
     /// boot and never changed afterwards. Selection filters on it FIRST (`select::eligible`):
     /// a Claude request and a Codex account have nothing to say to each other.
@@ -288,6 +313,19 @@ pub struct AccountRuntime {
     pub org_name: Option<String>,
     pub priority: i64,
     pub disabled: bool,
+    /// The config file no longer holds this account: it was deleted (`tcr
+    /// remove`, TcrBar's "Delete Account…", or a hand edit) while this process
+    /// ran. Set and cleared ONLY by [`Manager::reload_groups_if_changed`], which
+    /// compares the rotation with the file every time it re-reads it.
+    ///
+    /// A removed row keeps its slot, because a rotation index is held all over
+    /// this process (pins, the control index, sessions, in-flight guards) and
+    /// nothing may shift under them. It is parked (`disabled`), left out of
+    /// every snapshot (so `tcr status` and the panel stop listing it), never
+    /// the control or locked account, and invisible to name resolution. Before
+    /// this existed the row stayed listed until a restart, so a delete of a
+    /// row that was already parked changed nothing anyone could see.
+    pub removed: bool,
     /// Mirrors [`config::Account::groups`], normalized to an owned `Vec` (empty
     /// when the config carried no `groups` key) so [`Manager::eligible`] can test
     /// membership without an `Option` at every call site.
@@ -397,6 +435,8 @@ pub struct AccountRuntime {
     /// min-spacing between two selects of the SAME account.
     pub last_served_ms: i64,
     pub rate_limited_until_ms: Option<i64>,
+    /// What armed `rate_limited_until_ms`; read only to name the gate.
+    pub hold_cause: HoldCause,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -589,6 +629,24 @@ impl crate::identity::Queryable for AccountRuntime {
     }
 }
 
+/// [`crate::identity::match_one`] over the rotation, blind to rows deleted
+/// from the config ([`AccountRuntime::removed`]). A deleted row keeps its slot,
+/// so without this a query could still park, prioritise or promote it, and a
+/// re-login under the same name would read as ambiguous.
+fn match_listed(accounts: &[AccountRuntime], query: &str) -> crate::identity::Match {
+    let hits: Vec<usize> = crate::identity::match_accounts(accounts, query)
+        .into_iter()
+        .filter(|&idx| !accounts[idx].removed)
+        .collect();
+    match hits.as_slice() {
+        [] => crate::identity::Match::None,
+        [only] => crate::identity::Match::One(*only),
+        many => crate::identity::Match::Ambiguous(
+            many.iter().map(|&idx| accounts[idx].name.clone()).collect(),
+        ),
+    }
+}
+
 /// What [`Manager::set_disabled_by_query`] did.
 ///
 /// `Applied` carries the RESOLVED name plus the durable half's fate, which the
@@ -611,6 +669,18 @@ pub enum SetDisabledOutcome {
     /// The query named more than one — only reachable on a config hand-edited
     /// past the loader's rename migration. Listed here so the caller can tell
     /// the user which rows to go fix.
+    Ambiguous(Vec<String>),
+}
+
+/// What [`Manager::set_priority_by_query`] did. Same resolution arms as
+/// [`SetDisabledOutcome`], with no durable half: the CLI writes the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetPriorityOutcome {
+    /// The RESOLVED name of the account whose priority is now in force.
+    Applied { name: String },
+    /// The query named no account in the live rotation.
+    NoMatch,
+    /// The query named more than one.
     Ambiguous(Vec<String>),
 }
 
@@ -666,6 +736,7 @@ impl AccountRuntime {
             org_name: account.org_name.clone(),
             priority: account.priority.unwrap_or(0),
             disabled: account.disabled.unwrap_or(false),
+            removed: false,
             groups: account.groups.clone().unwrap_or_default(),
             organization_type: account.organization_type.clone(),
             rate_limit_tier: account.rate_limit_tier.clone(),
@@ -694,6 +765,7 @@ impl AccountRuntime {
             in_flight: 0,
             last_served_ms: 0,
             rate_limited_until_ms: None,
+            hold_cause: HoldCause::RateLimit,
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
@@ -2259,8 +2331,11 @@ impl Manager {
 
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
     /// `parked`, `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
-    /// the last check — the fix for group edits appearing to do nothing.
-    /// Called from a natural
+    /// the last check — the fix for group edits appearing to do nothing. The
+    /// same pass also follows the file's account LIST: an account it gained is
+    /// admitted, and one it lost is marked [`AccountRuntime::removed`], which is
+    /// what makes a delete leave the running proxy and the panel without a
+    /// restart. Called from a natural
     /// cadence point ([`Self::select_with_group`], [`Self::select_revalidation`],
     /// [`Self::snapshot`]) rather than a dedicated watcher thread — one more
     /// background task is one more thing to keep alive, and every one of
@@ -2429,7 +2504,8 @@ impl Manager {
         }
         {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-            for account in accounts.iter_mut() {
+            let fresh_control = fresh.control_account.as_ref().map(|c| c.name().to_string());
+            for (idx, account) in accounts.iter_mut().enumerate() {
                 let probe = crate::identity::probe(
                     account.provider,
                     &account.name,
@@ -2442,8 +2518,45 @@ impl Manager {
                     .iter()
                     .find(|a| crate::identity::same_identity(&probe, a))
                 else {
+                    // The file no longer holds this account: it was deleted.
+                    // Parked in memory only (there is no entry left to write
+                    // the flag into) and dropped from every snapshot; see
+                    // `AccountRuntime::removed`.
+                    if !account.removed {
+                        account.removed = true;
+                        account.disabled = true;
+                        changed.push(format!("{}: removed from the config", account.name));
+                        // A deleted account is not the control account: its
+                        // routing bypasses `disabled` on purpose, so leaving the
+                        // index would keep control traffic on the deleted row.
+                        // Same lock order as `probeable_indices`: accounts, then
+                        // control.
+                        let mut control = self.control_idx.write().expect("control lock poisoned");
+                        if *control == Some(idx) {
+                            *control = None;
+                            changed
+                                .push(format!("{}: no longer the control account", account.name));
+                        }
+                    }
                     continue;
                 };
+                if account.removed {
+                    // Back in the file (an undone hand edit, a login that wrote
+                    // the file): the file's row is the truth again, credentials
+                    // and bench flag included.
+                    account.removed = false;
+                    account.disabled = matched.disabled.unwrap_or(false);
+                    account.access_token = matched.access_token.clone();
+                    account.refresh_token = matched.refresh_token.clone();
+                    account.expires_at_ms = matched.expires_at.map(oauth::normalize_expires_at);
+                    changed.push(format!("{}: back in the config", account.name));
+                    if fresh_control.as_deref() == Some(account.name.as_str()) {
+                        let mut control = self.control_idx.write().expect("control lock poisoned");
+                        if control.is_none() {
+                            *control = Some(idx);
+                        }
+                    }
+                }
                 let new_groups = matched.groups.clone().unwrap_or_default();
                 if new_groups != account.groups {
                     changed.push(format!(
@@ -2455,10 +2568,10 @@ impl Manager {
             }
 
             // Admit an account the file gained since boot (or the last reload)
-            // — APP-35. Never touches or removes an account already in
-            // `accounts`; that is `save_tokens`'s removal semantics
-            // (`config.rs`'s doc-comment on it) and stays out of scope here.
-            // The identity match is the same probe the loop above uses, just
+            // — APP-35. Never touches an account already in `accounts`: one
+            // the file LOST was marked `removed` by the loop above, in place,
+            // and one that came back was revived there too, so neither is
+            // admitted a second time here. The identity match is the same probe the loop above uses, just
             // run in the opposite direction: does any LOADED account already
             // own this fresh entry?
             //
@@ -2686,7 +2799,7 @@ impl Manager {
     pub fn set_disabled_by_query(&self, query: &str, disabled: bool) -> SetDisabledOutcome {
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            match crate::identity::match_one(&accounts[..], query) {
+            match match_listed(&accounts[..], query) {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
@@ -2697,6 +2810,32 @@ impl Manager {
         SetDisabledOutcome::Applied {
             name,
             persist: self.set_disabled(idx, disabled),
+        }
+    }
+
+    /// Resolve `query` against the LIVE rotation and set that account's
+    /// `priority` in memory, so the next selection ranks by it. For the
+    /// [`crate::proxy::PRIORITY_PATH`] route behind `tcr priority`.
+    ///
+    /// Memory only, deliberately unlike [`Self::set_disabled`]: `tcr priority`
+    /// computes the value from the config file (its `--first`/`--last` are
+    /// relative to the file's priorities) and writes the file itself, then
+    /// sends the resolved integer here. Resolution is the same
+    /// [`crate::identity::match_one`] over the rotation slots that
+    /// [`Self::set_disabled_by_query`] uses, for the same reason.
+    pub fn set_priority_by_query(&self, query: &str, priority: i64) -> SetPriorityOutcome {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let idx = match match_listed(&accounts[..], query) {
+            crate::identity::Match::One(idx) => idx,
+            crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
+            crate::identity::Match::Ambiguous(names) => {
+                return SetPriorityOutcome::Ambiguous(names)
+            }
+        };
+        let account = &mut accounts[idx];
+        account.priority = priority;
+        SetPriorityOutcome::Applied {
+            name: account.name.clone(),
         }
     }
 
@@ -2764,6 +2903,7 @@ impl Manager {
             .read()
             .expect("accounts lock poisoned")
             .get(idx)
+            .filter(|a| !a.removed)
             .map(|a| a.name.clone())
     }
 
@@ -2912,7 +3052,7 @@ impl Manager {
         };
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            match crate::identity::match_one(&accounts[..], query) {
+            match match_listed(&accounts[..], query) {
                 // Refused here as boot ignores it (see `assemble`): a `match`, so a third
                 // provider decides this too instead of inheriting an answer.
                 crate::identity::Match::One(idx) => match accounts[idx].provider {
@@ -3171,6 +3311,16 @@ impl Manager {
                         // rotation early.
                         if row.status == AccountStatus::Error {
                             row.status = AccountStatus::Active;
+                        }
+                        // A login of an account deleted while this process ran
+                        // lands on the deleted row's slot (same identity) and
+                        // brings it back as the login asked for it, not parked
+                        // the way the delete left it. The durable write below
+                        // puts the row back in the file, so the next reload
+                        // agrees.
+                        if row.removed {
+                            row.removed = false;
+                            row.disabled = account.disabled.unwrap_or(false);
                         }
                         // F6: the submitted type always wins — this route only
                         // ever carries a real credential, so a row whose stored
@@ -3614,7 +3764,7 @@ mod tests {
     fn account(name: &str, priority: i64) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -4780,6 +4930,161 @@ mod tests {
         assert!(
             account.quota.five_hour.is_none(),
             "the payload carried no five-hour window, so none may be invented"
+        );
+    }
+
+    /// Codex quota headers saying the weekly window (the only one the measured plan
+    /// reports) is `used` percent spent, resetting a day out.
+    fn codex_weekly(used: &str) -> reqwest::header::HeaderMap {
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 86_400;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", used.parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            reset.to_string().parse().unwrap(),
+        );
+        headers
+    }
+
+    /// **A Codex row's `quotaUpdatedAtMs` comes from that row's own readings**, both
+    /// kinds: a served response's Codex quota headers, which `update_quota` routes to
+    /// the Codex parser by the row's provider, and a successful Codex probe. The
+    /// Anthropic row beside it read nothing and stays absent, and a Codex response
+    /// that carried no quota header leaves the time where it was. Walked to the
+    /// `tcr.status.v1` payload, the hop `tcr status --json` reads.
+    ///
+    /// Watched red: without the stamp in `Quota::update_from_codex_headers`, the
+    /// header reading leaves the Codex row absent.
+    #[tokio::test]
+    async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com/codex", 1)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            lock_refresher(),
+            Arc::new(RecordingProber {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            let payload = crate::status::StatusPayload::from_snapshot(
+                &snap,
+                &[],
+                false,
+                None,
+                Default::default(),
+            );
+            let json = serde_json::to_value(&payload).expect("payload serializes");
+            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
+        };
+        let stale = crate::now_ms() - 40 * 60 * 1000;
+        let rewind = |manager: &Manager| {
+            accounts_mut(manager)[1].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        };
+        assert_eq!(wire_value(&manager, 1), None, "nothing read yet");
+
+        let before = crate::now_ms();
+        manager.update_quota(1, &codex_weekly("40"), 200);
+        let read =
+            wire_value(&manager, 1).expect("a Codex header reading carries quotaUpdatedAtMs");
+        assert!(
+            read >= before,
+            "a fresh Codex reading reads as recent: {read} < {before}"
+        );
+        assert_eq!(
+            wire_value(&manager, 0),
+            None,
+            "the Anthropic row read nothing"
+        );
+
+        rewind(&manager);
+        manager.update_quota(1, &reqwest::header::HeaderMap::new(), 502);
+        assert_eq!(
+            wire_value(&manager, 1),
+            Some(stale),
+            "silence is not a reading"
+        );
+
+        rewind(&manager);
+        let before = crate::now_ms();
+        manager.probe_account(1).await;
+        let probed = wire_value(&manager, 1).expect("still present");
+        assert!(
+            probed >= before,
+            "a successful Codex probe moves it: {probed} < {before}"
+        );
+    }
+
+    /// **#466's shorter probe cadence reads a Codex row by its own readings.** A Codex
+    /// account whose weekly window is at its threshold, or that a Codex quota refusal
+    /// marked rejected below it, is out of rotation, so no served response refreshes it
+    /// and only a probe sees its window roll: it gets the near-limit cadence. An idle
+    /// Codex account keeps the routine one, as does the Anthropic account that read
+    /// nothing. The probe that cadence fires is the row's own provider's
+    /// (`a_probe_credential_names_the_accounts_provider_and_account_uuid` pins the
+    /// credential), and the hourly cap counts each account apart, so a faster Codex
+    /// cadence sends Codex bearers to `wham/usage` and nothing to Anthropic.
+    ///
+    /// Watched red: read every Codex row as routine in `ProbeUrgency::of`, and bob and
+    /// carol lose the shorter cadence.
+    #[test]
+    fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
+        use crate::schedule::ProbeUrgency;
+        let codex = |name: &str, priority: i64| Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(name, priority)
+        };
+        let manager = build_manager(
+            config_with(vec![
+                account("alice@example.com", 0),
+                codex("bob@example.com/codex", 1),
+                codex("carol@example.com/codex", 2),
+                codex("dave@example.com/codex", 3),
+            ]),
+            lock_refresher(),
+        );
+        // bob: at its weekly limit, read from a served 200.
+        manager.update_quota(1, &codex_weekly("97"), 200);
+        // carol: a Codex quota refusal at half its weekly window.
+        let mut refusal = codex_weekly("50");
+        refusal.insert(
+            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            "primary".parse().unwrap(),
+        );
+        manager.update_quota(2, &refusal, 429);
+        // dave: idle.
+        manager.update_quota(3, &codex_weekly("10"), 200);
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let urgency: Vec<(&str, ProbeUrgency)> = snap
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), ProbeUrgency::of(a)))
+            .collect();
+        assert_eq!(
+            urgency,
+            vec![
+                ("alice@example.com", ProbeUrgency::Routine),
+                ("bob@example.com/codex", ProbeUrgency::NearLimit),
+                ("carol@example.com/codex", ProbeUrgency::NearLimit),
+                ("dave@example.com/codex", ProbeUrgency::Routine),
+            ]
+        );
+        assert_eq!(
+            (snap.accounts[2].gate, snap.accounts[2].quota_state),
+            (
+                crate::stats::GateReason::Rejected,
+                crate::stats::QuotaState::Normal
+            ),
+            "control: carol is held by its refusal, not by its threshold"
         );
     }
 
@@ -8208,6 +8513,125 @@ mod tests {
         assert_eq!(snap.accounts[1].five_hour, None);
     }
 
+    /// `quotaUpdatedAtMs` is the time of the newest quota reading from EITHER
+    /// source, so a consumer can tell a reading too old to trust from a fresh
+    /// one. `lastProbeMs` alone cannot: a busy account's bars move from response
+    /// headers between probes, and an idle account with a wedged probe shows
+    /// frozen bars that `lastProbeMs` (stamped on failures too) reads as recent.
+    ///
+    /// Walks the hops a consumer sees: the runtime `Quota`, the manager's
+    /// snapshot, and the `tcr.status.v1` payload the server sends the CLI.
+    #[tokio::test]
+    async fn quota_updated_at_is_the_newest_reading_from_probe_or_headers() {
+        let manager = build_manager_with_prober(
+            config_with(vec![account("ok", 0), account("bad", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ScriptedProber {
+                ok_token: "at-ok".to_string(),
+            }),
+        );
+        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            let payload = crate::status::StatusPayload::from_snapshot(
+                &snap,
+                &[],
+                false,
+                None,
+                Default::default(),
+            );
+            let json = serde_json::to_value(&payload).expect("payload serializes");
+            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
+        };
+
+        // Nothing read yet: absent, never a fabricated "just now".
+        assert_eq!(wire_value(&manager, 0), None);
+
+        // A fresh account: a successful probe stamps a recent reading.
+        let before = crate::now_ms();
+        manager.probe_all().await;
+        let fresh = wire_value(&manager, 0).expect("a probed account carries quotaUpdatedAtMs");
+        assert!(
+            fresh >= before && fresh <= crate::now_ms(),
+            "a fresh probe reads as recent: {fresh} not in [{before}, now]"
+        );
+        // A FAILED probe is not a reading: `lastProbeMs` moves, this does not.
+        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+            .last_probe
+            .is_some());
+        assert_eq!(
+            wire_value(&manager, 1),
+            None,
+            "a failed probe read no quota and must not claim one"
+        );
+
+        // A stale account: the last reading was 40 minutes ago, past any sane
+        // freshness limit, and the wire says exactly when.
+        let stale = crate::now_ms() - 40 * 60 * 1000;
+        {
+            let mut accounts = accounts_mut(&manager);
+            accounts[0].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        }
+        assert_eq!(
+            wire_value(&manager, 0),
+            Some(stale),
+            "the status row carries the exact time of the stale reading"
+        );
+
+        // A response with no rate-limit headers (an error page) is silence, not
+        // a reading: the stale time stands.
+        manager.update_quota(0, &reqwest::header::HeaderMap::new(), 502);
+        assert_eq!(wire_value(&manager, 0), Some(stale));
+
+        // A header update after the stale probe moves it forward.
+        let before = crate::now_ms();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.30".parse().expect("header value"),
+        );
+        manager.update_quota(0, &headers, 200);
+        let moved = wire_value(&manager, 0).expect("still present");
+        assert!(
+            moved >= before,
+            "a 5h header reading moves quotaUpdatedAtMs forward: {moved} < {before}"
+        );
+
+        // A header update that returns `false` (no 5h window) but reads the 7d
+        // window is still a reading, and also moves it forward.
+        {
+            let mut accounts = accounts_mut(&manager);
+            accounts[0].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        }
+        let before = crate::now_ms();
+        let mut weekly_only = reqwest::header::HeaderMap::new();
+        weekly_only.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.40".parse().expect("header value"),
+        );
+        assert!(
+            !manager.update_quota(0, &weekly_only, 200),
+            "control: this response carries no 5h window"
+        );
+        let moved = wire_value(&manager, 0).expect("still present");
+        assert!(
+            moved >= before,
+            "a 7d-only header reading moves quotaUpdatedAtMs forward: {moved} < {before}"
+        );
+    }
+
+    /// Write access to the runtime rows, for tests that rewind a timestamp.
+    fn accounts_mut(manager: &Manager) -> std::sync::RwLockWriteGuard<'_, Vec<AccountRuntime>> {
+        manager.accounts.write().expect("accounts lock poisoned")
+    }
+
     /// Probe 429-tolerance: the usage endpoint throttling the *probe* is benign.
     /// After a good probe learns a bar, a following 429 probe must (a) read as
     /// `RateLimited`, never `Error`, and (b) leave the last-good utilization
@@ -10115,8 +10539,9 @@ mod tests {
 
     /// The 1h rewrite's default follows the fleet: on when every account is
     /// OAuth (the window counts a 1h write like a 5m one), off as soon as one
-    /// API-key account is present (billed 2x against 1.25x on every write), and
-    /// an explicit `cacheTtlRewrite` wins either way.
+    /// row of an unrecognized type is present (a static key that may be billed
+    /// 2x against 1.25x on every write), and an explicit `cacheTtlRewrite` wins
+    /// either way. An API-key row cannot be the trigger: it never loads.
     ///
     /// Watched red before the default read the account types: the second
     /// assertion failed, a fleet with an API-key account still rewrote.
@@ -10129,7 +10554,7 @@ mod tests {
         assert!(all_oauth.cache_ttl_rewrite_enabled(), "all OAuth: on");
 
         let mut api_key = account("k", 0);
-        api_key.account_type = "api_key".to_string();
+        api_key.account_type = crate::config::AccountType::Unrecognized("static".to_string());
         let mixed = build_manager(
             config_with(vec![account("a", 0), api_key.clone()]),
             pacing_refresher(),
@@ -11003,9 +11428,10 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let reset = now + Duration::seconds(5_000);
 
-        const ALL: [GateReason; 11] = [
+        const ALL: [GateReason; 12] = [
             GateReason::Ok,
             GateReason::Hold,
+            GateReason::Refused,
             GateReason::FiveHour,
             GateReason::SevenDay,
             GateReason::FableWeekly,
@@ -11088,6 +11514,21 @@ mod tests {
                     vec![
                         GateCase::plain("hold outliving the cache", long, false),
                         GateCase::plain("hold clearing while warm", short, true),
+                    ]
+                }
+                // A 403 refusal hold rides the same deadline as a rate-limit hold,
+                // so it splits on duration exactly the same way; only its name
+                // differs.
+                GateReason::Refused => {
+                    let mut long = gate_runtime();
+                    long.rate_limited_until_ms = Some(now_ms + (CACHE_WARM_HOLD_SECS + 60) * 1_000);
+                    long.hold_cause = HoldCause::Refused;
+                    let mut short = gate_runtime();
+                    short.rate_limited_until_ms = Some(now_ms + 30_000);
+                    short.hold_cause = HoldCause::Refused;
+                    vec![
+                        GateCase::plain("refusal hold outliving the cache", long, false),
+                        GateCase::plain("refusal hold clearing while warm", short, true),
                     ]
                 }
 
@@ -11749,8 +12190,10 @@ mod tests {
             "a write that never landed must not be reflected in memory"
         );
         // The runtime row still flips — the bench takes effect NOW, it just is not
-        // durable, which is exactly what the caller is told.
-        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled);
+        // durable, which is exactly what the caller is told. Read off the row
+        // itself, not a snapshot: this file never held `acct-a`, so a snapshot's
+        // reload marks the row removed and lists nothing.
+        assert!(manager.accounts.read().unwrap()[0].disabled);
         std::fs::remove_file(&path).ok();
 
         // Ambiguous — two disk entries share the identity, so none may be chosen.
@@ -12616,7 +13059,7 @@ mod tests {
     #[test]
     fn add_or_update_account_backfills_identity_and_corrects_a_stale_account_type() {
         let legacy_api_row = Account {
-            account_type: "api".to_string(),
+            account_type: crate::config::AccountType::Unrecognized("api".to_string()),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -12628,7 +13071,7 @@ mod tests {
             build_manager_with_disk(config_with(vec![legacy_api_row]), "f6-backfill");
 
         let submission = Account {
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             account_uuid: Some("uuid-alice".to_string()),
             org_uuid: Some("org-corp-uuid".to_string()),
             org_name: Some("Corp".to_string()),
@@ -12645,7 +13088,8 @@ mod tests {
         {
             let accounts = manager.accounts.read().expect("accounts lock poisoned");
             assert_eq!(
-                accounts[0].account_type, "oauth",
+                accounts[0].account_type,
+                crate::config::AccountType::OAuth,
                 "a stale non-oauth type must be corrected, or refresh_plan silently \
                  never refreshes this account again"
             );
@@ -12655,7 +13099,10 @@ mod tests {
         }
 
         let reloaded = config::load(&path).expect("reload persisted config");
-        assert_eq!(reloaded.accounts[0].account_type, "oauth");
+        assert_eq!(
+            reloaded.accounts[0].account_type,
+            crate::config::AccountType::OAuth
+        );
         assert_eq!(
             reloaded.accounts[0].account_uuid.as_deref(),
             Some("uuid-alice")
@@ -12801,7 +13248,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let mut api = account("api", 0);
-        api.account_type = "api".to_string();
+        api.account_type = crate::config::AccountType::Unrecognized("api".to_string());
         let manager = build_manager(
             config_with(vec![
                 account("idle", 0),

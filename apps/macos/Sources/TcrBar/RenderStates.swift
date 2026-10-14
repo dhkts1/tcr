@@ -74,6 +74,28 @@ enum RenderStates {
                 "henry.fitzgerald@example.com"
             ),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
+            // Option H's hover card (unit H2), pinned by ``hoverCardFixture(for:)``
+            // because this harness has no pointer. 02b: a line in the upper
+            // half, so the card opens below it, on the control account so the
+            // card's CONTROL pill is in frame. 02c: an out-of-tokens line in
+            // the lower half, so the card opens above it. Each is also drawn
+            // without its card and must come out the same size
+            // (``hoverCardKeepsPanelSize(without:with:named:)``).
+            (
+                "02b-mixed-thirteen-hover", .loaded(fleet(mixedJSON)), false,
+                "near@example.com"
+            ),
+            ("02c-mixed-thirteen-hover-lower", .loaded(fleet(mixedJSON)), false, nil),
+            // The strip over the Accounts tab (unit H3) with the pointer on
+            // its 8th segment, spent-3, pinned by ``litAccountFixture(for:)``:
+            // the segment ringed and spent-3's line lit, and no hover card.
+            // Held to the same with-and-without size check as 02b.
+            ("02d-mixed-thirteen-segment-hover", .loaded(fleet(mixedJSON)), false, nil),
+            // "Keep Card Open" (Gil, 2026-10-14) on one live account, ok-2, and
+            // one out-of-tokens account, spent-2, pinned by
+            // ``keptOpenFixture(for:)``: each draws its hover card's content in
+            // its own place in the list, splitting its box around it.
+            ("02e-mixed-thirteen-kept-open", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
             ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false, nil),
@@ -116,6 +138,10 @@ enum RenderStates {
             // own seeding of `FleetView.expandedGroupsKey` for
             // `henry-team`, the wholly-parked group `parkedGroupJSON` builds.
             ("15b-parked-group-expanded", .loaded(fleet(parkedGroupJSON)), false, nil),
+            // A line INSIDE a group box with its hover card (unit H1b): carol,
+            // DEV's one live account, pinned by ``hoverCardFixture(for:)`` and
+            // held to the same with-and-without size check as 02b.
+            ("15c-parked-group-hover", .loaded(fleet(parkedGroupJSON)), false, nil),
             // F2 — the Sessions tab, grouped by account, one row with a
             // tool running and one waiting, plus an unassigned session with
             // no matching Claude Code session file (`sessionsFixture`'s
@@ -193,7 +219,32 @@ enum RenderStates {
             // digits by accident of its own subject, and the strip's failure
             // is a width failure. See ``widestTabBadgesFleet``.
             ("23-widest-tab-badges", .loaded(widestTabBadgesFleet), false, nil),
+            // A delete `tcr` refused, and one that landed on a proxy too old
+            // to drop the row: each line under its own account, in `tcr`'s
+            // words. Option H's rows drew neither until 2026-10-14, so a
+            // refused "Delete Account…" looked like a click that did nothing.
+            // See ``removeControllerFixture(for:)``.
+            ("24-delete-outcomes", .loaded(fleet(healthyJSON)), false, nil),
         ]
+    }
+
+    /// The delete outcomes scene 24 draws; every other scene gets a controller
+    /// holding nothing, which draws no line, the panel's own default.
+    @MainActor
+    private static func removeControllerFixture(for sceneName: String) -> RemoveAccountController {
+        guard sceneName == "24-delete-outcomes" else { return RemoveAccountController() }
+        return .harness(
+            failures: [
+                AccountRef(name: "alice@example.com"): RemoveAccountCommand.Failure(
+                    exitCode: 1,
+                    message:
+                        "Error: the proxy running on :3456 refused this: no account matches 'alice@example.com' Nothing was changed."
+                )
+            ],
+            notices: [
+                AccountRef(name: "bob@example.com"):
+                    "[tcr] the proxy running on :3456 stopped routing to 'bob@example.com', but it predates live removal and keeps listing it as disabled until it restarts."
+            ])
     }
 
     /// Seeds for scene 22, the one scene that needs
@@ -279,6 +330,80 @@ enum RenderStates {
             return .tools
         default: return .accounts
         }
+    }
+
+    /// The row whose hover card a scene shows (``FleetSectionRow/id``), or
+    /// `nil` for none: a lookup by name for the reason ``initialTab(for:)`` is
+    /// one.
+    private static func hoverCardFixture(for sceneName: String) -> String? {
+        switch sceneName {
+        case "02b-mixed-thirteen-hover":
+            return FleetSectionRow.id(group: .ungrouped, accountID: "near@example.com")
+        case "02c-mixed-thirteen-hover-lower":
+            return FleetSectionRow.id(group: .ungrouped, accountID: "spent-5@example.com")
+        case "15c-parked-group-hover":
+            return FleetSectionRow.id(group: .named("dev"), accountID: "carol@example.com")
+        default: return nil
+        }
+    }
+
+    /// The accounts (``Account/id``) a scene keeps open. Every scene gets a
+    /// set, empty for all but one, so the operator's own choice in
+    /// `UserDefaults` never reaches a render.
+    private static func keptOpenFixture(for sceneName: String) -> KeptOpenCards {
+        switch sceneName {
+        case "02e-mixed-thirteen-kept-open":
+            return KeptOpenCards(["ok-2@example.com", "spent-2@example.com"])
+        default: return KeptOpenCards()
+        }
+    }
+
+    /// The account (``Account/id``) whose strip segment a scene points at, or
+    /// `nil` for none: a lookup by name for the reason ``initialTab(for:)`` is
+    /// one.
+    private static func litAccountFixture(for sceneName: String) -> String? {
+        switch sceneName {
+        case "02d-mixed-thirteen-segment-hover": return "spent-3@example.com"
+        default: return nil
+        }
+    }
+
+    /// The hover card's two promises, measured on the scene that pins one:
+    /// the panel is the SAME size with the card as without it (the card is an
+    /// overlay and must never grow the list, the `ffe8a86` rule), and the two
+    /// pictures DIFFER (the card really drew). The second half is the positive
+    /// control: a card that silently failed to draw would pass the first half
+    /// on its own. Prints what failed and answers `false`, which fails the run.
+    ///
+    /// A pointed-at strip segment (unit H3) makes the same two promises: the
+    /// ring and the lit line change no size, and they do draw.
+    @MainActor
+    private static func hoverCardKeepsPanelSize<A: View, B: View>(
+        without: A, with: B, named name: String
+    ) -> Bool {
+        let plain = ImageRenderer(content: without)
+        let hovered = ImageRenderer(content: with)
+        plain.scale = 2
+        hovered.scale = 2
+        guard let a = plain.nsImage, let b = hovered.nsImage else {
+            FileHandle.standardError.write(Data("hover check: \(name) did not render\n".utf8))
+            return false
+        }
+        if a.size != b.size {
+            FileHandle.standardError.write(
+                Data(
+                    ("hover check: \(name) is \(Int(b.size.width))x\(Int(b.size.height))pt "
+                        + "with its card and \(Int(a.size.width))x\(Int(a.size.height))pt "
+                        + "without: the card changed the panel's size\n").utf8))
+            return false
+        }
+        if a.tiffRepresentation == b.tiffRepresentation {
+            FileHandle.standardError.write(
+                Data("hover check: \(name) drew the same picture with and without its card\n".utf8))
+            return false
+        }
+        print("  hover check: \(name) \(Int(b.size.width))x\(Int(b.size.height))pt either way")
+        return true
     }
 
     /// `SessionFile`s for ``sessionsFixture``'s three sessions, on the two
@@ -537,7 +662,10 @@ enum RenderStates {
             UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
         }
 
-        let view =
+        // A closure over the hover pin, so a scene that pins a hover card can
+        // also be drawn without it and the two compared
+        // (``hoverCardKeepsPanelSize(without:with:named:)``).
+        let panel = { (hoverCard: String?, litAccount: String?) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -560,7 +688,7 @@ enum RenderStates {
                 // directly for the two scenes that need it.
                 updater: updater,
                 groupController: GroupController(),
-                removeController: RemoveAccountController(),
+                removeController: removeControllerFixture(for: scene.name),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
@@ -573,7 +701,10 @@ enum RenderStates {
                     ? noRequestsBannerZeroSince : nil,
                 initialClaudeCount: scene.name == "22-no-requests-banner" ? 1 : nil,
                 initialClaudeRoute: scene.name == "22-no-requests-banner"
-                    ? noRequestsBannerRoute : nil
+                    ? noRequestsBannerRoute : nil,
+                initialHoverCard: hoverCard,
+                initialLitAccount: litAccount,
+                initialKeptOpen: keptOpenFixture(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -585,6 +716,10 @@ enum RenderStates {
             // concrete size renders the real content; the scroll area is simply
             // shown at full height instead of clipped.
             .fixedSize()
+        }
+        let hoverCard = hoverCardFixture(for: scene.name)
+        let litAccount = litAccountFixture(for: scene.name)
+        let view = panel(hoverCard, litAccount)
 
         // The shipped default stays unsuffixed — every existing filename this
         // harness produces is unchanged — and only the forced `.comfortable`
@@ -595,6 +730,11 @@ enum RenderStates {
             density == .compact
             ? "\(scene.name)-\(appearance.rawValue).png"
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
+        if hoverCard != nil || litAccount != nil,
+            !hoverCardKeepsPanelSize(without: panel(nil, nil), with: view, named: name)
+        {
+            return false
+        }
         return rasterise(view, named: name, into: directory)
     }
 
@@ -642,7 +782,8 @@ enum RenderStates {
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: .accounts,
-                initialSessionFiles: [:]
+                initialSessionFiles: [:],
+                initialKeptOpen: KeptOpenCards()
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             .fixedSize()
@@ -2748,6 +2889,15 @@ enum RenderStates {
     private static let hold =
         #"[{"window":"7d","minutesUntilReset":6498,"resetAtMs":1786406400224}]"#
 
+    /// A `held` array holding the 5-hour window until `minutes` from the
+    /// render clock, the way `tcr` sends it. Relative for the reason
+    /// `fiveHourResetInMinutes` is: a fixed epoch stops drawing a countdown
+    /// once it has passed.
+    private static func heldFiveHour(inMinutes minutes: Int) -> String {
+        let resetAtMs = Int64((Date().timeIntervalSince1970 + Double(minutes) * 60) * 1000)
+        return #"[{"window":"5h","minutesUntilReset":\#(minutes),"resetAtMs":\#(resetAtMs)}]"#
+    }
+
     /// Two healthy accounts, and the row's two shapes side by side: alice has a
     /// reset on every window and carries a caption beside each percentage; bob
     /// has none on the wire and must still read as a complete row. The caption
@@ -3560,9 +3710,18 @@ enum RenderStates {
             account(
                 "near@example.com", quota: "0.94", state: "near", held: hold,
                 fiveHourResetInMinutes: 47, sevenDayResetInMinutes: 6_498))
+        // Out of tokens the way most of a real fleet is: the 5-hour window
+        // spent and HELD, the week only partly used. The hold is relative to
+        // the render clock (``heldFiveHour(inMinutes:)``), because the fixed
+        // `hold` timestamp is already in the past and a one-line row draws no
+        // "back in" for a reset that has passed.
+        let weeks = ["0.6", "0.5", "0.7", "0.4", "0.6", "0.5"]
         rows += (1...6).map {
             account(
-                "spent-\($0)@example.com", quota: "1.0", state: "spent", held: hold,
+                "spent-\($0)@example.com", quota: "1.0", state: "spent",
+                held: heldFiveHour(inMinutes: 12 + $0 * 30),
+                fiveHour: "1.0", fiveHourState: "spent",
+                sevenDay: weeks[$0 - 1], sevenDayState: "ok",
                 fiveHourResetInMinutes: 12 + $0 * 30, sevenDayResetInMinutes: 6_498)
         }
         rows.append(

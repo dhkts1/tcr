@@ -25,6 +25,7 @@ pub mod codex_login;
 pub mod codex_oauth;
 pub mod codex_probe;
 pub mod config;
+pub mod config_keys;
 pub mod control_identity;
 pub mod demo;
 pub mod doctor;

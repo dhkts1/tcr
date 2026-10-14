@@ -21,7 +21,8 @@ use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::peer;
 use teamclaude_rs::proxy::GROUP_HEADER_NAME;
 use teamclaude_rs::{
-    affinity, build_info, demo, mint, mitm, oauth, server, singleton, status, tui, update,
+    affinity, build_info, config_keys, demo, mint, mitm, oauth, server, singleton, status, tui,
+    update,
 };
 
 #[derive(Parser)]
@@ -82,6 +83,12 @@ enum Command {
     /// one-liners in the docs). Sessions get their own object-shaped verb
     /// rather than a flag that changes `status`'s top-level type.
     Sessions(SessionsArgs),
+    /// Print every account as claude-swap's `list --json` document, for
+    /// CodexBar. JSON only: `tcr status` is the view for a person.
+    ///
+    /// Its own verb for the same reason as `sessions`: the document is an
+    /// object, and `status --json`'s bare array has clients.
+    List(ListArgs),
     /// Print a usage report for the last N days (default 7), read from the
     /// usage ledger — cost, tokens, cache-hit ratio, by model/account/day, and
     /// the busiest sessions.
@@ -1197,6 +1204,16 @@ struct StatusArgs {
     /// Emit the fleet status as a JSON array instead of greppable text.
     #[arg(long)]
     json: bool,
+    /// Exit 4 when an enabled account's last probe failed (error, timeout or
+    /// upstream-down). Never-probed, rate-limited and disabled accounts do not
+    /// count. Output is unchanged; only the exit code differs.
+    ///
+    /// Opt-in because the DEFAULT exit is a contract: TcrBar runs
+    /// `tcr status --json` and reads any non-zero exit as a failed poll
+    /// (`StatusPoller.classify`), which would blank the panel. The rule and why
+    /// 4 rather than 1: `cli::StatusCheck`.
+    #[arg(long)]
+    check: bool,
 }
 
 /// `tcr doctor [--json]`: the route check. Same two options every read-only
@@ -1208,6 +1225,18 @@ struct DoctorArgs {
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit one JSON object instead of greppable `key: value` lines.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `tcr list --json`: the same two options as `status`, and `--json` is the
+/// only output there is.
+#[derive(clap::Args)]
+struct ListArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Emit claude-swap's list schema v1 (required: there is no text form).
     #[arg(long)]
     json: bool,
 }
@@ -1347,12 +1376,12 @@ struct RunArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Prefer accounts labelled with this group when picking an account for a
-    /// NEW request — falls back to the whole pool when the group has no
-    /// capacity, and once a session settles onto an account (a "pin"), that
-    /// pin is honoured group-blind for the rest of the session (correct for
-    /// this PREFER semantics; the restricting form that also constrains an
-    /// existing pin is Phase 2).
+    /// Serve this session from accounts labelled with this group. Strict by
+    /// default: when no member can serve, the request waits for one or gets a
+    /// 429, and is never sent to an account outside the group, even one the
+    /// session is already pinned to. Set `groupSettings.<group>.spillToPool:
+    /// true` in the config to let it fall back to the whole pool instead (a
+    /// reserved group stays strict either way).
     #[arg(long)]
     group: Option<String>,
     /// Launch `codex` instead of `claude`, routed through the proxy's Codex accounts.
@@ -1407,7 +1436,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
         Some(Command::Token(args)) => run_token(args),
-        Some(Command::Priority(args)) => run_priority(args),
+        Some(Command::Priority(args)) => run_priority(args).await,
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Control(args)) => run_control(args).await,
@@ -1415,6 +1444,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Peer(args)) => run_peer(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Sessions(args)) => run_sessions(args).await,
+        Some(Command::List(args)) => run_list(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
@@ -1443,8 +1473,9 @@ fn run_token(args: TokenArgs) -> anyhow::Result<()> {
     cli::print_access_token(&config_path, &args.query)
 }
 
-/// `tcr priority <query> [N|--first|--last]` — set rotation priority.
-fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
+/// `tcr priority <query> [N|--first|--last]` — set rotation priority, in the
+/// RUNNING proxy where there is one.
+async fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let priority = if args.first {
         PriorityArg::First
@@ -1455,7 +1486,7 @@ fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("provide a priority value, or one of --first / --last");
     };
-    cli::set_priority(&config_path, &args.query, priority)
+    cli::set_priority(&config_path, &args.query, priority).await
 }
 
 /// `tcr enable <query>` — clear an account's `disabled` flag, in the
@@ -5674,10 +5705,18 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
     }
 }
 
-/// `tcr status [--json]` — probe every account's live quota and print it.
+/// `tcr status [--json] [--check]` — probe every account's live quota and print it.
+///
+/// The exit code is carried out of [`cli::status`] and spent here, the same
+/// shape as [`run_doctor`]: it is non-zero only under `--check`, after the
+/// output is printed.
 async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::status(&config_path, args.json).await
+    let code = cli::status(&config_path, args.json, args.check).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// `tcr doctor [--json]`: whether Claude Code is routed to this proxy.
@@ -5701,6 +5740,30 @@ async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
 async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     cli::sessions(&config_path, args.json).await
+}
+
+/// `tcr list --json`: claude-swap's list schema v1, for CodexBar.
+///
+/// Bare `tcr list` is a usage error (exit 2, clap's code for one) that names
+/// both ways forward, rather than a second, text rendering: the people who
+/// want a table already have `tcr status`, and a text form here would be one
+/// more thing to keep in step with it.
+///
+/// Exit 1 carries the schema-v1 error envelope on stdout ([`cli::list_v1`]);
+/// `std::process::exit` after the printing, the same shape `run_doctor` uses.
+async fn run_list(args: ListArgs) -> anyhow::Result<()> {
+    if !args.json {
+        eprintln!(
+            "error: `tcr list` prints JSON only, for CodexBar: run `tcr list --json`, or `tcr status` for the readable view"
+        );
+        std::process::exit(2);
+    }
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    let code = cli::list_v1(&config_path).await;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// `tcr wrap [--days N] [--json]` — a usage report read from the ledger.
@@ -6842,7 +6905,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // that already has accounts (see `auto_import_claude_code_login`), and
     // never fatal: the failure paths all warn and boot with zero accounts,
     // exactly as this line did before.
-    let config = if config.accounts.is_empty() {
+    let config = if config.accounts.is_empty() && !config.refuses_claude_code_import() {
         match oauth::auto_import_claude_code_login(&config_path).await {
             // Re-read: the import wrote the file, and re-reading is what makes
             // the running fleet the one on disk.
@@ -6854,6 +6917,15 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     };
 
     init_tracing(args.headless);
+
+    // A misspelled key is kept in the file and has no effect, so say so once
+    // at boot. Never fatal: the file is shared with teamclaude and its
+    // unmodelled keys are kept on purpose (see `config_keys`).
+    if let Some(line) = config_keys::boot_line(&config_keys::unknown_keys(
+        &serde_json::Value::Object(config.extra.clone()),
+    )) {
+        tracing::warn!("{line}");
+    }
 
     // Auto-migrating `throttle` in memory (see `config::load`) is only half the
     // fix Gil asked for — "our code should auto migrate" means the file itself
@@ -8395,6 +8467,31 @@ mod tests {
         }
     }
 
+    /// Every `tcr` command the "proxy too old" warnings tell the user to run
+    /// must be one this binary accepts. All four named a `restart` subcommand,
+    /// which clap rejected with exit 2: the remedy in the warning was itself an
+    /// error.
+    #[test]
+    fn restart_hint_names_only_commands_that_parse() {
+        let commands: Vec<&str> = cli::RESTART_HINT
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tcr "))
+            .collect();
+        assert!(
+            !commands.is_empty(),
+            "the hint must name a tcr command to run: {}",
+            cli::RESTART_HINT
+        );
+        for command in commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("the warning tells the user to run `{command}`, which does not parse: {e}");
+            }
+        }
+    }
+
     /// Each flag alone still parses — the deprecated one is accepted, as promised
     /// to the scripts and launch agents that already pass it.
     #[test]
@@ -8876,7 +8973,7 @@ mod tests {
     fn account_with_groups(name: &str, groups: Option<&[&str]>) -> config::Account {
         config::Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,

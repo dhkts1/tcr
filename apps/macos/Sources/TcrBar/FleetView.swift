@@ -158,6 +158,28 @@ struct FleetView: View {
     /// loop with a pass budget rather than a convergence test.
     @State private var v4ContentHeight: CGFloat = 0
 
+    /// Which row's hover card is showing (option H, unit H2), by
+    /// ``FleetSectionRow/id``, because an account in two groups draws two
+    /// lines. The card hangs from ``v4Body``, never from the list; see
+    /// `AccountHoverCard.swift`.
+    @State private var hoverCard = HoverCardTracker()
+
+    /// The account whose segment the pointer is on in the strip over the
+    /// Accounts tab (unit H3), by ``Account/id``. Lights every line of that
+    /// account; opens no hover card.
+    @State private var litAccount: String?
+
+    /// The accounts whose card is kept open in the Accounts tab ("Keep Card
+    /// Open" in the row's right-click menu, Gil 2026-10-14), by
+    /// ``Account/id``. Persisted under ``keptOpenCardsKey`` in TcrBar's own
+    /// `UserDefaults`, the way ``expandedGroups`` is, so the choice outlives a
+    /// panel close and an app restart on this Mac and never reaches the `tcr`
+    /// config file. Pruned on each poll (``pruneKeptOpenCards()``).
+    @State private var keptOpen: KeptOpenCards
+
+    /// Internal, not `private`, for the reason ``expandedGroupsKey`` is.
+    static let keptOpenCardsKey = "keptOpenAccountCards"
+
     /// Accounts / Sessions / Tools (F2 + F3). `.accounts` selected by default.
     @State private var selectedTab: PanelTab = .accounts
 
@@ -269,7 +291,20 @@ struct FleetView: View {
         // into a zero-request read.
         initialZeroRequestsSince: Date? = nil,
         initialClaudeCount: Int? = nil,
-        initialClaudeRoute: ClaudeRouteRead.Route? = nil
+        initialClaudeRoute: ClaudeRouteRead.Route? = nil,
+        // The row (``FleetSectionRow/id``) whose hover card shows on the first
+        // frame. The render harness has no pointer, so this is the only way it
+        // can draw the card; the live app leaves it `nil` and the pointer
+        // drives it.
+        initialHoverCard: String? = nil,
+        // The account (``Account/id``) whose strip segment is pointed at on
+        // the first frame, for the same reason: the harness has no pointer.
+        initialLitAccount: String? = nil,
+        // The kept-open set for the first frame. `nil`, the live app's value,
+        // reads ``keptOpenCardsKey``; the render harness passes its own set
+        // for every scene, so an operator's real choice never leaks into a
+        // render.
+        initialKeptOpen: KeptOpenCards? = nil
     ) {
         self.poller = poller
         self.server = server
@@ -293,6 +328,12 @@ struct FleetView: View {
         self._zeroRequestsSince = State(initialValue: initialZeroRequestsSince)
         self._claudeCount = State(initialValue: initialClaudeCount)
         self._claudeRoute = State(initialValue: initialClaudeRoute)
+        self._hoverCard = State(initialValue: HoverCardTracker(shown: initialHoverCard))
+        self._litAccount = State(initialValue: initialLitAccount)
+        self._keptOpen = State(
+            initialValue: initialKeptOpen
+                ?? KeptOpenCards(
+                    UserDefaults.standard.stringArray(forKey: Self.keptOpenCardsKey) ?? []))
     }
 
     /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
@@ -332,6 +373,7 @@ struct FleetView: View {
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
+                pruneKeptOpenCards()
             }
         }
         // The kill confirm. `docs/design/tools-tab.md`: "a destructive control
@@ -399,6 +441,43 @@ struct FleetView: View {
             content: { v4Content },
             footer: { v4Footer }
         )
+        // At the panel root, so the list's `ScrollView` cannot clip it and,
+        // being an overlay, it cannot change the panel's size. See
+        // `AccountHoverCard.swift`.
+        .accountHoverCard(
+            shown: hoverCard.shown,
+            onHover: { inside in
+                if inside {
+                    hoverCard.cardEntered()
+                } else {
+                    hoverCard.cardLeft()
+                    settleHoverCardSoon()
+                }
+            },
+            card: { row in hoverCardBody(row) }
+        )
+    }
+
+    /// The account's full card, as it was drawn in the list before option H,
+    /// with the same gear and right-click menu from `AccountRow`'s one
+    /// definition.
+    @ViewBuilder
+    private func hoverCardBody(_ row: FleetSectionRow) -> some View {
+        if case .loaded(let fleet) = poller.state {
+            AccountHoverCardContent(row: row, now: Date(), snapshotMode: snapshotMode) {
+                v4AccountRow(row.account, in: fleet, actionsOnly: true)
+            } menu: {
+                v4AccountRow(row.account, in: fleet, menuOnly: true)
+            }
+        }
+    }
+
+    /// A leave waits a moment before the card goes, so the pointer can cross
+    /// from a line onto its card (``HoverCardTracker/settle()``).
+    private func settleHoverCardSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + V4.hoverCardGraceSeconds) {
+            hoverCard.settle()
+        }
     }
 
     /// Every account row the Accounts tab would draw, or `nil` when there is no
@@ -519,7 +598,7 @@ struct FleetView: View {
         if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
             switch visibleTab {
             case .accounts:
-                SummaryLine.accounts(fleet)
+                if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
@@ -602,11 +681,16 @@ struct FleetView: View {
         case .loaded(let fleet) where !fleet.accounts.isEmpty:
             switch visibleTab {
             case .accounts:
+                // Over the list and outside its `ScrollView`, so it does not
+                // scroll; the list's own budget is unchanged and the panel
+                // grows by the strip (option H's note: "the list is the same").
+                accountsStrip(fleet)
                 if fleet.source.countersAreStructural {
                     offlineNotice(fleet.source)
                 }
                 if snapshotMode {
                     accountsTabV4(fleet)
+                        .hoverCardList()
                 } else {
                     ScrollView {
                         accountsTabV4(fleet)
@@ -623,6 +707,9 @@ struct FleetView: View {
                             )
                     }
                     .frame(height: v4ListHeight(for: fleet))
+                    // The VISIBLE list, after the frame, so "the lower half"
+                    // means the lower half of what the reader can see.
+                    .hoverCardList()
                     .onPreferenceChange(V4ContentHeightKey.self) {
                         v4ContentHeight = PanelHeight.settled(v4ContentHeight, $0)
                     }
@@ -661,6 +748,25 @@ struct FleetView: View {
         Task { await peers.refresh() }
     }
 
+    /// The strip over the Accounts tab (unit H3), from the same sections,
+    /// caps and forms ``AccountsTabV4`` draws, so its segments read in the
+    /// list's own order.
+    private func accountsStrip(_ fleet: Fleet) -> some View {
+        FleetStripHeader(
+            strip: AccountsTabV4<EmptyView, EmptyView>.strip(
+                fleet: fleet, controlName: control.current, expandedGroups: expandedGroups,
+                lentTo: peers.snapshot.lentTo, exits: peers.snapshot.exits,
+                keptOpen: keptOpen, now: Date()),
+            lit: litAccount
+        ) { account, inside in
+            if inside {
+                litAccount = account
+            } else if litAccount == account {
+                litAccount = nil
+            }
+        }
+    }
+
     private func accountsTabV4(_ fleet: Fleet) -> some View {
         accountsTabBody(fleet)
             // One read per visit to this tab, for the lent-to lines. The read
@@ -680,6 +786,10 @@ struct FleetView: View {
             exits: peers.snapshot.exits,
             exitPeers: peers.snapshot.rows.filter { $0.trust == .trusted }.map(\.title),
             exitPeerRows: peers.snapshot.entries,
+            // Every account line is a `Menu` now (`AccountLineRow`), and
+            // `ImageRenderer` draws a `Menu` as the "prohibited" glyph, so a
+            // render has to ask for the still label.
+            snapshotMode: snapshotMode,
             onSetExit: { account, route, must in
                 peers.run(
                     PeerCommand.accountExit(account: account, route: route, must: must))
@@ -690,20 +800,42 @@ struct FleetView: View {
                 // re-open on the next visit.
                 SettingsNavigation.shared.peerSheet = lender
                 onSettings()
+            },
+            hoveredRow: hoverCard.shown,
+            litAccount: litAccount,
+            keptOpen: keptOpen,
+            onHoverLine: { rowID, inside in
+                if inside {
+                    hoverCard.rowEntered(rowID)
+                } else {
+                    hoverCard.rowLeft(rowID)
+                    settleHoverCardSoon()
+                }
+            },
+            // Read here, on the panel's own controllers, because option H's
+            // rows never drew them: a refused delete looked like no click.
+            notices: { account in
+                AccountRowNotice.collect(
+                    deleteFailure: removeController.failure(for: account.ref),
+                    deleteNotice: removeController.notice(for: account.ref),
+                    groupFailure: groupController.failure(forAccount: account.ref),
+                    toggleFailure: accounts.failure(for: account.ref))
+            },
+            menu: { account in
+                // The row's own actions, from the ONE definition of them —
+                // `AccountRow`'s menu, rendered with no row around it. A second
+                // copy of that menu for the v4 card is a second thing to keep in
+                // step with `tcr`'s subcommands.
+                v4AccountRow(account, in: fleet, menuOnly: true)
+            },
+            actions: { account in
+                // The SAME definition again, drawn this time as the visible
+                // controls in the card's trailing slot. `.contextMenu` was the
+                // card's only interaction until now: seven per-account actions,
+                // two destructive, reachable by pointer alone.
+                v4AccountRow(account, in: fleet, actionsOnly: true)
             }
-        ) { account in
-            // The row's own actions, from the ONE definition of them —
-            // `AccountRow`'s menu, rendered with no row around it. A second
-            // copy of that menu for the v4 card is a second thing to keep in
-            // step with `tcr`'s subcommands.
-            v4AccountRow(account, in: fleet, menuOnly: true)
-        } actions: { account in
-            // The SAME definition again, drawn this time as the visible
-            // controls in the card's trailing slot. `.contextMenu` was the
-            // card's only interaction until now: seven per-account actions,
-            // two destructive, reachable by pointer alone.
-            v4AccountRow(account, in: fleet, actionsOnly: true)
-        }
+        )
     }
 
     /// One `AccountRow`, built exactly as the legacy panel builds it, rendering
@@ -727,7 +859,11 @@ struct FleetView: View {
             allAccounts: fleet.accounts,
             snapshotMode: snapshotMode,
             menuOnly: menuOnly,
-            actionsOnly: actionsOnly
+            actionsOnly: actionsOnly,
+            cardKeptOpen: AccountsTabV4<EmptyView, EmptyView>.keepsTallCard(
+                account, lentTo: peers.snapshot.lentTo, exits: peers.snapshot.exits)
+                ? nil : keptOpen.contains(account.id),
+            onToggleKeptOpen: { toggleKeptOpen(account.id) }
         )
     }
 
@@ -2174,6 +2310,25 @@ struct FleetView: View {
     /// this count needs an answer either way. See ``NoRequestsBanner``.
     private func refreshClaudeCount() {
         claudeCount = ProcessTable.read().filter { $0.name == "claude" }.count
+    }
+
+    /// Drops every kept-open account the poll that just landed no longer
+    /// lists, so a card never stays open as a ghost of an account that left.
+    /// Only off a loaded fleet: an unreachable proxy says nothing about which
+    /// accounts exist, and pruning on it would close every card.
+    private func pruneKeptOpenCards() {
+        guard case .loaded(let fleet) = poller.state else { return }
+        let pruned = keptOpen.pruned(to: fleet.accounts)
+        guard pruned != keptOpen else { return }
+        keptOpen = pruned
+        UserDefaults.standard.set(keptOpen.ids, forKey: Self.keptOpenCardsKey)
+    }
+
+    /// "Keep Card Open" / "Close Card": the line turns into the card, or the
+    /// card back into the line, at once.
+    private func toggleKeptOpen(_ accountID: String) {
+        keptOpen.toggle(accountID)
+        UserDefaults.standard.set(keptOpen.ids, forKey: Self.keptOpenCardsKey)
     }
 
     /// Advances or clears ``zeroRequestsSince`` off the poll that just landed.
@@ -3914,6 +4069,14 @@ struct AccountRow: View {
     /// Takes precedence over ``menuOnly`` when both are set, which no call site
     /// does — the card passes one or the other.
     var actionsOnly: Bool = false
+    /// Whether this account's card is kept open in the Accounts tab, or `nil`
+    /// where the menu offers no "Keep Card Open" at all: the legacy panel,
+    /// which has no hover card to keep, and an account that already draws
+    /// its tall card (a lease line or an exit row).
+    var cardKeptOpen: Bool? = nil
+    /// Opens or closes this account's kept-open card (``FleetView``'s set,
+    /// keyed by ``Account/id``).
+    var onToggleKeptOpen: () -> Void = {}
     /// The last "Copy Access Token" that did not land — `tcr`'s own words,
     /// drawn under the row like the other failure lines. Row-local rather
     /// than a controller: nothing else needs to know, and a copy that did
@@ -4495,11 +4658,11 @@ struct AccountRow: View {
         if let verdict = accounts.verdict(for: account.ref, reportedDisabled: account.disabled) {
             parts.append(verdict.spokenLabel)
         }
-        // Same reason `removalNoticeLine` is drawn at all: a VoiceOver user
-        // gets no other signal that the delete landed but the row did not
-        // change, since nothing here re-derives the fleet from the config.
-        if removeController.needsRestart(account.ref) {
-            parts.append("removed from config and stopped, stays listed as disabled until the proxy restarts")
+        // Same reason `removalNoticeLine` is drawn at all: a delete that landed
+        // while the row stays listed (a proxy built before live removal) has
+        // no other signal, and `tcr`'s words are the reason.
+        if let notice = removeController.notice(for: account.ref) {
+            parts.append("delete: \(notice)")
         }
         return parts.joined(separator: ", ")
     }
@@ -4601,6 +4764,18 @@ struct AccountRow: View {
     @ViewBuilder
     private var contextMenuItems: some View {
         let enabling = account.disabled
+        // First, and in its own section: it changes how this panel draws the
+        // account, not the account, and Gil asked for it in this menu (Gil,
+        // 2026-10-14: "The row's right-click menu gains 'Keep card open' /
+        // 'Close card'").
+        if let kept = cardKeptOpen {
+            Button(kept ? "Close Card" : "Keep Card Open") { onToggleKeptOpen() }
+                .help(
+                    kept
+                        ? "Draws this account as one line again."
+                        : "Shows this account's card in the list all the time, on this Mac.")
+            Divider()
+        }
         Button(enabling ? "Enable" : "Disable") {
             Task { await performToggle(enabling: enabling) }
         }
@@ -4725,7 +4900,12 @@ struct AccountRow: View {
                 // not.
                 parkToggle(for: group)
                 Button("Remove from \(group)") {
-                    Task { await groupController.remove(account: account.ref, from: group) }
+                    Task {
+                        await groupController.remove(account: account.ref, from: group)
+                        // The proxy re-reads group membership on the poll
+                        // itself; asking now shows it without waiting one out.
+                        _ = await onChanged()
+                    }
                 }
                 Button("Delete group “\(group)” for everyone…") {
                     confirmDeleteGroup(group)
@@ -4736,6 +4916,7 @@ struct AccountRow: View {
                         for group in (account.groups ?? []) {
                             await groupController.remove(account: account.ref, from: group)
                         }
+                        _ = await onChanged()
                     }
                 }
             case .addToGroup:
@@ -4878,19 +5059,23 @@ struct AccountRow: View {
     /// actual default). Names the account, states the consequence in plain
     /// language (this is not reversible from the UI — the saved OAuth tokens
     /// are gone and getting the account back needs a fresh `tcr login`), and
-    /// states up front that the row stays listed as disabled until the proxy
-    /// restarts, even though the account itself stops serving right away.
+    /// says what the panel will show: the account stops serving and its row
+    /// goes, with no restart.
+    ///
+    /// A delete that lands polls at once rather than waiting out the poll
+    /// interval, so the row leaves while the person who clicked is still
+    /// looking. A refused one stays on the row with `tcr`'s reason
+    /// (``AccountRowNotice``).
     private func confirmDeleteAccount() {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Delete account “\(account.name)”?"
         alert.informativeText = """
             This removes “\(account.name)” and its saved credentials from the config. \
-            It is not reversible from here — getting it back means running `tcr login` \
+            It is not reversible from here: getting it back means running `tcr login` \
             again from scratch.
 
-            The account stops serving immediately, but this row stays listed here as \
-            disabled until the proxy restarts.
+            The account stops serving at once and leaves this list. No restart is needed.
             """
         let delete = alert.addButton(withTitle: "Delete Account")
         delete.hasDestructiveAction = true
@@ -4901,7 +5086,11 @@ struct AccountRow: View {
         delete.keyEquivalent = ""
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { await removeController.remove(account: account.ref) }
+        Task {
+            if case .accepted = await removeController.remove(account: account.ref) {
+                _ = await onChanged()
+            }
+        }
     }
 
     /// Shared by "Copy Account Name" and the per-group command copy — one
@@ -5382,33 +5571,22 @@ struct AccountRow: View {
         }
     }
 
-    /// Drawn after a successful ``RemoveAccountController/remove(account:org:)``
-    /// and never cleared while the panel stays open — the whole reason it
-    /// exists. `remove_account` now disables the account in the running proxy
-    /// before deleting it from the config, so the account itself stops
-    /// serving immediately — but this row keeps rendering exactly as it did
-    /// before, because nothing here re-derives the fleet from a config the
-    /// running proxy has not re-read, and the row's membership in the fleet
-    /// list is itself a boot-time snapshot (see ``RemoveAccountControl``'s
-    /// doc-comment). A silent success here is the exact bug this codebase
-    /// already lost an evening to for the enable/disable toggle — so this
-    /// line says what is actually true: stopped now, listed as disabled until
-    /// the next restart. It must not claim the row will disappear, because it
-    /// will not.
+    /// What `tcr` said while a delete of this row succeeded. A delete that
+    /// lands takes the row off the panel on the next poll, so this is drawn
+    /// only when the row is still here afterwards, and `tcr`'s words say why:
+    /// a proxy built before live removal keeps listing the row until it
+    /// restarts (see ``RemoveAccountCommand``'s doc-comment).
     ///
     /// `Tok.near`, matching `verdictLine`'s `.notHonoured`/`.spokeUp` tint:
     /// nothing failed — the delete landed — so this must not wear the error
     /// colour the line above reserves for a `tcr` failure.
     @ViewBuilder
     private var removalNoticeLine: some View {
-        if removeController.needsRestart(account.ref) {
-            Label(
-                "Removed from config and stopped. Stays listed as disabled until the proxy restarts.",
-                systemImage: "arrow.triangle.2.circlepath"
-            )
-            .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
-            .foregroundStyle(Tok.near)
-            .fixedSize(horizontal: false, vertical: true)
+        if let notice = removeController.notice(for: account.ref) {
+            Label(notice, systemImage: "arrow.triangle.2.circlepath")
+                .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
+                .foregroundStyle(Tok.near)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

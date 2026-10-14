@@ -109,7 +109,7 @@ impl Manager {
                 crate::provider::Provider::Codex => false,
             })
             .filter(|(_, a)| {
-                a.account_type == "oauth"
+                a.account_type.is_oauth()
                     && a.refresh_token.is_some()
                     && !a.disabled
                     && a.status != AccountStatus::Error

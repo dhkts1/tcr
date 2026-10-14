@@ -1843,7 +1843,7 @@ mod fleet {
     fn account() -> Account {
         Account {
             name: "lender-fake".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: teamclaude_rs::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             // One org, so every borrowed request lands in ONE per-org GCRA

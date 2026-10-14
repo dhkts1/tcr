@@ -54,7 +54,7 @@ use crate::config;
 use crate::fallback;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
-    InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome,
+    InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
 use crate::quota::{quota_rejections, UnifiedRejectionKind};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
@@ -902,6 +902,11 @@ fn stable_session_key(
 /// ever answers locally belongs under this prefix.
 pub const STATUS_PATH: &str = "/_tcr/status";
 
+/// Path of the light quota read [`quota_handler`] serves, for a status line that
+/// ticks every turn: per account its gate and its 5-hour and weekly utilization,
+/// read from memory. `GET` only, behind the same gate as [`STATUS_PATH`].
+pub const QUOTA_PATH: &str = "/_tcr/quota";
+
 /// Path of the live account-control endpoint [`set_disabled_handler`] serves —
 /// `POST` only, the one route on this process that MUTATES rotation.
 ///
@@ -1013,6 +1018,24 @@ pub const CONTROL_PATH: &str = "/_tcr/accounts/control";
 /// [`DISABLED_ENDPOINT`]/[`ADD_ACCOUNT_ENDPOINT`] so a caller can tell which of
 /// the three mutating routes answered.
 pub const CONTROL_ENDPOINT: &str = "account-control";
+
+/// Path of the live priority endpoint [`set_priority_handler`] serves, `POST`
+/// only, the fourth route on this process that changes rotation state.
+///
+/// It exists because `priority` was a boot-time read: `tcr priority` wrote the
+/// config file and the running proxy kept ranking by the old value until it
+/// restarted, which is the cold-cache event this tool exists to avoid.
+///
+/// Same shape as [`DISABLED_PATH`] and for the same reasons: registered as a
+/// real route so axum matches it exactly and BEFORE the catch-all, so a `POST`
+/// here can never be rewritten onto api.anthropic.com carrying a pooled OAuth
+/// Bearer. What authorizes the change is [`local_endpoint_gate`] plus the
+/// `application/json` requirement.
+pub const PRIORITY_PATH: &str = "/_tcr/accounts/priority";
+
+/// The [`ENDPOINT_HEADER`] value [`set_priority_handler`] stamps, so a caller
+/// can tell which mutating route answered.
+pub const PRIORITY_ENDPOINT: &str = "accounts-priority";
 
 /// Body cap for the local control route: a JSON object with three short fields.
 /// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
@@ -1544,6 +1567,12 @@ pub fn app(manager: Arc<Manager>) -> Router {
             STATUS_PATH,
             axum::routing::get(status_handler).fallback(status_method_not_allowed),
         )
+        // The quota read: a pure GET like the status route, registered the same
+        // way and for the same reasons.
+        .route(
+            QUOTA_PATH,
+            axum::routing::get(quota_handler).fallback(quota_method_not_allowed),
+        )
         // The two MUTATING local routes. Same reasoning as above, and the method
         // fallback matters more here: an unregistered method must answer a local
         // 405, never fall through to `handle` and be forwarded upstream.
@@ -1558,6 +1587,10 @@ pub fn app(manager: Arc<Manager>) -> Router {
         .route(
             CONTROL_PATH,
             axum::routing::post(set_control_handler).fallback(control_method_not_allowed),
+        )
+        .route(
+            PRIORITY_PATH,
+            axum::routing::post(set_priority_handler).fallback(priority_method_not_allowed),
         )
         .fallback(handle)
         .with_state(manager)
@@ -1749,6 +1782,51 @@ async fn status_handler(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     // Operational state that is stale the instant it is read, from a
     // credential-holding process — never store it anywhere.
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    response
+}
+
+/// A non-`GET` on [`QUOTA_PATH`]. A local 405, for the reasons
+/// [`status_method_not_allowed`] gives.
+async fn quota_method_not_allowed() -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr quota endpoint is read-only: GET.",
+        None,
+    )
+}
+
+/// `GET /_tcr/quota`: per account its gate and its 5-hour and weekly
+/// utilization with resets, the [`crate::status::QuotaPayload`] projection.
+///
+/// Gated exactly as [`status_handler`] is, through [`local_endpoint_gate`]. It
+/// answers from the manager's in-memory snapshot: no probe, no token refresh,
+/// no upstream call and, unlike the status route, no peers-file read, so a
+/// status line can call it on every turn. The one disk access is the config
+/// `stat` inside [`Manager::snapshot`], which re-reads the file only when its
+/// mtime moved.
+async fn quota_handler(
+    State(manager): State<Arc<Manager>>,
+    parts: axum::http::request::Parts,
+) -> Response {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "quota") {
+        return refusal;
+    }
+
+    let payload =
+        crate::status::QuotaPayload::from_snapshot(&manager.snapshot(OffsetDateTime::now_utc()));
+    let Ok(body) = serde_json::to_string(&payload) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "Could not serialize the quota snapshot.",
+            None,
+        );
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert("cache-control", HeaderValue::from_static("no-store"));
     response
 }
@@ -2014,6 +2092,130 @@ pub struct SetControlResponse {
     pub warning: Option<String>,
 }
 
+/// The 200 body of [`PRIORITY_PATH`]. Deserializable too, because `tcr
+/// priority` reads it and both halves of the wire contract belong to one type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SetPriorityResponse {
+    /// The RESOLVED account name, for the same reason as
+    /// [`SetDisabledResponse::name`].
+    pub name: String,
+    /// The priority now in force in the live rotation.
+    pub priority: i64,
+}
+
+/// The request body of [`PRIORITY_PATH`]. Both fields are `Option` so a body
+/// missing either is a 400 naming the field, the same reasoning as
+/// [`SetDisabledRequest`].
+#[derive(serde::Deserialize)]
+struct SetPriorityRequest {
+    query: Option<String>,
+    priority: Option<i64>,
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the priority route produced.
+fn stamp_priority_endpoint(response: Response) -> Response {
+    stamp_endpoint_as(response, PRIORITY_ENDPOINT)
+}
+
+/// A non-`POST` on [`PRIORITY_PATH`]. Answered locally with 405, same
+/// reasoning as [`disabled_method_not_allowed`].
+async fn priority_method_not_allowed() -> Response {
+    stamp_priority_endpoint(error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr priority endpoint takes POST.",
+        None,
+    ))
+}
+
+/// `POST /_tcr/accounts/priority`: set one account's priority IN THE LIVE
+/// ROTATION, for `tcr priority`.
+///
+/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
+/// first (refusal NOT stamped), then [`is_json_content_type`] (stamped). The
+/// work is [`Manager::set_priority_by_query`], which changes memory only; the
+/// CLI writes the config file, because `--first`/`--last` are computed from it.
+async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-priority") {
+        // NOT stamped: see `set_disabled_handler`'s identical comment.
+        return refusal;
+    }
+
+    if !is_json_content_type(&parts.headers) {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "The tcr priority endpoint requires Content-Type: application/json.",
+            None,
+        ));
+    }
+
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+            None,
+        ));
+    };
+    let Some(parsed) = parse_object::<SetPriorityRequest>(&bytes) else {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object: {\"query\": \"<account>\", \"priority\": 0}.",
+            None,
+        ));
+    };
+    let (Some(query), Some(priority)) = (parsed.query, parsed.priority) else {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Both \"query\" (string) and \"priority\" (integer) are required.",
+            None,
+        ));
+    };
+    if query.trim().is_empty() {
+        return stamp_priority_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "\"query\" must not be empty.",
+            None,
+        ));
+    }
+
+    match manager.set_priority_by_query(&query, priority) {
+        SetPriorityOutcome::NoMatch => stamp_priority_endpoint(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("No account in the live rotation matches '{query}'."),
+            None,
+        )),
+        SetPriorityOutcome::Ambiguous(names) => stamp_priority_endpoint(error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &crate::cli::ambiguous_query_message(&query, &names),
+            None,
+        )),
+        SetPriorityOutcome::Applied { name } => {
+            let payload = SetPriorityResponse { name, priority };
+            let Ok(body) = serde_json::to_string(&payload) else {
+                return stamp_priority_endpoint(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Could not serialize the priority result.",
+                    None,
+                ));
+            };
+            let mut response = Response::new(Body::from(body));
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert("cache-control", HeaderValue::from_static("no-store"));
+            stamp_priority_endpoint(response)
+        }
+    }
+}
+
 /// `POST /_tcr/accounts/control` — set or clear the identity-bound CONTROL
 /// account IN THE LIVE ROTATION, for `tcr control`.
 ///
@@ -2145,7 +2347,7 @@ async fn add_account_method_not_allowed() -> Response {
 struct AddAccountRequest {
     name: Option<String>,
     #[serde(rename = "type", default)]
-    account_type: Option<String>,
+    account_type: Option<config::AccountType>,
     #[serde(default)]
     account_uuid: Option<String>,
     #[serde(default)]
@@ -2379,12 +2581,24 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             None,
         ));
     };
+    // The same rule `config::load` applies to a file row: tcr does not serve
+    // API-key accounts. Without this, one added here would serve, and only
+    // the next load would set it aside.
+    let account_type = parsed.account_type.unwrap_or_default();
+    if matches!(account_type, config::AccountType::ApiKey) {
+        return stamp_add_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "tcr does not serve API-key accounts; add a Claude login instead.",
+            None,
+        ));
+    }
     let refresh_token = parsed.refresh_token.filter(|t| !t.trim().is_empty());
     let no_refresh_token_warning = refresh_token.is_none().then_some(NO_REFRESH_TOKEN_WARNING);
 
     let account = config::Account {
         name,
-        account_type: parsed.account_type.unwrap_or_else(|| "oauth".to_string()),
+        account_type,
         provider: parsed.provider,
         account_uuid: parsed.account_uuid,
         org_uuid: parsed.org_uuid,
@@ -4179,12 +4393,37 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // A 403 here is evidence about THIS request's account access, not proof the
         // refresh token itself is dead — that is still caught at the source, where
         // a rejected refresh sets `Error` directly.
+        //
+        // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
+        // keeps the status `Active`. Without one, rotation brought the account
+        // straight back and the next request paid the same refused round trip,
+        // while `tcr status` read the row as `gate: ok`; the hold's gate reads
+        // `refused` instead.
         if status == StatusCode::FORBIDDEN {
             tracing::warn!(
                 account = account_name.as_deref().unwrap_or("?"),
                 account_index = idx,
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
+            // Upstream's own words for the refusal, read capped in size and time
+            // exactly as the 429 arm reads its body, so a body that never
+            // completes cannot become a hang.
+            match tokio::time::timeout(
+                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+            )
+            .await
+            {
+                Ok(Ok(body)) => {
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &body)
+                }
+                Ok(Err(_)) | Err(_) => tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    "upstream 403 body could not be read within the cap"
+                ),
+            }
+            manager.mark_refused(idx);
             refused_403.push((idx, account_name.clone()));
             tried.insert(idx);
             continue;
@@ -6904,6 +7143,7 @@ fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
         GateReason::SevenDay | GateReason::FableWeekly => Some("seven_day"),
         GateReason::Ok
         | GateReason::Hold
+        | GateReason::Refused
         | GateReason::Standard
         | GateReason::Login
         | GateReason::Rejected
@@ -7038,6 +7278,7 @@ fn gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Ok => "in rotation",
         GateReason::Hold => "on an upstream hold",
+        GateReason::Refused => "refused upstream (403)",
         GateReason::FiveHour => "in the 5-hour window",
         GateReason::SevenDay => "in the weekly window",
         GateReason::FableWeekly => "in the Fable weekly window",
@@ -7312,7 +7553,7 @@ mod tests {
     fn add_account_request_carries_the_plan_fields() {
         let mut account = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -7360,7 +7601,7 @@ mod tests {
     fn add_account_request_carries_the_provider() {
         let mut account = Account {
             name: "alice@example.com/codex".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: crate::provider::Provider::Codex,
             account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
             org_uuid: None,
@@ -7419,7 +7660,7 @@ mod tests {
             http1_only: false,
             accounts: vec![Account {
                 name: "dummy".to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
@@ -9644,6 +9885,288 @@ mod tests {
         }
     }
 
+    // --- GET /_tcr/quota ----------------------------------------------------
+
+    /// The public spelling of the quota route, written out rather than read from
+    /// the constant so a rename of the path a status line calls fails here.
+    const QUOTA_URI: &str = "/_tcr/quota";
+
+    /// [`status_request`]'s shape for the quota route: drive the router directly
+    /// with a `ClientAddr` we control.
+    async fn quota_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(QUOTA_URI);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder.body(Body::empty()).expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, body)
+    }
+
+    /// Feed account `idx` a 5-hour and a weekly reading through the same headers
+    /// a live reply carries. Resets are whole seconds, as Anthropic sends them.
+    fn feed_quota(manager: &Manager, idx: usize, five_hour: &str, seven_day: &str, now_s: i64) {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (
+                "anthropic-ratelimit-unified-5h-utilization",
+                five_hour.to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                (now_s + 3_600).to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization",
+                seven_day.to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset",
+                (now_s + 86_400).to_string(),
+            ),
+        ] {
+            headers.insert(name, HeaderValue::from_str(&value).expect("header value"));
+        }
+        manager.update_quota(idx, &headers, 200);
+    }
+
+    /// THE GATE for the quota route: a status line ticks every turn, so the answer
+    /// must come from memory. It returns the small per-account shape, makes no
+    /// upstream attempt, and answers well inside one status-line tick.
+    ///
+    /// The upstream counter is checked live at the end: one real `/v1/messages`
+    /// through the same manager must move it to 1, so the 0 before it is a
+    /// measurement and not a harness that cannot count.
+    #[tokio::test]
+    async fn quota_endpoint_answers_from_memory_without_upstream() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![Some(raw_200())]).await;
+        let manager = fleet_configured(up_addr, &["alice", "bob"], |_| {});
+        let now_s = crate::now_ms() / 1000;
+        feed_quota(&manager, 0, "0.5", "0.2", now_s);
+        // Over `dummy_config`'s 0.90 threshold, so bob's gate names the window.
+        feed_quota(&manager, 1, "0.96", "0.4", now_s);
+
+        let started = std::time::Instant::now();
+        let (status, headers, body) = quota_request(
+            Arc::clone(&manager),
+            Method::GET,
+            Some(loopback_peer()),
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "loopback GET on the quota route is served, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the quota route answers from memory, took {elapsed:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the quota route never calls upstream"
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(payload["kind"], "tcr.quota.v1");
+        let accounts = payload["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts.len(), 2, "one row per account: {payload}");
+
+        // The row is the small shape and nothing more: a status line has no use
+        // for token counters, groups or plan fields.
+        let mut keys: Vec<&str> = accounts[0]
+            .as_object()
+            .expect("account row is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "fiveHour",
+                "fiveHourResetMs",
+                "gate",
+                "name",
+                "sevenDay",
+                "sevenDayResetMs"
+            ]
+        );
+
+        assert_eq!(accounts[0]["name"], "alice");
+        assert_eq!(accounts[0]["gate"], "ok");
+        assert_eq!(accounts[0]["fiveHour"], 0.5);
+        assert_eq!(accounts[0]["fiveHourResetMs"], (now_s + 3_600) * 1000);
+        assert_eq!(accounts[0]["sevenDay"], 0.2);
+        assert_eq!(accounts[0]["sevenDayResetMs"], (now_s + 86_400) * 1000);
+        assert_eq!(accounts[1]["name"], "bob");
+        assert_eq!(accounts[1]["gate"], "five-hour");
+        assert_eq!(accounts[1]["fiveHour"], 0.96);
+
+        // Positive control for the zero above: a real request through the same
+        // manager reaches the counted upstream.
+        assert_eq!(post_one(Arc::clone(&manager)).await, 200);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the upstream counter is live"
+        );
+    }
+
+    /// **The quota route names a Codex row's provider, and only a Codex row's.** A
+    /// status line reads these rows as its Claude picture, and a ChatGPT account's
+    /// windows must not pass for Claude capacity. `provider` is spelled as on
+    /// `tcr status --json`: `"codex"` on a Codex row, absent on an Anthropic one, so the
+    /// rows of an Anthropic-only fleet are the bytes they were (the six keys
+    /// `quota_endpoint_answers_from_memory_without_upstream` pins).
+    ///
+    /// Watched red: without the field, the Codex row is the six keys of a Claude one.
+    #[tokio::test]
+    async fn quota_endpoint_names_a_codex_rows_provider() {
+        let manager = Manager::with_live_refresher(
+            codex_fleet("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            None,
+        );
+        let now_s = crate::now_ms() / 1000;
+        feed_quota(&manager, 0, "0.5", "0.2", now_s);
+        let mut weekly = HeaderMap::new();
+        weekly.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("40"),
+        );
+        weekly.insert(
+            "x-codex-primary-window-minutes",
+            HeaderValue::from_static("10080"),
+        );
+        weekly.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_str(&(now_s + 86_400).to_string()).expect("header value"),
+        );
+        manager.update_quota(1, &weekly, 200);
+
+        let (status, _headers, body) = quota_request(
+            Arc::clone(&manager),
+            Method::GET,
+            Some(loopback_peer()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        let rows = payload["accounts"].as_array().expect("accounts array");
+        assert_eq!(rows[0]["name"], "alice@example.com");
+        assert!(
+            rows[0].get("provider").is_none(),
+            "an Anthropic row carries no provider key: {}",
+            rows[0]
+        );
+        assert_eq!(rows[1]["name"], "bob@example.com/codex");
+        assert_eq!(rows[1]["provider"], "codex", "{}", rows[1]);
+        assert!(
+            rows[1]["sevenDay"]
+                .as_f64()
+                .is_some_and(|v| (v - 0.4).abs() < 1e-9),
+            "the Codex row carries its own weekly reading: {}",
+            rows[1]
+        );
+    }
+
+    /// The quota route passes the same [`local_endpoint_gate`] as the status
+    /// route: a non-loopback or unproven peer is refused, and a configured proxy
+    /// key is required with no loopback exemption. A refusal carries no fleet
+    /// state.
+    #[tokio::test]
+    async fn quota_endpoint_has_the_status_gate() {
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let manager =
+                Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+            let (status, _headers, body) = quota_request(manager, Method::GET, peer, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} must be refused");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("dummy") && !text.contains("accounts"),
+                "a refused caller learns nothing about the fleet: {text}"
+            );
+        }
+
+        let keyed = || {
+            Manager::with_live_refresher(
+                dummy_config(Some("sk-proxy-secret"), "http://127.0.0.1:1"),
+                None,
+            )
+        };
+        let (status, _h, _b) =
+            quota_request(keyed(), Method::GET, Some(loopback_peer()), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a keyless loopback caller is refused when a key is set"
+        );
+        let (status, _h, body) = quota_request(
+            keyed(),
+            Method::GET,
+            Some(loopback_peer()),
+            Some("sk-proxy-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the right key is served");
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"name\":\"dummy\""),
+            "the keyed answer is a real payload"
+        );
+    }
+
+    /// GET only, answered locally: any other verb is a local 405, never a
+    /// fall-through to the forwarder (which would answer 502 off the dead port).
+    #[tokio::test]
+    async fn quota_endpoint_is_get_only() {
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let manager =
+                Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+            let (status, _headers, body) =
+                quota_request(manager, method.clone(), Some(loopback_peer()), None).await;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on the quota path is refused locally, got {status}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&body).contains("fiveHour"),
+                "a refused method returns no quota"
+            );
+        }
+    }
+
     // --- POST /_tcr/accounts/disabled ---------------------------------------
 
     /// A two-account config with distinct orgs, written to `path` so the manager
@@ -9653,7 +10176,7 @@ mod tests {
     fn two_account_config(api_key: Option<&str>) -> Config {
         let account = |name: &str, org: &str, uuid: &str, priority: i64| Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some(format!("11111111-1111-1111-1111-{org}")),
@@ -10518,6 +11041,299 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Drive the priority route with a `ClientAddr` we control, the same shape
+    /// as [`control_request`] but against [`PRIORITY_PATH`].
+    async fn priority_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(PRIORITY_PATH);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, bytes)
+    }
+
+    /// What a fresh session (no affinity pin, nothing tried) is routed to.
+    fn fresh_pick(manager: &Manager) -> Option<usize> {
+        manager.select(
+            &HashSet::new(),
+            OffsetDateTime::now_utc(),
+            None,
+            None,
+            "/v1/messages",
+            None,
+        )
+    }
+
+    /// THE BITING TEST for the priority route: after the endpoint answers, the
+    /// NEXT fresh session is routed by the new priority in the running process.
+    ///
+    /// Before the route existed `tcr priority` wrote only the file, so the live
+    /// rotation kept picking alice (priority 0) over bob (priority 1) until a
+    /// restart. A 200 alone would not catch a handler that answers and changes
+    /// nothing; the selection is the assertion that does.
+    #[tokio::test]
+    async fn priority_endpoint_reorders_the_live_rotation() {
+        let (manager, path) = control_manager("priority-apply", None);
+        assert_eq!(fresh_pick(&manager), Some(0), "alice leads at priority 0");
+
+        let (status, headers, body) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"bob@example.com","priority":-1}"#,
+        )
+        .await;
+        let picked = fresh_pick(&manager);
+        assert_eq!(
+            (status, picked),
+            (StatusCode::OK, Some(1)),
+            "the route must answer 200 and the next fresh session must go to bob; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(PRIORITY_ENDPOINT),
+            "the route stamps itself so a caller can tell it from a missing route"
+        );
+        let payload: SetPriorityResponse =
+            serde_json::from_slice(&body).expect("a priority payload");
+        assert_eq!(payload.name, "bob@example.com", "the RESOLVED name");
+        assert_eq!(payload.priority, -1);
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(snap.accounts[1].priority, -1, "status shows the live value");
+        assert_eq!(
+            snap.accounts[0].priority, 0,
+            "only the resolved account moved"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The live priority of rotation slot `idx`.
+    fn live_priority(manager: &Manager, idx: usize) -> i64 {
+        manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].priority
+    }
+
+    /// The priority route passes the same two gates as the other mutating
+    /// routes: a non-loopback or unprovable origin is 403, a missing or wrong
+    /// api-key is 401, and neither changes the live rotation.
+    #[tokio::test]
+    async fn priority_endpoint_refuses_bad_origin_and_bad_key() {
+        let body = r#"{"query":"bob@example.com","priority":-1}"#;
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let (manager, path) = control_manager("priority-origin", None);
+            let (status, _h, _b) =
+                priority_request(Arc::clone(&manager), Method::POST, peer, None, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} must be refused");
+            assert_eq!(live_priority(&manager, 1), 1, "{label} changed priority");
+            std::fs::remove_file(&path).ok();
+        }
+        for (label, provided) in [("no key at all", None), ("a wrong key", Some("wrong-key"))] {
+            let (manager, path) = control_manager("priority-key", Some("secret-key"));
+            let (status, _h, _b) = priority_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                provided,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{label} must be refused");
+            assert_eq!(live_priority(&manager, 1), 1, "{label} changed priority");
+            std::fs::remove_file(&path).ok();
+        }
+        let (manager, path) = control_manager("priority-key-ok", Some("secret-key"));
+        let (status, _h, b) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            Some("secret-key"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(live_priority(&manager, 1), -1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Request-shape refusals are local, stamped, and change nothing: a missing
+    /// content type (415), a wrong method (405), malformed bodies (400), an
+    /// unknown account (404) and an ambiguous one (409).
+    #[tokio::test]
+    async fn priority_endpoint_refuses_bad_requests_locally() {
+        use tower::ServiceExt as _;
+        let (manager, path) = control_manager("priority-shape", None);
+        let stamped = |h: &HeaderMap| {
+            h.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()) == Some(PRIORITY_ENDPOINT)
+        };
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(PRIORITY_PATH)
+            .body(Body::from(r#"{"query":"bob@example.com","priority":-1}"#))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(Arc::clone(&manager))
+            .oneshot(req)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(stamped(response.headers()), "a 415 names its route");
+
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+            let (status, headers, _b) = priority_request(
+                Arc::clone(&manager),
+                method.clone(),
+                Some(loopback_peer()),
+                None,
+                r#"{"query":"bob@example.com","priority":-1}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert!(stamped(&headers), "{method}: a 405 names its route");
+        }
+
+        for bad in [
+            "not json",
+            r#"["bob@example.com",-1]"#,
+            r#"{"query":"bob@example.com"}"#,
+            r#"{"priority":-1}"#,
+            r#"{"query":"bob@example.com","priority":"first"}"#,
+            r#"{"query":"  ","priority":-1}"#,
+        ] {
+            let (status, headers, _b) = priority_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                None,
+                bad,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(stamped(&headers), "{bad}: a 400 names its route");
+        }
+
+        let (status, headers, body) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"nobody@example.com","priority":-1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(stamped(&headers));
+        assert!(String::from_utf8_lossy(&body).contains("nobody@example.com"));
+        assert_eq!(live_priority(&manager, 0), 0, "nothing moved");
+        assert_eq!(live_priority(&manager, 1), 1, "nothing moved");
+        std::fs::remove_file(&path).ok();
+
+        let path = control_config_path("priority-ambiguous");
+        let mut config = two_account_config(None);
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        let (status, headers, _b) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","priority":-1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(stamped(&headers));
+        assert_eq!(live_priority(&manager, 0), 0, "a tie sets nothing");
+        assert_eq!(live_priority(&manager, 1), 1, "a tie sets nothing");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **`tcr priority` on a Codex account moves it within the Codex pool, live, and
+    /// moves nothing else.** The route resolves by exact name, like every live route,
+    /// so a Codex row is reached by its own name and, unlike `tcr control` (which
+    /// refuses a Codex account), takes the priority: the next fresh Codex request goes
+    /// to it, while a fresh Claude request still goes to the Anthropic account.
+    ///
+    /// Watched red: refuse a Codex row in `set_priority_by_query` as the control route
+    /// does, and the route answers 404 and the Codex pick never moves.
+    #[tokio::test]
+    async fn priority_endpoint_moves_a_codex_account_within_its_own_provider() {
+        let mut config = codex_fleet_with_carol("http://127.0.0.1:1", "http://127.0.0.1:1");
+        config.accounts[1].priority = Some(0);
+        config.accounts[2].priority = Some(1);
+        let manager = Manager::with_live_refresher(config, None);
+        let fresh = |path: &str| {
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                path,
+                None,
+            )
+        };
+        assert_eq!(
+            fresh(crate::provider::CODEX_RESPONSES_PATH),
+            Some(1),
+            "bob leads the Codex pool"
+        );
+        assert_eq!(fresh("/v1/messages"), Some(0));
+
+        let (status, headers, body) = priority_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"carol@example.com/codex","priority":-1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(PRIORITY_ENDPOINT)
+        );
+        let payload: SetPriorityResponse =
+            serde_json::from_slice(&body).expect("a priority payload");
+        assert_eq!(payload.name, "carol@example.com/codex");
+        assert_eq!(
+            fresh(crate::provider::CODEX_RESPONSES_PATH),
+            Some(2),
+            "the next fresh Codex request goes to carol"
+        );
+        assert_eq!(
+            fresh("/v1/messages"),
+            Some(0),
+            "a Claude request never reaches a Codex account, whatever its priority"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            (snap.accounts[2].priority, snap.accounts[2].provider),
+            (-1, crate::provider::Provider::Codex)
+        );
+    }
+
     /// Drive the control route with FULL control over the request line and every
     /// header, so a BROWSER-shaped or forward-proxy-shaped request is testable as
     /// it would actually arrive. [`control_request`] always sends
@@ -11067,6 +11883,40 @@ mod tests {
         let on_disk = account_in_file(&path, 2).expect("the appended entry");
         assert_eq!(on_disk["name"], "carol@example.com");
         assert_eq!(on_disk["accessToken"], "at-carol");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An `apikey` account is refused here with a stamped 400, by the same rule
+    /// `config::load` quarantines a file row by: tcr does not serve API-key
+    /// accounts. Neither the live rotation nor the file changes.
+    #[tokio::test]
+    async fn add_endpoint_refuses_an_api_key_account() {
+        let (manager, path) = control_manager("refuse-apikey", None);
+        let (status, headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","type":"apikey","accessToken":"sk-ant-api-fake"}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("does not serve API-key accounts"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(after.accounts.len(), 2, "nothing joined the rotation");
+        assert_eq!(account_count_in_file(&path), 2, "nothing reached the file");
         std::fs::remove_file(&path).ok();
     }
 
@@ -11638,7 +12488,7 @@ mod tests {
         // sends it (`cli.rs:478`, `.json(account)`).
         let probe_body = Account {
             name: String::new(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -12600,7 +13450,10 @@ mod tests {
             (Method::POST, "/_tcr/accounts/"),
             (Method::POST, "/_tcr/accounts/disable"),
             (Method::POST, "/_tcr/accounts/disabled/extra"),
-            (Method::POST, "/_tcr/accounts/priority"),
+            // `/_tcr/accounts/priority` itself is a route now (PRIORITY_PATH);
+            // its near-misses stay here.
+            (Method::POST, "/_tcr/accounts/priorities"),
+            (Method::POST, "/_tcr/accounts/priority/extra"),
             // The bare path IS registered (ADD_ACCOUNT_PATH) — a `GET` on it
             // gets a local 405, not a 404 like every other row here — but it
             // belongs in this table anyway for the assertion this table makes
@@ -17082,6 +17935,42 @@ mod tests {
         );
     }
 
+    /// A 403 must hold the refused account for a short while, so the next requests
+    /// stop paying the same refused round trip, and the row must read `refused`
+    /// rather than `ok` while the hold lasts.
+    #[tokio::test]
+    async fn forbidden_403_holds_the_account_and_shows_refused() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_403()), Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        for _ in 0..4 {
+            assert_eq!(post_one(manager.clone()).await, 200);
+        }
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "one wasted attempt on `a`, then `a` is held and never retried"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(
+            a.requests, 0,
+            "a held `a` is never selected again; `attempts` alone cannot show this, \
+             because the scripted upstream answers by connection order, not by account"
+        );
+        assert_eq!(
+            serde_json::to_value(a.gate).unwrap(),
+            serde_json::json!("refused"),
+            "a held 403 account must not read `gate: ok`"
+        );
+        assert_eq!(
+            manager.account_status(0),
+            Some(AccountStatus::Active),
+            "the hold is bounded, never the terminal `Error`"
+        );
+    }
+
     /// When 403s cover the WHOLE eligible fleet, the client must get a 502
     /// `proxy_error` naming the refused account(s) — never the bare upstream 403
     /// (unusable: names a credential the client cannot act on) and never a
@@ -19361,6 +20250,154 @@ mod tests {
             );
             assert_eq!(other.gate, GateReason::Ok);
         }
+    }
+
+    /// A Codex origin that answers the FIRST request 403 and every later one 200,
+    /// recording each bearer. The 403 carries `x-codex-rate-limit-reached-type`, which
+    /// must not turn a 403 into a quota verdict, and no window: a window would hand the
+    /// other account the better headroom, and selection would avoid the refused one
+    /// with no hold at all.
+    async fn spawn_codex_origin_forbidding_the_first() -> (
+        String,
+        Arc<std::sync::Mutex<Option<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let refused: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let served: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (refused_by, served_by) = (Arc::clone(&refused), Arc::clone(&served));
+        let origin = Router::new().fallback(move |req: Request| {
+            let (refused_by, served_by) = (Arc::clone(&refused_by), Arc::clone(&served_by));
+            async move {
+                let bearer = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                {
+                    let mut first = refused_by.lock().expect("refusal record poisoned");
+                    if first.is_none() {
+                        *first = Some(bearer);
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("x-codex-rate-limit-reached-type", "primary")
+                            .body(Body::from(
+                                r#"{"error":{"type":"forbidden","message":"workspace blocked"}}"#,
+                            ))
+                            .expect("403 response");
+                    }
+                }
+                served_by
+                    .lock()
+                    .expect("served record poisoned")
+                    .push(bearer);
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("200 response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Codex origin");
+        let addr = listener.local_addr().expect("Codex origin addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        (format!("http://{addr}"), refused, served)
+    }
+
+    /// **A Codex 403 holds its account briefly, as #459 holds an Anthropic one, and reads
+    /// `refused`, never a quota verdict.** The 403 arm is reached only for an account
+    /// `select` picked within the request's provider, so the hold lands on the Codex
+    /// account that answered, and `Manager::mark_refused` arms the flat
+    /// `REFUSED_HOLD_SECONDS` without reading a header. So the next three requests never
+    /// try the refused account again, its status stays `Active`, its gate reads `refused`
+    /// (not `rejected`: only a 429 carrying the reached-type header is a Codex quota
+    /// refusal), its hold is the short one, and the Anthropic account beside it is
+    /// neither held nor asked.
+    ///
+    /// Watched red: let only an Anthropic 403 arm the hold, and the refused Codex
+    /// account is tried again and reads `ok`.
+    #[tokio::test]
+    async fn a_codex_403_holds_its_account_briefly_and_reads_refused() {
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let (codex_url, refused, served) = spawn_codex_origin_forbidding_the_first().await;
+        let manager = Manager::with_live_refresher(
+            codex_fleet_with_carol(&anthropic_echo.url, &codex_url),
+            None,
+        );
+
+        for n in 0..4 {
+            let (status, answer) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "request {n} is served by the other Codex account: {}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+        let refused_idx = codex_index_of(
+            &refused
+                .lock()
+                .expect("refusal record poisoned")
+                .clone()
+                .expect("one account was refused"),
+        );
+        let served_bearers = served.lock().expect("served record poisoned").clone();
+        assert_eq!(served_bearers.len(), 4, "{served_bearers:?}");
+        assert!(
+            served_bearers
+                .iter()
+                .all(|bearer| codex_index_of(bearer) != refused_idx),
+            "the refused account is not tried again while held: {served_bearers:?}"
+        );
+        assert_eq!(
+            anthropic_echo.request_count(),
+            0,
+            "rotation never leaves Codex"
+        );
+
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let held = &snapshot.accounts[refused_idx];
+        assert_eq!(
+            held.gate,
+            GateReason::Refused,
+            "a Codex 403 reads refused, never rejected"
+        );
+        assert_eq!(
+            manager.account_status(refused_idx),
+            Some(AccountStatus::Active),
+            "the hold is bounded, never the terminal `Error`"
+        );
+        let until = held
+            .rate_limited_until
+            .expect("the refused account is held")
+            .unix_timestamp();
+        let now_s = OffsetDateTime::now_utc().unix_timestamp();
+        assert!(
+            until <= now_s + crate::manager::REFUSED_HOLD_SECONDS
+                && until > now_s + crate::manager::REFUSED_HOLD_SECONDS - 30,
+            "the short refusal hold: held until {until}, {now_s} now"
+        );
+        let alice = &snapshot.accounts[0];
+        assert_eq!(
+            (alice.gate, alice.rate_limited_until),
+            (GateReason::Ok, None),
+            "the Anthropic account is untouched"
+        );
     }
 
     /// **A Codex 429 that is NOT a quota refusal holds on `retry-after`, never on a

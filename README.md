@@ -4,16 +4,18 @@
 
 # teamclaude-rs (`tcr`)
 
-A local proxy that spreads Claude Code across a pool of Claude accounts.
+A local proxy that runs Claude Code across multiple Claude accounts.
 
 Point Claude Code (or any Anthropic API client) at it. For each request it picks an account by
 looking at what every account has left in every quota window. It keeps a conversation on the
 account whose prompt cache is already warm, and it shows you what the traffic would have cost.
 
+[![Latest release](https://img.shields.io/github/v/release/dhkts1/teamclaude-rs)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
-[Install](#install) · [Usage](#usage) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
+[Install](#install) · [Usage](#usage) · [Compared with other tools](#compared-with-other-tools) · [FAQ](#faq) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
 
 [![Download TcrBar for macOS](https://img.shields.io/badge/Download-TcrBar%20for%20macOS-blue?style=for-the-badge)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
 [![Install the CLI](https://img.shields.io/badge/Install-the%20CLI-lightgrey?style=for-the-badge)](#install)
@@ -23,6 +25,21 @@ account whose prompt cache is already warm, and it shows you what the traffic wo
 <img src="assets/tcrbar-panel-healthy.png" alt="TcrBar menu-bar panel showing a healthy fleet" width="400">
 
 </div>
+
+## Why tcr
+
+- **It chooses by quota, not by turn.** It reads the five-hour, weekly and per-model weekly window
+  on every account, and spends first the quota that resets soonest, so less of it expires unused.
+- **It keeps the prompt cache warm.** A conversation that moves to another account starts cold, and
+  its next request pays at least 12.5 times as much for the cached prefix. So each conversation
+  stays on one account, and on subscriptions the cache is held for an hour instead of five minutes. Over 30 days of the
+  author's own traffic, ending 2026-10-13, 97.6% of prompt tokens were read from cache.
+- **One proxy serves every session.** Each Claude Code session on the machine gets its own pin, and
+  you can add, disable or remove accounts while it runs.
+- **You can watch it.** A macOS menu-bar app and a terminal dashboard show every window, every
+  session, and what the traffic would have cost at list price.
+- **It stays on your machine.** No telemetry and no crash reporting. Tokens, logs and pins are
+  files on your own disk.
 
 ## Install
 
@@ -56,6 +73,32 @@ scripts/install-cli.sh          # places `tcr` at ~/.local/bin/tcr by default
 
 The Linux builds are static musl binaries, so they run on both Alpine and glibc systems. TcrBar and
 `tcr ui` are macOS-only.
+
+### Verify a download
+
+Get `tcr` from this repository's [release page](https://github.com/dhkts1/teamclaude-rs/releases)
+or `install.sh` above, never a copy repackaged elsewhere: it is about to hold your account tokens.
+Each CLI archive has a `.sha256` file beside it:
+
+```sh
+shasum -a 256 -c teamclaude-rs-aarch64-apple-darwin.tar.xz.sha256
+```
+
+TcrBar is signed with a Developer ID certificate and notarized by Apple. The commands that check
+it, and what the checksum does not prove, are in
+[`docs/architecture.md`](docs/architecture.md#verifying-a-download).
+
+### Uninstall
+
+Stop the proxy, then delete the binary: `~/.cargo/bin/tcr` from either installer, or
+`~/.local/bin/tcr` from `scripts/install-cli.sh`. On macOS, `apps/macos/scripts/uninstall.sh`
+removes TcrBar and its login item.
+
+Nothing deletes your data for you. `~/.config/teamclaude.json` holds working credentials for every
+account in the pool, so delete it too, along with `~/.cache/teamclaude/` and any
+`ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or `NODE_EXTRA_CA_CERTS` you exported. Every file `tcr` keeps
+is listed in [`docs/architecture.md`](docs/architecture.md#files-on-disk), and the full steps are
+under [Uninstalling](docs/architecture.md#uninstalling).
 
 ## Usage
 
@@ -99,8 +142,9 @@ key, its default and the file's permissions are in
 
 ### Managing the fleet
 
-These commands act on the running proxy when one is up, so changing the pool does not need a
-restart. Every flag is in [`docs/cli.md`](docs/cli.md).
+Changes to the pool reach a running proxy without a restart. `enable`, `disable`, `remove`,
+`priority` and `control` apply to it directly, and the proxy picks up `group` edits from the
+config file on its next request. Every flag is in [`docs/cli.md`](docs/cli.md).
 
 | Command | What it does |
 |---|---|
@@ -113,6 +157,7 @@ restart. Every flag is in [`docs/cli.md`](docs/cli.md).
 | `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
 | `tcr run --group <name>` | Start a session that prefers one group. |
 | `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour. The panel's Sessions and Tools tabs read the same feed. |
+| `tcr list --json` | Print every Claude account in claude-swap's list format, so CodexBar can show them. Never probes. |
 | `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day. Needs no running proxy. |
 | `tcr token <account>` | Print an account's access token to stdout, for piping. |
 | `tcr update` | Update `tcr` in place, from the checkout or the published installer. |
@@ -217,7 +262,13 @@ response: `tcr` is missing, a poll is failing, the fleet is empty, or the read i
 <details>
 <summary>The full fleet view, and the terminal dashboard</summary>
 
-<img src="assets/tcrbar-panel-fleet.png" alt="TcrBar panel listing a full fleet of accounts" width="400">
+<p>
+  <img src="assets/tcrbar-panel-fleet.png" alt="TcrBar panel listing a full fleet of accounts, one line each under a strip of every account" width="400">
+  <img src="assets/tcrbar-panel-hover.png" alt="TcrBar panel with an account's card open on hover" width="400">
+</p>
+
+Every account is one line. Point at a line, or at its segment in the strip, to open its card; right-click an
+account and choose Keep Card Open to leave it open.
 
 ![tcr live TUI](assets/tui-demo.gif)
 
@@ -269,6 +320,84 @@ WireGuard is built on the same handshake family, and if you want to understand h
 Diffie-Hellman based authentication works, that one spec is the best hour you can spend.
 [`docs/peers.md`](docs/peers.md) covers finding, trusting, lending and what each step sends.
 
+## Compared with other tools
+
+Several tools let Claude Code use more than one account. They differ in where they sit: a proxy in
+the request path chooses an account for every request, while a switcher changes which login Claude
+Code itself holds.
+
+| Tool | How it switches | How it picks an account | Keeps each conversation on one account | Runs on | License |
+|---|---|---|---|---|---|
+| **tcr** | Local proxy in the request path | Every request, by what is left in the five-hour, weekly and per-model weekly windows | Yes, always; moves only when that account cannot serve | macOS, Linux | PolyForm Noncommercial |
+| [claude-swap](https://github.com/realiti4/claude-swap) | Swaps Claude Code's stored login, for the whole machine or one terminal | By hand, next in turn, or automatically at a five-hour or seven-day threshold | Per terminal with `cswap run`; a switch moves the running session, which its README says rebuilds the cache | macOS, Linux, Windows | MIT |
+| [teamclaude](https://github.com/KarpelesLab/teamclaude) | Local proxy in the request path | Rotates when the five-hour or weekly window reaches a threshold, and tracks the per-model weekly cap | Opt-in with `distributeSessions`, off by default | Node.js 20+ | MIT |
+| [ccs](https://github.com/kaitranntt/ccs) | Launches Claude Code with a chosen profile; account pools go through a local proxy | Profile chosen at launch; the proxy rotates round-robin by default, or fills one account first with pool routing on | Opt-in: [pool routing](https://docs.ccs.kaitran.ca/features/pool) holds a conversation on one account for up to an hour | macOS, Linux, Windows | MIT |
+| [Quotio](https://github.com/nguyenphutrong/quotio) | macOS app that manages a local proxy (CLIProxyAPI) | Round-robin or fill-first | Not stated in its README | macOS app; CLI on macOS and Linux | MIT |
+| [cux](https://github.com/inulute/cux) | Swaps the login, restarts Claude Code and resumes the conversation | On a rate limit by default, with optional five-hour and seven-day thresholds | No: moving the conversation is how it works | Linux, macOS, Windows | GPL-3.0 |
+| [cc-account-switcher](https://github.com/ming86/cc-account-switcher) | Swaps the stored login while Claude Code is closed | By hand | Not stated in its README | macOS, Linux, WSL | MIT |
+
+Each row comes from that project's own README and docs, read on 2026-10-13. "Not stated" means its
+README does not say, not that the tool cannot.
+
+Another tool fits better if you need Windows (claude-swap, ccs, cux), want Codex, Gemini or other
+providers behind the same tool (teamclaude, ccs, Quotio), want no proxy in the request path
+(claude-swap, cux, cc-account-switcher), or need an open-source license for commercial use (every
+other row).
+
+## FAQ
+
+### How do I use Claude Code with more than one Claude account?
+
+Install `tcr`, run `tcr login` once for each account, start the proxy with `tcr` (or let TcrBar run
+it), and launch Claude Code with `tcr run`. Every request then goes through the proxy, which picks
+an account from the pool. If you are already logged in to Claude Code, the first run imports that
+login, so you only log in to the others.
+
+Claude Code has its own answer: `CLAUDE_CONFIG_DIR` moves its configuration directory, and
+[Anthropic's docs](https://code.claude.com/docs/en/env-vars) suggest it for running accounts side
+by side, as in `CLAUDE_CONFIG_DIR=~/.claude-work claude`. There you pick the account by picking
+the directory when you start a session. `tcr` keeps one Claude Code setup and picks the account
+for every request instead. `tcr` does not read `CLAUDE_CONFIG_DIR`: the import takes Claude Code's
+default login, and [`docs/cli.md`](docs/cli.md#--from-claude-code-importing-the-login-claude-already-has)
+says how to point it at another file.
+
+### Does switching accounts lose the prompt cache?
+
+Yes. Anthropic keeps the prompt cache per account, so a conversation that moves arrives cold and
+writes its whole cached prefix again. A cache write bills at 1.25 times the input price and a cache
+read at a tenth of it or less, so the first request after a move pays at least 12.5 times as much
+for that prefix (25 times on Opus 5.5), and on a long conversation the prefix is nearly all of the
+request. That is why `tcr` keeps each
+conversation on one account, even past the point where it would send new conversations elsewhere.
+It moves only when that account cannot serve the request. Pins are saved to disk, so a restart
+keeps them for conversations still within the cache lifetime.
+
+### How long does the cache stay warm?
+
+Five minutes after its last use, unless the request asks for an hour. From 1.1.19 `tcr` rewrites
+every cache breakpoint to the hour, so a conversation you come back to within the hour resumes warm
+instead of writing its prefix again. On a subscription the hour costs the five-hour window what
+five minutes does (measured 2026-10-06). `cacheTtlRewrite` in
+[`docs/configuration.md`](docs/configuration.md) turns it off.
+
+### What happens when an account runs out?
+
+New conversations skip any account that is close to a limit, on a rate-limit hold, or out of the
+model window a request needs, and go to the account the quota rules pick next. A conversation
+already on that account moves once, and pays one cache rebuild.
+
+### Does it run on Linux, and with API keys?
+
+The `tcr` CLI and terminal dashboard run on Linux as static builds for x86_64 and aarch64. TcrBar,
+the menu-bar app, is macOS only. Accounts are Claude subscriptions logged in through the browser,
+or Codex logins imported with `tcr login --from-codex`; `tcr` does not serve Anthropic API keys.
+
+### How is this related to teamclaude?
+
+`tcr` is a from-scratch Rust rewrite of the Node proxy
+[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and drops in for it: same
+config file, certificates and port.
+
 ## Documentation
 
 | Document | What is in it |
@@ -276,7 +405,7 @@ Diffie-Hellman based authentication works, that one spec is the best hour you ca
 | [`docs/configuration.md`](docs/configuration.md) | Every config key, its type, default and source citation. |
 | [`docs/cli.md`](docs/cli.md) | Every command and flag, exit codes, account resolution. |
 | [`docs/peers.md`](docs/peers.md) | Finding, trusting and sharing accounts with other Macs on your network. |
-| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, Codex requests, account selection, quota probes. |
+| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, Codex requests, account selection, quota probes, files on disk, verifying a download, uninstalling. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptoms and what they mean. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, test and lint gates, what `main` requires. |
 

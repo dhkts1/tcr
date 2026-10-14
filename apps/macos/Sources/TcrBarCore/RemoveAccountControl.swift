@@ -13,15 +13,14 @@ import Foundation
 ///     matched entry outright — there is no `tcr un-remove`. Getting the
 ///     account back means `tcr login` from scratch, which is why the panel
 ///     confirms before calling this at all.
-///  3. **The account stops serving immediately, but the row does not leave
-///     the panel until restart.** `remove_account` now disables the account
-///     in the running proxy before deleting it from the config, so rotation
-///     stops right away — no restart needed for that half. The fleet row
-///     list is still a boot-time snapshot (`CLAUDE.md`'s config-reload rule)
-///     though, so the row itself keeps rendering, unchanged, until the proxy
-///     restarts. ``RemoveAccountController`` tracks that a removal landed so
-///     the panel can say exactly that, and never claims the row will
-///     disappear — it will not.
+///  3. **The account stops serving at once and leaves the panel on the next
+///     poll.** `remove_account` parks the account in the running proxy, then
+///     deletes it from the config; the proxy drops a row the config no longer
+///     holds the next time it reads the file, which every `tcr status` makes
+///     it do. Until 2026-10-14 the row stayed listed until a restart, so a
+///     delete of an account that was already parked changed nothing on
+///     screen. A proxy built before that still keeps the row, and `tcr` says
+///     so on stderr, which lands in ``RemoveAccountController/notice(for:)``.
 ///  4. **Exit 0 with anything on stderr is not a clean success.** Same
 ///     three-arm ``Outcome`` as ``AccountCommand``/``GroupCommand``.
 public enum RemoveAccountCommand {
@@ -87,31 +86,49 @@ public enum RemoveAccountCommand {
 }
 
 /// Panel-facing state for account deletion: which calls are in flight, which
-/// have an unsuperseded failure, and which accounts have been successfully
-/// deleted this session — the last of which drives the "stopped, stays
-/// listed until restart" notice, since the row itself has no way to reflect
-/// a boot-time config change on its own.
+/// have an unsuperseded failure, and what `tcr` said on stderr while a delete
+/// succeeded.
 ///
-/// Keyed by ``AccountRef/id``, same as ``AccountController``. Never cleared: like
-/// ``GroupController/appliedPendingRestart``, there is no live config reload
-/// for this field, so once a delete lands it stays pending-restart until the
-/// app relaunches (which matches reality) — the panel is expected to keep
-/// rendering the notice on that row for as long as it is open.
+/// A delete that lands needs no state here: the running proxy drops the row
+/// the next time it reads the config, which `tcr status` makes it do, so the
+/// row leaves the panel on the next poll. A `notice` is what `tcr` printed
+/// when that will NOT happen (a proxy built before live removal, one it could
+/// not reach), and it stays on the row for as long as the row is listed.
+///
+/// Keyed by ``AccountRef/id``, same as ``AccountController``.
 @MainActor
 public final class RemoveAccountController: ObservableObject {
     @Published public private(set) var pending: Set<String> = []
     @Published public private(set) var failures: [String: RemoveAccountCommand.Failure] = [:]
-    @Published public private(set) var removed: Set<String> = []
+    @Published public private(set) var notices: [String: String] = [:]
 
-    public init() {}
+    /// Runs `tcr remove <query>` to completion, off the main actor. The real
+    /// subprocess by default; a test hands in a scripted outcome.
+    private let perform: @Sendable (String) -> RemoveAccountCommand.Outcome
+
+    public init(perform: (@Sendable (String) -> RemoveAccountCommand.Outcome)? = nil) {
+        self.perform = perform ?? { RemoveAccountCommand.perform(query: $0) }
+    }
+
+    /// A controller that already holds these outcomes and runs nothing, for
+    /// `--render-states`, which draws a refused delete without spawning `tcr`.
+    public static func harness(
+        failures: [AccountRef: RemoveAccountCommand.Failure] = [:],
+        notices: [AccountRef: String] = [:]
+    ) -> RemoveAccountController {
+        let controller = RemoveAccountController(perform: { _ in .clean })
+        for (account, failure) in failures { controller.failures[account.id] = failure }
+        for (account, notice) in notices { controller.notices[account.id] = notice }
+        return controller
+    }
 
     public func isPending(_ account: AccountRef) -> Bool { pending.contains(account.id) }
     public func failure(for account: AccountRef) -> RemoveAccountCommand.Failure? {
         failures[account.id]
     }
-    /// Whether this account was successfully deleted from the config this
-    /// session — the fact the "restart to apply" notice is drawn from.
-    public func needsRestart(_ account: AccountRef) -> Bool { removed.contains(account.id) }
+    /// What `tcr` said on stderr while a delete of this account succeeded,
+    /// verbatim, or `nil`.
+    public func notice(for account: AccountRef) -> String? { notices[account.id] }
 
     /// What a call did, as far as the subprocess can say — mirrors
     /// ``AccountController/Attempt``/``GroupController/Attempt``.
@@ -131,18 +148,20 @@ public final class RemoveAccountController: ObservableObject {
         guard !pending.contains(key) else { return .skipped }
         pending.insert(key)
         failures[key] = nil
+        notices[key] = nil
         defer { pending.remove(key) }
 
+        let perform = self.perform
+        let query = account.name
         let outcome = await Task.detached(priority: .userInitiated) {
-            RemoveAccountCommand.perform(query: account.name)
+            perform(query)
         }.value
 
         switch outcome {
         case .clean:
-            removed.insert(key)
             return .accepted(notice: nil)
         case .spoke(let notice):
-            removed.insert(key)
+            notices[key] = notice
             return .accepted(notice: notice)
         case .failed(let failure):
             failures[key] = failure

@@ -783,7 +783,7 @@ async fn exchange_code(
     verifier: &str,
     state: &str,
     redirect_uri: &str,
-) -> anyhow::Result<Tokens> {
+) -> anyhow::Result<Exchanged> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -808,6 +808,55 @@ async fn exchange_code(
     tokens_from_exchange_body(&text)
 }
 
+/// What one code-for-token exchange produced: the credential, and the identity
+/// the token endpoint sent beside it.
+struct Exchanged {
+    tokens: Tokens,
+    identity: ExchangeIdentity,
+}
+
+/// The `account` and `organization` objects of a token-exchange response.
+///
+/// The token endpoint sends these on every exchange, whatever the scope
+/// (`docs/design/long-lived-tokens.md`, "Identity arrives free at exchange
+/// time"). [`login`] still asks the profile endpoint first, because only it
+/// carries the plan fields; this is what names the row when that fetch comes
+/// back empty, instead of [`unnamed_fallback`].
+#[derive(Debug, Default, Deserialize)]
+struct ExchangeIdentity {
+    #[serde(default)]
+    account: Option<ExchangeAccount>,
+    #[serde(default)]
+    organization: Option<ExchangeOrg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeAccount {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    email_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeOrg {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The token-exchange response: the refresh fields plus the identity. A
+/// separate struct from [`RefreshResponse`], because a refresh never needs
+/// the identity.
+#[derive(Deserialize)]
+struct ExchangeResponse {
+    #[serde(flatten)]
+    refresh: RefreshResponse,
+    #[serde(flatten)]
+    identity: ExchangeIdentity,
+}
+
 /// Turn a raw token-endpoint response body into [`Tokens`], failing the exchange
 /// when no usable `refresh_token` is present.
 ///
@@ -817,9 +866,11 @@ async fn exchange_code(
 /// here would mint an account whose stored token is `""`; that account dies with
 /// `AuthRejected` on its first refresh (the refresh POST sends the empty token).
 /// Fail the exchange instead of persisting a self-destructing account.
-fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
-    let data: RefreshResponse =
-        serde_json::from_str(text).context("parse token-exchange response")?;
+fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Exchanged> {
+    let ExchangeResponse {
+        refresh: data,
+        identity,
+    } = serde_json::from_str(text).context("parse token-exchange response")?;
 
     let refresh_token = match data.refresh_token {
         Some(token) if !token.trim().is_empty() => token,
@@ -831,10 +882,13 @@ fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
         normalize_expires_at,
     );
 
-    Ok(Tokens {
-        access_token: data.access_token,
-        refresh_token: Some(refresh_token),
-        expires_at_ms,
+    Ok(Exchanged {
+        tokens: Tokens {
+            access_token: data.access_token,
+            refresh_token: Some(refresh_token),
+            expires_at_ms,
+        },
+        identity,
     })
 }
 
@@ -869,6 +923,26 @@ impl Profile {
     /// `account.uuid`, or `None` when the fetch failed or the endpoint sent none.
     pub fn account_uuid(&self) -> Option<&str> {
         self.account_uuid.as_deref()
+    }
+
+    /// This profile, with each identity field the profile endpoint left empty
+    /// taken from the token-exchange response instead. A field the profile
+    /// endpoint did send is kept. Both answers describe the one token the
+    /// exchange just minted, so they cannot name two different accounts.
+    fn or_exchange_identity(self, identity: ExchangeIdentity) -> Profile {
+        let (account_uuid, email) = identity
+            .account
+            .map_or((None, None), |a| (a.uuid, a.email_address));
+        let (org_uuid, org_name) = identity
+            .organization
+            .map_or((None, None), |o| (o.uuid, o.name));
+        Profile {
+            email: self.email.or(email),
+            account_uuid: self.account_uuid.or(account_uuid),
+            org_uuid: self.org_uuid.or(org_uuid),
+            org_name: self.org_name.or(org_name),
+            ..self
+        }
     }
 }
 
@@ -1039,7 +1113,7 @@ pub fn upsert_account(
     match crate::identity::resolve(config.accounts.iter().enumerate(), &probe) {
         crate::identity::Resolved::One(index) => {
             let account = &mut config.accounts[index];
-            account.account_type = "oauth".to_string();
+            account.account_type = crate::config::AccountType::OAuth;
             account.access_token = tokens.access_token.clone();
             account.refresh_token = tokens.refresh_token.clone();
             account.expires_at = Some(tokens.expires_at_ms);
@@ -1081,7 +1155,7 @@ pub fn upsert_account(
 
             config.accounts.push(Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 provider: Default::default(),
                 account_uuid,
                 org_uuid,
@@ -1280,7 +1354,7 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
 async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider::Provider>) {
     let probe = Account {
         name: String::new(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
@@ -1521,14 +1595,18 @@ pub async fn login(
     } = authorized;
 
     ui.say("Exchanging authorization code for tokens...");
-    let tokens = exchange_code(&code, &flow.verifier, &flow.state, &redirect_uri).await?;
+    let Exchanged { tokens, identity } =
+        exchange_code(&code, &flow.verifier, &flow.state, &redirect_uri).await?;
 
     // Load the existing config once (missing file → empty default; a corrupt
     // file surfaces as an error so login never clobbers it with defaults).
     let mut config = load_or_default(config_path)?;
 
-    // Fetch the account+org identity, then MINT a name for it.
-    let profile = fetch_profile(&tokens.access_token).await;
+    // Fetch the account+org identity, then MINT a name for it. A failed
+    // profile fetch still names the row from the exchange response.
+    let profile = fetch_profile(&tokens.access_token)
+        .await
+        .or_exchange_identity(identity);
     let name = mint_login_name(&config, &profile, account, name_override, ui)?;
 
     let saved = finish_login_checked(
@@ -1562,9 +1640,12 @@ pub async fn login(
 ///   row on re-login would break the pins, groups and control-account key that
 ///   name is the identity for; the row is confirmed to be the same account by
 ///   [`assert_requested_identity`] a moment later.
-/// * A profile with no email at all — the inference-only case — is the only path
-///   left that prompts ([`prompt_account_name`]), and the name it comes back
-///   with is minted for uniqueness too. Under [`LoginUi::Machine`] there is
+/// * A profile with no email at all is the only path left that prompts. A
+///   browser login reaches it only when the token-exchange response carried no
+///   email either ([`Profile::or_exchange_identity`]); a setup-token login,
+///   which never sees an exchange response, reaches it every time. The prompt is
+///   [`prompt_account_name`], and the name it comes back with is minted for
+///   uniqueness too. Under [`LoginUi::Machine`] there is
 ///   nobody to prompt, so that path takes [`unnamed_fallback`] directly — the
 ///   same answer an empty reply to the prompt gives.
 fn mint_login_name(
@@ -1914,9 +1995,17 @@ pub async fn login_from_claude_code(
         );
     };
     let subscription_type = login.subscription_type.clone();
-    let saved =
-        import_claude_code_login(config_path, force, name, account, login, LoginUi::Terminal)
-            .await?;
+    let saved = import_claude_code_login(
+        config_path,
+        ImportInto::AnyFleet,
+        force,
+        name,
+        account,
+        login,
+        LoginUi::Terminal,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("the import skipped a non-empty fleet it was told to accept"))?;
     eprintln!(
         "[tcr] imported as '{saved}'{}; {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
         plan_suffix(subscription_type.as_deref())
@@ -2152,7 +2241,7 @@ fn holds_newer_credential(stored: Option<i64>, import: Option<i64>) -> bool {
 fn codex_account_row(name: String, login: crate::codex_login::CodexLogin) -> Account {
     Account {
         name,
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         provider: crate::provider::Provider::Codex,
         account_uuid: login.account_id,
         org_uuid: None,
@@ -2266,8 +2355,22 @@ pub async fn auto_import_claude_code_login(config_path: &Path) -> Option<String>
     // prose on STDOUT — `tcr status --json` and `tcr accounts --json` are piped
     // into `jq` and decoded by TcrBar, so everything this path says goes to
     // stderr.
-    match import_claude_code_login(config_path, false, None, None, login, LoginUi::Machine).await {
-        Ok(saved) => {
+    match import_claude_code_login(
+        config_path,
+        ImportInto::EmptyFleetOnly,
+        false,
+        None,
+        None,
+        login,
+        LoginUi::Machine,
+    )
+    .await
+    {
+        // Another `tcr` process (the server booting while `tcr status` polls
+        // it, typically) imported first. Its row is the import; adding ours
+        // too would be the `unnamed` + `unnamed-2` duplicate.
+        Ok(None) => None,
+        Ok(Some(saved)) => {
             eprintln!(
                 "[tcr] imported '{saved}'{} from your Claude Code login; \
                  {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
@@ -2294,14 +2397,18 @@ pub async fn auto_import_claude_code_login(config_path: &Path) -> Option<String>
 /// credential carries the full `user:profile` scope, so `fetch_profile` returns
 /// a real identity for [`assert_requested_identity`] to confirm the requested
 /// row against. There is nothing here that cannot be evaluated.
+///
+/// Returns `Ok(None)` only under [`ImportInto::EmptyFleetOnly`], when the
+/// config it loads already has an account in it.
 async fn import_claude_code_login(
     config_path: &Path,
+    into: ImportInto,
     force: bool,
     name: Option<&str>,
     account: Option<&str>,
     login: crate::claude_code_login::ClaudeCodeLogin,
     ui: LoginUi,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     ui.install();
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
@@ -2313,6 +2420,17 @@ async fn import_claude_code_login(
     let tokens = tokens_from_claude_code_login(login);
 
     let mut config = load_or_default(config_path)?;
+    // The caller's "fleet is empty" check ran on an earlier read, and the route
+    // probe above can take a while against a server that is still booting.
+    // Another `tcr` process may have imported in that gap, and minting a name
+    // against its row would add the same login a second time.
+    // A fleet emptied by `tcr remove` says so in the file; refilling it here
+    // would undo that delete on the next poll.
+    if into == ImportInto::EmptyFleetOnly
+        && (!config.accounts.is_empty() || config.refuses_claude_code_import())
+    {
+        return Ok(None);
+    }
     let profile = fetch_profile(&tokens.access_token).await;
     let resolved_name = mint_login_name(&config, &profile, account, name, ui)?;
 
@@ -2326,6 +2444,17 @@ async fn import_claude_code_login(
         account,
     )
     .await
+    .map(Some)
+}
+
+/// Which configs [`import_claude_code_login`] may write a Claude Code login into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportInto {
+    /// `tcr login --from-claude-code`: the user asked, so any config.
+    AnyFleet,
+    /// The automatic first-run import: only a config with no accounts, checked
+    /// again on the read the write is based on.
+    EmptyFleetOnly,
 }
 
 /// What `tcr login --account` says to a row that is not a Claude account, before it does
@@ -2744,10 +2873,11 @@ async fn finish_login_account(
                 Err(crate::cli::LiveControlError::NoRoute) => {
                     let saved = persist_via_account(config_path, &account)?;
                     eprintln!(
-                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running — it will not see this account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running. It will not see this account until it restarts. {}",
                         config.proxy.port,
                         crate::proxy::ADD_ACCOUNT_PATH,
                         config_path.display(),
+                        crate::cli::RESTART_HINT,
                     );
                     Ok(saved)
                 }
@@ -2814,7 +2944,7 @@ async fn finish_login(
 ) -> anyhow::Result<String> {
     let account = Account {
         name: name.to_string(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         provider: Default::default(),
         account_uuid: profile.account_uuid,
         org_uuid: profile.org_uuid,
@@ -3153,6 +3283,83 @@ mod tests {
         assert_eq!(name, "unnamed");
     }
 
+    /// A browser login whose profile fetch came back empty takes its name from
+    /// the token-exchange response, not from [`unnamed_fallback`]. The fixture
+    /// is the response shape `docs/design/long-lived-tokens.md` records.
+    #[test]
+    fn a_login_with_an_empty_profile_is_named_from_the_exchange_response() {
+        let body = r#"{
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expires_in": 31536000,
+            "account": {
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "email_address": "alice@example.com"
+            },
+            "organization": {
+                "uuid": "22222222-2222-2222-2222-222222222222",
+                "name": "Example Org"
+            }
+        }"#;
+
+        // A config where the fallback would hand out `unnamed-2`, and one
+        // where alice's bare email is already taken.
+        let with_unnamed: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "unnamed", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+        let with_alice: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+
+        for (config, expected) in [
+            (&with_unnamed, "alice@example.com"),
+            (&with_alice, "alice@example.com/example-org"),
+        ] {
+            let Exchanged { identity, .. } =
+                tokens_from_exchange_body(body).expect("a present refresh_token must return Ok");
+            let profile = all_none_profile().or_exchange_identity(identity);
+            let name = mint_login_name(config, &profile, None, None, LoginUi::Machine).unwrap();
+            assert_eq!(name, expected);
+            assert_eq!(
+                profile.account_uuid(),
+                Some("11111111-1111-1111-1111-111111111111")
+            );
+            assert_eq!(
+                profile.org_uuid.as_deref(),
+                Some("22222222-2222-2222-2222-222222222222")
+            );
+        }
+    }
+
+    /// A field the profile endpoint DID send is kept; only its gaps are filled.
+    #[test]
+    fn exchange_identity_never_overrides_what_the_profile_sent() {
+        let body = r#"{
+            "access_token": "at",
+            "refresh_token": "rt",
+            "account": { "uuid": "33333333", "email_address": "bob@example.com" },
+            "organization": { "uuid": "44444444", "name": "Other Org" }
+        }"#;
+        let Exchanged { identity, .. } = tokens_from_exchange_body(body).unwrap();
+        let profile = profile_with_identity(
+            "alice@example.com",
+            Some("11111111"),
+            Some("22222222"),
+            None,
+        )
+        .or_exchange_identity(identity);
+        assert_eq!(profile.email(), Some("alice@example.com"));
+        assert_eq!(profile.account_uuid(), Some("11111111"));
+        assert_eq!(profile.org_uuid.as_deref(), Some("22222222"));
+        assert_eq!(profile.org_name.as_deref(), Some("Other Org"));
+    }
+
     // --- token-exchange refresh_token guard --------------------------------
 
     #[test]
@@ -3180,7 +3387,8 @@ mod tests {
         let tokens = tokens_from_exchange_body(
             r#"{"access_token":"at","refresh_token":"rt","expires_at":1700000000000}"#,
         )
-        .expect("a present refresh_token must return Ok");
+        .expect("a present refresh_token must return Ok")
+        .tokens;
         assert_eq!(tokens.access_token, "at");
         assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
         assert_eq!(tokens.expires_at_ms, 1_700_000_000_000);
@@ -3197,7 +3405,8 @@ mod tests {
         let tokens = tokens_from_exchange_body(
             r#"{"access_token":"at","refresh_token":"rt","expires_in":31536000}"#,
         )
-        .expect("a present refresh_token must return Ok");
+        .expect("a present refresh_token must return Ok")
+        .tokens;
         let after = crate::now_ms();
 
         let year_ms: i64 = 31_536_000 * 1000;
@@ -3540,7 +3749,7 @@ mod tests {
         assert_eq!(config.accounts.len(), 1);
         let account = &config.accounts[0];
         assert_eq!(account.name, "new@example.com");
-        assert_eq!(account.account_type, "oauth");
+        assert_eq!(account.account_type, crate::config::AccountType::OAuth);
         assert_eq!(account.access_token, "at1");
         assert_eq!(account.refresh_token.as_deref(), Some("rt1"));
         assert_eq!(account.expires_at, Some(111));
@@ -4932,7 +5141,7 @@ mod tests {
         // exactly the race `login()`'s doc-comment describes.
         let rotated_bob = Account {
             name: "bob@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -5140,7 +5349,7 @@ mod tests {
         // silent in this scenario and cannot carry a real round-trip.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -5244,7 +5453,7 @@ mod tests {
         // is silent for the whole test and cannot carry a real round-trip.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -5433,7 +5642,7 @@ mod tests {
         // as every sibling clobber test in this file.
         let rotated_alice = Account {
             name: "alice@example.com".to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -5872,7 +6081,7 @@ mod tests {
     fn named_account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -7084,5 +7293,62 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["accounts"][0]["provider"], "codex", "{doc}");
         assert_eq!(*checks.lock().unwrap(), [workspace_check_of("at-codex")]);
+    }
+
+    /// The first-run race the macOS e2e caught: this process saw an empty
+    /// fleet when its verb started, and by the time the import reads the
+    /// config, another `tcr` process (the server booting) has written its
+    /// import there. The automatic import must stop on that read, not mint
+    /// `unnamed-2` beside the other process's `unnamed`. Returns before the
+    /// profile fetch, so no network.
+    #[tokio::test]
+    async fn first_run_import_stops_when_another_process_imported_first() {
+        let dead_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-import-race-{}-{dead_port}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [
+                     {{ "name": "unnamed", "accessToken": "at-fake-first", "refreshToken": "rt-fake-first" }}
+                   ] }}"#
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let login = crate::claude_code_login::ClaudeCodeLogin {
+            access_token: "at-fake-second".to_string(),
+            refresh_token: Some("rt-fake-second".to_string()),
+            expires_at: Some(4_102_444_800_000),
+            subscription_type: Some("max".to_string()),
+        };
+
+        let outcome = import_claude_code_login(
+            &path,
+            ImportInto::EmptyFleetOnly,
+            false,
+            None,
+            None,
+            login,
+            LoginUi::Machine,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome, None,
+            "the automatic import must skip a fleet that is no longer empty"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the config must be left byte-for-byte alone"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

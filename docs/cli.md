@@ -718,9 +718,33 @@ Deletes the account from the config. Flags: `--config`.
 
 This is destructive and there is no confirmation prompt. The entry is removed and the file
 is rewritten in place; the access and refresh tokens go with it, so recovering the account
-means running `tcr login` again, not editing anything back. It is also a file-only
-operation: a running proxy keeps the account in its in-memory fleet until it is restarted,
-so removing an account is not a way to stop traffic going to it. Use `tcr disable` for that.
+means running `tcr login` again, not editing anything back.
+
+**It disables the account on the running proxy first, then deletes it from the file**, the
+same live route `tcr disable` uses. So a removed account leaves rotation at once, with no
+restart, and the proxy stops LISTING it the next time it reads the file, which every
+`tcr status` makes it do. TcrBar's row goes on its next poll.
+
+Everything the file could refuse (no such account, a name two rows share) is checked before
+the proxy is touched, and a write that fails after the disable puts the account back the way
+it was, so a failed `tcr remove` changes nothing. The delete edits the file's JSON in place,
+so a row the loader sets aside (an API-key row, a foreign `upstream`) does not block it and
+survives it byte for byte. Deleting the control account also drops `controlAccount`;
+deleting the last account writes `"claudeCodeImport": false`, so the next `tcr status` does
+not import this Mac's Claude Code login into the empty fleet.
+
+What happens depends on what the proxy answers:
+
+| the proxy | what `tcr remove` does |
+|---|---|
+| accepts the disable | deletes the entry from the file; if the proxy predates live removal it keeps listing the account as disabled until it restarts, and `tcr remove` says so on stderr |
+| is not running | deletes the entry from the file; there is nothing live to update |
+| rejects the api-key, or refuses the query (no match, or more than one) | exits with an error and changes nothing |
+| is too old to have the route | deletes the entry from the file and warns that the proxy will keep routing to the account until it restarts |
+| answers something unusable, or does not answer | deletes the entry from the file and warns that the proxy may keep routing to the account until it restarts |
+
+The refusals change nothing because a deletion cannot be undone: if the file lost the
+account while the proxy kept rotating it, there would be no record left to fix it from.
 
 ### `tcr priority <query> [N]`
 
@@ -737,8 +761,22 @@ every existing priority sits on the same side of it.
 
 The positional value conflicts with `--first`/`--last`, and `--first` conflicts with
 `--last`. There is no default: omitting all three is a runtime error,
-`provide a priority value, or one of --first / --last`. This is a file-only write; it does
-not reach a running proxy.
+`provide a priority value, or one of --first / --last`.
+
+**It changes the running proxy first, then the file**, so the next new session is routed by
+the new order with no restart. The value is worked out from the config file (that is what
+`--first` and `--last` are relative to), then POSTed to the proxy's
+`/_tcr/accounts/priority` route, which sets it in the live rotation. The command then writes
+the file. A session already pinned to an account stays on it; priority decides where new
+sessions go.
+
+| the proxy | what `tcr priority` does |
+|---|---|
+| applies it | writes the file |
+| is not running | writes the file; there is nothing live to update |
+| rejects the api-key, or refuses the query (no match, or more than one) | exits with an error and changes nothing |
+| is too old to have the route | writes the file and warns that the proxy keeps the old order until it restarts |
+| answers something unusable, or does not answer | writes the file and warns that the proxy may keep the old order until it restarts |
 
 ### `tcr enable <query>` and `tcr disable <query>`
 
@@ -788,6 +826,7 @@ Probes every account's live quota and prints the fleet.
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
 | `--json` | bool | `false` (text) | emit a JSON array instead of greppable text |
+| `--check` | bool | `false` | exit **4** when an enabled account's last probe failed; output unchanged |
 
 It asks the running proxy where there is one and falls back to an offline read where there
 is not; the output labels which it got, so a fallback is never silently presented as a live
@@ -799,6 +838,34 @@ With no accounts configured, it first tries to import this machine's Claude Code
 add one` on stderr and exits **0**: stdout stays the ordinary empty table (`[]` under `--json`), so a
 caller piping it into `jq` — TcrBar's panel among them — decodes an empty fleet rather than a
 failure. The same line and the same exit code come from `tcr accounts`.
+
+### `--check`: an exit code for scripts
+
+Without the flag, `tcr status` exits **0** whatever the probes said. With it, the output is the
+same bytes and only the exit code changes:
+
+| exit | meaning |
+|---|---|
+| **0** | no enabled account's last probe failed |
+| **1** | the command could not run (an unreadable config, say); not a probe verdict, so a script tells "tcr failed" from "a probe failed" |
+| **4** | at least one enabled account's last probe ended in `error`, `timeout` or `upstream-down` |
+
+These do not fail the check: `never` (no probe has run, so there is nothing to judge),
+`rate-limited` (the usage endpoint throttled the probe itself; the account's serving quota is
+untouched and its last bar is kept), and any account that is disabled, whatever its probe says.
+
+The code is 4 rather than 1 for the reason `tcr doctor` uses 2 and 3: 1 is what any verb exits
+with when it could not run at all (an unreadable config, say), and a script should be able to tell
+"the fleet has a failed probe" from "the command failed". 2 and 3 are doctor's route verdicts,
+which `tcr status` also prints, so they stay out of the way.
+
+The check is opt-in because the default exit is a contract. TcrBar runs `tcr status --json` and
+reads any non-zero exit as a failed poll (`StatusPoller.classify`), which would blank the panel
+every time one account's token was rejected.
+
+```sh
+tcr status --check >/dev/null || echo "a probe failed"
+```
 
 ### The weekly quota pair on `--json`
 
@@ -817,6 +884,22 @@ Unlike the shared `sevenDay` bucket, this window gates **Fable requests only** �
 request never checks it, and `held[]`/the general `quotaState` never reflect it either. It exists on
 the wire so a Fable-scoped caption and tint have something to read.
 
+### How old the quota reading is on `--json`
+
+| key | shape | what it is |
+|---|---|---|
+| `lastProbeMs` | Unix ms or `null` | when the background usage probe last finished, whether it succeeded or failed |
+| `quotaUpdatedAtMs` | Unix ms or `null` | when a quota reading was last taken from either source: a successful probe, or a served response that carried rate-limit headers. `null` when nothing has been read since the server started |
+
+Use `quotaUpdatedAtMs` to judge whether the bars are current. `lastProbeMs` cannot: a busy
+account's bars move from response headers between probes, and a failed probe moves
+`lastProbeMs` while reading nothing, so an idle account with a broken probe shows frozen bars
+next to a recent probe time. A server built before this key existed omits it.
+
+```sh
+tcr status --json | jq -r '.[] | "\(.name)\t\(((now * 1000 - (.quotaUpdatedAtMs // 0)) / 60000) | floor)m"'
+```
+
 ### The group keys on `--json`
 
 Each row carries its group labels plus the subsets that change what the row can serve. All
@@ -829,10 +912,10 @@ not an unmeasured one.
 | `reservedGroups` | array of strings | the subset marked `reserved` — the row serves only traffic that asked for one of its groups |
 | `parkedGroups` | array of strings | the subset marked `parked` (`tcr group park`) — non-empty means the row is out of rotation entirely, and names which group did it |
 
-A parked row's `gate` reads `"parked"`, beside the existing `"disabled"`, `"reserved"`,
-`"login"`, `"rejected"`, `"hold"`, `"five-hour"`, `"seven-day"`, `"fable-weekly"`,
-`"standard"` and `"ok"`. A row that is BOTH parked by its group and disabled on its own
-reports `"disabled"` — the row's own state outranks the group's, so the output never
+A parked row's `gate` reads `"parked"`. Every `gate` value, what it means and what to do
+about it is in [What the `gate` value means](troubleshooting.md#what-the-gate-value-means).
+A row that is BOTH parked by its group and disabled on its own
+reports `"disabled"`: the row's own state outranks the group's, so the output never
 attributes a bench to a group when a person did it.
 
 ```
@@ -984,6 +1067,29 @@ A server that has the key always sends it, MITM off included, and a server built
 it out. That difference is how `tcr run --codex` tells an older proxy from one running without
 MITM.
 
+### `GET /_tcr/quota`, the light read for a status line
+
+A Claude Code status line ticks every turn and needs only the quota, so it can call this instead of
+`/_tcr/status`. It answers from the running proxy's memory: no probe and no upstream call. The only
+disk access is the one every snapshot makes, a `stat` of the config file, re-reading it only when it
+changed so group gates stay current. Same gate as `/_tcr/status` (loopback only, and `x-api-key` when `proxy.apiKey` is set); any
+verb but `GET` is a local 405.
+
+```json
+{"kind":"tcr.quota.v1","accounts":[
+  {"name":"alice","gate":"ok","fiveHour":0.5,"fiveHourResetMs":1767225600000,
+   "sevenDay":0.2,"sevenDayResetMs":1767830400000}]}
+```
+
+One row per account in the server's order. `gate` is the same token `tcr status --json` reports
+(`ok`, `hold`, `five-hour`, `seven-day`, ...); utilizations are fractions and resets are Unix
+milliseconds, `null` when the window has no reading yet. Check `kind` before trusting a body: a tcr
+too old to have the route answers it with a local 404.
+
+A Codex account's row carries `"provider": "codex"`, spelled as on `tcr status --json`, and an
+Anthropic row carries no `provider` key, so a status line that wants its Claude picture keeps only
+the rows without one.
+
 ---
 
 ## `tcr doctor`
@@ -1046,6 +1152,30 @@ the route is right, nothing answers, and the port is held by something that is n
 `--json` emits the same decision as one object, with `verdict` and `exitCode` written out so a
 caller reads one document instead of re-deriving either.
 
+### Config keys tcr does not recognise
+
+`doctor` also names every top-level key in the config that this build does not recognise, with the
+known key it is closest to. A misspelled key is kept in the file as written and has no effect, so
+without this line `quotaProbeSecs` looks exactly like a config that sets the probe cadence:
+
+```
+unknownKey: quotaProbeSecs (did you mean quotaProbeSeconds?)
+```
+
+In `--json` the same list is `unknownKeys`, an array that is `[]` when every key is known:
+
+```
+"unknownKeys": [{ "key": "quotaProbeSecs", "nearest": "quotaProbeSeconds" }]
+```
+
+`nearest` is `null` when no known key is close enough to be a likely typo. A key counts as known when
+it is a field tcr models, one of the keys read from the unmodelled map
+([configuration](configuration.md#keys-read-from-the-unmodelled-map)), a key teamclaude writes
+(`routes`, `sx`, `logDir`, `autoUpdate`), or the legacy `throttle`. The list is reported and never
+enforced: the file is not changed, the exit code above still describes routing alone, and the server
+logs the same keys once at boot. Only top-level keys are checked; per-account and `proxy` keys are
+not.
+
 `tcr status` prints this verdict line **first**, and only when it is exit 2 or 3, so a glance at the
 fleet cannot show healthy accounts while Claude Code talks to something else. The `--json` form of
 `status` is untouched: it stays a bare array.
@@ -1081,6 +1211,66 @@ stays a single JSON object a script can pipe into `jq`.
 
 ---
 
+## `tcr list`
+
+`tcr list --json` prints every configured Claude account as one JSON object in claude-swap's list
+schema v1, the document [CodexBar](https://github.com/steipete/CodexBar)'s "Read accounts from
+claude-swap" setting parses. It exists so CodexBar can show tcr's accounts with no change on its
+side. The projection and its rules live in `crates/tcr-status-wire/src/cswap_v1.rs`; the committed
+example is `tests/fixtures/cswap-list-v1.json`.
+
+```
+tcr list --json | jq -c '{v: .schemaVersion, n: (.accounts|length)}'
+```
+
+What each field carries:
+
+| field | value |
+|---|---|
+| `schemaVersion` | `1` |
+| `activeAccountNumber` | `null`: tcr pins per session and has no one active account |
+| `supportsAccountSwitching` | `false`: tcr routes per request, so CodexBar hides Switch |
+| `accounts[].number` | the account's 1-based position among the Claude accounts of the config file's `accounts` list |
+| `accounts[].active` | `false` on every row |
+| `accounts[].email` | the account name before any `/org` suffix |
+| `accounts[].organizationName` | the org's name, or `""` |
+| `accounts[].usageStatus` | `relogin_required` when the account needs a login; `ok` when the live server's last quota probe succeeded; `unavailable` otherwise, including every row when no server answers and any gate this build does not know |
+| `accounts[].usage.fiveHour`, `.sevenDay` | `{pct, resetsAt}`: percent used (0 to 100) and the reset in ISO-8601 UTC; omitted when unknown |
+| `accounts[].usage.scoped` | the Fable weekly window as `{"name": "Fable", ...}`; omitted when unknown |
+| `accounts[].usageFetchedAt` | when the bars were last read (`quotaUpdatedAtMs`: a successful probe or a served response's quota headers); omitted when unknown. Not `lastProbeMs`, which a failed probe also stamps |
+| `accounts[].disabled` | `true` when the account is disabled or in a parked group |
+
+Not sent: `alias`, `usage.spend` (tcr's cost is a list-price equivalent with no limit) and
+`lastGoodUsage` (tcr keeps no quota reading on disk). An API-key account is never listed: tcr
+serves subscription logins only, so `apikey` rows are quarantined when the config loads. A Codex
+account is not listed either: claude-swap's list is CodexBar's list of Claude accounts, with no
+field to say a row is anything else, so a Codex row there would be drawn as a Claude account.
+
+**It never probes.** CodexBar runs this on every refresh, so it reads the running proxy and
+nothing else. With no proxy answering it still lists every configured account, each as
+`unavailable`, where `tcr status` would fall back to probing every account over the network.
+A slot follows the config file even when the running proxy holds its accounts in another order
+(the file was reordered after it started); an account the proxy still serves but the file no
+longer lists is placed after the file's accounts.
+
+A handled failure (a config file that cannot be parsed) prints
+`{"schemaVersion":1,"error":{"type":"config_unreadable","message":"..."}}` on **stdout** and exits
+1, because CodexBar reads stdout whatever the exit code. Bare `tcr list` without `--json` is a
+usage error, exit 2, pointing at `tcr status` for the readable view.
+
+CodexBar runs its configured path as `<path> --list --json` and `<path> --version`, with no
+shell, so point it at a shim that forwards both:
+
+```sh
+#!/bin/sh
+case "$1" in --version) exec tcr --version ;; *) exec tcr list --json ;; esac
+```
+
+Save it as an executable file (`chmod +x`) and set it as CodexBar's claude-swap path. The cards
+are labelled "claude-swap" until CodexBar learns about tcr as a source of its own.
+
+---
+
 ## `tcr wrap`
 
 `tcr wrap [--days N] [--json]` — a usage report for the last `N` days (default 7, ending
@@ -1088,8 +1278,8 @@ today UTC), read straight off the usage ledger in `~/.cache/teamclaude/usage/`. 
 status`, this needs no running proxy: the ledger is a durable, append-only record on disk, and
 `tcr wrap` just reads it.
 
-It reports, in order: totals (requests, input/output/cache-read tokens, cost, cache-hit
-ratio), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
+It reports, in order: totals (requests; uncached input, output, cache-write and cache-read
+tokens; cost; and the cache-hit ratio, the share of all prompt tokens read from cache), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
 per-day breakdown with the busiest day marked, the count of distinct sessions plus the three
 longest-running ones by request count, and a comparison against the previous `N`-day period
 (`+12%` / `-3%`). `--config` (default `~/.config/teamclaude.json`) is consulted only for
@@ -1120,24 +1310,24 @@ Example (fake data):
 $ tcr wrap --days 7
 tcr wrap: last 7 day(s), 2026-09-06 to 2026-09-12 (UTC)
 
-totals requests=1204 input=812000 output=241500 cacheRead=98000 cost=$42.17 cacheHitRatio=12.1%
+totals requests=1200 input=812000 output=241500 cacheWrite=90000 cacheRead=98000 cost=$42.17 cacheHitRatio=9.8%
 
 by model (sorted by cost):
-  claude-opus-5                requests=610      cost=$31.80
-  claude-sonnet-5              requests=594      cost=$10.37
+  claude-opus-5                requests=600      cost=$31.80
+  claude-sonnet-5              requests=600      cost=$10.37
 
 by account (sorted by requests):
-  alice@example.com            requests=812      cost=$28.44
-  bob@example.com              requests=392      cost=$13.73
+  alice@example.com            requests=800      cost=$28.44
+  bob@example.com              requests=400      cost=$13.73
 
 by day (busiest marked *):
   2026-09-06   requests=140      cost=$4.90
   2026-09-07   requests=210      cost=$7.35
-  2026-09-08 * requests=305      cost=$10.68
+  2026-09-08 * requests=300      cost=$10.68
   2026-09-09   requests=180      cost=$6.30
-  2026-09-10   requests=145      cost=$5.08
+  2026-09-10   requests=140      cost=$5.08
   2026-09-11   requests=120      cost=$4.20
-  2026-09-12   requests=104      cost=$3.66
+  2026-09-12   requests=110      cost=$3.66
 
 sessions: 38 distinct; top 3 by requests:
   session 1234567890123456789 requests=210

@@ -42,13 +42,14 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
     let now = crate::now_ms();
     AccountRuntime {
         name: name.to_string(),
-        account_type: "oauth".to_string(),
+        account_type: crate::config::AccountType::OAuth,
         provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
         org_name: Some("Demo Org".to_string()),
         priority,
         disabled: false,
+        removed: false,
         groups: Vec::new(),
         // A believable default plan, overridden per row below so the demo shows
         // the mix a real fleet has — which is the whole reason the plan is on
@@ -81,6 +82,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         in_flight: 0,
         last_served_ms: 0,
         rate_limited_until_ms: None,
+        hold_cause: crate::manager::HoldCause::RateLimit,
         refresh_retry_after_ms: None,
         error_retry_after_ms: None,
         error_backoff_ms: 0,

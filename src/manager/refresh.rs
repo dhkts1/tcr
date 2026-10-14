@@ -205,7 +205,9 @@ impl Manager {
         }
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account = accounts.get(idx)?;
-        if account.account_type != "oauth" {
+        // Deleted from the config: nothing will ever store a rotated token for
+        // it, so rotating would only burn the single-use refresh token.
+        if !account.account_type.is_oauth() || account.removed {
             return None;
         }
         let refresh_token = account.refresh_token.clone()?;

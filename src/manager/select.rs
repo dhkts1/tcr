@@ -535,7 +535,21 @@ impl Manager {
         // belongs to one provider, and a request of the other provider has no
         // account that is both. Serving it would hand the request a credential
         // its own upstream does not know.
-        if let Some(li) = self.locked_idx {
+        //
+        // A locked account deleted from the config is no lock at all: the next
+        // boot resolves `lockAccount` to nothing and rotates normally, so this
+        // process does the same now rather than serve a deleted account. That
+        // is decided first, so a deleted lock rotates either provider's request
+        // and only a live one refuses the other provider's.
+        let locked = self.locked_idx.filter(|&li| {
+            !self
+                .accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .get(li)
+                .is_some_and(|a| a.removed)
+        });
+        if let Some(li) = locked {
             let same_provider = {
                 let accounts = self.accounts.read().expect("accounts lock poisoned");
                 accounts.get(li).is_some_and(|a| a.provider == provider)
@@ -2588,7 +2602,11 @@ impl Manager {
         }
         if let Some(until) = account.rate_limited_until_ms {
             if now_ms < until {
-                gates.push((GateReason::Hold, ms_to_odt(until)));
+                let reason = match account.hold_cause {
+                    HoldCause::RateLimit => GateReason::Hold,
+                    HoldCause::Refused => GateReason::Refused,
+                };
+                gates.push((reason, ms_to_odt(until)));
             }
         }
         if let Some(window) = account.quota.five_hour {
@@ -3221,7 +3239,7 @@ mod revalidation_sticky_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -3379,7 +3397,7 @@ mod sticky_divert_replay_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -3551,7 +3569,7 @@ mod strict_group_door_tests {
     fn account(name: &str, groups: &[&str]) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -4047,7 +4065,7 @@ mod reserved_gate_agreement_tests {
         AccountRuntime::from_config(
             &Account {
                 name: "probe".to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
@@ -4218,7 +4236,7 @@ mod group_miss_tests {
         AccountRuntime::from_config(
             &Account {
                 name: name.to_string(),
-                account_type: "oauth".to_string(),
+                account_type: crate::config::AccountType::OAuth,
                 provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
@@ -4367,7 +4385,7 @@ mod reset_urgency_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -4624,7 +4642,7 @@ mod fable_last_resort_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -5005,7 +5023,7 @@ mod stale_pin_load_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -5228,7 +5246,7 @@ mod provider_filter_tests {
     fn account(name: &str) -> Account {
         Account {
             name: name.to_string(),
-            account_type: "oauth".to_string(),
+            account_type: crate::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,

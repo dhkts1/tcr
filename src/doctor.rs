@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::config_keys::UnknownKey;
 use crate::status::StatusPayload;
 
 /// The base URL Claude Code talks to when nothing sets one.
@@ -383,6 +384,11 @@ pub struct Report {
     /// Anything that got in the way of resolving the route (an unreadable
     /// settings file, most often).
     pub problems: Vec<String>,
+    /// Top-level config keys this build does not recognise, each with its
+    /// nearest known spelling. Reported and never rejected: the file keeps
+    /// them as written (see [`crate::config_keys`]). They do not change
+    /// [`Self::exit_code`], which is about routing alone.
+    pub unknown_keys: Vec<UnknownKey>,
 }
 
 impl Report {
@@ -448,6 +454,12 @@ impl Report {
         for problem in &self.problems {
             lines.push(format!("problem: {problem}"));
         }
+        for unknown in &self.unknown_keys {
+            lines.push(format!(
+                "unknownKey: {}",
+                crate::config_keys::describe(unknown)
+            ));
+        }
         lines.push(self.verdict());
         lines.join("\n")
     }
@@ -466,6 +478,15 @@ impl Report {
             );
         }
         value
+    }
+
+    /// Fill [`Self::unknown_keys`] from the loaded config's unmodelled map.
+    /// Separate from [`inspect`] so `tcr status`, which calls `inspect` for
+    /// its route line alone, is untouched.
+    pub fn with_config_keys(mut self, config: &crate::config::Config) -> Self {
+        self.unknown_keys =
+            crate::config_keys::unknown_keys(&serde_json::Value::Object(config.extra.clone()));
+        self
     }
 }
 
@@ -490,6 +511,7 @@ pub fn inspect(port: u16, requests_in_window: Option<u64>) -> Report {
         port_holder: port_holder(port),
         requests_in_window,
         problems: resolution.problems,
+        unknown_keys: Vec::new(),
     }
 }
 
@@ -746,6 +768,7 @@ mod tests {
             port_holder: None,
             requests_in_window: requests,
             problems: Vec::new(),
+            unknown_keys: Vec::new(),
         }
     }
 
@@ -828,5 +851,80 @@ mod tests {
         assert!(json["verdict"]
             .as_str()
             .is_some_and(|v| v.starts_with("verdict: ")));
+        assert_eq!(
+            json["unknownKeys"],
+            serde_json::json!([]),
+            "an empty array, never absent or null, when every key is known"
+        );
+    }
+
+    fn config_from(json: &str) -> crate::config::Config {
+        serde_json::from_str(json).expect("a test config parses")
+    }
+
+    /// The lane's gate, in Rust: a misspelled `quotaProbeSeconds` is named in
+    /// the JSON and in the text, with the spelling it meant, and the exit code
+    /// stays the routing answer.
+    #[test]
+    fn a_misspelled_config_key_is_named_and_the_exit_code_is_unchanged() {
+        let report = report_for("http://127.0.0.1:3456", BaseUrlSource::ProcessEnv, Some(0))
+            .with_config_keys(&config_from(r#"{"accounts":[],"quotaProbeSecs":60}"#));
+
+        assert_eq!(
+            report.to_json()["unknownKeys"],
+            serde_json::json!([{"key": "quotaProbeSecs", "nearest": "quotaProbeSeconds"}])
+        );
+        let text = report.render_text();
+        assert!(
+            text.contains("unknownKey: quotaProbeSecs (did you mean quotaProbeSeconds?)"),
+            "{text}"
+        );
+        assert_eq!(
+            report.exit_code(),
+            0,
+            "an unknown key is not a routing failure"
+        );
+    }
+
+    #[test]
+    fn the_correct_spelling_reports_no_unknown_keys() {
+        let report = report_for("http://127.0.0.1:3456", BaseUrlSource::ProcessEnv, Some(0))
+            .with_config_keys(&config_from(r#"{"accounts":[],"quotaProbeSeconds":60}"#));
+
+        assert_eq!(report.to_json()["unknownKeys"], serde_json::json!([]));
+        assert!(!report.render_text().contains("unknownKey:"));
+    }
+
+    /// `tcr doctor` on a config holding a Codex account prints no `unknownKey:`
+    /// line and reports `unknownKeys: []`. Loaded the way `cli::doctor` loads it,
+    /// through `config::load`, so the Codex row's `credentialVersion` 2 is
+    /// accepted first, and with a `codexUpstream` the user set, so the key is on
+    /// disk. `codexUpstream` and each row's `provider` are modelled fields, so
+    /// serde takes them before the unmodelled map doctor reads is built, and
+    /// `codexUpstream` is in the registry besides.
+    ///
+    /// Watched red: rename the `codexUpstream` field's serde key so the key lands
+    /// in that map AND drop its registry line, and it is named here. Either alone
+    /// stays green, the other one still covering it.
+    #[test]
+    fn a_codex_config_reports_no_unknown_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teamclaude.json");
+        std::fs::write(
+            &path,
+            r#"{"codexUpstream":"http://127.0.0.1:9100","accounts":[
+                 {"name":"alice@example.com","accessToken":"at-a"},
+                 {"name":"alice@example.com/codex","provider":"codex","type":"oauth",
+                  "accessToken":"at-c","accountUuid":"11111111-1111-4111-8111-111111111111",
+                  "credentialVersion":2}]}"#,
+        )
+        .expect("write the config");
+        let config = crate::config::load(&path).expect("a Codex config loads");
+        let report = report_for("http://127.0.0.1:3456", BaseUrlSource::ProcessEnv, Some(0))
+            .with_config_keys(&config);
+
+        assert_eq!(report.to_json()["unknownKeys"], serde_json::json!([]));
+        let text = report.render_text();
+        assert!(!text.contains("unknownKey:"), "{text}");
     }
 }
