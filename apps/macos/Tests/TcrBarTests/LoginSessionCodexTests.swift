@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 
@@ -382,7 +383,79 @@ final class LoginSessionCodexTests: XCTestCase {
         XCTAssertTrue(gone, "the child the sign-in started outlived Cancel")
     }
 
+    /// Quitting TcrBar ends a sign-in still running. `codex login` waits for the browser
+    /// with no timeout of its own, so a sign-in TcrBar left behind would keep its loopback
+    /// listener for good, and could still save an account nobody is watching for.
+    @MainActor
+    func testQuittingEndsARunningSignIn() throws {
+        let center = NotificationCenter()
+        let (session, sleeper) = try startedSignIn(notifications: center)
+        center.post(name: NSApplication.willTerminateNotification, object: nil)
+        XCTAssertTrue(ended(sleeper), "the child the sign-in started outlived quitting TcrBar")
+        withExtendedLifetime(session) {}
+    }
+
+    /// A session dropped with its child still running ends that child. The panel is rebuilt
+    /// under an open sheet when a notification opens it on another tab, and nothing then
+    /// presses Cancel.
+    @MainActor
+    func testADiscardedSessionEndsItsSignIn() throws {
+        var (session, sleeper): (LoginSession?, pid_t) = try startedSignIn(
+            notifications: NotificationCenter())
+        XCTAssertNotNil(session)
+        session = nil
+        XCTAssertTrue(ended(sleeper), "the child the sign-in started outlived its session")
+    }
+
     // MARK: - Helpers
+
+    /// A Codex sign-in running a fake tcr whose own child sleeps, as `codex login` would wait
+    /// for the browser, and that child's pid. The child is killed when the test ends.
+    @MainActor
+    private func startedSignIn(notifications: NotificationCenter) throws -> (LoginSession, pid_t) {
+        let root = try temporaryFolder()
+        let pidFile = root.appendingPathComponent("sleep.pid")
+        let script = root.appendingPathComponent("fake-tcr")
+        try executable(
+            script,
+            """
+            #!/bin/sh
+            /bin/sleep 60 &
+            echo $! > '\(pidFile.path)'
+            wait
+            """)
+        let session = LoginSession(
+            request: .codex(account: nil), open: { _ in }, resolve: { .success(script) },
+            storedCodexExecutable: { nil }, notifications: notifications)
+        session.start()
+
+        var pid: pid_t?
+        let started = Date()
+        while pid == nil, Date().timeIntervalSince(started) < 5 {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+                let value = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            {
+                pid = value
+            } else {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        let sleeper = try XCTUnwrap(pid, "the fake tcr never started its child")
+        addTeardownBlock {
+            if kill(sleeper, 0) == 0 { kill(sleeper, SIGKILL) }
+        }
+        return (session, sleeper)
+    }
+
+    /// Whether `pid` is gone within five seconds.
+    private func ended(_ pid: pid_t) -> Bool {
+        let since = Date()
+        while Date().timeIntervalSince(since) < 5 {
+            if kill(pid, 0) != 0 && errno == ESRCH { return true }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return false
+    }
 
     private func fixtureLines() throws -> [String] {
         String(decoding: try CanonicalFixtures.data("codex-login-events.jsonl"), as: UTF8.self)

@@ -52,6 +52,8 @@ public final class LoginSession: ObservableObject {
 
     private var flow: LoginFlow
     private var process: Process?
+    /// The observer that ends a running child when TcrBar quits; set only while one runs.
+    private var quitObserver: NSObjectProtocol?
     private var buffer = LineBuffer()
     private var stderrText = ""
     private var cancelled = false
@@ -61,6 +63,7 @@ public final class LoginSession: ObservableObject {
     private let environment: [String: String]
     private let storedCodexExecutable: () -> String?
     private let resolvedCodexExecutable: () -> String?
+    private let notifications: NotificationCenter
 
     /// `request` is the sign-in to run, `nil` for the chooser, which runs nothing
     /// until ``begin(_:)``. `phase` is where the sheet opens: `.choosing`, or
@@ -75,6 +78,8 @@ public final class LoginSession: ObservableObject {
     /// a test can drive the whole session without a browser, an installed `tcr`
     /// or this Mac's codex. `storedCodexExecutable` is the path `Choose codex…`
     /// saved; `resolvedCodexExecutable` the one this Mac's search found.
+    /// `notifications` is where TcrBar's quit is announced, so a test can quit a
+    /// session without announcing a quit to the whole process.
     public init(
         request: LoginRequest?,
         phase: LoginPhase = .opening,
@@ -85,7 +90,8 @@ public final class LoginSession: ObservableObject {
         storedCodexExecutable: @escaping () -> String? = {
             UserDefaults.standard.string(forKey: TcrTool.codexOverrideDefaultsKey)
         },
-        resolvedCodexExecutable: @escaping () -> String? = { nil }
+        resolvedCodexExecutable: @escaping () -> String? = { nil },
+        notifications: NotificationCenter = .default
     ) {
         self.request = request
         self.phase = phase
@@ -95,6 +101,7 @@ public final class LoginSession: ObservableObject {
         self.environment = environment
         self.storedCodexExecutable = storedCodexExecutable
         self.resolvedCodexExecutable = resolvedCodexExecutable
+        self.notifications = notifications
         self.flow = LoginFlow(requesting: request?.account)
     }
 
@@ -259,24 +266,54 @@ public final class LoginSession: ObservableObject {
         do {
             try child.run()
             process = child
+            watchForQuit()
         } catch {
             phase = .failed(reason: "could not run \(executable.path): \(error.localizedDescription)")
         }
     }
 
     /// Stop the login. The child is terminated rather than left running: it
-    /// holds a loopback listener and would otherwise sit there for the rest of
-    /// its 2-minute timeout, ready to accept a callback for a flow the person
-    /// just abandoned.
+    /// holds a loopback listener, ready to accept a callback for a flow the person
+    /// just abandoned, for the rest of a Claude login's 2-minute timeout, and for
+    /// good on a Codex sign-in, whose `codex login` has no timeout of its own.
     ///
     /// `terminate()` sends SIGTERM to tcr's whole process group, which also stops
     /// the `codex login` that `tcr login --codex` runs as a child of its own.
     /// Never change it to a SIGKILL, which tcr cannot clean up after, or to a
     /// signal sent to tcr's pid alone, which codex would outlive.
+    ///
+    /// Quitting TcrBar cancels a running child the same way (``watchForQuit()``),
+    /// and so does dropping the session while one runs (`deinit`).
     public func cancel() {
         cancelled = true
         process?.terminate()
         process = nil
+        stopWatchingForQuit()
+    }
+
+    /// Cancel a running child when TcrBar quits. Nothing else would: the child runs in
+    /// its own process group, so it outlives this app, and a quit tears the panel down
+    /// without pressing Cancel. The observer runs synchronously on the main thread that
+    /// posts the quit, so the signal is sent before the app exits.
+    private func watchForQuit() {
+        stopWatchingForQuit()
+        quitObserver = notifications.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cancel() }
+        }
+    }
+
+    private func stopWatchingForQuit() {
+        if let quitObserver { notifications.removeObserver(quitObserver) }
+        quitObserver = nil
+    }
+
+    deinit {
+        // A session dropped while its child runs, by a panel rebuilt under an open sheet
+        // say, must not leave `tcr login` and its codex behind with nobody to cancel them.
+        if let process, process.isRunning { process.terminate() }
+        if let quitObserver { notifications.removeObserver(quitObserver) }
     }
 
     /// One chunk of the child's stdout. A chunk is not a line — the split and
@@ -308,6 +345,7 @@ public final class LoginSession: ObservableObject {
     /// forever on a process that is gone.
     private func childEnded(exitCode: Int32) {
         process = nil
+        stopWatchingForQuit()
         guard !cancelled else { return }
         flow.finish(exitCode: exitCode, stderr: stderrText)
         publishFlow()

@@ -495,9 +495,11 @@ struct FleetView: View {
         }
         // The sheet IS `loginSession != nil` — dismissing by any route (Esc,
         // click-away) runs the same cancel the button does, because a login
-        // left running would keep a loopback listener open for the rest of its
-        // 2-minute timeout, ready to accept a callback for a flow the person
-        // just abandoned.
+        // left running would keep a loopback listener open, ready to accept a
+        // callback for a flow the person just abandoned: for the rest of a
+        // Claude login's 2-minute timeout, and for good on a Codex sign-in,
+        // whose `codex login` has no timeout. Quitting TcrBar, or a rebuild
+        // that drops the session, cancels it too (`LoginSession.cancel()`).
         .sheet(
             isPresented: Binding(
                 get: { loginSession != nil },
