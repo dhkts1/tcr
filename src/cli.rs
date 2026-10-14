@@ -3682,13 +3682,6 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
             )
         );
     } else {
-        // One greppable `source=` line above the account lines, in the same
-        // key=value idiom, so the provenance is visible without --json.
-        // `http1Only` rides here rather than per-account: it is a server-wide
-        // fact, like `source` itself, not a per-account gating detail — see
-        // `Manager::http1_only`'s doc-comment for why this must NOT be
-        // re-derived from the config file when `source=live`. `groupColors`
-        // rides the same way, one `name:hex` token per group.
         // The route problem goes ABOVE the fleet, because it outranks it: a
         // glance at `tcr status` that shows healthy accounts while Claude Code
         // is pointed at another base URL is the exact reading that cost a
@@ -3697,39 +3690,81 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         // the text form. `--json` is a bare array a script pipes into jq, and
         // a line above it would corrupt that contract.
         let route = crate::doctor::inspect(proxy_port, served_recently);
-        if route.exit_code() != 0 {
-            println!("{}", route.verdict());
-        }
-        let group_colors_field = if group_colors.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " groupColors={}",
-                group_colors
-                    .iter()
-                    .map(|(g, hex)| format!("{g}:{hex}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-        println!(
-            "status source={}{}{} http1Only={}{}",
-            source.as_str(),
-            match source {
-                StatusSource::Live => String::new(),
-                StatusSource::Offline =>
-                    " note=serving-counters-unavailable-no-server-answered".to_string(),
-            },
-            build_fields(server_build.as_ref()),
-            http1_only,
-            group_colors_field,
+        let claude_verdict = (route.exit_code() != 0).then(|| route.verdict());
+        print!(
+            "{}",
+            render_status_text(&StatusText {
+                snapshot: &snapshot,
+                source,
+                server_build: server_build.as_ref(),
+                client_build: &BuildInfo::current(),
+                http1_only,
+                group_colors: &group_colors,
+                claude_verdict,
+            })
         );
-        print!("{}", render_accounts(&snapshot, source));
     }
     if !check {
         return Ok(0);
     }
     Ok(StatusCheck::of(&snapshot).exit_code())
+}
+
+/// What `tcr status` prints on stdout in its text form, in order: a route verdict when there is
+/// one to give, the `status source=` header, and one line per account. Pure, so the bytes a
+/// Claude-only fleet sees can be pinned.
+pub(crate) struct StatusText<'a> {
+    pub snapshot: &'a StatsSnapshot,
+    pub source: StatusSource,
+    pub server_build: Option<&'a BuildInfo>,
+    pub client_build: &'a BuildInfo,
+    pub http1_only: bool,
+    pub group_colors: &'a std::collections::BTreeMap<String, String>,
+    /// `crate::doctor::Report::verdict()` when Claude's route has a problem (`exit_code() != 0`).
+    pub claude_verdict: Option<String>,
+}
+
+/// The bytes of `tcr status`'s text form, [`StatusText`]'s lines in order, each ending in a
+/// newline.
+pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
+    let mut out = String::new();
+    if let Some(verdict) = &text.claude_verdict {
+        out.push_str(verdict);
+        out.push('\n');
+    }
+    // One greppable `source=` line above the account lines, in the same
+    // key=value idiom, so the provenance is visible without --json.
+    // `http1Only` rides here rather than per-account: it is a server-wide
+    // fact, like `source` itself, not a per-account gating detail — see
+    // `Manager::http1_only`'s doc-comment for why this must NOT be
+    // re-derived from the config file when `source=live`. `groupColors`
+    // rides the same way, one `name:hex` token per group.
+    let group_colors_field = if text.group_colors.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " groupColors={}",
+            text.group_colors
+                .iter()
+                .map(|(g, hex)| format!("{g}:{hex}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    out.push_str(&format!(
+        "status source={}{}{} http1Only={}{}\n",
+        text.source.as_str(),
+        match text.source {
+            StatusSource::Live => String::new(),
+            StatusSource::Offline =>
+                " note=serving-counters-unavailable-no-server-answered".to_string(),
+        },
+        build_fields(text.server_build, text.client_build),
+        text.http1_only,
+        group_colors_field,
+    ));
+    out.push_str(&render_accounts(text.snapshot, text.source));
+    out
 }
 
 /// `tcr list --json`: every configured account in claude-swap's list schema v1,
@@ -3933,9 +3968,9 @@ pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
 /// two are the same binary only until someone rebuilds without restarting, which
 /// is the normal state of affairs here (`tcr update` rebuilds on purpose without
 /// restarting). When they differ, the CLI you just ran is newer than the server
-/// answering it — worth seeing before trusting either.
-fn build_fields(server: Option<&BuildInfo>) -> String {
-    let client = BuildInfo::current();
+/// answering it — worth seeing before trusting either. `client` is this binary's
+/// own build (`BuildInfo::current()`), a parameter so the line can be pinned.
+fn build_fields(server: Option<&BuildInfo>, client: &BuildInfo) -> String {
     match server {
         Some(server) => format!(
             " server_sha={} server_dirty={} server_built_at={} client_sha={}",
@@ -7246,7 +7281,7 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-07-26T00:00:00Z".to_string(),
         };
-        let live = build_fields(Some(&server));
+        let live = build_fields(Some(&server), &BuildInfo::current());
         assert!(live.contains("server_sha=cd146ce"), "{live}");
         assert!(live.contains("server_dirty=false"), "{live}");
         assert!(
@@ -7258,7 +7293,7 @@ mod tests {
             "{live}"
         );
 
-        let offline = build_fields(None);
+        let offline = build_fields(None, &BuildInfo::current());
         assert!(
             !offline.contains("server_sha="),
             "no server, no server fields: {offline}"
@@ -7269,7 +7304,7 @@ mod tests {
         );
 
         // An unknown dirty flag reads as `unknown`, never as `false`.
-        let murky = build_fields(Some(&BuildInfo::default()));
+        let murky = build_fields(Some(&BuildInfo::default()), &BuildInfo::current());
         assert!(murky.contains("server_dirty=unknown"), "{murky}");
     }
 
@@ -8937,6 +8972,92 @@ mod tests {
              (apps/macos: swift test) — that is the half of the contract this \
              process cannot check.",
             path.display()
+        );
+    }
+
+    /// `tcr status`'s text form over the contract sample's Anthropic rows, as a live
+    /// server at `abc1234` answers a client at `def5678`, with `claude_verdict` above the
+    /// header when there is one.
+    fn claude_only_status_text(claude_verdict: Option<&str>) -> String {
+        let (mut snapshot, _) = status_contract_snapshot();
+        snapshot
+            .accounts
+            .retain(|row| row.provider == Provider::Anthropic);
+        let server = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let client = BuildInfo {
+            sha: "def5678".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        // The group colors `status_contract_rendered` builds.
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            (
+                "codereview".to_string(),
+                crate::config::derive_group_color("codereview"),
+            ),
+            ("dev".to_string(), "#0a84ff".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        render_status_text(&StatusText {
+            snapshot: &snapshot,
+            source: StatusSource::Live,
+            server_build: Some(&server),
+            client_build: &client,
+            http1_only: false,
+            group_colors: &group_colors,
+            claude_verdict: claude_verdict.map(str::to_string),
+        })
+    }
+
+    /// The bytes `tcr status` prints for a fleet with no Codex account, pinned before the
+    /// status text learned about Codex accounts: every line a Codex fleet gains must leave a
+    /// Claude-only fleet's text byte for byte as it was, the route verdict above the header
+    /// included.
+    #[test]
+    fn claude_only_status_text_is_unchanged() {
+        assert_eq!(
+            claude_only_status_text(None),
+            "status source=live server_sha=abc1234 server_dirty=false \
+             server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
+             groupColors=codereview:#63cbfe,dev:#0a84ff\n\
+             account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
+             state=ok status=active probe=ok stream_errors=2 last_stream_error=overloaded_error \
+             groups=codereview,dev\n\
+             account bob@example.com priority=1 plan=Team 5x 5h=95% wk=91% fable=10% cache=75% \
+             state=near status=active probe=rate-limited stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account carol@example.com priority=2 plan=Team Standard 5h=100% wk=100% fable=50% \
+             cache=75% state=spent status=throttled probe=error stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
+             probe=never stream_errors=0 disabled\n"
+        );
+        assert_eq!(
+            claude_only_status_text(Some(
+                "verdict: this proxy is not on Claude's route: \
+                 /Users/example/.claude/settings.json sets https://gateway.example.com"
+            )),
+            "verdict: this proxy is not on Claude's route: \
+             /Users/example/.claude/settings.json sets https://gateway.example.com\n\
+             status source=live server_sha=abc1234 server_dirty=false \
+             server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
+             groupColors=codereview:#63cbfe,dev:#0a84ff\n\
+             account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
+             state=ok status=active probe=ok stream_errors=2 last_stream_error=overloaded_error \
+             groups=codereview,dev\n\
+             account bob@example.com priority=1 plan=Team 5x 5h=95% wk=91% fable=10% cache=75% \
+             state=near status=active probe=rate-limited stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account carol@example.com priority=2 plan=Team Standard 5h=100% wk=100% fable=50% \
+             cache=75% state=spent status=throttled probe=error stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
+             probe=never stream_errors=0 disabled\n"
         );
     }
 
