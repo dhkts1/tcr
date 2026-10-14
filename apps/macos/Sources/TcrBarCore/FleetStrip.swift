@@ -81,7 +81,8 @@ public struct StripSegment: Identifiable, Equatable, Sendable {
 public struct FleetStrip: Equatable, Sendable {
     /// Left to right, the tab's rows top to bottom.
     public let segments: [StripSegment]
-    /// N: the accounts in the live band. A count; no plan weighting.
+    /// N: the accounts in the live band the router can still send work to. A
+    /// count; no plan weighting. ``canTakeWork(_:)`` has the rule.
     public let canTakeWork: Int
     /// M: every account.
     public let total: Int
@@ -106,10 +107,27 @@ public struct FleetStrip: Equatable, Sendable {
         }
         self.segments = segments
         self.total = segments.count
-        self.canTakeWork = segments.filter { FleetBand($0.account) == .live }.count
+        self.canTakeWork = segments.filter { Self.canTakeWork($0.account) }.count
         self.nextBackCountdown = FleetSection.firstBackCountdown(
             segments.map(\.account).filter { FleetBand($0) == .outOfTokens }, now: now)
     }
+
+    /// In the live band, and not an account the router will never select: a
+    /// dead login (``FleetTally/Kind/needsRelogin``) or one Anthropic has
+    /// rejected (``FleetTally/Kind/rejected``) is neither spent nor parked, so
+    /// it sits in the live band, but counting it as capacity is the overclaim
+    /// those two buckets exist to stop.
+    static func canTakeWork(_ account: Account) -> Bool {
+        guard FleetBand(account) == .live else { return false }
+        switch FleetTally.Kind(account: account) {
+        case .needsRelogin, .rejected: return false
+        case .ok, .near, .spent, .unknown, .unmeasured, .disabled: return true
+        }
+    }
+
+    /// Nothing can take work: the headline wears the out-of-tokens colour
+    /// rather than the ready one.
+    public var isOutOfCapacity: Bool { canTakeWork == 0 }
 
     /// "5 of 13 can take work now".
     public var headline: String { "\(canTakeWork) of \(total) can take work now" }

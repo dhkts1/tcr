@@ -993,8 +993,12 @@ struct FleetView: View {
     private var v4FooterLeading: String {
         switch visibleTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
-        case .sessions: return "proxy + Claude Code session files"
-        case .tools: return "from request bodies only · nothing logged"
+        // Both lines are sized to fit beside their trailing fact at 372 pt:
+        // the longer "proxy + Claude Code session files" and "from request
+        // bodies only · nothing logged" both drew truncated, and the second
+        // is the panel's one privacy claim.
+        case .sessions: return "proxy + session files"
+        case .tools: return "request bodies only · nothing logged"
         case .peers: return "peer mesh · nothing built yet"
         }
     }
@@ -1350,11 +1354,15 @@ struct FleetView: View {
                 // someone to go and type a command is the worst version of an
                 // empty state — it names work the panel can do for them.
                 VStack(alignment: .leading, spacing: V4.buttonGap) {
+                    // An empty fleet is a starting point, not a reading this
+                    // build cannot classify: it drew the unreadable-row
+                    // triangle in the `unknown` purple, the glyph and colour
+                    // the panel keeps for an account row it failed to decode.
                     banner(
-                        icon: Tok.unreadableGlyph,
+                        icon: "tray",
                         title: "No accounts configured",
                         detail: "tcr answered, and the fleet is empty. Add one to start serving.",
-                        tint: Tok.unknown
+                        tint: Tok.dim
                     )
                     V4Button(
                         title: "Add account…",
@@ -1927,12 +1935,11 @@ struct FleetView: View {
             let visible =
                 toolsRunningExpanded ? entries : Array(entries.prefix(Self.runningVisibleItems))
             let hidden = entries.count - visible.count
-            // Finding 5: state the denominator the ring fills toward, rather
-            // than drawing a fraction with no stated whole.
-            toolsSection(
-                "RUNNING NOW",
-                subtitle: "\(entries.count) · ring fills toward the 600s timeout"
-            ) {
+            // Finding 5 stated the denominator the ring fills toward here, as
+            // "· ring fills toward the 600s timeout". It now sits on the ring
+            // itself (its help and its spoken "4m 18s of 600s"): no
+            // explanatory captions over the rows (Gil, 2026-10-14).
+            toolsSection("RUNNING NOW", subtitle: "\(entries.count)") {
                 ForEach(Array(visible.enumerated()), id: \.offset) { index, entry in
                     if index > 0 { itemRule }
                     runningToolItem(entry)
@@ -1956,7 +1963,7 @@ struct FleetView: View {
     private func timedOutSection(_ fleet: Fleet) -> some View {
         if let classes = fleet.toolsTimeoutClasses, !classes.isEmpty {
             let total = classes.reduce(0) { $0 + $1.count }
-            toolsSection("TIMED OUT TODAY", subtitle: "\(total) · by command class") {
+            toolsSection("TIMED OUT TODAY", subtitle: "\(total)") {
                 ForEach(classes) { timeoutClass in
                     timeoutClassRow(timeoutClass, total: total)
                     if expandedTimeoutClasses.contains(timeoutClass.name) {
@@ -2179,7 +2186,11 @@ struct FleetView: View {
                             accessibilityText: elapsed.map {
                                 "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
                             },
-                            size: V4.toolRowRingSize)
+                            size: V4.toolRowRingSize
+                        )
+                        // The denominator, where the ring is: the section
+                        // head used to carry it as a caption over every row.
+                        .help("Fills toward the \(Int(bashTimeoutSeconds))s tool timeout")
                     }
                     // Elapsed and "20s left" are ONE reading, so they are one
                     // Text: a call in the warning band is red AND says how
@@ -2396,10 +2407,12 @@ struct FleetView: View {
                     // alone, and the spoken value says it too.
                     let spoken = ToolCallLabel.spoken(
                         seconds: seconds, timeout: bashTimeoutSeconds)
+                    let timedOut = ToolCallLabel.timedOut(
+                        seconds: seconds, timeout: bashTimeoutSeconds)
                     V4Pill(
                         text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
-                        role: ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
-                            ? .bad : .neutral
+                        role: timedOut ? .bad : .neutral,
+                        uppercased: timedOut
                     )
                     .accessibilityValue(spoken ?? "")
                     .help(spoken ?? "")
@@ -3418,8 +3431,11 @@ struct FleetView: View {
     private func offlineNotice(_ source: StatusSource) -> some View {
         HStack(spacing: Tok.tightSpacing) {
             Image(systemName: "wifi.slash")
-            Text("source: \(source.token) — quota is real, all serving counters are structurally zero.")
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                "Source: \(source.token). Quota is real; request and token counts show zero "
+                    + "because they were not measured."
+            )
+            .fixedSize(horizontal: false, vertical: true)
         }
         .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
         .foregroundStyle(Tok.offline)

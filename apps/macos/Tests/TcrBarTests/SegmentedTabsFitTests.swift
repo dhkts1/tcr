@@ -322,7 +322,7 @@ final class SegmentedTabsFitTests: XCTestCase {
     /// Scoped to the `enum PanelTab { … }` block specifically, not the whole
     /// file: `FleetView.swift` has at least one OTHER switch over the same
     /// cases with completely different strings (`v4FooterLeading`'s `case
-    /// .sessions: return "proxy + Claude Code session files"`), and a
+    /// .sessions: return "proxy + session files"`), and a
     /// file-wide `firstMatch` grabbed that one instead the first time this
     /// test was written.
     private func panelTabTitle(_ caseName: String) throws -> String {

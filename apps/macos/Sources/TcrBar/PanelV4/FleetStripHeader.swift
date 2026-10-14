@@ -39,12 +39,13 @@ struct FleetStripHeader: View {
     }
 
     /// `.hl`: the count in green at 600, and the countdown in red inside a
-    /// `dim` "next back".
+    /// `dim` "next back". When nothing can take work the count is red too:
+    /// "0 of 3 can take work now" in the ready green read as good news.
     private var headline: some View {
         HStack(alignment: .firstTextBaseline, spacing: V4.stripHeadlineGap) {
             Text(strip.headline)
                 .font(V4.font(V4.stripHeadlineSize, .semibold))
-                .foregroundStyle(Tok.ok)
+                .foregroundStyle(strip.isOutOfCapacity ? Tok.spent : Tok.ok)
                 .lineLimit(1)
             Spacer(minLength: 0)
             if let countdown = strip.nextBackCountdown {
