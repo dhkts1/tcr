@@ -72,6 +72,14 @@ tcr status --json | jq -r '.[] | "\(.name)\t\(.gate)"'
 | `reserved` | `RESERVED` | The account is in a group marked reserved, so it only takes requests that ask for that group (`tcr run --group <group>`). `tcr status` reports the fleet as a request with no group sees it, so a reserved account reads `reserved` even while it serves its group's sessions. | Nothing, if you meant it. `tcr group unreserve <group>` opens it to all traffic. |
 | `parked` | `PARKED` | The account is in a group marked parked, which holds it out of every request, even one that asks for that group. An account that is also disabled on its own reads `disabled`, not `parked`. | `tcr group unpark <group>`. An account disabled on its own stays disabled. |
 
+On a Codex row, ChatGPT's usage-limit refusal reads `rejected` only when nothing else explains
+it. It reads as the window that refused it, `five-hour` or `seven-day`, with that window's reset.
+Past the reset the row keeps that window, with no time, until the next quota probe confirms the
+window rolled. A refusal no full window explains, for credits or a spend cap, reads `hold` while
+the hold tcr set for it lasts, or `refused` if an upstream 403 holds the account. A quota probe
+ends the refusal when it sees a window roll or reads the account allowed again. The details are
+in [`cli.md`](cli.md#codex-rows-on---json).
+
 ## A response that breaks partway through is not moved to another account
 
 tcr picks an account for each request inside a retry loop. A 401, a 403, a 429 or a

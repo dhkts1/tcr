@@ -1980,22 +1980,141 @@ impl Manager {
     ///
     /// The windows come first because the hold is clamped to an hour
     /// (`MAX_RATE_LIMIT_HOLD_SECONDS`): a weekly refusal holds for at most that, while
-    /// the account stays rejected until the window it stored actually rolls.
+    /// the account stays rejected until a usage probe sees the window it stored roll, or
+    /// reads the account allowed ([`crate::quota::Quota::apply_usage`]).
     fn rejected_codex_free_at_ms(
         account: &AccountRuntime,
         threshold: f64,
         now: OffsetDateTime,
     ) -> Option<i64> {
         let now_ms = odt_to_ms(now);
-        [account.quota.five_hour, account.quota.seven_day]
-            .into_iter()
-            .flatten()
-            .filter(|window| window.effective(now) >= threshold)
-            .filter_map(|window| window.live_reset(now))
-            .max()
-            .map(odt_to_ms)
+        Self::rejected_codex_window(account, threshold, now)
+            .map(|(_, reset)| odt_to_ms(reset))
             .or(account.rate_limited_until_ms)
             .filter(|&at| at > now_ms)
+    }
+
+    /// The window that is holding a `rejected` CODEX account out, and when it rolls: among its
+    /// five-hour and weekly windows at or over `threshold` with a live reset, the one whose
+    /// reset is latest, since every one of them has to roll before the account serves. `None`
+    /// when no window explains the refusal.
+    ///
+    /// One answer for both of its readers, [`Self::rejected_codex_free_at_ms`] (when the
+    /// exhaustion hint expects the account back) and [`Self::codex_refusal_gate`] (what the
+    /// snapshot reports), so the two cannot name different windows.
+    fn rejected_codex_window(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+    ) -> Option<(GateReason, OffsetDateTime)> {
+        [
+            (GateReason::FiveHour, account.quota.five_hour),
+            (GateReason::SevenDay, account.quota.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(gate, window)| {
+            let window = window.filter(|w| w.effective(now) >= threshold)?;
+            Some((gate, window.live_reset(now)?))
+        })
+        .max_by_key(|&(_, reset)| reset)
+    }
+
+    /// The window that refused a `rejected` CODEX account and has reached its reset since, with
+    /// no probe yet to read the new window: among its five-hour and weekly windows whose STORED
+    /// utilization is at or over `threshold` and whose reset is at or before `now`, the one
+    /// whose reset is latest, as in [`Self::rejected_codex_window`]. `None` when no such window
+    /// is stored.
+    ///
+    /// The stored utilization, not [`crate::quota::QuotaWindow::effective`], which reads a
+    /// window past its reset as `0.0`: that the window rolled is the clock's inference, and the
+    /// refusal stands until a usage probe reads the new window
+    /// ([`crate::quota::Quota::apply_usage`]).
+    fn rolled_codex_window(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+    ) -> Option<GateReason> {
+        [
+            (GateReason::FiveHour, account.quota.five_hour),
+            (GateReason::SevenDay, account.quota.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(gate, window)| {
+            let window = window.filter(|w| w.utilization >= threshold)?;
+            Some((gate, window.reset.filter(|&reset| reset <= now)?))
+        })
+        .max_by_key(|&(_, reset)| reset)
+        .map(|(gate, _)| gate)
+    }
+
+    /// The gate a CODEX account at its usage limit REPORTS: the window that refused it, with
+    /// that window's reset as the time it frees, in place of a `Rejected` that names no time.
+    /// Only a Codex row whose `account_gate` is `Rejected` is changed:
+    ///
+    /// 1. a full window with a live reset ([`Self::rejected_codex_window`]) reports its own gate,
+    ///    `FiveHour` or `SevenDay`, freeing at that reset;
+    /// 2. else a full window whose reset has passed, with no probe yet to confirm the roll
+    ///    ([`Self::rolled_codex_window`]), keeps its own gate, with no time;
+    /// 3. else a hold still in the future reports itself, freeing at the hold's end: `Hold`, or
+    ///    `Refused` when an upstream 403 armed it, the name `account_gate` gives that hold;
+    /// 4. else it stays `Rejected`, with no time.
+    ///
+    /// Why: ChatGPT's usage-limit refusal names the window it refused on, and that window's
+    /// headers carry its reset, so the account's return is known. Anthropic's `rejected` is its
+    /// own verdict and names no window, so an Anthropic row is returned unchanged.
+    ///
+    /// Why rule 2: past the reset the window has rolled as far as the clock knows, but the
+    /// refusal stands until a usage probe reads the new window. In those minutes the account is
+    /// still out on that window, so the row keeps reading spent on it; `Rejected` would read a
+    /// window refusal as a refusal no window explains.
+    ///
+    /// Why rule 3 holds even for a refusal that carried no reset: the proxy arms a hold for every
+    /// Codex quota refusal, to its windows' reset (`quota::codex_hold_seconds`, clamped to an
+    /// hour), else to the 429's `retry-after`, else for 60 seconds. While that hold is live the
+    /// account really is held, with a known end, so `Hold` and its countdown are the truth; once
+    /// the hold lapses, the refusal that still stands reads `Rejected`. The live hold can also be
+    /// an upstream 403's ([`Self::mark_refused`]): once the refusal's own hold lapses the account
+    /// is back in the pool, which never reads `rejected`, and a 403 then holds it for
+    /// [`REFUSED_HOLD_SECONDS`]. That hold reads `Refused` here, as it does on any other row.
+    ///
+    /// Display only, and only [`Self::snapshot`] calls it. Selection still reads the refusal
+    /// through `account_terminal_gate`, and the exhaustion hint through `account_gate`, so this
+    /// remap changes neither whether the account is held out nor when the hint expects it back.
+    /// The probe cadence does read the snapshot row, so `schedule::ProbeUrgency::of` takes a
+    /// standing refusal from the row's `limit_reached_type` as well as from `Rejected`, and the
+    /// remap cannot slow the probe that ends the refusal either.
+    /// The tokens are ones every client already parses: they are variants of the closed
+    /// `GateReason` enum, so no older CLI fails to read a payload that carries them.
+    pub(super) fn codex_refusal_gate(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+        gate: GateReason,
+        free_at: Option<OffsetDateTime>,
+    ) -> (GateReason, Option<OffsetDateTime>) {
+        if account.provider != crate::provider::Provider::Codex || gate != GateReason::Rejected {
+            return (gate, free_at);
+        }
+        if let Some((window, reset)) = Self::rejected_codex_window(account, threshold, now) {
+            return (window, Some(reset));
+        }
+        if let Some(window) = Self::rolled_codex_window(account, threshold, now) {
+            return (window, None);
+        }
+        match account
+            .rate_limited_until_ms
+            .filter(|&until| until > odt_to_ms(now))
+        {
+            // Named by its cause, as `account_gate` names a hold on a row with no refusal.
+            Some(until) => (
+                match account.hold_cause {
+                    HoldCause::RateLimit => GateReason::Hold,
+                    HoldCause::Refused => GateReason::Refused,
+                },
+                ms_to_odt(until),
+            ),
+            None => (GateReason::Rejected, None),
+        }
     }
 
     /// Mark account `idx` as serving one more in-flight request: bump its
@@ -4033,6 +4152,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -4081,6 +4201,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -4111,6 +4232,7 @@ mod tests {
                     }),
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -4540,6 +4662,176 @@ mod tests {
             "the backfill must run once per account, not once per probe"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A Codex usage prober whose every answer names one ChatGPT plan and nothing else.
+    struct CodexPlanProber {
+        plan: &'static str,
+    }
+
+    impl UsageProber for CodexPlanProber {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            let plan = self.plan;
+            Box::pin(async move {
+                Ok(Usage {
+                    codex: Some(crate::codex_probe::CodexProbeFacts {
+                        plan_type: Some(plan.into()),
+                        ..Default::default()
+                    }),
+                    ..Usage::default()
+                })
+            })
+        }
+    }
+
+    /// **A Codex account's plan follows its usage probe**, and the change is written to that
+    /// row's `organizationType` and to no other key. A refresh carries no new plan, so before
+    /// this a plan changed at ChatGPT (Plus to Pro here) stayed what the login said at import.
+    /// The write is the surgical `save_plan`, and an unchanged plan writes nothing at all.
+    ///
+    /// Watched red, one break at a time: pass `Some("")` as the rate-limit tier to `save_plan`
+    /// and the document gains a `rateLimitTier`; drop the call in `probe_account` and the
+    /// runtime plan stays `plus`.
+    #[tokio::test]
+    async fn a_plus_to_pro_probe_updates_the_plan_and_saves_only_that_key() {
+        let path = tmp_config_path("codex-plan");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+                  "credentialVersion": 2,
+                  "accountUuid": "22222222-2222-4222-8222-222222222222",
+                  "organizationType": "plus", "groups": ["orchard"], "priority": 0,
+                  "accessToken": "at-bob", "refreshToken": "rt-bob",
+                  "expiresAt": 4102444800000 }
+            ] }"#,
+        )
+        .unwrap();
+        let original = read_config_json(&path);
+        let manager = Manager::new(
+            crate::config::load(&path).unwrap(),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(CodexPlanProber { plan: "pro" }),
+            Arc::new(NoWarmer),
+            Some(path.clone()),
+        );
+        // The Anthropic profile endpoint is never this plan's source: a Codex row skips the
+        // backfill, and the counting fake keeps the live endpoint out should that ever break.
+        let profile_calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::clone(&profile_calls),
+        }));
+
+        manager.probe_account(0).await;
+
+        assert_eq!(
+            manager.accounts.read().expect("accounts lock poisoned")[0]
+                .organization_type
+                .as_deref(),
+            Some("pro"),
+            "the runtime row follows the probe's plan"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .plan_label()
+                .as_deref(),
+            Some("ChatGPT Pro")
+        );
+        let mut expected = original.clone();
+        expected["accounts"][0]["organizationType"] = serde_json::json!("pro");
+        assert_eq!(
+            read_config_json(&path),
+            expected,
+            "the plan is saved, and no other key moves"
+        );
+        assert_eq!(profile_calls.load(Ordering::Relaxed), 0);
+
+        let saved = std::fs::read(&path).unwrap();
+        manager.probe_account(0).await;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            saved,
+            "an unchanged plan writes nothing"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A Codex usage prober that answers with what the real parser makes of one payload.
+    struct CodexPayloadProber {
+        payload: serde_json::Value,
+    }
+
+    impl UsageProber for CodexPayloadProber {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            let usage = crate::codex_probe::usage_from_payload(&self.payload);
+            Box::pin(async move { Ok(usage) })
+        }
+    }
+
+    /// **An empty `plan_type` names no plan.** A probe that answers `""`, or only whitespace,
+    /// leaves the account's plan as it was, in memory and on disk, so the plan label never goes
+    /// blank. A plan the probe does name is still taken verbatim.
+    ///
+    /// Watched red: take `plan_type` with no emptiness check, and the row's plan becomes `""`.
+    #[tokio::test]
+    async fn a_probe_with_an_empty_plan_type_leaves_the_plan_as_it_was() {
+        for plan_type in ["", "   "] {
+            let path = tmp_config_path("codex-empty-plan");
+            std::fs::write(
+                &path,
+                r#"{ "accounts": [
+                    { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+                      "credentialVersion": 2,
+                      "accountUuid": "22222222-2222-4222-8222-222222222222",
+                      "organizationType": "plus", "groups": ["orchard"], "priority": 0,
+                      "accessToken": "at-bob", "refreshToken": "rt-bob",
+                      "expiresAt": 4102444800000 }
+                ] }"#,
+            )
+            .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let manager = Manager::new(
+                crate::config::load(&path).unwrap(),
+                Arc::new(CountingRefresher {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(CodexPayloadProber {
+                    payload: serde_json::json!({ "plan_type": plan_type, "rate_limit": null }),
+                }),
+                Arc::new(NoWarmer),
+                Some(path.clone()),
+            );
+            manager.set_plan_prober(Arc::new(CountingPlanProber {
+                plan: crate::probe::Plan::default(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }));
+
+            manager.probe_account(0).await;
+
+            assert_eq!(
+                manager.accounts.read().expect("accounts lock poisoned")[0]
+                    .organization_type
+                    .as_deref(),
+                Some("plus"),
+                "plan_type {plan_type:?} names no plan"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                    .plan_label()
+                    .as_deref(),
+                Some("ChatGPT Plus"),
+                "plan_type {plan_type:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "plan_type {plan_type:?} writes nothing"
+            );
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     /// A profile fetch that failed says nothing about the account's quota or its
@@ -5085,6 +5377,436 @@ mod tests {
                 crate::stats::QuotaState::Normal
             ),
             "control: carol is held by its refusal, not by its threshold"
+        );
+    }
+
+    /// **A Codex refusal keeps the near-limit probe cadence whatever gate its row reports.**
+    /// The snapshot reports a standing refusal as the window or the hold that explains it
+    /// (`Manager::codex_refusal_gate`), not as `Rejected`, and `ProbeUrgency::of` reads that
+    /// row. The refusal still stands until a probe ends it, so the account keeps the cadence a
+    /// `rejected` one gets: while the hold the proxy armed for the refusal lasts (`Hold`),
+    /// while an upstream 403's hold lasts (`Refused`), and past the refusing window's reset
+    /// before a probe confirms the roll (that window, with no time). Every one of them reads
+    /// below its threshold at that moment, so only the refusal can set the cadence. A hold no
+    /// refusal set stays routine, as does the Anthropic account, and so does a refused account
+    /// whose login then died: `Login` outranks `Rejected`, so the refusal never was what held
+    /// it out, and before the remap it read routine too.
+    ///
+    /// Watched red: read only `GateReason::Rejected` in `ProbeUrgency::of`, and bob, carol and
+    /// erin read routine; read any standing refusal whatever the gate, and frank reads
+    /// near-limit.
+    #[test]
+    fn a_codex_refusal_keeps_the_near_limit_cadence_whatever_gate_its_row_reports() {
+        use crate::schedule::ProbeUrgency;
+        use crate::stats::{GateReason, QuotaState};
+        let codex = |name: &str, priority: i64| Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(name, priority)
+        };
+        let manager = build_manager(
+            config_with(vec![
+                account("alice@example.com", 0),
+                codex("bob@example.com/codex", 1),
+                codex("carol@example.com/codex", 2),
+                codex("dave@example.com/codex", 3),
+                codex("erin@example.com/codex", 4),
+                codex("frank@example.com/codex", 5),
+            ]),
+            lock_refresher(),
+        );
+        let refusal = |mut headers: reqwest::header::HeaderMap| {
+            headers.insert(
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "rate_limit_reached".parse().unwrap(),
+            );
+            headers
+        };
+        // bob: refused at half its weekly window, held as the proxy holds every refusal.
+        manager.update_quota(1, &refusal(codex_weekly("50")), 429);
+        manager.mark_rate_limited(1, 1800);
+        // carol: refused on a full weekly window that rolls in half a minute, read a minute on,
+        // before any probe.
+        let soon = OffsetDateTime::now_utc().unix_timestamp() + 30;
+        let mut full = reqwest::header::HeaderMap::new();
+        full.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        full.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        full.insert(
+            "x-codex-primary-reset-at",
+            soon.to_string().parse().unwrap(),
+        );
+        manager.update_quota(2, &refusal(full), 429);
+        // dave: a hold no refusal set, over an idle weekly window.
+        manager.update_quota(3, &codex_weekly("10"), 200);
+        manager.mark_rate_limited(3, 1800);
+        // erin: refused at half its weekly window, then held by an upstream 403.
+        manager.update_quota(4, &refusal(codex_weekly("50")), 429);
+        manager.mark_refused(4);
+        // frank: refused at half its weekly window, then its login died.
+        manager.update_quota(5, &refusal(codex_weekly("50")), 429);
+        accounts_mut(&manager)[5].status = AccountStatus::Error;
+
+        // Past carol's reset, well inside erin's two-minute hold.
+        let later = OffsetDateTime::now_utc() + Duration::minutes(1);
+        let snap = manager.snapshot(later);
+        let rows: Vec<(&str, GateReason, QuotaState, ProbeUrgency)> = snap
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.gate, a.quota_state, ProbeUrgency::of(a)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "alice@example.com",
+                    GateReason::Ok,
+                    QuotaState::Normal,
+                    ProbeUrgency::Routine
+                ),
+                (
+                    "bob@example.com/codex",
+                    GateReason::Hold,
+                    QuotaState::Normal,
+                    ProbeUrgency::NearLimit
+                ),
+                (
+                    "carol@example.com/codex",
+                    GateReason::SevenDay,
+                    QuotaState::Normal,
+                    ProbeUrgency::NearLimit
+                ),
+                (
+                    "dave@example.com/codex",
+                    GateReason::Hold,
+                    QuotaState::Normal,
+                    ProbeUrgency::Routine
+                ),
+                (
+                    "erin@example.com/codex",
+                    GateReason::Refused,
+                    QuotaState::Normal,
+                    ProbeUrgency::NearLimit
+                ),
+                (
+                    "frank@example.com/codex",
+                    GateReason::Login,
+                    QuotaState::Normal,
+                    ProbeUrgency::Routine
+                ),
+            ]
+        );
+    }
+
+    /// **A Codex row's snapshot reports its quota facts, and the refusal's kind exactly while
+    /// that refusal stands.** The refusal sets the kind, the credits and which windows the plan
+    /// has; a probe that sees the window roll ends the refusal and its kind; a new refusal
+    /// brings a new kind, which a probe refreshes while it stands, and that probe, carrying no
+    /// window, reports `[]`: the plan has none, which is a fact, not an unknown; a 2xx that
+    /// carried a window ends it, and a probe then never brings the kind back. An Anthropic row
+    /// reports none of it, even with a stray fact on its quota.
+    ///
+    /// Watched red, one break at a time: fill the facts for every row and the Anthropic row
+    /// reports the stray credits; let the accessor ignore the status and drop the clear on a
+    /// 2xx, and the kind outlives the refusal; filter an empty list out in
+    /// `codex_snapshot_facts`, and the `[]` reads `None`.
+    #[test]
+    fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
+        use crate::codex_probe::CodexProbeFacts;
+        use tcr_status_wire::CodexCredits;
+        let manager = build_manager(
+            config_with(vec![
+                Account {
+                    provider: crate::provider::Provider::Codex,
+                    account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
+                    ..account("bob@example.com", 0)
+                },
+                account("alice@example.com", 1),
+            ]),
+            lock_refresher(),
+        );
+        let snap = |idx: usize| manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].clone();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let now_ms = crate::now_ms();
+        let headers = |pairs: &[(&str, String)]| {
+            let mut h = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                h.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("a name"),
+                    value.parse().expect("a header value"),
+                );
+            }
+            h
+        };
+        let credits = Some(CodexCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("12.50".into()),
+        });
+
+        // 1. The weekly refusal.
+        let refusal = headers(&[
+            ("x-codex-primary-used-percent", "100".into()),
+            ("x-codex-primary-window-minutes", "10080".into()),
+            ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
+            (
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "rate_limit_reached".into(),
+            ),
+            ("x-codex-credits-has-credits", "true".into()),
+            ("x-codex-credits-unlimited", "false".into()),
+            ("x-codex-credits-balance", "12.50".into()),
+        ]);
+        manager.update_quota(0, &refusal, 429);
+        let bob = snap(0).codex;
+        assert_eq!(
+            bob.limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+        assert_eq!(bob.quota_windows, Some(vec!["sevenDay".to_string()]));
+        assert_eq!(bob.seven_day_window_minutes, Some(10_080));
+        assert_eq!(bob.five_hour_window_minutes, None);
+        assert_eq!(bob.credits, credits);
+        assert!(!bob.spend_control_reached);
+
+        // 2. A probe sees the weekly window roll: the refusal ends, and its kind with it.
+        manager.apply_usage(
+            0,
+            &Usage {
+                seven_day: Some(UsageBucket {
+                    utilization: Some(0.02),
+                    reset_at_ms: Some(now_ms + 604_000_000),
+                }),
+                ..Usage::default()
+            },
+        );
+        assert_eq!(snap(0).codex.limit_reached_type, None, "the window rolled");
+
+        // 3. A refusal no full window explains brings its own kind.
+        let refusal_no_full_window = headers(&[
+            ("x-codex-primary-used-percent", "40".into()),
+            ("x-codex-primary-window-minutes", "10080".into()),
+            ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
+            (
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "workspace_credits".into(),
+            ),
+        ]);
+        manager.update_quota(0, &refusal_no_full_window, 429);
+        assert_eq!(
+            snap(0).codex.limit_reached_type.as_deref(),
+            Some("workspace_credits")
+        );
+
+        // 4. While it stands, a probe's kind refreshes it.
+        let probe_kind = Usage {
+            codex: Some(CodexProbeFacts {
+                limit_reached_type: Some("rate_limit_reached".into()),
+                ..Default::default()
+            }),
+            ..Usage::default()
+        };
+        manager.apply_usage(0, &probe_kind);
+        assert_eq!(
+            snap(0).codex.limit_reached_type.as_deref(),
+            Some("rate_limit_reached"),
+            "the probe refreshes the kind while the refusal stands"
+        );
+        assert_eq!(
+            snap(0).codex.quota_windows,
+            Some(Vec::new()),
+            "a probe that carried no window says the plan reports none: [], not unknown"
+        );
+
+        // 5. A 2xx that carried a window ends the refusal; a probe never brings its kind back.
+        let ok_with_window = headers(&[
+            ("x-codex-primary-used-percent", "41".into()),
+            ("x-codex-primary-window-minutes", "10080".into()),
+            ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
+        ]);
+        manager.update_quota(0, &ok_with_window, 200);
+        assert_eq!(snap(0).codex.limit_reached_type, None, "the 2xx ended it");
+        manager.apply_usage(0, &probe_kind);
+        assert_eq!(
+            snap(0).codex.limit_reached_type,
+            None,
+            "a probe never brings the kind back without a refusal"
+        );
+
+        // 6. Control: the Anthropic row reports none of it, even with a stray fact.
+        let anthropic_ok =
+            headers(&[("anthropic-ratelimit-unified-5h-utilization", "0.20".into())]);
+        manager.update_quota(1, &anthropic_ok, 200);
+        assert_eq!(snap(1).codex, crate::stats::CodexFacts::default());
+        manager.accounts.write().expect("accounts lock poisoned")[1]
+            .quota
+            .codex
+            .credits = Some(CodexCredits::default());
+        assert_eq!(
+            snap(1).codex,
+            crate::stats::CodexFacts::default(),
+            "only a Codex row ever reports these facts"
+        );
+    }
+
+    /// **A Codex refusal ends when a usage probe reads the account allowed**: allowed, not at
+    /// its limit, its spend control not reached, and no refusal kind. That is the backend's own
+    /// verdict, so a probe ends a refusal no window explains (a spend cap, credits) once ChatGPT
+    /// ends it. Each condition is needed: a probe that reads any one of them otherwise, or that
+    /// carries no `rate_limit` at all, leaves the refusal and its kind standing. The window-roll
+    /// lift still ends a refusal on a probe that says not allowed, and an Anthropic rejection is
+    /// untouched: its probe carries no verdict.
+    ///
+    /// Driven through the real payload parser (`codex_probe::usage_from_payload`), each probe at
+    /// the refusal's own 60 percent, so no window rolls.
+    ///
+    /// Watched red, one condition dropped at a time: without `allowed`, the probe carrying no
+    /// `rate_limit` lifts the refusal; without `limit_reached`, the probe allowed but at its
+    /// limit does; without the spend control, the spend-control probe does; without the kind,
+    /// the probe carrying one does.
+    #[test]
+    fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
+        use crate::codex_probe::usage_from_payload;
+        use serde_json::{json, Value};
+        let manager = build_manager(
+            config_with(vec![
+                Account {
+                    provider: crate::provider::Provider::Codex,
+                    account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
+                    ..account("bob@example.com", 0)
+                },
+                account("alice@example.com", 1),
+            ]),
+            lock_refresher(),
+        );
+        let gate = |idx: usize| {
+            let row = manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].clone();
+            (row.gate, row.codex.limit_reached_type)
+        };
+        let codex_request = || {
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                crate::provider::CODEX_RESPONSES_PATH,
+                None,
+            )
+        };
+        let reset_at = (OffsetDateTime::now_utc() + Duration::days(5)).unix_timestamp();
+        // The Pro refusal: its one window, the weekly one, at 60 percent in the primary slot.
+        let refuse = || {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("x-codex-primary-used-percent", "60".parse().unwrap());
+            h.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+            h.insert(
+                "x-codex-primary-reset-at",
+                reset_at.to_string().parse().unwrap(),
+            );
+            h.insert(
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "rate_limit_reached".parse().unwrap(),
+            );
+            manager.update_quota(0, &h, 429);
+        };
+        let payload = |allowed: bool, limit_reached: bool, spend: bool, kind: Value, used: u32| {
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": allowed,
+                    "limit_reached": limit_reached,
+                    "primary_window": {
+                        "used_percent": used,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": reset_at,
+                    },
+                    "secondary_window": null,
+                },
+                "spend_control": { "reached": spend },
+                "rate_limit_reached_type": kind,
+            })
+        };
+        let refused = (GateReason::Rejected, Some("rate_limit_reached".to_string()));
+
+        refuse();
+        assert_eq!(gate(0), refused, "precondition: refused, with its kind");
+
+        let kind = json!({ "type": "rate_limit_reached", "details": "fixture" });
+        for (case, probe) in [
+            (
+                "not allowed, at its limit",
+                payload(false, true, false, Value::Null, 60),
+            ),
+            (
+                "allowed but at its limit",
+                payload(true, true, false, Value::Null, 60),
+            ),
+            (
+                "spend control reached",
+                payload(true, false, true, Value::Null, 60),
+            ),
+            (
+                "carrying a refusal kind",
+                payload(true, false, false, kind, 60),
+            ),
+            (
+                "no rate_limit",
+                json!({
+                    "plan_type": "pro",
+                    "rate_limit": null,
+                    "spend_control": { "reached": false },
+                }),
+            ),
+        ] {
+            manager.apply_usage(0, &usage_from_payload(&probe));
+            assert_eq!(gate(0), refused, "{case}: the refusal and its kind stand");
+        }
+
+        manager.apply_usage(
+            0,
+            &usage_from_payload(&payload(true, false, false, Value::Null, 60)),
+        );
+        assert_eq!(
+            gate(0),
+            (GateReason::Ok, None),
+            "read allowed: the refusal and its kind end"
+        );
+        // The pool pick (`Manager::eligible`) reads the hold and the windows, never `rejected`,
+        // so this holds before the lift too: what the lift ends is the refusal itself, its kind
+        // and the gate every reader is shown, and with them the pin and control gates that read
+        // `rejected` (`account_terminal_gate`).
+        assert_eq!(codex_request(), Some(0), "and the account serves");
+
+        // The window-roll lift, on a probe that says not allowed: the weekly reading fell.
+        refuse();
+        assert_eq!(gate(0), refused, "a fresh refusal");
+        manager.apply_usage(
+            0,
+            &usage_from_payload(&payload(false, false, false, Value::Null, 2)),
+        );
+        assert_eq!(gate(0), (GateReason::Ok, None), "the window rolled");
+
+        // Control: an Anthropic rejection, probed at the same reading, stands.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[1].quota.status = Some("rejected".to_string());
+            accounts[1].quota.seven_day = Some(crate::quota::QuotaWindow {
+                utilization: 0.6,
+                reset: Some(OffsetDateTime::now_utc() + Duration::days(5)),
+            });
+        }
+        manager.apply_usage(
+            1,
+            &Usage {
+                seven_day: Some(UsageBucket {
+                    utilization: Some(0.6),
+                    reset_at_ms: Some(reset_at * 1000),
+                }),
+                ..Usage::default()
+            },
+        );
+        assert_eq!(
+            gate(1).0,
+            GateReason::Rejected,
+            "an Anthropic probe lifts nothing"
         );
     }
 
@@ -8798,6 +9520,7 @@ mod tests {
                             seven_day: None,
                             seven_day_oi: None,
                             extra_usage_usd: None,
+                            codex: None,
                         })
                     }
                 })
@@ -11018,6 +11741,7 @@ mod tests {
                     reset_at_ms: Some(reset_ms),
                 }),
                 extra_usage_usd: None,
+                codex: None,
             },
         );
         // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
@@ -11410,6 +12134,209 @@ mod tests {
             (GateReason::Rejected, None),
             "a rejected account must not advertise a window reset as its recovery"
         );
+    }
+
+    /// A refused account as the snapshot sees it: `provider`, `rejected`, and the two windows
+    /// as (utilization, reset from `now`). Thresholds are the default 0.95.
+    fn refused_runtime(
+        provider: crate::provider::Provider,
+        now: OffsetDateTime,
+        five_hour: Option<(f64, Duration)>,
+        seven_day: Option<(f64, Duration)>,
+    ) -> AccountRuntime {
+        let window = |(utilization, reset_in): (f64, Duration)| crate::quota::QuotaWindow {
+            utilization,
+            reset: Some(now + reset_in),
+        };
+        let mut account = AccountRuntime::from_config(&account("refused", 0), false);
+        account.provider = provider;
+        account.quota.status = Some("rejected".into());
+        account.quota.five_hour = five_hour.map(window);
+        account.quota.seven_day = seven_day.map(window);
+        account
+    }
+
+    /// The (gate, free-at in Unix seconds) the snapshot reports for account 0.
+    fn reported_gate(manager: &Manager, now: OffsetDateTime) -> (GateReason, Option<i64>) {
+        let row = &manager.snapshot(now).accounts[0];
+        (row.gate, row.free_at.map(OffsetDateTime::unix_timestamp))
+    }
+
+    /// **A Codex account at its weekly limit reports `SevenDay` and the weekly reset**, not a
+    /// `Rejected` with no time: ChatGPT's usage-limit refusal names the window, and the window
+    /// outranks the hour-long hold the refusal also armed.
+    ///
+    /// Watched red: return the input unchanged from `codex_refusal_gate` and this reads
+    /// `Rejected`.
+    #[test]
+    fn a_weekly_refusal_reports_seven_day_and_its_reset() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.3, Duration::hours(2))),
+            Some((1.0, Duration::days(3))),
+        )]);
+        manager.mark_rate_limited(0, 3600);
+        assert_eq!(
+            reported_gate(&manager, now),
+            (
+                GateReason::SevenDay,
+                Some((now + Duration::days(3)).unix_timestamp())
+            )
+        );
+    }
+
+    /// The five-hour window that refused an account is its gate, with that window's reset. With
+    /// both windows full, both have to roll before it serves, so the later reset, the weekly
+    /// one, is the gate.
+    ///
+    /// Watched red: take the earliest reset instead of the latest and the both-full case reads
+    /// `FiveHour`.
+    #[test]
+    fn a_five_hour_refusal_reports_five_hour() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((1.0, Duration::minutes(52))),
+            Some((0.17, Duration::days(5))),
+        )]);
+        assert_eq!(
+            reported_gate(&manager, now),
+            (
+                GateReason::FiveHour,
+                Some((now + Duration::minutes(52)).unix_timestamp())
+            )
+        );
+
+        let both_full = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((1.0, Duration::hours(1))),
+            Some((1.0, Duration::days(3))),
+        )]);
+        assert_eq!(
+            reported_gate(&both_full, now),
+            (
+                GateReason::SevenDay,
+                Some((now + Duration::days(3)).unix_timestamp())
+            ),
+            "both full: the later reset is when the account serves again"
+        );
+    }
+
+    /// A refusal no full window explains (credits, a spend cap) but that armed a hold reports
+    /// the hold, until the hold's end.
+    #[test]
+    fn a_refusal_with_no_full_window_holds_until_its_reset() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )]);
+        manager.mark_rate_limited(0, 1800);
+        let row = manager.snapshot(now).accounts[0].clone();
+        assert!(row.rate_limited_until.is_some(), "the hold is armed");
+        assert_eq!(row.gate, GateReason::Hold);
+        assert_eq!(row.free_at, row.rate_limited_until);
+    }
+
+    /// **A standing refusal whose live hold an upstream 403 armed reports `Refused`**, the gate
+    /// a 403's hold reads on every other row, until the hold's end. A refused Codex account is
+    /// back in the pool once the refusal's own hold lapses, since the pick reads the hold and
+    /// the windows and never `rejected`, so the live hold can be a 403's
+    /// (`Manager::mark_refused`). The remap reports a live hold under the name `account_gate`
+    /// gives it.
+    ///
+    /// Watched red: report every live hold as `Hold`, and this reads `Hold`.
+    #[test]
+    fn a_refusal_held_by_an_upstream_403_reports_refused() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )]);
+        manager.mark_refused(0);
+        let row = manager.snapshot(now).accounts[0].clone();
+        assert!(row.rate_limited_until.is_some(), "the 403's hold is armed");
+        assert_eq!(row.gate, GateReason::Refused);
+        assert_eq!(row.free_at, row.rate_limited_until);
+    }
+
+    /// **The window that refused an account keeps its gate past its reset, with no time, until a
+    /// probe confirms the roll.** The clock says the window has rolled; only a usage probe reads
+    /// the new window and ends the refusal. Reading `Rejected` in between would turn a spent
+    /// row into a refused one for the minutes until the next probe. The hold the refusal armed,
+    /// to that same reset, has lapsed by then too. Weekly and five-hour alike.
+    ///
+    /// Watched red: without the rolled-window rule, past the reset this reads
+    /// `(Rejected, None)`.
+    #[test]
+    fn a_refusing_window_past_its_reset_keeps_its_gate_until_a_probe_confirms_the_roll() {
+        let now = OffsetDateTime::now_utc();
+        let weekly = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            None,
+            Some((1.0, Duration::minutes(1))),
+        )]);
+        weekly.mark_rate_limited(0, 60);
+        assert_eq!(
+            reported_gate(&weekly, now),
+            (
+                GateReason::SevenDay,
+                Some((now + Duration::minutes(1)).unix_timestamp())
+            ),
+            "before the reset: the window, and its reset"
+        );
+        assert_eq!(
+            reported_gate(&weekly, now + Duration::minutes(2)),
+            (GateReason::SevenDay, None),
+            "past the reset, no probe yet: the same window, with no time"
+        );
+
+        let five_hour = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((1.0, Duration::minutes(1))),
+            Some((0.3, Duration::days(5))),
+        )]);
+        assert_eq!(
+            reported_gate(&five_hour, now + Duration::minutes(2)),
+            (GateReason::FiveHour, None)
+        );
+    }
+
+    /// With neither a full window nor a hold, nothing names a time: still `Rejected`.
+    #[test]
+    fn a_refusal_with_neither_stays_rejected() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )]);
+        assert_eq!(reported_gate(&manager, now), (GateReason::Rejected, None));
+    }
+
+    /// Anthropic's `rejected` is its own verdict and names no time, so its row is exactly what
+    /// `account_gate` says, a full weekly window or not.
+    #[test]
+    fn an_anthropic_rejected_row_is_unchanged() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Anthropic,
+            now,
+            None,
+            Some((1.0, Duration::days(3))),
+        )]);
+        assert_eq!(reported_gate(&manager, now), (GateReason::Rejected, None));
     }
 
     /// The drift guard, and the reason R7 exists. [`Manager::account_gate`] (what
@@ -13527,6 +14454,7 @@ mod tests {
             seven_day: None,
             seven_day_oi: None,
             extra_usage_usd: None,
+            codex: None,
         };
         for cycle in 0..5 {
             manager.apply_usage(0, &headerless_probe);

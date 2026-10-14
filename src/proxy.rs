@@ -20239,8 +20239,8 @@ mod tests {
             );
             assert_eq!(
                 held.gate,
-                GateReason::Rejected,
-                "a refusal carrying x-codex-rate-limit-reached-type reads as rejected"
+                GateReason::SevenDay,
+                "a refusal carrying x-codex-rate-limit-reached-type reports the full window that refused it"
             );
             assert_eq!(held.seven_day, Some(1.0), "the weekly window was learned");
             let other = &snapshot.accounts[served_idx];
@@ -20661,6 +20661,109 @@ mod tests {
         assert_eq!(
             header(&relayed, "x-codex-turn-state").as_deref(),
             Some("opaque")
+        );
+    }
+
+    /// **The Codex quota facts reach the snapshot from a pooled serve, though the client never
+    /// sees the headers that carry them.** The proxy folds the upstream headers into the serving
+    /// account's quota BEFORE `build_response` strips them from the pooled answer, so the
+    /// credits, the windows and their lengths are on bob's row and on nobody else's, and none of
+    /// the eleven headers reaches the client. The reached-type header rides on a 200 here, which
+    /// is no refusal, so no kind is reported.
+    ///
+    /// Watched red: strip the eleven names from the upstream headers before `update_quota`, and
+    /// the credits are never read.
+    #[tokio::test]
+    async fn codex_quota_facts_reach_the_snapshot_though_the_client_never_sees_their_headers() {
+        let secs = OffsetDateTime::now_utc().unix_timestamp();
+        let quota_headers: Vec<(&'static str, String)> = vec![
+            ("x-codex-primary-used-percent", "25".to_string()),
+            ("x-codex-primary-window-minutes", "300".to_string()),
+            ("x-codex-primary-reset-at", (secs + 3600).to_string()),
+            ("x-codex-secondary-used-percent", "3".to_string()),
+            ("x-codex-secondary-window-minutes", "10080".to_string()),
+            ("x-codex-secondary-reset-at", (secs + 86_400).to_string()),
+            ("x-codex-rate-limit-reached-type", "primary".to_string()),
+            ("x-codex-credits-has-credits", "true".to_string()),
+            ("x-codex-credits-unlimited", "false".to_string()),
+            ("x-codex-credits-balance", "12.50".to_string()),
+            ("x-codex-promo-message", "fixture promo".to_string()),
+        ];
+        for name in crate::quota::CODEX_QUOTA_HEADERS {
+            assert!(
+                quota_headers.iter().any(|(sent, _)| *sent == name),
+                "precondition: the fixture sends every name in the strip list, {name} included"
+            );
+        }
+        let answer_with = quota_headers.clone();
+        let origin = Router::new().fallback(move || {
+            let answer_with = answer_with.clone();
+            async move {
+                let mut response = Response::builder().header(CONTENT_TYPE, "application/json");
+                for (name, value) in &answer_with {
+                    response = response.header(*name, value.as_str());
+                }
+                response.body(Body::from("{}")).expect("Codex response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Codex origin");
+        let codex_url = format!(
+            "http://{}",
+            listener.local_addr().expect("Codex origin addr")
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        let manager =
+            Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
+
+        let pooled = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(pooled.status(), StatusCode::OK);
+        for (name, _) in &quota_headers {
+            assert!(
+                pooled.headers().get(*name).is_none(),
+                "{name} leaked from a pooled serve"
+            );
+        }
+
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let bob = &snapshot.accounts[1].codex;
+        assert_eq!(
+            bob.credits,
+            Some(tcr_status_wire::CodexCredits {
+                has_credits: true,
+                unlimited: false,
+                balance: Some("12.50".into()),
+            }),
+            "the credits were read before the strip"
+        );
+        assert_eq!(
+            bob.quota_windows,
+            Some(vec!["fiveHour".to_string(), "sevenDay".to_string()])
+        );
+        assert_eq!(bob.five_hour_window_minutes, Some(300));
+        assert_eq!(bob.seven_day_window_minutes, Some(10_080));
+        assert_eq!(
+            bob.limit_reached_type, None,
+            "a 200 carrying the reached-type header is no refusal"
+        );
+        assert_eq!(
+            snapshot.accounts[0].codex,
+            crate::stats::CodexFacts::default(),
+            "alice, the Anthropic account, reports none of it"
         );
     }
 

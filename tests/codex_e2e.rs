@@ -609,3 +609,120 @@ async fn a_codex_request_with_the_codex_pool_exhausted_gets_the_codex_error_shap
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
 }
+
+/// A Codex origin that refuses every inference request the way a ChatGPT Pro login is refused at
+/// its weekly limit: `429`, its one window (the weekly one, in the primary slot) full until
+/// `weekly_reset` (Unix seconds), the refusal's kind, and the account's credits. Any other path
+/// is a 404.
+async fn spawn_weekly_refusing_codex_origin(weekly_reset: u64) -> String {
+    let app = Router::new().fallback(move |req: axum::extract::Request| async move {
+        if req.uri().path() != "/backend-api/codex/responses" {
+            return (StatusCode::NOT_FOUND, "stub: unknown path").into_response();
+        }
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("content-type", "application/json".to_string()),
+                ("x-codex-primary-used-percent", "100".to_string()),
+                ("x-codex-primary-window-minutes", "10080".to_string()),
+                ("x-codex-primary-reset-at", weekly_reset.to_string()),
+                (
+                    "x-codex-rate-limit-reached-type",
+                    "rate_limit_reached".to_string(),
+                ),
+                ("x-codex-credits-has-credits", "true".to_string()),
+                ("x-codex-credits-unlimited", "false".to_string()),
+                ("x-codex-credits-balance", "12.50".to_string()),
+            ],
+            r#"{"error":{"type":"usage_limit_reached","message":"out"}}"#,
+        )
+            .into_response()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+/// Both Codex accounts at their weekly limit, through the real binary: `tcr status --json`
+/// reports each as `seven-day` with the time the window rolls, not as `rejected` with no time,
+/// though the hour-long hold the refusal armed is still there. Each row carries what the refusal
+/// said: its kind, which windows the plan has (the weekly one alone) and how long it is, and the
+/// credits, all read off headers the client never saw. The Anthropic row carries none of it.
+///
+/// Watched red: drop the `codex_refusal_gate` call in `Manager::snapshot` and both rows read
+/// `rejected`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_usage_limit_reports_the_refusing_window_on_status_json() {
+    let upstream = spawn_stub(ANTHROPIC_ORIGIN, Ledger::default()).await;
+    let weekly_reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3 * 86_400;
+    let refusing_codex = spawn_weekly_refusing_codex_origin(weekly_reset).await;
+    let server = start_server(&upstream, &refusing_codex).await;
+
+    // alice is refused, the rotation tries bob, he is refused too, and tcr answers.
+    let resp = client()
+        .post(format!("{}/backend-api/codex/responses", server.base()))
+        .header("authorization", "Bearer client-own")
+        .header("session-id", "s")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-6-astra","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+
+    let rows = server.status_rows().await;
+    for name in ["alice@example.com/codex", "bob@example.com/codex"] {
+        let row = rows
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} row"));
+        assert_eq!(row["source"], "live", "{row}");
+        assert_eq!(row["gate"], "seven-day", "{row}");
+        assert_eq!(row["freeAtMs"], weekly_reset * 1000, "{row}");
+        assert!(
+            row["secondsUntilFree"].as_i64().is_some_and(|s| s > 0),
+            "{row}"
+        );
+        assert!(
+            row["rateLimitedUntilMs"].is_number(),
+            "the hold is armed, and the window outranks it: {row}"
+        );
+        assert_eq!(row["limitReachedType"], "rate_limit_reached", "{row}");
+        assert_eq!(
+            row["quotaWindows"],
+            serde_json::json!(["sevenDay"]),
+            "{row}"
+        );
+        assert_eq!(row["sevenDayWindowMinutes"], 10_080, "{row}");
+        assert!(row.get("fiveHourWindowMinutes").is_none(), "{row}");
+        assert_eq!(
+            row["credits"],
+            serde_json::json!({"balance": "12.50", "hasCredits": true, "unlimited": false}),
+            "{row}"
+        );
+        assert!(row.get("spendControlReached").is_none(), "{row}");
+    }
+
+    let carol = rows
+        .iter()
+        .find(|row| row["name"] == "carol@example.com")
+        .expect("carol row");
+    for key in [
+        "quotaWindows",
+        "fiveHourWindowMinutes",
+        "sevenDayWindowMinutes",
+        "limitReachedType",
+        "spendControlReached",
+        "credits",
+    ] {
+        assert!(
+            carol.get(key).is_none(),
+            "the Anthropic row carries no {key}: {carol}"
+        );
+    }
+}

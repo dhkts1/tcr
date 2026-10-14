@@ -229,6 +229,10 @@ impl Manager {
         match result {
             Ok(usage) => {
                 self.apply_usage(idx, &usage);
+                // A Codex probe names the account's ChatGPT plan; keep the row's plan current.
+                if let Some(plan) = usage.codex.as_ref().and_then(|f| f.plan_type.as_deref()) {
+                    self.record_codex_plan(idx, plan);
+                }
                 // A successful read is first-hand evidence the endpoint is up —
                 // clear any run of 5xx reads the same way a 429's self-clearing
                 // resets it below.
@@ -421,6 +425,68 @@ impl Manager {
                 account = %target.name, error = %err,
                 "learned this account's plan but could not persist it — it will be \
                  re-fetched after a restart"
+            ),
+        }
+    }
+
+    /// Keep Codex account `idx`'s ChatGPT plan current from its usage probe's `plan_type`: when
+    /// it differs from the row's `organization_type`, record it on the runtime row and write that
+    /// one key to the config through [`config::save_plan`].
+    ///
+    /// The probe, and not the login's id token, because the token's plan claim is read once, at
+    /// import: a refresh does not bring a new plan, so a Plus account upgraded to Pro would read
+    /// Plus until it was imported again. The usage probe runs on every cadence and names the
+    /// plan each time, so it is the plan's live source.
+    ///
+    /// The write is surgical for the reason [`config::save_disabled`] names: the server's
+    /// `Config` is a boot-time snapshot, so writing it whole would revert every setting changed
+    /// while the proxy ran. Only `organizationType` is passed; the other two plan keys are
+    /// `None`, which `save_plan` leaves untouched. An unchanged plan writes nothing, and a write
+    /// that fails is logged and dropped, as [`Self::backfill_plan_if_unknown`] does: the runtime
+    /// row carries the plan for this process's life, and the next start probes it again.
+    fn record_codex_plan(&self, idx: usize, plan_type: &str) {
+        let target = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
+            if account.provider != crate::provider::Provider::Codex
+                || account.organization_type.as_deref() == Some(plan_type)
+            {
+                return;
+            }
+            let previous = account.organization_type.replace(plan_type.to_string());
+            tracing::info!(
+                account = %account.name,
+                previous_plan = ?previous,
+                plan = plan_type,
+                "the usage probe reports a different ChatGPT plan; recording it"
+            );
+            // The identity probe `save_plan` locates the on-disk row by, built from the row's
+            // own stored identity (provider included), as the backfill builds it.
+            crate::identity::probe(
+                account.provider,
+                &account.name,
+                account.account_uuid.clone(),
+                account.org_uuid.clone(),
+                account.org_name.clone(),
+            )
+        };
+
+        let Some(path) = self.config_path.as_ref() else {
+            return;
+        };
+        match config::save_plan(path, &target, Some(plan_type), None, None) {
+            Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
+            Ok(outcome) => tracing::warn!(
+                account = %target.name, %outcome,
+                "recorded this account's new ChatGPT plan but could not persist it — the next \
+                 start will probe it again"
+            ),
+            Err(err) => tracing::warn!(
+                account = %target.name, error = %err,
+                "recorded this account's new ChatGPT plan but could not persist it — the next \
+                 start will probe it again"
             ),
         }
     }

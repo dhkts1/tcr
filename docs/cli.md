@@ -960,12 +960,17 @@ probe, not forever.
 
 The output stays a bare array of rows. A Codex account's row carries `"provider": "codex"`; an
 Anthropic row carries no `provider` key at all, never `null`, so a client written before the key
-reads every Anthropic row exactly as before. On a Codex row `organizationType` is the ChatGPT plan
-claim, verbatim (`pro`, `plus`, `team`, …), `plan` is its label (`ChatGPT Pro`), and
+reads every Anthropic row exactly as before. On a Codex row `organizationType` is the ChatGPT plan,
+verbatim (`pro`, `plus`, `team`, …), `plan` is its label (`ChatGPT Pro`), and
 `rateLimitTier`, `seatTier`, `orgUuid` and `orgName` are `null`: a ChatGPT workspace is named by its
-account id alone. That plan is read from the login's token claims at import, and the probe never
-backfills it. The plain text carries the same label (`plan=ChatGPT Pro`), and the terminal
-dashboard tags a Codex row `[codex]` after its name.
+account id alone. A plan word tcr does not know is labelled `ChatGPT` and the word as ChatGPT wrote
+it (`edu` reads `ChatGPT edu`), unless the word already starts with `ChatGPT`. That plan is read
+from the login's token claims at import and kept current by the quota probe, whose `plan_type`
+names it on every probe: when the plan changes at ChatGPT (Plus to Pro, say), the new one is written
+to that row's `organizationType` in the config, and no other key is touched. A probe whose
+`plan_type` is missing or blank names no plan, and leaves the one the row has. The plain text
+carries the same label (`plan=ChatGPT Pro`), and the terminal dashboard tags a Codex row `[codex]`
+after its name.
 
 ```
 tcr status --json | jq -r '.[] | select(.provider == "codex") | "\(.name)\t\(.plan // "unknown")"'
@@ -976,6 +981,50 @@ account's do, matched by window length rather than by the slot Codex reports a w
 Measured on ChatGPT Pro logins, Codex reports a weekly window only, so such an account's
 `fiveHour` stays `null` while `sevenDay` moves; the mapping is in
 [architecture.md](architecture.md#codex-requests).
+
+A Codex row also says which windows its plan has, and what Codex reported about the account
+beside them. Each key is on Codex rows only, and absent rather than `null` when there is nothing
+to say:
+
+| key | shape | what it is |
+|---|---|---|
+| `quotaWindows` | array of `"fiveHour"` / `"sevenDay"`, in that order | which usage windows the account's plan reports. Absent: not known yet, so a reader draws both. `[]`: the plan reports no usage window at all, which is a fact, not a gap. Once the quota probe has answered, its answer outranks the response headers', which may carry a five-hour slot the plan does not have |
+| `fiveHourWindowMinutes` | integer | how long the window in the five-hour bucket is, in minutes, as reported (`300`). Absent when no length was reported |
+| `sevenDayWindowMinutes` | integer | how long the window in the weekly bucket is, in minutes: `10080` is seven days, and a 30-day window reads `43200`. Absent when no length was reported |
+| `limitReachedType` | string | why ChatGPT refused the account, verbatim: `rate_limit_reached`, or a credits or spend-cap kind. Present exactly while that refusal stands |
+| `spendControlReached` | `true`, or absent | the quota probe says the account's spend control is reached |
+| `credits` | `{hasCredits, unlimited, balance?}` | the account's credits, from the last response or probe that reported them. `balance` is verbatim (`"12.50"`), and absent when none was reported |
+
+On a Codex row, `held` labels each window by that reported length: whole days read `{n}d`, whole
+hours `{n}h`, anything else `{n}m`, so a 30-day weekly window is held as `30d`. Without a length,
+and on every Anthropic row, the labels stay `5h` and `7d`.
+
+A Codex account at its usage limit reports the window that refused it as its `gate`:
+`"seven-day"` or `"five-hour"`, with `freeAtMs` and `secondsUntilFree` naming when that window
+rolls. With both windows full, the later of the two binds, since both must roll before the account
+serves. Once that reset has passed, the row keeps the window's `gate`, with a `null` `freeAtMs`,
+until the next usage probe confirms the window rolled. A refusal that no full window explains, such
+as one for credits or a spend cap, still sets a hold: tcr holds every Codex quota refusal, to its
+windows' reset (at most an hour), else to the 429's `retry-after`, else for 60 seconds. While that
+hold lasts the row reads `"hold"` with `rateLimitedUntilMs`, because the account really is held
+until then; once it lapses, the refusal that still stands reads `"rejected"` with a `null`
+`freeAtMs`. A refused account is back in the pool once that hold lapses, and if an upstream 403
+then holds it, the row reads `"refused"` until that hold ends, as on any other row. These readings
+are display only. They change no routing, and whichever of them the row shows, a refused account
+is probed around half the cadence, as every account upstream answered `rejected` is
+([configuration.md](configuration.md#both-cadences-are-random-per-account-not-a-fleet-sweep)).
+
+A usage probe ends a Codex refusal when it sees one of the account's windows roll, or when it reads
+the account allowed: not at its limit, with its spend control not reached and no refusal kind. The
+second is how a probe ends a refusal for credits or a spend cap, which no window roll explains. An
+Anthropic row's `"rejected"` is unchanged: a probe ends it only on a window roll.
+
+Under the pool, `codex`'s own limit display disagrees with these rows, and that is expected. A
+pooled response has its per-account `x-codex-*` quota headers stripped, because they describe
+whichever account served that one request, so `codex`'s in-session limit line goes blank.
+`codex`'s own usage call (`/backend-api/wham/usage`) is relayed on the client's own login, so its
+`/status` shows that login's limits, not the serving account's. The pool's limits are in TcrBar
+and `tcr status`.
 
 ### The `usage` object on `--json`
 

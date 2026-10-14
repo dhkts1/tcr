@@ -133,7 +133,9 @@ pub struct UsageRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeldWindowRow {
-    /// `"5h"` or `"7d"`.
+    /// `"5h"` or `"7d"`. On a Codex row that reported the window's length, the label
+    /// follows the length instead: whole days `"{n}d"`, whole hours `"{n}h"`, else
+    /// `"{n}m"`, so a 30-day window reads `"30d"`.
     pub window: String,
     pub reset_at_ms: i64,
     pub minutes_until_reset: i64,
@@ -443,8 +445,12 @@ pub struct AccountStatusRow {
     ///
     /// `"rejected"` is the provider's own refusal, which means a different signal per
     /// provider: on an Anthropic row, Anthropic's `anthropic-ratelimit-unified-status:
-    /// rejected` header; on a Codex row, a 429 that carried
-    /// `x-codex-rate-limit-reached-type`.
+    /// rejected` header. On a Codex row, a 429 that carried
+    /// `x-codex-rate-limit-reached-type` reads as the full window that refused it
+    /// (`"five-hour"` or `"seven-day"`, freeing at that window's reset, or with no time
+    /// once that reset has passed and no probe has yet confirmed the roll), else as the
+    /// live hold while it lasts, `"hold"` or, when an upstream 403 armed it,
+    /// `"refused"`, and as `"rejected"` only when neither explains it.
     pub gate: String,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
@@ -707,21 +713,25 @@ pub fn plan_label(
 }
 
 /// The customer-facing name of a ChatGPT plan, from the raw `chatgpt_plan_type` claim stored
-/// verbatim in `organizationType` for Codex rows. Unknown values pass through, as `plan_label`
-/// does, so a plan we have not met shows what the provider said rather than nothing.
+/// verbatim in `organizationType` for Codex rows. A word this table has not met is named
+/// `ChatGPT {word}`, the word kept as the provider wrote it (`edu` reads `ChatGPT edu`), so it
+/// still reads as a ChatGPT plan beside the Claude ones rather than as a bare word. A word that
+/// already starts with `ChatGPT`, in any case, is shown as it is, never prefixed twice.
 pub fn codex_plan_label(raw: Option<&str>) -> Option<String> {
     let raw = raw?.trim();
     if raw.is_empty() {
         return None;
     }
-    Some(match raw.to_ascii_lowercase().as_str() {
+    let lower = raw.to_ascii_lowercase();
+    Some(match lower.as_str() {
         "free" => "ChatGPT Free".to_string(),
         "plus" => "ChatGPT Plus".to_string(),
         "pro" => "ChatGPT Pro".to_string(),
         "team" => "ChatGPT Team".to_string(),
         "business" => "ChatGPT Business".to_string(),
         "enterprise" => "ChatGPT Enterprise".to_string(),
-        _ => raw.to_string(),
+        _ if lower.starts_with("chatgpt") => raw.to_string(),
+        _ => format!("ChatGPT {raw}"),
     })
 }
 
@@ -873,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_plan_label_names_the_chatgpt_plans_and_passes_unknowns_through() {
+    fn codex_plan_label_names_the_chatgpt_plans_and_prefixes_an_unknown_word() {
         assert_eq!(
             codex_plan_label(Some("pro")).as_deref(),
             Some("ChatGPT Pro")
@@ -900,8 +910,18 @@ mod tests {
         );
         assert_eq!(
             codex_plan_label(Some("edu")).as_deref(),
-            Some("edu"),
-            "unknown values survive verbatim, like plan_label"
+            Some("ChatGPT edu"),
+            "an unknown word is named as a ChatGPT plan, the word kept as written"
+        );
+        assert_eq!(
+            codex_plan_label(Some("ChatGPT Edu")).as_deref(),
+            Some("ChatGPT Edu"),
+            "a word that already says ChatGPT is not prefixed twice"
+        );
+        assert_eq!(
+            codex_plan_label(Some("chatgpt_edu")).as_deref(),
+            Some("chatgpt_edu"),
+            "in any case"
         );
         assert_eq!(codex_plan_label(None), None);
         assert_eq!(codex_plan_label(Some("  ")), None);

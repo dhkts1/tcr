@@ -1987,19 +1987,51 @@ fn resolve_thresholds(config: &Config) -> Vec<f64> {
 /// the future. Mirrors `Quota::is_near`'s dimensions (5h + 7d; the model-scoped
 /// `7d_oi` never gates shared rotation, so it is not shown as a hold here).
 struct HeldWindow {
-    label: &'static str,
+    /// `5h` or `7d`; on a Codex row, the window's own length when it reported one
+    /// ([`window_length_label`]).
+    label: String,
     reset: OffsetDateTime,
+}
+
+/// A window's label from its length in minutes, the rule TcrBar labels a Codex window's row
+/// by: whole days read `{n}d`, whole hours `{n}h`, anything else `{n}m`. So 300 is `5h`, 10080
+/// is `7d`, and a 30-day window, 43200, is `30d`.
+fn window_length_label(minutes: u32) -> String {
+    if minutes.is_multiple_of(24 * 60) {
+        format!("{}d", minutes / (24 * 60))
+    } else if minutes.is_multiple_of(60) {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 /// The windows holding account `a` out of rotation, evaluated against its own
 /// `threshold`. `a.five_hour`/`a.seven_day` are already the EFFECTIVE utilizations
 /// and `*_reset` the live (future-only) resets — both baked in at snapshot time —
 /// so a held window always carries a future reset to show.
+///
+/// A Codex row labels each window by the length it reported, so a 30-day window reads
+/// `30d` where the fixed label would claim `7d`; without a reported length, and on every
+/// Anthropic row, the label is the fixed `5h` or `7d`.
 fn held_windows(a: &AccountSnapshot, threshold: f64) -> Vec<HeldWindow> {
+    let label = |fixed: &str, minutes: Option<u32>| {
+        minutes
+            .filter(|_| a.provider == Provider::Codex)
+            .map_or_else(|| fixed.to_string(), window_length_label)
+    };
     let mut held = Vec::new();
     for (label, util, reset) in [
-        ("5h", a.five_hour, a.five_hour_reset),
-        ("7d", a.seven_day, a.seven_day_reset),
+        (
+            label("5h", a.codex.five_hour_window_minutes),
+            a.five_hour,
+            a.five_hour_reset,
+        ),
+        (
+            label("7d", a.codex.seven_day_window_minutes),
+            a.seven_day,
+            a.seven_day_reset,
+        ),
     ] {
         if let (Some(u), Some(reset)) = (util, reset) {
             if u >= threshold {
@@ -2470,7 +2502,7 @@ fn account_status_rows_at(
             let held: Vec<tcr_status_wire::HeldWindowRow> = held_windows(a, threshold)
                 .into_iter()
                 .map(|h| tcr_status_wire::HeldWindowRow {
-                    window: h.label.to_string(),
+                    window: h.label,
                     reset_at_ms: (h.reset.unix_timestamp_nanos() / 1_000_000) as i64,
                     minutes_until_reset: (h.reset - now).whole_minutes().max(0),
                 })
@@ -2504,9 +2536,14 @@ fn account_status_rows_at(
                 // (`Manager::account_terminal_gate`/`account_gate`), including the
                 // one TcrBar could not otherwise see: `rejected`, the provider's
                 // own refusal. On an Anthropic row that is the
-                // `anthropic-ratelimit-unified-status: rejected` header; on a
+                // `anthropic-ratelimit-unified-status: rejected` header. On a
                 // Codex row, a 429 that carried `x-codex-rate-limit-reached-type`
-                // (`crate::quota::is_codex_quota_refusal`). Before this field
+                // (`crate::quota::is_codex_quota_refusal`) reads as the full
+                // window that refused it, else as the live hold while it lasts
+                // (`hold`, or `refused` when an upstream 403 armed it), and as
+                // `rejected` only when neither explains it: the snapshot's
+                // display-only remap, `Manager::codex_refusal_gate`, which
+                // routing never reads. Before this field
                 // existed, `status` was rewritten only for `Throttled` (see
                 // `snapshot.rs`), so a rejected account still read `status:
                 // "active"` and the panel drew it as eligible when the router will
@@ -5694,6 +5731,7 @@ mod tests {
                     seven_day: None,
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -5717,6 +5755,7 @@ mod tests {
                     seven_day: None,
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -6834,6 +6873,7 @@ mod tests {
                             seven_day: None,
                             seven_day_oi: None,
                             extra_usage_usd: None,
+                            codex: None,
                         }),
                         Provider::Codex => Err(crate::probe::ProbeError {
                             status: Some(401),
@@ -7099,6 +7139,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Ok(Usage {
@@ -7109,6 +7150,7 @@ mod tests {
                         }),
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 }
             })
@@ -7196,6 +7238,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Ok(Usage {
@@ -7203,6 +7246,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 }
             })
@@ -7478,6 +7522,7 @@ mod tests {
                     seven_day: None,
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -8967,6 +9012,90 @@ mod tests {
             rendered, fixture,
             "render_sessions_json no longer emits codex-sessions.json"
         );
+    }
+
+    /// **A Codex row's held window is labelled by its length**, in the JSON `held` array and in
+    /// the text `held=` token alike: a 30-day weekly window reads `30d`, where the fixed label
+    /// would say `7d`, the length the plan does not have. Without a reported length the label
+    /// is the fixed one, and an Anthropic row keeps `7d` whatever its facts hold.
+    ///
+    /// Watched red: label every window by its slot, as before, and the 30-day row reads `7d`.
+    #[test]
+    fn a_codex_held_window_is_labelled_by_its_length() {
+        let now = fixture_instant(CANONICAL_NOW_MS);
+        let full_weekly = |provider: Provider, minutes: Option<u32>| AccountSnapshot {
+            provider,
+            seven_day: Some(1.0),
+            seven_day_reset: Some(canonical_at(3 * DAY_MS)),
+            codex: CodexFacts {
+                seven_day_window_minutes: minutes,
+                ..CodexFacts::default()
+            },
+            ..canonical_codex_row(
+                "bob@example.com/codex",
+                0,
+                "pro",
+                "55555555-5555-4555-8555-555555555555",
+            )
+        };
+        let held_labels = |row: AccountSnapshot| -> (Vec<String>, String) {
+            let snapshot = StatsSnapshot {
+                accounts: vec![row.clone()],
+                current: None,
+                recent: Vec::new(),
+                sessions: Vec::new(),
+                wire_sessions: Vec::new(),
+                wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+            };
+            let json = render_accounts_json_at(
+                now,
+                &snapshot,
+                &[0.85],
+                StatusSource::Live,
+                None,
+                false,
+                None,
+                &std::collections::BTreeMap::new(),
+                None,
+                None,
+            );
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(&json).expect("the renderer emits a JSON array");
+            let held = rows[0]["held"]
+                .as_array()
+                .expect("every row carries held")
+                .iter()
+                .map(|h| h["window"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (held, held_suffix(&row, 0.85, now))
+        };
+
+        let (json, text) = held_labels(full_weekly(Provider::Codex, Some(43_200)));
+        assert_eq!(
+            json,
+            vec!["30d".to_string()],
+            "a 30-day window, on the wire"
+        );
+        assert!(
+            text.starts_with(" held=30d "),
+            "and in the text token: {text}"
+        );
+
+        let (json, text) = held_labels(full_weekly(Provider::Codex, None));
+        assert_eq!(
+            json,
+            vec!["7d".to_string()],
+            "no reported length: the fixed label"
+        );
+        assert!(text.starts_with(" held=7d "), "{text}");
+
+        let (json, text) = held_labels(full_weekly(Provider::Anthropic, Some(43_200)));
+        assert_eq!(
+            json,
+            vec!["7d".to_string()],
+            "an Anthropic row is unchanged"
+        );
+        assert!(text.starts_with(" held=7d "), "{text}");
     }
 
     /// An Anthropic row renders exactly as the committed contract fixture holds it, with no

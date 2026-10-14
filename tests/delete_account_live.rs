@@ -257,6 +257,7 @@ async fn quota_state_does_not_change_a_delete() {
                 seven_day: None,
                 seven_day_oi: None,
                 extra_usage_usd: None,
+                codex: None,
             },
         );
     }

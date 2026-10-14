@@ -97,9 +97,21 @@ pub enum GateReason {
     /// an `anthropic-ratelimit-unified-status: rejected` header; on a Codex account
     /// it is a 429 that carried `x-codex-rate-limit-reached-type`
     /// ([`crate::quota::is_codex_quota_refusal`]). Unlike a window it carries no
-    /// reset to wait on, so it never self-frees. Long held out of rotation by
+    /// reset to wait on, so it names no time. It still ends without a human: a usage
+    /// probe that sees one of the account's windows roll clears it, on either
+    /// provider, and on a Codex account so does a probe that reads the account
+    /// allowed ([`crate::quota::Quota::apply_usage`]). Long held out of rotation by
     /// [`crate::manager::Manager::account_hard_ok`], it had no reason of its own
     /// here and so rendered as [`GateReason::Ok`].
+    ///
+    /// That is the verdict [`crate::manager::Manager::account_gate`] returns, and
+    /// the one the pin and control gates read. A SNAPSHOT reports a Codex refusal
+    /// more precisely ([`crate::manager::Manager::codex_refusal_gate`]): as the full
+    /// window that refused it, freeing at that window's reset (or with no time once
+    /// that reset has passed and no probe has yet confirmed the roll), else as the
+    /// live hold while it lasts: [`Self::Hold`], or [`Self::Refused`] when an upstream
+    /// 403 armed it. So on a Codex row this variant means a standing refusal that
+    /// neither explains.
     Rejected,
     /// Operator-disabled — held out until re-enabled, never self-frees.
     Disabled,
@@ -193,11 +205,23 @@ pub struct AccountSnapshot {
     /// Why this account is out of rotation right now (the latest-clearing hard
     /// gate), computed live via [`crate::manager::Manager::account_gate`] for the
     /// general (non-Fable) view. [`GateReason::Ok`] when in rotation.
+    ///
+    /// One remap, for display only: on a Codex account whose `account_gate` is
+    /// [`GateReason::Rejected`], this reports the full window that refused it, with
+    /// [`Self::free_at`] at that window's reset (`None` once that reset has passed,
+    /// until a probe confirms the roll), else the live hold, [`GateReason::Hold`] or,
+    /// when an upstream 403 armed it, [`GateReason::Refused`], with `free_at` at the
+    /// hold's end while that hold lasts
+    /// ([`crate::manager::Manager::codex_refusal_gate`]). The pin and control gates
+    /// still read the unmapped verdict.
     pub gate: GateReason,
     /// When [`Self::gate`] clears — the instant ALL active hard gates have lifted.
     /// `None` when in rotation (`Ok`), when the gate never self-frees
     /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
-    /// we cannot promise a time).
+    /// we cannot promise a time). On a Codex refusal it is when the gate SHOWN
+    /// clears, not the refusal: the refusing window's reset, after which the refusal
+    /// stands until a probe confirms the roll, or the hold's end, after which a
+    /// refusal no window explains still reads [`GateReason::Rejected`].
     pub free_at: Option<OffsetDateTime>,
     /// Count of stream failures this account's streams carried within the decay
     /// window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`): an in-band SSE

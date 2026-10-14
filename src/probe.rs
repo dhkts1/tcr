@@ -81,6 +81,11 @@ pub struct Usage {
     /// report this field" or "its shape was not one we recognise" — never a
     /// fabricated `0.0`; see [`parse_extra_usage_usd`].
     pub extra_usage_usd: Option<f64>,
+    /// What a Codex usage probe said beyond the buckets: the plan's windows and their
+    /// lengths, its plan, credits, spend control and refusal kind
+    /// ([`crate::codex_probe::CodexProbeFacts`]). Anthropic's probe leaves it `None`, so an
+    /// Anthropic reading folds into the quota exactly as it did before the field existed.
+    pub codex: Option<crate::codex_probe::CodexProbeFacts>,
 }
 
 /// Why a probe failed. `status` carries the HTTP code when there was one — the
@@ -224,6 +229,7 @@ pub fn usage_from_payload(data: &Value) -> Usage {
         seven_day: normalize_usage_bucket(data.get("seven_day")),
         seven_day_oi: normalize_usage_bucket(fable.as_ref()),
         extra_usage_usd: parse_extra_usage_usd(data),
+        codex: None,
     }
 }
 

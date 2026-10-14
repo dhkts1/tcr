@@ -202,6 +202,13 @@ impl Manager {
                     &reserved,
                     &parked,
                 );
+                // A Codex account at its usage limit reports the window that refused it, and
+                // when that window rolls, instead of a `Rejected` with no time. Display only:
+                // selection and the exhaustion hint never see this remap, and the probe
+                // cadence, which reads this row, takes the refusal from its
+                // `limit_reached_type` instead (`schedule::ProbeUrgency::of`). See
+                // `Manager::codex_refusal_gate`.
+                let (gate, free_at) = Self::codex_refusal_gate(a, threshold, now, gate, free_at);
                 let mut reserved_groups: Vec<String> = a
                     .groups
                     .iter()
@@ -305,7 +312,7 @@ impl Manager {
                                 .map(odt_to_ms),
                         ),
                     ),
-                    codex: crate::stats::CodexFacts::default(),
+                    codex: codex_snapshot_facts(a),
                 }
             })
             .collect();
@@ -368,5 +375,27 @@ impl Manager {
             wire_sessions,
             wire_sessions_summary,
         }
+    }
+}
+
+/// The quota facts a Codex row reports on the status wire, read off its quota: which windows the
+/// plan has (the probe's once any probe answered, else the headers'), each one's length, the
+/// refusal's kind while that refusal stands, the spend control and the credits.
+///
+/// An Anthropic row keeps the defaults, whatever its quota holds, so its wire row gains no key.
+/// The login error and the import folder are not quota facts and stay at their defaults here.
+fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
+    if a.provider != crate::provider::Provider::Codex {
+        return crate::stats::CodexFacts::default();
+    }
+    let windows = a.quota.codex.windows();
+    crate::stats::CodexFacts {
+        quota_windows: windows.map(|w| w.wire_names()),
+        five_hour_window_minutes: windows.and_then(|w| w.five_hour).and_then(|w| w.minutes),
+        seven_day_window_minutes: windows.and_then(|w| w.seven_day).and_then(|w| w.minutes),
+        limit_reached_type: a.quota.codex_limit_reached_type().map(str::to_string),
+        spend_control_reached: a.quota.codex.spend_control_reached,
+        credits: a.quota.codex.credits.clone(),
+        ..Default::default()
     }
 }

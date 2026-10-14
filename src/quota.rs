@@ -110,6 +110,12 @@ pub struct Quota {
     /// to a recent probe time. This is display data only; nothing in selection
     /// reads it. It crosses the wire as `quotaUpdatedAtMs`.
     pub updated_at: Option<OffsetDateTime>,
+    /// What a Codex account's readings said beyond its windows' utilization: which windows
+    /// its plan has and how long they are, the refusal's kind, its spend control and its
+    /// credits. See [`CodexQuotaFacts`]. Only the Codex readers write it
+    /// ([`Self::update_from_codex_headers`], and [`Self::apply_usage`] with a Codex probe's
+    /// reading), so on an Anthropic account it stays the default.
+    pub codex: CodexQuotaFacts,
 }
 
 /// A generic view over "case-insensitive header name → value" so the same
@@ -410,6 +416,54 @@ impl Quota {
         // about the read, the same rule `Manager::apply_usage` latches
         // `quota_known` on. A failed probe never reaches here.
         self.updated_at = Some(OffsetDateTime::now_utc());
+        // A Codex probe's facts (an Anthropic probe carries none). Its windows are the plan's
+        // and outrank the headers' from now on (`CodexQuotaFacts::windows`); its spend control
+        // is current; its credits stand until another reading reports them.
+        if let Some(facts) = &usage.codex {
+            self.codex.probed_windows = Some(facts.windows);
+            self.codex.spend_control_reached = facts.spend_control_reached;
+            if let Some(credits) = &facts.credits {
+                self.codex.credits = Some(credits.clone());
+            }
+            // Before the kind's refresh below, so a lifted refusal takes no kind with it.
+            self.lift_a_codex_refusal_the_probe_reads_allowed(facts);
+            // Only while a refusal stands: the kind is present exactly as long as the refusal.
+            // `drop_rejection_if_a_window_rolled` ran first, so a probe that sees the window
+            // roll has already ended the refusal before its own kind could refresh it.
+            if self.status.as_deref() == Some("rejected") {
+                if let Some(kind) = &facts.limit_reached_type {
+                    self.codex.limit_reached_type = Some(kind.clone());
+                }
+            }
+        }
+    }
+
+    /// End a Codex refusal that the usage probe reads as over: the backend says the account is
+    /// allowed, not at its limit, with its spend control not reached and no refusal kind.
+    ///
+    /// Why: that is the backend's own verdict on the account. A spend cap or a credits refusal
+    /// leaves the windows where they were, so [`Self::drop_rejection_if_a_window_rolled`] never
+    /// fires for it, and without this no probe ever ended it. Every condition is needed: a
+    /// probe that reads the account refused, at its limit, at its spend control, or carrying a
+    /// refusal kind is still reporting the refusal, and a probe with no `rate_limit` carries no
+    /// verdict at all.
+    ///
+    /// A wrong lift costs one refused request, which marks the account again: the same trade
+    /// [`Self::drop_rejection_if_a_window_rolled`] makes. Runs after that window check, in
+    /// [`Self::apply_usage`].
+    fn lift_a_codex_refusal_the_probe_reads_allowed(
+        &mut self,
+        facts: &crate::codex_probe::CodexProbeFacts,
+    ) {
+        if self.status.as_deref() == Some("rejected")
+            && facts.allowed == Some(true)
+            && facts.limit_reached != Some(true)
+            && !facts.spend_control_reached
+            && facts.limit_reached_type.is_none()
+        {
+            self.status = None;
+            self.codex.limit_reached_type = None;
+        }
     }
 
     /// Drop a `rejected` status whose window has since rolled.
@@ -422,9 +476,11 @@ impl Quota {
     /// [`crate::manager::Manager::account_terminal_gate`] skips an account carrying
     /// `rejected`, so no further served response ever arrives to refresh it, and
     /// this probe path used to move the windows while leaving `status` alone.
-    /// Nothing else clears it: `Quota` is runtime state, never serialized, so only
+    /// Nothing else cleared it: `Quota` is runtime state, never serialized, so only
     /// a restart, a keep-warm response (`warmupSeconds`, off by default) or a human
-    /// ended a rejection.
+    /// ended a rejection. A Codex refusal has a second way out, the backend's own word:
+    /// a probe that reads the account allowed ends it
+    /// ([`Self::lift_a_codex_refusal_the_probe_reads_allowed`], which runs after this).
     ///
     /// **The signal is a utilization that FELL.** A shared window's utilization only
     /// rises while that window is running, so a probed value strictly below the one
@@ -457,6 +513,8 @@ impl Quota {
             || window_rolled(self.seven_day, usage.seven_day)
         {
             self.status = None;
+            // A Codex refusal's kind lives exactly as long as the refusal.
+            self.codex.limit_reached_type = None;
         }
     }
 }
@@ -634,6 +692,97 @@ pub fn quota_rejections(headers: &impl HeaderView) -> Vec<UnifiedRejectionKind> 
     .collect()
 }
 
+/// One Codex usage window a reading carried. Which of tcr's buckets it fills is the field of
+/// [`CodexWindows`] it sits in; this is how long it is.
+///
+/// The length is kept because it is a fact of the plan the bars cannot show: a weekly-length
+/// slot can be seven days or thirty, and both fill the weekly bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodexWindow {
+    /// The window's length in minutes, as the reading reported it: the headers'
+    /// `window-minutes` as is, or the probe's `limit_window_seconds` divided by 60. `None` when
+    /// the reading named no length; a length of zero or less is no length.
+    pub minutes: Option<u32>,
+}
+
+/// Which usage windows one Codex reading carried, by tcr's bucket, and how long each is.
+///
+/// Which windows a plan has is a fact a reading carries, not something every account shares: a
+/// ChatGPT Pro login reports its weekly window and no five-hour one (measured 2026-10-12 and
+/// 2026-10-14), and a plan can report no window at all. So a bucket is present only when the
+/// reading carried a window for it, by the no-data rule both readers apply: a placeholder slot
+/// at zero `used-percent`, with no length and no reset, is not a window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodexWindows {
+    pub five_hour: Option<CodexWindow>,
+    pub seven_day: Option<CodexWindow>,
+}
+
+impl CodexWindows {
+    /// The windows present, as the status wire names them: `"fiveHour"` then `"sevenDay"`, each
+    /// only when present. Empty when the reading carried none, which is a fact about the plan,
+    /// not a gap in what tcr knows.
+    pub fn wire_names(&self) -> Vec<String> {
+        [(self.five_hour, "fiveHour"), (self.seven_day, "sevenDay")]
+            .into_iter()
+            .filter_map(|(window, name)| window.map(|_| name.to_string()))
+            .collect()
+    }
+}
+
+/// What a Codex account's readings said beyond its windows' utilization, kept on its
+/// [`Quota`] for the status wire to report.
+///
+/// The windows are kept twice, once per reader, because the two can disagree and the probe
+/// outranks the headers: Pro response headers may carry a five-hour slot the plan does not
+/// have (at zero `used-percent` but with a length and a reset, which passes the no-data rule),
+/// while the usage probe reports the plan's own windows. [`Self::windows`] says which wins.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexQuotaFacts {
+    /// The windows the last successful usage probe carried. `Some` once any probe has answered,
+    /// and `Some` of no window at all when the plan reported none.
+    pub probed_windows: Option<CodexWindows>,
+    /// The windows the last response that carried any window carried. A response that carried
+    /// none leaves it alone: silence is not evidence.
+    pub header_windows: Option<CodexWindows>,
+    /// Why ChatGPT refused the account, verbatim: the refusal's
+    /// `x-codex-rate-limit-reached-type`, or, while that refusal stands, the probe's
+    /// `rate_limit_reached_type`. Read it through [`Quota::codex_limit_reached_type`], which
+    /// answers only while the refusal stands.
+    pub limit_reached_type: Option<String>,
+    /// Whether the last successful probe said the account's spend control is reached.
+    pub spend_control_reached: bool,
+    /// The account's credits, from the last reading that reported them.
+    pub credits: Option<tcr_status_wire::CodexCredits>,
+}
+
+impl CodexQuotaFacts {
+    /// The windows the account's plan has, as far as tcr knows: the probe's once any probe has
+    /// answered, else the response headers'. `None` before any reading, which is unknown, not
+    /// "no windows".
+    ///
+    /// Once any probe has answered, the probe's set of windows AND their lengths win over the
+    /// headers', because the probe describes the plan: a Pro response's headers may carry a
+    /// five-hour slot with a length the plan does not have, and reporting that length would
+    /// contradict the windows the plan reports (see [`CodexQuotaFacts`]).
+    pub fn windows(&self) -> Option<CodexWindows> {
+        self.probed_windows.or(self.header_windows)
+    }
+}
+
+impl Quota {
+    /// Why ChatGPT refused this account, verbatim, and only while that refusal stands:
+    /// `None` whenever `status` is not `rejected`, whatever is stored. Present exactly while the
+    /// refusal stands, so a reader can rely on its presence; see
+    /// [`CodexQuotaFacts::limit_reached_type`] for where it comes from.
+    pub fn codex_limit_reached_type(&self) -> Option<&str> {
+        self.codex
+            .limit_reached_type
+            .as_deref()
+            .filter(|_| self.status.as_deref() == Some("rejected"))
+    }
+}
+
 /// The longest window, in minutes, that is still tcr's FIVE-HOUR bucket; a longer window is
 /// the weekly one.
 ///
@@ -648,11 +797,13 @@ pub fn quota_rejections(headers: &impl HeaderView) -> Vec<UnifiedRejectionKind> 
 /// days-away reset would land in `five_hour`.
 pub const CODEX_FIVE_HOUR_CUTOFF_MINUTES: i64 = 600;
 
-/// Every per-account Codex response header: the seven this module reads a quota fact from
-/// (the two windows' `used-percent`, `window-minutes` and `reset-at`, and the refusal's
-/// `rate-limit-reached-type`), then the four the Codex client reads and tcr does not
-/// (`codex-api/src/rate_limits.rs`): whether the account has credits, whether they are
-/// unlimited, their balance, and a promotional message. All eleven describe the SERVING
+/// Every per-account Codex response header: the ten this module reads a quota fact from
+/// (the two windows' `used-percent`, `window-minutes` and `reset-at`, the refusal's
+/// `rate-limit-reached-type`, and the three credits headers: whether the account has credits,
+/// whether they are unlimited, and their balance), then the one the Codex client reads and tcr
+/// does not, a promotional message (`codex-api/src/rate_limits.rs`). The credits are read
+/// BEFORE the strip, in [`Quota::update_from_codex_headers`], which the proxy calls with the
+/// upstream headers ahead of building the pooled answer. All eleven describe the SERVING
 /// account, so `proxy::build_response` strips exactly these from a pooled Codex response
 /// (`proxy::is_account_scoped`), as it strips `anthropic-ratelimit-*`: a pooled client would
 /// otherwise be shown another account's credit balance, changing from request to request.
@@ -669,14 +820,23 @@ pub const CODEX_QUOTA_HEADERS: [&str; 11] = [
     "x-codex-secondary-window-minutes",
     "x-codex-secondary-reset-at",
     CODEX_REACHED_TYPE_HEADER,
-    "x-codex-credits-has-credits",
-    "x-codex-credits-unlimited",
-    "x-codex-credits-balance",
+    CODEX_CREDITS_HAS_CREDITS_HEADER,
+    CODEX_CREDITS_UNLIMITED_HEADER,
+    CODEX_CREDITS_BALANCE_HEADER,
     "x-codex-promo-message",
 ];
 
+/// Whether the serving Codex account has credits, `true` or `false`
+/// (`codex-api/src/rate_limits.rs`). Read into [`CodexQuotaFacts::credits`], then stripped.
+const CODEX_CREDITS_HAS_CREDITS_HEADER: &str = "x-codex-credits-has-credits";
+/// Whether those credits are unlimited, `true` or `false`.
+const CODEX_CREDITS_UNLIMITED_HEADER: &str = "x-codex-credits-unlimited";
+/// The credits balance, kept verbatim (`12.50`).
+const CODEX_CREDITS_BALANCE_HEADER: &str = "x-codex-credits-balance";
+
 /// Sent on a Codex QUOTA refusal (`codex-api/src/rate_limits.rs`). Its presence is what tcr
-/// reads as "this 429 is the quota", as against any other 429.
+/// reads as "this 429 is the quota", as against any other 429, and its value, verbatim, is the
+/// refusal's kind ([`CodexQuotaFacts::limit_reached_type`]).
 pub const CODEX_REACHED_TYPE_HEADER: &str = "x-codex-rate-limit-reached-type";
 
 /// Is this Codex response a QUOTA refusal? A 429 that carries
@@ -719,13 +879,19 @@ impl Quota {
     /// `http_status` stands in for Anthropic's `unified-status` header, which Codex has no
     /// equivalent of. A 2xx that carried a window, from either slot, means this account is
     /// being served (`allowed`). A 429 carrying `x-codex-rate-limit-reached-type`
-    /// ([`is_codex_quota_refusal`]) means it is not (`rejected`, which `select()` treats as a
-    /// hard fail, so no 2xx follows to clear it). The Codex usage probe
+    /// ([`is_codex_quota_refusal`]) means it is not (`rejected`). The Codex usage probe
     /// ([`crate::codex_probe`]) is what clears it, as the Anthropic probe clears an Anthropic
-    /// rejection: its reading is folded through [`Self::apply_usage`], and
+    /// rejection: its reading is folded through [`Self::apply_usage`], where
     /// `drop_rejection_if_a_window_rolled` drops the `rejected` once a probed window's
-    /// utilization falls below the one stored, which is the window rolling. Anything else, a
-    /// 429 without that header included, leaves `status` as it was.
+    /// utilization falls below the one stored, which is the window rolling, and
+    /// `lift_a_codex_refusal_the_probe_reads_allowed` drops it once the probe reads the
+    /// account allowed, which is how a refusal no window explains ends. Anything else, a 429
+    /// without that header included, leaves `status` as it was.
+    ///
+    /// Beside the windows it records the facts the status wire reports
+    /// ([`CodexQuotaFacts`]): which windows this response carried and how long each is, the
+    /// refusal's `x-codex-rate-limit-reached-type` (set with `rejected`, cleared with it), and
+    /// the credits, from any response that reported them.
     ///
     /// The headers are READ here and then stripped, as Anthropic's are: `proxy::build_response`
     /// drops [`CODEX_QUOTA_HEADERS`] from a pooled serve (`proxy::is_account_scoped`), since
@@ -739,11 +905,11 @@ impl Quota {
         http_status: u16,
     ) -> bool {
         let now = OffsetDateTime::now_utc();
-        // This response's reading of each bucket, (utilization, reported reset), merged
-        // across slots before anything is written: see the doc for why a slot may not
-        // simply overwrite.
-        let mut five_hour: Option<(f64, Option<OffsetDateTime>)> = None;
-        let mut weekly: Option<(f64, Option<OffsetDateTime>)> = None;
+        // This response's reading of each bucket, (utilization, reported reset, length in
+        // minutes), merged across slots before anything is written: see the doc for why a
+        // slot may not simply overwrite.
+        let mut five_hour: Option<(f64, Option<OffsetDateTime>, Option<u32>)> = None;
+        let mut weekly: Option<(f64, Option<OffsetDateTime>, Option<u32>)> = None;
         for (prefix, positional_is_weekly) in
             [("x-codex-primary", false), ("x-codex-secondary", true)]
         {
@@ -768,16 +934,29 @@ impl Quota {
                 None => &mut five_hour,
             };
             let utilization = used / 100.0;
+            let length = minutes.and_then(|m| u32::try_from(m).ok());
             *bucket = Some(match *bucket {
-                None => (utilization, reported),
-                Some((other, other_reset)) => (other.max(utilization), other_reset.max(reported)),
+                None => (utilization, reported, length),
+                Some((other, other_reset, other_length)) => (
+                    other.max(utilization),
+                    other_reset.max(reported),
+                    codex_kept_length((other, other_length), (utilization, length)),
+                ),
             });
         }
         // Any window is evidence this response came from a served Codex account. Not
         // `read_five_hour`: on the measured plan the only window is the weekly one.
         let read_a_window = five_hour.is_some() || weekly.is_some();
         let read_five_hour = five_hour.is_some();
-        if let Some((utilization, reported)) = weekly {
+        // Which windows this response carried, and how long each is. Only a response that
+        // carried one says anything about the plan's windows; silence leaves them alone.
+        if read_a_window {
+            self.codex.header_windows = Some(CodexWindows {
+                five_hour: five_hour.map(|(_, _, minutes)| CodexWindow { minutes }),
+                seven_day: weekly.map(|(_, _, minutes)| CodexWindow { minutes }),
+            });
+        }
+        if let Some((utilization, reported, _)) = weekly {
             let reset = resolve_reset(
                 reported,
                 self.seven_day.and_then(|w| w.reset),
@@ -786,7 +965,7 @@ impl Quota {
             );
             self.seven_day = Some(QuotaWindow { utilization, reset });
         }
-        if let Some((utilization, reported)) = five_hour {
+        if let Some((utilization, reported, _)) = five_hour {
             let reset = resolve_reset(
                 reported,
                 self.five_hour.and_then(|w| w.reset),
@@ -796,10 +975,19 @@ impl Quota {
             self.five_hour = Some(QuotaWindow { utilization, reset });
         }
         let refused = http_status == 429 && is_codex_quota_refusal(headers);
+        // The refusal's kind is set in the statement that marks the refusal and cleared in the
+        // one that ends it, so it is present exactly while the refusal stands.
         if refused {
             self.status = Some("rejected".to_string());
+            self.codex.limit_reached_type = headers
+                .get_str(CODEX_REACHED_TYPE_HEADER)
+                .map(str::to_string);
         } else if read_a_window && (200..300).contains(&http_status) {
             self.status = Some("allowed".to_string());
+            self.codex.limit_reached_type = None;
+        }
+        if let Some(credits) = codex_credits_from_headers(headers) {
+            self.codex.credits = Some(credits);
         }
         // `updated_at` moves on the rule `update_from_headers` stamps it by: this
         // response carried a Codex quota fact that was read, a window from either slot
@@ -810,6 +998,56 @@ impl Quota {
             self.updated_at = Some(now);
         }
         read_five_hour
+    }
+}
+
+/// The credits a Codex response reported, or `None` when it reported none and the last
+/// reading should stand.
+///
+/// `x-codex-credits-has-credits` is required, `true` or `false` in any case: without it the
+/// response said nothing about credits. `x-codex-credits-unlimited` is `false` unless it says
+/// `true`. `x-codex-credits-balance` is kept trimmed and otherwise verbatim (`"12.50"`), and an
+/// empty one is no balance.
+fn codex_credits_from_headers(headers: &impl HeaderView) -> Option<tcr_status_wire::CodexCredits> {
+    let flag = |name: &str| {
+        let raw = headers.get_str(name)?.trim();
+        if raw.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if raw.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    Some(tcr_status_wire::CodexCredits {
+        has_credits: flag(CODEX_CREDITS_HAS_CREDITS_HEADER)?,
+        unlimited: flag(CODEX_CREDITS_UNLIMITED_HEADER).unwrap_or(false),
+        balance: headers
+            .get_str(CODEX_CREDITS_BALANCE_HEADER)
+            .map(str::trim)
+            .filter(|balance| !balance.is_empty())
+            .map(str::to_string),
+    })
+}
+
+/// The length a bucket keeps when two Codex windows land in it, each given as (utilization,
+/// length in minutes): the length of the window whose utilization the bucket keeps, which is the
+/// fuller one, and the longer of the two on equal utilization.
+///
+/// One rule for both readers, the headers ([`Quota::update_from_codex_headers`]) and the probe
+/// ([`crate::codex_probe::usage_from_payload`]), so they report one account's lengths alike. A
+/// utilization the reading did not carry is passed as `f64::NEG_INFINITY`, so the window that
+/// did carry one is the one kept, as the bucket keeps its utilization.
+pub(crate) fn codex_kept_length(
+    first: (f64, Option<u32>),
+    second: (f64, Option<u32>),
+) -> Option<u32> {
+    if first.0 > second.0 {
+        first.1
+    } else if second.0 > first.0 {
+        second.1
+    } else {
+        first.1.max(second.1)
     }
 }
 
@@ -2057,5 +2295,247 @@ mod tests {
             Some(0),
             "a reset before any clock is already past: no hold, and no overflow"
         );
+    }
+
+    // --- Codex: which windows a reading carried, and the facts beside them ----
+
+    /// The windows a Codex quota says its plan has, as the status wire names them.
+    fn carried(q: &Quota) -> Option<Vec<String>> {
+        q.codex.windows().map(|w| w.wire_names())
+    }
+
+    fn names(list: &[&str]) -> Option<Vec<String>> {
+        Some(list.iter().map(|name| name.to_string()).collect())
+    }
+
+    /// The shape a ChatGPT Pro login reports: its weekly window only, in the PRIMARY slot.
+    fn pro_codex_headers(reset: i64) -> TestHeaders {
+        TestHeaders::new(&[
+            ("x-codex-primary-used-percent", "40"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-primary-reset-at", &reset.to_string()),
+        ])
+    }
+
+    /// Which windows a plan has is what a reading carried: both on the two-window shape, the
+    /// weekly one alone on the Pro shape. A later response that carried no window at all is
+    /// silence, not evidence that the windows went away, and before any reading the set is
+    /// unknown rather than empty.
+    #[test]
+    fn codex_headers_record_which_windows_carried_a_value() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut two = Quota::default();
+        let _ =
+            two.update_from_codex_headers(&codex_headers("25", "3", now + 3600, now + 86_400), 200);
+        assert_eq!(carried(&two), names(&["fiveHour", "sevenDay"]));
+
+        let mut pro = Quota::default();
+        let _ = pro.update_from_codex_headers(&pro_codex_headers(now + 86_400), 200);
+        assert_eq!(carried(&pro), names(&["sevenDay"]));
+
+        let _ = pro.update_from_codex_headers(
+            &TestHeaders::new(&[("content-type", "text/event-stream")]),
+            200,
+        );
+        assert_eq!(
+            carried(&pro),
+            names(&["sevenDay"]),
+            "a response that carried no window leaves the set alone"
+        );
+
+        assert_eq!(
+            Quota::default().codex.windows(),
+            None,
+            "before any reading the windows are unknown, not none"
+        );
+    }
+
+    /// A slot that carries no data is not a window, so it cannot add a five-hour window to a
+    /// plan that reports only its weekly one: a `0` with no length and no reset, or a value
+    /// that is not a number at all. Each placeholder is tried in the secondary slot beside the
+    /// Pro shape, and in the PRIMARY slot, which is the five-hour slot by position, beside a
+    /// weekly window the secondary slot carries by its length. The primary slot is the case only
+    /// the no-data rule decides: nothing else stops a placeholder there from filing a five-hour
+    /// window.
+    ///
+    /// Watched red: count every slot that has a percent as a window, before the no-data rule,
+    /// and the primary-slot placeholder reads `["fiveHour", "sevenDay"]`.
+    #[test]
+    fn an_empty_five_hour_slot_is_not_a_window() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for (label, placeholder) in [("0, no length, no reset", "0"), ("an empty value", "")] {
+            let mut h = pro_codex_headers(now + 86_400);
+            h.push("x-codex-secondary-used-percent", placeholder);
+            let mut q = Quota::default();
+            let _ = q.update_from_codex_headers(&h, 200);
+            assert_eq!(carried(&q), names(&["sevenDay"]), "{label}");
+            assert!(q.five_hour.is_none(), "{label}: {:?}", q.five_hour);
+
+            let mut h = TestHeaders::new(&[
+                ("x-codex-secondary-used-percent", "40"),
+                ("x-codex-secondary-window-minutes", "10080"),
+                ("x-codex-secondary-reset-at", &(now + 86_400).to_string()),
+            ]);
+            h.push("x-codex-primary-used-percent", placeholder);
+            let mut q = Quota::default();
+            let _ = q.update_from_codex_headers(&h, 200);
+            assert_eq!(
+                carried(&q),
+                names(&["sevenDay"]),
+                "{label}, in the primary slot"
+            );
+            assert!(
+                q.five_hour.is_none(),
+                "{label}, in the primary slot: {:?}",
+                q.five_hour
+            );
+        }
+    }
+
+    /// Each window keeps the length it reported, in minutes, whichever slot it came in: 300
+    /// and 10 080 on the two-window shape, and a 30-day window (43 200) still fills the weekly
+    /// bucket. Two windows in one bucket keep the length of the one whose utilization the
+    /// bucket keeps (the fuller), and the longer length on equal utilization. A
+    /// `window-minutes` of 0 is no length: the slot is filed by its position, with none.
+    #[test]
+    fn codex_headers_keep_each_windows_length() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let read = |h: &TestHeaders| {
+            let mut q = Quota::default();
+            let _ = q.update_from_codex_headers(h, 200);
+            q.codex.windows().expect("the reading carried a window")
+        };
+        let window = |minutes: Option<u32>| Some(CodexWindow { minutes });
+
+        let two = read(&codex_headers("25", "3", now + 3600, now + 86_400));
+        assert_eq!(two.five_hour, window(Some(300)));
+        assert_eq!(two.seven_day, window(Some(10_080)));
+
+        let thirty_days = read(&TestHeaders::new(&[
+            ("x-codex-secondary-used-percent", "20"),
+            ("x-codex-secondary-window-minutes", "43200"),
+            ("x-codex-secondary-reset-at", &(now + 86_400).to_string()),
+        ]));
+        assert_eq!(thirty_days.seven_day, window(Some(43_200)));
+        assert_eq!(thirty_days.five_hour, None);
+
+        for ((primary_used, secondary_used), kept) in [
+            (("40", "90"), 43_200),
+            (("90", "40"), 10_080),
+            (("50", "50"), 43_200),
+        ] {
+            let weekly = read(&TestHeaders::new(&[
+                ("x-codex-primary-used-percent", primary_used),
+                ("x-codex-primary-window-minutes", "10080"),
+                ("x-codex-primary-reset-at", &(now + 86_400).to_string()),
+                ("x-codex-secondary-used-percent", secondary_used),
+                ("x-codex-secondary-window-minutes", "43200"),
+                ("x-codex-secondary-reset-at", &(now + 200_000).to_string()),
+            ]));
+            assert_eq!(
+                weekly.seven_day,
+                window(Some(kept)),
+                "10080 at {primary_used}%, 43200 at {secondary_used}%"
+            );
+            assert_eq!(weekly.five_hour, None);
+        }
+
+        let no_length = read(&TestHeaders::new(&[
+            ("x-codex-primary-used-percent", "30"),
+            ("x-codex-primary-window-minutes", "0"),
+            ("x-codex-primary-reset-at", &(now + 3600).to_string()),
+        ]));
+        assert_eq!(no_length.five_hour, window(None));
+        assert_eq!(no_length.seven_day, None);
+    }
+
+    /// The refusal's kind and the account's credits are read off the response headers, which
+    /// the proxy strips from a pooled answer only after this fold. The kind lives exactly as long
+    /// as the refusal: set with `rejected`, cleared by a 2xx that carried a window, never brought
+    /// in by a 2xx, and cleared again when a probe sees the window roll. The credits are the last
+    /// reading that reported them: a response without them leaves them alone.
+    ///
+    /// Watched red: drop the clear from `drop_rejection_if_a_window_rolled` and let the accessor
+    /// ignore `status`, and the last step still reads the refusal's kind after it rolled.
+    #[test]
+    fn codex_headers_read_the_reached_type_and_credits_before_the_strip() {
+        use tcr_status_wire::CodexCredits;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        let mut refusal = codex_headers("100", "12", now + 1800, now + 86_400);
+        refusal.push(CODEX_REACHED_TYPE_HEADER, "rate_limit_reached");
+        refusal.push("x-codex-credits-has-credits", "true");
+        refusal.push("x-codex-credits-unlimited", "false");
+        refusal.push("x-codex-credits-balance", "12.50");
+        let mut q = Quota::default();
+        let _ = q.update_from_codex_headers(&refusal, 429);
+        assert_eq!(q.status.as_deref(), Some("rejected"));
+        assert_eq!(q.codex_limit_reached_type(), Some("rate_limit_reached"));
+        let credits = Some(CodexCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("12.50".into()),
+        });
+        assert_eq!(q.codex.credits, credits);
+
+        let _ =
+            q.update_from_codex_headers(&codex_headers("10", "5", now + 1800, now + 86_400), 200);
+        assert_eq!(q.status.as_deref(), Some("allowed"));
+        assert_eq!(
+            q.codex_limit_reached_type(),
+            None,
+            "a 2xx that carried a window ends the refusal, and its kind with it"
+        );
+        assert_eq!(
+            q.codex.credits, credits,
+            "a response without the credits headers leaves the last reading alone"
+        );
+
+        let _ = q.update_from_codex_headers(
+            &TestHeaders::new(&[("x-codex-credits-has-credits", "FALSE")]),
+            200,
+        );
+        assert_eq!(
+            q.codex.credits,
+            Some(CodexCredits {
+                has_credits: false,
+                unlimited: false,
+                balance: None,
+            }),
+            "the flag is read in any case, unlimited is false when absent, and no balance is none"
+        );
+
+        let _ = q.update_from_codex_headers(
+            &TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]),
+            200,
+        );
+        assert_eq!(
+            q.codex_limit_reached_type(),
+            None,
+            "a 200 is no refusal, whatever it carries"
+        );
+
+        let mut rolled = Quota {
+            seven_day: Some(QuotaWindow {
+                utilization: 1.0,
+                reset: Some(OffsetDateTime::now_utc() + Duration::days(3)),
+            }),
+            status: Some("rejected".to_string()),
+            ..Quota::default()
+        };
+        rolled.codex.limit_reached_type = Some("rate_limit_reached".to_string());
+        rolled.apply_usage(&crate::probe::Usage {
+            seven_day: Some(crate::probe::UsageBucket {
+                utilization: Some(0.02),
+                reset_at_ms: None,
+            }),
+            ..crate::probe::Usage::default()
+        });
+        assert_eq!(rolled.status, None, "the weekly window rolled");
+        assert_eq!(
+            rolled.codex.limit_reached_type, None,
+            "the refusal's kind goes with the refusal"
+        );
+        assert_eq!(rolled.codex_limit_reached_type(), None);
     }
 }
