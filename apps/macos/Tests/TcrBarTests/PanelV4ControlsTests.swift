@@ -172,7 +172,8 @@ final class PanelV4ControlsTests: XCTestCase {
             "the fixed-width trailing column takes the priority, not the label")
         XCTAssertTrue(
             source.contains(".frame(maxWidth: .infinity, alignment: .leading)")
-                && source.contains(".clipped()"),
+                && source.contains(".clipShape(RowLabelClip(overhang:")
+                && source.contains("width: rect.width + overhang,"),
             "a selectable Text lays out its FULL string when clicked, so the "
                 + "label needs a frame and a clip, not only a line limit")
         XCTAssertTrue(

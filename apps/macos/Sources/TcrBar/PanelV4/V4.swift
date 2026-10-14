@@ -283,7 +283,7 @@ enum V4 {
     static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
     /// The Bash tool's own timeout — the denominator the ring fills toward, and
-    /// the figure the RUNNING NOW section head states out loud.
+    /// the figure the ring's help and spoken value state.
     static let toolTimeoutSeconds: Double = 600
     /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
     /// and the row says how long is left (Gil, 2026-09-13: "red plus

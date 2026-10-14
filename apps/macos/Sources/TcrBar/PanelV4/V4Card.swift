@@ -92,9 +92,15 @@ struct V4Row<Leading: View, Trailing: View>: View {
             // re-drew itself at full length, under the pill, the moment the
             // operator clicked it (2026-09-13). `lineLimit` does not bind
             // that: a frame does.
+            //
+            // Only the TRAILING edge needs binding, so the clip reaches past
+            // the other three by a status dot's halo. A plain `.clipped()`
+            // cut the halo of every busy or waiting session's dot flat on its
+            // left, because the dot is the first thing in the label and the
+            // Sessions tab draws its rows on the panel's own inset.
             leading()
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .clipped()
+                .clipShape(RowLabelClip(overhang: V4.dotHaloWidth))
             Spacer(minLength: 0)
             // The PRIORITY sits on the trailing column, not on the label.
             //
@@ -113,6 +119,21 @@ struct V4Row<Leading: View, Trailing: View>: View {
                 .layoutPriority(1)
         }
         .frame(minHeight: V4.rowLineHeight)
+    }
+}
+
+/// The label's clip: its own trailing edge, and `overhang` points past each
+/// of the other three, so a halo drawn around the label's first glyph survives
+/// while a label laid out wider than its frame still stops at the trailing
+/// column.
+struct RowLabelClip: Shape {
+    let overhang: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        Path(
+            CGRect(
+                x: rect.minX - overhang, y: rect.minY - overhang,
+                width: rect.width + overhang, height: rect.height + 2 * overhang))
     }
 }
 

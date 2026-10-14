@@ -4,10 +4,10 @@ import SwiftUI
 /// 12 pt glyph and, inline beside it, `.unit`.
 ///
 /// The subtitle is INLINE and lowercase on purpose (`.sec .unit{font-weight:400;
-/// letter-spacing:.02em;text-transform:none}`). It is the sentence that states
-/// the denominator the section's numbers are against — "· ring fills toward the
-/// 600s timeout" — and a denominator on its own second line reads as a caption
-/// about the card rather than as part of the heading.
+/// letter-spacing:.02em;text-transform:none}`). It carries the section's count,
+/// "· 3", and nothing more: an explanation there ("· ring fills toward the 600s
+/// timeout") is a caption over the rows, which Gil ruled out on 2026-10-14. A
+/// denominator belongs on the mark it measures, as the ring's help does.
 struct SectionHead: View {
     let title: String
     var systemImage: String?
