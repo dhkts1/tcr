@@ -211,16 +211,16 @@ struct GeneralSettingsPane: View {
     /// Same cost statement `CLAUDE.md` gives, and the same confirm-before-act
     /// shape `FleetView.confirmTakeover()` already uses for its own
     /// most-expensive action.
+    ///
+    /// The words come from ``RestartAlertCopy``, read against the fleet of the
+    /// last poll: once it holds a Codex account, the alert names Codex sessions as
+    /// well as Claude Code ones.
     private func confirmRestart() {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Restart the proxy?"
-        alert.informativeText = """
-            Every live session loses its prompt cache. Anthropic's cache is \
-            per-account, so a session that comes back on a different account pays \
-            a full cold prefix — the most expensive event in this system \
-            (CLAUDE.md). Session-affinity pins under 15 minutes old are restored.
-            """
+        let holdsCodex = poller.state.loadedFleet?.holdsCodex == true
+        alert.informativeText = RestartAlertCopy.restartInformative(holdsCodex: holdsCodex)
         let restart = alert.addButton(withTitle: "Restart")
         restart.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")

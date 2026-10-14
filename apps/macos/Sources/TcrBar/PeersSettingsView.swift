@@ -121,6 +121,17 @@ struct PeersSettingsPane: View {
         RenderSettings.requestedDirectory() != nil ? RenderStates.peerNow : Date()
     }
 
+    /// Whether the fleet this window reads holds a Codex account.
+    ///
+    /// No Mac lends, serves or carries a Codex request, so while it does, every
+    /// promise on this pane and its sheets about "your requests" or "your traffic"
+    /// names Claude (``PeersCodexCopy``), the Sharing head says where Codex requests
+    /// go, and the lease picker offers Claude accounts only. A Claude-only fleet, or
+    /// no fleet read yet, draws the pane as it always was.
+    private var holdsCodex: Bool {
+        dependencies.poller.state.loadedFleet?.holdsCodex == true
+    }
+
     var body: some View {
         Form {
             if snapshot.unsupported {
@@ -332,7 +343,7 @@ struct PeersSettingsPane: View {
     private var sharing: some View {
         Section {
             Toggle(isOn: shareBinding) {
-                Text("Share accounts with trusted Macs")
+                Text(PeersCodexCopy.settingsShareToggle(holdsCodex: holdsCodex))
             }
 
             LabeledContent("Defaults") {
@@ -353,7 +364,8 @@ struct PeersSettingsPane: View {
         } header: {
             peersSectionHead(
                 "Sharing", plaintext: true,
-                "A trusted Mac serves your requests in plaintext.")
+                PeersCodexCopy.sharingHead(holdsCodex: holdsCodex),
+                second: holdsCodex ? PeersCodexCopy.codexStaysOnThisMac : nil)
         }
     }
 
@@ -466,9 +478,7 @@ struct PeersSettingsPane: View {
                 LabeledContent("Route the internet through") {
                     Text(via).foregroundStyle(Tok.inkDim)
                 }
-                peersRow(
-                    "auto picks a trusted Mac the moment this one's own route is dead. none "
-                        + "never routes through a peer; naming one pins it.")
+                peersRow(PeersCodexCopy.viaRow(holdsCodex: holdsCodex))
 
                 LabeledContent("Hop limit") {
                     Text(hopLimit).foregroundStyle(Tok.inkDim)
@@ -545,12 +555,15 @@ struct PeersSettingsPane: View {
     /// the disclosure. ``PeerPaneLayout`` owns the arithmetic and
     /// `PeerPaneLayoutTests` owns the gate; this ties both to the drawn
     /// pane, so the type is not a number only a test knows about.
+    ///
+    /// `holdsCodex` is a fleet holding a Codex account, whose Sharing head draws
+    /// one more line.
     static func estimatedHeight(
-        trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool
+        trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool, holdsCodex: Bool = false
     ) -> CGFloat {
         let content = shippedContent(
             trustedMacs: trustedMacs, pendingKnocks: pendingKnocks,
-            advancedOpen: advancedOpen)
+            advancedOpen: advancedOpen, holdsCodex: holdsCodex)
         return PeerPaneLayout.height(content, metrics: shippedMetrics)
     }
 
@@ -563,11 +576,11 @@ struct PeersSettingsPane: View {
     /// counts ARE this file's facts, the same way the row counts are, and the
     /// gate reads them from here.
     static func shippedContent(
-        trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool
+        trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool, holdsCodex: Bool = false
     ) -> PeerPaneLayout.Content {
         PeerPaneLayout.drawnContent(
             trustedMacs: trustedMacs, pendingKnocks: pendingKnocks,
-            advancedOpen: advancedOpen, advancedRows: advancedRowCount)
+            advancedOpen: advancedOpen, advancedRows: advancedRowCount, holdsCodex: holdsCodex)
     }
 
     /// The height of the pane's LAST row, for the render harness.
@@ -732,15 +745,9 @@ struct PeersSettingsPane: View {
                 LabeledContent("How many at once") {
                     Text("\(terms.maxInFlight)").foregroundStyle(Tok.inkDim)
                 }
-                peersRow(
-                    "max in flight. Not a rate limit: how many of your requests one Mac may "
-                        + "have open at the same moment.")
+                peersRow(PeersCodexCopy.maxInFlight(holdsCodex: holdsCodex))
 
-                disclosureNote(
-                    "These are what Share accounts writes for every trusted Mac. A Mac "
-                        + "serving your request reads it in plaintext; your own sign-in never "
-                        + "leaves this Mac. 7d_oi is Fable's own allowance, which is why it "
-                        + "is offered separately and defaults to all of it.")
+                disclosureNote(PeersCodexCopy.defaultsNote(holdsCodex: holdsCodex))
             }
             .formStyle(.grouped)
 
@@ -784,14 +791,12 @@ struct PeersSettingsPane: View {
             Form {
                 Section {
                     grant(
-                        "\(row.title) may carry your traffic without reading it",
-                        detail: "Used when this Mac has no route of its own. It holds your "
-                            + "encrypted bytes and cannot open them.",
+                        PeersCodexCopy.carryGrant(title: row.title, holdsCodex: holdsCodex),
+                        detail: PeersCodexCopy.carryGrantDetail(holdsCodex: holdsCodex),
                         arguments: ["peer", "allow", row.id, "gateway"],
                         plaintext: false)
                     grant(
-                        "\(row.title) may serve your requests on its own accounts, and read "
-                            + "them",
+                        PeersCodexCopy.serveGrant(title: row.title, holdsCodex: holdsCodex),
                         detail: "This is the disclosure. Off is the safe state and the "
                             + "default; the tab's Share switch turns it on for every trusted "
                             + "Mac at once.",
@@ -889,6 +894,7 @@ struct PeersSettingsPane: View {
                 peerLabel: leaseSheetLabel(for: draft),
                 groupNames: groupNames,
                 accountLabels: accountLabels,
+                holdsCodex: holdsCodex,
                 handedKeyUntil: handedKeyUntil(for: draft),
                 now: now,
                 onCancel: { editingLease = nil },
@@ -925,7 +931,7 @@ struct PeersSettingsPane: View {
         let end = endFor(grant)
         return VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 7) {
-                Menu(grant.scopeLabel) {
+                Menu(grant.scopeLabel(holdsCodex: holdsCodex)) {
                     scopeMenuItems { write($0, grant.terms, end) }
                 }
                 .disabled(ended)
@@ -1012,7 +1018,7 @@ struct PeersSettingsPane: View {
     /// fleet this window already reads, so the picker cannot offer a group
     /// that does not exist.
     @ViewBuilder private func scopePicker(selection: Binding<LendScope>) -> some View {
-        Menu(selection.wrappedValue.label) {
+        Menu(selection.wrappedValue.label(holdsCodex: holdsCodex)) {
             scopeMenuItems { selection.wrappedValue = $0 }
         }
         .fixedSize()
@@ -1025,7 +1031,8 @@ struct PeersSettingsPane: View {
         -> some View
     {
         PeerScopeMenu(
-            groupNames: groupNames, accountLabels: accountLabels, choose: choose)
+            groupNames: groupNames, accountLabels: accountLabels, choose: choose,
+            holdsCodex: holdsCodex)
     }
 
     // MARK: - The two key sheets
@@ -1299,8 +1306,13 @@ struct PeersSettingsPane: View {
     /// second line in it is a second line, while a footer is another block
     /// with its own spacing on both sides. That is 44 pt of the 100 this pane
     /// had to find.
+    ///
+    /// `second`, when there is one, is one more line under the sentence, in the
+    /// head's ordinary ink: the Sharing head's line saying where Codex requests go,
+    /// in a fleet holding a Codex account. Every other head, and every head of a
+    /// Claude-only fleet, passes none.
     private func peersSectionHead(
-        _ title: String, plaintext: Bool = false, _ sentence: String
+        _ title: String, plaintext: Bool = false, _ sentence: String, second: String? = nil
     ) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(title)
@@ -1312,6 +1324,13 @@ struct PeersSettingsPane: View {
                 .foregroundStyle(plaintext ? Tok.unknown : Tok.inkFaint)
                 .textCase(nil)
                 .fixedSize(horizontal: false, vertical: true)
+            if let second {
+                Text(second)
+                    .font(.caption)
+                    .foregroundStyle(Tok.inkFaint)
+                    .textCase(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -1434,9 +1453,11 @@ struct PeersSettingsPane: View {
         return Array(Set(fleet.accounts.flatMap { $0.groups ?? [] })).sorted()
     }
 
+    /// The accounts a lease can lend: in a fleet holding a Codex account, the Claude
+    /// ones, because the server's lease never lends a Codex account.
     private var accountLabels: [String] {
         guard case .loaded(let fleet) = dependencies.poller.state else { return [] }
-        return fleet.accounts.map(\.name).sorted()
+        return PeerLease.eligibleLendAccounts(fleet.accounts)
     }
 
     // MARK: - Bindings
@@ -1596,6 +1617,9 @@ struct PeerLeaseSheet: View {
     @State private var untilTime: Date
     private let groupNames: [String]
     private let accountLabels: [String]
+    /// Whether the fleet holds a Codex account: "all" then reads `All Claude
+    /// accounts`, and a caption says the Codex accounts stay on this Mac.
+    private let holdsCodex: Bool
     /// When the key this lease last handed the borrower stops working, as the
     /// LENDER's own record reported it. Carried in rather than derived here:
     /// a draft holds what the operator is choosing, and this is a measurement
@@ -1612,6 +1636,7 @@ struct PeerLeaseSheet: View {
         peerLabel: String? = nil,
         groupNames: [String] = [],
         accountLabels: [String] = [],
+        holdsCodex: Bool = false,
         handedKeyUntil: Int64? = nil,
         now: Date = Date(),
         onCancel: @escaping () -> Void = {},
@@ -1622,6 +1647,7 @@ struct PeerLeaseSheet: View {
         self.peerLabel = peerLabel ?? draft.peer
         self.groupNames = groupNames
         self.accountLabels = accountLabels
+        self.holdsCodex = holdsCodex
         self.handedKeyUntil = handedKeyUntil
         self.now = now
         self.onCancel = onCancel
@@ -1644,14 +1670,17 @@ struct PeerLeaseSheet: View {
 
             Form {
                 LabeledContent("Lend from") {
-                    Menu(draft.scope.label) {
+                    Menu(draft.scope.label(holdsCodex: holdsCodex)) {
                         PeerScopeMenu(
                             groupNames: groupNames, accountLabels: accountLabels,
-                            choose: { draft.scope = $0 })
+                            choose: { draft.scope = $0 }, holdsCodex: holdsCodex)
                     }
                     .fixedSize()
                 }
                 caption("Only this scope's own accounts serve what it lends.")
+                if holdsCodex {
+                    caption(PeersCodexCopy.leaseCaption)
+                }
 
                 // On the LEASE and not on the Mac: decision row 15 puts
                 // `mode` on the grant, so a Mac with two leases can send one
@@ -1708,9 +1737,7 @@ struct PeerLeaseSheet: View {
                                 .foregroundStyle(Tok.inkDim)
                         })
                 }
-                caption(
-                    "max in flight. Not a rate limit: how many of your requests one Mac may "
-                        + "have open at the same moment.")
+                caption(PeersCodexCopy.maxInFlight(holdsCodex: holdsCodex))
 
                 Picker("Ends", selection: endKind) {
                     ForEach(EndKind.allCases, id: \.self) { kind in
@@ -1857,9 +1884,12 @@ struct PeerScopeMenu: View {
     let groupNames: [String]
     let accountLabels: [String]
     let choose: (LendScope) -> Void
+    /// Whether the fleet holds a Codex account: "all" then says whose
+    /// (``LendScope/label(holdsCodex:)``).
+    var holdsCodex: Bool = false
 
     var body: some View {
-        Button("All accounts") { choose(.all) }
+        Button(LendScope.all.label(holdsCodex: holdsCodex)) { choose(.all) }
         if !groupNames.isEmpty {
             Divider()
             ForEach(groupNames, id: \.self) { name in

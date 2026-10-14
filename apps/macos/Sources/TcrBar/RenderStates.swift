@@ -650,10 +650,30 @@ enum RenderStates {
                 if renderPeer(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        // The same peers, with a Codex account in the fleet.
+        for scene in mixedPeerScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeer(scene, appearance: appearance, holdsCodex: true, into: directory) {
+                    written += 1
+                }
+            }
+        }
         for scene in peerSheetScenes {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerSheet(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        // Two of those sheets again, with a Codex account in the fleet.
+        for scene in mixedPeerSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeerSheet(
+                    scene, appearance: appearance, holdsCodex: true, into: directory)
+                {
+                    written += 1
+                }
             }
         }
         for scene in peerMovedSheetScenes {
@@ -1077,60 +1097,15 @@ enum RenderStates {
             // 3. Two found, neither trusted, the second with its name NOT
             //    announced (decision row 9), so this side has an address and
             //    no name and the row is drawn rather than hidden.
-            (
-                "47-peers-found-untrusted",
-                peersSnapshot(
-                    PeerListDocument(
-                        finding: true,
-                        peers: [
-                            .init(
-                                name: "studio-mac", address: "studio-mac.local:7749",
-                                lastSeenMs: peerMsAgo(2)),
-                            .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6)),
-                        ])),
-                false
-            ),
+            ("47-peers-found-untrusted", peersSnapshot(foundUntrustedPeers), false),
             // 4. The safe steady state, and the one most operators stay in:
             //    one Mac trusted and carrying, sharing still off.
-            (
-                "48-peers-trusted-share-off",
-                peersSnapshot(
-                    PeerListDocument(
-                        finding: true,
-                        peers: [
-                            .init(
-                                id: "tcr-4b8we1r0zp", name: "studio-mac",
-                                address: "studio-mac.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(3), carries: true),
-                            .init(
-                                name: "attic-nuc", address: "attic-nuc.local:7749",
-                                lastSeenMs: peerMsAgo(40)),
-                        ])),
-                false
-            ),
+            ("48-peers-trusted-share-off", peersSnapshot(trustedShareOffPeers), false),
             // 5. The one screen where plaintext crosses a machine boundary, so
             //    the one screen that uses the reserved hue: sharing on, with
             //    the meter that says how much. The second row reads `nothing
             //    yet` rather than a blank, zero spent is a measurement.
-            (
-                "49-peers-share-on",
-                peersSnapshot(
-                    PeerListDocument(
-                        finding: true, sharing: true,
-                        peers: [
-                            .init(
-                                id: "tcr-4b8we1r0zp", name: "studio-mac",
-                                address: "studio-mac.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
-                                leaseSpent: 0.34, leaseTtlSeconds: 240),
-                            .init(
-                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
-                                address: "attic-nuc.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(5), carries: true, serves: true,
-                                leaseSpent: 0, leaseTtlSeconds: 300),
-                        ])),
-                false
-            ),
+            ("49-peers-share-on", peersSnapshot(shareOnPeers), false),
             // 6. The other direction, and the reason the mesh exists: this
             //    Mac's own accounts are dry (`dry: true` puts the header's
             //    summary line in its own honest state) and studio-mac is
@@ -1773,6 +1748,71 @@ enum RenderStates {
         ]
     }
 
+    /// Scene 47's peers: two found, neither trusted, the second announcing no name.
+    private static let foundUntrustedPeers = PeerListDocument(
+        finding: true,
+        peers: [
+            .init(
+                name: "studio-mac", address: "studio-mac.local:7749",
+                lastSeenMs: peerMsAgo(2)),
+            .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6)),
+        ])
+
+    /// Scene 48's peers: one Mac trusted and carrying, sharing still off.
+    private static let trustedShareOffPeers = PeerListDocument(
+        finding: true,
+        peers: [
+            .init(
+                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                address: "studio-mac.local:7749", trusted: true,
+                lastSeenMs: peerMsAgo(3), carries: true),
+            .init(
+                name: "attic-nuc", address: "attic-nuc.local:7749",
+                lastSeenMs: peerMsAgo(40)),
+        ])
+
+    /// Scene 49's peers: sharing on, two Macs trusted and serving.
+    private static let shareOnPeers = PeerListDocument(
+        finding: true, sharing: true,
+        peers: [
+            .init(
+                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                address: "studio-mac.local:7749", trusted: true,
+                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
+                leaseSpent: 0.34, leaseTtlSeconds: 240),
+            .init(
+                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                address: "attic-nuc.local:7749", trusted: true,
+                lastSeenMs: peerMsAgo(5), carries: true, serves: true,
+                leaseSpent: 0, leaseTtlSeconds: 300),
+        ])
+
+    /// Scenes 47 to 49 again: the same peers, with a Codex account in the fleet.
+    ///
+    /// No Mac lends, serves or carries a Codex request, so each promise names Claude,
+    /// and a line under the Share card says where Codex requests go instead.
+    private static var mixedPeerScenes:
+        [(
+            name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal,
+            detailsOpen: Bool
+        )]
+    {
+        [
+            (
+                "47b-peers-found-untrusted-mixed",
+                peersSnapshot(foundUntrustedPeers, holdsCodex: true), false, PeerRefusal(), false
+            ),
+            (
+                "48b-peers-trusted-share-off-mixed",
+                peersSnapshot(trustedShareOffPeers, holdsCodex: true), false, PeerRefusal(), false
+            ),
+            (
+                "49b-peers-share-on-mixed",
+                peersSnapshot(shareOnPeers, holdsCodex: true), false, PeerRefusal(), false
+            ),
+        ]
+    }
+
     /// The fixture Settings > Peers renders under `--render-settings`, which
     /// is the Settings > Peers mockup (kept outside the tree)'s own scene 58:
     /// sharing on, two Macs trusted, one asleep, and the five This Mac
@@ -1877,8 +1917,11 @@ enum RenderStates {
     /// rendered as three ended rows.
     static let peerNow = Date(timeIntervalSince1970: 1_786_000_000)
 
-    private static func peersSnapshot(_ document: PeerListDocument) -> PeersSnapshot {
-        PeersSnapshotBuilder.snapshot(from: document, now: peerNow)
+    /// `holdsCodex` builds the snapshot a fleet holding a Codex account reads.
+    private static func peersSnapshot(_ document: PeerListDocument, holdsCodex: Bool = false)
+        -> PeersSnapshot
+    {
+        PeersSnapshotBuilder.snapshot(from: document, now: peerNow, holdsCodex: holdsCodex)
     }
 
     /// One Peers-tab state, drawn inside the REAL panel shell.
@@ -1887,6 +1930,8 @@ enum RenderStates {
     /// composed into it, which is what lets these scenes carry the header, the
     /// summary line and the four-tab strip with Peers selected, the mockup's
     /// own frame, without `FleetView` needing a way to inject fixture peers.
+    ///
+    /// `holdsCodex` draws the tab of a fleet holding a Codex account.
     @MainActor
     private static func renderPeer(
         _ scene: (
@@ -1894,13 +1939,15 @@ enum RenderStates {
             detailsOpen: Bool
         ),
         appearance: Appearance,
+        holdsCodex: Bool = false,
         into directory: URL
     ) -> Bool {
         withDrawingAppearance(appearance.nsAppearance) {
             rasterise(
                 peersPanel(
                     snapshot: scene.snapshot, dry: scene.dry, refusal: scene.refusal,
-                    detailsOpen: scene.detailsOpen, appearance: appearance),
+                    detailsOpen: scene.detailsOpen, holdsCodex: holdsCodex,
+                    appearance: appearance),
                 named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
         }
     }
@@ -1960,18 +2007,36 @@ enum RenderStates {
         ]
     }
 
+    /// Scenes 58 and 60 again, with a Codex account in the fleet: a trusted Mac
+    /// never carries a Codex request, so what the pin buys is named as Claude
+    /// traffic, over the tab that fleet draws.
+    private static var mixedPeerSheetScenes:
+        [(name: String, state: PeerPairState, typed: String, expiresIn: TimeInterval?)]
+    {
+        [
+            ("58b-trust-compare-mixed", .comparing(code: "418902"), "", nil),
+            ("60b-trust-done-mixed", .done(peer: "tcr-4b8we1r0zp"), "", nil),
+        ]
+    }
+
     /// One Trust sheet state, over the found-rows tab it opens from.
+    ///
+    /// `holdsCodex` draws the sheet, and the tab under it, in a fleet holding a
+    /// Codex account.
     @MainActor
     private static func renderPeerSheet(
         _ scene: (name: String, state: PeerPairState, typed: String, expiresIn: TimeInterval?),
         appearance: Appearance,
+        holdsCodex: Bool = false,
         into directory: URL
     ) -> Bool {
         withDrawingAppearance(appearance.nsAppearance) {
             let run = PeerPairRun(pinned: scene.state)
             run.compare.set(scene.typed)
             let view =
-                peersPanel(snapshot: trustSheetTab, dry: false, appearance: appearance)
+                peersPanel(
+                    snapshot: trustSheetTab(holdsCodex: holdsCodex), dry: false,
+                    holdsCodex: holdsCodex, appearance: appearance)
                 .overlay {
                     ZStack {
                         Color.black.opacity(sheetScrimAlpha)
@@ -1980,7 +2045,8 @@ enum RenderStates {
                             state: scene.state,
                             compare: .constant(run.compare),
                             expiresIn: scene.expiresIn,
-                            snapshotMode: true
+                            snapshotMode: true,
+                            holdsCodex: holdsCodex
                         )
                         .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
                         .shadow(radius: sheetShadowRadius)
@@ -2302,7 +2368,8 @@ enum RenderStates {
 
     /// The tab underneath every Trust sheet: the found row the sheet was
     /// opened from, already waiting, which is what the live panel draws.
-    private static var trustSheetTab: PeersSnapshot {
+    /// `holdsCodex` builds it for a fleet holding a Codex account.
+    private static func trustSheetTab(holdsCodex: Bool) -> PeersSnapshot {
         PeersSnapshotBuilder.waiting(
             peersSnapshot(
                 PeerListDocument(
@@ -2311,15 +2378,19 @@ enum RenderStates {
                         .init(
                             name: "studio-mac", address: "studio-mac.local:7749",
                             lastSeenMs: peerMsAgo(8))
-                    ])),
+                    ]),
+                holdsCodex: holdsCodex),
             knocked: ["studio-mac.local:7749"])
     }
 
     /// The Peers tab as a panel, for the scene renderers above.
     @MainActor
+    ///
+    /// `holdsCodex` is the pinned controller's: the tab of a fleet holding a Codex
+    /// account.
     private static func peersPanel(
         snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal = PeerRefusal(),
-        detailsOpen: Bool = false,
+        detailsOpen: Bool = false, holdsCodex: Bool = false,
         appearance: Appearance
     ) -> some View {
         // Density: absent, which is `PanelDensityPreference`'s own
@@ -2358,7 +2429,8 @@ enum RenderStates {
                 },
                 content: {
                     PeersTabV4(
-                        controller: PeerController.pinned(scene.snapshot, refusal: refusal),
+                        controller: PeerController.pinned(
+                            scene.snapshot, refusal: refusal, holdsCodex: holdsCodex),
                         snapshotMode: true,
                         refusalDetailsOpen: detailsOpen)
                 },
@@ -2480,6 +2552,16 @@ enum RenderStates {
                             mode: .serve,
                             handedKeyUntil: Int64(peerNow.timeIntervalSince1970) + 166,
                             peer: "studio-mac", now: peerNow)))),
+            // A Codex account's card with the waiting scene's exit: must-locked to
+            // a Mac that is down. A Codex request always leaves from this Mac, so
+            // the card draws no picker, no must switch and no waiting pill, and
+            // says instead that tcr refuses the account, and how to clear the lock.
+            ControlScene(
+                name: "w12-exits-codex",
+                view: exitsCodexCard(
+                    .init(
+                        route: .via(exitPeerId), strict: true, peerDown: true,
+                        waitingSeconds: 40))),
         ]
     }
 
@@ -2523,6 +2605,24 @@ enum RenderStates {
         // file's own fixture stopped decoding, so the scene draws nothing
         // rather than a card invented here.
         guard let account = fleet(exitsAliceJSON).accounts.first else {
+            return AnyView(EmptyView())
+        }
+        return AnyView(
+            AccountCard(
+                account: account, shape: .full, now: peerNow,
+                exit: exit, exitPeers: ["studio-mac", "attic-nuc"],
+                exitPeerRows: exitPeerRows, snapshotMode: true,
+                actions: { EmptyView() }
+            )
+            .frame(width: V4.panelWidth))
+    }
+
+    /// ``exitsCard(_:)`` over canonical bob, a Codex account, with every instant
+    /// pinned to ``peerNow``: the same card arguments, so the only difference is
+    /// what a Codex card draws for an exit.
+    @MainActor
+    private static func exitsCodexCard(_ exit: AccountExit) -> AnyView {
+        guard let account = fleet("[\(codexRow(.bob, now: peerNow))]").accounts.first else {
             return AnyView(EmptyView())
         }
         return AnyView(

@@ -30,6 +30,53 @@ public enum RemoveAccountCommand {
         ["remove", query]
     }
 
+    /// What the delete alert says, for this row in this fleet.
+    ///
+    /// A Claude row's alert is the panel's own, word for word. A Codex row comes back
+    /// through the Codex sign-in, not `tcr login`, and deleting it leaves the codex
+    /// CLI's own login alone, so its first paragraph says both.
+    ///
+    /// Deleting the LAST Codex account changes what codex does next, and that alert
+    /// says so in a paragraph of its own. The proxy's Codex paths count only the Codex
+    /// accounts still in the config (the per-provider account count the manager keeps
+    /// in `src/manager/state.rs`), so once the last one goes, the next tunnel to
+    /// chatgpt.com is no longer intercepted, and `tcr run --codex`, which reads the
+    /// listed rows, starts codex on its own login straight away.
+    ///
+    /// `deleted` holds the names whose delete already landed while their row is still
+    /// listed: the keys of ``RemoveAccountController/notices``, which only a delete
+    /// that succeeded records. Such a row is not counted. Every other Codex row is, in
+    /// any state, a disabled one included, because it is still in the config. A name
+    /// keeps its notice until it is deleted again, so a row re-added under that name in
+    /// the same app run is counted as deleted here.
+    public static func confirmation(
+        for account: Account, in accounts: [Account], deleted: Set<String>
+    ) -> DeleteConfirmation {
+        let message = "Delete account “\(account.name)”?"
+        let leaves =
+            "The account stops serving at once and leaves this list. No restart is needed."
+        guard account.provider == .codex else {
+            return DeleteConfirmation(
+                message: message,
+                informative: "This removes “\(account.name)” and its saved credentials from "
+                    + "the config. It is not reversible from here: getting it back means "
+                    + "running `tcr login` again from scratch.\n\n" + leaves)
+        }
+        var informative =
+            "This removes “\(account.name)” and its saved login from the config. It is not "
+            + "reversible from here: getting it back means signing it in again (Add account… "
+            + "› Codex account…). The codex CLI's own login is not touched.\n\n" + leaves
+        let anotherCodex = accounts.contains {
+            $0.provider == .codex && $0.name != account.name && !deleted.contains($0.name)
+        }
+        if !anotherCodex {
+            informative +=
+                "\n\nThis is your last Codex account. tcr stops intercepting chatgpt.com, and "
+                + "codex runs on its own login."
+        }
+        return DeleteConfirmation(message: message, informative: informative)
+    }
+
     /// Why a delete did not happen. `tcr`'s own words, unparaphrased.
     public struct Failure: Error, Equatable, Sendable {
         public let exitCode: Int32
@@ -82,6 +129,17 @@ public enum RemoveAccountCommand {
                 return .failed(Failure(exitCode: -1, message: error.localizedDescription))
             }
         }
+    }
+}
+
+/// The delete alert's two lines: the question, and what deleting costs.
+public struct DeleteConfirmation: Equatable, Sendable {
+    public let message: String
+    public let informative: String
+
+    public init(message: String, informative: String) {
+        self.message = message
+        self.informative = informative
     }
 }
 

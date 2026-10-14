@@ -437,4 +437,71 @@ final class PeerLeaseTests: XCTestCase {
             draft.end, .until("18:00"),
             "a lease ending tomorrow at 18:00 must not read as ending at 18:00 today")
     }
+
+    // MARK: - A fleet holding a Codex account
+
+    /// The server's lease never lends a Codex account, so "all" says whose: every
+    /// Claude account. A named scope and a Claude-only fleet read as today, and the
+    /// property every existing caller reads is unchanged.
+    func testTheAllScopeNamesClaudeWithACodexAccount() {
+        XCTAssertEqual(LendScope.all.label(holdsCodex: true), "All Claude accounts")
+        XCTAssertEqual(LendScope.all.label(holdsCodex: false), "All accounts")
+        XCTAssertEqual(LendScope.group("orchard").label(holdsCodex: true), "Group: orchard")
+        XCTAssertEqual(LendScope.all.label, "All accounts")
+    }
+
+    /// A lease's scope popup follows the fleet the same way, from the grant the wire
+    /// decodes.
+    func testAGrantsScopeLabelFollowsTheFleet() throws {
+        let grant = try JSONDecoder().decode(
+            PeerLendGrant.self,
+            from: Data(#"{"id":"ls-1","scope":"all","window":"7d","fraction":0.2}"#.utf8))
+        XCTAssertEqual(grant.scope, .all)
+        XCTAssertEqual(grant.scopeLabel(holdsCodex: true), "All Claude accounts")
+        XCTAssertEqual(grant.scopeLabel, "All accounts")
+    }
+
+    /// The lease picker offers only accounts a lease can lend: the Claude ones. A
+    /// Claude-only fleet's picker is every account, sorted, as today.
+    func testTheLeasePickerListsClaudeAccountsOnly() throws {
+        XCTAssertEqual(
+            PeerLease.eligibleLendAccounts(try canonicalFleet().accounts), ["alice@example.com"])
+        let claudeOnly = try decodeFleet([
+            canonicalRow("alice@example.com"),
+            canonicalRow(
+                "alice@example.com",
+                ["name": "nina@example.com", "orgUuid": "22222222-2222-4222-8222-222222222222"]),
+        ])
+        XCTAssertEqual(
+            PeerLease.eligibleLendAccounts(claudeOnly.accounts),
+            claudeOnly.accounts.map(\.name).sorted())
+    }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// All ten canonical rows: alice (Claude, in orchard) and nine Codex rows.
+private func canonicalFleet() throws -> Fleet {
+    try decodeFleet(
+        [
+            "alice@example.com", "bob@example.com/codex", "carol@example.com", "dana@example.com",
+            "erin@example.com/codex", "gil@example.com", "hal@example.com", "ivy@example.com",
+            "jo@example.com", "kim@example.com",
+        ].map { try canonicalRow($0) })
 }

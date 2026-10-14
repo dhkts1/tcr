@@ -172,19 +172,24 @@ public enum PeerPairState: Equatable, Sendable {
     /// deadline to state, and a caller with nothing to count passes `nil`,
     /// which is what a rendered fixture does: a pinned state carries no
     /// clock, so a picture of this sheet is the same picture on every run.
-    public func sentence(peerName: String, expiresIn remaining: TimeInterval? = nil) -> String {
+    ///
+    /// `holdsCodex` is whether the fleet holds a Codex account. A trusted Mac
+    /// never carries a Codex request, so there what the pin buys is named as
+    /// Claude traffic (``PeersCodexCopy``); without one the words are today's.
+    public func sentence(
+        peerName: String, expiresIn remaining: TimeInterval? = nil, holdsCodex: Bool = false
+    ) -> String {
         switch self {
         case .asking:
             return PeerAdmission.waitingSentence(expiresIn: remaining)
         case .comparing:
+            let traffic = holdsCodex ? "your Claude traffic" : "your traffic"
             return "\(peerName) is showing six digits of its own. Read them off that screen and "
                 + "type them here: if one digit differs, stop, because something is answering "
-                + "in its place. A match pins its key and it can carry your traffic without "
+                + "in its place. A match pins its key and it can carry \(traffic) without "
                 + "reading it."
         case .done(let peer):
-            return "Its key is pinned here as \(peer). It can carry your encrypted bytes and "
-                + "open none of them; nothing is shared until you turn sharing on. Do the same "
-                + "on that Mac, pointed back here, so both sides hold a pin."
+            return PeersCodexCopy.trustDone(peer: peer, holdsCodex: holdsCodex)
         case .refused(let message):
             return message
         case .cancelled:

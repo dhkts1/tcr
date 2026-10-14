@@ -89,6 +89,98 @@ final class ContextMenuReloginAvailabilityTests: XCTestCase {
         XCTAssertFalse(source.contains("} else if account.isRejected {"))
     }
 
+    /// Every account item in the menu is offered through ``Account/availableActions``,
+    /// the one value the line, the floating card and the kept-open and tall cards
+    /// all reach this menu through, so a Codex row is offered only what works on it.
+    /// The rest of the menu keeps today's shape: Keep Card Open first and ungated,
+    /// a panel affordance on both providers; Add to group…'s divider and its guard;
+    /// and the polls after a group removal.
+    func testEveryMenuItemIsGatedThroughAvailableActions() throws {
+        let body = try contextMenuItemsBody()
+        for gate in [
+            "let actions = account.availableActions",
+            "actions.contains(.toggleEnabled)", "actions.contains(.relogin)",
+            "actions.contains(.controlAccount)", "actions.contains(.copyName)",
+            "actions.contains(.copyAccessToken)", "actions.contains(.mintToken)",
+            "actions.contains(.deleteAccount)", "TokenCommand.menuTitle(for: account)",
+        ] {
+            XCTAssertTrue(body.contains(gate), "contextMenuItems no longer holds \(gate)")
+        }
+        XCTAssertTrue(body.contains(#"Button("Re-login…") { onRelogin() }"#))
+        XCTAssertFalse(
+            body.contains(#"Button("Copy Access Token")"#),
+            "the token item is titled in the view again, so a Codex row reads Claude's title")
+
+        let keptOpen = try XCTUnwrap(
+            body.range(of: "if let kept = cardKeptOpen {"), "the Keep Card Open block is gone")
+        let firstGate = try XCTUnwrap(body.range(of: "actions.contains("))
+        XCTAssertLessThan(
+            keptOpen.lowerBound, firstGate.lowerBound,
+            "Keep Card Open is no longer first, or sits behind an account gate")
+        XCTAssertTrue(
+            collapsed(body).contains(
+                #"if let kept = cardKeptOpen { Button(kept ? "Close Card" : "Keep Card Open") { onToggleKeptOpen() } .help( kept ? "Draws this account as one line again." : "Shows this account's card in the list all the time, on this Mac.") Divider() }"#
+            ),
+            "the Keep Card Open block changed")
+
+        let source = try fleetViewSource()
+        for call in [
+            "AccountActions.groupItems(for: account", "AccountActions.addToGroupEntries(for: account",
+            "RestartAlertCopy.takeoverInformative(holdsCodex:",
+        ] {
+            XCTAssertTrue(source.contains(call), "FleetView.swift no longer holds \(call)")
+        }
+        for gone in ["private func parkToggle(", "private var candidateGroupsToAdd"] {
+            XCTAssertFalse(source.contains(gone), "FleetView.swift still holds \(gone)")
+        }
+
+        let addStart = "private var addToGroupMenu: some View {"
+        let addEnd = "private var everyGroupFleetWide: Set<String> {"
+        guard let open = source.range(of: addStart),
+            let close = source.range(of: addEnd, range: open.upperBound..<source.endIndex)
+        else {
+            return XCTFail(
+                "\(addStart) or \(addEnd) has moved or been renamed in FleetView.swift — "
+                    + "update this test's anchors")
+        }
+        let addMenu = collapsed(String(source[open.upperBound..<close.lowerBound]))
+        let newGroup = try XCTUnwrap(
+            addMenu.range(of: #"Button("New group…") { presentNewGroupPrompt() }"#),
+            "Add to group… no longer starts with New group…")
+        let guarded = try XCTUnwrap(
+            addMenu.range(of: #"if !entries.isEmpty { Divider() ForEach(entries, id: \.group) {"#),
+            "Add to group… lost the divider under New group…, or its guard")
+        XCTAssertLessThan(newGroup.lowerBound, guarded.lowerBound)
+
+        for removal in [#"Button("Remove from \(group)")"#, #"Button("Remove from all groups")"#] {
+            let anchor = try XCTUnwrap(
+                source.range(of: removal), "\(removal) has moved or been renamed")
+            let rest = source[anchor.upperBound...]
+            let poll = try XCTUnwrap(
+                rest.range(of: "_ = await onChanged()"), "nothing polls after \(removal)")
+            if let nextButton = rest.range(of: "Button(") {
+                XCTAssertLessThan(
+                    poll.lowerBound, nextButton.lowerBound,
+                    "\(removal) no longer polls before the next item")
+            }
+        }
+    }
+
+    /// Every whitespace run as one space: FleetView.swift is not swift-format linted, so
+    /// its indentation is not stable.
+    private func collapsed(_ text: String) -> String {
+        text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// The whole of FleetView.swift.
+    private func fleetViewSource() throws -> String {
+        try String(
+            contentsOf: repoRoot().appendingPathComponent(
+                "apps/macos/Sources/TcrBar/FleetView.swift"),
+            encoding: .utf8)
+    }
+
     private func repoRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // FleetViewContextMenuTests.swift -> TcrBarTests

@@ -417,6 +417,7 @@ struct FleetView: View {
                 claudeRoute = ClaudeRouteRead.current()
                 refreshCodexCount()
             }
+            syncPeersProvider()
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
@@ -430,6 +431,7 @@ struct FleetView: View {
                 refreshCodexZeroRequestsSince()
                 pruneKeptOpenCards()
             }
+            syncPeersProvider()
         }
         // The kill confirm. `docs/design/tools-tab.md`: "a destructive control
         // confirms … kill asks once, names the command it will signal."
@@ -2428,6 +2430,19 @@ struct FleetView: View {
         UserDefaults.standard.set(keptOpen.ids, forKey: Self.keptOpenCardsKey)
     }
 
+    /// Tells the Peers tab whether the fleet holds a Codex account, from the poll
+    /// that just landed (`false` while no fleet is loaded). No Mac lends, serves or
+    /// carries a Codex request, so with one the tab names Claude in every promise
+    /// about borrowing or carrying. Written only when it changes, so an unchanged
+    /// fleet costs the tab no redraw. It reads nothing from the machine, so it runs
+    /// in `snapshotMode` too.
+    private func syncPeersProvider() {
+        let holdsCodex = poller.state.loadedFleet?.holdsCodex == true
+        if peers.holdsCodex != holdsCodex {
+            peers.holdsCodex = holdsCodex
+        }
+    }
+
     /// "Keep Card Open" / "Close Card": the line turns into the card, or the
     /// card back into the line, at once.
     private func toggleKeptOpen(_ accountID: String) {
@@ -3845,22 +3860,15 @@ struct FleetView: View {
     /// `tcr server --headless --replace`
     /// — the replacement is performed by `tcr`'s own singleton.
     /// TcrBar signals nothing it did not spawn.
+    ///
+    /// Once the fleet holds a Codex account the alert names Codex sessions too,
+    /// which lose their pins with the rest (``RestartAlertCopy``).
     private func confirmTakeover() {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Take over the port from the running proxy?"
-        alert.informativeText = """
-            This kills the proxy currently holding the port and starts a new one \
-            in its place.
-
-            That wipes the session-to-account pin map. Anthropic's prompt cache is \
-            per-account, so every live Claude session is re-pinned to a different \
-            account and pays a full cold prompt-cache prefix on its next request. \
-            It is the most expensive thing this app can do.
-
-            Only do this if the running proxy is stuck or is a build you need to \
-            replace.
-            """
+        let holdsCodex = poller.state.loadedFleet?.holdsCodex == true
+        alert.informativeText = RestartAlertCopy.takeoverInformative(holdsCodex: holdsCodex)
         let takeOver = alert.addButton(withTitle: "Take over port")
         takeOver.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
@@ -4895,9 +4903,16 @@ struct AccountRow: View {
     ///
     /// Deliberately does NOT add routing or pin controls: that is a separate
     /// feature, not this row's to invent.
+    ///
+    /// Which account items appear is decided by ``Account/availableActions``, one
+    /// core value, so every route to this menu offers the same items: a Codex row
+    /// is not offered the control account, a minted token or the group commands
+    /// that can only fail on it. A Claude row's set is every item, so its menu is
+    /// the one it always was.
     @ViewBuilder
     private var contextMenuItems: some View {
         let enabling = account.disabled
+        let actions = account.availableActions
         // First, and in its own section: it changes how this panel draws the
         // account, not the account, and Gil asked for it in this menu (Gil,
         // 2026-10-14: "The row's right-click menu gains 'Keep card open' /
@@ -4910,25 +4925,29 @@ struct AccountRow: View {
                         : "Shows this account's card in the list all the time, on this Mac.")
             Divider()
         }
-        Button(enabling ? "Enable" : "Disable") {
-            Task { await performToggle(enabling: enabling) }
+        if actions.contains(.toggleEnabled) {
+            Button(enabling ? "Enable" : "Disable") {
+                Task { await performToggle(enabling: enabling) }
+            }
+            .disabled(accounts.isPending(account.ref))
         }
-        .disabled(accounts.isPending(account.ref))
-        Button("Re-login…") { onRelogin() }
-            .help(
-                "Signs in through your browser, requesting this exact account. "
-                    + "`tcr` refuses to save if the browser hands back a different "
-                    + "one. The login it starts now mints a credential good for a "
-                    + "year, so running it on a healthy row is a safe way to get "
-                    + "ahead of the old one expiring."
-            )
+        if actions.contains(.relogin) {
+            Button("Re-login…") { onRelogin() }
+                .help(
+                    "Signs in through your browser, requesting this exact account. "
+                        + "`tcr` refuses to save if the browser hands back a different "
+                        + "one. The login it starts now mints a credential good for a "
+                        + "year, so running it on a healthy row is a safe way to get "
+                        + "ahead of the old one expiring."
+                )
+        }
         Divider()
         // Hidden entirely while `control` cannot answer the question at all
         // (``ControlAccountController/unavailable``) — an older `tcr` has no
         // `control` subcommand, and an action this build cannot even read back
         // is worse than no action: a click would exit non-zero with a message
         // about a route that does not exist, on every single row, forever.
-        if !control.unavailable {
+        if actions.contains(.controlAccount), !control.unavailable {
             if control.isControl(account.name) {
                 Button("Clear Control Account") {
                     Task { await performSetControl(name: nil, key: account.id) }
@@ -4945,21 +4964,41 @@ struct AccountRow: View {
                 .disabled(control.isPending(account.id))
             }
         }
-        Divider()
-        Button("Copy Account Name") {
-            copyToPasteboard(account.name)
+        // The rule under the control items closes their section, so a row that
+        // is never offered them (a Codex row) draws one rule here, not two in a
+        // row with nothing between them. A Claude row draws it as it always did.
+        if actions.contains(.controlAccount) {
+            Divider()
+        }
+        if actions.contains(.copyName) {
+            Button("Copy Account Name") {
+                copyToPasteboard(account.name)
+            }
         }
         // The token is a secret: it goes from `tcr token`'s stdout straight
-        // to the pasteboard and is never rendered, logged or kept.
-        Button("Copy Access Token") {
-            Task { await performCopyToken() }
+        // to the pasteboard and is never rendered, logged or kept. On a Codex
+        // row it is a ChatGPT bearer, and the item's title and help say so
+        // (``TokenCommand/menuTitle(for:)``); a Claude row's item has no help.
+        if actions.contains(.copyAccessToken) {
+            if let help = TokenCommand.menuHelp(for: account) {
+                Button(TokenCommand.menuTitle(for: account)) {
+                    Task { await performCopyToken() }
+                }
+                .help(help)
+            } else {
+                Button(TokenCommand.menuTitle(for: account)) {
+                    Task { await performCopyToken() }
+                }
+            }
         }
         // Distinct wording from the button above on purpose: "Copy" hands over
         // a string that already exists and dies in hours, "Mint" makes a new
         // one that does not — the confusion between the two is exactly what
         // prompted this item to exist.
-        Button("Mint Long-Lived Token…") {
-            onMint()
+        if actions.contains(.mintToken) {
+            Button("Mint Long-Lived Token…") {
+                onMint()
+            }
         }
         Divider()
         groupMenuItems
@@ -4968,10 +5007,12 @@ struct AccountRow: View {
         // `dangerZone`'s "Take over port…": the most expensive, least
         // reversible action on the row does not get to sit beside routine
         // ones a misclick could land on instead.
-        Button("Delete Account…") {
-            confirmDeleteAccount()
+        if actions.contains(.deleteAccount) {
+            Button("Delete Account…") {
+                confirmDeleteAccount()
+            }
+            .disabled(removeController.isPending(account.ref))
         }
-        .disabled(removeController.isPending(account.ref))
     }
 
     /// One entry per ``Account/groupMenuActions``, wired directly to
@@ -4986,63 +5027,14 @@ struct AccountRow: View {
         ForEach(account.groupMenuActions, id: \.self) { action in
             switch action {
             case .remove(let group):
-                // First, and disabled because there is nothing to click — this
-                // states a fact about the group, it does not offer to change it.
-                // Without it the panel renders a group that serves nothing
-                // exactly like one that works: a member, a colour, a healthy
-                // row. That is how a group whose only member was the control
-                // account survived on the live fleet, silently falling back on
-                // every request.
-                if !GroupRouting.routes(
-                    group: group, accounts: allAccounts, controlName: control.current)
-                {
-                    Button("⚠︎ “\(group)” routes nothing — control account only") {}
-                        .disabled(true)
-                } else if GroupRouting.allowsControlAccount(group: group, accounts: allAccounts) {
-                    // The opted-in state gets its OWN line rather than just the
-                    // absence of the warning above. Silence would be cheaper and
-                    // is the wrong call here: "opted in" and "I forgot to opt in"
-                    // would look identical, and an unroutable group that looked
-                    // fine is the exact failure this whole menu section exists
-                    // to end.
-                    Button("“\(group)” may use the control account") {}
-                        .disabled(true)
-                }
-                // The USE command, above the two removals. This slot used to copy
-                // `tcr group rm <group> <account>` — the twin of the button
-                // right below it — which made three consecutive entries all
-                // spell a deletion and offered no way at all to start a session
-                // on the group. Copying the command that administers a label was
-                // never what anyone wanted off a row that already carries it.
-                let copyRun = GroupCommand.CopyCommandMenuEntry(
-                    arguments: GroupCommand.runArguments(group: group))
-                Button(copyRun.title) {
-                    copyToPasteboard(copyRun.copiedText)
-                }
-                // Same distinction as the row-level item: this mints a NEW
-                // long-lived token for every member of the group, it does not
-                // copy anything that already exists.
-                Button("Mint Long-Lived Tokens for “\(group)”…") {
-                    onMintGroup(group)
-                }
-                // One click, either direction, with the current state on the
-                // item itself — the only administrative entry in this menu that
-                // takes effect without a restart, which is why it can be a
-                // toggle at all rather than an instruction to go and edit the
-                // config. It sits above the two removals because holding a
-                // group back is the reversible thing to want; deleting it is
-                // not.
-                parkToggle(for: group)
-                Button("Remove from \(group)") {
-                    Task {
-                        await groupController.remove(account: account.ref, from: group)
-                        // The proxy re-reads group membership on the poll
-                        // itself; asking now shows it without waiting one out.
-                        _ = await onChanged()
-                    }
-                }
-                Button("Delete group “\(group)” for everyone…") {
-                    confirmDeleteGroup(group)
+                // Which items, in which order, and in whose words, is the core's
+                // (``AccountActions/groupItems(for:group:accounts:controlName:)``),
+                // so a Codex row is told why it has no run copy and no mint
+                // rather than being offered two items that can only fail.
+                let items = AccountActions.groupItems(for: account, group: group,
+                    accounts: allAccounts, controlName: control.current)
+                ForEach(items, id: \.self) { item in
+                    groupMenuItem(item, group: group)
                 }
             case .removeAll:
                 Button("Remove from all groups") {
@@ -5059,58 +5051,105 @@ struct AccountRow: View {
         }
     }
 
-    /// The Park/Unpark toggle for one group, with a checkmark showing the
-    /// state it is in right now.
-    ///
-    /// The state is read from the FLEET (`allAccounts`), not from this row: a
-    /// group is parked or not for everyone, and reading this row alone would
-    /// draw an unchecked item on a member the wire happened to omit. Disabled
-    /// while the call is in flight, so a second click cannot queue a second
-    /// subprocess against the same label.
+    /// One item of a group's submenu, as the core listed it.
     @ViewBuilder
-    private func parkToggle(for group: String) -> some View {
-        let parked = allAccounts.contains { ($0.parkedGroups ?? []).contains(group) }
-        Button {
-            Task { await groupController.setParked(group: group, parked: !parked) }
-        } label: {
-            // A leading checkmark rather than `Toggle`: `Menu` contents are
-            // rasterised nowhere (see `RenderStates`' header) and a plain
-            // Button with an explicit mark is what the rest of this menu uses.
-            Label(
-                parked ? "Unpark group “\(group)”" : "Park group “\(group)”",
-                systemImage: parked ? "checkmark" : "pause.circle")
+    private func groupMenuItem(_ item: GroupMenuItem, group: String) -> some View {
+        switch item {
+        case .statement(let text):
+            // Disabled because there is nothing to click — this states a fact
+            // about the group, it does not offer to change it. Without the
+            // routing line the panel renders a group that serves nothing
+            // exactly like one that works: a member, a colour, a healthy row.
+            // That is how a group whose only member was the control account
+            // survived on the live fleet, silently falling back on every
+            // request. The opted-in state gets its OWN line rather than just
+            // the absence of the warning: silence would be cheaper and is the
+            // wrong call here, because "opted in" and "I forgot to opt in"
+            // would look identical.
+            Button(text) {}
+                .disabled(true)
+        case .copyRun:
+            // The USE command, above the two removals. This slot used to copy
+            // `tcr group rm <group> <account>` — the twin of the button
+            // right below it — which made three consecutive entries all
+            // spell a deletion and offered no way at all to start a session
+            // on the group. Copying the command that administers a label was
+            // never what anyone wanted off a row that already carries it.
+            let copyRun = GroupCommand.CopyCommandMenuEntry(
+                arguments: GroupCommand.runArguments(group: group))
+            Button(copyRun.title) {
+                copyToPasteboard(copyRun.copiedText)
+            }
+        case .mintGroup(let title):
+            // Same distinction as the row-level item: this mints a NEW
+            // long-lived token for every member the mint can serve, it does
+            // not copy anything that already exists.
+            Button(title) {
+                onMintGroup(group)
+            }
+        case .park(let title, let parked):
+            // One click, either direction, with the current state on the
+            // item itself — the only administrative entry in this menu that
+            // takes effect without a restart, which is why it can be a
+            // toggle at all rather than an instruction to go and edit the
+            // config. It sits above the two removals because holding a
+            // group back is the reversible thing to want; deleting it is
+            // not. The state is the FLEET's, not this row's: a group is
+            // parked or not for everyone. Disabled while the call is in
+            // flight, so a second click cannot queue a second subprocess
+            // against the same label.
+            Button {
+                Task { await groupController.setParked(group: group, parked: !parked) }
+            } label: {
+                // A leading checkmark rather than `Toggle`: `Menu` contents are
+                // rasterised nowhere (see `RenderStates`' header) and a plain
+                // Button with an explicit mark is what the rest of this menu uses.
+                Label(title, systemImage: parked ? "checkmark" : "pause.circle")
+            }
+            .disabled(groupController.isPending("park/\(group)"))
+        case .removeFromGroup:
+            Button("Remove from \(group)") {
+                Task {
+                    await groupController.remove(account: account.ref, from: group)
+                    // The proxy re-reads group membership on the poll
+                    // itself; asking now shows it without waiting one out.
+                    _ = await onChanged()
+                }
+            }
+        case .deleteGroup:
+            Button("Delete group “\(group)” for everyone…") {
+                confirmDeleteGroup(group)
+            }
         }
-        .disabled(groupController.isPending("park/\(group)"))
-    }
-
-    /// Every group this account is not already a member of, fleet-wide —
-    /// the population ``groupMenuItems``'s "Add to group…" submenu offers.
-    /// Disabled rather than hidden when empty (no group exists yet anywhere
-    /// in the fleet): a missing submenu reads as "this row cannot be added
-    /// to a group", which is not the true reason.
-    private var candidateGroupsToAdd: [String] {
-        let existing = Set(account.groups ?? [])
-        let everyGroup = Set(allAccounts.flatMap { $0.groups ?? [] })
-        return everyGroup.subtracting(existing).sorted()
     }
 
     /// Never disabled, unlike before this round: "New group…" is always a
     /// usable entry even for a fleet with no groups at all yet, which is the
     /// exact gap this menu exists to close.
+    ///
+    /// The groups below it are the core's
+    /// (``AccountActions/addToGroupEntries(for:accounts:)``): every group this
+    /// account is not in, fleet-wide, with a reserved one listed disabled on a
+    /// Codex row, which no Codex request can reach.
     @ViewBuilder
     private var addToGroupMenu: some View {
         Menu("Add to group…") {
             Button("New group…") { presentNewGroupPrompt() }
-            if !candidateGroupsToAdd.isEmpty {
+            let entries = AccountActions.addToGroupEntries(for: account, accounts: allAccounts)
+            if !entries.isEmpty {
                 Divider()
-                ForEach(candidateGroupsToAdd, id: \.self) { group in
-                    Button(group) {
-                        Task { await groupController.add(account: account.ref, to: group) }
+                ForEach(entries, id: \.group) { entry in
+                    Button(entry.title) {
+                        Task { await groupController.add(account: account.ref, to: entry.group) }
                     }
-                    let copyAdd = GroupCommand.CopyCommandMenuEntry(
-                        arguments: GroupCommand.addArguments(group: group, account: account.name))
-                    Button(copyAdd.title) {
-                        copyToPasteboard(copyAdd.copiedText)
+                    .disabled(!entry.isEnabled)
+                    if entry.offersCopy {
+                        let copyAdd = GroupCommand.CopyCommandMenuEntry(
+                            arguments: GroupCommand.addArguments(
+                                group: entry.group, account: account.name))
+                        Button(copyAdd.title) {
+                            copyToPasteboard(copyAdd.copiedText)
+                        }
                     }
                 }
             }
@@ -5200,17 +5239,17 @@ struct AccountRow: View {
     /// interval, so the row leaves while the person who clicked is still
     /// looking. A refused one stays on the row with `tcr`'s reason
     /// (``AccountRowNotice``).
+    ///
+    /// The words are the core's (``RemoveAccountCommand/confirmation(for:in:deleted:)``):
+    /// a Codex row's alert names its own sign-in, and the last one's says what
+    /// changes for codex.
     private func confirmDeleteAccount() {
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "Delete account “\(account.name)”?"
-        alert.informativeText = """
-            This removes “\(account.name)” and its saved credentials from the config. \
-            It is not reversible from here: getting it back means running `tcr login` \
-            again from scratch.
-
-            The account stops serving at once and leaves this list. No restart is needed.
-            """
+        let copy = RemoveAccountCommand.confirmation(
+            for: account, in: allAccounts, deleted: Set(removeController.notices.keys))
+        alert.messageText = copy.message
+        alert.informativeText = copy.informative
         let delete = alert.addButton(withTitle: "Delete Account")
         delete.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")

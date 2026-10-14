@@ -172,15 +172,24 @@ struct AccountCard<Actions: View>: View {
                     .padding(.top, V4.quotaMarginTop)
                     .help(line.help)
             }
-            if let line = PeerLease.lentToLine(lentTo) {
-                lentLine(line)
+            // A Codex request always leaves from this Mac, so a Codex card draws
+            // no lease line, and in place of the exit picker one statement of
+            // where its requests leave from (``AccountExit/statement(for:exit:)``).
+            if account.availableActions.contains(.lentToLine) {
+                if let line = PeerLease.lentToLine(lentTo) {
+                    lentLine(line)
+                }
             }
             if let exit {
-                AccountExitRow(
-                    account: account.name, exit: exit, peers: exitPeers,
-                    peerRows: exitPeerRows,
-                    snapshotMode: snapshotMode, onChoose: onChooseExit,
-                    onToggleMust: onToggleExitMust)
+                if let statement = AccountExit.statement(for: account, exit: exit) {
+                    AccountExitStatement(text: statement)
+                } else {
+                    AccountExitRow(
+                        account: account.name, exit: exit, peers: exitPeers,
+                        peerRows: exitPeerRows,
+                        snapshotMode: snapshotMode, onChoose: onChooseExit,
+                        onToggleMust: onToggleExitMust)
+                }
             }
         }
         // `.contain` WITH a label. Without one the container has no accessible
@@ -398,8 +407,13 @@ struct AccountCard<Actions: View>: View {
     /// ``AccountExitRow`` draws under the picker, when this account is
     /// must-locked to a Mac that is down right now. `nil` on every other
     /// account, which draws no second pill at all.
+    ///
+    /// `nil` on a Codex card too, whatever its exit says: a Codex request always
+    /// leaves from this Mac and never waits for another one, so the card keeps its
+    /// state pill and draws its exit statement instead.
     private var exitWaitingPillText: String? {
-        exit?.waitingPill(peers: exitPeerRows)
+        guard account.availableActions.contains(.exitPicker) else { return nil }
+        return exit?.waitingPill(peers: exitPeerRows)
     }
 
     /// The sentence behind the waiting pill, the same one

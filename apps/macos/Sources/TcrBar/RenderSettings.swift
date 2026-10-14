@@ -50,7 +50,8 @@ import TcrBarCore
 /// Writes one PNG per pane per appearance and exits without ever showing a
 /// menu-bar item, polling `tcr`, or touching a server. The panes a fleet
 /// holding both Claude and Codex accounts draws differently (``mixedTabs``)
-/// are rendered once more over such a fleet, as `<tab>-mixed-<appearance>.png`.
+/// are rendered once more over such a fleet, as `<tab>-mixed-<appearance>.png`,
+/// and so are the Peers sheets, as `<sheet>-mixed-<appearance>.png`.
 enum RenderSettings {
     static let flag = "--render-settings"
 
@@ -144,6 +145,19 @@ enum RenderSettings {
                 }
             }
         }
+        // The Peers sheets over the same fleet, which name Claude in their
+        // promises and say the Codex accounts stay on this Mac.
+        for scene in SheetScene.allCases {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if render(
+                    .peers, appearance: appearance, sheet: scene, fleet: mixed,
+                    nameSuffix: "-mixed", into: directory)
+                {
+                    written += 1
+                }
+            }
+        }
 
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
@@ -165,8 +179,9 @@ enum RenderSettings {
 
     /// The panes that draw something of their own over a fleet holding both
     /// Claude and Codex accounts: Menu Bar's "Cup shows" row and its counts
-    /// caption.
-    static let mixedTabs: [SettingsTab] = [.menuBar]
+    /// caption, and Peers, whose promises name Claude and whose Sharing head says
+    /// that Codex requests always leave from this Mac.
+    static let mixedTabs: [SettingsTab] = [.menuBar, .peers]
 
     /// ``fixtureAccounts()`` plus canonical bob, a ready Codex account: a fleet
     /// holding both providers.
@@ -265,10 +280,13 @@ enum RenderSettings {
     /// anything. Two models of one pane, and either one alone is a claim: the
     /// arithmetic is what the tests can gate, the drawn figure is what the
     /// operator gets.
-    private static func paneEstimate(for tab: SettingsTab) -> CGFloat {
+    ///
+    /// `fleet` is the capture's: one holding a Codex account draws one more line
+    /// under the Sharing head, and the estimate charges it.
+    private static func paneEstimate(for tab: SettingsTab, fleet: Fleet) -> CGFloat {
         guard tab == .peers else { return 0 }
         return PeersSettingsPane.estimatedHeight(
-            trustedMacs: 2, pendingKnocks: 1, advancedOpen: false)
+            trustedMacs: 2, pendingKnocks: 1, advancedOpen: false, holdsCodex: fleet.holdsCodex)
     }
 
     /// The pane's own scroll view: the WIDEST one in the window, which is the
@@ -440,7 +458,7 @@ enum RenderSettings {
                 "  \(tab.rawValue): scrolled to \(Int(offset)) pt to show the last "
                     + "\(Int(rowHeight)) pt of the pane (document \(Int(documentHeight)) pt, "
                     + "viewport \(Int(viewportHeight)) pt, resting \(Int(restingY)) pt, "
-                    + "pane estimate \(Int(paneEstimate(for: tab))) pt)")
+                    + "pane estimate \(Int(paneEstimate(for: tab, fleet: fleet))) pt)")
             for _ in 0..<3 {
                 RunLoop.current.run(until: Date().addingTimeInterval(0.05))
             }

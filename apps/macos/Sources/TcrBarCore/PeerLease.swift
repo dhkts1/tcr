@@ -85,6 +85,15 @@ public enum LendScope: Equatable, Hashable, Sendable {
         }
     }
 
+    /// ``label``, in a fleet that may hold a Codex account: there `all` reads `All
+    /// Claude accounts`, because the server's lease never lends a Codex account and
+    /// "all" has to say whose. Every other scope, and every scope in a Claude-only
+    /// fleet, reads ``label``.
+    public func label(holdsCodex: Bool) -> String {
+        guard holdsCodex, self == .all else { return label }
+        return "All Claude accounts"
+    }
+
     /// Read `all` / `group:work` / `account:alice,bob` back. `nil` on anything
     /// else, a scope this build cannot name is not silently turned into
     /// `all`, which would widen a lease the operator narrowed.
@@ -461,6 +470,10 @@ public struct PeerLendGrant: Decodable, Equatable, Identifiable, Sendable {
     /// The scope popup's label.
     public var scopeLabel: String { scope.label }
 
+    /// The scope popup's label in a fleet that may hold a Codex account
+    /// (``LendScope/label(holdsCodex:)``).
+    public func scopeLabel(holdsCodex: Bool) -> String { scope.label(holdsCodex: holdsCodex) }
+
     /// The end popup's label: `No end`, or `ends 19:00` from the stored
     /// absolute instant.
     ///
@@ -652,6 +665,15 @@ public struct LeaseDraft: Equatable, Identifiable, Sendable {
 
 /// The lease surfaces' words and argv, in one place.
 public enum PeerLease {
+    /// The accounts the lease picker offers, by name, sorted: every account whose
+    /// row offers ``AccountAction/lend``.
+    ///
+    /// The server's lease never lends a Codex account, so the picker never offers
+    /// one. In a Claude-only fleet that is every account, as it always was.
+    public static func eligibleLendAccounts(_ accounts: [Account]) -> [String] {
+        accounts.filter { $0.availableActions.contains(.lend) }.map(\.name).sorted()
+    }
+
     /// How close an end has to be before the meter states it instead of the
     /// percentage: inside the hour.
     ///
