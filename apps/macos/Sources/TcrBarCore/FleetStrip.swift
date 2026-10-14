@@ -30,7 +30,7 @@ public enum StripSegmentTone: Equatable, Sendable {
         switch kind {
         case .ok: self = .ok
         case .near: self = .near
-        case .spent, .needsRelogin, .rejected: self = .bad
+        case .spent, .needsRelogin, .rejected, .unreachable: self = .bad
         case .unmeasured: self = .info
         case .unknown, .disabled: self = .quiet
         }
@@ -78,6 +78,90 @@ public struct StripSegment: Identifiable, Equatable, Sendable {
     }
 }
 
+/// One provider's headline row in the strip, for a fleet holding Codex accounts.
+///
+/// A Claude account and a Codex account serve different clients, so a fleet holding both
+/// has two capacities, and the one folded "can take work now" over every row would hide
+/// a pool with nothing left: three ready Codex accounts read as work proceeding while
+/// every Claude request is refused. Each pool therefore gets its own row, with the count
+/// the menu bar shows for it, worded "ready" because it is that count and not the
+/// band-based one the folded headline makes.
+///
+/// The row counts down by the strip's own rule, over this pool's out-of-tokens rows
+/// alone, so it agrees with that pool's OUT OF TOKENS heading. When that rule has no
+/// figure and nothing in the pool is ready, the pool's own return fills in: a row held
+/// only by a hold that carries no window still says when it frees.
+public struct StripPoolLine: Equatable, Sendable {
+    public let provider: Provider
+    /// `Claude` or `Codex`.
+    public let name: String
+    /// Rows whose state is ready.
+    public let ready: Int
+    /// Rows that are not parked.
+    public let enabled: Int
+    /// Rows parked by hand or by a parked group.
+    public let parked: Int
+    /// The count's colour: grey with nothing enabled, green with something ready, amber
+    /// with nothing ready and something near its limit, red otherwise.
+    public let tone: SummaryRun.Role
+    /// `"in 2h 39m"`: the soonest this pool's out-of-tokens rows are back, by the
+    /// rule its OUT OF TOKENS heading uses. `nil` when none is waiting on a reset.
+    public let nextBackCountdown: String?
+    /// `"in 47m"`: the pool's own return, only while nothing in it is ready and
+    /// ``nextBackCountdown`` has no figure. `nil` otherwise.
+    public let nextInCountdown: String?
+    /// The breakdown the row does not draw: `"Codex: 3 ready · 1 spent"`.
+    public let help: String
+    /// The breakdown's clauses past the ready one, for the spoken sentence.
+    private let spokenClauses: [String]
+
+    public init(pool: PoolCapacity, nextBackCountdown: String?) {
+        provider = pool.provider
+        name = pool.name
+        ready = pool.readyCount
+        enabled = pool.enabledCount
+        parked = pool.parkedCount
+        if pool.enabledCount == 0 {
+            tone = .dim
+        } else if pool.readyCount > 0 {
+            tone = .ok
+        } else if pool.isNear {
+            tone = .near
+        } else {
+            tone = .bad
+        }
+        self.nextBackCountdown = nextBackCountdown
+        nextInCountdown =
+            nextBackCountdown == nil
+            ? QuotaFormat.resetCaption(resetAtMs: pool.nextReturnAtMs, now: pool.now) : nil
+        help = "\(pool.name): " + pool.breakdownLabels.joined(separator: " · ")
+        spokenClauses = pool.breakdown.filter { $0.kind != .ok }.map {
+            "\($0.count) \($0.kind.phrase(for: pool.provider))"
+        }
+    }
+
+    /// `"Claude · "`, drawn ahead of the count.
+    public var lead: String { "\(name) · " }
+
+    /// `"0 of 2 ready"`, or `"2 parked"` when nothing in the pool is enabled.
+    public var count: String {
+        enabled == 0 ? "\(parked) parked" : "\(ready) of \(enabled) ready"
+    }
+
+    /// `"Claude, 0 of 2 ready, 2 spent, next back in 2h 39m."`: the row and its
+    /// breakdown, saying the ready count once.
+    public var spoken: String {
+        guard enabled > 0 else { return "\(name), \(parked) parked." }
+        var clauses = ["\(name), \(ready) of \(enabled) ready"] + spokenClauses
+        if let nextBackCountdown {
+            clauses.append("next back \(nextBackCountdown)")
+        } else if let nextInCountdown {
+            clauses.append("next \(nextInCountdown)")
+        }
+        return clauses.joined(separator: ", ") + "."
+    }
+}
+
 public struct FleetStrip: Equatable, Sendable {
     /// Left to right, the tab's rows top to bottom.
     public let segments: [StripSegment]
@@ -89,6 +173,10 @@ public struct FleetStrip: Equatable, Sendable {
     /// figure as the out-of-tokens heading's "first back in". `nil` when no
     /// account is waiting on a reset.
     public let nextBackCountdown: String?
+    /// One headline row per pool, Claude first, drawn in place of ``headline``
+    /// in a fleet holding Codex accounts. `nil` for every other fleet, which
+    /// draws ``headline`` as it always has.
+    public let pools: [StripPoolLine]?
 
     /// "Segments are about 25 pt wide at 13 accounts and about 12 pt at 25;
     /// past that the strip stops being pointable" (option H's own note). The
@@ -98,7 +186,11 @@ public struct FleetStrip: Equatable, Sendable {
     /// `drawnRows`: every row the tab draws (and the rows of a group it has
     /// closed), in its order; ``Swift/Array/rowsInDrawOrder(expandedGroups:parkedCap:isCard:)``
     /// builds it. An account's segment sits at its FIRST row.
-    public init(drawnRows: [FleetSectionRow], now: Date) {
+    ///
+    /// `pools`: ``Fleet/providerPools(now:)``, `nil` for a fleet with no Codex
+    /// account. Each pool's row counts down by the rule ``nextBackCountdown``
+    /// uses, over that pool's own out-of-tokens segments.
+    public init(drawnRows: [FleetSectionRow], now: Date, pools: [PoolCapacity]? = nil) {
         var seen: Set<String> = []
         var segments: [StripSegment] = []
         for row in drawnRows where seen.insert(row.account.id).inserted {
@@ -109,6 +201,14 @@ public struct FleetStrip: Equatable, Sendable {
         self.canTakeWork = segments.filter { FleetBand($0.account) == .live }.count
         self.nextBackCountdown = FleetSection.firstBackCountdown(
             segments.map(\.account).filter { FleetBand($0) == .outOfTokens }, now: now)
+        self.pools = pools?.map { pool in
+            StripPoolLine(
+                pool: pool,
+                nextBackCountdown: FleetSection.firstBackCountdown(
+                    segments.map(\.account).filter {
+                        $0.provider == pool.provider && FleetBand($0) == .outOfTokens
+                    }, now: now))
+        }
     }
 
     /// "5 of 13 can take work now".

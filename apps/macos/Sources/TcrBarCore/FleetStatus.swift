@@ -1830,7 +1830,48 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// Whether Anthropic itself has rejected this account, so the router will
     /// never select it however healthy its quota looks. The one gate the panel
     /// had no way to see, and the reason ``gate`` is decoded at all.
-    public var isRejected: Bool { gate == .rejected }
+    ///
+    /// Not every `rejected` gate is a refusal. A server built before the
+    /// refusing-window gate existed sent a Codex quota refusal as `rejected`
+    /// too, with the full window still listed in ``held``. That row is out
+    /// until its window rolls, which is spent, so it is not rejected here
+    /// (``isOlderServerWindowRefusal``). With that, the state classifier, the
+    /// pill's help, the pool-membership pill, the spoken card and the legacy
+    /// panel all read it as spent. The exclusion never holds on a Claude row.
+    public var isRejected: Bool { gate == .rejected && !isOlderServerWindowRefusal }
+
+    /// A Codex row from a server that predates the refusing-window gate,
+    /// refused at a full window: the gate reads `rejected`, ChatGPT named no
+    /// limit (``limitReachedType`` is absent, and a newer server always sends
+    /// one with a Codex refusal), and ``held`` still names the window. It is
+    /// timed by that window, as any spent row is.
+    public var isOlderServerWindowRefusal: Bool {
+        provider == .codex && gate == .rejected && limitReachedType == nil && !held.isEmpty
+    }
+
+    /// A Codex row in a reserved group. A Codex session cannot ask for a group,
+    /// so no Codex request can reach this account, whatever its quota says.
+    public var isUnreachable: Bool { provider == .codex && gate == .unknown("reserved") }
+
+    /// A Codex row the server holds because ChatGPT refused it and named the
+    /// limit it reached: a `hold` gate with a ``limitReachedType``.
+    ///
+    /// A refused Codex row has two causes, and this is one of them: a usage
+    /// refusal. The other is ``isForbiddenHold``, ChatGPT answering 403. Both
+    /// read as refused, and only the help sentence tells them apart. Neither
+    /// is a quota window running out, which is spent.
+    public var isRefusedHold: Bool {
+        provider == .codex && gate == .unknown("hold") && limitReachedType != nil
+    }
+
+    /// A Codex row the server holds for a short while because ChatGPT
+    /// answered its last request with 403 Forbidden: the `refused` gate.
+    ///
+    /// A refused Codex row has two causes, and this is one of them: an
+    /// upstream 403. The other is ``isRefusedHold``, a usage refusal that
+    /// names its limit. A Claude row with the same gate reads as it always
+    /// has; that gate is decoded on every row, and only a Codex row reads it.
+    public var isForbiddenHold: Bool { provider == .codex && gate == .refused }
 
     /// When every gate holding this account out lifts, in unix ms, on every
     /// row; `nil` when nothing holds it or nothing says when.
@@ -2153,8 +2194,18 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     ///
     /// Anything else is an account we know nothing about, and the fleet must say
     /// so rather than assume the best.
+    ///
+    /// One Codex case is evidence with no quota at all: a plan that reported
+    /// it has no usage window (``quotaWindows`` is `[]`). There is no figure to
+    /// carry, so `quota` stays `nil` for good, and without this clause such an
+    /// account would sit unmeasured forever and never count as capacity. Only
+    /// a successful probe stores the empty list, and a failed, timed-out or
+    /// rate-limited probe leaves it in place, the same way it leaves a Claude
+    /// row's last bar, so the same `hasBeenProbed` test decides both. Only a
+    /// Codex row carries ``quotaWindows``, so no Claude row's answer moves.
     public var hasQuotaEvidence: Bool {
-        quota != nil && probeStatus.hasBeenProbed
+        (quota != nil && probeStatus.hasBeenProbed)
+            || (provider == .codex && quotaWindows == [] && probeStatus.hasBeenProbed)
     }
 
     /// In rotation *and* known to have headroom.
@@ -2819,6 +2870,12 @@ public struct FleetTally: Equatable, Sendable {
         /// this build cannot name" with "no quota state at all".
         case unmeasured
         case disabled
+        /// A Codex account in a reserved group, ``Account/isUnreachable``. A
+        /// Codex session cannot ask for a group, so no request can reach it,
+        /// however healthy its quota reads. Counted on its own, never as ready
+        /// and never as parked: the operator did not park it, and the remedy is
+        /// to take it out of that group. Only a Codex row lands here.
+        case unreachable
 
         public var token: String {
             switch self {
@@ -2830,6 +2887,7 @@ public struct FleetTally: Equatable, Sendable {
             case .rejected: return "rejected"
             case .unmeasured: return "unmeasured"
             case .disabled: return "disabled"
+            case .unreachable: return "unreachable"
             }
         }
 
@@ -2852,7 +2910,16 @@ public struct FleetTally: Equatable, Sendable {
             case .rejected: return "rejected by Anthropic"
             case .unmeasured: return "unmeasured"
             case .disabled: return "parked"
+            case .unreachable: return "unreachable"
             }
+        }
+
+        /// ``phrase`` for one provider's row. A refusal is worded as the
+        /// provider's own: Anthropic rejects a Claude account, ChatGPT refuses
+        /// a Codex one. Every other bucket reads the same for both.
+        public func phrase(for provider: Provider) -> String {
+            if self == .rejected, provider == .codex { return "refused by ChatGPT" }
+            return phrase
         }
 
         /// The same bucket as the v4 account card's state PILL: `OK`, `Near`,
@@ -2875,7 +2942,17 @@ public struct FleetTally: Equatable, Sendable {
             case .rejected: return "Rejected"
             case .unmeasured: return "Unmeasured"
             case .disabled: return "Parked"
+            case .unreachable: return "Unreachable"
             }
+        }
+
+        /// ``pillText`` for one provider's row: `Refused` on a refused Codex
+        /// row, the word ChatGPT's own refusal earns, and this register's word
+        /// everywhere else. One function, beside the register it extends, so
+        /// the card and anything after it read one answer.
+        public func pillText(for provider: Provider) -> String {
+            if self == .rejected, provider == .codex { return "Refused" }
+            return pillText
         }
 
         /// The bucket an *enabled* account's quota state falls into.
@@ -2890,9 +2967,10 @@ public struct FleetTally: Equatable, Sendable {
 
         /// The bucket ANY account falls into, measurement included.
         ///
-        /// The ladder is the pre-v4 rotation pill's own branch order
-        /// (`FleetView.swift`'s `rotationPill`), because a card and a row
-        /// looking at one account may not reach two verdicts:
+        /// On a Claude row the ladder is the pre-v4 rotation pill's own branch
+        /// order (`FleetView.swift`'s `rotationPill`), because a card and a row
+        /// looking at one account may not reach two verdicts. The Codex rungs
+        /// sit among them, each tested only on a Codex row:
         ///
         ///  1. `disabled` — the operator's own decision, and the reason this
         ///     bucket exists at all: an account held out by hand still has a
@@ -2905,13 +2983,24 @@ public struct FleetTally: Equatable, Sendable {
         ///     legended PARKED two equally idle accounts read `OK` and
         ///     `PARKED`, and the headline counted the `OK` one as capacity.
         ///  3. `health == .needsRelogin` — a dead credential.
-        ///  4. ``Account/isRejected`` — Anthropic's own verdict.
-        ///  5. the quota state, or `.unmeasured` when nothing was ever probed.
+        ///  4. ``Account/isUnreachable`` — a Codex row in a reserved group,
+        ///     which no Codex request can reach.
+        ///  5. ``Account/isOlderServerWindowRefusal`` — a Codex row a server
+        ///     older than the refusing-window gate called rejected while its
+        ///     full window was still held. It is out until that window rolls,
+        ///     which is spent, exactly as the row a newer server sends for it.
+        ///  6. ``Account/isRejected`` — Anthropic's own verdict — or a refused
+        ///     Codex row, for either of its two causes: a usage refusal that
+        ///     names its limit (``Account/isRefusedHold``) or a 403
+        ///     (``Account/isForbiddenHold``).
+        ///  7. the quota state, or `.unmeasured` when nothing was ever probed.
         ///
-        /// 3 and 4 sit ahead of `hasQuotaEvidence` deliberately: a broken or
-        /// rejected account has no quota reading either, and checking evidence
-        /// first would land every one of them back in `.unmeasured` — telling
-        /// the operator to wait for a sweep that will never fix either cause.
+        /// 3 to 6 sit ahead of `hasQuotaEvidence` deliberately: a broken,
+        /// unreachable or refused account may have no quota reading either, and
+        /// checking evidence first would land every one of them back in
+        /// `.unmeasured` — telling the operator to wait for a sweep that will
+        /// never fix any of those causes. 4 and 5, and the Codex half of 6,
+        /// start with the row's provider, so no Claude row moves.
         ///
         /// Public because the v4 account card (`PanelV4/AccountCard.swift`, a
         /// different module) draws its state pill from this and nothing else:
@@ -2923,7 +3012,11 @@ public struct FleetTally: Equatable, Sendable {
                 self = .disabled
             } else if account.health == .needsRelogin {
                 self = .needsRelogin
-            } else if account.isRejected {
+            } else if account.isUnreachable {
+                self = .unreachable
+            } else if account.isOlderServerWindowRefusal {
+                self = .spent
+            } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
                 self = .rejected
             } else {
                 self = account.hasQuotaEvidence ? Kind(quotaState: account.quotaState) : .unmeasured
@@ -3678,7 +3771,7 @@ public struct Fleet: Equatable, Sendable {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .disabled,
+            .ok, .near, .spent, .unknown, .unreachable, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }
@@ -3701,13 +3794,18 @@ public struct Fleet: Equatable, Sendable {
     /// reason `.needsRelogin` is: the pre-v4 header names it in
     /// ``capacitySummary`` one line above, the v4 summary line has no such
     /// second clause.
+    ///
+    /// `.unreachable` is in both lists, because no sentence names it anywhere
+    /// else. Only a Codex row is ever unreachable, so neither list moves for a
+    /// fleet without one.
     public var sentenceBreakdown: [FleetTally] {
         var counts: [FleetTally.Kind: Int] = [:]
         for account in accounts {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .rejected, .disabled,
+            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .rejected, .unreachable,
+            .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }
@@ -3831,6 +3929,61 @@ public struct Fleet: Equatable, Sendable {
         }
         guard denominator > 0 else { return nil }
         return Double(reads) / Double(denominator)
+    }
+
+    // MARK: Usage, per provider
+    //
+    // A fleet holding both providers cannot draw one fleet-wide figure beside
+    // Claude's spend: the cache ratio would fold Codex's cache into Claude's
+    // prompt cache, and "N unpriced today" would count Codex requests, which no
+    // price list covers, as a gap in Claude's dollars. Each figure below is the
+    // whole-fleet one over one provider's rows, by the same code and with the
+    // same nil-when-unmeasured rule.
+
+    /// This fleet's rows of one provider, as a fleet of their own.
+    private func rows(of provider: Provider) -> Fleet {
+        Fleet(accounts: accounts.filter { $0.provider == provider })
+    }
+
+    /// ``measuredUsage`` over one provider's rows.
+    public func measuredUsage(of provider: Provider) -> [UsageRow] {
+        rows(of: provider).measuredUsage
+    }
+
+    /// ``hasUsage`` over one provider's rows.
+    public func hasUsage(of provider: Provider) -> Bool { rows(of: provider).hasUsage }
+
+    /// ``todayCost`` over one provider's rows.
+    public func todayCost(of provider: Provider) -> Double? { rows(of: provider).todayCost }
+
+    /// ``todayCacheHitRatio`` over one provider's rows.
+    public func todayCacheHitRatio(of provider: Provider) -> Double? {
+        rows(of: provider).todayCacheHitRatio
+    }
+
+    /// ``todayUnpricedRequests`` over one provider's rows.
+    public func todayUnpricedRequests(of provider: Provider) -> Int? {
+        rows(of: provider).todayUnpricedRequests
+    }
+
+    /// Today's output tokens over one provider's rows, the figure a Codex day is
+    /// told in when it cannot be priced. `nil` when no row of that provider was
+    /// measured, never `0`.
+    public func todayOutputTokens(of provider: Provider) -> Int? {
+        let usage = measuredUsage(of: provider)
+        guard !usage.isEmpty else { return nil }
+        return usage.reduce(0) { $0 + $1.today.outputTokens }
+    }
+
+    /// Whether one provider's day is priced through and through: it served
+    /// requests, none of them unpriced, and the sum has a price. Only then is it
+    /// told in dollars. A partly priced Codex day is told in tokens, never as a
+    /// partial dollar figure, and never as `$0.00`.
+    public func todayIsFullyPriced(of provider: Provider) -> Bool {
+        let today = measuredUsage(of: provider).map(\.today)
+        let requests = today.reduce(0) { $0 + $1.requests }
+        let unpriced = today.reduce(0) { $0 + $1.unpricedRequests }
+        return requests > 0 && unpriced == 0 && todayCost(of: provider) != nil
     }
 
     /// Today's traffic per model with the ids CANONICALIZED — the same map

@@ -384,16 +384,17 @@ struct AccountCard<Actions: View>: View {
             + "requests wait until it is back."
     }
 
-    /// ``FleetTally/Kind/pillText``, kept under this name because the pill
-    /// and the spoken label both read it, and a wiring test pins the pill's
-    /// call by it.
-    private var statePillText: String { kind.pillText }
+    /// ``FleetTally/Kind/pillText(for:)``, kept under this name because the
+    /// pill and the spoken label both read it, and a wiring test pins the
+    /// pill's call by it. A refused Codex row reads `Refused`; every other
+    /// row reads the register's own word.
+    private var statePillText: String { kind.pillText(for: account.provider) }
 
     private var statePillRole: V4Pill.Role {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin, .rejected: return .bad
+        case .spent, .needsRelogin, .rejected, .unreachable: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }

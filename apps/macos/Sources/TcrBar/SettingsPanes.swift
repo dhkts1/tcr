@@ -242,6 +242,8 @@ struct MenuBarSettingsPane: View {
     @ObservedObject private var runningToolsPreference: ShowRunningToolsPreference
     @ObservedObject private var defaultTabPreference: DefaultTabPreference
     @ObservedObject private var panelDensityPreference: PanelDensityPreference
+    @ObservedObject private var poller: StatusPoller
+    @ObservedObject private var cupPoolPreference: MenuBarCupPoolPreference
 
     init(dependencies: SettingsDependencies) {
         self.dependencies = dependencies
@@ -249,6 +251,15 @@ struct MenuBarSettingsPane: View {
         self.runningToolsPreference = dependencies.runningToolsPreference
         self.defaultTabPreference = dependencies.defaultTabPreference
         self.panelDensityPreference = dependencies.panelDensityPreference
+        self.poller = dependencies.poller
+        self.cupPoolPreference = dependencies.cupPoolPreference
+    }
+
+    /// A fleet holding both Claude and Codex accounts: the count beside the cup
+    /// has one part per pool, and the cup can be told which pool to follow.
+    /// Every other fleet keeps this section exactly as it was.
+    private var holdsBothProviders: Bool {
+        poller.state.loadedFleet?.holdsBothProviders == true
     }
 
     var body: some View {
@@ -260,13 +271,29 @@ struct MenuBarSettingsPane: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Show the ready count beside the cup")
                         Text(
-                            "The cup's fill level already shows capacity; this spells it out "
-                                + "as \u{201c}9/13\u{201d}, in tabular digits."
+                            holdsBothProviders
+                                ? MenuBarCupPool.mixedCountsCaption
+                                : "The cup's fill level already shows capacity; this spells it out "
+                                    + "as \u{201c}9/13\u{201d}, in tabular digits."
                         )
                         .font(.caption).foregroundStyle(Tok.inkDim)
                     }
                 }
                 .toggleStyle(.switch)
+                if holdsBothProviders {
+                    Picker(selection: $cupPoolPreference.pool) {
+                        ForEach(MenuBarCupPool.allCases, id: \.self) { pool in
+                            Text(pool.title).tag(pool)
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(MenuBarCupPool.settingsLabel)
+                            Text(MenuBarCupPool.settingsCaption)
+                                .font(.caption).foregroundStyle(Tok.inkDim)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
                 Toggle(
                     isOn: $runningToolsPreference.showRunningToolCount
                 ) {

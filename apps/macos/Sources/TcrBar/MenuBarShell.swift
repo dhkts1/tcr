@@ -75,6 +75,11 @@ final class MenuBarShell {
     /// the Settings window happens to be open.
     let runningToolsPreference: ShowRunningToolsPreference
     let defaultTabPreference: DefaultTabPreference
+    /// "Cup shows" (Settings window, Menu Bar pane): which pool the cup follows
+    /// in a fleet holding both Claude and Codex accounts. Owned here for the
+    /// same reason as `countsPreference`: the mark it steers is composed on
+    /// every poll tick, not just while the Settings window is open.
+    let cupPoolPreference: MenuBarCupPoolPreference
     /// "Panel density" (Settings window, Menu Bar pane). Owned here, same
     /// shape as `defaultTabPreference`, even though `V4.compact` never reads
     /// this instance — the picker binding in `SettingsPanes` needs a live
@@ -89,6 +94,7 @@ final class MenuBarShell {
             poller: poller, server: server, loginItem: loginItem, awake: awake,
             preference: preference, countsPreference: countsPreference,
             runningToolsPreference: runningToolsPreference,
+            cupPoolPreference: cupPoolPreference,
             defaultTabPreference: defaultTabPreference,
             panelDensityPreference: panelDensityPreference,
             groupController: groupController, updater: updater,
@@ -124,7 +130,8 @@ final class MenuBarShell {
         runningToolsPreference: ShowRunningToolsPreference? = nil,
         defaultTabPreference: DefaultTabPreference? = nil,
         panelDensityPreference: PanelDensityPreference? = nil,
-        knocks: KnockReader? = nil
+        knocks: KnockReader? = nil,
+        cupPoolPreference: MenuBarCupPoolPreference? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -153,6 +160,7 @@ final class MenuBarShell {
         self.runningToolsPreference = runningToolsPreference ?? ShowRunningToolsPreference()
         self.defaultTabPreference = defaultTabPreference ?? DefaultTabPreference()
         self.panelDensityPreference = panelDensityPreference ?? PanelDensityPreference()
+        self.cupPoolPreference = cupPoolPreference ?? MenuBarCupPoolPreference()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -225,17 +233,20 @@ final class MenuBarShell {
         // The knock count is combined in here for the same reason the other
         // three are: the mark is recomposed whenever ANY of them changes, and
         // a knock arriving between two polls must move the bar without
-        // waiting for an account figure to change.
+        // waiting for an account figure to change. "Cup shows" joins them for
+        // the same reason: picking a pool must move the cup at once.
         self.poller.$state
             .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
             .combineLatest(self.runningToolsPreference.$showRunningToolCount)
             .combineLatest(self.knocks.$knocks)
-            .sink { [weak self] outer, pending in
+            .combineLatest(self.cupPoolPreference.$pool)
+            .sink { [weak self] withKnocks, cupPool in
+                let (outer, pending) = withKnocks
                 let (combined, showRunningTools) = outer
                 let (state, isOn, showCounts) = combined
                 self?.updateMark(
                     state: state, awake: isOn, showCounts: showCounts,
-                    showRunningTools: showRunningTools, knocks: pending.count)
+                    showRunningTools: showRunningTools, knocks: pending.count, cupPool: cupPool)
             }
             .store(in: &marks)
 
@@ -343,12 +354,15 @@ final class MenuBarShell {
 
     // MARK: - The mark
 
-    /// Which colour the one coffee-cup glyph wears. `PollState.capacityTintKind(awake:)`
+    /// Which colour the one coffee-cup glyph wears. `PollState.capacityTintKind(awake:cupPool:)`
     /// (`TcrBarCore/StatusPoller.swift`) is the whole decision — testable there,
     /// against no `NSColor` at all — and this is the one place `Tok`'s actual
-    /// colours attach to it.
-    static func cupTint(for state: PollState, awake: Bool) -> MenuBarMark.Tint {
-        switch state.capacityTintKind(awake: awake) {
+    /// colours attach to it. `cupPool` is "Cup shows": in a fleet holding Codex
+    /// accounts the colour follows the same pool the fill does.
+    static func cupTint(
+        for state: PollState, awake: Bool, cupPool: MenuBarCupPool
+    ) -> MenuBarMark.Tint {
+        switch state.capacityTintKind(awake: awake, cupPool: cupPool) {
         case .failed: return .failed(Tok.spentNSColor)
         case .near: return .near(Tok.nearNSColor)
         case .awake: return .awake(Tok.awakeNSColor)
@@ -356,11 +370,13 @@ final class MenuBarShell {
         }
     }
 
-    /// One line for the tooltip. The menu bar has room for a glyph and nothing
-    /// else, so this is where the poll's own summary is reachable by a human who
-    /// has not opened the panel. ``PollState/tooltipSentence`` is the fuller
-    /// capacity sentence when a healthy read has one to give, and
-    /// ``PollState/summary`` unchanged for every other case.
+    /// The tooltip. The menu bar has room for a glyph and nothing else, so this
+    /// is where the poll's own summary is reachable by a human who has not
+    /// opened the panel. ``PollState/menuBarToolTip(awake:showRunningTools:knocks:cupPool:now:)``
+    /// composes it in the library, where it is tested:
+    /// ``PollState/tooltipSentence`` is the fuller capacity sentence when a
+    /// healthy read has one to give, and ``PollState/summary`` unchanged for
+    /// every other case.
     ///
     /// The running-tools clause, when the segment is shown, sits between that
     /// sentence and the keep-awake clause — matching the mockup's own ordering
@@ -371,20 +387,14 @@ final class MenuBarShell {
     /// A Mac waiting on an answer is PREPENDED, in its own sentence, ahead of
     /// every capacity clause: it is the one thing on this item that is waiting
     /// on a person, and the pointer route is where the amber glyph beside the
-    /// cup says what it means in words.
+    /// cup says what it means in words. A fleet holding both Claude and Codex
+    /// accounts gives each pool its own line, and says which one the cup shows.
     static func toolTip(
-        state: PollState, awake: Bool, showRunningTools: Bool, knocks: Int = 0
+        state: PollState, awake: Bool, showRunningTools: Bool, knocks: Int = 0,
+        cupPool: MenuBarCupPool
     ) -> String {
-        var sentence = state.tooltipSentence
-        if let running = state.runningToolsCount(showRunningTools: showRunningTools) {
-            let noun = running == 1 ? "tool" : "tools"
-            sentence += " · \(running) \(noun) running"
-        }
-        if awake {
-            sentence = "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
-        }
-        guard let asking = PeerAdmission.knockBarSentence(count: knocks) else { return sentence }
-        return "\(asking) \(sentence)"
+        state.menuBarToolTip(
+            awake: awake, showRunningTools: showRunningTools, knocks: knocks, cupPool: cupPool)
     }
 
     /// The knock segment: `person.fill.questionmark` in amber, plus the count
@@ -433,11 +443,14 @@ final class MenuBarShell {
     ///
     /// This label is opt-in (the counts preference, default off): the cup
     /// itself already carries capacity by default, as its fill level and its
-    /// own colour (``MenuBarShell/cupTint(for:awake:)``) — this is a second,
-    /// numeric rendering of the identical fact for an operator who wants it
-    /// spelled out. `amber` matches whatever tint the cup drew for the same
-    /// poll, so the two can never disagree about which state they describe.
-    /// The separator dot is drawn `Tok.mute` so it reads as
+    /// own colour (``MenuBarShell/cupTint(for:awake:cupPool:)``) — this is a
+    /// second, numeric rendering of the identical fact for an operator who
+    /// wants it spelled out. A fleet with one provider has one part, amber
+    /// exactly when the cup is, so the two can never disagree about which
+    /// state they describe. A fleet holding both providers has one part per
+    /// pool (`3/4 · 0/2`, Claude first), each amber when its own pool is near
+    /// (`nearHalves`, in order), so the amber says which pool is short.
+    /// The separator dots are drawn `Tok.mute` so they read as
     /// punctuation rather than a second urgency signal, and the running count
     /// itself is `labelColor` — amber marks capacity, not tool activity.
     /// Internal, not `private`: `RenderMark` composes the identical title this
@@ -445,13 +458,26 @@ final class MenuBarShell {
     /// the render fixtures and the live mark can never draw the label two
     /// different ways.
     static func countsAttributedTitle(
-        _ label: String, amber: Bool, runningTools: Int?
+        _ label: String, nearHalves: [Bool], runningTools: Int?
     ) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(
             ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
-        let result = NSMutableAttributedString(
-            string: label,
-            attributes: [.font: font, .foregroundColor: amber ? Tok.nearNSColor : .labelColor])
+        let result = NSMutableAttributedString()
+        for (index, half) in label.components(separatedBy: " \u{00b7} ").enumerated() {
+            if index > 0 {
+                result.append(
+                    NSAttributedString(
+                        string: " \u{00b7} ",
+                        attributes: [.font: font, .foregroundColor: NSColor(Tok.mute)]))
+            }
+            let near = index < nearHalves.count && nearHalves[index]
+            result.append(
+                NSAttributedString(
+                    string: half,
+                    attributes: [
+                        .font: font, .foregroundColor: near ? Tok.nearNSColor : .labelColor,
+                    ]))
+        }
         guard let runningTools else { return result }
 
         result.append(
@@ -504,19 +530,20 @@ final class MenuBarShell {
         }
         title.append(
             Self.countsAttributedTitle(
-                label, amber: state.countIsNearCapacity,
+                label, nearHalves: state.countsNearHalves,
                 runningTools: state.runningToolsCount(showRunningTools: showRunningTools)))
         return title
     }
 
     private func updateMark(
         state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool,
-        knocks: Int
+        knocks: Int, cupPool: MenuBarCupPool
     ) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
-            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn),
-            knocks: knocks)
+            fraction: state.capacityFraction(cupPool: cupPool),
+            tint: Self.cupTint(for: state, awake: isOn, cupPool: cupPool),
+            knocks: knocks, fleet: state.loadedFleet)
         {
             button.image = mark
             button.attributedTitle = Self.markTitle(
@@ -530,7 +557,8 @@ final class MenuBarShell {
             button.title = "tcr"
         }
         button.toolTip = Self.toolTip(
-            state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks)
+            state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks,
+            cupPool: cupPool)
     }
 
     // MARK: - The panel's size, predicted against what it really is

@@ -95,6 +95,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
 
     /// The strip over this tab (unit H3): one segment per account, in the
     /// order this view draws its rows, from the same sections, caps and forms.
+    /// A fleet holding Codex accounts also gets one headline row per pool.
     static func strip(
         fleet: Fleet, controlName: String?, expandedGroups: Set<String>,
         lentTo: [String: [PeerLentToEntry]], exits: [String: AccountExit],
@@ -106,7 +107,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
             .rowsInDrawOrder(expandedGroups: expandedGroups, parkedCap: parkedVisibleRows) {
                 form($0, lentTo: lentTo, exits: exits, keptOpen: keptOpen) == .card
             }
-        return FleetStrip(drawnRows: rows, now: now)
+        return FleetStrip(drawnRows: rows, now: now, pools: fleet.providerPools(now: now))
     }
 
     var body: some View {
@@ -487,7 +488,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin, .rejected: return .bad
+        case .spent, .needsRelogin, .rejected, .unreachable: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }

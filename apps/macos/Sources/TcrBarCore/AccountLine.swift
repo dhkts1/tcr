@@ -188,6 +188,8 @@ extension Account {
             return AccountLineText("re-login", .bad)
         case .rejected:
             return AccountLineText("rejected", .bad)
+        case .unreachable:
+            return AccountLineText("unreachable", .bad)
         case .unmeasured:
             return AccountLineText("unmeasured", .info)
         case .disabled:

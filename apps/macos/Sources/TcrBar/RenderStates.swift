@@ -225,6 +225,11 @@ enum RenderStates {
             // refused "Delete Account…" looked like a click that did nothing.
             // See ``removeControllerFixture(for:)``.
             ("24-delete-outcomes", .loaded(fleet(healthyJSON)), false, nil),
+            // A fleet holding both providers: both Claude accounts out of
+            // tokens, one Codex account ready and one held on its week. The
+            // strip counts each pool on its own row, and the money line adds
+            // the Codex tokens. See ``mixedFleetJSON``.
+            ("24-mixed-fleet", .loaded(fleet(mixedFleetJSON)), false, nil),
         ]
     }
 
@@ -3900,6 +3905,61 @@ extension RenderStates {
         guard let text = RenderFixtureRow.jsonText(object, laying: extra)
         else { preconditionFailure("a render fixture row is not valid JSON: \(object), with \(extra)") }
         return text
+    }
+
+    /// Codex traffic with nothing refused and nothing sent around the pool in the last ten
+    /// minutes. The canonical Codex rows carry refusals, which draw the refusal banner, so a
+    /// scene about something else lays this over each of its Codex rows. Never over a Claude
+    /// row, which reports no Codex traffic at all.
+    private static let quietCodexTraffic: [String: Any] = ["refused10m": 0, "unpooled10m": 0]
+
+    /// Scene `24-mixed-fleet`, at the real clock: Claude's two accounts both out of tokens,
+    /// and Codex's two split.
+    ///
+    /// - alice is the canonical row with her 5-hour window full and held, her week at 41%,
+    ///   and in no group.
+    /// - frank is a second Claude account: his 5-hour window at 22%, his week spent and
+    ///   held, and alice's day of usage, so the money line totals two of her days.
+    /// - bob is ready and carol is held on her week, both canonical, with quiet traffic.
+    private static var mixedFleetJSON: String {
+        let now = Date()
+        func atMs(_ minutes: Int) -> Int64 {
+            Int64((now.timeIntervalSince1970 + Double(minutes) * 60) * 1000)
+        }
+        // `extra` is laid over the row after its instants move, so its own instants are
+        // written from `now` here.
+        let alice = codexRow(
+            .alice, now: now,
+            extra: [
+                "quotaState": "spent", "quota": 1.0, "fiveHour": 1.0, "fiveHourState": "spent",
+                "held": [["window": "5h", "minutesUntilReset": 159, "resetAtMs": atMs(159)]],
+                "sevenDay": 0.41, "groups": [String](),
+            ])
+        let frank = account(
+            "frank@example.com", quota: "1.0", state: "spent",
+            held: #"[{"window":"7d","minutesUntilReset":4320,"resetAtMs":\#(atMs(4320))}]"#,
+            fiveHour: "0.22", fiveHourState: "ok", sevenDay: "1.0", sevenDayState: "spent",
+            fiveHourResetInMinutes: 250, sevenDayResetInMinutes: 4320,
+            sevenDayOi: "0.40", sevenDayOiState: "ok", usage: frankUsage(now: now),
+            plan: "Max 20x", now: now)
+        let bob = codexRow(.bob, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        let carol = codexRow(.carol, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        return "[\(alice),\(frank),\(bob),\(carol)]"
+    }
+
+    /// frank's `usage`: canonical alice's, so his day is hers, with his own window on his
+    /// card, `$9.02 · 31k`.
+    private static func frankUsage(now: Date) -> String {
+        guard
+            let row = try? JSONSerialization.jsonObject(
+                with: Data(codexRow(.alice, now: now).utf8)) as? [String: Any],
+            var usage = row["usage"] as? [String: Any],
+            var window = usage["window"] as? [String: Any]
+        else { preconditionFailure("canonical alice carries no usage window") }
+        window["costUsd"] = 9.02
+        window["outputTokens"] = 31_000
+        usage["window"] = window
+        return jsonText(usage, laying: [:])
     }
 
     /// `apps/macos/Tests/Fixtures/codex-status.json`, verbatim, indented to sit here.

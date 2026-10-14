@@ -66,6 +66,9 @@ public enum SettingsRowBadge {
     /// `In the menu bar` section, Menu Bar pane.
     public static let showReadyCount = "menuBar.showReadyCount"
     public static let showRunningToolCount = "menuBar.showRunningToolCount"
+    /// Which pool the cup shows, drawn only for a fleet holding both Claude
+    /// and Codex accounts.
+    public static let cupShows = "menuBar.cupShows"
     /// `When the panel opens` section, Menu Bar pane.
     public static let openOnTab = "menuBar.openOnTab"
     public static let textSize = "menuBar.textSize"
@@ -115,6 +118,9 @@ public enum SettingsRowBadge {
         keepAwake: .live,
         showReadyCount: .live,
         showRunningToolCount: .live,
+        // A `UserDefaults` write the menu bar's mark pipeline observes, so the
+        // cup redraws at once.
+        cupShows: .live,
         openOnTab: .live,
         textSize: .readOnly,
         // A `UserDefaults` write, read back on the panel's next draw

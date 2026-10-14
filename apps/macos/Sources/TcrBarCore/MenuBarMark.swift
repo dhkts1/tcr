@@ -37,7 +37,7 @@ import AppKit
 ///    when no account is ready and at least one is close; ``Tint/failed(_:)``
 ///    when the last poll did not answer at all. Colour is deliberately a
 ///    single channel here — unlike the old gauge/cup pair, there is only one
-///    glyph left to carry it, so the caller (``MenuBarShell/cupTint(for:awake:)``)
+///    glyph left to carry it, so the caller (``MenuBarShell/cupTint(for:awake:cupPool:)``)
 ///    picks exactly one `Tint` per poll, never blends two.
 ///
 /// ## The catch, and how a coloured tint dodges it
@@ -75,13 +75,34 @@ public enum MenuBarMark {
     /// the one thing here that is waiting on a person rather than reporting on
     /// a fleet. Capacity follows it, unchanged, and at zero knocks the
     /// sentence is byte-identical to what it has always been.
-    public static func accessibilityDescription(awake: Bool, knocks: Int = 0) -> String {
+    ///
+    /// A fleet holding Codex accounts names each pool that has an enabled
+    /// account, Claude first: `tcr fleet capacity: Claude 1 of 1 ready, Codex
+    /// 3 of 9 ready`. The cup and its colour describe one pool, and a listener
+    /// has neither, so the sentence carries both counts. With no `fleet`, or a
+    /// fleet with no Codex account, it is the phrase it has always been.
+    public static func accessibilityDescription(
+        awake: Bool, knocks: Int = 0, fleet: Fleet? = nil
+    ) -> String {
+        let phrase = capacityPhrase(fleet)
         let capacity =
             awake
-            ? "tcr fleet capacity. \(KeepAwakeGlyph.accessibilityDescription)."
-            : "tcr fleet capacity"
+            ? "\(phrase). \(KeepAwakeGlyph.accessibilityDescription)."
+            : phrase
         guard let asking = PeerAdmission.knockBarSentence(count: knocks) else { return capacity }
         return "\(asking) \(capacity)"
+    }
+
+    /// `tcr fleet capacity`, followed in a fleet holding Codex accounts by each
+    /// pool's count, over the pools that have an enabled account.
+    private static func capacityPhrase(_ fleet: Fleet?) -> String {
+        let phrase = "tcr fleet capacity"
+        guard let pools = fleet?.providerPools() else { return phrase }
+        let counts = pools.filter { $0.enabledCount > 0 }.map {
+            "\($0.name) \($0.readyCount) of \($0.enabledCount) ready"
+        }
+        guard !counts.isEmpty else { return phrase }
+        return "\(phrase): " + counts.joined(separator: ", ")
     }
 
     /// Which colour the cup wears. Kept as data here, decided by the caller
@@ -131,7 +152,12 @@ public enum MenuBarMark {
     ///   in the status item's title (`MenuBarShell.updateMark`), not part of
     ///   this cup: it has to be drawn whether or not the counts label is on,
     ///   and the cup is a reading of the fleet and nothing else.
-    public static func image(fraction: Double?, tint: Tint, knocks: Int = 0) -> NSImage? {
+    /// - Parameter fleet: the fleet the cup reads, for the spoken description
+    ///   alone (``accessibilityDescription(awake:knocks:fleet:)``). It changes
+    ///   no pixel: the fill and the tint are `fraction` and `tint`.
+    public static func image(
+        fraction: Double?, tint: Tint, knocks: Int = 0, fleet: Fleet? = nil
+    ) -> NSImage? {
         guard
             let outline = NSImage(
                 systemSymbolName: symbolName,
@@ -161,7 +187,8 @@ public enum MenuBarMark {
         composed.isTemplate = tint == .template
         let awake: Bool
         if case .awake = tint { awake = true } else { awake = false }
-        composed.accessibilityDescription = accessibilityDescription(awake: awake, knocks: knocks)
+        composed.accessibilityDescription = accessibilityDescription(
+            awake: awake, knocks: knocks, fleet: fleet)
         return composed
     }
 

@@ -333,7 +333,7 @@ private enum LineColor {
         switch FleetTally.Kind(account: account) {
         case .ok: return Tok.ok
         case .near: return Tok.near
-        case .spent, .needsRelogin, .rejected: return Tok.spent
+        case .spent, .needsRelogin, .rejected, .unreachable: return Tok.spent
         case .unmeasured: return Tok.unmeasured
         case .unknown, .disabled: return Tok.mute
         }

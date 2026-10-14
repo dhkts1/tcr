@@ -78,6 +78,48 @@ enum RenderMark {
         ]
     }
 
+    /// The cup and the count over a fleet holding Codex accounts, rendered
+    /// after ``scenes``, each with the counts on and keep-awake off so the
+    /// fill, the tint and the two-part count are all a scene shows.
+    /// `cupPool` is "Cup shows": the cup follows the emptier pool unless it is
+    /// pinned, and the count shows both pools, Claude first, whatever the pin.
+    private static var poolScenes:
+        [
+            (
+                scene: (
+                    name: String, state: PollState, awake: Bool, showCounts: Bool,
+                    showRunningTools: Bool, appearance: NSAppearance.Name?, knocks: Int
+                ),
+                cupPool: MenuBarCupPool
+            )
+        ]
+    {
+        [
+            // Claude 3 of 4, Codex 2 of 2: the cup follows Claude, three
+            // quarters full.
+            (("14-dark-mixed-counts", .loaded(poolsReadyFleet), false, true, false, nil, 0), .emptier),
+            // Codex has nothing ready and nothing near: an empty cup, not amber.
+            (("15-dark-mixed-codex-out", .loaded(codexOutFleet), false, true, false, nil, 0), .emptier),
+            // Codex has nothing ready and one near: the cup is amber, and so is
+            // Codex's half of the count alone.
+            (("16-dark-mixed-codex-near", .loaded(codexNearFleet), false, true, false, nil, 0), .emptier),
+            // One provider: one count, and the cup half full.
+            (("17-dark-codex-only", .loaded(codexOnlyFleet), false, true, false, nil, 0), .emptier),
+            // Scene 15's fleet with the cup pinned to Claude.
+            (
+                ("18-dark-mixed-pinned-claude", .loaded(codexOutFleet), false, true, false, nil, 0),
+                .claude
+            ),
+            // Scene 15's fleet at its fullest: a Mac asking, both counts, and
+            // three running tools.
+            (
+                ("19-dark-mixed-running-knock", .loaded(codexOutRunningFleet), false, true, true, nil, 1),
+                .emptier
+            ),
+            (("20-light-mixed-counts", .loaded(poolsReadyFleet), false, true, false, .aqua, 0), .emptier),
+        ]
+    }
+
     @MainActor
     static func run(into directory: URL) -> Never {
         do {
@@ -89,12 +131,16 @@ enum RenderMark {
             exit(1)
         }
 
+        let total = scenes.count + poolScenes.count
         var written = 0
         for scene in scenes {
             if render(scene, into: directory) { written += 1 }
         }
-        print("\nrendered \(written)/\(scenes.count) images into \(directory.path)")
-        exit(written == scenes.count ? 0 : 1)
+        for (scene, cupPool) in poolScenes {
+            if render(scene, cupPool: cupPool, into: directory) { written += 1 }
+        }
+        print("\nrendered \(written)/\(total) images into \(directory.path)")
+        exit(written == total ? 0 : 1)
     }
 
     /// The width `NSFont.menuBarFont(ofSize: 0)`'s tallest glyph plus the label
@@ -109,12 +155,14 @@ enum RenderMark {
             name: String, state: PollState, awake: Bool, showCounts: Bool,
             showRunningTools: Bool, appearance: NSAppearance.Name?, knocks: Int
         ),
+        cupPool: MenuBarCupPool = .emptier,
         into directory: URL
     ) -> Bool {
-        let tint = MenuBarShell.cupTint(for: scene.state, awake: scene.awake)
+        let tint = MenuBarShell.cupTint(for: scene.state, awake: scene.awake, cupPool: cupPool)
         guard
             let mark = MenuBarMark.image(
-                fraction: scene.state.capacityFraction, tint: tint, knocks: scene.knocks)
+                fraction: scene.state.capacityFraction(cupPool: cupPool), tint: tint,
+                knocks: scene.knocks, fleet: scene.state.loadedFleet)
         else {
             FileHandle.standardError.write(Data("no such SF Symbol: \(MenuBarMark.symbolName)\n".utf8))
             return false
@@ -439,6 +487,137 @@ enum RenderMark {
                         ToolCall(tool: "Read", commandHead: nil, startedMs: msAgo(3))
                     ])),
         ]
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable, sessions: sessions,
+            sessionsSupported: true)
+    }
+
+    // MARK: - Fleets holding Codex accounts
+
+    /// One Claude row in the shape the fixtures above use: ready below its
+    /// limit, or spent with its 5-hour window held.
+    private static func claudeRowJSON(_ name: String, spent: Bool = false) -> String {
+        let quota = spent ? "1.0" : "0.2"
+        return """
+            {
+              "source": "live", "serverSha": "abc1234", "serverDirty": false,
+              "name": "\(name)", "priority": 1, "status": "active",
+              "disabled": false, "quota": \(quota), "quotaState": "\(spent ? "spent" : "ok")",
+              "fiveHour": \(quota), "sevenDay": 0.3, "sevenDayOi": 0.0,
+              "held": \(spent ? #"[{"window": "5h", "minutesUntilReset": 90, "resetAtMs": 999000000000}]"# : "[]"),
+              "requests": 3, "inputTokens": 30, "outputTokens": 3,
+              "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+              "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+            }
+            """
+    }
+
+    /// One Codex row reporting its weekly window only: `ok` below its limit,
+    /// `near` close to it, `spent` with the week held (gate `seven-day`), or
+    /// `signedOut`, whose login the server reports as failed.
+    private enum CodexRowState { case ok, near, spent, signedOut }
+
+    private static func codexRowJSON(_ name: String, _ state: CodexRowState) -> String {
+        let week: String
+        let quotaState: String
+        var status = "active"
+        var gate = "ok"
+        var held = "[]"
+        switch state {
+        case .ok:
+            week = "0.3"
+            quotaState = "ok"
+        case .near:
+            week = "0.9"
+            quotaState = "near"
+        case .spent:
+            week = "1.0"
+            quotaState = "spent"
+            gate = "seven-day"
+            held = #"[{"window": "7d", "minutesUntilReset": 4560, "resetAtMs": 999000000000}]"#
+        case .signedOut:
+            week = "0.4"
+            quotaState = "ok"
+            status = "error"
+        }
+        return """
+            {
+              "source": "live", "serverSha": "abc1234", "serverDirty": false,
+              "provider": "codex", "quotaWindows": ["sevenDay"],
+              "name": "\(name)", "priority": 1, "status": "\(status)", "gate": "\(gate)",
+              "disabled": false, "quota": \(week), "quotaState": "\(quotaState)",
+              "fiveHour": null, "sevenDay": \(week), "sevenDayOi": null,
+              "held": \(held), "requests": 3, "inputTokens": 30, "outputTokens": 3,
+              "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+              "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+            }
+            """
+    }
+
+    private static func fleet(_ rows: [String]) -> Fleet {
+        (try? Fleet.decode(Data("[\(rows.joined(separator: ","))]".utf8))) ?? Fleet(accounts: [])
+    }
+
+    /// Claude's pool of 3 of 4: three ready, one spent.
+    private static var claudeThreeOfFourRows: [String] {
+        [
+            claudeRowJSON("rosa@example.com"), claudeRowJSON("sam@example.com"),
+            claudeRowJSON("tara@example.com"), claudeRowJSON("uma@example.com", spent: true),
+        ]
+    }
+
+    /// Claude 3 of 4, Codex 2 of 2: `3/4 · 2/2`.
+    private static var poolsReadyFleet: Fleet {
+        fleet(
+            claudeThreeOfFourRows + [
+                codexRowJSON("vic@example.com", .ok), codexRowJSON("wren@example.com", .ok),
+            ])
+    }
+
+    /// Claude 3 of 4, Codex 0 of 2, both spent on the week: `3/4 · 0/2`.
+    private static var codexOutFleet: Fleet {
+        fleet(
+            claudeThreeOfFourRows + [
+                codexRowJSON("vic@example.com", .spent), codexRowJSON("wren@example.com", .spent),
+            ])
+    }
+
+    /// Claude 3 of 4, Codex 0 of 2 with one near its limit: `3/4 · 0/2`, the
+    /// second half amber.
+    private static var codexNearFleet: Fleet {
+        fleet(
+            claudeThreeOfFourRows + [
+                codexRowJSON("vic@example.com", .near), codexRowJSON("wren@example.com", .spent),
+            ])
+    }
+
+    /// Codex alone: two ready, one spent, one signed out, `2/4`.
+    private static var codexOnlyFleet: Fleet {
+        fleet([
+            codexRowJSON("vic@example.com", .ok), codexRowJSON("wren@example.com", .ok),
+            codexRowJSON("xena@example.com", .spent), codexRowJSON("yuri@example.com", .signedOut),
+        ])
+    }
+
+    /// ``codexOutFleet`` with three live sessions each running one call, built
+    /// the way ``runningToolsFleet`` is: `sessionsSupported` is set by hand.
+    private static var codexOutRunningFleet: Fleet {
+        let base = codexOutFleet
+        func msAgo(_ seconds: TimeInterval) -> Int64 {
+            Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
+        }
+        let sessions = [
+            ("dddddddd-0004", "rosa@example.com", "cargo test"),
+            ("eeeeeeee-0005", "sam@example.com", "swift build"),
+            ("ffffffff-0006", "sam@example.com", "make check"),
+        ].map { id, account, command in
+            Session(
+                sessionId: id, account: account, firstSeenMs: msAgo(1800), lastSeenMs: msAgo(10),
+                tools: SessionTools(
+                    calls: 3, running: [
+                        ToolCall(tool: "Bash", commandHead: command, startedMs: msAgo(5))
+                    ]))
+        }
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: sessions,
             sessionsSupported: true)

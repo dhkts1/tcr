@@ -321,7 +321,8 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
             counts[FleetTally.Kind(account: row.account), default: 0] += 1
         }
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .needsRelogin, .rejected, .unmeasured, .disabled,
+            .ok, .near, .spent, .unknown, .needsRelogin, .rejected, .unreachable, .unmeasured,
+            .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }
@@ -417,14 +418,15 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// ``breakdown`` right there. A row an operator has to act on now is a
     /// different matter: a dead credential or an account out of tokens needs
     /// the card, its reset countdown and its menu, so one of those keeps the
-    /// whole group open. Four is the mockup's own smallest collapsed group
-    /// (six) rounded down to where a group stops being readable at a glance;
-    /// below it the cards cost less height than the summary saves.
+    /// whole group open. An unreachable Codex account is one too: its remedy
+    /// is to take it out of this very group. Four is the mockup's own smallest
+    /// collapsed group (six) rounded down to where a group stops being readable
+    /// at a glance; below it the cards cost less height than the summary saves.
     public var collapsesByDefault: Bool {
         guard case .named = group, band == .live, rows.count >= 4 else { return false }
         return !rows.contains { row in
             switch FleetTally.Kind(account: row.account) {
-            case .spent, .needsRelogin, .rejected: return true
+            case .spent, .needsRelogin, .rejected, .unreachable: return true
             case .ok, .near, .unknown, .unmeasured, .disabled: return false
             }
         }

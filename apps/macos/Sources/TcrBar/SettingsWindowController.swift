@@ -112,6 +112,7 @@ struct SettingsDependencies {
     var preference: LaunchPreference
     var countsPreference: MenuBarCountsPreference
     var runningToolsPreference: ShowRunningToolsPreference
+    var cupPoolPreference: MenuBarCupPoolPreference
     var defaultTabPreference: DefaultTabPreference
     var panelDensityPreference: PanelDensityPreference
     var groupController: GroupController

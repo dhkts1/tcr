@@ -2355,13 +2355,15 @@ struct FleetView: View {
     }
 
     /// The Accounts tab's no-requests banner text, or `nil` when it must not
-    /// show. See ``NoRequestsBanner``.
+    /// show. See ``NoRequestsBanner``. Beside a Codex account the proxy does
+    /// serve requests, so the sentence names Claude.
     private func noRequestsBannerText(_ fleet: Fleet) -> String? {
         guard let since = zeroRequestsSince, let route = claudeRoute else { return nil }
         return NoRequestsBanner.text(
             liveFor: Date().timeIntervalSince(since),
             claudeCount: claudeCount,
-            route: route)
+            route: route,
+            namesClaude: fleet.holdsCodex)
     }
 
     /// One of today's slowest calls — the same item, with a pill where the
@@ -2829,7 +2831,7 @@ struct FleetView: View {
         switch kind {
         case .ok: return Tok.color(for: QuotaState.ok)
         case .near: return Tok.color(for: QuotaState.near)
-        case .spent, .needsRelogin, .rejected: return Tok.spent
+        case .spent, .needsRelogin, .rejected, .unreachable: return Tok.spent
         case .unknown: return Tok.unknown
         case .unmeasured: return Tok.unmeasured
         case .disabled: return Tok.disabled

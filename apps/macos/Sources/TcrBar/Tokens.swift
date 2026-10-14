@@ -636,6 +636,9 @@ public enum Tok {
         // `.rejected` reuses `spent` for the same reason `.needsRelogin` does,
         // one line up: Anthropic's verdict is known-cannot-serve.
         case .rejected: return spent
+        // An unreachable Codex account serves nothing either, for the same
+        // known-cannot-serve reason, so it reuses `spent` too.
+        case .unreachable: return spent
         case .unmeasured: return unmeasured
         case .disabled: return disabled
         }

@@ -48,7 +48,9 @@ import TcrBarCore
 ///     TcrBar.app/Contents/MacOS/TcrBar --render-settings <output-directory>
 ///
 /// Writes one PNG per pane per appearance and exits without ever showing a
-/// menu-bar item, polling `tcr`, or touching a server.
+/// menu-bar item, polling `tcr`, or touching a server. The panes a fleet
+/// holding both Claude and Codex accounts draws differently (``mixedTabs``)
+/// are rendered once more over such a fleet, as `<tab>-mixed-<appearance>.png`.
 enum RenderSettings {
     static let flag = "--render-settings"
 
@@ -109,10 +111,13 @@ enum RenderSettings {
 
         var written = 0
         var attempted = 0
+        let fleet = Fleet(accounts: fixtureAccounts())
         for tab in SettingsTab.allCases {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(tab, appearance: appearance, into: directory) { written += 1 }
+                if render(tab, appearance: appearance, fleet: fleet, into: directory) {
+                    written += 1
+                }
             }
         }
         // The two sheet scenes, after the panes: same window, same appearance
@@ -120,7 +125,21 @@ enum RenderSettings {
         for scene in SheetScene.allCases {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(.peers, appearance: appearance, sheet: scene, into: directory) {
+                if render(.peers, appearance: appearance, sheet: scene, fleet: fleet, into: directory)
+                {
+                    written += 1
+                }
+            }
+        }
+        // The mixed pass, last, so every capture above keeps its name and its
+        // place in the run.
+        let mixed = mixedFleet()
+        for tab in mixedTabs {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if render(
+                    tab, appearance: appearance, fleet: mixed, nameSuffix: "-mixed", into: directory)
+                {
                     written += 1
                 }
             }
@@ -142,6 +161,21 @@ enum RenderSettings {
                 "carol@example.com", groups: ["henry-team"], parkedGroups: ["henry-team"],
                 groupColors: ["henry-team": "#32d74b"]),
         ]
+    }
+
+    /// The panes that draw something of their own over a fleet holding both
+    /// Claude and Codex accounts: Menu Bar's "Cup shows" row and its counts
+    /// caption.
+    static let mixedTabs: [SettingsTab] = [.menuBar]
+
+    /// ``fixtureAccounts()`` plus canonical bob, a ready Codex account: a fleet
+    /// holding both providers.
+    private static func mixedFleet() -> Fleet {
+        let row = RenderStates.codexRow(.bob, now: Date())
+        guard let bob = try? Fleet.decode(Data("[\(row)]".utf8)).accounts.first else {
+            preconditionFailure("canonical bob does not decode")
+        }
+        return Fleet(accounts: fixtureAccounts() + [bob])
     }
 
     /// 660×581, the reviewed window as a FRAME
@@ -253,10 +287,12 @@ enum RenderSettings {
         return found.max { $0.bounds.width < $1.bounds.width }
     }
 
+    /// `fleet` is what the pinned poller reads, and `nameSuffix` follows the
+    /// pane's name in the file's: `-mixed` for the mixed pass, empty otherwise.
     @MainActor
     private static func render(
-        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil,
-        into directory: URL
+        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil, fleet: Fleet,
+        nameSuffix: String = "", into directory: URL
     ) -> Bool {
         // Two appearances, two mechanisms: `NSApp.appearance` is what the window
         // and its title bar adopt, and the DRAWING appearance is what every
@@ -273,11 +309,12 @@ enum RenderSettings {
 
         return withDrawingAppearance(appearance.nsAppearance) {
             renderUnderCurrentAppearance(
-                tab, appearance: appearance, sheet: sheet, into: directory)
+                tab, appearance: appearance, sheet: sheet, fleet: fleet, nameSuffix: nameSuffix,
+                into: directory)
         }
     }
 
-    /// The body of ``render(_:appearance:into:)``, run with the drawing
+    /// The body of ``render(_:appearance:sheet:fleet:nameSuffix:into:)``, run with the drawing
     /// appearance already installed.
     ///
     /// A separate function only because the macOS 12 replacement for assigning
@@ -286,9 +323,9 @@ enum RenderSettings {
     /// to change nothing.
     @MainActor
     private static func renderUnderCurrentAppearance(
-        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, into directory: URL
+        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, fleet: Fleet,
+        nameSuffix: String, into directory: URL
     ) -> Bool {
-        let fleet = Fleet(accounts: fixtureAccounts())
         let dependencies = SettingsDependencies(
             poller: StatusPoller(pinnedState: .loaded(fleet), lastPollAt: Date()),
             server: ServerController(),
@@ -297,6 +334,10 @@ enum RenderSettings {
             preference: LaunchPreference(),
             countsPreference: MenuBarCountsPreference(),
             runningToolsPreference: ShowRunningToolsPreference(),
+            // A scratch suite, so a render never reads the operator's own
+            // choice of pool.
+            cupPoolPreference: MenuBarCupPoolPreference(
+                defaults: UserDefaults(suiteName: "tcrbar.render-settings")!),
             defaultTabPreference: DefaultTabPreference(),
             panelDensityPreference: PanelDensityPreference(),
             groupController: GroupController(),
@@ -406,7 +447,7 @@ enum RenderSettings {
         }
 
         // A sheet scene is named for the SHEET, not for the pane behind it.
-        let name = "\(sheet?.rawValue ?? tab.rawValue)-\(appearance.rawValue).png"
+        let name = "\(sheet?.rawValue ?? tab.rawValue)\(nameSuffix)-\(appearance.rawValue).png"
         // `NSView.cacheDisplay`/`ImageRenderer` both draw OFFSCREEN, bypassing
         // the window server entirely — measured across every attempt in this
         // file's own doc-comment, neither one reliably reproduces what
