@@ -68,11 +68,13 @@ public struct SessionProjectSection: Identifiable, Equatable, Sendable {
 
     /// What this section spent, summed the same partial-sum way
     /// ``FleetSection/todaySpend`` sums an account section's cost: `nil` only
-    /// when not one row could be priced, never a fabricated zero.
+    /// when not one row could be priced, never a fabricated zero. Read through
+    /// ``Session/pricedCostUsd``, so a Codex session nothing could be priced
+    /// for adds no dollars rather than the wire's `0.0`.
     public var spend: Double? {
         var total: Double?
         for row in rows {
-            total = UsageTotals.addCost(total, row.session.costUsd)
+            total = UsageTotals.addCost(total, row.session.pricedCostUsd)
         }
         return total
     }

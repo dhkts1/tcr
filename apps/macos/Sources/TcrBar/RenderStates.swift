@@ -317,6 +317,24 @@ enum RenderStates {
             // ivy added to ORCHARD: tcr's warning that no Codex request can ask for a
             // group, kept under her line.
             ("25f-codex-group-add-warning", .loaded(fleet(codexGroupAddWarningJSON)), false, nil),
+            // The Sessions tab of a fleet holding both providers: alice's Claude
+            // session and bob's Codex one, both in teamclaude-rs, bob's joined by
+            // the first line of his rollout file. It shows the Codex footer, the
+            // `Codex` lead on bob's subtitle and the summary's two clause groups.
+            // See ``sessionsTabMixedFleet``.
+            ("16b-sessions-tab-mixed", .loaded(sessionsTabMixedFleet), false, nil),
+            // A Codex-only fleet with no session and no Codex request in the last
+            // hour: the Codex-only empty line and footer.
+            ("16c-sessions-tab-codex-only-empty", .loaded(codexOnlyQuietSessionsFleet), false, nil),
+            // A proxy too old to record Codex sessions: bob served seven requests
+            // in the last hour and the list holds alice's session alone, so the
+            // tab says why bob's is missing above it.
+            ("16d-sessions-tab-old-server-codex", .loaded(oldServerCodexSessionsFleet), false, nil),
+            // The Tools tab with a running Codex call: bob's one-shot
+            // `exec_command` filling its own 120s ring, red with 20s left, beside
+            // alice's calm Bash ring and its ✕, `no Kill` in bob's slot, and the
+            // Codex categories in BY TOOL. See ``toolsTabCodexFleet``.
+            ("17c-tools-tab-codex", .loaded(toolsTabCodexFleet), false, nil),
         ]
     }
 
@@ -551,10 +569,11 @@ enum RenderStates {
         switch sceneName {
         case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
             "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed",
-            "22b-sessions-tab-real-fleet":
+            "22b-sessions-tab-real-fleet", "16b-sessions-tab-mixed",
+            "16c-sessions-tab-codex-only-empty", "16d-sessions-tab-old-server-codex":
             return .sessions
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
-            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet":
+            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex":
             return .tools
         default: return .accounts
         }
@@ -675,6 +694,23 @@ enum RenderStates {
                     sessionId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
                     cwd: "/Users/bob/git/demo-ui", name: "demo-ui-b2", status: "busy"),
             ]
+        }
+        // The canonical sessions' files: alice's Claude Code session file, and
+        // the file the join makes for bob from line 1 of his codex rollout,
+        // which carries his folder and nothing else. The old-server scene has
+        // no Codex session to join.
+        let alice = SessionFile(
+            sessionId: "a1f3c2d4-0000-4000-8000-000000000001",
+            cwd: "/Users/example/git/teamclaude-rs", name: "teamclaude-rs-c7", status: "busy")
+        let bob = SessionFile(
+            sessionId: "019a3c5e-0000-7000-8000-000000000002",
+            cwd: "/Users/example/git/teamclaude-rs")
+        switch sceneName {
+        case "16b-sessions-tab-mixed", "17c-tools-tab-codex":
+            return [alice.sessionId: alice, bob.sessionId: bob]
+        case "16d-sessions-tab-old-server-codex":
+            return [alice.sessionId: alice]
+        default: break
         }
         guard
             sceneName == "16-sessions-tab" || sceneName == "17-tools-tab"
@@ -2852,7 +2888,8 @@ enum RenderStates {
         -> [String: RunningCallStats]
     {
         guard
-            sceneName == "17-tools-tab" || sceneName == "17b-tools-tab-timeout-class-open",
+            sceneName == "17-tools-tab" || sceneName == "17b-tools-tab-timeout-class-open"
+                || sceneName == "17c-tools-tab-codex",
             case .loaded(let fleet) = state,
             let entry = fleet.toolsRunning.first(where: { $0.call.tool == "Bash" })
         else { return [:] }
@@ -4477,6 +4514,160 @@ extension RenderStates {
                 "lee@example.com/codex", quota: "null", state: "ok", probe: "never",
                 usage: "null", plan: "ChatGPT Plus", provider: "codex")
             + "]"
+    }
+
+    // MARK: The Sessions and Tools scenes
+
+    /// Scene `16b-sessions-tab-mixed`: canonical alice and bob, with both canonical sessions.
+    private static var sessionsTabMixedFleet: Fleet {
+        let now = Date()
+        return fleet("[\(codexRow(.alice, now: now)),\(codexRow(.bob, now: now))]")
+            .withSessions(canonicalSessionsRead(now: now))
+    }
+
+    /// Scene `16c-sessions-tab-codex-only-empty`: canonical bob and dana with an hour that
+    /// served nothing, and no session, on a live channel. The canonical rows served 7 and 9
+    /// requests in the last hour, which would rightly draw the old-server line instead.
+    private static var codexOnlyQuietSessionsFleet: Fleet {
+        let now = Date()
+        let rows = [CanonicalCodexRow.bob, .dana].map { row in
+            codexRow(row, now: now, extra: ["usage": usageWithQuietHour(row, now: now)])
+        }
+        return fleet("[\(rows.joined(separator: ","))]")
+            .withSessions(Fleet.SessionsRead(sessions: [], channel: .live))
+    }
+
+    /// Scene `16d-sessions-tab-old-server-codex`: canonical alice and bob, bob's last hour
+    /// at 7 requests, and alice's session alone, as a proxy built before Codex sessions lists
+    /// them: no session carries a provider.
+    private static var oldServerCodexSessionsFleet: Fleet {
+        let now = Date()
+        return fleet("[\(codexRow(.alice, now: now)),\(codexRow(.bob, now: now))]")
+            .withSessions(canonicalSessionsRead(now: now, includingBob: false))
+    }
+
+    /// Scene `17c-tools-tab-codex`: canonical alice and bob with both sessions, bob's whole
+    /// timeline 55 s earlier so his call, started 100 s ago, still starts after his last
+    /// request. That call is codex's one-shot `exec_command`, the one schema that carries a
+    /// timeout (`timeout_ms` 120000, so 120 s), which the canonical call, codex's default
+    /// interactive `exec_command`, does not: 100 s into its 120 its ring is red with 20 s left,
+    /// where the Bash tool's 600 s would call it calm.
+    private static var toolsTabCodexFleet: Fleet {
+        let now = Date()
+        return fleet("[\(codexRow(.alice, now: now)),\(codexRow(.bob, now: now))]")
+            .withSessions(
+                canonicalSessionsRead(now: now, bobEarlierBy: 55, bobTimeoutSeconds: 120))
+    }
+
+    /// The canonical row's `usage` with a last hour that served nothing, shaped as the wire
+    /// writes an idle hour, and every instant already moved to `now`.
+    private static func usageWithQuietHour(_ row: CanonicalCodexRow, now: Date) -> [String: Any] {
+        guard
+            let object = try? JSONSerialization.jsonObject(
+                with: Data(codexRow(row, now: now).utf8)) as? [String: Any],
+            var usage = object["usage"] as? [String: Any]
+        else { preconditionFailure("canonical \(row.rawValue) carries no usage") }
+        usage["lastHour"] = [
+            "cacheCreation1hTokens": 0, "cacheCreationTokens": 0, "cacheReadTokens": 0,
+            "costUsd": 0.0, "inputTokens": 0, "outputTokens": 0, "requests": 0,
+            "unpricedRequests": 0,
+        ]
+        return usage
+    }
+
+    /// `apps/macos/Tests/Fixtures/codex-sessions.json`'s two sessions, every instant written
+    /// as far before `now` as it sits before the fixture's clock, decoded through
+    /// `Fleet.decodeSessions`: alice first seen 40 min ago and last seen 3 s ago, her Bash
+    /// `cargo test` started 20 s ago; bob first seen 175 s ago and last seen 50 s ago, his
+    /// `cargo build` started 45 s ago.
+    ///
+    /// `bobEarlierBy` moves every one of bob's instants that many seconds earlier, and
+    /// `bobTimeoutSeconds` lays a timeout on his running call. `includingBob: false` leaves his
+    /// session out.
+    private static func canonicalSessionsRead(
+        now: Date, includingBob: Bool = true, bobEarlierBy: TimeInterval = 0,
+        bobTimeoutSeconds: Int? = nil
+    ) -> Fleet.SessionsRead {
+        func ago(_ seconds: TimeInterval) -> Int64 {
+            Int64(((now.timeIntervalSince1970 - seconds) * 1000).rounded())
+        }
+        func bobAgo(_ seconds: TimeInterval) -> Int64 { ago(seconds + bobEarlierBy) }
+        let alice = """
+            {"account": "alice@example.com", "cacheCreationTokens": 12000,
+             "cacheReadTokens": 160000, "cacheTtlSecs": 3600, "costUsd": 1.2034,
+             "firstSeenMs": \(ago(2400)), "inputTokens": 180000, "lastSeenMs": \(ago(3)),
+             "model": "claude-opus-5", "outputTokens": 9200,
+             "reqPerMinute": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              1, 2, 3, 2, 4, 3, 5, 0],
+             "requests": 24, "sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+             "tools": {
+               "byTool": [
+                 {"calls": 8, "errors": 0, "overOneMinute": 0, "secondsP50": 2.5, "tool": "Bash"},
+                 {"calls": 4, "errors": 0, "overOneMinute": 0, "secondsP50": 0.1, "tool": "Read"}],
+               "calls": 12, "errors": 0, "overOneMinute": 0,
+               "running": [
+                 {"commandClass": "build", "commandHead": "cargo test",
+                  "startedMs": \(ago(20)), "tool": "Bash"}],
+               "slowest": [
+                 {"commandClass": "build", "commandHead": "cargo build --release",
+                  "endedMs": \(ago(295)), "seconds": 12.0, "tool": "Bash"},
+                 {"commandClass": "build", "commandHead": "cargo build",
+                  "endedMs": \(ago(230)), "seconds": 6.0, "tool": "Bash"},
+                 {"commandClass": "search", "commandHead": "rg -n TODO",
+                  "endedMs": \(ago(175)), "seconds": 3.0, "tool": "Bash"},
+                 {"commandClass": "build", "commandHead": "cargo test -p example",
+                  "endedMs": \(ago(250)), "seconds": 2.5, "tool": "Bash"},
+                 {"commandClass": "git-local", "commandHead": "git status",
+                  "endedMs": \(ago(160)), "seconds": 2.5, "tool": "Bash"},
+                 {"commandClass": "git-local", "commandHead": "git status",
+                  "endedMs": \(ago(320)), "seconds": 2.0, "tool": "Bash"},
+                 {"commandClass": "build", "commandHead": "cargo test",
+                  "endedMs": \(ago(110)), "seconds": 2.0, "tool": "Bash"},
+                 {"commandClass": "git-local", "commandHead": "git status",
+                  "endedMs": \(ago(125)), "seconds": 1.5, "tool": "Bash"},
+                 {"commandClass": null,
+                  "commandHead": "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+                  "endedMs": \(ago(280)), "seconds": 0.4, "tool": "Read"},
+                 {"commandClass": null,
+                  "commandHead": "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+                  "endedMs": \(ago(350)), "seconds": 0.1, "tool": "Read"}],
+               "subagentsRunning": 0, "timedOut": [], "timeouts": 0, "timeoutsByClass": {}}}
+            """
+        let timeout = bobTimeoutSeconds.map { #", "timeoutSeconds": \#($0)"# } ?? ""
+        let bob = """
+            {"account": "bob@example.com/codex", "cacheCreationTokens": 0,
+             "cacheReadTokens": 80000, "costUsd": 0.0, "firstSeenMs": \(bobAgo(175)),
+             "inputTokens": 95000, "lastSeenMs": \(bobAgo(50)), "model": "gpt-5.1-codex",
+             "outputTokens": 4100, "provider": "codex", "reasoningTokens": 1200,
+             "reqPerMinute": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              0, 0, 0, 0, 2, 3, 2, 0],
+             "requests": 7, "sessionId": "019a3c5e-0000-7000-8000-000000000002",
+             "tools": {
+               "byTool": [
+                 {"calls": 2, "errors": 0, "overOneMinute": 0, "secondsP50": 4.0,
+                  "tool": "exec_command"},
+                 {"calls": 1, "errors": 0, "overOneMinute": 0, "secondsP50": 0.2,
+                  "tool": "apply_patch"}],
+               "calls": 3, "errors": 0, "overOneMinute": 0,
+               "running": [
+                 {"commandClass": "build", "commandHead": "cargo build",
+                  "startedMs": \(bobAgo(45)), "tool": "exec_command"\(timeout)}],
+               "slowest": [
+                 {"commandClass": "build", "commandHead": "cargo test",
+                  "endedMs": \(bobAgo(115)), "seconds": 4.0, "tool": "exec_command"},
+                 {"commandClass": "build", "commandHead": "cargo check",
+                  "endedMs": \(bobAgo(55.5)), "seconds": 4.0, "tool": "exec_command"},
+                 {"commandClass": null, "commandHead": "apply_patch",
+                  "endedMs": \(bobAgo(94.8)), "seconds": 0.2, "tool": "apply_patch"}],
+               "subagentsRunning": 0, "timedOut": [], "timeouts": 0, "timeoutsByClass": {}},
+             "unpricedRequests": 7}
+            """
+        let sessions = includingBob ? [alice, bob] : [alice]
+        let document = #"{"supported": true, "sessions": [\#(sessions.joined(separator: ","))]}"#
+        guard let read = try? Fleet.decodeSessions(Data(document.utf8)),
+            read.unreadable.isEmpty, read.sessions.count == sessions.count
+        else { preconditionFailure("the canonical sessions no longer decode") }
+        return read
     }
 
     /// `apps/macos/Tests/Fixtures/codex-status.json`, verbatim, indented to sit here.

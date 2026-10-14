@@ -1207,21 +1207,44 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     /// one-shot `exec_command`, which managed requirements select. By default
     /// it has none: codex's default `exec_command` is the interactive one, and
     /// it takes no timeout. `nil` for every Claude call and from an older
-    /// server. A Codex call without one draws no ring; a Claude `Bash` call's
-    /// ring is the Bash tool's own cap (``capped``), never this.
+    /// server. A Codex call without one draws no ring; a Claude `Bash` call,
+    /// which never carries one, fills toward the Bash tool's own cap
+    /// (``timeoutCap(bashTimeout:)``).
     public let timeoutSeconds: Int?
 
-    /// Does this call have a KNOWN cap it can run out of? Only a `Bash` call
-    /// does (`bashTimeoutSeconds`, 600s) — an `Agent` or a `Read` has no
-    /// deadline this build knows about, so it can never be "near" one.
+    /// Claude Code's Bash tool timeout, 600 s: the cap a Claude `Bash` call
+    /// runs out of, since the wire names no timeout for any Claude call. The
+    /// ring, the near-timeout count and the running list's sort all read this
+    /// one figure, so none of them can measure a Bash call against a different
+    /// one.
+    public static let bashTimeoutSeconds: Double = 600
+
+    /// The cap this call runs out of, in seconds, or `nil` when it has none
+    /// this build knows: the call's own ``timeoutSeconds`` when the wire
+    /// carries one above zero (a codex one-shot `exec_command`; a zero is sent
+    /// as no timeout, and is read as none), else `bashTimeout` for a Claude
+    /// `Bash` call, else nothing. An `Agent`, a `Read`, or a Codex call under
+    /// codex's default interactive shell has no deadline, so it draws no ring
+    /// and can never be "near" one.
+    public func timeoutCap(bashTimeout: Double) -> Double? {
+        if let own = timeoutSeconds, own > 0 { return Double(own) }
+        return tool == "Bash" ? bashTimeout : nil
+    }
+
+    /// Does this call have a KNOWN cap it can run out of? A call that carries
+    /// its own timeout does: on the wire that is only a codex call, and it
+    /// runs out of that. A Claude `Bash` call does too, against Claude Code's
+    /// 600 s Bash cap (``bashTimeoutSeconds``). Anything else, an `Agent`, a
+    /// `Read`, or a Codex call with no timeout, has no deadline this build
+    /// knows about, so it can never be "near" one.
     ///
-    /// The ONE expression both the running list's sort (``Fleet/toolsRunning``)
-    /// and the row that draws its ring (`FleetView.runningToolItem`) read,
-    /// so the two cannot re-derive the string compare and disagree. Before
-    /// this was hoisted here, `FleetView.swift:1729` was the only place that
-    /// spelled `tool == "Bash"`, and the running list's own sort was a second
-    /// place that would have needed the identical string.
-    public var capped: Bool { tool == "Bash" }
+    /// The running list's sort (``Fleet/toolsRunning``) and the row that draws
+    /// its ring (`FleetView.runningToolItem`) both decide this through
+    /// ``timeoutCap(bashTimeout:)``, so the two cannot re-derive it and
+    /// disagree. Before this was hoisted here, `FleetView.swift:1729` was the
+    /// only place that spelled `tool == "Bash"`, and the running list's own
+    /// sort was a second place that would have needed the identical string.
+    public var capped: Bool { timeoutCap(bashTimeout: 1) != nil }
 
     public init(
         tool: String,
@@ -1520,6 +1543,20 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
     /// session and from an older server, because the wire skips it at zero.
     public let reasoningTokens: Int
 
+    /// The dollars this session's priced requests cost: ``costUsd``, except `nil` for a
+    /// Codex session none of whose requests could be priced (``unpricedRequests`` at least
+    /// ``requests``).
+    ///
+    /// On the wire a Codex session's `costUsd` is `0.0` when nothing it sent was priced, and
+    /// a ChatGPT plan bills no request, so that zero is not a measurement: drawn, it would
+    /// read as a session that cost nothing. A partly priced Codex session keeps the dollars
+    /// that were priced. A Claude session's cost means exactly what it always meant, a
+    /// measured `0.0` included. Everything that prints or sums session dollars reads this.
+    public var pricedCostUsd: Double? {
+        if provider == .codex, unpricedRequests >= requests { return nil }
+        return costUsd
+    }
+
     public var id: String { sessionId }
 
     public init(
@@ -1595,14 +1632,18 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
 public struct SessionToolEntry: Identifiable, Equatable, Sendable {
     public let sessionId: String
     public let call: ToolCall
+    /// The provider of the session that made the call. A Codex call files under the Codex
+    /// tool buckets, and its row offers no Kill: tcr cannot match it to a codex process.
+    public let provider: Provider
 
     public var id: String {
         "\(sessionId)|\(call.tool)|\(call.startedMs ?? 0)|\(call.endedMs ?? 0)|\(call.commandHead ?? "")"
     }
 
-    public init(sessionId: String, call: ToolCall) {
+    public init(sessionId: String, call: ToolCall, provider: Provider = .anthropic) {
         self.sessionId = sessionId
         self.call = call
+        self.provider = provider
     }
 
     /// Is this RUNNING call, as of `now`, inside the timeout warning band?
@@ -1616,15 +1657,22 @@ public struct SessionToolEntry: Identifiable, Equatable, Sendable {
     /// reading what coloured the rows. A summary line that can disagree with the
     /// rows beneath it is worse than no summary line.
     ///
-    /// `false` for any call this build knows no cap for — ``ToolCall/capped``
-    /// is `Bash`-only, so an `Agent` or a `Read` can never be "near" a timeout
-    /// it does not have — and `false` for a call with no ``ToolCall/startedMs``,
+    /// The cap is ``ToolCall/timeoutCap(bashTimeout:)`` with `timeoutSeconds`
+    /// as the Bash figure: the call's own timeout when the wire carries one
+    /// (codex's calls), and Claude Code's 600 s Bash cap otherwise. So a codex
+    /// call with 20 s left of its own 120 is near, where the Bash rule would
+    /// call it calm.
+    ///
+    /// `false` for any call this build knows no cap for — an `Agent`, a `Read`
+    /// or a Codex call with no timeout can never be "near" a timeout it does
+    /// not have — and `false` for a call with no ``ToolCall/startedMs``,
     /// which has no elapsed time to compare against a deadline at all.
     public func isNearTimeout(now: Date, timeoutSeconds: Double, warnWithinSeconds: Double) -> Bool {
-        guard call.capped, let startedMs = call.startedMs else { return false }
+        guard let cap = call.timeoutCap(bashTimeout: timeoutSeconds), let startedMs = call.startedMs
+        else { return false }
         let elapsed = max(
             0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(startedMs) / 1000)))
-        return (timeoutSeconds - elapsed) <= warnWithinSeconds
+        return (cap - elapsed) <= warnWithinSeconds
     }
 }
 
@@ -3454,8 +3502,10 @@ public struct Fleet: Equatable, Sendable {
     /// already aged out of ``sessions``; this sums only the sessions the proxy
     /// still has open right now. `nil` only when not one live session could be
     /// priced — the same "never a fabricated zero" rule ``todayCost`` follows.
+    /// Summed over ``Session/pricedCostUsd``, so an unpriced Codex session adds
+    /// nothing.
     public var sessionsLiveCost: Double? {
-        sessions.reduce(nil) { UsageTotals.addCost($0, $1.costUsd) }
+        sessions.reduce(nil) { UsageTotals.addCost($0, $1.pricedCostUsd) }
     }
 
     /// How many distinct accounts the live sessions are attributed to, over how
@@ -3478,7 +3528,9 @@ public struct Fleet: Equatable, Sendable {
 
     /// One row per category — the mockup's `BY TOOL`
     /// list: Bash, Agent, and Read/Grep/Glob/Edit pooled as one bucket
-    /// (the panel groups them). `nil` when
+    /// (the panel groups them), then codex's shell, edit and other calls,
+    /// each bucket chosen by ``ToolCallLabel/category(forTool:provider:)``
+    /// for the provider of the session that made the call. `nil` when
     /// not one session reports `byTool`, the same "silence over a fake zero"
     /// rule as ``toolsOverOneMinute``. The per-category median is the mean of
     /// each contributing session's own p50 — an approximation stated as one
@@ -3486,19 +3538,15 @@ public struct Fleet: Equatable, Sendable {
     /// fleet-wide median (this build never sees the raw per-call durations,
     /// only each session's already-reduced p50).
     public var toolsByCategory: [ToolCategory]? {
-        let allBuckets = sessions.flatMap(\.tools.byTool)
-        guard !allBuckets.isEmpty else { return nil }
-        func category(for tool: String) -> String {
-            switch tool {
-            case "Bash": return "Bash"
-            case "Agent", "Task": return "Agent"
-            default: return "Read/Grep/Edit"
-            }
+        let allBuckets = sessions.flatMap { session in
+            session.tools.byTool.map { (provider: session.provider, row: $0) }
         }
-        let grouped = Dictionary(grouping: allBuckets) { category(for: $0.tool) }
-        let order = ["Bash", "Agent", "Read/Grep/Edit"]
-        return order.compactMap { name in
-            guard let rows = grouped[name], !rows.isEmpty else { return nil }
+        guard !allBuckets.isEmpty else { return nil }
+        let grouped = Dictionary(grouping: allBuckets) {
+            ToolCallLabel.category(forTool: $0.row.tool, provider: $0.provider)
+        }
+        return ToolCallLabel.categoryOrder.compactMap { name in
+            guard let rows = grouped[name]?.map(\.row), !rows.isEmpty else { return nil }
             let calls = rows.reduce(0) { $0 + $1.calls }
             let medians = rows.compactMap(\.secondsP50)
             let median = medians.isEmpty ? nil : medians.reduce(0, +) / Double(medians.count)
@@ -3545,7 +3593,9 @@ public struct Fleet: Equatable, Sendable {
         // A Bash call is filed under its class; anything else under its own
         // tool name, which is how a timed-out `WebFetch` reaches the card.
         let entries = sessions.flatMap { session in
-            session.tools.timedOut.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
+            session.tools.timedOut.map {
+                SessionToolEntry(sessionId: session.sessionId, call: $0, provider: session.provider)
+            }
         }
         let calls = Dictionary(grouping: entries) { $0.call.commandClass ?? $0.call.tool }
         return
@@ -3557,15 +3607,21 @@ public struct Fleet: Equatable, Sendable {
             }
     }
 
-    /// Every tool call currently running, pooled across every session.
+    /// Every tool call currently running, pooled across every session, each
+    /// nearest its own deadline first.
     /// `docs/design/tools-tab.md`'s first question is "is something stuck or
     /// about to time out" — but age alone answers a different question, since
-    /// only a ``ToolCall/capped`` call (`Bash`) HAS a timeout to be near. An
+    /// only a ``ToolCall/capped`` call HAS a timeout to be near. An
     /// `Agent` running two legitimate hours would otherwise outrank a `Bash`
     /// call thirty seconds from being killed and push it under the fold.
     ///
-    /// So: capped calls first, oldest first among themselves (oldest is
-    /// nearest its timeout); uncapped calls with a known age follow, oldest
+    /// So: capped calls first, nearest their own deadline first. A deadline is
+    /// the call's start plus its cap (``ToolCall/timeoutCap(bashTimeout:)``,
+    /// the expression the row's ring reads), so a codex call 20 s from its own
+    /// 120 s timeout outranks a `Bash` call with nine minutes of its 600 s
+    /// left, though the `Bash` call is older. Among calls that share a cap the
+    /// deadline order is the age order, oldest first, and equal deadlines fall
+    /// back to the start time. Uncapped calls with a known age follow, oldest
     /// first; a call with no `startedMs` has no elapsed time to rank at all
     /// and sorts LAST of all, capped or not — three tiers, not two, because a
     /// capped-but-ageless call is no more actionable than an uncapped one.
@@ -3576,12 +3632,22 @@ public struct Fleet: Equatable, Sendable {
             guard entry.call.startedMs != nil else { return 2 }
             return entry.call.capped ? 0 : 1
         }
+        // Non-nil for every call in tier 0: it has a start and a cap.
+        func deadline(_ entry: SessionToolEntry) -> Double? {
+            guard let startedMs = entry.call.startedMs,
+                let cap = entry.call.timeoutCap(bashTimeout: ToolCall.bashTimeoutSeconds)
+            else { return nil }
+            return Double(startedMs) + 1000 * cap
+        }
         return sessions.flatMap { session in
-            session.tools.running.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
+            session.tools.running.map {
+                SessionToolEntry(sessionId: session.sessionId, call: $0, provider: session.provider)
+            }
         }
         .sorted { lhs, rhs in
             let (lt, rt) = (tier(lhs), tier(rhs))
             if lt != rt { return lt < rt }
+            if lt == 0, let ld = deadline(lhs), let rd = deadline(rhs), ld != rd { return ld < rd }
             return (lhs.call.startedMs ?? .max) < (rhs.call.startedMs ?? .max)
         }
     }
@@ -3606,7 +3672,9 @@ public struct Fleet: Equatable, Sendable {
     /// session.
     public var toolsSlowest: [SessionToolEntry] {
         let pooled = sessions.flatMap { session in
-            session.tools.slowest.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
+            session.tools.slowest.map {
+                SessionToolEntry(sessionId: session.sessionId, call: $0, provider: session.provider)
+            }
         }
         return Array(pooled.sorted { ($0.call.seconds ?? 0) > ($1.call.seconds ?? 0) }.prefix(10))
     }

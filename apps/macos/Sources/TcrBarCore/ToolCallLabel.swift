@@ -98,4 +98,37 @@ public enum ToolCallLabel {
         guard let remaining, remaining <= warnWithin else { return age }
         return "\(age) · \(Int(max(0, remaining.rounded())))s left"
     }
+
+    /// The BY TOOL buckets, in the order the line lists them: Claude's three, then codex's.
+    public static let categoryOrder = [
+        "Bash", "Agent", "Read/Grep/Edit", "Codex shell", "Codex edit", "Codex other",
+    ]
+
+    /// The BY TOOL bucket a call files under, by the provider of the session that made it.
+    ///
+    /// A Claude call keeps the buckets it always had: `Bash`, `Agent` for `Agent` and `Task`,
+    /// and `Read/Grep/Edit` for everything else. A Codex call never shares one of them, even
+    /// when its name matches, because a codex call is not a Claude Code tool.
+    ///
+    /// The Codex names are codex's own tool names, as tcr reads them off the response stream:
+    /// `exec_command` is codex's shell tool, the one it offers by default; `shell` and a
+    /// `local_shell_call` item are the older shell forms, kept so a call that arrives under
+    /// one of them still reads as a shell call; `apply_patch` is codex's file edit. Anything
+    /// else codex calls, `update_plan` for one, is `Codex other`.
+    public static func category(forTool tool: String, provider: Provider) -> String {
+        switch provider {
+        case .anthropic:
+            switch tool {
+            case "Bash": return "Bash"
+            case "Agent", "Task": return "Agent"
+            default: return "Read/Grep/Edit"
+            }
+        case .codex:
+            switch tool {
+            case "shell", "exec_command", "local_shell_call": return "Codex shell"
+            case "apply_patch": return "Codex edit"
+            default: return "Codex other"
+            }
+        }
+    }
 }

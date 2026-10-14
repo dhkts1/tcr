@@ -78,6 +78,26 @@ final class RunningToolsMarkTests: XCTestCase {
         XCTAssertEqual(PollState.loaded(fleet).runningToolsCount(showRunningTools: true), 2)
     }
 
+    /// A codex call is a running call like any other: the segment counts it beside Claude's,
+    /// the same count the Tools tab's RUNNING NOW list draws.
+    func testTheRunningCountIncludesCodexCalls() throws {
+        let payload = """
+            {"supported": true, "sessions": [
+              {"sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+               "account": "alice@example.com", "firstSeenMs": 0, "lastSeenMs": 0,
+               "tools": {"calls": 1, "running": [{"tool": "Bash", "startedMs": 0}]}},
+              {"sessionId": "019a3c5e-0000-7000-8000-000000000002",
+               "account": "bob@example.com/codex", "provider": "codex",
+               "firstSeenMs": 0, "lastSeenMs": 0,
+               "tools": {"calls": 1, "running": [{"tool": "exec_command", "startedMs": 0}]}}]}
+            """
+        let sessions = try Fleet.decodeSessions(Data(payload.utf8)).sessions
+        XCTAssertEqual(sessions.map(\.provider), [.anthropic, .codex])
+        let fleet = Fleet(
+            accounts: [], sessions: [sessions[0], sessions[1]], sessionsSupported: true)
+        XCTAssertEqual(PollState.loaded(fleet).runningToolsCount(showRunningTools: true), 2)
+    }
+
     /// Zero running is a real, drawable fact once the wire exists — distinct
     /// from `nil`, which means "do not draw the segment at all".
     func testRunningToolsCountCanBeZeroWithoutBeingNil() {

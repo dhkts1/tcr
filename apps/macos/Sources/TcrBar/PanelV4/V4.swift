@@ -273,9 +273,12 @@ enum V4 {
     static var toolRowRingSize: CGFloat { compact ? 20 : 22 }
     static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
-    /// The Bash tool's own timeout — the denominator the ring fills toward, and
-    /// the figure the RUNNING NOW section head states out loud.
-    static let toolTimeoutSeconds: Double = 600
+    /// The Bash tool's own timeout — the denominator a Claude `Bash` call's ring
+    /// fills toward, and the figure the RUNNING NOW section head states out
+    /// loud. It is ``ToolCall/bashTimeoutSeconds``, the figure the running
+    /// list's sort and the near-timeout count read, so the three cannot drift.
+    /// A codex call that carries its own timeout fills toward that instead.
+    static let toolTimeoutSeconds: Double = ToolCall.bashTimeoutSeconds
     /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
     /// and the row says how long is left (Gil, 2026-09-13: "red plus
     /// `· 20s to timeout` within 60 s of the 600 s limit").
@@ -289,6 +292,12 @@ enum V4 {
     /// tab. A hit target smaller than the glyph's own confidence is how a
     /// mis-click kills the wrong command.
     static let killHitTarget: CGFloat = 24
+    /// The slot a running Codex call's row gives the words "no Kill", where a Claude
+    /// call's row draws its ✕: tcr cannot match a codex call to a process, so it offers
+    /// none, and says so. The label measures 34.4 pt at the 12 pt mute size (32.0 pt at
+    /// Compact's 11 pt), and this is that plus a margin: 11 pt wider than the ✕'s target,
+    /// which a Codex row's name gives up.
+    static let noKillWidth: CGFloat = 35
     /// The glyph inside that target. Smaller than the box on purpose: the box
     /// is what the pointer must hit, the glyph is what the eye must not be
     /// dominated by — a running row is about its command, not about the way

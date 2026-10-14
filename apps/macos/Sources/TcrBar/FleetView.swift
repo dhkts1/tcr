@@ -213,6 +213,11 @@ struct FleetView: View {
     /// touches disk.
     @State private var sessionFiles: [String: SessionFile] = [:]
 
+    /// The Codex sessions' rollout files, remembered across polls — see
+    /// ``CodexRolloutJoin``. Merged into ``sessionFiles`` by
+    /// ``readSessionFiles()``.
+    @State private var codexRolloutJoin = CodexRolloutJoin()
+
     /// What the box itself is doing, for the Tools tab's machine line. `nil`
     /// until the first reading lands, which is the state the line draws
     /// nothing in: the alternative is "load 0.0 of 0" for one frame, and a
@@ -436,7 +441,7 @@ struct FleetView: View {
         // `RenderStates.swift`'s sessions-tab fixtures.
         .onAppear {
             if !snapshotMode {
-                sessionFiles = SessionFiles.read()
+                sessionFiles = readSessionFiles()
                 machine = MachineStats.read()
                 refreshRunningProcesses()
                 refreshClaudeCount()
@@ -447,7 +452,7 @@ struct FleetView: View {
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
-                sessionFiles = SessionFiles.read()
+                sessionFiles = readSessionFiles()
                 machine = MachineStats.read()
                 refreshRunningProcesses()
                 refreshClaudeCount()
@@ -1092,11 +1097,22 @@ struct FleetView: View {
 
     /// Where this tab's numbers come from — the mockup gives each tab its own
     /// provenance line rather than repeating one global block on all three.
+    /// Sessions and Tools name codex once the loaded fleet holds a Codex
+    /// account (``SessionsCodexCopy``); before a fleet loads they say what
+    /// they always said.
     private var v4FooterLeading: String {
         switch visibleTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
-        case .sessions: return "proxy + Claude Code session files"
-        case .tools: return "from request bodies only · nothing logged"
+        case .sessions:
+            if case .loaded(let fleet) = poller.state {
+                return SessionsCodexCopy.sessionsFooter(fleet)
+            }
+            return "proxy + Claude Code session files"
+        case .tools:
+            if case .loaded(let fleet) = poller.state {
+                return SessionsCodexCopy.toolsFooter(holdsCodex: fleet.holdsCodex)
+            }
+            return "from request bodies only · nothing logged"
         case .peers: return "peer mesh · nothing built yet"
         }
     }
@@ -1104,6 +1120,12 @@ struct FleetView: View {
     private var v4FooterTrailing: String? {
         if visibleTab == .sessions { return "sparkline: req/min, 30m" }
         guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
+        // With a Codex account the Tools footer's provenance sentence says
+        // "from request and response bodies · nothing logged", 299.5 pt, and
+        // beside "server abc1234" it cut to "… · no…": the privacy claim lost
+        // to make room for a build id the other tabs still show. The sentence
+        // outranks the id (`PanelFooter`'s own rule), so here the id goes.
+        if visibleTab == .tools, fleet.holdsCodex { return nil }
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }
 
@@ -1627,10 +1649,14 @@ struct FleetView: View {
                 detail: detail,
                 tint: Tok.unknown)
         } else if fleet.sessions.isEmpty {
+            // A proxy too old to record Codex sessions lists none, while a
+            // Codex row says codex was busy: that is said, rather than an
+            // idle hour nobody had.
             banner(
                 icon: "person.2",
                 title: "No live sessions",
-                detail: "Nothing has spoken to the proxy in the last hour.",
+                detail: SessionsCodexCopy.oldServerLine(fleet)
+                    ?? SessionsCodexCopy.emptyDetail(fleet),
                 tint: Tok.inkDim)
         } else {
             let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
@@ -1642,17 +1668,31 @@ struct FleetView: View {
             // "Show N more sessions" button already follows.
             let fold = SessionsFold(joined, now: Date())
             let displayed = warmupsExpanded ? joined : fold.visible
+            let oldServerLine = SessionsCodexCopy.oldServerLine(fleet)
             if snapshotMode {
-                sessionsTabBody(displayed: displayed, fold: fold)
+                sessionsTabBody(displayed: displayed, fold: fold, oldServerLine: oldServerLine)
             } else {
-                ScrollView { sessionsTabBody(displayed: displayed, fold: fold) }
-                    .frame(height: visibleRowsHeight(for: fleet))
+                ScrollView {
+                    sessionsTabBody(displayed: displayed, fold: fold, oldServerLine: oldServerLine)
+                }
+                .frame(height: visibleRowsHeight(for: fleet))
             }
         }
     }
 
-    private func sessionsTabBody(displayed: [JoinedSession], fold: SessionsFold) -> some View {
+    /// `oldServerLine` is ``SessionsCodexCopy/oldServerLine(_:)``: above the
+    /// list, because the list itself cannot say that its Codex sessions are
+    /// missing, only that the ones it has are there.
+    private func sessionsTabBody(
+        displayed: [JoinedSession], fold: SessionsFold, oldServerLine: String?
+    ) -> some View {
         VStack(alignment: .leading, spacing: Tok.cardGap) {
+            if let oldServerLine {
+                Text(oldServerLine)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.near)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             sessionsList(displayed)
             warmupFoldLine(fold)
         }
@@ -1823,8 +1863,9 @@ struct FleetView: View {
                     // clause at all on a server that does not send it: the two
                     // earlier rounds of this bridge left the `$` out entirely
                     // for exactly that reason, and the field existing is what
-                    // changed, not the rule.
-                    if let cost = row.session.costUsd {
+                    // changed, not the rule. Read through `pricedCostUsd`, so a
+                    // Codex session nothing was priced for draws no `$0.00`.
+                    if let cost = row.session.pricedCostUsd {
                         Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
                             .lineLimit(1).layoutPriority(1)
                     }
@@ -1896,8 +1937,18 @@ struct FleetView: View {
     /// account that got cut ("sonnet-5 · h…" in `--render-states`). Absent while
     /// the proxy has not attributed the session to an account yet, never
     /// guessed.
+    ///
+    /// In a fleet holding both providers a Codex session's subtitle leads with
+    /// `Codex` (``SessionsCodexCopy/subtitleLead(for:in:)``), read off the
+    /// fleet in ``poller`` as ``v4Badges`` reads it. A Claude row's subtitle is
+    /// what it always was.
     private func sessionSubtitle(_ row: JoinedSession, showProject: Bool) -> String {
-        [
+        var lead: String?
+        if case .loaded(let fleet) = poller.state {
+            lead = SessionsCodexCopy.subtitleLead(for: row.session, in: fleet)
+        }
+        return [
+            lead,
             showProject ? row.project : nil,
             row.session.account.map(AccountName.short),
             row.session.model.map(QuotaFormat.modelLabel),
@@ -1969,7 +2020,12 @@ struct FleetView: View {
             // word: it is the join-has-no-file case, not a fourth state
             // this build has a name for, and inventing one here would claim
             // a reading nobody made.
+            //
+            // A Codex session says how long ago it was last seen, "2m ago":
+            // tcr cannot see what codex does between requests, so it never
+            // calls one idle or waiting.
             let age = row.ageLabel(now: now)
+            if row.session.provider == .codex { return SessionsCodexCopy.trailing(age: age) }
             switch row.activity {
             case .waiting: return "waiting \(age)"
             case .idle: return "idle \(age)"
@@ -2036,7 +2092,7 @@ struct FleetView: View {
         }
     }
 
-    /// RUNNING NOW — one two-line item per call, longest-running first
+    /// RUNNING NOW — one two-line item per call, nearest its own deadline first
     /// (``Fleet/toolsRunning`` sorts them), five before the fold.
     @ViewBuilder
     private func runningNowSection(_ fleet: Fleet) -> some View {
@@ -2046,10 +2102,13 @@ struct FleetView: View {
                 toolsRunningExpanded ? entries : Array(entries.prefix(Self.runningVisibleItems))
             let hidden = entries.count - visible.count
             // Finding 5: state the denominator the ring fills toward, rather
-            // than drawing a fraction with no stated whole.
+            // than drawing a fraction with no stated whole. Once a running
+            // call is codex's, a ring may fill toward that call's own timeout,
+            // so the head stops naming the Bash tool's 600s for all of them.
             toolsSection(
                 "RUNNING NOW",
-                subtitle: "\(entries.count) · ring fills toward the 600s timeout"
+                subtitle: SessionsCodexCopy.runningUnit(
+                    count: entries.count, anyCodex: entries.contains { $0.provider == .codex })
             ) {
                 ForEach(Array(visible.enumerated()), id: \.offset) { index, entry in
                     if index > 0 { itemRule }
@@ -2260,15 +2319,17 @@ struct FleetView: View {
         let elapsed = entry.call.startedMs.map { started in
             max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
         }
-        // Only a Bash call HAS a timeout to be near: an Agent or a Read has no
-        // cap this build knows, so it draws no ring and can never be "20s
-        // from" anything. `ToolCall.capped` is the ONE place that decides
-        // that — the running list's own sort (`Fleet.toolsRunning`) reads the
-        // same property — and the ring, the tint and the label all read it
-        // here too; the first draft decided it per site and printed "17s
-        // left" beside a call with no ring.
-        let capped = entry.call.capped
-        let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
+        // A call HAS a timeout to be near only when this build knows its cap:
+        // its own, when the wire carries one (a codex call), or the Bash
+        // tool's 600s for a Claude `Bash` call. An Agent, a Read or a codex
+        // call with no timeout has none, so it draws no ring and can never be
+        // "20s from" anything. `ToolCall.timeoutCap(bashTimeout:)` is the ONE
+        // place that decides that — the running list's own sort
+        // (`Fleet.toolsRunning`) reads the same expression — and the ring, the
+        // tint and the label all read it here too; the first draft decided it
+        // per site and printed "17s left" beside a call with no ring.
+        let cap = entry.call.timeoutCap(bashTimeout: bashTimeoutSeconds)
+        let remaining = cap.flatMap { cap in elapsed.map { cap - $0 } }
         // The ONE expression this row and the tab's own summary line
         // (``toolsSummaryLine``, via ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)``)
         // both read — see ``SessionToolEntry/isNearTimeout(now:timeoutSeconds:warnWithinSeconds:)``'s
@@ -2290,12 +2351,12 @@ struct FleetView: View {
                 // `.tool .tt{gap:6px}` for this row, and two of the points
                 // that pay for the cpu/memory clause beside the session name.
                 HStack(spacing: V4.pillGap) {
-                    if capped {
+                    if let cap {
                         ProgressRing(
-                            fraction: (elapsed ?? 0) / bashTimeoutSeconds,
+                            fraction: (elapsed ?? 0) / cap,
                             tint: isNearTimeout ? Tok.spent : Tok.ok,
                             accessibilityText: elapsed.map {
-                                "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
+                                "\(durationLabel($0)) of \(Int(cap))s"
                             },
                             size: V4.toolRowRingSize)
                     }
@@ -2310,9 +2371,29 @@ struct FleetView: View {
                     .font(V4.font(V4.dimSize))
                     .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
                     .lineLimit(1)
-                    if stats != nil { killButton(entry) }
+                    // tcr cannot match a codex call to a process, so it never
+                    // offers to kill one, and says so in the ✕'s place: an
+                    // empty slot would read as a button that failed to draw.
+                    if entry.provider == .codex {
+                        noKillLabel
+                    } else if stats != nil {
+                        killButton(entry)
+                    }
                 }
             })
+    }
+
+    /// The words a running Codex call's row shows where a Claude call's ✕
+    /// goes, in the panel's mute style, in a slot of their own width
+    /// (``V4/noKillWidth``). The help and VoiceOver say why.
+    private var noKillLabel: some View {
+        Text(SessionsCodexCopy.noKill)
+            .font(V4.font(V4.muteSize))
+            .foregroundStyle(Tok.mute)
+            .lineLimit(1)
+            .frame(width: V4.noKillWidth)
+            .help(SessionsCodexCopy.noKillHelp)
+            .accessibilityLabel(SessionsCodexCopy.noKillHelp)
     }
 
     /// The ✕ at the trailing end of a running row.
@@ -2421,6 +2502,20 @@ struct FleetView: View {
         // extra table walk here is cheaper than a row that keeps drawing a
         // ✕ for the thing it just killed until the next poll lands.
         refreshRunningProcesses()
+    }
+
+    /// One poll's session files: Claude Code's, and, when this Mac has a codex
+    /// home, the first line of the rollout codex wrote for each Codex session
+    /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
+    /// A Claude file wins an id clash. Read on appear and on each poll, never
+    /// in `snapshotMode`, like the Claude files alone were.
+    private func readSessionFiles() -> [String: SessionFile] {
+        let claude = SessionFiles.read()
+        guard let codexHome = codexPresence.codexHome, case .loaded(let fleet) = poller.state
+        else { return claude }
+        let codexIds = Set(fleet.sessions.filter { $0.provider == .codex }.map(\.sessionId))
+        let rollouts = codexRolloutJoin.files(for: codexIds, codexHome: codexHome, now: Date())
+        return claude.merging(rollouts) { claudeFile, _ in claudeFile }
     }
 
     /// One poll's process reading for every RUNNING Bash call on the tab.
@@ -2736,21 +2831,31 @@ struct FleetView: View {
         let working = joined.filter { $0.activity == .busy }.count
         let waiting = joined.filter { $0.activity == .waiting }.count
         var numbers: [Text] = []
-        if let hourly = fleet.burnRateSegment {
-            numbers.append(summaryPhrase(hourly))
-        }
-        if let today = fleet.todayCost {
-            numbers.append(summaryPhrase("\(QuotaFormat.usd(today)) today"))
-        }
-        if let live = fleet.sessionsLiveCost {
-            numbers.append(summaryPhrase("\(QuotaFormat.usd(live)) live"))
-        }
-        if !fleet.accounts.isEmpty {
-            numbers.append(
-                summaryPhrase("\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
-        }
-        if fleet.toolsTotalErrors > 0 {
-            numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err"))
+        // A fleet holding a Codex account counts each pool apart
+        // (``SessionsCodexCopy/summaryClauses(_:)``): Codex requests are never
+        // priced, so one fleet-wide burn rate and one account ratio would file
+        // them as Claude's missing dollars. Every other fleet keeps the line
+        // below.
+        if let clauses = SessionsCodexCopy.summaryClauses(fleet) {
+            numbers = clauses.map(summaryPhrase)
+        } else {
+            if let hourly = fleet.burnRateSegment {
+                numbers.append(summaryPhrase(hourly))
+            }
+            if let today = fleet.todayCost {
+                numbers.append(summaryPhrase("\(QuotaFormat.usd(today)) today"))
+            }
+            if let live = fleet.sessionsLiveCost {
+                numbers.append(summaryPhrase("\(QuotaFormat.usd(live)) live"))
+            }
+            if !fleet.accounts.isEmpty {
+                numbers.append(
+                    summaryPhrase(
+                        "\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
+            }
+            if fleet.toolsTotalErrors > 0 {
+                numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err"))
+            }
         }
         return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack(alignment: .firstTextBaseline) {

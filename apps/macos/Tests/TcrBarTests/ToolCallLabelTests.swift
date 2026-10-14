@@ -98,4 +98,36 @@ final class ToolCallLabelTests: XCTestCase {
             ToolCallLabel.running(elapsed: 602, remaining: -2, warnWithin: 60),
             "10m 2s · 0s left")
     }
+
+    // MARK: - Categories
+
+    /// codex's shell tools file under one bucket and its patch tool under another, each named
+    /// for the provider; every other Codex tool shares a third rather than claiming a Claude one.
+    func testTheCodexShellAndEditCategories() {
+        for tool in ["shell", "exec_command", "local_shell_call"] {
+            XCTAssertEqual(
+                ToolCallLabel.category(forTool: tool, provider: .codex), "Codex shell", tool)
+        }
+        XCTAssertEqual(ToolCallLabel.category(forTool: "apply_patch", provider: .codex), "Codex edit")
+        XCTAssertEqual(
+            ToolCallLabel.category(forTool: "update_plan", provider: .codex), "Codex other")
+        XCTAssertEqual(ToolCallLabel.category(forTool: "Bash", provider: .codex), "Codex other")
+    }
+
+    /// A Claude tool keeps the buckets it always had, whatever its name: a Claude call never
+    /// lands in a Codex bucket, even one named like a codex tool.
+    func testAClaudeToolKeepsClaudesBuckets() {
+        XCTAssertEqual(ToolCallLabel.category(forTool: "Bash", provider: .anthropic), "Bash")
+        XCTAssertEqual(ToolCallLabel.category(forTool: "Agent", provider: .anthropic), "Agent")
+        XCTAssertEqual(ToolCallLabel.category(forTool: "Task", provider: .anthropic), "Agent")
+        XCTAssertEqual(
+            ToolCallLabel.category(forTool: "Read", provider: .anthropic), "Read/Grep/Edit")
+        XCTAssertEqual(
+            ToolCallLabel.category(forTool: "shell", provider: .anthropic), "Read/Grep/Edit")
+        XCTAssertEqual(
+            ToolCallLabel.category(forTool: "update_plan", provider: .anthropic), "Read/Grep/Edit")
+        XCTAssertEqual(
+            ToolCallLabel.categoryOrder,
+            ["Bash", "Agent", "Read/Grep/Edit", "Codex shell", "Codex edit", "Codex other"])
+    }
 }
