@@ -130,6 +130,16 @@ enum SetupAction {
     ClaudeSettings(SetupSettingsArgs),
     /// Say which route is installed, and anything in the way of either.
     Status(SetupStatusArgs),
+    /// Link `tcr-run` beside the `tcr` on PATH: `tcr run` under another name,
+    /// for a tool that takes a Claude Code executable path.
+    TcrRun(SetupTcrRunArgs),
+}
+
+#[derive(clap::Args)]
+struct SetupTcrRunArgs {
+    /// Take the link back out (only the symlink tcr made).
+    #[arg(long)]
+    remove: bool,
 }
 
 /// Parse `--shell` through the one recogniser `src/setup.rs` uses for
@@ -1476,9 +1486,32 @@ struct ServerArgs {
     no_replace: bool,
 }
 
+/// The name under which this binary is `tcr run`: a symlink called `tcr-run`
+/// (`tcr setup tcr-run`) gives a tool that takes a Claude Code executable path
+/// one path to point at.
+const TCR_RUN_ALIAS: &str = "tcr-run";
+
+/// The argv clap parses: this process's own, or, when it was started as
+/// [`TCR_RUN_ALIAS`], `tcr run` followed by every argument exactly as given.
+/// Rewriting the argv rather than building a `RunArgs` by hand means
+/// `tcr-run X` and `tcr run X` go through one parser and cannot drift.
+fn effective_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let invoked_as_alias = argv.first().is_some_and(|argv0| {
+        Path::new(argv0)
+            .file_name()
+            .is_some_and(|name| name == TCR_RUN_ALIAS)
+    });
+    if !invoked_as_alias {
+        return argv;
+    }
+    let mut out = vec![std::ffi::OsString::from("tcr"), "run".into()];
+    out.extend(argv.into_iter().skip(1));
+    out
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(effective_argv(std::env::args_os().collect()));
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_claude(args),
@@ -5826,6 +5859,29 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
                     "every claude launch now goes through tcr; while tcr is not running, claude cannot reach Anthropic (undo: tcr setup claude-settings --remove)"
                 );
             }
+        }
+        SetupAction::TcrRun(args) => {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let Some(dir) = setup::tcr_dir_on_path(&path) else {
+                anyhow::bail!(
+                    "no tcr on PATH; tcr-run is linked beside it, so put tcr on PATH first"
+                );
+            };
+            let change = if args.remove {
+                setup::remove_tcr_run(&dir)?
+            } else {
+                setup::install_tcr_run(&dir)?
+            };
+            let link = change.path.display();
+            println!(
+                "{}",
+                match change.change {
+                    setup::Change::Added => format!("linked {link} -> tcr"),
+                    setup::Change::Deleted => format!("removed {link}"),
+                    _ if args.remove => format!("no {link} to remove"),
+                    _ => format!("already linked: {link} -> tcr"),
+                }
+            );
         }
         SetupAction::Status(args) => {
             let config_path = args.config.unwrap_or_else(config::default_path);

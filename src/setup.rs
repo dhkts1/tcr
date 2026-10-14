@@ -218,6 +218,8 @@ pub enum SetupError {
     NotTcrsBaseUrl { path: PathBuf, value: String },
     #[error("{}: {why}", path.display())]
     Malformed { path: PathBuf, why: String },
+    #[error("refusing to touch {}: it is {what}", path.display())]
+    Occupied { path: PathBuf, what: String },
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -1401,6 +1403,93 @@ pub fn tcr_word() -> anyhow::Result<String> {
             "tcr is not on PATH and its own path ({exe}) cannot be quoted for a shell; put tcr on PATH and retry"
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// tcr-run: `tcr run` under another name
+// ---------------------------------------------------------------------------
+
+/// The name `tcr setup tcr-run` links. The binary dispatches on it in
+/// `src/main.rs` (`effective_argv`).
+pub const TCR_RUN_LINK: &str = "tcr-run";
+
+/// The directory of the first executable `tcr` on `path` (a `PATH` value).
+pub fn tcr_dir_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::split_paths(path).find(|dir| {
+        std::fs::metadata(dir.join("tcr"))
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// Is `link` a symlink tcr made: one whose target's file name is `tcr`?
+fn is_tcr_link(link: &Path) -> bool {
+    std::fs::read_link(link).is_ok_and(|target| target.file_name().is_some_and(|n| n == "tcr"))
+}
+
+/// Make `<dir>/tcr-run` a symlink to the `tcr` beside it. The target is the
+/// relative name `tcr`, so the link follows whatever `tcr` that directory
+/// holds after an upgrade. Refuses anything already at that path that is not
+/// such a link: a file, or a symlink to something else, is someone's own.
+pub fn install_tcr_run(dir: &Path) -> Result<FileChange, SetupError> {
+    let link = dir.join(TCR_RUN_LINK);
+    match std::fs::symlink_metadata(&link) {
+        Ok(_) if is_tcr_link(&link) => {
+            return Ok(FileChange {
+                path: link,
+                change: Change::Unchanged,
+            });
+        }
+        Ok(meta) => {
+            let what = if meta.file_type().is_symlink() {
+                format!(
+                    "a symlink to {}",
+                    std::fs::read_link(&link)
+                        .map(|target| target.display().to_string())
+                        .unwrap_or_default()
+                )
+            } else {
+                "a file tcr did not make".to_string()
+            };
+            return Err(SetupError::Occupied { path: link, what });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(SetupError::Io { path: link, source }),
+    }
+    std::os::unix::fs::symlink("tcr", &link).map_err(|source| SetupError::Io {
+        path: link.clone(),
+        source,
+    })?;
+    Ok(FileChange {
+        path: link,
+        change: Change::Added,
+    })
+}
+
+/// Take `<dir>/tcr-run` out, only when it is the link tcr made.
+pub fn remove_tcr_run(dir: &Path) -> Result<FileChange, SetupError> {
+    let link = dir.join(TCR_RUN_LINK);
+    match std::fs::symlink_metadata(&link) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileChange {
+            path: link,
+            change: Change::Unchanged,
+        }),
+        Err(source) => Err(SetupError::Io { path: link, source }),
+        Ok(_) if is_tcr_link(&link) => {
+            std::fs::remove_file(&link).map_err(|source| SetupError::Io {
+                path: link.clone(),
+                source,
+            })?;
+            Ok(FileChange {
+                path: link,
+                change: Change::Deleted,
+            })
+        }
+        Ok(_) => Err(SetupError::Occupied {
+            path: link,
+            what: "not the symlink tcr makes".to_string(),
+        }),
+    }
 }
 
 /// One line per file touched, for the person who ran the verb.
