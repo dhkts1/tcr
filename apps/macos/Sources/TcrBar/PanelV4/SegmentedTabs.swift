@@ -52,50 +52,17 @@ struct SegmentedTabs: View {
                     .font(.system(size: V4.tabLabelSize))
                     .frame(width: V4.tabIconBox, height: V4.tabIconBox)
                 // ONE line, at its own width, never a share of the strip.
-                //
-                // Equal quarters of the strip are 84.25 pt. Measured at the
-                // system font, "Sessions" beside a two-digit badge wants
-                // 106.2 pt and so broke into `Sess` over `ions` on the
-                // released panel. Nothing in the strip's own tokens can pay
-                // for it: taking `segGap` to zero returns 2.25 pt, and a
-                // smaller badge font is larger than the one already used.
-                //
-                // Their own widths fit with room to spare: the four together
-                // want 303.8 pt of the strip's 337, even at `Sessions 120`
-                // and `Tools 12`, which leaves enough for `V4.tabInset` on
-                // each side of each tab (`TabStripLayout` below hands those
-                // widths out). `fixedSize` is what reports that ideal width
-                // to the layout instead of accepting a smaller one,
-                // `lineLimit(1)` is what makes a label that somehow still
-                // cannot fit ellipsise rather than grow the strip a second
-                // line, and `SegmentedTabsFitTests` is what fails if a longer
-                // label ever spends the slack.
+                // `fixedSize` reports the label's ideal width to the layout
+                // instead of accepting a smaller one (an equal share once broke
+                // "Sessions" into `Sess` over `ions`), and `lineLimit(1)` makes
+                // a label that somehow cannot fit ellipsise rather than grow
+                // the strip a second line. Nothing else in this row changes
+                // with the data, so the strip never moves.
                 Text(tab.title)
                     .font(V4.font(V4.tabLabelSize, .semibold))
                     .tracking(V4.tabLabelTracking)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
-                if let count = badges[tab], count > 0 {
-                    // The same rule as the label, and it is not optional once
-                    // the label has it. With only the label fixed, an item
-                    // still holds its equal quarter and the compression moves
-                    // to whatever can still give: rendered at `Sessions 120`
-                    // and `Tools 12`, the three-digit badge was squeezed to a
-                    // bare sliver and the two-digit one broke into `1` over
-                    // `2`. A count that cannot be read is the one thing a
-                    // badge is for.
-                    Text("\(count)")
-                        .font(V4.font(V4.badgeSize))
-                        .foregroundStyle(Tok.ink)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .contentTransition(.numericText())
-                        .padding(.horizontal, V4.badgePaddingH)
-                        .background(
-                            RoundedRectangle(cornerRadius: V4.badgeRadius)
-                                .fill(Tok.ink.opacity(V4.badgeFillAlpha))
-                        )
-                }
             }
             .foregroundStyle(isOn ? Tok.ink : Tok.dim)
             .frame(maxWidth: .infinity)
@@ -108,11 +75,50 @@ struct SegmentedTabs: View {
                         radius: 1, x: 0, y: 1)
             )
             .animation(reduceMotion ? nil : .easeOut(duration: V4.hoverDuration), value: isOn)
+            .overlay(alignment: .topTrailing) { countBadge(tab) }
             .contentShape(Rectangle())
         }
         .buttonStyle(V4PressStyle(cornerRadius: V4.tabRadius))
         .accessibilityLabel(badges[tab].map { "\(tab.title), \($0)" } ?? tab.title)
         .accessibilityAddTraits(isOn ? [.isSelected] : [])
+    }
+
+    /// The tab's count, drawn small over its pill's top-trailing corner and
+    /// lifted above the pill's top edge, so it takes no room in the strip and
+    /// stays clear of the label's letters.
+    ///
+    /// It sat inline after the label through 1.1.20, and every count that
+    /// appeared, vanished or gained a digit re-laid the whole strip (Gil,
+    /// 2026-10-14: "avoid layout shifts. now whats going on with our tabs is
+    /// horrible"). A slot reserved beside the label at the badge's worst case
+    /// does not fit three badged tabs (``TabStripFit`` has the arithmetic), so
+    /// the badge is laid over the corner instead and only its own glyphs
+    /// change. ``TabStripFit/badgeText(_:)`` caps it at `99+`, so the widest
+    /// badge is known and stays inside its tab.
+    ///
+    /// Filled opaque under the usual tint, because it straddles the pill's
+    /// edge and the strip's: a translucent pill would show both edges through
+    /// its digits.
+    @ViewBuilder
+    private func countBadge(_ tab: PanelTab) -> some View {
+        if let text = TabStripFit.badgeText(badges[tab]) {
+            Text(text)
+                .font(V4.font(V4.tabBadgeSize))
+                .foregroundStyle(Tok.ink)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .contentTransition(.numericText())
+                .padding(.horizontal, V4.tabBadgePaddingH)
+                .background(
+                    ZStack {
+                        RoundedRectangle(cornerRadius: V4.badgeRadius).fill(Tok.panel)
+                        RoundedRectangle(cornerRadius: V4.badgeRadius)
+                            .fill(Tok.ink.opacity(V4.badgeFillAlpha))
+                    }
+                )
+                .offset(y: -V4.tabBadgeLift)
+                .accessibilityHidden(true)
+        }
     }
 }
 
