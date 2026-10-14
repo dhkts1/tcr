@@ -5,7 +5,7 @@ import TcrBarCore
 /// while it does it.
 ///
 /// Takes a ``LoginPhase`` rather than the ``LoginSession`` that produces one.
-/// That is what lets `--render-states` draw all four states without spawning a
+/// That is what lets `--render-states` draw every phase without spawning a
 /// login — the harness renders this view directly with a pinned phase, which is
 /// the only way a state like `.failed` gets looked at before it happens to a
 /// person.

@@ -53,7 +53,7 @@ public struct PanelSizeDelta: Equatable, Sendable {
     /// counting fields.
     public static let version = "v1"
 
-    /// What ``PanelSize/plan(rowCount:header:footer:geometry:metrics:)``
+    /// What ``PanelSize/plan(rowCount:sectionHeads:header:footer:geometry:metrics:)``
     /// returned for this tick.
     public let predicted: PanelSize.Plan
 

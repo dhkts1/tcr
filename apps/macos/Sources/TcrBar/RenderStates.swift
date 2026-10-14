@@ -581,9 +581,10 @@ enum RenderStates {
         var refusedChoice = missing
         refusedChoice.refusedCodexChoice = "~/Downloads/codex is not an executable file."
         let missingReason =
-            "could not find the codex CLI (searched /Users/example/.local/bin, "
-            + "/Users/example/.cargo/bin, /opt/homebrew/bin, /usr/local/bin). Install it, or set "
-            + "TCR_CODEX_BIN to its path. Nothing was written."
+            "could not find the codex CLI (searched TCR_CODEX_BIN, CODEX_BIN, PATH, "
+            + "/Users/example/.local/bin, /Users/example/.cargo/bin, /opt/homebrew/bin, "
+            + "/usr/local/bin, /Users/example/.npm-global/bin). Install it, or set TCR_CODEX_BIN "
+            + "to its path. Nothing was written."
         return [
             ("20e-login-choose", .choosing, nil, LoginSheetFacts()),
             ("20f-login-codex-opening", .opening, nil, signIn),
