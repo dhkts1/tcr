@@ -158,3 +158,74 @@ fn the_second_run_reuses_the_file_it_created() {
         "a read-only verb must leave the file byte-for-byte alone"
     );
 }
+
+/// [`run_tcr`]'s command, with codex's own login pinned inside the scratch `HOME`: `CODEX_HOME`
+/// and `TCR_CODEX_AUTH` are removed, so the only codex login the child can find is
+/// `<home>/.codex/auth.json`. A developer's mac usually has a real one at `~/.codex`, and a
+/// first run that found it would print a line these assertions are not about.
+fn command_without_codex(home: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .args(args)
+        .env("HOME", home)
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("no-such-claude-code-credentials.json"),
+        )
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("CODEX_HOME")
+        .env_remove("TCR_CODEX_AUTH");
+    command
+}
+
+/// Run `command`, returning (exit code, stdout, stderr).
+fn outcome(command: &mut Command) -> (Option<i32>, String, String) {
+    let out = command
+        .output()
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `tcr <args…>` through [`command_without_codex`].
+fn run_tcr_without_codex(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
+    outcome(&mut command_without_codex(home, args))
+}
+
+/// `text` with the scratch HOME, as written and in its canonical form, replaced by `<home>`.
+fn normalize_home(text: &str, home: &std::path::Path) -> String {
+    let mut out = text.to_string();
+    if let Ok(canonical) = std::fs::canonicalize(home) {
+        out = out.replace(&canonical.display().to_string(), "<home>");
+    }
+    out.replace(&home.display().to_string(), "<home>")
+}
+
+/// What a first run prints with no codex login on the machine, pinned before the empty-fleet
+/// hint learned about codex logins: with no evidence of codex, the lines are exactly the ones a
+/// Claude-only first run always printed. Twice, each on a fresh HOME: once with no
+/// `CODEX_HOME`, and once with `CODEX_HOME` naming an empty folder.
+#[test]
+fn an_empty_fleet_without_a_codex_login_prints_todays_lines() {
+    const STDERR: &str = "[tcr] created <home>/.config/teamclaude.json with no accounts\n\
+                          no accounts configured — run `tcr login` to add one\n";
+
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let (code, stdout, stderr) = run_tcr_without_codex(home.path(), &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "no accounts configured\n");
+    assert_eq!(normalize_home(&stderr, home.path()), STDERR);
+
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let empty_codex_home = tempfile::tempdir().expect("an empty CODEX_HOME must be creatable");
+    let (code, stdout, stderr) = outcome(
+        command_without_codex(home.path(), &["accounts"])
+            .env("CODEX_HOME", empty_codex_home.path()),
+    );
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "no accounts configured\n");
+    assert_eq!(normalize_home(&stderr, home.path()), STDERR);
+}

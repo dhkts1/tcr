@@ -18,8 +18,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// One Claude account, fake from end to end. Its token expires in 2100, and `tcr doctor` never
+/// refreshes, probes or rotates, so the row is only ever read.
+const ALICE: &str = r#"{ "name": "alice@example.com", "accessToken": "at-alice", "refreshToken": "rt-alice", "expiresAt": 4102444800000 }"#;
 
 /// A port nothing is listening on: bound from the kernel's ephemeral range and
 /// released immediately.
@@ -45,6 +49,48 @@ fn write_config(home: &Path, port: u16) -> std::path::PathBuf {
     )
     .expect("write the config");
     path
+}
+
+/// [`write_config`]'s file, holding `accounts` (a comma-separated list of account objects)
+/// instead of none.
+fn write_config_with(home: &Path, port: u16, accounts: &str) -> PathBuf {
+    let dir = home.join(".config");
+    std::fs::create_dir_all(&dir).expect("create the config directory");
+    let path = dir.join("teamclaude.json");
+    std::fs::write(
+        &path,
+        format!("{{\n  \"accounts\": [{accounts}],\n  \"proxy\": {{ \"port\": {port} }}\n}}\n"),
+    )
+    .expect("write the config");
+    path
+}
+
+/// `text` with every fact that changes from run to run replaced by a placeholder: the scratch
+/// HOME (as written, and in the canonical form the kernel resolves it to, `/var` becoming
+/// `/private/var`) by `<home>`, the scratch port by `<port>`, and a port holder's pid and name by
+/// `<pid> <holder>`. The holder of an answering port is this test binary, whose name carries a
+/// build hash.
+fn normalize(text: &str, home: &Path, port: u16) -> String {
+    let mut out = text.to_string();
+    if let Ok(canonical) = std::fs::canonicalize(home) {
+        out = out.replace(&canonical.display().to_string(), "<home>");
+    }
+    out = out
+        .replace(&home.display().to_string(), "<home>")
+        .replace(&format!("127.0.0.1:{port}"), "127.0.0.1:<port>")
+        .replace(&format!(":{port} "), ":<port> ")
+        .replace(&format!("proxyPort: {port}"), "proxyPort: <port>")
+        .replace(&format!("\"proxyPort\": {port}"), "\"proxyPort\": <port>");
+    out.split_inclusive('\n')
+        .map(|line| {
+            if line.starts_with("portHolder: pid ") {
+                let end = if line.ends_with('\n') { "\n" } else { "" };
+                format!("portHolder: pid <pid> <holder>{end}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
 }
 
 fn write_settings(home: &Path, base_url: &str) -> std::path::PathBuf {
@@ -343,4 +389,79 @@ fn tcr_status_json_stays_a_bare_array() {
     let document: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bare array ({e}):\n{stdout}"));
     assert!(document.is_array(), "{stdout}");
+}
+
+/// Where [`claude_only_doctor_is_unchanged`] keeps the bytes it pins.
+fn claude_only_golden_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/doctor-claude-only.golden")
+}
+
+/// What `tcr doctor` prints for a fleet of Claude accounts alone, pinned before Codex accounts
+/// existed in it: a Codex block, a Codex verdict and a Codex exit code may only ever appear when
+/// the fleet holds a Codex account, or with `--codex`. Four runs, each on a fresh scratch HOME
+/// whose config holds one Claude account: Claude sent elsewhere by a settings file, routed here
+/// with a proxy answering, routed here with nothing answering, and the first again as JSON.
+///
+/// The golden was written once, by `TCR_UPDATE_DOCTOR_GOLDEN=1`, from the code as it stood
+/// before Codex accounts reached `tcr doctor`. It is never regenerated to fit a change.
+#[test]
+fn claude_only_doctor_is_unchanged() {
+    // (label, a settings file sends Claude elsewhere, a proxy answers, `--json`)
+    let scenarios = [
+        ("a settings file sends Claude elsewhere", true, false, false),
+        ("routed here, the proxy answers", false, true, false),
+        ("routed here, nothing answers", false, false, false),
+        (
+            "json, a settings file sends Claude elsewhere",
+            true,
+            false,
+            true,
+        ),
+    ];
+    let mut text = String::new();
+    for (label, settings, answers, json) in scenarios {
+        let home = tempfile::tempdir().expect("temp home");
+        if settings {
+            write_settings(home.path(), "https://gateway.example.com");
+        }
+        let port = if answers {
+            fake_status_endpoint(3)
+        } else {
+            free_port()
+        };
+        let config = write_config_with(home.path(), port, ALICE)
+            .display()
+            .to_string();
+        let mut args = vec!["doctor"];
+        if json {
+            args.push("--json");
+        }
+        args.extend(["--config", &config]);
+        let (code, stdout, stderr) = run_tcr(
+            home.path(),
+            Some(&format!("http://127.0.0.1:{port}")),
+            &args,
+        );
+        text.push_str(&normalize(
+            &format!("== {label}\nexit: {code:?}\n-- stdout\n{stdout}-- stderr\n{stderr}"),
+            home.path(),
+            port,
+        ));
+    }
+
+    let golden = claude_only_golden_path();
+    if std::env::var_os("TCR_UPDATE_DOCTOR_GOLDEN").is_some() {
+        std::fs::write(&golden, &text).expect("write the golden");
+        return;
+    }
+    let pinned = std::fs::read_to_string(&golden)
+        .unwrap_or_else(|e| panic!("cannot read the golden at {} ({e})", golden.display()));
+    assert_eq!(
+        text,
+        pinned,
+        "`tcr doctor` no longer prints what a Claude-only fleet saw before Codex accounts reached \
+         it ({}). This golden is never regenerated to fit a change, TCR_UPDATE_DOCTOR_GOLDEN \
+         included: a fleet with no Codex account must read exactly as it did.",
+        golden.display()
+    );
 }
