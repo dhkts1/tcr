@@ -118,6 +118,11 @@ struct SettingsDependencies {
     var groupController: GroupController
     var updater: Updater
     var onWhatsNew: () -> Void = {}
+    /// The command-line tcr a shell on this Mac would run, its version, and whether
+    /// it predates Codex accounts, for Settings › Updates. Blocking: the pane runs
+    /// it off the main thread, and only on a fleet holding a Codex account. The
+    /// render harness passes a fixed answer, so no render looks at this Mac's tcr.
+    var pathTcr: @Sendable () -> TcrTool.PathTcr? = { TcrTool.pathTcr() }
 }
 
 /// Reference-counted `.accessory` ↔ `.regular` toggling, the same pattern

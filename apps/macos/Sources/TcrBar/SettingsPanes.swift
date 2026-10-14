@@ -122,6 +122,12 @@ struct GeneralSettingsPane: View {
         self.poller = dependencies.poller
     }
 
+    /// The route the running proxy reports for Codex. It is the same on every Codex
+    /// row, so the first that carries one is read; `nil` until the server says.
+    private func codexRoute(in fleet: Fleet) -> CodexRoute? {
+        fleet.accounts.lazy.filter { $0.provider == .codex }.compactMap(\.codexRoute).first
+    }
+
     var body: some View {
         Form {
             Section {
@@ -158,6 +164,24 @@ struct GeneralSettingsPane: View {
                     Text("\(Int(poller.interval)) s")
                         .foregroundStyle(Tok.inkDim)
                         .monospacedDigit()
+                }
+                // Only on a fleet holding a Codex account: whether the running
+                // proxy pools codex, as it reported. Read-only, because nothing
+                // in this window changes it.
+                if let fleet = poller.state.loadedFleet, fleet.holdsCodex {
+                    LabeledContent {
+                        HStack(spacing: 6) {
+                            Text(CodexSignInCopy.settingsCodexValue(route: codexRoute(in: fleet)))
+                                .foregroundStyle(Tok.inkDim)
+                                .lineLimit(2)
+                            rowTag(
+                                SettingsRowBadge.timing(for: SettingsRowBadge.serverCodex) ?? .readOnly,
+                                inSection: SettingsRowBadge.timing(for: SettingsRowBadge.proxyRestart)
+                                    ?? .live)
+                        }
+                    } label: {
+                        Text(CodexSignInCopy.settingsCodexLabel)
+                    }
                 }
             } header: {
                 SectionHeader(
@@ -370,6 +394,12 @@ struct GroupsRotationSettingsPane: View {
         self.groupController = dependencies.groupController
     }
 
+    /// "Claude accounts only" under the four rotation rows that only Claude
+    /// accounts follow, on a fleet holding a Codex account; nothing on any other.
+    private var claudeOnlyScope: String? {
+        poller.state.loadedFleet?.holdsCodex == true ? CodexSignInCopy.rotationScope : nil
+    }
+
     /// Derived from the FULL fleet, not a filtered panel view — S8's own
     /// fix (`docs/design/panel-tabs-review.md`): every group the fleet has
     /// is a row here, not only the ones with an expanded card on the panel.
@@ -411,12 +441,13 @@ struct GroupsRotationSettingsPane: View {
                     "Control reserve",
                     "The control account is picked below threshold minus reserve.",
                     value: "5%",
-                    key: SettingsRowBadge.controlReserve, sectionTiming: rotationSectionTiming)
+                    key: SettingsRowBadge.controlReserve, sectionTiming: rotationSectionTiming,
+                    scope: claudeOnlyScope)
                 readOnlyRow(
                     "Fable weekly threshold", "The separate ceiling for the weekly window.",
                     value: "80%",
                     key: SettingsRowBadge.fableWeeklyThreshold,
-                    sectionTiming: rotationSectionTiming)
+                    sectionTiming: rotationSectionTiming, scope: claudeOnlyScope)
                 readOnlyRow(
                     "Reset urgency tier",
                     "An account resetting within this long is preferred.",
@@ -430,11 +461,12 @@ struct GroupsRotationSettingsPane: View {
                 readOnlyRow(
                     "Control account", nil, value: "henry@example.com",
                     key: SettingsRowBadge.controlAccount,
-                    sectionTiming: rotationSectionTiming)
+                    sectionTiming: rotationSectionTiming, scope: claudeOnlyScope)
                 readOnlyRow(
                     "Pooled control", "Let the control account serve ordinary traffic too.",
                     value: "Off",
-                    key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming)
+                    key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming,
+                    scope: claudeOnlyScope)
             } header: {
                 SectionHeader(title: "Rotation", timing: rotationSectionTiming, hint: readOnlyHint)
             }
@@ -508,10 +540,21 @@ struct GroupsRotationSettingsPane: View {
                 Text(group.isReserved ? "Yes" : "No").foregroundStyle(Tok.inkDim)
                 rowTag(.readOnly, inSection: groupsSectionTiming)
             }
-            .help("Only sessions tagged with this group route here. \(readOnlyHint)")
+            .help(
+                group.codexMemberCount > 0
+                    ? "Only sessions tagged with this group route here. "
+                        + "\(CodexSignInCopy.groupReservedCodexHelp) \(readOnlyHint)"
+                    : "Only sessions tagged with this group route here. \(readOnlyHint)")
 
             HStack(spacing: 6) {
-                Text("Members: \(group.memberCount)").monospacedDigit()
+                // Each provider counted in a group with a Codex member; the header
+                // above keeps the total.
+                Text(
+                    group.codexMemberCount > 0
+                        ? CodexSignInCopy.groupMembers(
+                            claude: group.claudeMemberCount, codex: group.codexMemberCount)
+                        : "Members: \(group.memberCount)"
+                ).monospacedDigit()
                 Spacer()
                 if let hex = group.colorHex {
                     Circle().fill(Color(hex: hex) ?? Tok.inkFaint).frame(width: 14, height: 14)
@@ -533,10 +576,12 @@ struct GroupsRotationSettingsPane: View {
     ///   config). A blank value where a number belongs was worse than a
     ///   labelled illustrative one — a reader has no way to tell "unmeasured"
     ///   from "forgot to wire this up".
+    /// - Parameter scope: one more caption under the detail, naming which
+    ///   accounts the row applies to, or `nil` for none.
     @ViewBuilder
     private func readOnlyRow(
         _ title: String, _ detail: String?, value: String, key: String,
-        sectionTiming: SettingsRowTiming
+        sectionTiming: SettingsRowTiming, scope: String? = nil
     ) -> some View {
         LabeledContent {
             HStack(spacing: 6) {
@@ -548,6 +593,9 @@ struct GroupsRotationSettingsPane: View {
                 Text(title)
                 if let detail {
                     Text(detail).font(.caption).foregroundStyle(Tok.inkDim)
+                }
+                if let scope {
+                    Text(scope).font(.caption).foregroundStyle(Tok.inkDim)
                 }
             }
         }
@@ -568,11 +616,23 @@ struct UpdatesSettingsPane: View {
     let dependencies: SettingsDependencies
     @ObservedObject private var updater: Updater
     @ObservedObject private var server: ServerController
+    @ObservedObject private var poller: StatusPoller
+    /// The command-line tcr a shell would run, read off the main thread when the
+    /// fleet holds a Codex account, and `nil` otherwise.
+    @State private var pathTcr: TcrTool.PathTcr?
 
     init(dependencies: SettingsDependencies) {
         self.dependencies = dependencies
         self.updater = dependencies.updater
         self.server = dependencies.server
+        self.poller = dependencies.poller
+    }
+
+    /// Only a loaded fleet holding a Codex account asks about the command-line tcr:
+    /// one that predates Codex accounts cannot read such a config. A poll that first
+    /// loads a Codex row asks again.
+    private var holdsCodex: Bool {
+        poller.state.loadedFleet?.holdsCodex == true
     }
 
     private var versionLine: String {
@@ -622,6 +682,10 @@ struct UpdatesSettingsPane: View {
                     Text(installedCliPath).font(.caption).foregroundStyle(Tok.inkDim)
                         .lineLimit(2)
                 }
+                if holdsCodex, let pathTcr, pathTcr.predatesCodex {
+                    Text(CodexSignInCopy.pathTcrFlag(path: pathTcr.path, version: pathTcr.version))
+                        .font(.caption).foregroundStyle(Tok.spent)
+                }
                 Text(
                     "Updating replaces both. TcrBar supervises the server, so an update "
                         + "restarts it and spends the cold prefix. You cannot replace the "
@@ -637,6 +701,14 @@ struct UpdatesSettingsPane: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .formContentTopMarginIfAvailable(8)
+        .task(id: holdsCodex) {
+            guard holdsCodex else {
+                pathTcr = nil
+                return
+            }
+            let read = dependencies.pathTcr
+            pathTcr = await Task.detached(priority: .utility) { read() }.value
+        }
     }
 
     @ViewBuilder

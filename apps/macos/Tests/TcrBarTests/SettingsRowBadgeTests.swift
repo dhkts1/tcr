@@ -33,6 +33,7 @@ final class SettingsRowBadgeTests: XCTestCase {
             SettingsRowBadge.checkNow, SettingsRowBadge.whatsNew,
             SettingsRowBadge.checkAutomatically, SettingsRowBadge.runningServer,
             SettingsRowBadge.installedCli, SettingsRowBadge.updatingReplacesBoth,
+            SettingsRowBadge.serverCodex,
         ]
         for key in declaredKeys {
             XCTAssertNotNil(
@@ -103,5 +104,12 @@ final class SettingsRowBadgeTests: XCTestCase {
     func testStartServerAtLaunchHasANonEmptyLabelForVoiceOver() {
         XCTAssertEqual(SettingsRowBadge.startServerAtLaunchLabel, "Start the server at launch")
         XCTAssertFalse(SettingsRowBadge.startServerAtLaunchLabel.isEmpty)
+    }
+
+    /// The Codex row under Server shows what the running proxy reports and offers no
+    /// control, so it reads as read-only.
+    func testTheCodexServerRowIsReadOnly() {
+        XCTAssertEqual(SettingsRowBadge.timing(for: SettingsRowBadge.serverCodex), .readOnly)
+        XCTAssertEqual(SettingsRowBadge.serverCodex, "server.codex")
     }
 }

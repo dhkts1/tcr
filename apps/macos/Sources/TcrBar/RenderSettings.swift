@@ -139,7 +139,9 @@ enum RenderSettings {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if render(
-                    tab, appearance: appearance, fleet: mixed, nameSuffix: "-mixed", into: directory)
+                    tab, appearance: appearance,
+                    fleet: tab == .groupsRotation ? mixedFleetWithOrchard() : mixed,
+                    nameSuffix: "-mixed", into: directory)
                 {
                     written += 1
                 }
@@ -180,8 +182,10 @@ enum RenderSettings {
     /// The panes that draw something of their own over a fleet holding both
     /// Claude and Codex accounts: Menu Bar's "Cup shows" row and its counts
     /// caption, and Peers, whose promises name Claude and whose Sharing head says
-    /// that Codex requests always leave from this Mac.
-    static let mixedTabs: [SettingsTab] = [.menuBar, .peers]
+    /// that Codex requests always leave from this Mac; General's Codex row under
+    /// Server, Updates' flag on a command-line tcr that predates Codex accounts, and
+    /// Groups & Rotation's Claude-only rotation rows and per-provider Members line.
+    static let mixedTabs: [SettingsTab] = [.menuBar, .peers, .general, .updates, .groupsRotation]
 
     /// ``fixtureAccounts()`` plus canonical bob, a ready Codex account: a fleet
     /// holding both providers.
@@ -191,6 +195,17 @@ enum RenderSettings {
             preconditionFailure("canonical bob does not decode")
         }
         return Fleet(accounts: fixtureAccounts() + [bob])
+    }
+
+    /// ``mixedFleet()`` plus canonical ivy, a Codex account in ORCHARD, for the Groups
+    /// pane: the fixture's own groups hold only Claude accounts, so without her no group
+    /// would have a Codex member to count.
+    private static func mixedFleetWithOrchard() -> Fleet {
+        let row = RenderStates.codexRow(.ivy, now: Date())
+        guard let ivy = try? Fleet.decode(Data("[\(row)]".utf8)).accounts.first else {
+            preconditionFailure("canonical ivy does not decode")
+        }
+        return Fleet(accounts: mixedFleet().accounts + [ivy])
     }
 
     /// 660×581, the reviewed window as a FRAME
@@ -360,7 +375,10 @@ enum RenderSettings {
             panelDensityPreference: PanelDensityPreference(),
             groupController: GroupController(),
             updater: Updater(startingUpdater: false),
-            onWhatsNew: {})
+            onWhatsNew: {},
+            // A fixed answer, never this Mac's tcr: a command-line tcr that predates
+            // Codex accounts. Read only over a fleet holding a Codex account.
+            pathTcr: { TcrTool.PathTcr(path: "/usr/local/bin/tcr", version: "0.2.44", predatesCodex: true) })
 
         // A fresh navigation object per capture, not `.shared` — so setting
         // `selectedTab` here can never race or persist against a later call

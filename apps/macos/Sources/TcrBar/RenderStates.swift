@@ -298,6 +298,25 @@ enum RenderStates {
             // Scene 22's Claude account beside a Codex account that is serving: the Claude
             // line names Claude, and no Codex line shows.
             ("26h-mixed-claude-no-requests-banner", .loaded(fleet(mixedClaudeQuietJSON)), false, nil),
+            // The tcr inside TcrBar is too old for a config holding a Codex account: the
+            // poll's banner names that tcr and the fix, where tcr's words name a version.
+            (
+                "09b-bundled-tcr-predates-codex",
+                .commandFailed(
+                    exitCode: 1,
+                    message:
+                        "error: could not read /Users/example/.config/teamclaude.json: account "
+                        + "\"bob@example.com/codex\" carries credentialVersion 2, which this build "
+                        + "only understands up to 1; refusing to load rather than silently "
+                        + "reinterpret its credential shape"),
+                false, nil
+            ),
+            // A Codex re-login tcr refused, its reason kept under erin's line for this app
+            // run. See ``codexNotesFixture(for:)``.
+            ("25d-codex-relogin-refused", .loaded(fleet(codexReloginRefusedJSON)), false, nil),
+            // ivy added to ORCHARD: tcr's warning that no Codex request can ask for a
+            // group, kept under her line.
+            ("25f-codex-group-add-warning", .loaded(fleet(codexGroupAddWarningJSON)), false, nil),
         ]
     }
 
@@ -318,6 +337,23 @@ enum RenderStates {
                 AccountRef(name: "bob@example.com"):
                     "[tcr] the proxy running on :3456 stopped routing to 'bob@example.com', but it predates live removal and keeps listing it as disabled until it restarts."
             ])
+    }
+
+    /// The Codex notes scenes 25d and 25f draw under a line, recorded against the rows
+    /// those scenes draw. Every other scene gets none, so a note an operator's own run
+    /// recorded never reaches a render.
+    private static func codexNotesFixture(for sceneName: String) -> CodexNotes {
+        var notes = CodexNotes()
+        switch sceneName {
+        case "25d-codex-relogin-refused":
+            notes.recordReloginRefusal(routedRefusal, for: sceneRow(.erin))
+        case "25f-codex-group-add-warning":
+            notes.recordGroupAddNotice(
+                orchardWarning, group: "orchard", for: sceneRow(.ivy).ref)
+        default:
+            break
+        }
+        return notes
     }
 
     /// Seeds for scene 22, the one scene that needs
@@ -430,6 +466,81 @@ enum RenderStates {
                         + "live login — no browser was opened and nothing was changed."),
                 nil
             ),
+        ]
+    }
+
+    /// The sheet for a Codex account: the chooser, the sign-in in each of its phases,
+    /// the import, and what the sheet says when tcr cannot find codex. Every reason and
+    /// notice is inlined as tcr sends it, because a render never reads the test bundle.
+    private static var codexSheetScenes:
+        [(name: String, phase: LoginPhase, url: URL?, facts: LoginSheetFacts)]
+    {
+        let authorize = URL(
+            string: "https://auth.openai.com/oauth/authorize?client_id=app_EXAMPLE&state=RENDER-FIXTURE")
+        let signIn = LoginSheetFacts(request: .codex(account: nil))
+        let home = "/Users/example/.codex"
+        let saved = LoginSheetFacts(
+            request: .codex(account: nil),
+            notices: [
+                "tcr intercepts chatgpt.com from now on: codex started with `tcr run --codex` is "
+                    + "pooled; a codex that reaches this proxy some other way needs "
+                    + "CODEX_CA_CERTIFICATE set to tcr's CA, or chatgpt.com in NO_PROXY to stay on "
+                    + "its own login",
+                "codex needs a login of its own to start, even when pooled, and none is at "
+                    + "/Users/example/.codex/auth.json: unless codex keeps its login in the "
+                    + "keyring, run `codex login` once",
+                "the tcr at /usr/local/bin/tcr (0.2.44) predates Codex accounts: update it before "
+                    + "it next starts — it would read this login as a Claude account and send its "
+                    + "token to Anthropic",
+            ],
+            savedPlan: "ChatGPT Pro")
+        var savedWithoutPathTcr = saved
+        savedWithoutPathTcr.notices = Array(saved.notices.prefix(2))
+        savedWithoutPathTcr.bundledTcrWithoutCLI = "/Applications/TcrBar.app/Contents/MacOS/tcr"
+        let missing = LoginSheetFacts(request: .codex(account: nil), failureCode: "codex-missing")
+        var refusedChoice = missing
+        refusedChoice.refusedCodexChoice = "~/Downloads/codex is not an executable file."
+        let missingReason =
+            "could not find the codex CLI (searched /Users/example/.local/bin, "
+            + "/Users/example/.cargo/bin, /opt/homebrew/bin, /usr/local/bin). Install it, or set "
+            + "TCR_CODEX_BIN to its path. Nothing was written."
+        return [
+            ("20e-login-choose", .choosing, nil, LoginSheetFacts()),
+            ("20f-login-codex-opening", .opening, nil, signIn),
+            ("20g-login-codex-waiting", .waitingForBrowser(email: nil), authorize, signIn),
+            ("20h-login-codex-waiting-no-url", .waitingForBrowser(email: nil), nil, signIn),
+            ("20i-login-codex-saved", .saved(account: "bob@example.com"), nil, saved),
+            (
+                "20j-login-codex-refused", .failed(reason: routedRefusal), nil,
+                LoginSheetFacts(request: .codex(account: nil), failureCode: "codex-routed")
+            ),
+            ("20k-login-codex-missing", .failed(reason: missingReason), nil, missing),
+            (
+                "20l-login-codex-identity",
+                .failed(
+                    reason:
+                        "the ChatGPT login that came back is carol@example.com, not the one "
+                        + "'erin@example.com/codex' holds. Sign out of chatgpt.com in the browser "
+                        + "first, or use a private window, then retry "
+                        + "`tcr login --codex --account erin@example.com/codex`. Nothing was written."),
+                nil,
+                LoginSheetFacts(
+                    request: .codex(account: "erin@example.com/codex"), failureCode: "codex-identity")
+            ),
+            (
+                "20m-codex-import-confirm", .confirmingImport(home: home, account: nil), nil,
+                LoginSheetFacts(request: .codexImport(home: home, account: nil))
+            ),
+            (
+                "20n-codex-import-saved", .saved(account: "bob@example.com"), nil,
+                LoginSheetFacts(
+                    request: .codexImport(home: home, account: nil), savedPlan: "ChatGPT Pro")
+            ),
+            (
+                "20i-login-codex-saved-no-path-tcr", .saved(account: "bob@example.com"), nil,
+                savedWithoutPathTcr
+            ),
+            ("20o-login-codex-choice-refused", .failed(reason: missingReason), nil, refusedChoice),
         ]
     }
 
@@ -644,6 +755,18 @@ enum RenderStates {
                 if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        // The Codex sheets, the same way, each with what it says beyond its phase.
+        for scene in codexSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderSheet(
+                    (scene.name, scene.phase, scene.url), appearance: appearance, into: directory,
+                    facts: scene.facts)
+                {
+                    written += 1
+                }
+            }
+        }
         for scene in peerSceneList {
             for appearance in Appearance.allCases {
                 attempted += 1
@@ -851,6 +974,8 @@ enum RenderStates {
                 // Render mode never looks at this Mac's codex: `.absent`, except in
                 // the one scene that names a presence of its own.
                 codexPresence: seeds.presence,
+                // Empty, except in the two scenes that draw a note under a line.
+                codexNotes: CodexNoteStore(notes: codexNotesFixture(for: scene.name)),
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
                 initialSessionFiles: sessionFilesFixture(for: scene.name),
@@ -910,14 +1035,22 @@ enum RenderStates {
     /// Same appearance dance as ``render(_:appearance:into:)`` and the same
     /// writer, and deliberately NO controller of any kind: a ``LoginSession``
     /// would spawn `tcr login`. The harness draws a phase, never a login.
+    ///
+    /// `facts` is everything a Codex sheet says beyond its phase, empty for the Claude
+    /// sheets, and `displayHome` the home a codex folder is shortened against: always
+    /// `/Users/example`, never the rendering Mac's.
     @MainActor
     private static func renderSheet(
         _ scene: (name: String, phase: LoginPhase, url: URL?),
         appearance: Appearance,
-        into directory: URL
+        into directory: URL,
+        facts: LoginSheetFacts = LoginSheetFacts(),
+        displayHome: String = "/Users/example"
     ) -> Bool {
         return withDrawingAppearance(appearance.nsAppearance) {
-            renderSheetUnderCurrentAppearance(scene, appearance: appearance, into: directory)
+            renderSheetUnderCurrentAppearance(
+                scene, appearance: appearance, into: directory, facts: facts,
+                displayHome: displayHome)
         }
     }
 
@@ -928,7 +1061,9 @@ enum RenderStates {
     private static func renderSheetUnderCurrentAppearance(
         _ scene: (name: String, phase: LoginPhase, url: URL?),
         appearance: Appearance,
-        into directory: URL
+        into directory: URL,
+        facts: LoginSheetFacts,
+        displayHome: String
     ) -> Bool {
         // The panel underneath is the ordinary healthy Accounts tab, built the
         // same way every other scene builds one — pinned state, harness
@@ -968,7 +1103,7 @@ enum RenderStates {
                     // app has.
                     LoginSheet(
                         phase: scene.phase, codexPresence: .absent, authorizeURL: scene.url,
-                        snapshotMode: true
+                        snapshotMode: true, facts: facts, displayHome: displayHome
                     )
                     .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
                     .shadow(radius: sheetShadowRadius)
@@ -4267,6 +4402,44 @@ extension RenderStates {
     private static var mixedClaudeQuietJSON: String {
         "[\(colleagueRow),\(codexRow(.bob, now: Date(), extra: ["codexTraffic": quietCodexTraffic]))]"
     }
+
+    /// Scene `25d-codex-relogin-refused`: canonical alice, and erin, signed out, with quiet
+    /// traffic so no refusal banner draws. alice reports no Codex traffic at all.
+    private static var codexReloginRefusedJSON: String {
+        let now = Date()
+        return "[\(codexRow(.alice, now: now)),\(codexRow(.erin, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
+    }
+
+    /// Scene `25f-codex-group-add-warning`: canonical alice and ivy, both in ORCHARD, ivy with
+    /// quiet traffic.
+    private static var codexGroupAddWarningJSON: String {
+        let now = Date()
+        return "[\(codexRow(.alice, now: now)),\(codexRow(.ivy, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
+    }
+
+    /// One Codex row of scenes 25d and 25f, decoded as those scenes decode it, so a note is
+    /// recorded against the row the scene draws.
+    private static func sceneRow(_ row: CanonicalCodexRow) -> Account {
+        let json = "[\(codexRow(row, now: Date(), extra: ["codexTraffic": quietCodexTraffic]))]"
+        guard let account = try? Fleet.decode(Data(json.utf8)).accounts.first else {
+            preconditionFailure("the canonical \(row.rawValue) does not decode")
+        }
+        return account
+    }
+
+    /// tcr's refusal of a Codex login whose ChatGPT workspace is served away from
+    /// chatgpt.com, as `tcr login --codex` sends it.
+    private static let routedRefusal =
+        "this Codex login's ChatGPT workspace is not served at https://chatgpt.com with no "
+        + "routing of its own (workspace_backend_origin is \"https://gov.chatgpt.com\"): codex "
+        + "sends that workspace's traffic to its own backend, or routes it by residency, and tcr "
+        + "pools a Codex login only at https://chatgpt.com. Nothing was written."
+
+    /// What `tcr group add orchard ivy@example.com` prints on stderr when it succeeds.
+    private static let orchardWarning =
+        "warning: 'ivy@example.com' is a Codex account. A Codex session cannot ask for a group, "
+        + "so 'orchard' labels it and can park it, but never routes to it; while 'orchard' is "
+        + "reserved, it serves nothing."
 
     /// frank's `usage`: canonical alice's, so his day is hers, with his own window on his
     /// card, `$9.02 · 31k`.

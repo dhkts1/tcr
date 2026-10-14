@@ -40,6 +40,15 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
     /// after the failures and before the note on a success: a state the account
     /// is in outranks a remark on something that worked. `nil` on every Claude
     /// row, which therefore gets exactly the lines it always did.
+    ///
+    /// A failure that carries the refusal of a bundled tcr too old to read a
+    /// config holding a Codex account reads as the sentence naming that tcr
+    /// (``PredatesCodexRefusal/displayed(_:)``), since tcr's own words name a
+    /// version and not the fix. Such a tcr refuses every command with the same
+    /// words, so a line whose text an earlier line already has is dropped: the
+    /// row says it once. Lines of different texts are all kept, as before, and
+    /// two failures of tcr's own words never share a text, because each starts
+    /// with its own prefix.
     public static func collect(
         deleteFailure: RemoveAccountCommand.Failure?,
         deleteNotice: String?,
@@ -49,16 +58,13 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
     ) -> [AccountRowNotice] {
         var lines: [AccountRowNotice] = []
         if let deleteFailure {
-            lines.append(AccountRowNotice(text: deleteFailure.summary, tone: .failure))
+            lines.append(failure(deleteFailure.summary))
         }
         if let groupFailure {
-            lines.append(
-                AccountRowNotice(
-                    text: "group “\(groupFailure.group)”: \(groupFailure.failure.summary)",
-                    tone: .failure))
+            lines.append(failure("group “\(groupFailure.group)”: \(groupFailure.failure.summary)"))
         }
         if let toggleFailure {
-            lines.append(AccountRowNotice(text: toggleFailure.summary, tone: .failure))
+            lines.append(failure(toggleFailure.summary))
         }
         if let codexNote {
             lines.append(codexNote)
@@ -66,6 +72,11 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
         if let deleteNotice {
             lines.append(AccountRowNotice(text: deleteNotice, tone: .note))
         }
-        return lines
+        var seen = Set<String>()
+        return lines.filter { seen.insert($0.text).inserted }
+    }
+
+    private static func failure(_ text: String) -> AccountRowNotice {
+        AccountRowNotice(text: PredatesCodexRefusal.displayed(text), tone: .failure)
     }
 }

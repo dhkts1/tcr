@@ -214,6 +214,31 @@ final class AccountActionsTests: XCTestCase {
                 + "a test of the exit rather than of every Codex row")
     }
 
+    /// Re-import takes the login a codex folder holds now, so only a Codex row that was
+    /// imported from a folder, and so names one, offers it.
+    func testTheReimportItemNeedsACodexHome() throws {
+        XCTAssertTrue(try canonical("erin@example.com/codex").availableActions.contains(.reimport))
+        XCTAssertFalse(try canonical("bob@example.com/codex").availableActions.contains(.reimport))
+        XCTAssertFalse(try canonical("alice@example.com").availableActions.contains(.reimport))
+    }
+
+    /// Re-login runs the sign-in of the row's own provider, for that row, and Re-import
+    /// reads the folder the row names. Re-login stays offered on both providers.
+    func testACodexReloginRunsTheCodexSignIn() throws {
+        let erin = try canonical("erin@example.com/codex")
+        let alice = try canonical("alice@example.com")
+        let bob = try canonical("bob@example.com/codex")
+        XCTAssertEqual(erin.reloginRequest, .codex(account: "erin@example.com/codex"))
+        XCTAssertEqual(alice.reloginRequest, .claude(account: "alice@example.com"))
+        XCTAssertEqual(
+            erin.reimportRequest,
+            .codexImport(home: "/Users/example/.codex", account: "erin@example.com/codex"))
+        XCTAssertNil(bob.reimportRequest)
+        XCTAssertNil(alice.reimportRequest)
+        XCTAssertTrue(erin.availableActions.contains(.relogin))
+        XCTAssertTrue(alice.availableActions.contains(.relogin))
+    }
+
     /// One canonical row, decoded inside the whole canonical fleet.
     private func canonical(_ name: String) throws -> Account {
         try XCTUnwrap(

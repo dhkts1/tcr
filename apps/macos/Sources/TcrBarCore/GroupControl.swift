@@ -188,6 +188,19 @@ public enum GroupCommand {
         case failed(Failure)
     }
 
+    /// The warning in a successful command's stderr: its first line that starts with
+    /// `warning: `, without that prefix, or `nil` when it warned of nothing.
+    ///
+    /// Adding a Codex account to a group succeeds and warns that no Codex request can
+    /// ask for a group. That warning is what the account's line keeps; the rest of
+    /// stderr is a remark on a success.
+    public static func warning(inNotice notice: String) -> String? {
+        let prefix = "warning: "
+        return notice.split(whereSeparator: \.isNewline)
+            .first { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+    }
+
     /// Pure classification of a finished invocation.
     public static func classify(exitCode: Int32, stderr: String) -> Outcome {
         let text = stderr.trimmingCharacters(in: .whitespacesAndNewlines)

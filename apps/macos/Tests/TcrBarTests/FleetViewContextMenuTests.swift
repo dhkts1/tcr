@@ -166,6 +166,19 @@ final class ContextMenuReloginAvailabilityTests: XCTestCase {
         }
     }
 
+    /// Re-import is one more gated item in the one menu every route reaches, offered
+    /// through ``Account/availableActions`` on a Codex row that names the codex folder it
+    /// was imported from. Re-login stays where it was.
+    func testTheReimportItemIsGatedThroughAvailableActions() throws {
+        let body = try contextMenuItemsBody()
+        XCTAssertTrue(
+            body.contains("availableActions.contains(.reimport)"),
+            "Re-import is offered outside availableActions, so a row with no codex folder "
+                + "could be offered an import of nothing")
+        XCTAssertTrue(body.contains("onReimport()"), "the Re-import item runs nothing")
+        XCTAssertTrue(body.contains(#"Button("Re-login…") { onRelogin() }"#))
+    }
+
     /// Every whitespace run as one space: FleetView.swift is not swift-format linted, so
     /// its indentation is not stable.
     private func collapsed(_ text: String) -> String {

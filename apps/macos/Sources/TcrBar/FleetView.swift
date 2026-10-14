@@ -38,7 +38,20 @@ struct FleetView: View {
     /// (``CodexPresence/emptyFleetHint(home:)``). It is a parameter for the same
     /// reason ``snapshotMode`` is: the render harness passes `.absent`, except in
     /// the one scene that names its own.
+    ///
+    /// Add account… and the sign-in sheet read it through ``effectivePresence``,
+    /// which also counts the fleet's own Codex rows.
     let codexPresence: CodexPresence
+    /// What the panel keeps under a Codex account's line for this app run: a
+    /// refused re-login and a group add's warning. Owned by the shell so a note
+    /// survives the panel closing, and observed so recording one redraws the
+    /// lines. The render harness hands each scene its own.
+    @ObservedObject var codexNotes: CodexNoteStore
+    /// The tcr inside TcrBar when this Mac has no other, resolved by the shell
+    /// beside ``codexPresence``: the Codex line and a saved Codex sign-in say how
+    /// to start codex through the pool with it. The render harness passes
+    /// `initialBundledTcrWithoutCLI` instead.
+    let bundledTcrWithoutCLI: String?
 
     /// Render the account list unscrolled, for the PNG harness only.
     ///
@@ -58,6 +71,11 @@ struct FleetView: View {
     /// Opens the Settings window (gear button, `⌘,`). Same closure shape as
     /// ``onWhatsNew``, and for the same reason: the render harness passes `{}`.
     var onSettings: () -> Void = {}
+    /// Runs a picker for the sign-in sheet, the codex folder to import or the codex
+    /// to use, and keeps the panel up while it runs (the shell's
+    /// `runOpenPanel(_:)`). Same closure shape as ``onSettings``, and for the same
+    /// reason: the render harness passes nothing and can open no panel.
+    var runOpenPanel: (NSOpenPanel) -> URL? = { _ in nil }
     /// Run when **Find Macs on this network** is switched ON, which is where
     /// notification permission is asked for. Same closure shape and same
     /// reason as the two above: the render harness passes `{}`, so a rendered
@@ -283,9 +301,14 @@ struct FleetView: View {
         removeController: RemoveAccountController,
         startServerAtLaunch: Binding<Bool>,
         codexPresence: CodexPresence,
+        // `nil` means a store of the panel's own, made below: a default argument
+        // is evaluated off the main actor, where the store cannot be made.
+        codexNotes: CodexNoteStore? = nil,
+        bundledTcrWithoutCLI: String? = nil,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
+        runOpenPanel: @escaping (NSOpenPanel) -> URL? = { _ in nil },
         onFindingTurnedOn: @escaping () -> Void = {},
         initialTab: PanelTab = .accounts,
         // Found in review (2026-09-12): `snapshotMode` never reads
@@ -363,9 +386,12 @@ struct FleetView: View {
         self.removeController = removeController
         self._startServerAtLaunch = startServerAtLaunch
         self.codexPresence = codexPresence
+        self.codexNotes = codexNotes ?? CodexNoteStore()
+        self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings
+        self.runOpenPanel = runOpenPanel
         self.onFindingTurnedOn = onFindingTurnedOn
         self._selectedTab = State(initialValue: initialTab)
         self._sessionFiles = State(initialValue: initialSessionFiles)
@@ -430,6 +456,7 @@ struct FleetView: View {
                 refreshCodexCount()
                 refreshCodexZeroRequestsSince()
                 pruneKeptOpenCards()
+                reconcileCodexNotes()
             }
             syncPeersProvider()
         }
@@ -469,12 +496,19 @@ struct FleetView: View {
             if let loginSession {
                 LoginSheetHost(
                     session: loginSession,
+                    bundledTcrWithoutCLI: bundledTcrWithoutCLI,
                     onCopyLink: { url in
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(url.absoluteString, forType: .string)
                     },
                     onCancel: { endLogin(cancelling: true) },
-                    onDone: { endLogin(cancelling: false) }
+                    onDone: { endLogin(cancelling: false) },
+                    onChoose: { request in beginLogin(request) },
+                    onImportLink: { chooseCodexFolder(for: loginSession) },
+                    onConfirmImport: {
+                        if let request = loginSession.request { beginLogin(request) }
+                    },
+                    onChooseCodex: { chooseCodexExecutable(for: loginSession) }
                 )
             }
         }
@@ -603,7 +637,7 @@ struct FleetView: View {
             fleet: fleet, codexProcesses: codexCount,
             codexQuietFor: codexZeroRequestsSince.map { Date().timeIntervalSince($0) },
             peerSharing: peerSharingSeed ?? peers.snapshot.sharing,
-            bundledTcrWithoutCLI: bundledTcrSeed)
+            bundledTcrWithoutCLI: snapshotMode ? bundledTcrSeed : bundledTcrWithoutCLI)
         {
             Text(banner.text)
                 .font(V4.font(V4.muteSize))
@@ -908,8 +942,9 @@ struct FleetView: View {
                     toggleFailure: accounts.failure(for: account.ref),
                     codexNote: account.provider == .codex
                         ? CodexCardFacts.noteLine(
-                            reloginRefusal: nil, loginError: account.loginError,
-                            codexHome: account.codexHome, groupAddWarning: nil
+                            reloginRefusal: codexNotes.notes.reloginRefusal(for: account.ref),
+                            loginError: account.loginError, codexHome: account.codexHome,
+                            groupAddWarning: codexNotes.notes.groupAddWarning(for: account.ref)
                         ).map(AccountRowNotice.init(codexNote:))
                         : nil)
             },
@@ -943,11 +978,13 @@ struct FleetView: View {
             accounts: accounts,
             control: control,
             onChanged: { await poller.pollOnce() },
-            onRelogin: { reloginAccount(account.ref) },
+            onRelogin: { reloginAccount(account) },
+            onReimport: { reimportAccount(account) },
             onMint: { mintAccountToken(account.ref) },
             onMintGroup: { group in mintGroupTokens(group) },
             groupController: groupController,
             removeController: removeController,
+            codexNotes: codexNotes,
             allAccounts: fleet.accounts,
             snapshotMode: snapshotMode,
             menuOnly: menuOnly,
@@ -972,7 +1009,7 @@ struct FleetView: View {
                     v4Actions
                 }
                 if let loginError {
-                    Text(loginError)
+                    Text(PredatesCodexRefusal.displayed(loginError))
                         .font(V4.font(V4.muteSize))
                         .foregroundStyle(Tok.spent)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1095,7 +1132,7 @@ struct FleetView: View {
                 if !fleetIsEmpty {
                     V4Button(
                         title: "Add account…",
-                        help: Self.addAccountHelp
+                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp
                     ) { addAccount() }
                 }
                 Spacer(minLength: 0)
@@ -1386,12 +1423,25 @@ struct FleetView: View {
                 tint: Tok.spent
             )
         case .commandFailed(let code, let message):
-            banner(
-                icon: Tok.unreadableGlyph,
-                title: "tcr status failed (exit \(code))",
-                detail: message.isEmpty ? "The server is probably not running." : message,
-                tint: Tok.spent
-            )
+            if PredatesCodexRefusal.matches(message) {
+                // The bundled tcr cannot read a config holding a Codex account, and
+                // its refusal names a credential version, not the fix. The banner
+                // names the tcr and the fix; tcr's own words stay in the tooltip.
+                banner(
+                    icon: Tok.unreadableGlyph,
+                    title: CodexSignInCopy.predatesCodexTitle,
+                    detail: CodexSignInCopy.predatesCodexDetail,
+                    tint: Tok.spent
+                )
+                .help(message)
+            } else {
+                banner(
+                    icon: Tok.unreadableGlyph,
+                    title: "tcr status failed (exit \(code))",
+                    detail: message.isEmpty ? "The server is probably not running." : message,
+                    tint: Tok.spent
+                )
+            }
         case .undecodable(let message):
             // The decoder's own text is a Swift `DecodingError` description —
             // key paths and type names. It is the right thing to keep and the
@@ -1411,7 +1461,7 @@ struct FleetView: View {
         case .loaded(let fleet):
             if fleet.accounts.isEmpty {
                 // The remedy is a button now, not an instruction: signing in
-                // runs in the app (``beginLogin(reloggingIn:)``), and telling
+                // runs in the app (``beginLogin(_:)``), and telling
                 // someone to go and type a command is the worst version of an
                 // empty state — it names work the panel can do for them.
                 VStack(alignment: .leading, spacing: V4.buttonGap) {
@@ -1426,7 +1476,7 @@ struct FleetView: View {
                     )
                     V4Button(
                         title: "Add account…",
-                        help: Self.addAccountHelp
+                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp
                     ) { addAccount() }
                 }
             } else {
@@ -2443,6 +2493,16 @@ struct FleetView: View {
         }
     }
 
+    /// Drops every Codex note the poll that just landed has moved past: a refused
+    /// re-login once its row's state changes, a group add's warning once its row
+    /// leaves that group, and either once its row leaves the fleet. Only off a
+    /// loaded fleet, for the reason ``pruneKeptOpenCards()`` gives: a failed poll
+    /// says nothing about the rows, so it leaves every note as it was.
+    private func reconcileCodexNotes() {
+        guard case .loaded(let fleet) = poller.state else { return }
+        codexNotes.reconcile(with: fleet.accounts)
+    }
+
     /// "Keep Card Open" / "Close Card": the line turns into the card, or the
     /// card back into the line, at once.
     private func toggleKeptOpen(_ accountID: String) {
@@ -3388,11 +3448,13 @@ struct FleetView: View {
             accounts: accounts,
             control: control,
             onChanged: { await poller.pollOnce() },
-            onRelogin: { reloginAccount(account.ref) },
+            onRelogin: { reloginAccount(account) },
+            onReimport: { reimportAccount(account) },
             onMint: { mintAccountToken(account.ref) },
             onMintGroup: { group in mintGroupTokens(group) },
             groupController: groupController,
             removeController: removeController,
+            codexNotes: codexNotes,
             allAccounts: fleet.accounts,
             enclosingGroupName: enclosingGroupName,
             // Every row reaching this section is parked BECAUSE this named
@@ -3596,7 +3658,7 @@ struct FleetView: View {
             fleetActions
 
             if let loginError {
-                Text(loginError)
+                Text(PredatesCodexRefusal.displayed(loginError))
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
@@ -3660,7 +3722,7 @@ struct FleetView: View {
             // rather than in a Terminal window they have to go and find.
             if !fleetIsEmpty {
                 Button("Add account…") { addAccount() }
-                    .help(Self.addAccountHelp)
+                    .help(CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp)
             }
             Spacer(minLength: 0)
         }
@@ -3707,26 +3769,69 @@ struct FleetView: View {
         }
     }
 
+    /// This Mac's codex evidence with the fleet's own Codex rows counted: a fleet
+    /// that holds a Codex account is evidence on any Mac. Add account… offers the
+    /// chooser on it, and each Add account… button names both providers.
+    private var effectivePresence: CodexPresence {
+        var presence = codexPresence
+        if let fleet = poller.state.loadedFleet { presence.fleetHoldsCodex = fleet.holdsCodex }
+        return presence
+    }
+
     /// Sign in, in the app.
     ///
     /// This used to be a Terminal hand-off with no alternative, because
     /// `tcr login` prompted on stdin. `--non-interactive` removed the prompts
     /// (`src/oauth.rs`'s `LoginUi`), so the panel runs the login itself and
-    /// shows a sheet — see ``beginLogin(reloggingIn:)`` for what happens when
+    /// shows a sheet — see ``beginLogin(_:)`` for what happens when
     /// the `tcr` on this machine predates that flag. The ellipsis in the label
     /// is still doing real work: this opens a browser window.
+    ///
+    /// On a Mac with no sign of codex this is the Claude sign-in, started at
+    /// once, exactly as it always was. With one, the sheet opens on the chooser
+    /// first, and nothing runs until a Claude or a Codex account, or the import,
+    /// is picked. The chooser's Codex help depends on whether this tcr has
+    /// `tcr login --codex`, which is asked once and remembered.
     private func addAccount() {
-        beginLogin(reloggingIn: nil)
+        guard effectivePresence.isPresent else {
+            beginLogin(.claude(account: nil))
+            return
+        }
+        loginError = nil
+        guard !snapshotMode else { return }
+        switch TcrTool.resolve() {
+        case .failure(let missing):
+            loginError = Self.loginFailureMessage(.toolMissing(searched: missing.searched))
+        case .success(let tcr):
+            let codex = effectivePresence.codexExecutable
+            loginSession = LoginSession(
+                request: nil, phase: .choosing,
+                codexSupported: LoginCapability.probeCodex(executable: tcr),
+                resolvedCodexExecutable: { codex })
+        }
     }
 
-    /// Same sign-in, aimed at one existing row: `tcr login --account <name>`
-    /// requests that identity and refuses to write anything if the browser
-    /// hands back a different one.
-    private func reloginAccount(_ account: AccountRef) {
-        beginLogin(reloggingIn: account.name)
+    /// Same sign-in, aimed at one existing row, by the row's own provider: a
+    /// Claude row runs `tcr login --account <name>` and a Codex row
+    /// `tcr login --codex --account <name>`. Either requests that identity and
+    /// refuses to write anything if the browser hands back a different one.
+    private func reloginAccount(_ account: Account) {
+        beginLogin(account.reloginRequest)
     }
 
-    /// Start an in-app login, or fall back to the Terminal window.
+    /// Take the login the codex folder a row was imported from holds now. The
+    /// sheet opens on the confirmation, which states that sharing the login costs
+    /// that codex one sign-in, and nothing runs until it is accepted.
+    private func reimportAccount(_ account: Account) {
+        guard let request = account.reimportRequest,
+            case .codexImport(let home, let name) = request
+        else { return }
+        loginError = nil
+        guard !snapshotMode else { return }
+        loginSession = LoginSession(request: request, phase: .confirmingImport(home: home, account: name))
+    }
+
+    /// Start a sign-in, in the sheet, or fall back to a Terminal window.
     ///
     /// The fallback is not a nicety. TcrBar and `tcr` update independently, so
     /// the binary this app resolves can be older than the app itself; without
@@ -3734,24 +3839,84 @@ struct FleetView: View {
     /// immediately on an unknown argument where they used to get a Terminal
     /// window that worked. ``LoginCapability/probe(executable:)`` asks that
     /// binary once and remembers the answer.
-    private func beginLogin(reloggingIn name: String?) {
+    ///
+    /// A Codex sign-in or import asks again at every click
+    /// (``LoginCapability/readCodexPath(executable:)``): a `tcr` with
+    /// `tcr login --codex` runs it here; one that can only import a codex login
+    /// gets the two commands in Terminal; and one that predates Codex accounts
+    /// gets the sheet's failed phase naming it, and no script at all, since
+    /// nothing it can run would work. A Terminal fallback closes the sheet first.
+    ///
+    /// A sheet already up, the chooser or the import's confirmation, runs the
+    /// request itself; otherwise a new one is presented.
+    private func beginLogin(_ request: LoginRequest) {
         loginError = nil
         guard !snapshotMode else { return }
 
         switch TcrTool.resolve() {
         case .failure(let missing):
             loginError = Self.loginFailureMessage(.toolMissing(searched: missing.searched))
+            return
         case .success(let executable):
-            guard LoginCapability.probe(executable: executable) else {
-                if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
-                    loginError = Self.loginFailureMessage(why)
+            switch request {
+            case .claude(let name):
+                guard LoginCapability.probe(executable: executable) else {
+                    closeSheetForTerminal()
+                    if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
+                        loginError = Self.loginFailureMessage(why)
+                    }
+                    return
                 }
-                return
+            case .codex, .codexImport:
+                switch LoginCapability.readCodexPath(executable: executable) {
+                case .inSheet:
+                    break
+                case .terminal:
+                    closeSheetForTerminal()
+                    let launched: Result<URL, LoginLauncher.Failure>
+                    if case .codexImport(let home, let name) = request {
+                        launched = LoginLauncher.launchCodexImport(codexHome: home, reloggingIn: name)
+                    } else {
+                        launched = LoginLauncher.launchCodexLogin(reloggingIn: request.account)
+                    }
+                    if case .failure(let why) = launched {
+                        loginError = Self.loginFailureMessage(why)
+                    }
+                    return
+                case .predatesCodex:
+                    loginSession = LoginSession(
+                        request: request, phase: .failed(reason: pathTcrFlag(for: executable)))
+                    return
+                }
             }
-            let session = LoginSession(account: name)
+        }
+
+        if let session = loginSession {
+            session.begin(request)
+        } else {
+            let codex = effectivePresence.codexExecutable
+            let session = LoginSession(request: request, resolvedCodexExecutable: { codex })
             loginSession = session
             session.start()
         }
+    }
+
+    /// Close a sheet that is up before a Terminal window takes over: the sign-in
+    /// is no longer the sheet's to show.
+    private func closeSheetForTerminal() {
+        if loginSession != nil { endLogin(cancelling: true) }
+    }
+
+    /// The failed sheet's detail for a tcr that predates Codex accounts, naming it
+    /// and its version as Settings › Updates does. It runs `tcr --version`, which
+    /// reads no config.
+    private func pathTcrFlag(for executable: URL) -> String {
+        let output = try? TcrTool.run(executable: executable, arguments: ["--version"])
+        let version = output.flatMap {
+            $0.exitCode == 0
+                ? TcrTool.version(fromVersionOutput: String(decoding: $0.stdout, as: UTF8.self)) : nil
+        }
+        return CodexSignInCopy.pathTcrFlag(path: executable.path, version: version)
     }
 
     /// Close the sheet, and re-poll when something actually changed. A saved
@@ -3759,12 +3924,71 @@ struct FleetView: View {
     /// one poll away from showing it — the row list itself only fills in fully
     /// after the proxy restarts (`CLAUDE.md`'s config-reload rule), which the
     /// sheet says out loud.
+    ///
+    /// A Codex re-login that tcr refused wrote nothing, so nothing the server
+    /// reports says why the row still reads `re-login`. tcr's reason is kept
+    /// under the row for this app run (``CodexNoteStore``). Re-imports and fresh
+    /// adds record nothing: there is no row of theirs to explain.
     private func endLogin(cancelling: Bool) {
         if cancelling { loginSession?.cancel() }
+        if let session = loginSession, case .codex(let name?) = session.request,
+            let refusal = session.refusal,
+            let row = poller.state.loadedFleet?.accounts.first(where: { $0.name == name })
+        {
+            codexNotes.recordReloginRefusal(refusal, for: row)
+        }
         let saved: Bool
         if case .saved = loginSession?.phase { saved = true } else { saved = false }
         loginSession = nil
         if saved { Task { await poller.pollOnce() } }
+    }
+
+    /// The import link's folder picker, shown through the shell's runner so the
+    /// panel stays up behind it. A chosen folder opens the import's confirmation
+    /// in the same sheet; no choice leaves the sheet as it was.
+    private func chooseCodexFolder(for session: LoginSession) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = URL(fileURLWithPath: homeDirectory, isDirectory: true)
+            .appendingPathComponent(".codex", isDirectory: true)
+        panel.message = CodexSignInCopy.importPanelMessage
+        panel.prompt = CodexSignInCopy.panelPrompt
+        guard let url = runOpenPanel(panel) else { return }
+        session.confirmImport(home: url.path, account: nil)
+    }
+
+    /// `Choose codex…`: the codex executable tcr could not find, picked by hand,
+    /// through the shell's runner like the folder picker.
+    ///
+    /// Hidden folders are shown, because npm, nvm and volta all install codex
+    /// under one. Aliases are not resolved, so a symlink is stored as chosen and
+    /// not as the versioned file it points at today. An accepted choice is stored
+    /// for every later Codex sign-in, and the same request runs again with it; a
+    /// refused one stores nothing, and the sheet says why under tcr's reason.
+    private func chooseCodexExecutable(for session: LoginSession) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.resolvesAliases = false
+        panel.message = CodexSignInCopy.codexPanelMessage
+        panel.prompt = CodexSignInCopy.panelPrompt
+        guard let url = runOpenPanel(panel), let request = session.request else { return }
+        let path = url.path
+        guard CodexExecutableChoice.isAcceptable(path: path) else {
+            session.refuseCodexChoice(
+                CodexSignInCopy.refusedCodexChoice(shortPath: HomePath.short(path, home: homeDirectory)))
+            return
+        }
+        UserDefaults.standard.set(path, forKey: TcrTool.codexOverrideDefaultsKey)
+        let codex = effectivePresence.codexExecutable
+        let rerun = LoginSession(request: request, resolvedCodexExecutable: { codex })
+        loginSession = rerun
+        rerun.start()
     }
 
     /// Hand `tcr mint --account <name>` to a Terminal window for one row.
@@ -4157,6 +4381,10 @@ struct AccountRow: View {
     /// Drawn on every row's context menu, and additionally as the standalone
     /// ``AccountRow/reloginButton`` on a `.needsRelogin` row.
     let onRelogin: () -> Void
+    /// Takes the login the codex folder this row was imported from holds now
+    /// (``FleetView/reimportAccount(_:)``). Offered only on a Codex row that names
+    /// such a folder.
+    let onReimport: () -> Void
     /// Hands `tcr mint --account <this row's name>` to a Terminal window. See
     /// ``FleetView/mintAccountToken(_:)``.
     let onMint: () -> Void
@@ -4172,6 +4400,9 @@ struct AccountRow: View {
     @ObservedObject var groupController: GroupController
     /// Deleting this row's account. See ``RemoveAccountController``.
     @ObservedObject var removeController: RemoveAccountController
+    /// Where a group add's warning about a Codex row is kept, under the row's
+    /// line, for this app run. See ``CodexNoteStore``.
+    let codexNotes: CodexNoteStore
     /// The whole fleet, so ``addToGroupMenu`` can offer every group this
     /// account is not already in, not just the ones visible in whatever
     /// section this row happens to be drawn under.
@@ -4785,14 +5016,17 @@ struct AccountRow: View {
         // spoken when it did, because a gate that decides whether Fable
         // requests can land here is not a sighted-user-only fact.
         if let fable = account.fableWeeklySpokenLabel(now: Date()) { parts.append(fable) }
+        // A bundled tcr too old for a config holding a Codex account refuses with
+        // words that name a version; each failure says which tcr and the fix.
         if let failure = accounts.failure(for: account.ref) {
-            parts.append("last action failed: \(failure.summary)")
+            parts.append("last action failed: \(PredatesCodexRefusal.displayed(failure.summary))")
         }
         if let failure = removeController.failure(for: account.ref) {
-            parts.append("last action failed: \(failure.summary)")
+            parts.append("last action failed: \(PredatesCodexRefusal.displayed(failure.summary))")
         }
         if let refused = groupController.failure(forAccount: account.ref) {
-            parts.append("group '\(refused.group)' failed: \(refused.failure.summary)")
+            parts.append(
+                "group '\(refused.group)' failed: \(PredatesCodexRefusal.displayed(refused.failure.summary))")
         }
         // Spoken for the same reason the pill is: a confirmation only a sighted
         // user gets is half built, and the `✓` in `rowLabel` is punctuation to a
@@ -4934,12 +5168,20 @@ struct AccountRow: View {
         if actions.contains(.relogin) {
             Button("Re-login…") { onRelogin() }
                 .help(
-                    "Signs in through your browser, requesting this exact account. "
-                        + "`tcr` refuses to save if the browser hands back a different "
-                        + "one. The login it starts now mints a credential good for a "
-                        + "year, so running it on a healthy row is a safe way to get "
-                        + "ahead of the old one expiring."
+                    account.provider == .codex
+                        ? codexReloginHelp
+                        : "Signs in through your browser, requesting this exact account. "
+                            + "`tcr` refuses to save if the browser hands back a different "
+                            + "one. The login it starts now mints a credential good for a "
+                            + "year, so running it on a healthy row is a safe way to get "
+                            + "ahead of the old one expiring."
                 )
+        }
+        // A Codex row imported from a codex folder can take that folder's login
+        // again, at the cost the confirmation states before anything runs.
+        if account.availableActions.contains(.reimport), let home = account.codexHome {
+            Button(CodexSignInCopy.reimportItem(shortPath: HomePath.short(home))) { onReimport() }
+                .help(CodexSignInCopy.reimportHelp(shortPath: HomePath.short(home)))
         }
         Divider()
         // Hidden entirely while `control` cannot answer the question at all
@@ -5140,7 +5382,16 @@ struct AccountRow: View {
                 Divider()
                 ForEach(entries, id: \.group) { entry in
                     Button(entry.title) {
-                        Task { await groupController.add(account: account.ref, to: entry.group) }
+                        Task {
+                            let attempt = await groupController.add(
+                                account: account.ref, to: entry.group)
+                            // A Codex row's add succeeds with a warning that no Codex
+                            // request can ask for a group; it stays under the line.
+                            if account.provider == .codex, case .accepted(let notice?) = attempt {
+                                codexNotes.recordGroupAddNotice(
+                                    notice, group: entry.group, for: account.ref)
+                            }
+                        }
                     }
                     .disabled(!entry.isEnabled)
                     if entry.offersCopy {
@@ -5188,7 +5439,13 @@ struct AccountRow: View {
         let outcome = NewGroupName.evaluate(typed, existingGroups: everyGroupFleetWide)
         switch outcome {
         case .valid(let name):
-            Task { await groupController.add(account: account.ref, to: name) }
+            Task {
+                let attempt = await groupController.add(account: account.ref, to: name)
+                // The same warning as the candidate list's add, kept the same way.
+                if account.provider == .codex, case .accepted(let notice?) = attempt {
+                    codexNotes.recordGroupAddNotice(notice, group: name, for: account.ref)
+                }
+            }
         case .rejected, .duplicate:
             let failureAlert = NSAlert()
             failureAlert.alertStyle = .warning
@@ -5638,21 +5895,23 @@ struct AccountRow: View {
                     .lineLimit(2)
             }
             if let failure = accounts.failure(for: account.ref) {
-                // `tcr`'s own words, verbatim. A toggle that did not happen must
+                // `tcr`'s own words, verbatim, unless they are a bundled tcr's
+                // refusal of a config holding a Codex account, which names a
+                // version rather than the fix. A toggle that did not happen must
                 // never be indistinguishable from one that did.
-                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                Label(PredatesCodexRefusal.displayed(failure.summary), systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = removeController.failure(for: account.ref) {
-                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                Label(PredatesCodexRefusal.displayed(failure.summary), systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = tokenCopyFailure {
-                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                Label(PredatesCodexRefusal.displayed(failure.summary), systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
@@ -5666,7 +5925,7 @@ struct AccountRow: View {
             // closed by the time this appears.
             if let refused = groupController.failure(forAccount: account.ref) {
                 Label(
-                    "group '\(refused.group)': \(refused.failure.summary)",
+                    PredatesCodexRefusal.displayed("group '\(refused.group)': \(refused.failure.summary)"),
                     systemImage: Tok.unreadableGlyph
                 )
                 .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
@@ -5813,16 +6072,37 @@ struct AccountRow: View {
     /// shipped. Untargeted, the row's click could authenticate as whichever
     /// account happened to be signed into the browser; targeted, a mismatch
     /// refuses rather than overwriting the wrong account's credentials.
+    @ViewBuilder
     private var reloginButton: some View {
-        Button("Re-login…") { onRelogin() }
+        let button = Button("Re-login…") { onRelogin() }
             .buttonStyle(.bordered)
             .controlSize(.small)
             .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
             .accessibilityLabel("Re-login \(account.name)")
-            .help(
-                "Signs in through your browser, requesting this exact account. "
-                    + "`tcr` refuses to save if the browser hands back a different one."
-            )
+        if account.provider == .codex {
+            // A Codex row signs in to ChatGPT, and says so: in the help, and to
+            // VoiceOver, which hears the hint where a card shows the button.
+            button
+                .help(codexReloginHelp)
+                .accessibilityHint(CodexSignInCopy.reloginHint)
+        } else {
+            button
+                .help(
+                    "Signs in through your browser, requesting this exact account. "
+                        + "`tcr` refuses to save if the browser hands back a different one."
+                )
+        }
+    }
+
+    /// Re-login's help on a Codex row: the ChatGPT sign-in, or, when this tcr is
+    /// known to lack `tcr login --codex`, the Terminal window that runs instead.
+    /// It reads the answer a probe already gave and never runs one, because it
+    /// words a menu item. Never resolved in a render, which looks at no tcr.
+    private var codexReloginHelp: String {
+        guard !snapshotMode, case .success(let tcr) = TcrTool.resolve(),
+            LoginCapability.knownCodexSupport(executable: tcr) == false
+        else { return CodexSignInCopy.reloginHelp }
+        return CodexSignInCopy.oldTcrHelp
     }
 
     /// `tcr enable <name>` / `tcr disable <name>`, keyed off the account's own

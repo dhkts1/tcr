@@ -59,6 +59,16 @@ final class MenuBarShell {
     /// to apply" notice must survive the panel closing and reopening, not
     /// reset the moment the operator dismisses it.
     let removeController: RemoveAccountController
+    /// This Mac's codex evidence for Add account… and the sign-in sheet, resolved
+    /// off the main thread each time the panel opens. Owned here so the panel is
+    /// rebuilt around the same answer, and so nothing renders it: the render
+    /// harness passes no evidence at all.
+    let codexPresence: CodexPresenceController
+    /// What the panel keeps under a Codex account's line for this app run: a
+    /// refused re-login and a group add's warning. Owned here for the same reason
+    /// as `groupController`: a note that reset every time the panel opened would
+    /// be gone by the time anyone looked.
+    let codexNotes: CodexNoteStore
     /// Owned here for the same reason as the rest, plus one of its own: the
     /// delegate's `tcrbar://check-for-updates` handler reaches through the shell
     /// to find it, so an updater that only existed while the panel was open would
@@ -147,6 +157,8 @@ final class MenuBarShell {
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
         self.removeController = removeController ?? RemoveAccountController()
+        self.codexPresence = CodexPresenceController()
+        self.codexNotes = CodexNoteStore()
         // The controller's `init` is inert; nothing fetches until `AppDelegate`
         // calls `checkAfterLaunch()`, which the shell probe never does.
         self.whatsNew =
@@ -198,8 +210,10 @@ final class MenuBarShell {
                 accounts: self.accounts, control: self.control, awake: self.awake,
                 preference: self.preference, updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
+                codexPresence: self.codexPresence, codexNotes: self.codexNotes,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
+                runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
                 onFindingTurnedOn: { [weak self] in
                     self?.knockNotifier?.requestAuthorizationOnce()
                 },
@@ -716,6 +730,19 @@ final class MenuBarShell {
         settingsWindow.show()
     }
 
+    /// Runs a picker for the sign-in sheet and keeps the panel up while it runs.
+    /// The popover is transient, so a picker taking focus would close it and the
+    /// sheet's next step would be drawn into a panel nobody can see.
+    func runOpenPanel(_ panel: NSOpenPanel) -> URL? {
+        let behavior = popover.behavior
+        popover.behavior = .applicationDefined
+        defer {
+            popover.behavior = behavior
+            if !popover.isShown { openPanel() }
+        }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
     /// `DefaultTabPreference` stores a plain string (see that type's own
     /// doc-comment on why it cannot hold `PanelTab` directly); this is the
     /// one place that turns it back into the real enum, at the one call site
@@ -748,8 +775,10 @@ final class MenuBarShell {
                 accounts: accounts, control: control, awake: awake,
                 preference: preference, updater: updater,
                 groupController: groupController, removeController: removeController,
+                codexPresence: codexPresence, codexNotes: codexNotes,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
+                runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
                 onFindingTurnedOn: { [weak self] in
                     self?.knockNotifier?.requestAuthorizationOnce()
                 },
@@ -823,6 +852,21 @@ final class MenuBarShell {
         // own rather than waiting for the timer, and the panel it is drawing
         // meanwhile is the same panel it always drew.
         Task { await poller.pollOnce() }
+        // This Mac's codex evidence, for Add account… and the sign-in sheet,
+        // resolved off the main thread once per open: it only checks where codex
+        // lives, and never runs it or opens a file of its. With evidence, or a
+        // Codex row in the fleet, this tcr is asked once whether it has
+        // `tcr login --codex`, so the chooser and a Codex row's Re-login can word
+        // their help without starting a process on a click.
+        Task {
+            let fleetHoldsCodex = poller.state.loadedFleet?.holdsCodex == true
+            await codexPresence.refresh(fleetHoldsCodex: fleetHoldsCodex)
+            if codexPresence.presence.isPresent || fleetHoldsCodex,
+                case .success(let tcr) = TcrTool.resolve()
+            {
+                _ = LoginCapability.probeCodex(executable: tcr)
+            }
+        }
     }
 
     func closePanel() {
@@ -848,8 +892,12 @@ struct FleetPanel: View {
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
     @ObservedObject var removeController: RemoveAccountController
+    @ObservedObject var codexPresence: CodexPresenceController
+    @ObservedObject var codexNotes: CodexNoteStore
     var onWhatsNew: () -> Void = {}
     var onSettings: () -> Void = {}
+    /// The shell's picker runner, which keeps the panel up while a picker runs.
+    var runOpenPanel: (NSOpenPanel) -> URL? = { _ in nil }
     /// Run when **Find Macs on this network** is switched ON.
     ///
     /// The one moment a knock becomes possible at all, and therefore the
@@ -872,9 +920,12 @@ struct FleetPanel: View {
             groupController: groupController,
             removeController: removeController,
             startServerAtLaunch: $preference.startServerAtLaunch,
-            codexPresence: .absent,
+            codexPresence: codexPresence.presence,
+            codexNotes: codexNotes,
+            bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,
             onWhatsNew: onWhatsNew,
             onSettings: onSettings,
+            runOpenPanel: runOpenPanel,
             onFindingTurnedOn: onFindingTurnedOn,
             initialTab: initialTab
         )

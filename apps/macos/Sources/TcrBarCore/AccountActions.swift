@@ -10,6 +10,8 @@ public enum AccountAction: Hashable, Sendable {
     case toggleEnabled, relogin, controlAccount, copyName, copyAccessToken, mintToken
     case groupStatement, copyRunGroup, mintGroupTokens, parkGroup, removeFromGroup, addToGroup
     case deleteAccount, exitPicker, exitStatement, lentToLine, lend
+    /// Take the login the codex folder a row was imported from holds now.
+    case reimport
 }
 
 extension Account {
@@ -23,12 +25,31 @@ extension Account {
     /// instead of offering an exit picker, and a Codex account is never inside a lease.
     ///
     /// Re-login is offered on both: one verb for both providers, so the state word and
-    /// the action word match on every row.
+    /// the action word match on every row. Re-import is offered only on a Codex row that
+    /// names the codex folder it was imported from, because that folder is what it reads.
     public var availableActions: Set<AccountAction> {
         switch provider {
         case .anthropic: return AccountActions.claudeRow
-        case .codex: return AccountActions.codexRow
+        case .codex:
+            guard codexHome != nil else { return AccountActions.codexRow }
+            return AccountActions.codexRow.union([.reimport])
         }
+    }
+
+    /// The sign-in Re-login runs for this row: its own provider's, naming the row, so the
+    /// sign-in can refuse a browser that hands back a different account.
+    public var reloginRequest: LoginRequest {
+        switch provider {
+        case .anthropic: return .claude(account: name)
+        case .codex: return .codex(account: name)
+        }
+    }
+
+    /// The import Re-import runs for this row, from the codex folder it names, or `nil` on
+    /// a row that names none.
+    public var reimportRequest: LoginRequest? {
+        guard provider == .codex, let codexHome else { return nil }
+        return .codexImport(home: codexHome, account: name)
     }
 }
 
