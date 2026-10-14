@@ -338,6 +338,11 @@ public final class StatusPoller: ObservableObject {
 
     @Published public private(set) var state: PollState = .pending
     @Published public private(set) var lastPollAt: Date?
+    /// When the read behind ``state`` began, set with it. Polls are not ordered, so the
+    /// state can predate a change made while its read ran; a change recorded after this
+    /// instant is one that read could not have seen. Not published: it is read when
+    /// ``lastPollAt`` changes, and changes with it.
+    public private(set) var lastPollBegan: Date?
 
     public let interval: TimeInterval
     private var task: Task<Void, Never>?
@@ -386,8 +391,17 @@ public final class StatusPoller: ObservableObject {
     /// depends on that.
     @discardableResult
     public func pollOnce() async -> PollState {
-        let next = await Self.fetch()
+        await pollOnce(through: Self.fetch)
+    }
+
+    /// ``pollOnce()`` through `fetch`, which a test hands a stand-in read so that no `tcr`
+    /// runs. The begin time is taken before the read starts.
+    @discardableResult
+    func pollOnce(through fetch: () async -> PollState) async -> PollState {
+        let began = Date()
+        let next = await fetch()
         state = next
+        lastPollBegan = began
         lastPollAt = Date()
         return next
     }

@@ -128,3 +128,29 @@ final class StatusPollerCombineTests: XCTestCase {
         XCTAssertEqual(state.countsNearHalves, [false])
     }
 }
+
+/// When a poll's read began, published with the state that read returned.
+///
+/// A poll is two subprocesses that take tens of milliseconds, and polls are not ordered,
+/// so the state a poll publishes can predate a change the panel made while it ran. The
+/// begin time is what lets a caller tell: a note recorded after it is one that read could
+/// not have seen. No `tcr` runs: the read is a stand-in that only waits.
+@MainActor
+final class StatusPollerBeganTests: XCTestCase {
+    func testAPollIsStampedWithWhenItsReadBegan() async throws {
+        let poller = StatusPoller()
+        XCTAssertNil(poller.lastPollBegan)
+        let before = Date()
+        await poller.pollOnce(through: {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            return .toolMissing(searched: [])
+        })
+        let began = try XCTUnwrap(poller.lastPollBegan)
+        let landed = try XCTUnwrap(poller.lastPollAt)
+        XCTAssertGreaterThanOrEqual(began, before)
+        XCTAssertGreaterThanOrEqual(
+            landed.timeIntervalSince(began), 0.05,
+            "the poll was stamped when its read ended, not when it began")
+        XCTAssertEqual(poller.state, .toolMissing(searched: []))
+    }
+}

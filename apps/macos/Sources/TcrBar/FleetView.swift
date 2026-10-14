@@ -2637,10 +2637,14 @@ struct FleetView: View {
     /// re-login once its row's state changes, a group add's warning once its row
     /// leaves that group, and either once its row leaves the fleet. Only off a
     /// loaded fleet, for the reason ``pruneKeptOpenCards()`` gives: a failed poll
-    /// says nothing about the rows, so it leaves every note as it was.
+    /// says nothing about the rows, so it leaves every note as it was. With the
+    /// time that poll's read began, so a poll already under way when a group add
+    /// returned, which still lists the groups from before it, keeps that add's
+    /// warning.
     private func reconcileCodexNotes() {
         guard case .loaded(let fleet) = poller.state else { return }
-        codexNotes.reconcile(with: fleet.accounts)
+        let pollBegan = poller.lastPollBegan ?? .distantFuture
+        codexNotes.reconcile(with: fleet.accounts, pollBegan: pollBegan)
     }
 
     /// "Keep Card Open" / "Close Card": the line turns into the card, or the

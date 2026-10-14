@@ -158,12 +158,13 @@ final class FleetViewCodexWiringTests: XCTestCase {
             source, from: "private func reconcileCodexNotes() {", to: "private func toggleKeptOpen(")
         for text in [
             "guard case .loaded(let fleet) = poller.state else { return }",
-            "codexNotes.reconcile(with: fleet.accounts)",
+            "let pollBegan = poller.lastPollBegan",
+            "codexNotes.reconcile(with: fleet.accounts, pollBegan: pollBegan)",
         ] {
             XCTAssertTrue(
                 reconcile.contains(text),
-                "reconcileCodexNotes lost \(text): a failed poll would clear every note, or "
-                    + "no poll would")
+                "reconcileCodexNotes lost \(text): a failed poll would clear every note, no "
+                    + "poll would, or a poll begun before a group add would erase its warning")
         }
         let poll = try slice(
             source, from: ".onChange(of: poller.lastPollAt)", to: ".confirmationDialog(")

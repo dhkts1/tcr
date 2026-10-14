@@ -16,10 +16,11 @@ public struct CodexNotes: Equatable, Sendable {
         let loginError: String?
     }
 
-    /// A warning, with the group whose add printed it.
+    /// A warning, with the group whose add printed it and when the add returned.
     private struct Warning: Equatable, Sendable {
         let text: String
         let group: String
+        let recordedAt: Date
     }
 
     private var refusals: [AccountRef: Refusal] = [:]
@@ -35,23 +36,32 @@ public struct CodexNotes: Equatable, Sendable {
     }
 
     /// Keep the warning a successful `tcr group add` printed for this row, without its
-    /// `warning: ` prefix. A notice that warned of nothing keeps nothing.
-    public mutating func recordGroupAddNotice(_ notice: String, group: String, for account: AccountRef) {
+    /// `warning: ` prefix, stamped with `recordedAt`, when the add returned. A notice that
+    /// warned of nothing keeps nothing.
+    public mutating func recordGroupAddNotice(
+        _ notice: String, group: String, for account: AccountRef, at recordedAt: Date = Date()
+    ) {
         guard let text = GroupCommand.warning(inNotice: notice) else { return }
-        warnings[account] = Warning(text: text, group: group)
+        warnings[account] = Warning(text: text, group: group, recordedAt: recordedAt)
     }
 
     /// Drop every note the fleet has moved past: a refusal once its row's `status` or
     /// `loginError` differs from when it came back, a warning once its row is no longer in
     /// that group, and either once its row has left the fleet.
-    public mutating func reconcile(with accounts: [Account]) {
+    ///
+    /// `pollBegan` is when the read that produced `accounts` began. A warning recorded after
+    /// it stays, whatever that read says: polls are not ordered, and one already under way
+    /// when the add returned carries the groups from before the add, which is no sign that
+    /// the row left the group. Left out, the read is taken as begun after every note.
+    public mutating func reconcile(with accounts: [Account], pollBegan: Date = .distantFuture) {
         let rows = Dictionary(accounts.map { ($0.ref, $0) }, uniquingKeysWith: { first, _ in first })
         refusals = refusals.filter { ref, refusal in
             guard let row = rows[ref] else { return false }
             return row.status == refusal.status && row.loginError == refusal.loginError
         }
         warnings = warnings.filter { ref, warning in
-            rows[ref].map { ($0.groups ?? []).contains(warning.group) } ?? false
+            pollBegan < warning.recordedAt
+                || (rows[ref].map { ($0.groups ?? []).contains(warning.group) } ?? false)
         }
     }
 
@@ -74,14 +84,17 @@ public final class CodexNoteStore: ObservableObject {
         notes.recordReloginRefusal(reason, for: account)
     }
 
-    public func recordGroupAddNotice(_ notice: String, group: String, for account: AccountRef) {
-        notes.recordGroupAddNotice(notice, group: group, for: account)
+    public func recordGroupAddNotice(
+        _ notice: String, group: String, for account: AccountRef, at recordedAt: Date = Date()
+    ) {
+        notes.recordGroupAddNotice(notice, group: group, for: account, at: recordedAt)
     }
 
-    /// Reconciled on a copy, and published only when a note went: every poll calls this.
-    public func reconcile(with accounts: [Account]) {
+    /// Reconciled on a copy, and published only when a note went: every poll calls this,
+    /// with the time its read began (``CodexNotes/reconcile(with:pollBegan:)``).
+    public func reconcile(with accounts: [Account], pollBegan: Date = .distantFuture) {
         var next = notes
-        next.reconcile(with: accounts)
+        next.reconcile(with: accounts, pollBegan: pollBegan)
         if next != notes { notes = next }
     }
 }
