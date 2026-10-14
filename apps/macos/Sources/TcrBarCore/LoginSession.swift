@@ -196,16 +196,22 @@ public enum LoginPhase: Equatable, Sendable {
 /// The wire format is `LoginEvent::line` in `src/oauth.rs` — one JSON object
 /// per line, `event` naming which.
 public enum LoginProgressEvent: Equatable, Sendable {
-    /// Open this URL. Nothing has been read or written yet.
-    case browser(url: String)
+    /// Open this URL. Nothing has been read or written yet. `opened` means the
+    /// sign-in opened a browser itself.
+    case browser(url: String, opened: Bool = false)
     /// The URL is out; the loopback callback is what settles it now.
     case waiting
-    /// Written, under this account name.
-    case saved(account: String)
-    /// Nothing was written, and this is the whole reason.
-    case failed(reason: String)
+    /// One sentence tcr wants shown verbatim, before it saves or fails. Never a
+    /// state change.
+    case notice(text: String)
+    /// Written, under this account name. `provider` and `plan` are tcr's own
+    /// tokens, sent on a Codex save only.
+    case saved(account: String, provider: String? = nil, plan: String? = nil)
+    /// Nothing was written, and this is the whole reason. `code` names a
+    /// refusal, so a sheet can title it without parsing the reason.
+    case failed(reason: String, code: String? = nil)
 
-    /// `nil` for anything that is not one of the four events: a blank line, a
+    /// `nil` for anything that is not one of the five events: a blank line, a
     /// line of prose, a JSON object with an `event` this version does not
     /// know, or an event missing the field that carries its meaning.
     ///
@@ -229,15 +235,18 @@ public enum LoginProgressEvent: Equatable, Sendable {
         switch event {
         case "browser":
             guard let url = text("url") else { return nil }
-            return .browser(url: url)
+            return .browser(url: url, opened: fields["opened"] as? Bool ?? false)
         case "waiting":
             return .waiting
+        case "notice":
+            guard let notice = text("text") else { return nil }
+            return .notice(text: notice)
         case "saved":
             guard let account = text("account") else { return nil }
-            return .saved(account: account)
+            return .saved(account: account, provider: text("provider"), plan: text("plan"))
         case "error":
             guard let reason = text("reason") else { return nil }
-            return .failed(reason: reason)
+            return .failed(reason: reason, code: text("code"))
         default:
             return nil
         }
@@ -252,6 +261,9 @@ public struct LoginFlow {
     /// who is being signed in.
     public let requested: String?
     public private(set) var phase: LoginPhase = .opening
+    /// Every notice this login sent, in order, for the sheet to show under its
+    /// result.
+    public private(set) var notices: [String] = []
 
     public init(requesting: String? = nil) {
         self.requested = requesting
@@ -260,13 +272,20 @@ public struct LoginFlow {
     /// Fold one event in. Returns the URL the caller must open, and only on
     /// the event that asks for one — the side effect stays outside the machine.
     ///
-    /// A late event after a terminal phase is ignored: once a login has said
-    /// `saved` or `error`, nothing that follows can unsay it.
+    /// A notice never changes the phase, so a late one cannot undo a result,
+    /// and it is kept even after `saved` or `error`. Every other event after a
+    /// terminal phase is ignored: once a login has said `saved` or `error`,
+    /// nothing that follows can unsay it.
     @discardableResult
     public mutating func apply(_ event: LoginProgressEvent) -> URL? {
-        guard !phase.isTerminal else { return nil }
         switch event {
-        case .browser(let url):
+        case .notice(let text):
+            // Kept, and nothing else: a notice never moves or ends the login.
+            notices.append(text)
+            return nil
+        case _ where phase.isTerminal:
+            return nil
+        case .browser(let url, _):
             // An unopenable URL is a failure, not a silently skipped step:
             // the browser is the only human part of this flow.
             guard let parsed = URL(string: url), parsed.scheme == "https" else {
@@ -277,10 +296,10 @@ public struct LoginFlow {
         case .waiting:
             phase = .waitingForBrowser(email: requested)
             return nil
-        case .saved(let account):
+        case .saved(let account, _, _):
             phase = .saved(account: account)
             return nil
-        case .failed(let reason):
+        case .failed(let reason, _):
             phase = .failed(reason: reason)
             return nil
         }

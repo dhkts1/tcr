@@ -1,0 +1,5 @@
+{"event":"browser","opened":true,"url":"https://auth.openai.com/oauth/authorize?client_id=app_EXAMPLE&state=EXAMPLE"}
+{"event":"waiting"}
+{"event":"notice","text":"tcr intercepts chatgpt.com from now on: codex started with `tcr run --codex` is pooled; a codex that reaches this proxy some other way needs CODEX_CA_CERTIFICATE set to tcr's CA, or chatgpt.com in NO_PROXY to stay on its own login"}
+{"account":"bob@example.com","event":"saved","plan":"ChatGPT Pro","provider":"codex"}
+{"code":"codex-identity","event":"error","reason":"the ChatGPT login that came back is carol@example.com, not the one 'erin@example.com/codex' holds. Sign out of chatgpt.com in the browser first, or use a private window, then retry `tcr login --codex --account erin@example.com/codex`. Nothing was written."}

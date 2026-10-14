@@ -435,6 +435,31 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertEqual(fleet.serverSha, "abc1234")
     }
 
+    /// The contract's Codex row names its provider and carries none of the Codex facts, so
+    /// this is what a row with no Codex data decodes to: each fact absent, which reads as
+    /// unknown, never as a value. The canonical Codex fixture is the proof of the present
+    /// half (`CodexDecodeTests`).
+    func testCommittedContractFixtureHasNoCodexKeys() throws {
+        let fleet = try Fleet.decode(contractFixtureData())
+
+        XCTAssertEqual(
+            fleet.accounts.map(\.provider), [.anthropic, .anthropic, .anthropic, .anthropic, .codex])
+        let codex = try XCTUnwrap(fleet.accounts.last)
+        XCTAssertEqual(codex.name, "bob@example.com/codex")
+        XCTAssertNil(codex.quotaWindows)
+        XCTAssertNil(codex.credits)
+        XCTAssertNil(codex.fiveHourWindowMinutes)
+        XCTAssertNil(codex.sevenDayWindowMinutes)
+        XCTAssertNil(codex.limitReachedType)
+        XCTAssertNil(codex.loginError)
+        XCTAssertNil(codex.codexHome)
+        XCTAssertNil(codex.codexRoute)
+        XCTAssertNil(codex.codexTraffic)
+        XCTAssertNil(codex.usage?.sevenDayWindow)
+        XCTAssertFalse(codex.spendControlReached)
+        XCTAssertEqual(codex.usage?.today.reasoningTokens, 0)
+    }
+
     /// The `unknown` variant, which the committed fixture cannot contain.
     ///
     /// `quota_state_token` (src/cli.rs) emits exactly `ok` / `near` / `spent`,

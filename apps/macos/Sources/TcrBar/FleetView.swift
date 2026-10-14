@@ -33,6 +33,10 @@ struct FleetView: View {
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
+    /// What this Mac shows of codex, decided by the caller once per panel open.
+    /// Nothing reads it yet. It is a parameter for the same reason
+    /// ``snapshotMode`` is: the render harness passes `.absent`.
+    let codexPresence: CodexPresence
 
     /// Render the account list unscrolled, for the PNG harness only.
     ///
@@ -254,6 +258,7 @@ struct FleetView: View {
         groupController: GroupController,
         removeController: RemoveAccountController,
         startServerAtLaunch: Binding<Bool>,
+        codexPresence: CodexPresence,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
@@ -316,6 +321,7 @@ struct FleetView: View {
         self.groupController = groupController
         self.removeController = removeController
         self._startServerAtLaunch = startServerAtLaunch
+        self.codexPresence = codexPresence
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings

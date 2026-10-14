@@ -690,6 +690,8 @@ enum RenderStates {
                 groupController: GroupController(),
                 removeController: removeControllerFixture(for: scene.name),
                 startServerAtLaunch: .constant(false),
+                // `.absent` in every render: render mode never looks at this Mac's codex.
+                codexPresence: .absent,
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
                 initialSessionFiles: sessionFilesFixture(for: scene.name),
@@ -780,6 +782,7 @@ enum RenderStates {
                 groupController: GroupController(),
                 removeController: RemoveAccountController(),
                 startServerAtLaunch: .constant(false),
+                codexPresence: .absent,
                 snapshotMode: true,
                 initialTab: .accounts,
                 initialSessionFiles: [:],
@@ -798,9 +801,12 @@ enum RenderStates {
                     // an offscreen layer whose backing showed as white corners
                     // around the light-mode sheet, which is not a surface this
                     // app has.
-                    LoginSheet(phase: scene.phase, authorizeURL: scene.url, snapshotMode: true)
-                        .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
-                        .shadow(radius: sheetShadowRadius)
+                    LoginSheet(
+                        phase: scene.phase, codexPresence: .absent, authorizeURL: scene.url,
+                        snapshotMode: true
+                    )
+                    .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
+                    .shadow(radius: sheetShadowRadius)
                 }
             }
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
@@ -2653,7 +2659,14 @@ enum RenderStates {
         // reset offsets are measured from the same fixed instant its card
         // renders against, rather than a real `Date()` that keeps moving
         // out from under a `now` that does not.
-        now: Date = Date()
+        now: Date = Date(),
+        // Wire `"provider"`. `nil` omits the key, the Anthropic row and the
+        // older-server row alike, which every existing scene keeps.
+        provider: String? = nil,
+        // Any other wire keys, laid over the row last, so they win. Empty for
+        // every existing scene, which therefore builds the same text it always
+        // has.
+        extra: [String: Any] = [:]
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
@@ -2695,7 +2708,7 @@ enum RenderStates {
         let planFragment = plan.map { "\"plan\":\"\($0)\"," } ?? ""
         let orgFragment = orgUuid.map { "\"orgUuid\":\"\($0)\"," } ?? ""
         let gateFragment = gate.map { "\"gate\":\"\($0)\"," } ?? ""
-        return """
+        let row = """
             {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
              \(planFragment)\(orgFragment)\(gateFragment)
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
@@ -2712,6 +2725,13 @@ enum RenderStates {
              "source":"\(source)","serverSha":"abc1234","serverDirty":false,
              "usage":\(usage)}
             """
+        guard provider != nil || !extra.isEmpty else { return row }
+        guard
+            var object = (try? JSONSerialization.jsonObject(with: Data(row.utf8)))
+                as? [String: Any]
+        else { preconditionFailure("account(\(name)) did not build a JSON object") }
+        if let provider { object["provider"] = provider }
+        return jsonText(object, laying: extra)
     }
 
     // MARK: Usage fixtures
@@ -3840,4 +3860,1237 @@ enum RenderStates {
             "carol@example.com", quota: "0.12", state: "ok", probe: "ok", status: "error")
         return "[\(alice),\(carol)]"
     }
+}
+
+// MARK: - The canonical Codex rows
+
+extension RenderStates {
+    /// The ten rows of `apps/macos/Tests/Fixtures/codex-status.json`, by name; alice is the one
+    /// Claude row. A Codex scene draws these, so it shows what the fixture says.
+    enum CanonicalCodexRow: String, CaseIterable {
+        case alice = "alice@example.com"
+        case bob = "bob@example.com/codex"
+        case carol = "carol@example.com"
+        case dana = "dana@example.com"
+        case erin = "erin@example.com/codex"
+        case gil = "gil@example.com"
+        case hal = "hal@example.com"
+        case ivy = "ivy@example.com"
+        case jo = "jo@example.com"
+        case kim = "kim@example.com"
+    }
+
+    /// One canonical row as a JSON object for a scene's array: the fixture's facts, with every
+    /// absolute instant moved to sit as far from `now` as it sits from the fixture's own clock,
+    /// so carol frees in 3d 4h and hal is held for 47m whenever the render runs. `extra` is
+    /// laid over the row last, as `account(...)`'s is, for a scene that varies one fact.
+    /// `RenderFixtureRow`, in TcrBarCore, builds the row, where the shim tests it.
+    static func codexRow(_ row: CanonicalCodexRow, now: Date, extra: [String: Any] = [:]) -> String {
+        guard
+            let text = RenderFixtureRow.json(
+                named: row.rawValue, in: canonicalCodexStatusJSON, now: now, extra: extra)
+        else { preconditionFailure("the canonical Codex rows hold no \(row.rawValue)") }
+        return text
+    }
+
+    /// `object` with `extra` laid over it (`extra` wins), as JSON text with sorted keys, written
+    /// by `RenderFixtureRow.jsonText(_:laying:)`. A value is anything `JSONSerialization` writes:
+    /// a string, a number, a `Bool`, `NSNull()` for `null`, or an array or dictionary of those.
+    private static func jsonText(_ object: [String: Any], laying extra: [String: Any]) -> String {
+        guard let text = RenderFixtureRow.jsonText(object, laying: extra)
+        else { preconditionFailure("a render fixture row is not valid JSON: \(object), with \(extra)") }
+        return text
+    }
+
+    /// `apps/macos/Tests/Fixtures/codex-status.json`, verbatim, indented to sit here.
+    /// `RenderStatesCanonicalRowsTests` holds it equal to the fixture.
+    private static let canonicalCodexStatusJSON = #"""
+        [
+          {
+            "cacheCreationTokens": 1600000,
+            "cacheHitRatio": 0.75,
+            "cacheReadTokens": 6000000,
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.47,
+            "fiveHourResetAtMs": 1767235140000,
+            "fiveHourState": "ok",
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [
+              "orchard"
+            ],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 8000000,
+            "lastProbeMs": null,
+            "lastStreamError": "overloaded_error",
+            "name": "alice@example.com",
+            "orgName": "Example Personal",
+            "orgUuid": "11111111-1111-1111-1111-111111111111",
+            "organizationType": "claude_max",
+            "outputTokens": 31860,
+            "parkedGroups": [],
+            "plan": "Max 20x",
+            "priority": 0,
+            "probeError": null,
+            "probeStatus": "ok",
+            "quota": 0.62,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "rateLimitTier": "default_claude_max_20x",
+            "rateLimitedUntilMs": null,
+            "requests": 102,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.2,
+            "sevenDayOi": 0.62,
+            "sevenDayOiResetAtMs": 1767571200000,
+            "sevenDayOiState": "ok",
+            "sevenDayResetAtMs": 1767571200000,
+            "sevenDayState": "ok",
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 2,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 47000,
+                "cacheCreationTokens": 188000,
+                "cacheReadTokens": 705000,
+                "costUsd": 1.6413,
+                "inputTokens": 47000,
+                "outputTokens": 3756,
+                "requests": 12,
+                "unpricedRequests": 0
+              },
+              "today": {
+                "cacheCreation1hTokens": 400000,
+                "cacheCreationTokens": 1600000,
+                "cacheReadTokens": 6000000,
+                "costUsd": 14.1657,
+                "inputTokens": 400000,
+                "outputTokens": 31860,
+                "requests": 102,
+                "unpricedRequests": 0
+              },
+              "todayByModel": {
+                "claude-opus-5": {
+                  "cacheCreation1hTokens": 280000,
+                  "cacheCreationTokens": 1120000,
+                  "cacheReadTokens": 4200000,
+                  "costUsd": 12.0785,
+                  "inputTokens": 280000,
+                  "outputTokens": 21140,
+                  "requests": 70,
+                  "unpricedRequests": 0
+                },
+                "claude-sonnet-5": {
+                  "cacheCreation1hTokens": 120000,
+                  "cacheCreationTokens": 480000,
+                  "cacheReadTokens": 1800000,
+                  "costUsd": 2.0872,
+                  "inputTokens": 120000,
+                  "outputTokens": 10720,
+                  "requests": 32,
+                  "unpricedRequests": 0
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 157000,
+                "cacheCreationTokens": 628000,
+                "cacheReadTokens": 2355000,
+                "costUsd": 5.6141,
+                "inputTokens": 157000,
+                "outputTokens": 12476,
+                "requests": 40,
+                "since": 1767217140000,
+                "unpricedRequests": 0
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.82,
+            "cacheReadTokens": 902000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 1100000,
+            "lastProbeMs": 1767225570000,
+            "lastStreamError": null,
+            "name": "bob@example.com/codex",
+            "orgName": null,
+            "orgUuid": "55555555-5555-4555-8555-555555555555",
+            "organizationType": "pro",
+            "outputTokens": 22000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 1,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.34,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 42,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.34,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767571200000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 160000,
+                "costUsd": null,
+                "inputTokens": 30000,
+                "outputTokens": 4100,
+                "reasoningTokens": 1200,
+                "requests": 7,
+                "unpricedRequests": 7
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 50000000,
+                "costUsd": null,
+                "inputTokens": 11000000,
+                "outputTokens": 1100000,
+                "reasoningTokens": 420000,
+                "requests": 1480,
+                "since": 1766966400000,
+                "unpricedRequests": 1480
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 902000,
+                "costUsd": null,
+                "inputTokens": 198000,
+                "outputTokens": 22000,
+                "reasoningTokens": 9000,
+                "requests": 42,
+                "unpricedRequests": 42
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 902000,
+                  "costUsd": null,
+                  "inputTokens": 198000,
+                  "outputTokens": 22000,
+                  "reasoningTokens": 9000,
+                  "requests": 42,
+                  "unpricedRequests": 42
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.89,
+            "cacheReadTokens": 4806000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "credits": {
+              "balance": "12.50",
+              "hasCredits": true,
+              "unlimited": false
+            },
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": 1767499200000,
+            "gate": "seven-day",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [
+              {
+                "minutesUntilReset": 4560,
+                "resetAtMs": 1767499200000,
+                "window": "7d"
+              }
+            ],
+            "http1Only": false,
+            "inputTokens": 5400000,
+            "lastProbeMs": 1767225570000,
+            "lastStreamError": null,
+            "limitReachedType": "rate_limit_reached",
+            "name": "carol@example.com",
+            "orgName": null,
+            "orgUuid": "66666666-6666-4666-8666-666666666666",
+            "organizationType": "pro",
+            "outputTokens": 61000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 2,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 1.0,
+            "quotaState": "spent",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 310,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": 273600,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 1.0,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767499200000,
+            "sevenDayState": "spent",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 140000000,
+                "costUsd": null,
+                "inputTokens": 20000000,
+                "outputTokens": 5400000,
+                "reasoningTokens": 2100000,
+                "requests": 2900,
+                "since": 1766894400000,
+                "unpricedRequests": 2900
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 4806000,
+                "costUsd": null,
+                "inputTokens": 594000,
+                "outputTokens": 61000,
+                "reasoningTokens": 21000,
+                "requests": 310,
+                "unpricedRequests": 310
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 4806000,
+                  "costUsd": null,
+                  "inputTokens": 594000,
+                  "outputTokens": 61000,
+                  "reasoningTokens": 21000,
+                  "requests": 310,
+                  "unpricedRequests": 310
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.85,
+            "cacheReadTokens": 1700000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.18,
+            "fiveHourResetAtMs": 1767236520000,
+            "fiveHourState": "ok",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 2000000,
+            "lastProbeMs": 1767225570000,
+            "lastStreamError": null,
+            "name": "dana@example.com",
+            "orgName": null,
+            "orgUuid": "77777777-7777-4777-8777-777777777777",
+            "organizationType": "plus",
+            "outputTokens": 260000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Plus",
+            "priority": 3,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.25,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 96,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.25,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767657600000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 150000,
+                "costUsd": null,
+                "inputTokens": 30000,
+                "outputTokens": 24000,
+                "reasoningTokens": 6000,
+                "requests": 9,
+                "unpricedRequests": 9
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 7600000,
+                "costUsd": null,
+                "inputTokens": 1400000,
+                "outputTokens": 640000,
+                "reasoningTokens": 180000,
+                "requests": 400,
+                "since": 1767052800000,
+                "unpricedRequests": 400
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 1700000,
+                "costUsd": null,
+                "inputTokens": 300000,
+                "outputTokens": 260000,
+                "reasoningTokens": 70000,
+                "requests": 96,
+                "unpricedRequests": 96
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 1700000,
+                  "costUsd": null,
+                  "inputTokens": 300000,
+                  "outputTokens": 260000,
+                  "reasoningTokens": 70000,
+                  "requests": 96,
+                  "unpricedRequests": 96
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 540000,
+                "costUsd": null,
+                "inputTokens": 100000,
+                "outputTokens": 210000,
+                "reasoningTokens": 55000,
+                "requests": 31,
+                "since": 1767218520000,
+                "unpricedRequests": 31
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": null,
+            "cacheReadTokens": 0,
+            "codexHome": "/Users/example/.codex",
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.0,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": "ok",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": null,
+            "gate": "login",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 0,
+            "lastProbeMs": 1767225540000,
+            "lastStreamError": null,
+            "loginError": "refresh_token_reused",
+            "name": "erin@example.com/codex",
+            "orgName": null,
+            "orgUuid": "88888888-8888-4888-8888-888888888888",
+            "organizationType": "team",
+            "outputTokens": 0,
+            "parkedGroups": [],
+            "plan": "ChatGPT Team",
+            "priority": 4,
+            "probeError": "refresh_token_reused",
+            "probeStatus": "error",
+            "provider": "codex",
+            "quota": 0.4,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 0,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.4,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767398400000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "error",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 4000000,
+                "costUsd": null,
+                "inputTokens": 1000000,
+                "outputTokens": 140000,
+                "reasoningTokens": 50000,
+                "requests": 120,
+                "since": 1766793600000,
+                "unpricedRequests": 120
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "todayByModel": {}
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.71,
+            "cacheReadTokens": 284000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.15,
+            "fiveHourResetAtMs": 1767236520000,
+            "fiveHourState": "ok",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": null,
+            "gate": "rejected",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 400000,
+            "lastProbeMs": 1767225540000,
+            "lastStreamError": null,
+            "limitReachedType": "rate_limit_reached",
+            "name": "gil@example.com",
+            "orgName": null,
+            "orgUuid": "99999999-9999-4999-8999-999999999999",
+            "organizationType": "team",
+            "outputTokens": 52000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Team",
+            "priority": 5,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.15,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 24,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.1,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767744000000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "spendControlReached": true,
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 21000,
+                "costUsd": null,
+                "inputTokens": 9000,
+                "outputTokens": 3000,
+                "reasoningTokens": 800,
+                "requests": 2,
+                "unpricedRequests": 2
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 2100000,
+                "costUsd": null,
+                "inputTokens": 900000,
+                "outputTokens": 310000,
+                "reasoningTokens": 90000,
+                "requests": 140,
+                "since": 1767139200000,
+                "unpricedRequests": 140
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 284000,
+                "costUsd": null,
+                "inputTokens": 116000,
+                "outputTokens": 52000,
+                "reasoningTokens": 14000,
+                "requests": 24,
+                "unpricedRequests": 24
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 284000,
+                  "costUsd": null,
+                  "inputTokens": 116000,
+                  "outputTokens": 52000,
+                  "reasoningTokens": 14000,
+                  "requests": 24,
+                  "unpricedRequests": 24
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 234000,
+                "costUsd": null,
+                "inputTokens": 96000,
+                "outputTokens": 48000,
+                "reasoningTokens": 13000,
+                "requests": 20,
+                "since": 1767218520000,
+                "unpricedRequests": 20
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.8,
+            "cacheReadTokens": 1520000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": 1767228420000,
+            "gate": "hold",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 1900000,
+            "lastProbeMs": 1767225480000,
+            "lastStreamError": null,
+            "limitReachedType": "rate_limit_reached",
+            "name": "hal@example.com",
+            "orgName": null,
+            "orgUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "organizationType": "pro",
+            "outputTokens": 40000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 6,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.6,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": 1767228420000,
+            "requests": 77,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": 2820,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.6,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767657600000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "throttled",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 32000000,
+                "costUsd": null,
+                "inputTokens": 8000000,
+                "outputTokens": 1900000,
+                "reasoningTokens": 700000,
+                "requests": 900,
+                "since": 1767052800000,
+                "unpricedRequests": 900
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 1520000,
+                "costUsd": null,
+                "inputTokens": 380000,
+                "outputTokens": 40000,
+                "reasoningTokens": 15000,
+                "requests": 77,
+                "unpricedRequests": 77
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 1520000,
+                  "costUsd": null,
+                  "inputTokens": 380000,
+                  "outputTokens": 40000,
+                  "reasoningTokens": 15000,
+                  "requests": 77,
+                  "unpricedRequests": 77
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.78,
+            "cacheReadTokens": 1014000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.88,
+            "fiveHourResetAtMs": 1767228720000,
+            "fiveHourState": "near",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": 1767228720000,
+            "gate": "five-hour",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [
+              "orchard"
+            ],
+            "held": [
+              {
+                "minutesUntilReset": 52,
+                "resetAtMs": 1767228720000,
+                "window": "5h"
+              }
+            ],
+            "http1Only": false,
+            "inputTokens": 1300000,
+            "lastProbeMs": 1767225560000,
+            "lastStreamError": null,
+            "name": "ivy@example.com",
+            "orgName": null,
+            "orgUuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "organizationType": "plus",
+            "outputTokens": 260000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Plus",
+            "priority": 7,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.88,
+            "quotaState": "near",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 60,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": 3120,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.17,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767744000000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 330000,
+                "costUsd": null,
+                "inputTokens": 90000,
+                "outputTokens": 80000,
+                "reasoningTokens": 22000,
+                "requests": 20,
+                "unpricedRequests": 20
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 5400000,
+                "costUsd": null,
+                "inputTokens": 1600000,
+                "outputTokens": 900000,
+                "reasoningTokens": 250000,
+                "requests": 300,
+                "since": 1767139200000,
+                "unpricedRequests": 300
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 1014000,
+                "costUsd": null,
+                "inputTokens": 286000,
+                "outputTokens": 260000,
+                "reasoningTokens": 70000,
+                "requests": 60,
+                "unpricedRequests": 60
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 1014000,
+                  "costUsd": null,
+                  "inputTokens": 286000,
+                  "outputTokens": 260000,
+                  "reasoningTokens": 70000,
+                  "requests": 60,
+                  "unpricedRequests": 60
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 860000,
+                "costUsd": null,
+                "inputTokens": 240000,
+                "outputTokens": 210000,
+                "reasoningTokens": 60000,
+                "requests": 52,
+                "since": 1767210720000,
+                "unpricedRequests": 52
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.75,
+            "cacheReadTokens": 225000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "credits": {
+              "hasCredits": true,
+              "unlimited": true
+            },
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 300000,
+            "lastProbeMs": 1767225550000,
+            "lastStreamError": null,
+            "name": "jo@example.com",
+            "orgName": null,
+            "orgUuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "organizationType": "business",
+            "outputTokens": 6000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Business",
+            "priority": 8,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": null,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 30,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": null,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": null,
+            "sevenDayState": null,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 225000,
+                "costUsd": null,
+                "inputTokens": 75000,
+                "outputTokens": 6000,
+                "reasoningTokens": 1000,
+                "requests": 30,
+                "unpricedRequests": 30
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 225000,
+                  "costUsd": null,
+                  "inputTokens": 75000,
+                  "outputTokens": 6000,
+                  "reasoningTokens": 1000,
+                  "requests": 30,
+                  "unpricedRequests": 30
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": null,
+            "cacheReadTokens": 0,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": null,
+            "gate": "reserved",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [
+              "research"
+            ],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 0,
+            "lastProbeMs": 1767225420000,
+            "lastStreamError": null,
+            "name": "kim@example.com",
+            "orgName": null,
+            "orgUuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "organizationType": "pro",
+            "outputTokens": 0,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 9,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.05,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 0,
+            "reservedGroups": [
+              "research"
+            ],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.05,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767744000000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 700000,
+                "costUsd": null,
+                "inputTokens": 200000,
+                "outputTokens": 30000,
+                "reasoningTokens": 9000,
+                "requests": 40,
+                "since": 1767139200000,
+                "unpricedRequests": 40
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "todayByModel": {}
+            }
+          }
+        ]
+        """#
 }

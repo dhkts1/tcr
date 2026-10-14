@@ -844,6 +844,7 @@ struct FleetPanel: View {
             groupController: groupController,
             removeController: removeController,
             startServerAtLaunch: $preference.startServerAtLaunch,
+            codexPresence: .absent,
             onWhatsNew: onWhatsNew,
             onSettings: onSettings,
             onFindingTurnedOn: onFindingTurnedOn,

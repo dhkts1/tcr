@@ -7,7 +7,7 @@ import Foundation
 // block); the Rust side owns that spelling, so this file is the one place that
 // has to track it.
 //
-// Six deliberate decisions:
+// Seven deliberate decisions:
 //
 //  1. Unknown enum payloads decode to an `.unknown(String)` case that carries the
 //     raw text. A `quotaState` variant added on the Rust side must degrade to a
@@ -58,6 +58,11 @@ import Foundation
 //     quota window started". None of the three is a zero, and none of them
 //     renders as one. Every counter INSIDE a bucket is non-optional, because
 //     the Rust side writes all of them together or writes no bucket at all.
+//  7. An absent `provider` is Anthropic, which every row was before the key
+//     existed. A provider this build cannot name is the one key that costs its
+//     row: the row is listed as unreadable, because the alternative is counting
+//     another provider's account as Claude capacity. Every other Codex key is
+//     optional, and absent means unknown.
 
 /// How close an account is to its own switch threshold.
 ///
@@ -307,6 +312,115 @@ extension ProbeState: Decodable {
     public init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self.init(token: raw)
+    }
+}
+
+/// The upstream an account, or a session, serves.
+///
+/// Unlike every enum above, there is no `unknown` case, and that is deliberate: a provider
+/// this build cannot name is not a state of a Claude account, so it never becomes one. See
+/// decision 7 in this file's header.
+public enum Provider: Equatable, Sendable {
+    case anthropic
+    case codex
+
+    /// The wire token; `src/provider.rs` serialises the Rust enum lowercase.
+    public var token: String {
+        switch self {
+        case .anthropic: return "anthropic"
+        case .codex: return "codex"
+        }
+    }
+
+    /// A row's `provider` value, read: absent is Anthropic, every row's provider before the key
+    /// existed. A value this build cannot name throws, and costs the row.
+    public static func decoding(_ token: String?) throws -> Provider {
+        guard let token else { return .anthropic }
+        switch token {
+        case "anthropic": return .anthropic
+        case "codex": return .codex
+        default: throw UnknownProviderError(token: token)
+        }
+    }
+}
+
+/// Its description is the unreadable row's reason, word for word: `Fleet.decode` keeps
+/// `"\(error)"`.
+public struct UnknownProviderError: Error, Equatable, CustomStringConvertible {
+    public let token: String
+    public var description: String { "provider '\(token)' is newer than this TcrBar" }
+}
+
+/// A quota window a Codex plan reports, by the wire's name for it.
+public enum QuotaWindowKind: String, Equatable, Sendable {
+    case fiveHour
+    case sevenDay
+
+    /// The windows a plan reported, in wire order. An unknown name is dropped, never fatal.
+    /// A list of nothing but unknown names is not the plan saying it has no window, so it
+    /// reads as unknown (`nil`), never as `[]`.
+    public static func decoding(_ names: [String]?) -> [QuotaWindowKind]? {
+        guard let names else { return nil }
+        let kinds = names.compactMap(QuotaWindowKind.init(rawValue:))
+        return kinds.isEmpty && !names.isEmpty ? nil : kinds
+    }
+}
+
+/// A Codex account's ChatGPT credits, as the server last read them.
+public struct CodexCredits: Equatable, Sendable, Decodable {
+    public let hasCredits: Bool
+    public let unlimited: Bool
+    /// ChatGPT's own string (`"12.50"`), drawn as it came and never parsed.
+    public let balance: String?
+
+    public init(hasCredits: Bool, unlimited: Bool, balance: String? = nil) {
+        self.hasCredits = hasCredits
+        self.unlimited = unlimited
+        self.balance = balance
+    }
+}
+
+/// Whether tcr can pool the codex on this Mac, as the CLI works it out. It is the same on
+/// every Codex row.
+public struct CodexRoute: Equatable, Sendable, Decodable {
+    /// `true` carries no ``code`` and no ``reason``.
+    public let pooled: Bool
+    /// Why it is not pooled, as a code.
+    public let code: String?
+    /// Why it is not pooled, in words.
+    public let reason: String?
+    /// The upstream Codex requests go to, set only when it is not the default one.
+    public let upstream: String?
+
+    public init(pooled: Bool, code: String? = nil, reason: String? = nil, upstream: String? = nil) {
+        self.pooled = pooled
+        self.code = code
+        self.reason = reason
+        self.upstream = upstream
+    }
+}
+
+/// The Codex requests tcr refused or did not pool in the last ten minutes. It is the same on
+/// every Codex row.
+public struct CodexTraffic: Equatable, Sendable, Decodable {
+    /// The 429s tcr itself answered a Codex request with in the last ten minutes.
+    public let refused10m: Int
+    /// The last of those refusals' error type.
+    public let lastRefusal: String?
+    /// When that last refusal was sent, in unix ms.
+    public let lastRefusalAtMs: Int64?
+    /// Requests relayed on the client's own credential, because they carried a routing
+    /// header, in the last ten minutes.
+    public let unpooled10m: Int
+
+    public init(
+        refused10m: Int, lastRefusal: String? = nil, lastRefusalAtMs: Int64? = nil,
+        unpooled10m: Int
+    ) {
+        self.refused10m = refused10m
+        self.lastRefusal = lastRefusal
+        self.lastRefusalAtMs = lastRefusalAtMs
+        self.unpooled10m = unpooled10m
     }
 }
 
@@ -815,7 +929,9 @@ public struct HeldWindow: Decodable, Equatable, Sendable {
 /// Every counter here is non-optional, unlike the row-level ones: the Rust side
 /// writes all eight keys whenever it writes a bucket at all, so a missing key is
 /// a shape this build does not know how to read, and `Fleet.decode` marking that
-/// row unreadable is the honest outcome. `costUsd` is the ONE genuine null.
+/// row unreadable is the honest outcome. `costUsd` is the ONE genuine null. The
+/// one key outside those eight is ``reasoningTokens``, which the wire skips at
+/// zero, so its absence reads as 0.
 public struct UsageTotals: Decodable, Equatable, Sendable {
     public let requests: Int
     /// BASE input only — cache creation and cache reads are the two fields
@@ -851,10 +967,15 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
     public let unpricedRequests: Int
     /// When this bucket started, unix milliseconds. Present only on
     /// `usage.window`, which is the only bucket whose start is a fact the
-    /// server knows (Anthropic's own reset header); `nil` on `today`,
-    /// `lastHour` and every per-model bucket, whose spans are defined by their
-    /// names.
+    /// server knows (Anthropic's own reset header), and on a Codex row's
+    /// `usage.sevenDayWindow`, whose start the server knows from the weekly
+    /// reset; `nil` on `today`, `lastHour` and every per-model bucket, whose
+    /// spans are defined by their names.
     public let since: Int64?
+    /// The reasoning tokens a Codex response reported, broken out of
+    /// ``outputTokens``. 0 for every Anthropic bucket and for an older server,
+    /// because the wire skips it at zero.
+    public let reasoningTokens: Int
 
     public init(
         requests: Int,
@@ -865,7 +986,8 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
         outputTokens: Int,
         costUsd: Double?,
         unpricedRequests: Int,
-        since: Int64? = nil
+        since: Int64? = nil,
+        reasoningTokens: Int = 0
     ) {
         self.requests = requests
         self.inputTokens = inputTokens
@@ -876,6 +998,29 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
         self.costUsd = costUsd
         self.unpricedRequests = unpricedRequests
         self.since = since
+        self.reasoningTokens = reasoningTokens
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case requests, inputTokens, cacheCreationTokens, cacheCreation1hTokens, cacheReadTokens
+        case outputTokens, costUsd, unpricedRequests, since, reasoningTokens
+    }
+
+    /// Hand-written for ``reasoningTokens`` alone, whose absence is 0. Every other key
+    /// decodes exactly as the synthesised decoder did: `decode` for the seven counters,
+    /// `decodeIfPresent` for `costUsd` and `since`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        requests = try c.decode(Int.self, forKey: .requests)
+        inputTokens = try c.decode(Int.self, forKey: .inputTokens)
+        cacheCreationTokens = try c.decode(Int.self, forKey: .cacheCreationTokens)
+        cacheCreation1hTokens = try c.decode(Int.self, forKey: .cacheCreation1hTokens)
+        cacheReadTokens = try c.decode(Int.self, forKey: .cacheReadTokens)
+        outputTokens = try c.decode(Int.self, forKey: .outputTokens)
+        costUsd = try c.decodeIfPresent(Double.self, forKey: .costUsd)
+        unpricedRequests = try c.decode(Int.self, forKey: .unpricedRequests)
+        since = try c.decodeIfPresent(Int64.self, forKey: .since)
+        reasoningTokens = try c.decodeIfPresent(Int.self, forKey: .reasoningTokens) ?? 0
     }
 
     /// Two buckets added, for summing rows into a fleet total.
@@ -896,7 +1041,8 @@ public struct UsageTotals: Decodable, Equatable, Sendable {
             outputTokens: outputTokens + other.outputTokens,
             costUsd: UsageTotals.addCost(costUsd, other.costUsd),
             unpricedRequests: unpricedRequests + other.unpricedRequests,
-            since: nil
+            since: nil,
+            reasoningTokens: reasoningTokens + other.reasoningTokens
         )
     }
 
@@ -972,17 +1118,23 @@ public struct UsageRow: Decodable, Equatable, Sendable {
     /// ``today``, split by model id. Keys are raw ids (`claude-opus-5`);
     /// ``QuotaFormat/modelLabel(_:)`` shortens them for display.
     public let todayByModel: [String: UsageTotals]
+    /// On a Codex row with a known weekly reset, the current weekly window,
+    /// whose `since` is when it started. Otherwise `nil`, and a tail falls back
+    /// to ``today``.
+    public let sevenDayWindow: UsageTotals?
 
     public init(
         today: UsageTotals,
         window: UsageTotals?,
         lastHour: UsageTotals,
-        todayByModel: [String: UsageTotals]
+        todayByModel: [String: UsageTotals],
+        sevenDayWindow: UsageTotals? = nil
     ) {
         self.today = today
         self.window = window
         self.lastHour = lastHour
         self.todayByModel = todayByModel
+        self.sevenDayWindow = sevenDayWindow
     }
 
     /// The bucket the card's 5h line shows: this account's own quota window
@@ -1029,6 +1181,14 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     public let startedMs: Int64?
     public let endedMs: Int64?
     public let seconds: Double?
+    /// The call's own timeout, in seconds, when the request that started it
+    /// named one. A Codex call carries a timeout only when codex runs its
+    /// one-shot `exec_command`, which managed requirements select. By default
+    /// it has none: codex's default `exec_command` is the interactive one, and
+    /// it takes no timeout. `nil` for every Claude call and from an older
+    /// server. A Codex call without one draws no ring; a Claude `Bash` call's
+    /// ring is the Bash tool's own cap (``capped``), never this.
+    public let timeoutSeconds: Int?
 
     /// Does this call have a KNOWN cap it can run out of? Only a `Bash` call
     /// does (`bashTimeoutSeconds`, 600s) — an `Agent` or a `Read` has no
@@ -1048,7 +1208,8 @@ public struct ToolCall: Decodable, Equatable, Sendable {
         commandClass: String? = nil,
         startedMs: Int64? = nil,
         endedMs: Int64? = nil,
-        seconds: Double? = nil
+        seconds: Double? = nil,
+        timeoutSeconds: Int? = nil
     ) {
         self.tool = tool
         self.commandHead = commandHead
@@ -1056,10 +1217,11 @@ public struct ToolCall: Decodable, Equatable, Sendable {
         self.startedMs = startedMs
         self.endedMs = endedMs
         self.seconds = seconds
+        self.timeoutSeconds = timeoutSeconds
     }
 
     private enum CodingKeys: String, CodingKey {
-        case tool, commandHead, commandClass, startedMs, endedMs, seconds
+        case tool, commandHead, commandClass, startedMs, endedMs, seconds, timeoutSeconds
     }
 
     /// Hand-written so a payload from a server built before `commandClass`
@@ -1073,6 +1235,7 @@ public struct ToolCall: Decodable, Equatable, Sendable {
         startedMs = try c.decodeIfPresent(Int64.self, forKey: .startedMs)
         endedMs = try c.decodeIfPresent(Int64.self, forKey: .endedMs)
         seconds = try c.decodeIfPresent(Double.self, forKey: .seconds)
+        timeoutSeconds = try c.decodeIfPresent(Int.self, forKey: .timeoutSeconds)
     }
 }
 
@@ -1325,6 +1488,17 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
     /// drawn then. See ``CacheCountdown``.
     public let cacheTtlSecs: Int?
 
+    /// Which upstream this session talks to. Absent means Anthropic, and a
+    /// provider this build cannot name makes the session's row unreadable: the
+    /// rule account rows follow.
+    public let provider: Provider
+    /// The requests ``costUsd`` leaves out because they could not be priced. 0
+    /// means every request was priced.
+    public let unpricedRequests: Int
+    /// The reasoning tokens a Codex session's responses reported. 0 for a Claude
+    /// session and from an older server, because the wire skips it at zero.
+    public let reasoningTokens: Int
+
     public var id: String { sessionId }
 
     public init(
@@ -1340,7 +1514,10 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         tools: SessionTools = SessionTools(),
         reqPerMinute: [UInt16]? = nil,
         costUsd: Double? = nil,
-        cacheTtlSecs: Int? = nil
+        cacheTtlSecs: Int? = nil,
+        provider: Provider = .anthropic,
+        unpricedRequests: Int = 0,
+        reasoningTokens: Int = 0
     ) {
         self.sessionId = sessionId
         self.account = account
@@ -1355,15 +1532,22 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         self.reqPerMinute = reqPerMinute
         self.costUsd = costUsd
         self.cacheTtlSecs = cacheTtlSecs
+        self.provider = provider
+        self.unpricedRequests = unpricedRequests
+        self.reasoningTokens = reasoningTokens
     }
 
     private enum CodingKeys: String, CodingKey {
         case sessionId, account, model, firstSeenMs, lastSeenMs, requests, inputTokens,
             outputTokens, cacheReadTokens, tools, reqPerMinute, costUsd, cacheTtlSecs
+        case provider, unpricedRequests, reasoningTokens
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // First, for the same reason as an account row: a session of a provider this build
+        // cannot name says exactly that.
+        provider = try Provider.decoding(c.decodeIfPresent(String.self, forKey: .provider))
         sessionId = try c.decode(String.self, forKey: .sessionId)
         account = try c.decodeIfPresent(String.self, forKey: .account)
         model = try c.decodeIfPresent(String.self, forKey: .model)
@@ -1377,6 +1561,8 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         reqPerMinute = try c.decodeIfPresent([UInt16].self, forKey: .reqPerMinute)
         costUsd = try c.decodeIfPresent(Double.self, forKey: .costUsd)
         cacheTtlSecs = try c.decodeIfPresent(Int.self, forKey: .cacheTtlSecs)
+        unpricedRequests = try c.decodeIfPresent(Int.self, forKey: .unpricedRequests) ?? 0
+        reasoningTokens = try c.decodeIfPresent(Int.self, forKey: .reasoningTokens) ?? 0
     }
 }
 
@@ -1463,9 +1649,9 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// field is absent — an older `tcr` this newer TcrBar talks to, same
     /// forward-compat contract every other field in this struct follows, see
     /// decision \#3 above — and when the window itself has no reading yet.
-    /// Synthesized `Decodable` already calls `decodeIfPresent` for an
-    /// `Optional` property, so no field is ever missing from a decode; a
-    /// `nil` here falls back to the shared `quotaState` tint for that bar.
+    /// Each key's `decodeIfPresent` line in `init(from:)` is what turns an
+    /// absent key into `nil` rather than a failed row; a `nil` here falls
+    /// back to the shared `quotaState` tint for that bar.
     public let fiveHourState: QuotaState?
     public let sevenDayState: QuotaState?
     /// The FABLE weekly window's own state (`src/cli.rs`'s `sevenDayOiState`),
@@ -1545,23 +1731,25 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// Group labels (`src/stats.rs`'s `AccountSnapshot::groups`, carried onto
     /// the wire as `"groups"`, always an array — `[]` for an unlabelled
     /// account, never `null`). Optional here, deliberately, unlike the wire's
-    /// own `[]`-never-`null` rule: synthesized `Decodable` would *throw* on
-    /// this whole row against an older `tcr` that predates the field and
-    /// omits the key outright, the same failure mode decision \#3 above
-    /// exists to prevent. `nil` means "this server did not report groups";
-    /// `[]` means "reported, and there are none" — both render as ungrouped,
-    /// but the type keeps the distinction rather than collapsing it.
+    /// own `[]`-never-`null` rule: an older `tcr` that predates the field
+    /// omits the key outright, and this key's `decodeIfPresent` line in
+    /// `init(from:)` turns that into `nil` instead of a throw on this whole
+    /// row, the same failure mode decision \#3 above exists to prevent. `nil`
+    /// means "this server did not report groups"; `[]` means "reported, and
+    /// there are none" — both render as ungrouped, but the type keeps the
+    /// distinction rather than collapsing it.
     public let groups: [String]?
 
     /// Which of this account's own `groups` are held out of the general
     /// pool (`src/stats.rs`'s reserved-group flag, carried onto the wire as
     /// `"reservedGroups"`, repeated per row exactly the way `"groups"`
     /// itself already is — not a group-scoped lookup). Optional for the same
-    /// forward-compat reason `groups` is: synthesized `Decodable` would
-    /// throw against a server built before this field existed, and that
-    /// server's rows must keep decoding. `nil` and `[]` both mean "nothing
-    /// reserved" — this build has no server old enough to send `groups` but
-    /// not this, but the two fields are decoded identically on principle.
+    /// forward-compat reason `groups` is: a server built before this field
+    /// existed omits the key, and that server's rows must keep decoding,
+    /// which this key's `decodeIfPresent` line in `init(from:)` sees to.
+    /// `nil` and `[]` both mean "nothing reserved" — this build has no server
+    /// old enough to send `groups` but not this, but the two fields are
+    /// decoded identically on principle.
     public let reservedGroups: [String]?
 
     /// Which of this account's own `groups` are PARKED (`tcr group park`,
@@ -1591,10 +1779,11 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// nothing here is allowed to invent a colour when this dictionary lacks
     /// one — see ``GroupTag/background`` and ``AccountRow``'s chip, which
     /// fall back to a neutral token instead. Optional for the same
-    /// forward-compat reason `groups` is: synthesized `Decodable` would throw
-    /// against a server built before this field existed. `nil` when the wire
-    /// key is absent, `[:]` when it is present and empty — both leave every
-    /// group's ``GroupTag/background`` `nil`.
+    /// forward-compat reason `groups` is: a server built before this field
+    /// existed omits the key, and this key's `decodeIfPresent` line in
+    /// `init(from:)` turns that into `nil` instead of a throw. `nil` when the
+    /// wire key is absent, `[:]` when it is present and empty — both leave
+    /// every group's ``GroupTag/background`` `nil`.
     public let groupColors: [String: String]?
 
     /// The customer-facing plan label the SERVER derived (`Max 20x`, `Team 5x`,
@@ -1643,13 +1832,49 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// had no way to see, and the reason ``gate`` is decoded at all.
     public var isRejected: Bool { gate == .rejected }
 
+    /// When every gate holding this account out lifts, in unix ms, on every
+    /// row; `nil` when nothing holds it or nothing says when.
+    public let freeAtMs: Int64?
+
+    /// Which upstream this account serves. Absent on the wire means Anthropic;
+    /// see decision 7 in this file's header.
+    public let provider: Provider
+
+    /// The quota windows the plan reported. `nil` is unknown, and draws both
+    /// rows as before; `[]` is the plan saying it has none.
+    public let quotaWindows: [QuotaWindowKind]?
+    /// The length of the window in the 5-hour slot, in minutes, when the plan
+    /// said.
+    public let fiveHourWindowMinutes: Int?
+    /// The same, for the weekly slot.
+    public let sevenDayWindowMinutes: Int?
+    /// ChatGPT's reason for refusing this account, verbatim; present exactly
+    /// while the refusal stands.
+    public let limitReachedType: String?
+    /// Whether ChatGPT's spend control is reached; `false` when absent.
+    public let spendControlReached: Bool
+    /// The account's ChatGPT credits, once they were reported.
+    public let credits: CodexCredits?
+    /// The refresh error that signed this account out, verbatim. An absent
+    /// reason is never drawn.
+    public let loginError: String?
+    /// The folder this account was imported from; `nil` for a login of tcr's
+    /// own.
+    public let codexHome: String?
+    /// Whether tcr can pool codex. Computed by the CLI, and the same on every
+    /// Codex row; `nil` from a CLI that predates it.
+    public let codexRoute: CodexRoute?
+    /// The Codex requests tcr refused or did not pool. The same on every Codex
+    /// row; `nil` from an older server or CLI.
+    public let codexTraffic: CodexTraffic?
+
     /// Explicit memberwise init, needed only because adding `fiveHourState`/
     /// `sevenDayState` after the struct already had test fixtures constructing
     /// it directly would otherwise force every one of them to grow two new
     /// arguments. Both default to `nil` — the same "no per-window reading"
     /// value the wire's absent-field case decodes to — so every pre-existing
-    /// call site keeps compiling unchanged. `Decodable` synthesis is untouched
-    /// by this: it is generated independently of this initializer.
+    /// call site keeps compiling unchanged. Decoding is `init(from:)`, below,
+    /// and never goes through this initializer.
     public init(
         name: String,
         priority: Int,
@@ -1691,7 +1916,19 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         seatTier: String? = nil,
         orgUuid: String? = nil,
         orgName: String? = nil,
-        gate: GateReason? = nil
+        gate: GateReason? = nil,
+        freeAtMs: Int64? = nil,
+        provider: Provider = .anthropic,
+        quotaWindows: [QuotaWindowKind]? = nil,
+        fiveHourWindowMinutes: Int? = nil,
+        sevenDayWindowMinutes: Int? = nil,
+        limitReachedType: String? = nil,
+        spendControlReached: Bool = false,
+        credits: CodexCredits? = nil,
+        loginError: String? = nil,
+        codexHome: String? = nil,
+        codexRoute: CodexRoute? = nil,
+        codexTraffic: CodexTraffic? = nil
     ) {
         self.name = name
         self.priority = priority
@@ -1734,6 +1971,103 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.orgUuid = orgUuid
         self.orgName = orgName
         self.gate = gate
+        self.freeAtMs = freeAtMs
+        self.provider = provider
+        self.quotaWindows = quotaWindows
+        self.fiveHourWindowMinutes = fiveHourWindowMinutes
+        self.sevenDayWindowMinutes = sevenDayWindowMinutes
+        self.limitReachedType = limitReachedType
+        self.spendControlReached = spendControlReached
+        self.credits = credits
+        self.loginError = loginError
+        self.codexHome = codexHome
+        self.codexRoute = codexRoute
+        self.codexTraffic = codexTraffic
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, priority, status, disabled, quota, quotaState, fiveHour, sevenDay, sevenDayOi
+        case fiveHourState, sevenDayState, sevenDayOiState
+        case fiveHourResetAtMs, sevenDayResetAtMs, sevenDayOiResetAtMs, held
+        case requests, inputTokens, outputTokens, cacheReadTokens, cacheHitRatio, usage
+        case probeStatus, probeError, lastStreamError, streamErrorCount, source, serverSha, serverDirty
+        case groups, reservedGroups, parkedGroups, controlAllowedGroups, groupColors
+        case plan, organizationType, rateLimitTier, seatTier, orgUuid, orgName, gate, freeAtMs
+        case provider, quotaWindows, fiveHourWindowMinutes, sevenDayWindowMinutes
+        case limitReachedType, spendControlReached, credits, loginError, codexHome
+        case codexRoute, codexTraffic
+    }
+
+    /// Hand-written, because three keys need what synthesis cannot express: a
+    /// default and a throw (`provider`), dropping the names this build does not
+    /// know (`quotaWindows`), and a `false` default (`spendControlReached`).
+    ///
+    /// Every older key decodes exactly as synthesis did: `decode` for the eight
+    /// non-optional properties, and `decodeIfPresent` for the rest, so an absent
+    /// optional key is still `nil` and never costs the row. A test pins each
+    /// one (`CodexDecodeTests.testEveryPreExistingKeyStillReachesItsField`).
+    /// Making a property optional no longer makes it tolerate a missing or
+    /// `null` key on its own: change its line here to `decodeIfPresent` too,
+    /// or the row still throws.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // First, so a row of a provider this build cannot name says exactly that, whatever else
+        // about it this build cannot read.
+        provider = try Provider.decoding(c.decodeIfPresent(String.self, forKey: .provider))
+        name = try c.decode(String.self, forKey: .name)
+        priority = try c.decode(Int.self, forKey: .priority)
+        status = try c.decode(String.self, forKey: .status)
+        disabled = try c.decode(Bool.self, forKey: .disabled)
+        quota = try c.decodeIfPresent(Double.self, forKey: .quota)
+        quotaState = try c.decode(QuotaState.self, forKey: .quotaState)
+        fiveHour = try c.decodeIfPresent(Double.self, forKey: .fiveHour)
+        sevenDay = try c.decodeIfPresent(Double.self, forKey: .sevenDay)
+        sevenDayOi = try c.decodeIfPresent(Double.self, forKey: .sevenDayOi)
+        fiveHourState = try c.decodeIfPresent(QuotaState.self, forKey: .fiveHourState)
+        sevenDayState = try c.decodeIfPresent(QuotaState.self, forKey: .sevenDayState)
+        sevenDayOiState = try c.decodeIfPresent(QuotaState.self, forKey: .sevenDayOiState)
+        fiveHourResetAtMs = try c.decodeIfPresent(Int64.self, forKey: .fiveHourResetAtMs)
+        sevenDayResetAtMs = try c.decodeIfPresent(Int64.self, forKey: .sevenDayResetAtMs)
+        sevenDayOiResetAtMs = try c.decodeIfPresent(Int64.self, forKey: .sevenDayOiResetAtMs)
+        held = try c.decode([HeldWindow].self, forKey: .held)
+        requests = try c.decodeIfPresent(Int.self, forKey: .requests)
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens)
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens)
+        cacheReadTokens = try c.decodeIfPresent(Int.self, forKey: .cacheReadTokens)
+        cacheHitRatio = try c.decodeIfPresent(Double.self, forKey: .cacheHitRatio)
+        usage = try c.decodeIfPresent(UsageRow.self, forKey: .usage)
+        probeStatus = try c.decode(ProbeState.self, forKey: .probeStatus)
+        probeError = try c.decodeIfPresent(String.self, forKey: .probeError)
+        lastStreamError = try c.decodeIfPresent(String.self, forKey: .lastStreamError)
+        streamErrorCount = try c.decodeIfPresent(Int.self, forKey: .streamErrorCount)
+        source = try c.decode(StatusSource.self, forKey: .source)
+        serverSha = try c.decodeIfPresent(String.self, forKey: .serverSha)
+        serverDirty = try c.decodeIfPresent(Bool.self, forKey: .serverDirty)
+        groups = try c.decodeIfPresent([String].self, forKey: .groups)
+        reservedGroups = try c.decodeIfPresent([String].self, forKey: .reservedGroups)
+        parkedGroups = try c.decodeIfPresent([String].self, forKey: .parkedGroups)
+        controlAllowedGroups = try c.decodeIfPresent([String].self, forKey: .controlAllowedGroups)
+        groupColors = try c.decodeIfPresent([String: String].self, forKey: .groupColors)
+        plan = try c.decodeIfPresent(String.self, forKey: .plan)
+        organizationType = try c.decodeIfPresent(String.self, forKey: .organizationType)
+        rateLimitTier = try c.decodeIfPresent(String.self, forKey: .rateLimitTier)
+        seatTier = try c.decodeIfPresent(String.self, forKey: .seatTier)
+        orgUuid = try c.decodeIfPresent(String.self, forKey: .orgUuid)
+        orgName = try c.decodeIfPresent(String.self, forKey: .orgName)
+        gate = try c.decodeIfPresent(GateReason.self, forKey: .gate)
+        freeAtMs = try c.decodeIfPresent(Int64.self, forKey: .freeAtMs)
+        quotaWindows = try QuotaWindowKind.decoding(
+            c.decodeIfPresent([String].self, forKey: .quotaWindows))
+        fiveHourWindowMinutes = try c.decodeIfPresent(Int.self, forKey: .fiveHourWindowMinutes)
+        sevenDayWindowMinutes = try c.decodeIfPresent(Int.self, forKey: .sevenDayWindowMinutes)
+        limitReachedType = try c.decodeIfPresent(String.self, forKey: .limitReachedType)
+        spendControlReached =
+            try c.decodeIfPresent(Bool.self, forKey: .spendControlReached) ?? false
+        credits = try c.decodeIfPresent(CodexCredits.self, forKey: .credits)
+        loginError = try c.decodeIfPresent(String.self, forKey: .loginError)
+        codexHome = try c.decodeIfPresent(String.self, forKey: .codexHome)
+        codexRoute = try c.decodeIfPresent(CodexRoute.self, forKey: .codexRoute)
+        codexTraffic = try c.decodeIfPresent(CodexTraffic.self, forKey: .codexTraffic)
     }
 
     /// This row's identity — its name, which `tcr` guarantees is unique.
@@ -2902,6 +3236,14 @@ public struct Fleet: Equatable, Sendable {
 
     public var serverSha: String? { accounts.first?.serverSha }
     public var serverDirty: Bool { accounts.first?.serverDirty ?? false }
+
+    /// Whether any row is a Codex account, in any state: disabled, parked or
+    /// broken included. Every Codex element the panel draws is gated on this,
+    /// re-read on every poll. A fleet without one is Claude-only, and draws what
+    /// it drew before Codex accounts existed.
+    public var holdsCodex: Bool { accounts.contains { $0.provider == .codex } }
+    /// Whether any row is an Anthropic account, in any state.
+    public var holdsAnthropic: Bool { accounts.contains { $0.provider == .anthropic } }
 
     public var toolsTotalCalls: Int { sessions.reduce(0) { $0 + $1.tools.calls } }
     public var toolsTotalErrors: Int { sessions.reduce(0) { $0 + $1.tools.errors } }
