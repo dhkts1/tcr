@@ -4255,7 +4255,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // benches every account outside its set, whatever its provider.
                 let tried_of_provider = tried
                     .iter()
-                    .filter(|&&i| manager.provider(i) == Some(provider))
+                    .filter(|&&i| manager.live_provider(i) == Some(provider))
                     .count();
                 let rotation_is_spent =
                     machine_level || tried_of_provider + 1 >= provider_account_count;
@@ -5099,7 +5099,24 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     tool_uses: response_tool_uses,
                     bound_tokens,
                     codex_tool_calls,
+                    codex_stream_limit,
                 } = parse_sse_usage(byte_stream, provider, &stream_path).await;
+                // A 200 can carry a quota refusal in its SSE body. The client has
+                // already received that stream, so never replay it here; bench the
+                // serving account before its next pinned turn is selected.
+                if let Some(limit) = codex_stream_limit {
+                    manager_side.update_quota_with_codex_refusal(
+                        idx,
+                        &limit.headers,
+                        429,
+                        limit.refusal.as_ref(),
+                    );
+                    if limit.refusal.is_some() {
+                        manager_side.mark_codex_quota_limited(idx, limit.hold_seconds);
+                    } else {
+                        manager_side.mark_rate_limited(idx, limit.hold_seconds);
+                    }
+                }
                 // Who minted the account-bound tokens in this turn. Recorded before anything
                 // else the parse learned, because it is the only one of them that changes how a
                 // LATER request is routed: every following turn of this conversation echoes
@@ -6757,6 +6774,8 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 /// needs no `message_start` to count as a turn on the Responses endpoint. Auxiliary
 /// image, memory and search streams have their own framing; they never synthesize
 /// a missing Responses terminator, while explicit error events still count.
+/// A Codex quota or rate-limit failure also returns [`SseParse::codex_stream_limit`]
+/// so the caller holds that account for subsequent turns without replaying this stream.
 async fn parse_sse_usage<S, B, E>(
     stream: S,
     provider: crate::provider::Provider,
@@ -6773,6 +6792,7 @@ where
     // Set only on a Codex stream, from its terminal event; see `SseParse::model`.
     let mut model: Option<String> = None;
     let mut stream_error: Option<String> = None;
+    let mut codex_stream_limit = None;
     let mut saw_any_event = false;
     let mut saw_message_start = false;
     let mut saw_message_stop = false;
@@ -6819,12 +6839,14 @@ where
                     Some("response.failed") => {
                         saw_codex_end = true;
                         if stream_error.is_none() {
-                            stream_error = Some(codex_error_kind(
-                                value.get("response").and_then(|r| r.get("error")),
-                            ));
+                            let error = value.get("response").and_then(|r| r.get("error"));
+                            codex_stream_limit = error.and_then(CodexStreamLimit::from_error);
+                            stream_error = Some(codex_error_kind(error));
                         }
                     }
                     Some("error") if stream_error.is_none() => {
+                        codex_stream_limit =
+                            value.get("error").and_then(CodexStreamLimit::from_error);
                         stream_error = Some(codex_error_kind(value.get("error")));
                     }
                     _ => {}
@@ -7079,6 +7101,7 @@ where
         tool_uses,
         bound_tokens,
         codex_tool_calls,
+        codex_stream_limit,
     }
 }
 
@@ -7141,6 +7164,9 @@ struct SseParse {
     /// [`TRUNCATED_STREAM_ERROR_KIND`] when the turn's end (`message_stop`; a Codex terminal
     /// event) was never observed.
     stream_error: Option<String>,
+    /// Positive quota/rate-limit advice from the first Codex error event.
+    /// Other stream errors remain observational and never change routing.
+    codex_stream_limit: Option<CodexStreamLimit>,
     /// Every COMPLETED client-side `tool_use` block — what the Tools tab's RUNNING NOW is built
     /// from.
     tool_uses: Vec<crate::session_wire::ToolUseEvent>,
@@ -7150,6 +7176,57 @@ struct SseParse {
     /// most `PENDING_TOOL_CAP` of them; always empty on an Anthropic stream, whose calls are
     /// `tool_uses`.
     codex_tool_calls: Vec<crate::session_wire::CodexToolCall>,
+}
+
+/// Codex's failed-response reader recognizes quota codes and transient rate limits
+/// even when the HTTP response was successful. Read only their reset/retry advice;
+/// context, prompt, policy and overload errors do not condemn an account's quota.
+struct CodexStreamLimit {
+    headers: HeaderMap,
+    refusal: Option<crate::quota::CodexQuotaRefusal>,
+    hold_seconds: i64,
+}
+
+impl CodexStreamLimit {
+    fn from_error(error: &Value) -> Option<Self> {
+        let mut headers = HeaderMap::new();
+        if let Some(values) = error.get("headers").and_then(Value::as_object) {
+            for (name, value) in values {
+                if name.eq_ignore_ascii_case("retry-after")
+                    || name.to_ascii_lowercase().starts_with("x-codex-")
+                {
+                    if let (Ok(name), Some(Ok(value))) = (
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                        value.as_str().map(reqwest::header::HeaderValue::from_str),
+                    ) {
+                        headers.insert(name, value);
+                    }
+                }
+            }
+        }
+        let now = OffsetDateTime::now_utc();
+        let refusal = crate::quota::CodexQuotaRefusal::from_error(&headers, Some(error), now);
+        if refusal.is_none()
+            && !matches!(
+                error.get("code").and_then(Value::as_str),
+                Some("rate_limit_exceeded" | "slow_down")
+            )
+        {
+            return None;
+        }
+        let hold_seconds = refusal
+            .as_ref()
+            .and_then(|refusal| refusal.reset)
+            .map_or_else(
+                || parse_retry_after(&headers).unwrap_or(60),
+                |reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()),
+            );
+        Some(Self {
+            headers,
+            refusal,
+            hold_seconds,
+        })
+    }
 }
 
 /// One `tool_use` content block being assembled across SSE events — see [`parse_sse_usage`].
@@ -8159,7 +8236,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),
-            codex_upstream: crate::config::default_codex_upstream(),
+            codex_upstream: "http://127.0.0.1:0".to_string(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: crate::config::PacingConfig::default(),
@@ -11002,16 +11079,10 @@ mod tests {
         );
     }
 
-    /// **The quota route names a Codex row's provider, and only a Codex row's.** A
-    /// status line reads these rows as its Claude picture, and a ChatGPT account's
-    /// windows must not pass for Claude capacity. `provider` is spelled as on
-    /// `tcr status --json`: `"codex"` on a Codex row, absent on an Anthropic one, so the
-    /// rows of an Anthropic-only fleet are the bytes they were (the six keys
-    /// `quota_endpoint_answers_from_memory_without_upstream` pins).
-    ///
-    /// Watched red: without the field, the Codex row is the six keys of a Claude one.
+    /// The documented v1 quota endpoint reports Claude capacity only. Codex's
+    /// provider and weekly window remain available on the provider-aware status route.
     #[tokio::test]
-    async fn quota_endpoint_names_a_codex_rows_provider() {
+    async fn quota_v1_excludes_codex_rows_while_status_keeps_their_capacity() {
         let manager = Manager::with_live_refresher(
             codex_fleet("http://127.0.0.1:1", "http://127.0.0.1:1"),
             None,
@@ -11049,13 +11120,21 @@ mod tests {
             "an Anthropic row carries no provider key: {}",
             rows[0]
         );
+        assert_eq!(payload["kind"], "tcr.quota.v1");
+        assert_eq!(rows.len(), 1, "Codex is absent from Claude's v1 capacity");
+
+        let (status, _, body) =
+            status_request(manager, Method::GET, Some(loopback_peer()), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        let rows = payload["accounts"].as_array().expect("status accounts");
         assert_eq!(rows[1]["name"], "bob@example.com/codex");
         assert_eq!(rows[1]["provider"], "codex", "{}", rows[1]);
         assert!(
             rows[1]["sevenDay"]
                 .as_f64()
                 .is_some_and(|v| (v - 0.4).abs() < 1e-9),
-            "the Codex row carries its own weekly reading: {}",
+            "the provider-aware status route keeps Codex's weekly reading: {}",
             rows[1]
         );
     }
@@ -19834,7 +19913,12 @@ mod tests {
     /// 502); a request the guard REJECTS returns its local status (421) with no
     /// egress. The 421-vs-503 split is what proves whether the guard fired.
     async fn spawn_dead_upstream_proxy() -> SocketAddr {
-        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+        let config = dummy_config(None, "http://127.0.0.1:1");
+        assert_eq!(
+            config.codex_upstream, "http://127.0.0.1:0",
+            "an unspecified test origin must fail closed"
+        );
+        let manager = Manager::with_live_refresher(config, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -22483,7 +22567,7 @@ mod tests {
 
     /// **A fleet with no Codex account answers a Codex request by saying so**,
     /// and names the fix, instead of a `pool_unavailable` 429 whose 60-second
-    /// retry no wait will satisfy. Still a 429 in the `{"error": {...}}`
+    /// retry no wait will satisfy. It answers 400 in the `{"error": {...}}`
     /// envelope, with no `retry-after`: waiting changes nothing. Neither origin
     /// is asked.
     ///
@@ -22562,7 +22646,7 @@ mod tests {
     /// request shape hyper treats specially), and `Host: chatgpt.com` takes the host
     /// guard's allow-listed branch rather than the guard-skipped one `oneshot` gets.
     /// The fleet has no Codex account at all, so a request that slipped past step 1c'
-    /// would be answered 429 by the exhausted pool, never forwarded anywhere.
+    /// would be answered 400 by the empty pool, never forwarded anywhere.
     #[tokio::test]
     async fn codex_upgrade_over_a_real_socket_is_answered_426() {
         let addr = spawn_dead_upstream_proxy().await;
@@ -23606,6 +23690,211 @@ mod tests {
             (1, Some(CodexRefusalKind::CredentialRefused))
         );
     }
+    #[tokio::test]
+    async fn codex_failed_stream_limits_move_the_next_pinned_turn() {
+        for code in [
+            "insufficient_quota",
+            "usage_not_included",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "rate_limit_exceeded",
+            "slow_down",
+            "context_length_exceeded",
+            "invalid_prompt",
+            "server_is_overloaded",
+        ] {
+            for event in ["response.failed", "error"] {
+                let reset = OffsetDateTime::now_utc().unix_timestamp() + 7200;
+                let error = serde_json::json!({
+                    "code": code, "resets_at": reset,
+                    "headers": {"retry-after": "25"}
+                });
+                let failure = if event == "response.failed" {
+                    serde_json::json!({"type": event, "response": {"error": error}})
+                } else {
+                    serde_json::json!({"type": event, "error": error})
+                };
+                let failed_bytes = format!("data: {failure}\n\n");
+                let seen = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+                let origin_seen = Arc::clone(&seen);
+                let origin_failure = failed_bytes.clone();
+                let origin = Router::new().fallback(move |req: Request| {
+                    let seen = Arc::clone(&origin_seen);
+                    let failed_bytes = origin_failure.clone();
+                    async move {
+                        let idx = codex_index_of(req.headers()["authorization"].to_str().unwrap());
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(idx);
+                        let body = if seen.len() == 1 {
+                            failed_bytes
+                        } else {
+                            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n".into()
+                        };
+                        Response::builder().header(CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(body)).unwrap()
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server =
+                    tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+                let manager = Manager::with_live_refresher(
+                    codex_fleet_with_carol("http://127.0.0.1:9", &url),
+                    None,
+                );
+                let send = || async {
+                    use tower::ServiceExt as _;
+                    let mut request = Request::builder()
+                        .method(Method::POST)
+                        .uri(crate::provider::CODEX_RESPONSES_PATH)
+                        .header("authorization", "Bearer client-own")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("session-id", "test-stream-quota-session")
+                        .body(Body::from("{}"))
+                        .unwrap();
+                    request.extensions_mut().insert(ClientAddr(loopback_peer()));
+                    request.extensions_mut().insert(SessionKey(1));
+                    app(Arc::clone(&manager)).oneshot(request).await.unwrap()
+                };
+                let first = send().await;
+                assert_eq!(first.status(), StatusCode::OK);
+                assert_eq!(
+                    to_bytes(first.into_body(), MAX_BODY_BYTES).await.unwrap(),
+                    failed_bytes
+                );
+                let first_idx = seen.lock().unwrap()[0];
+                assert_eq!(
+                    manager.affinity_pin(stable_hash("sid:", "test-stream-quota-session")),
+                    Some(first_idx),
+                    "the test must exercise a real conversation pin"
+                );
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if manager.snapshot(OffsetDateTime::now_utc()).accounts[first_idx]
+                            .last_stream_error
+                            .as_deref()
+                            == Some(code)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("stream error was recorded");
+                let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+                let request_error = matches!(
+                    code,
+                    "context_length_exceeded" | "invalid_prompt" | "server_is_overloaded"
+                );
+                if request_error {
+                    assert!(
+                        snapshot.accounts[first_idx].rate_limited_until.is_none(),
+                        "{event}/{code} must not hold a healthy account"
+                    );
+                } else {
+                    let held = snapshot.accounts[first_idx]
+                        .rate_limited_until
+                        .unwrap_or_else(|| panic!("{event}/{code} must hold its serving account"));
+                    if matches!(code, "rate_limit_exceeded" | "slow_down") {
+                        assert!(
+                            (20..=25).contains(&(held - OffsetDateTime::now_utc()).whole_seconds())
+                        );
+                    } else {
+                        assert!((held.unix_timestamp() - reset).abs() <= 1, "{event}/{code}");
+                    }
+                }
+                let second = send().await;
+                assert_eq!(second.status(), StatusCode::OK);
+                to_bytes(second.into_body(), MAX_BODY_BYTES).await.unwrap();
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 2);
+                if request_error {
+                    assert_eq!(
+                        seen[0], seen[1],
+                        "{event}/{code} must preserve the healthy pin"
+                    );
+                } else {
+                    assert_ne!(
+                        seen[0], seen[1],
+                        "{event}/{code} must move a pinned conversation"
+                    );
+                }
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_codex_siblings_do_not_hide_a_spent_pools_reset() {
+        for state in [
+            "disabled",
+            "parked",
+            "reserved",
+            "login",
+            "unsupported",
+            "locked",
+        ] {
+            let mut config = codex_fleet_with_carol("http://127.0.0.1:9", "http://127.0.0.1:9");
+            match state {
+                "disabled" => config.accounts[2].disabled = Some(true),
+                "parked" | "reserved" => {
+                    config.accounts[2].groups = Some(vec!["test-group".into()]);
+                    config.group_settings.insert(
+                        "test-group".into(),
+                        crate::config::GroupSettings {
+                            parked: state == "parked",
+                            reserved: state == "reserved",
+                            ..Default::default()
+                        },
+                    );
+                }
+                "unsupported" => {
+                    config.accounts[2].egress =
+                        crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32]));
+                    config.accounts[2].egress_strict = true;
+                }
+                "locked" => config.lock_account = Some(config.accounts[1].name.clone()),
+                "login" => {}
+                _ => unreachable!(),
+            }
+            let manager = Manager::with_live_refresher(config, None);
+            if state == "login" {
+                manager.mark_error(2);
+            }
+            let now = OffsetDateTime::now_utc();
+            let reset = now.unix_timestamp() + 3 * 86400;
+            let headers = HeaderMap::new();
+            let body =
+                serde_json::json!({"error":{"type":"usage_limit_reached", "resets_at":reset}})
+                    .to_string();
+            let refusal =
+                crate::quota::CodexQuotaRefusal::parse(&headers, body.as_bytes(), now).unwrap();
+            manager.update_quota_with_codex_refusal(1, &headers, 429, Some(&refusal));
+            manager.mark_codex_quota_limited(1, 3 * 86400);
+            let response = exhausted_response(
+                &manager,
+                now,
+                2,
+                false,
+                crate::provider::Provider::Codex,
+                None,
+                None,
+            );
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let body = body_json(response).await;
+            assert_eq!(
+                body["error"]["type"], "usage_limit_reached",
+                "{state}: {body}"
+            );
+            assert!(
+                (body["error"]["resets_at"].as_i64().unwrap() - reset).abs() <= 1,
+                "{state}: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn codex_refusal_probe_releases_the_account_hold() {
         let manager = Manager::with_live_refresher(

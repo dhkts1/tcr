@@ -1956,6 +1956,12 @@ impl Manager {
         only: Option<usize>,
     ) -> ExhaustionHint {
         let now_ms = odt_to_ms(now);
+        let codex_candidates = match provider.or_else(|| only.and_then(|idx| self.provider(idx))) {
+            Some(crate::provider::Provider::Codex) => {
+                Some(self.codex_candidate_indices(only, group))
+            }
+            Some(crate::provider::Provider::Anthropic) | None => None,
+        };
         let reserved_groups = self.reserved_groups();
         let parked_groups = self.parked_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
@@ -1970,6 +1976,11 @@ impl Manager {
             .iter()
             .enumerate()
             .filter(|&(idx, _)| only.is_none_or(|only| only == idx))
+            .filter(|&(idx, _)| {
+                codex_candidates
+                    .as_ref()
+                    .is_none_or(|candidates| candidates.contains(&idx))
+            })
             .filter(|(_, account)| provider.is_none_or(|p| account.provider == p))
             .filter(|(_, account)| group.is_none_or(|g| account.groups.iter().any(|m| m == g)))
         {

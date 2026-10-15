@@ -758,11 +758,9 @@ pub struct QuotaPayload {
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuota {
     pub name: String,
-    /// Which upstream this account belongs to, spelled as on [`AccountStatus`]:
-    /// `"codex"` on a Codex row and absent on an Anthropic one, so an
-    /// Anthropic-only fleet's rows are exactly what they were before the field. A
-    /// status line reads these rows as its Claude picture, and without the key a
-    /// Codex account's windows would read as Claude capacity.
+    /// The shared upstream discriminator. The v1 quota projection includes only
+    /// Anthropic accounts and omits their default provider field, preserving the
+    /// documented Claude-only wire shape.
     #[serde(
         default,
         skip_serializing_if = "crate::provider::Provider::is_anthropic"
@@ -776,11 +774,16 @@ pub struct AccountQuota {
 }
 
 impl QuotaPayload {
-    /// Project a live snapshot onto the quota wire, in the server's account order.
+    /// Project Claude capacity onto the documented v1 quota wire, in server order.
+    /// Codex capacity belongs to the provider-aware status route, not this v1 shape.
     pub fn from_snapshot(snapshot: &StatsSnapshot) -> Self {
         let accounts = snapshot
             .accounts
             .iter()
+            .filter(|account| match account.provider {
+                crate::provider::Provider::Anthropic => true,
+                crate::provider::Provider::Codex => false,
+            })
             .map(|a| AccountQuota {
                 name: a.name.clone(),
                 provider: a.provider,
@@ -2101,10 +2104,30 @@ mod tests {
         }
     }
 
-    /// A snapshot survives serialize → wire → deserialize → snapshot with every
-    /// rendered field intact. This is the contract `tcr status --json` depends on:
-    /// the live path must render byte-identically to the offline path given the
-    /// same numbers, differing only in the `source` label.
+    #[test]
+    fn quota_v1_contains_only_anthropic_capacity() {
+        let mut snapshot = snapshot_with_counters();
+        let mut codex = snapshot.accounts[0].clone();
+        codex.name = "bob@example.com/codex".into();
+        codex.provider = crate::provider::Provider::Codex;
+        snapshot.accounts.push(codex.clone());
+        let payload = QuotaPayload::from_snapshot(&snapshot);
+        assert_eq!(payload.kind, "tcr.quota.v1");
+        assert_eq!(
+            payload
+                .accounts
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alice@example.com"],
+            "the documented v1 quota shape reports Claude capacity only"
+        );
+        snapshot.accounts = vec![codex];
+        assert!(QuotaPayload::from_snapshot(&snapshot).accounts.is_empty());
+    }
+
+    /// Every rendered field survives the status wire round trip. The live path
+    /// must render the same numbers as offline, differing only in its source label.
     #[test]
     fn payload_round_trips_every_rendered_field() {
         let snapshot = snapshot_with_counters();

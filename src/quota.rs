@@ -860,6 +860,16 @@ impl CodexQuotaRefusal {
     pub fn parse(headers: &impl HeaderView, body: &[u8], now: OffsetDateTime) -> Option<Self> {
         let document = serde_json::from_slice::<serde_json::Value>(body).ok();
         let error = document.as_ref().and_then(|doc| doc.get("error"));
+        Self::from_error(headers, error, now)
+    }
+
+    /// The same error envelope can arrive inside a successful Responses stream.
+    /// Reuse the HTTP classifier and deadline rules without parsing the event twice.
+    pub(crate) fn from_error(
+        headers: &impl HeaderView,
+        error: Option<&serde_json::Value>,
+        now: OffsetDateTime,
+    ) -> Option<Self> {
         let limit_reached_type = headers
             .get_str(CODEX_REACHED_TYPE_HEADER)
             .map(str::to_owned);
@@ -891,6 +901,8 @@ fn codex_quota_error(error: &serde_json::Value) -> bool {
         error.get("code").and_then(serde_json::Value::as_str),
         Some(
             "insufficient_quota"
+                | "usage_limit_reached"
+                | "usage_not_included"
                 | "credit_balance_exhausted"
                 | "organization_spend_limit_exceeded"
                 | "project_spend_limit_exceeded"

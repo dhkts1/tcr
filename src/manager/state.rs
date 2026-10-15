@@ -215,6 +215,31 @@ impl Manager {
         group: Option<&str>,
         matches: impl Fn(&AccountRuntime) -> bool,
     ) -> (usize, usize) {
+        self.fold_codex_candidates(bound_to, group, (0, 0), |(total, matching), _, account| {
+            (total + 1, matching + usize::from(matches(account)))
+        })
+    }
+
+    /// The exhaustion deadline must fold the same slots that can recover by
+    /// waiting. Disabled or unsupported siblings must not hide a real reset.
+    pub(super) fn codex_candidate_indices(
+        &self,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+    ) -> HashSet<usize> {
+        self.fold_codex_candidates(bound_to, group, HashSet::new(), |mut indices, idx, _| {
+            indices.insert(idx);
+            indices
+        })
+    }
+
+    fn fold_codex_candidates<T>(
+        &self,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+        initial: T,
+        mut fold: impl FnMut(T, usize, &AccountRuntime) -> T,
+    ) -> T {
         self.reload_groups_if_changed();
         let unsupported = self.codex_accounts_with_unsupported_exit();
         let parked = self.parked_groups();
@@ -239,9 +264,7 @@ impl Manager {
                         && !unsupported.contains(idx)
                 }
             })
-            .fold((0, 0), |(total, matching), (_, account)| {
-                (total + 1, matching + usize::from(matches(account)))
-            })
+            .fold(initial, |value, (idx, account)| fold(value, idx, account))
     }
 
     /// The live locked slot, when the lock belongs to this request's provider.
@@ -401,7 +424,8 @@ impl Manager {
             .map(str::to_string)
     }
 
-    /// `None` only for an index that no longer exists.
+    /// A slot's immutable provider, including retired slots. Bound history still
+    /// needs this identity to release a conversation through its normal warning path.
     pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
         self.accounts
             .read()
@@ -409,11 +433,55 @@ impl Manager {
             .get(idx)
             .map(|a| a.provider)
     }
+
+    /// A provider only while its slot remains live. Rotation counts must match
+    /// provider_account_count, which excludes retired rows.
+    pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .filter(|account| !account.removed)
+            .map(|account| account.provider)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_slots_keep_their_provider_identity_but_do_not_count_in_live_rotation() {
+        let manager = manager_with(
+            r#"{"accounts":[
+                {"name":"alice@example.com","accessToken":"at-alice"},
+                {"name":"bob@example.com","accessToken":"at-bob","provider":"codex"}
+            ]}"#,
+        );
+        for (idx, provider) in [
+            crate::provider::Provider::Anthropic,
+            crate::provider::Provider::Codex,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(manager.provider(idx), Some(provider));
+            assert_eq!(manager.live_provider(idx), Some(provider));
+            manager.accounts.write().unwrap()[idx].removed = true;
+            assert_eq!(
+                manager.provider(idx),
+                Some(provider),
+                "bound history retains a removed slot's provider identity"
+            );
+            assert_eq!(
+                manager.live_provider(idx),
+                None,
+                "a retired slot cannot consume a live rotation step"
+            );
+        }
+        assert_eq!(manager.provider(2), None);
+        assert_eq!(manager.live_provider(2), None);
+    }
 
     fn manager_with(config: &str) -> Arc<Manager> {
         let config: Config = serde_json::from_str(config).expect("the inline test config parses");
