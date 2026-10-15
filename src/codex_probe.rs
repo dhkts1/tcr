@@ -138,6 +138,8 @@ pub async fn fetch_usage(
 
 /// Map the payload onto tcr's buckets. `used_percent` is 0–100; `reset_at` is epoch seconds and
 /// outranks `reset_after_seconds`, which is relative to a clock we did not observe.
+/// Network reset values saturate when added or converted to milliseconds, so an extreme future
+/// reset cannot wrap into the past (and a past reset cannot wrap into the future).
 ///
 /// A window is trusted only as far as it carries data, by the same three rules the header parser
 /// applies (`Quota::update_from_codex_headers`), so the probe and the headers read one account
@@ -199,9 +201,9 @@ pub fn usage_from_payload(v: &Value) -> Usage {
             .or_else(|| {
                 w.get("reset_after_seconds")
                     .and_then(Value::as_i64)
-                    .map(|s| now_s + s)
+                    .map(|s| now_s.saturating_add(s))
             })
-            .map(|s| s * 1000);
+            .map(|s| s.saturating_mul(1000));
         // Zero or less is no length.
         let seconds = w
             .get("limit_window_seconds")
@@ -328,6 +330,27 @@ mod tests {
         let usage = usage_from_payload(&v);
         let reset = usage.five_hour.unwrap().reset_at_ms.unwrap();
         assert!(reset >= before + 119_000 && reset <= before + 121_000 + 1000);
+    }
+
+    #[test]
+    fn network_reset_values_saturate_instead_of_wrapping() {
+        for key in ["reset_at", "reset_after_seconds"] {
+            for (seconds, expected) in [(i64::MAX, i64::MAX), (i64::MIN, i64::MIN)] {
+                let mut window = serde_json::json!({
+                    "used_percent": 100,
+                    "limit_window_seconds": 18_000,
+                });
+                window[key] = serde_json::json!(seconds);
+                let usage = usage_from_payload(&serde_json::json!({
+                    "rate_limit": { "primary_window": window },
+                }));
+                assert_eq!(
+                    usage.five_hour.unwrap().reset_at_ms,
+                    Some(expected),
+                    "{key} must never wrap a future reset into the past or a past reset into the future"
+                );
+            }
+        }
     }
 
     /// The shape the real backend sent, measured 2026-10-12 on two Pro logins, one exhausted
