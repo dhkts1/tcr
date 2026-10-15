@@ -2720,11 +2720,17 @@ fn codex_account_row(
 /// Whether `login` is the account `row` holds, by the rule the write resolves its row by:
 /// [`crate::identity::same_identity`] against the row [`codex_account_row`] would write, so a
 /// Codex row of the same ChatGPT user in the same workspace.
+///
+/// A login that does not name both its user and its workspace is never the row's. Without
+/// them `same_identity` falls back to comparing names, and the probe row here carries `row`'s
+/// own name, so any such login would pass.
 pub(crate) fn codex_login_is_row(row: &Account, login: &crate::codex_login::CodexLogin) -> bool {
-    crate::identity::same_identity(
-        row,
-        &codex_account_row(row.name.clone(), login.clone(), None),
-    )
+    login.user_id.is_some()
+        && login.account_id.is_some()
+        && crate::identity::same_identity(
+            row,
+            &codex_account_row(row.name.clone(), login.clone(), None),
+        )
 }
 
 /// The name a Codex import writes under.
@@ -7733,6 +7739,85 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["accounts"][0]["name"], "alice@example.com", "{doc}");
         assert_eq!(doc["accounts"][0]["provider"], "codex", "{doc}");
+    }
+
+    /// `--account` naming a Codex row refuses a login that does not name both its ChatGPT
+    /// user and its workspace: such a login cannot be shown to be that row's account. The
+    /// identity check fell back to comparing names, and its probe row carried the target row's
+    /// own name, so the check passed for any such login and the import wrote a row for whoever
+    /// it was. It is refused like any other login that is not the row's, before the route probe
+    /// and the workspace check, with nothing written. `--codex` refuses the same login.
+    ///
+    /// Watched red: without the check, carol's login with no user id is imported beside bob's
+    /// row, as `carol@example.com`.
+    #[tokio::test]
+    async fn an_account_import_refuses_a_login_that_names_no_user_or_workspace() {
+        let (port, probes) = stub_add_route(true, Some(crate::provider::Provider::Codex)).await;
+        let (upstream, checks) =
+            accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
+        let (_dir, path) = import_config(
+            port,
+            &upstream,
+            &format!(
+                r#"[{{ "name": "bob@example.com/codex", "provider": "codex",
+                      "accountUuid": "{CODEX_USER_A}", "orgUuid": "{CODEX_ACCOUNT_A}",
+                      "accessToken": "at-bob", "refreshToken": "rt-bob",
+                      "expiresAt": 1700000000000 }}]"#
+            ),
+        );
+        let before = std::fs::read(&path).unwrap();
+        let carol = || crate::codex_login::CodexLogin {
+            email: Some("carol@example.com".to_string()),
+            ..alice_codex_login(1_800_000_000_000, "at-carol", "rt-carol")
+        };
+        for (what, login) in [
+            (
+                "no user",
+                crate::codex_login::CodexLogin {
+                    user_id: None,
+                    ..carol()
+                },
+            ),
+            (
+                "no workspace",
+                crate::codex_login::CodexLogin {
+                    account_id: None,
+                    ..carol()
+                },
+            ),
+        ] {
+            let err = import_codex_login(
+                &path,
+                false,
+                None,
+                Some("bob@example.com/codex"),
+                login,
+                None,
+            )
+            .await
+            .expect_err(what);
+            assert_eq!(
+                err.to_string(),
+                "the Codex login on this machine is not 'bob@example.com/codex'; nothing was \
+                 written.",
+                "{what}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{what}: nothing was written"
+            );
+        }
+        assert!(
+            probes.lock().unwrap().is_empty(),
+            "not even the route probe: {:?}",
+            probes.lock().unwrap()
+        );
+        assert!(
+            checks.lock().unwrap().is_empty(),
+            "no workspace check: {:?}",
+            checks.lock().unwrap()
+        );
     }
 
     // --- import_codex_login: logins tcr must not pool -----------------------------
