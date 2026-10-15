@@ -489,10 +489,11 @@ impl Report {
         lines.join("\n")
     }
 
-    /// [`Self::render_text`]'s lines without the verdict: the six keys, then a `problem:` line
-    /// for each problem, then an `unknownKey:` line for each unknown config key. Beside a Codex
-    /// block ([`Diagnosis`]) these lines come first and the verdict last, so a config's unknown
-    /// keys sit after `requests10m:` and before `codexAccounts:`.
+    /// [`Self::render_text`]'s lines without the verdict: the seven keys, `baseUrl:` to
+    /// `shellRoute:`, then a `problem:` line for each problem, then an `unknownKey:` line for each
+    /// unknown config key. Beside a Codex block ([`Diagnosis`]) these lines come first and the
+    /// verdict last, so a config's unknown keys sit after `shellRoute:` and before
+    /// `codexAccounts:`.
     pub fn fact_lines(&self) -> Vec<String> {
         let holder = match &self.port_holder {
             Some(holder) => format!("pid {} {}", holder.pid, holder.name),
@@ -1067,7 +1068,7 @@ pub struct Diagnosis {
 
 impl Diagnosis {
     /// The text form, by the table on [`Diagnosis`]. A config's unknown keys ride the Claude
-    /// half, after `requests10m:` and its problems; under `--codex` they come right before the
+    /// half, after `shellRoute:` and its problems; under `--codex` they come right before the
     /// verdict, since a misspelled `codexUpstream` matters most to a reader asking about codex.
     pub fn render_text(&self) -> String {
         let Some(codex) = &self.codex else {

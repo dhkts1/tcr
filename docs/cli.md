@@ -1792,6 +1792,7 @@ proxyPort: 3456
 portHolder: pid 4242 tcr
 portHolderIsTcr: yes
 requests10m: 3
+shellRoute: not installed
 codexAccounts: 2 (1 in rotation, 1 in the weekly window)
 codexIntercept: yes
 codexCa: /Users/example/.config/tcr-ca.pem (readable)
@@ -1851,12 +1852,13 @@ Codex's exit codes mirror Claude's: **0** when `codex` is pooled, **2** when a p
 `codex` would not be pooled (the verdict says why), **3** when no proxy answered or its status
 could not be read. A mixed fleet keeps Claude's, so a script that asks `doctor` whether Claude Code
 reaches this proxy gets the answer it always got. Its Claude verdict, when the proxy served,
-names the requests as Claude's (`this proxy has served 3 Claude requests`), since the Codex count
-sits right above it; a fleet without the block keeps `this proxy has served 3 requests`. Its other
-two verdicts already name Claude's route, and keep their words.
+names the requests as Claude's (`this proxy has served 3 Claude requests`), whether the base URL
+or the [shell route](#tcr-setup) is Claude's route, since the Codex count sits right above it; a
+fleet without the block keeps `this proxy has served 3 requests`. Its verdicts that name no count
+already name Claude's route, and keep their words.
 
 **Unknown config keys.** In mixed and Codex-only text the `unknownKey:` lines sit with Claude's
-keys: after `requests10m:` and any `problem:` line, before `codexAccounts:`. Under `--codex` they
+keys: after `shellRoute:` and any `problem:` line, before `codexAccounts:`. Under `--codex` they
 come after the block, right before the verdict, since a misspelled `codexUpstream` matters most to
 a reader asking about `codex`: the block would read `codexUpstream: https://chatgpt.com (default)`
 and nothing else would say why. They never change an exit code.
