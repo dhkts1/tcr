@@ -43,7 +43,7 @@ pub fn thinking_is_org_bound(model: &str) -> bool {
 
 /// The top-level `model` key of a request body, if present. Only the ROOT `model`
 /// is read — a `model` nested inside message content is never the request's target
-/// model. Mirrors the `usage_from_json` parse pattern in `proxy.rs`: a lenient
+/// model. Mirrors the `parse_non_streamed_response` parse pattern in `proxy.rs`: a lenient
 /// `serde_json` peek that yields `None` on non-JSON or a missing/absent key.
 pub fn parse_request_model(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<ModelPeek>(body)
