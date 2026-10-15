@@ -403,8 +403,9 @@ trusts tcr's leaf only if that file holds tcr's CA.
 
 ## `tcr setup`
 
-Makes typing `claude` go through tcr, one of two ways. TcrBar asks once which one you want and
-has a row in Settings > General to change or undo it; these are the commands it runs.
+Makes typing `claude` go through tcr, one of two ways. TcrBar asks once which one you want, on a
+fleet with a Claude account to serve claude (a Mac that pools Codex alone is never asked), and has a
+row in Settings > General to change or undo it; these are the commands it runs.
 
 | command | what it writes | covers |
 |---|---|---|
