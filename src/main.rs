@@ -9165,6 +9165,58 @@ mod tests {
         assert!(!ls.contains("Nothing else is taken from it"), "{ls}");
     }
 
+    /// Every command the `login` row of docs/troubleshooting.md's gate table tells a user to run
+    /// parses, and its `--from-codex` re-import names the folder to read: without
+    /// `--codex-home`, `--from-codex` reads `$CODEX_HOME` or `~/.codex`, never the folder the
+    /// row records, so an account imported from another folder would be refused.
+    ///
+    /// Watched red: the row said `tcr login --from-codex --account <name>` imports the login
+    /// again "from the folder it came from".
+    #[test]
+    fn the_troubleshooting_login_remedies_parse_and_name_the_folder() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/troubleshooting.md");
+        let doc =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+        let row = doc
+            .lines()
+            .find(|line| line.starts_with("| `login` |"))
+            .expect("docs/troubleshooting.md has a `login` row");
+        let commands: Vec<String> = row
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tcr "))
+            .map(|span| {
+                span.replace("<name>", "bob@example.com/codex")
+                    .replace("<folder>", "/Users/example/.codex-second")
+            })
+            .collect();
+        assert!(
+            commands.iter().any(|command| command.contains("--codex ")),
+            "positive control, the row's `--codex` remedy: {commands:?}"
+        );
+        for command in &commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!(
+                    "the login row tells the user to run `{command}`, which does not parse: {e}"
+                );
+            }
+            if command.contains("--from-codex") {
+                assert!(
+                    command.contains("--codex-home "),
+                    "`{command}` reads `$CODEX_HOME` or ~/.codex, not the folder the row records"
+                );
+            }
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("--from-codex")),
+            "the row names no `--from-codex` re-import: {commands:?}"
+        );
+    }
+
     /// The command `tcr doctor`'s pooled Codex verdict names parses, in the sentence for one
     /// request and in the one for several.
     #[test]
