@@ -148,6 +148,16 @@ pub struct PinFile {
     pub pins: Vec<StoredPin>,
 }
 
+/// [`PinFile`]'s write side: the same JSON, built from references to the caller's pins so a
+/// save sorts and writes them without copying each one first.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PinFileRef<'a> {
+    version: u32,
+    saved_at_ms: i64,
+    pins: Vec<&'a StoredPin>,
+}
+
 /// What a [`load`] made of the file. Every field except `pins` exists so the
 /// caller can say out loud what it threw away — a silent drop here is
 /// indistinguishable from the feature not working.
@@ -190,7 +200,7 @@ pub fn default_path() -> PathBuf {
 /// Returns how many were written. The caller decides what a failure means; it is
 /// never fatal here.
 pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, ConfigError> {
-    let mut pins = pins.to_vec();
+    let mut pins: Vec<&StoredPin> = pins.iter().collect();
     if pins.len() > PIN_CAP {
         pins.sort_by_key(|p| std::cmp::Reverse(p.touched_at_ms));
         pins.truncate(PIN_CAP);
@@ -199,7 +209,7 @@ pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, Confi
     // nothing changed.
     pins.sort_by_key(|p| p.key);
     let count = pins.len();
-    let file = PinFile {
+    let file = PinFileRef {
         version: FORMAT_VERSION,
         saved_at_ms: now_ms,
         pins,
@@ -689,6 +699,29 @@ mod tests {
         assert!(
             !report.pins.contains_key(&0),
             "the oldest pin is the one dropped"
+        );
+    }
+
+    /// `save` writes through [`PinFileRef`] to skip copying every pin, and the file must still
+    /// be exactly what [`PinFile`], the type `load` reads, serializes to.
+    #[test]
+    fn the_reference_file_serializes_exactly_like_the_owned_one() {
+        let pins: Vec<StoredPin> = (0..5u64)
+            .map(|i| pin(i, "a@example.com", Some("uuid-a"), Some("org-1"), i as i64))
+            .collect();
+        let owned = PinFile {
+            version: FORMAT_VERSION,
+            saved_at_ms: 42,
+            pins: pins.clone(),
+        };
+        let borrowed = PinFileRef {
+            version: FORMAT_VERSION,
+            saved_at_ms: 42,
+            pins: pins.iter().collect(),
+        };
+        assert_eq!(
+            serde_json::to_string_pretty(&borrowed).expect("serialize the reference file"),
+            serde_json::to_string_pretty(&owned).expect("serialize the owned file")
         );
     }
 
