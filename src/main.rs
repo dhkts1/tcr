@@ -701,11 +701,14 @@ mod peer_cli {
         /// neighbours; the panel decodes both.
         #[arg(long)]
         pub json: bool,
-        /// Path to the main config (default: ~/.config/teamclaude.json), read
-        /// for the ACCOUNT LABELS the `lentTo` block is keyed by. Nothing else
-        /// is taken from it, and a config that is missing or unreadable leaves
-        /// `lentTo` empty rather than failing the listing: the peers half of
-        /// this output does not depend on it.
+        /// Path to the main config (default: ~/.config/teamclaude.json). The
+        /// `--json` form reads it for the ACCOUNT LABELS the `lentTo` block is
+        /// keyed by, each account's exit lock (`exits`) and the expiry a
+        /// handed-over key ends at (`handedKeyUntil`); the text form reads it
+        /// for the Codex exit pins it lists. A config that is missing or
+        /// unreadable reads as one with no accounts, so `lentTo` and `exits`
+        /// are empty and no pins are listed, rather than failing the listing:
+        /// the peers half of this output does not depend on it.
         #[arg(long)]
         pub config: Option<PathBuf>,
     }
@@ -1447,12 +1450,18 @@ struct LoginArgs {
     #[arg(long, requires = "from_codex", value_name = "DIR")]
     codex_home: Option<PathBuf>,
     /// Drive the login from another program instead of a terminal: stdin is
-    /// never read, the browser is never opened here, and progress goes to
-    /// stdout as one JSON object per line — `{"event":"browser","url":…}`,
-    /// `{"event":"waiting"}`, `{"event":"saved","account":…}`,
-    /// `{"event":"error","reason":…}`. The caller opens the URL; the loopback
-    /// callback is then the only way the login can complete, and the same
-    /// 2-minute timeout exits non-zero with the reason on one stderr line.
+    /// never read, and progress goes to stdout as one JSON object per line —
+    /// `{"event":"browser","url":…}`, `{"event":"waiting"}`,
+    /// `{"event":"notice","text":…}`, `{"event":"saved","account":…}`,
+    /// `{"event":"error","reason":…}`; a Codex account's `saved` adds
+    /// `provider` and, when known, `plan`, and a refusal a caller can name adds
+    /// `code`. tcr's own browser flow never opens the browser here: the caller
+    /// opens the URL, the loopback callback is then the only way the login can
+    /// complete, and the same 2-minute timeout exits non-zero with the reason
+    /// on one stderr line. Under `--codex`, `codex login` opens the browser
+    /// itself, so its `browser` line carries `"opened":true` and the caller
+    /// opens nothing; `--codex` has no timeout, and waits until the sign-in
+    /// ends or the caller sends SIGTERM, which also stops `codex login`.
     /// Refuses to combine with `--token`, which reads the credential from
     /// stdin: that is the one input this mode has no way to supply.
     #[arg(long, conflicts_with = "token")]
@@ -9111,6 +9120,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The help says what `--non-interactive` does under `--codex`, where `codex login` opens
+    /// the browser itself and nothing times the sign-in out: the `browser` line's
+    /// `"opened":true` tells the caller to open nothing, and SIGTERM is how it ends an abandoned
+    /// sign-in. And `tcr peer ls --help` names the Codex exit pins its text form reads from the
+    /// config.
+    ///
+    /// Watched red: the old help says the caller opens the URL and the same 2-minute timeout
+    /// applies, and `peer ls` takes nothing from the config but the account labels.
+    #[test]
+    fn the_help_tells_the_truth_about_codex_logins_and_pins() {
+        use clap::CommandFactory as _;
+        let cli = Cli::command();
+        let help = |path: &[&str], id: &str| -> String {
+            let mut command = &cli;
+            for name in path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no {name} subcommand"));
+            }
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("no {id} argument"));
+            arg.get_long_help()
+                .or_else(|| arg.get_help())
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        let login = help(&["login"], "non_interactive");
+        for fact in [r#""opened":true"#, "`--codex` has no timeout", "SIGTERM"] {
+            assert!(
+                login.contains(fact),
+                "`tcr login --help` must say {fact}:\n{login}"
+            );
+        }
+        let ls = help(&["peer", "ls"], "config");
+        assert!(
+            ls.contains("Codex exit pins"),
+            "`tcr peer ls --help` must name the Codex exit pins it reads:\n{ls}"
+        );
+        assert!(!ls.contains("Nothing else is taken from it"), "{ls}");
     }
 
     /// The command `tcr doctor`'s pooled Codex verdict names parses, in the sentence for one

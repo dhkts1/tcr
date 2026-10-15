@@ -647,8 +647,9 @@ anything else that can read lines and open a URL. It changes four things and not
   | `account-is-codex` | `--account` names a Codex account, without `--codex` or `--from-codex` |
   | `account-is-claude` | `--codex --account` or `--from-codex --account` names a Claude account |
 * **A failure exits non-zero** with that same reason on ONE stderr line, rather than
-  anyhow's indented multi-line chain. The 2-minute callback timeout is a failure like any
-  other.
+  anyhow's indented multi-line chain. The 2-minute callback timeout of tcr's own browser flow
+  is a failure like any other. `--codex` has no timeout: it waits until `codex login` ends, or
+  until the caller sends SIGTERM, which also stops `codex login` and deletes its folder.
 
 It refuses to combine with `--token`, which reads the credential from stdin: that is the
 one input this mode has no way to supply. `--from-codex` and `--from-claude-code` honour it: each
@@ -2218,7 +2219,7 @@ Codex account, because no lease draws on one.
 |---|---|---|---|
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
 | `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, and no `node` at all, because a found row carries no key to pin |
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read for the account labels the `lentTo` block is keyed by, and for the Codex exit pins the text form lists. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty and lists no pins, instead of failing the listing |
+| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read: `--json` reads it for the account labels the `lentTo` block is keyed by, each account's exit lock (`exits`) and the expiry a handed-over key ends at (`handedKeyUntil`), and the text form for the Codex exit pins it lists. A config that is missing or unreadable reads as one with no accounts, so `lentTo` and `exits` are empty and no pins are listed, instead of failing the listing |
 
 ### `tcr peer find <on\|off>`
 
