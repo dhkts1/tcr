@@ -5,6 +5,8 @@
 //! holds, that an upgrade never reaches an origin, that relays keep the client's bearer and add
 //! none to a call that came without one, and that a Claude request never lands on a Codex
 //! account.
+//! CONNECT routing is covered in `tests/intercepted_host.rs`, whose injected blind transport
+//! stays on loopback even when interception regresses. This binary uses base-URL requests.
 //!
 //! Never binds 3456 (`dead_port`). Never reads a real credential (`TCR_CODEX_AUTH` and
 //! `TCR_CLAUDE_CODE_CREDENTIALS` point at files that do not exist).
@@ -604,51 +606,6 @@ async fn a_codex_turn_is_pooled_pinned_measured_and_relayed_correctly() {
     assert_eq!(bare.account_id, None, "and with no account id");
 
     assert_each_reached_its_own_origin(&ledger);
-}
-
-/// The proxy URL that `tcr run --codex` exports causes reqwest to send the marker on
-/// CONNECT. The TLS connection stays on the test proxy, whose upstream is a loopback stub.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_marked_codex_connect_reaches_the_pool_and_relays_other_paths() {
-    let (upstream, codex_upstream, ledger) = spawn_origins().await;
-    let server = start_server(&upstream, &codex_upstream).await;
-    let ca = std::fs::read(server.home.path().join(".config/tcr-ca.pem")).unwrap();
-    let proxy =
-        reqwest::Proxy::https(format!("http://tcr-codex@127.0.0.1:{}", server.port)).unwrap();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .proxy(proxy)
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .unwrap();
-    let response = client
-        .post("https://chatgpt.com/backend-api/codex/responses")
-        .bearer_auth("client-own")
-        .header("session-id", "marked-session")
-        .json(&serde_json::json!({"model": "gpt-6-astra", "input": []}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let _ = response.bytes().await.unwrap();
-    assert_eq!(
-        ledger.last().authorization.as_deref(),
-        Some("Bearer at-alice")
-    );
-
-    let response = client
-        .get("https://chatgpt.com/share/example")
-        .bearer_auth("client-own")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
-    assert_eq!(response.text().await.unwrap(), "stub: unknown path");
-    let request = ledger.last();
-    assert_eq!(request.origin, CODEX_ORIGIN);
-    assert_eq!(request.path, "/share/example");
-    assert_eq!(request.authorization.as_deref(), Some("Bearer client-own"));
 }
 
 /// Watched red: drop the provider check in `manager::select::eligible` and the second

@@ -57,6 +57,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt as _;
+use tracing::instrument::WithSubscriber as _;
 
 use crate::manager::Manager;
 
@@ -844,6 +845,17 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// A per-listener transport seam for isolated integration tests. Production listeners
+/// always use the ordinary host-and-port connector through serve or serve_with_shutdown.
+#[doc(hidden)]
+pub type TunnelConnector = Arc<
+    dyn Fn(String, u16) -> futures::future::BoxFuture<'static, io::Result<TcpStream>> + Send + Sync,
+>;
+
+fn direct_tunnel_connector() -> TunnelConnector {
+    Arc::new(|host, port| Box::pin(TcpStream::connect((host, port))))
+}
+
 /// Run the hybrid listener forever: accept, classify each connection
 /// (`CONNECT` → MITM, else base-URL), and serve it on its own task. `tls` is
 /// `None` only when TLS material could not be loaded at all — CONNECT then
@@ -854,6 +866,26 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
 /// the loop dies with the test's runtime.
 pub async fn serve(listener: TcpListener, manager: Arc<Manager>, tls: Option<Arc<TlsAcceptor>>) {
     serve_with_shutdown(listener, manager, tls, std::future::pending::<()>()).await;
+}
+
+/// Test support: run the same listener and CONNECT handler with an explicit blind transport.
+/// Tests can supply a connector that only dials a held loopback socket, so a broken
+/// interception decision cannot resolve or connect to a real upstream.
+#[doc(hidden)]
+pub async fn serve_with_tunnel_connector(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    connector: TunnelConnector,
+) {
+    serve_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        std::future::pending::<()>(),
+        connector,
+    )
+    .await;
 }
 
 /// [`serve`], plus a shutdown branch on the accept loop.
@@ -873,6 +905,23 @@ pub async fn serve_with_shutdown(
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
     shutdown: impl std::future::Future<Output = ()>,
+) {
+    serve_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        shutdown,
+        direct_tunnel_connector(),
+    )
+    .await;
+}
+
+async fn serve_with_shutdown_using_connector(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl std::future::Future<Output = ()>,
+    connector: TunnelConnector,
 ) {
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -895,11 +944,15 @@ pub async fn serve_with_shutdown(
         };
         let manager = manager.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_conn(stream, peer, manager, tls).await {
-                tracing::debug!(error = %err, "connection ended with error");
+        let connector = Arc::clone(&connector);
+        tokio::spawn(
+            async move {
+                if let Err(err) = handle_conn(stream, peer, manager, tls, connector).await {
+                    tracing::debug!(error = %err, "connection ended with error");
+                }
             }
-        });
+            .with_current_subscriber(),
+        );
     }
 }
 
@@ -909,9 +962,10 @@ async fn handle_conn(
     peer: SocketAddr,
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
+    connector: TunnelConnector,
 ) -> io::Result<()> {
     if peek_is_connect(&stream).await? {
-        handle_connect(stream, peer, manager, tls).await
+        handle_connect(stream, peer, manager, tls, connector).await
     } else {
         // Base-URL mode: cleartext straight through the router. `serve_http`
         // auto-negotiates, so an h2-prior-knowledge client is served as h2 here
@@ -956,6 +1010,7 @@ async fn handle_connect(
     peer: SocketAddr,
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
+    connector: TunnelConnector,
 ) -> io::Result<()> {
     let head = read_request_head(&mut stream).await?;
     let first_line = head.lines().next().unwrap_or("");
@@ -982,15 +1037,26 @@ async fn handle_connect(
     // ([`intercepts_now`]): there is no pooled account to serve a codex, and it
     // keeps its own login. Counted on every CONNECT, never cached, so an import
     // takes effect on the next tunnel.
-    if !intercepts_now(&manager, &host, codex_connect_marked(&head)) {
-        return tunnel(stream, &host, port).await;
+    let codex_marked = codex_connect_marked(&head);
+    let policy_intercepts = intercepts_now(&manager, &host, codex_marked);
+    let leaf_covers_host = policy_intercepts && host_covered_by_loaded_leaf(&host);
+    if host.eq_ignore_ascii_case(crate::provider::CODEX_HOST) {
+        tracing::debug!(
+            peer_port = peer.port(),
+            codex_marked,
+            intercepted = leaf_covers_host && tls.is_some(),
+            "Codex CONNECT"
+        );
     }
-    if !host_covered_by_loaded_leaf(&host) {
+    if !policy_intercepts {
+        return tunnel(stream, &host, port, &connector).await;
+    }
+    if !leaf_covers_host {
         tracing::debug!(
             %host,
             "MITM: host is policy-allowed but the loaded leaf does not cover it — blind-tunneling instead of a broken handshake"
         );
-        return tunnel(stream, &host, port).await;
+        return tunnel(stream, &host, port, &connector).await;
     }
 
     let Some(acceptor) = tls else {
@@ -1021,8 +1087,13 @@ async fn handle_connect(
 /// open-tunnel behavior the JS `teamclaude` proxy provides (and Claude Code needs
 /// to reach `platform.claude.com`, its bridge, and telemetry). Only reachable
 /// from `127.0.0.1`, so it is no wider a network surface than the local shell.
-async fn tunnel(mut client: TcpStream, host: &str, port: u16) -> io::Result<()> {
-    let mut upstream = match TcpStream::connect((host, port)).await {
+async fn tunnel(
+    mut client: TcpStream,
+    host: &str,
+    port: u16,
+    connector: &TunnelConnector,
+) -> io::Result<()> {
+    let mut upstream = match connector(host.to_string(), port).await {
         Ok(s) => s,
         Err(err) => {
             tracing::debug!(%host, port, error = %err, "MITM: tunnel connect failed");
@@ -1855,7 +1926,13 @@ mod tests {
 
         // Tunnel the accepted (tcr) side out to the echo upstream.
         tokio::spawn(async move {
-            let _ = tunnel(server_side, "127.0.0.1", echo_port).await;
+            let _ = tunnel(
+                server_side,
+                "127.0.0.1",
+                echo_port,
+                &direct_tunnel_connector(),
+            )
+            .await;
         });
 
         // The tunnel first writes the CONNECT-OK line.
@@ -1984,7 +2061,9 @@ mod tests {
                     // never swallowed silently, so a test that fails because the
                     // connection died has the reason in the captured log rather
                     // than presenting as an unexplained client-side error.
-                    if let Err(err) = handle_conn(stream, peer, manager, None).await {
+                    if let Err(err) =
+                        handle_conn(stream, peer, manager, None, direct_tunnel_connector()).await
+                    {
                         tracing::debug!(error = %err, "connection ended with error");
                     }
                 });

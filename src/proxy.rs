@@ -2955,6 +2955,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 && wants_websocket_upgrade(&req_headers) =>
         {
             tracing::debug!(
+                peer_port = parts
+                    .extensions
+                    .get::<ClientAddr>()
+                    .map(|client| client.0.port()),
                 "answered a Codex WebSocket upgrade with 426 so the client falls back to SSE"
             );
             return upgrade_required_response();
@@ -4550,7 +4554,28 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // straight back and the next request paid the same refused round trip,
         // while `tcr status` read the row as `gate: ok`; the hold's gate reads
         // `refused` instead.
+        // Refusal diagnostics use response-header allowlists only, never a whole map or
+        // request credentials, cookies or body content.
+        let header_str = |name: &str| {
+            up_headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("<absent>")
+        };
         if status == StatusCode::FORBIDDEN {
+            tracing::info!(
+                account = account_name.as_deref().unwrap_or("?"),
+                account_index = idx,
+                provider = provider.as_str(),
+                content_type = header_str("content-type"),
+                cf_mitigated = header_str("cf-mitigated"),
+                cf_ray = header_str("cf-ray"),
+                server = header_str("server"),
+                request_id = header_str("request-id"),
+                x_request_id = header_str("x-request-id"),
+                retry_after_raw = header_str("retry-after"),
+                "403 diagnostic"
+            );
             // Upstream's own words for the refusal, read capped in size and time
             // exactly as the 429 arm reads its body, so a body that never
             // completes cannot become a hang. A Codex body can also be forwarded, so it gets
@@ -4626,12 +4651,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
         // 429 → durable quota rejection rotates; a transient limit waits/rotates.
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let header_str = |name: &str| {
-                up_headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("<absent>")
-            };
             tracing::info!(
                 account = account_name.as_deref().unwrap_or("?"),
                 account_index = idx,
@@ -4649,6 +4668,23 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
                 unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
                 quota_rejected = !rejections.is_empty(),
+                provider = provider.as_str(),
+                codex_primary_used_percent = header_str("x-codex-primary-used-percent"),
+                codex_primary_window_minutes = header_str("x-codex-primary-window-minutes"),
+                codex_primary_reset_at = header_str("x-codex-primary-reset-at"),
+                codex_secondary_used_percent = header_str("x-codex-secondary-used-percent"),
+                codex_secondary_window_minutes = header_str("x-codex-secondary-window-minutes"),
+                codex_secondary_reset_at = header_str("x-codex-secondary-reset-at"),
+                codex_rate_limit_reached_type = header_str("x-codex-rate-limit-reached-type"),
+                codex_credits_has_credits = header_str("x-codex-credits-has-credits"),
+                codex_credits_unlimited = header_str("x-codex-credits-unlimited"),
+                codex_credits_balance = header_str("x-codex-credits-balance"),
+                content_type = header_str("content-type"),
+                cf_mitigated = header_str("cf-mitigated"),
+                cf_ray = header_str("cf-ray"),
+                server = header_str("server"),
+                request_id = header_str("request-id"),
+                x_request_id = header_str("x-request-id"),
                 // WHO asked, so a 429 that follows one client around can be told
                 // from one that follows an account. Measured 2026-09-24: 143 of 145
                 // requests to `/v1/messages` WITHOUT `?beta=true` got a 429 with no
@@ -5512,6 +5548,8 @@ fn log_upstream_error_body(
         status = status.as_u16(),
         error.r#type = error_type.unwrap_or("<unparsed>"),
         error.message = error_message.unwrap_or("<unparsed>"),
+        body_length = body.len(),
+        body_truncated = body.len() > ERROR_BODY_LOG_CAP,
         body = %body_text,
         "upstream error response"
     );
@@ -17831,6 +17869,148 @@ mod tests {
         );
     }
 
+    /// Refusal diagnostics keep the allowlisted upstream evidence and distinguish a full
+    /// body from a capped prefix, without logging request credentials, cookies or prompts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_refusal_logs_only_allowlisted_evidence() {
+        for (status, padding) in [
+            (StatusCode::TOO_MANY_REQUESTS, 0),
+            (StatusCode::TOO_MANY_REQUESTS, ERROR_BODY_LOG_CAP),
+            (StatusCode::FORBIDDEN, 0),
+        ] {
+            let body = if status == StatusCode::FORBIDDEN {
+                "<html>evidence-403-challenge</html>".to_string()
+            } else {
+                serde_json::json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "evidence-429-message",
+                        "resets_at": 4_102_444_800_i64,
+                    },
+                    "padding": "x".repeat(padding),
+                })
+                .to_string()
+            };
+            let raw = format!(
+                "HTTP/1.1 {} evidence\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\nretry-after: 120\r\n\
+                 x-codex-primary-used-percent: 100\r\n\
+                 x-codex-primary-window-minutes: 300\r\n\
+                 x-codex-primary-reset-at: 4102444800\r\n\
+                 x-codex-secondary-used-percent: 35\r\n\
+                 x-codex-secondary-window-minutes: 10080\r\n\
+                 x-codex-secondary-reset-at: 4102531200\r\n\
+                 x-codex-rate-limit-reached-type: credits\r\n\
+                 x-codex-credits-has-credits: false\r\n\
+                 x-codex-credits-unlimited: false\r\n\
+                 x-codex-credits-balance: 0.00\r\n\
+                 cf-mitigated: challenge\r\ncf-ray: fixture-ray\r\nserver: cloudflare\r\n\
+                 request-id: fixture-request\r\nx-request-id: fixture-x-request\r\n\
+                 authorization: Bearer fixture-response-secret\r\n\
+                 cookie: fixture-response-cookie\r\nset-cookie: fixture-set-cookie\r\n\r\n{body}",
+                status.as_u16(),
+                body.len(),
+            );
+            let mut log = String::new();
+            let mut captured = false;
+            // Match the existing upstream log test's protection against tracing's shared
+            // callsite cache when other tests first visit a site without a subscriber.
+            for _ in 0..3 {
+                let (up_addr, _) = spawn_counted_upstream(vec![Some(raw.clone())]).await;
+                let mut config = codex_fleet("http://127.0.0.1:9", &format!("http://{up_addr}"));
+                config.lock_account = Some("bob@example.com/codex".into());
+                config
+                    .extra
+                    .insert("revalidationServe".into(), serde_json::json!(false));
+                let manager = Manager::with_live_refresher(config, None);
+                let sink = SharedBuf::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(sink.clone())
+                    .with_ansi(false)
+                    .finish();
+                let _guard = tracing::subscriber::set_default(subscriber);
+                tracing::callsite::rebuild_interest_cache();
+                let response = drive_full(
+                    manager,
+                    Method::POST,
+                    crate::provider::CODEX_RESPONSES_PATH,
+                    Some(loopback_peer()),
+                    &[
+                        ("content-type", "application/json"),
+                        ("authorization", "Bearer fixture-client-secret"),
+                        ("cookie", "fixture-client-cookie"),
+                    ],
+                    r#"{"model":"codex-evidence-model","input":"fixture-private-prompt"}"#,
+                )
+                .await;
+                assert_eq!(response.status(), status);
+                log = sink.contents();
+                let error_line = log
+                    .lines()
+                    .find(|line| line.contains("upstream error response"));
+                let marker = format!("{} diagnostic", status.as_u16());
+                let diagnostic = log.lines().find(|line| line.contains(&marker));
+                let (Some(error_line), Some(diagnostic)) = (error_line, diagnostic) else {
+                    continue;
+                };
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    for evidence in [
+                        r#"codex_primary_used_percent="100""#,
+                        r#"codex_primary_window_minutes="300""#,
+                        r#"codex_primary_reset_at="4102444800""#,
+                        r#"codex_secondary_used_percent="35""#,
+                        r#"codex_secondary_window_minutes="10080""#,
+                        r#"codex_secondary_reset_at="4102531200""#,
+                        r#"codex_rate_limit_reached_type="credits""#,
+                        r#"codex_credits_has_credits="false""#,
+                        r#"codex_credits_unlimited="false""#,
+                        r#"codex_credits_balance="0.00""#,
+                    ] {
+                        assert!(diagnostic.contains(evidence), "missing {evidence}: {log}");
+                    }
+                }
+                for evidence in [
+                    r#"content_type="application/json""#,
+                    r#"cf_mitigated="challenge""#,
+                    r#"cf_ray="fixture-ray""#,
+                    r#"server="cloudflare""#,
+                    r#"request_id="fixture-request""#,
+                    r#"x_request_id="fixture-x-request""#,
+                ] {
+                    assert!(diagnostic.contains(evidence), "missing {evidence}: {log}");
+                }
+                assert!(
+                    error_line.contains(&format!("body_length={}", body.len())),
+                    "{log}"
+                );
+                assert!(
+                    error_line.contains(&format!(
+                        "body_truncated={}",
+                        body.len() > ERROR_BODY_LOG_CAP
+                    )),
+                    "{log}"
+                );
+                for private in [
+                    "fixture-client-secret",
+                    "fixture-response-secret",
+                    "at-bob",
+                    "fixture-client-cookie",
+                    "fixture-response-cookie",
+                    "fixture-set-cookie",
+                    "fixture-private-prompt",
+                ] {
+                    assert!(
+                        !log.contains(private),
+                        "private request/header data reached the log: {private}"
+                    );
+                }
+                captured = true;
+                break;
+            }
+            assert!(captured, "refusal evidence was never logged: {log}");
+        }
+    }
+
     /// A `429` with no quota guidance at all (no `retry-after`, no `unified-*`
     /// header) and upstream's own error body. A direct API client draws this shape
     /// on `/v1/messages` without `?beta=true`.
@@ -23382,27 +23562,50 @@ mod tests {
     #[tokio::test]
     async fn codex_exhausted_pool_reports_the_earliest_body_reset() {
         let earliest = OffsetDateTime::now_utc().unix_timestamp() + 7200;
-        let origin = Router::new().fallback(move |headers: HeaderMap| async move {
-            let later = headers.get("authorization").unwrap() == "Bearer at-carol";
-            let reset = earliest + if later { 3600 } else { 0 };
-            Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({"error":{"type":"usage_limit_reached","resets_at":reset}})
-                        .to_string(),
-                ))
-                .unwrap()
+        let later = earliest + 3600;
+        let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&refused);
+        let origin = Router::new().fallback(move |headers: HeaderMap| {
+            let bearer = headers.get("authorization").unwrap().to_str().unwrap();
+            let reset = match bearer {
+                "Bearer at-bob" => later,
+                "Bearer at-carol" => earliest,
+                other => panic!("unexpected Codex bearer: {other}"),
+            };
+            seen.lock().unwrap().push((bearer.to_string(), reset));
+            async move {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error":{"type":"usage_limit_reached","resets_at":reset}})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
         let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
+        // Bob is refused first; Carol, refused second, has the earlier reset.
+        config.accounts[1].priority = Some(0);
+        config.accounts[2].priority = Some(1);
         config
             .extra
             .insert("revalidationServe".into(), serde_json::json!(false));
         let manager = Manager::with_live_refresher(config, None);
-        let body = body_json(send_codex_turn(&manager).await).await;
+        let response = send_codex_turn(&manager).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(response).await;
+        assert_eq!(
+            *refused.lock().unwrap(),
+            [
+                ("Bearer at-bob".to_string(), later),
+                ("Bearer at-carol".to_string(), earliest),
+            ],
+            "the account refused second must have the earliest reset"
+        );
         assert_eq!(body["error"]["type"], "usage_limit_reached");
         assert!(
             (body["error"]["resets_at"].as_i64().unwrap() - earliest).abs() <= 2,

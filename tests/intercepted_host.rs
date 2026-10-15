@@ -1,9 +1,10 @@
 //! Inside a tunnel tcr terminates, the tunnel's own host fixes the upstream; a request that came through `CONNECT chatgpt.com:443` is a request for `chatgpt.com`,
 //! whatever `Host` it declares, and if it declares none. These tests open real tunnels through
-//! the real listener ([`tcr::mitm::serve`]), over a leaf minted into a temp dir, to an
+//! the real listener, over a leaf minted into a temp dir, to an
 //! Anthropic and a Codex origin on loopback, and check that:
 //!
 //! - a marked ChatGPT tunnel relays other paths with the client's credential to ChatGPT;
+//! - an unmarked ChatGPT CONNECT carries opaque bytes without terminating TLS;
 //! - an Anthropic tunnel carrying a backend-api path is refused with 421;
 //! - a request that names any host but the tunnel's is answered 421 as well;
 //! - a request whose path agrees with its tunnel is served, with or without a `Host`;
@@ -12,20 +13,20 @@
 //! # Why this is its own test binary
 //!
 //! `handle_connect` terminates a `CONNECT` only for a host covered by the leaf this PROCESS
-//! loaded last, and blind-tunnels any other host to the real one. Lib tests in `src/mitm.rs`
+//! loaded last. Lib tests in `src/mitm.rs`
 //! (`load_tls_prefers_the_preexisting_js_leaf` among them) load the JS proxy's leaf, which tcr
 //! counts as covering `api.anthropic.com` alone, so a `chatgpt.com` tunnel opened in the lib test
-//! binary while one of them ran would leave the machine. Every test here loads a leaf tcr mints,
-//! which covers every intercepted host, and [`start`] checks that it does before any tunnel is
-//! opened. A test added to this file must start through [`start`] and must never load the JS leaf.
+//! binary while one of them ran would take the blind branch. Every test here loads a leaf tcr
+//! mints, which covers every intercepted host, and [`start`] checks that it does before any
+//! tunnel is opened. A test added to this file must start through [`start`] and must never
+//! load the JS leaf.
 //!
 //! # House rules
 //!
-//! No real account or token, and no request leaves 127.0.0.1: both origins are on loopback, and
-//! every tunnel is to a host the minted leaf covers, so tcr terminates it instead of connecting
-//! out. That takes a Codex account in the fleet as well: with none, tcr blind-tunnels
-//! `chatgpt.com` to the real host, so [`start`] checks the fleet holds one and every ChatGPT
-//! CONNECT sends the Codex marker. Every listener binds
+//! No real account or token, and no request leaves 127.0.0.1: both HTTP origins are on loopback,
+//! and an injected blind-tunnel connector dials only a held loopback byte-echo stub by socket
+//! address. It never resolves a hostname or falls back to a real destination, even if the
+//! interception decision regresses or a leaf does not cover the host. Every listener binds
 //! `127.0.0.1:0`.
 
 use std::net::SocketAddr;
@@ -41,11 +42,60 @@ use serde_json::json;
 use tcr::manager::Manager;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::instrument::WithSubscriber as _;
 
 /// The bearer a `codex` client sends inside a `chatgpt.com` tunnel: its own ChatGPT login.
 const CHATGPT_BEARER: &str = "Bearer at-chatgpt-client";
 /// The bearer a Claude client sends inside an `api.anthropic.com` tunnel.
 const CLAUDE_BEARER: &str = "Bearer at-claude-client";
+
+/// Each listener owns its trace buffer and subscriber; concurrent fixtures share neither.
+#[derive(Clone, Default)]
+struct TraceLog(Arc<Mutex<Vec<u8>>>);
+
+impl TraceLog {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    fn assert_connect(&self, peer_port: u16, marked: bool, intercepted: bool) {
+        let logs = self.contents();
+        let peer = format!("peer_port={peer_port}");
+        let line = logs
+            .lines()
+            .find(|line| line.contains("Codex CONNECT") && line.contains(&peer))
+            .unwrap_or_else(|| panic!("missing CONNECT routing event for {peer}: {logs}"));
+        assert!(line.contains(&format!("codex_marked={marked}")), "{line}");
+        assert!(
+            line.contains(&format!("intercepted={intercepted}")),
+            "{line}"
+        );
+        assert!(!logs.contains(CHATGPT_BEARER), "{logs}");
+        assert!(
+            !logs.contains(tcr::mitm::CODEX_PROXY_AUTHORIZATION),
+            "{logs}"
+        );
+    }
+}
+
+impl std::io::Write for TraceLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// One request a fake origin received: its path, and the bearer it carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,12 +168,14 @@ struct Tcr {
     ca_path: PathBuf,
     anthropic: Origin,
     codex: Origin,
+    blind_tunnels: Arc<Mutex<Vec<(String, u16)>>>,
+    trace: TraceLog,
     _leaf_dir: tempfile::TempDir,
 }
 
 /// Mint a leaf into a fresh temp dir, check that it covers both hosts the tests tunnel to and
-/// that the fleet holds a Codex account (so each tunnel is terminated here and never carried to
-/// the real host), and serve a fleet of one Anthropic and one Codex account on `127.0.0.1:0`.
+/// that the fleet holds a Codex account, and serve it on `127.0.0.1:0`. Every blind branch is
+/// connected to a local byte-echo stub, including when a regression chooses it incorrectly.
 async fn start() -> Tcr {
     let leaf_dir = tempfile::tempdir().expect("a temp dir for the leaf");
     let assets = tcr::mitm::load_tls_in(leaf_dir.path()).expect("mint a leaf");
@@ -175,16 +227,47 @@ async fn start() -> Tcr {
         .await
         .expect("bind tcr's listener");
     let addr = listener.local_addr().expect("tcr's address");
-    tokio::spawn(tcr::mitm::serve(
-        listener,
-        manager,
-        Some(Arc::new(assets.acceptor)),
-    ));
+    let blind_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the blind tunnel's local stub");
+    let blind_addr = blind_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = blind_listener.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = stream.into_split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+    let blind_tunnels = Arc::new(Mutex::new(Vec::new()));
+    let recorded_tunnels = Arc::clone(&blind_tunnels);
+    let connector: tcr::mitm::TunnelConnector = Arc::new(move |host, port| {
+        recorded_tunnels.lock().unwrap().push((host, port));
+        Box::pin(TcpStream::connect(blind_addr))
+    });
+    let trace = TraceLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(trace.clone())
+        .finish();
+    tokio::spawn(
+        tcr::mitm::serve_with_tunnel_connector(
+            listener,
+            manager,
+            Some(Arc::new(assets.acceptor)),
+            connector,
+        )
+        .with_subscriber(subscriber),
+    );
     Tcr {
         addr,
         ca_path,
         anthropic,
         codex,
+        blind_tunnels,
+        trace,
         _leaf_dir: leaf_dir,
     }
 }
@@ -253,7 +336,17 @@ where
 /// Open a marked `CONNECT {host}:443` through tcr, finish TLS trusting tcr's CA, send `request` inside
 /// the tunnel, and return the status and the whole response.
 async fn through_tunnel(tcr: &Tcr, host: &str, request: &[u8]) -> (u16, String) {
+    let (status, response, _) = through_tunnel_with_peer_port(tcr, host, request).await;
+    (status, response)
+}
+
+async fn through_tunnel_with_peer_port(
+    tcr: &Tcr,
+    host: &str,
+    request: &[u8],
+) -> (u16, String, u16) {
     let mut tcp = TcpStream::connect(tcr.addr).await.expect("reach tcr");
+    let peer_port = tcp.local_addr().unwrap().port();
     tcp.write_all(
         format!(
             "CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\nProxy-Authorization: {}\r\n\r\n",
@@ -273,13 +366,116 @@ async fn through_tunnel(tcr: &Tcr, host: &str, request: &[u8]) -> (u16, String) 
         .connect(name, tcp)
         .await
         .expect("tcr terminates the tunnel with a leaf its CA signed");
-    exchange(&mut tls, request).await
+    let (status, response) = exchange(&mut tls, request).await;
+    (status, response, peer_port)
 }
 
 /// Send `request` to tcr's listener directly, as a base-URL client does: no tunnel.
 async fn base_url(tcr: &Tcr, request: &[u8]) -> (u16, String) {
     let mut tcp = TcpStream::connect(tcr.addr).await.expect("reach tcr");
     exchange(&mut tcp, request).await
+}
+
+/// An unmarked CONNECT must take the actual blind branch even when Codex accounts exist.
+#[tokio::test]
+async fn an_unmarked_chatgpt_connect_is_a_blind_byte_tunnel_with_a_codex_pool() {
+    let tcr = start().await;
+    let mut stream = TcpStream::connect(tcr.addr).await.unwrap();
+    let peer_port = stream.local_addr().unwrap().port();
+    stream
+        .write_all(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(5), read_head(&mut stream))
+        .await
+        .expect("the unmarked CONNECT answers promptly");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head:?}");
+    assert_eq!(
+        *tcr.blind_tunnels.lock().unwrap(),
+        vec![("chatgpt.com".to_string(), 443)],
+        "the real CONNECT header must select the blind transport"
+    );
+    let opaque = b"opaque bytes without a TLS handshake\0\r\n";
+    stream.write_all(opaque).await.unwrap();
+    let mut echoed = vec![0; opaque.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+        .await
+        .expect("the blind tunnel echoes promptly")
+        .expect("the blind tunnel carries bytes unchanged");
+    assert_eq!(echoed.as_slice(), &opaque[..]);
+    tcr.trace.assert_connect(peer_port, false, false);
+    assert!(tcr.anthropic.seen().is_empty());
+    assert!(tcr.codex.seen().is_empty());
+}
+
+/// The proxy URL's userinfo must mark the actual CONNECT, pool model calls and relay other
+/// paths on the client's credential. A wrong blind decision can reach only the local stub.
+#[tokio::test]
+async fn a_marked_codex_connect_reaches_the_pool_and_relays_other_paths() {
+    let tcr = start().await;
+    let websocket = concat!(
+        "GET /backend-api/codex/responses HTTP/1.1\r\n",
+        "host: chatgpt.com\r\n",
+        "authorization: Bearer at-chatgpt-client\r\n",
+        "upgrade: websocket\r\n",
+        "connection: Upgrade, close\r\n",
+        "sec-websocket-version: 13\r\n",
+        "sec-websocket-key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n",
+    );
+    let (status, response, peer_port) =
+        through_tunnel_with_peer_port(&tcr, "chatgpt.com", websocket.as_bytes()).await;
+    assert_eq!(status, 426, "{response}");
+    tcr.trace.assert_connect(peer_port, true, true);
+    let logs = tcr.trace.contents();
+    assert!(
+        logs.lines().any(|line| {
+            line.contains("answered a Codex WebSocket upgrade with 426")
+                && line.contains(&format!("peer_port={peer_port}"))
+        }),
+        "the CONNECT and WebSocket fallback share their peer port: {logs}"
+    );
+    assert!(tcr.codex.seen().is_empty(), "the upgrade stays local");
+    let ca = std::fs::read(&tcr.ca_path).unwrap();
+    let proxy = reqwest::Proxy::https(format!("http://tcr-codex@{}", tcr.addr)).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let response = client
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .header("authorization", CHATGPT_BEARER)
+        .header("session-id", "marked-session")
+        .json(&json!({"model": "gpt-6-astra", "input": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await.unwrap();
+    assert_eq!(
+        tcr.codex.seen(),
+        vec![seen("/backend-api/codex/responses", "Bearer at-fake-codex")]
+    );
+
+    let response = client
+        .get("https://chatgpt.com/share/example")
+        .header("authorization", CHATGPT_BEARER)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await.unwrap();
+    assert_eq!(
+        tcr.codex.seen(),
+        vec![
+            seen("/backend-api/codex/responses", "Bearer at-fake-codex"),
+            seen("/share/example", CHATGPT_BEARER),
+        ]
+    );
+    assert!(tcr.blind_tunnels.lock().unwrap().is_empty());
+    assert!(tcr.anthropic.seen().is_empty());
 }
 
 /// A `GET` of `path` over HTTP/1.1 that carries `bearer` and the extra header lines in

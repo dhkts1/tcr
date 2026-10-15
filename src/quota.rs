@@ -1217,6 +1217,32 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_quota_refusal_stores_its_body_reset_in_the_quota_snapshot() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let reset = OffsetDateTime::from_unix_timestamp(now + 7200).unwrap();
+        let body = serde_json::json!({
+            "error": {"type": "usage_limit_reached", "resets_at": reset.unix_timestamp()}
+        })
+        .to_string();
+
+        for headers in [
+            TestHeaders::new(&[]),
+            codex_headers("100", "100", now + 1800, now + 86_400),
+        ] {
+            let mut quota = Quota::default();
+
+            let _ = quota.update_from_codex_response(&headers, 429, body.as_bytes());
+
+            assert_eq!(quota.status.as_deref(), Some("rejected"));
+            assert_eq!(
+                quota.codex.refusal_reset,
+                Some(reset),
+                "the body deadline reaches the snapshot and outranks header windows"
+            );
+        }
+    }
+
+    #[test]
     fn parses_unified_utilization_and_reset() {
         let reset_secs = 1_893_456_000i64;
         let headers = TestHeaders::new(&[
