@@ -131,13 +131,14 @@ async fn a_codex_request_is_never_offered_to_a_fallback_provider() {
     );
     assert_eq!(
         status,
-        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_REQUEST,
         "it gets the dry fleet's own answer: {}",
         String::from_utf8_lossy(&body)
     );
     let parsed: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
     // The fleet is empty, so it has no Codex account, and the dry fleet's own
-    // Codex answer says exactly that rather than reporting a usage limit.
+    // Codex answer says exactly that as an immediate configuration error, rather than
+    // reporting a usage limit that waiting could end.
     assert_eq!(parsed["error"]["type"], "no_codex_account");
 
     assert_eq!(

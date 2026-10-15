@@ -694,17 +694,11 @@ async fn an_anthropic_request_never_lands_on_a_codex_account() {
     assert_each_reached_its_own_origin(&ledger);
 }
 
-/// The other direction of the spill, and the error shape a Codex client reads. Every Codex
-/// account is disabled, which is no usage limit, so the 429 is the plain one in codex's own
-/// envelope (`pool_unavailable`), which codex retries rather than ending its turn.
-///
-/// Watched red: set the `type` in `proxy::codex_pool_unavailable_body` to `rate_limit_error`,
-/// or drop the Codex arm of `proxy::exhausted_response` so the Anthropic envelope goes out, and
-/// the type assertion fails; send `proxy::codex_exhausted_body` whatever gates the pool and it
-/// reads `usage_limit_reached`; drop the provider check in `manager::select::eligible` and
-/// carol serves the request (200).
+/// Every Codex account is disabled, so waiting cannot make the pool usable. The client gets
+/// an immediate 400 in Codex's envelope (`no_codex_account`) with an operator remedy and no
+/// retry hint; the request cannot spill onto the healthy Anthropic account.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_codex_request_with_the_codex_pool_exhausted_gets_the_codex_error_shape() {
+async fn a_disabled_codex_pool_gets_an_immediate_configuration_error() {
     let (upstream, codex_upstream, _ledger) = spawn_origins().await;
     let server = start_server(&upstream, &codex_upstream).await;
     for name in ["alice@example.com/codex", "bob@example.com/codex"] {
@@ -719,9 +713,19 @@ async fn a_codex_request_with_the_codex_pool_exhausted_gets_the_codex_error_shap
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(!resp.headers().contains_key("retry-after"));
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
+    assert_eq!(body["error"]["type"], "no_codex_account", "{body}");
+    assert_eq!(body["error"]["code"], "no_codex_account", "{body}");
+    assert!(body.get("type").is_none(), "Codex's error envelope: {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Enable"),
+        "the disabled pool needs an operator action: {body}"
+    );
 }
 
 /// A Codex origin that refuses every inference request the way a ChatGPT Pro login is refused at
@@ -842,16 +846,17 @@ async fn a_codex_usage_limit_reports_the_refusing_window_on_status_json() {
 }
 
 /// The route and the refusals, through the real binary: with both Codex accounts disabled, a
-/// Codex request is refused by tcr itself, and `tcr status --json` then repeats on each Codex
-/// row the same route and the same ten-minute counts, read off the server's own status. The
-/// scratch HOME's server mints its own leaf, which covers chatgpt.com, and the CLI reads the CA
-/// it wrote there, so the route is pooled and names the non-default Codex origin. The Anthropic
-/// row carries neither key, and `tcr status`'s text form notes the refusal on stderr.
+/// Codex request gets an immediate configuration error, and `tcr status --json` then repeats
+/// on each Codex row the same route and the same ten-minute counts, read off the server's own
+/// status. The scratch HOME's server mints its own leaf, which covers chatgpt.com, and the CLI
+/// reads the CA it wrote there, so the route remains pooled and names the non-default Codex
+/// origin even though every Codex account is disabled. The Anthropic row carries neither key,
+/// and `tcr status`'s text form notes the refusal on stderr.
 ///
 /// Watched red: with the production half of this change set aside, the Codex rows carry neither
 /// key.
 #[tokio::test(flavor = "multi_thread")]
-async fn status_json_reports_the_route_and_the_refusals_live() {
+async fn status_reports_the_disabled_codex_pool_refusal_live() {
     let (upstream, codex_upstream, _ledger) = spawn_origins().await;
     let server = start_server(&upstream, &codex_upstream).await;
     for name in ["alice@example.com/codex", "bob@example.com/codex"] {
@@ -866,9 +871,10 @@ async fn status_json_reports_the_route_and_the_refusals_live() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(!resp.headers().contains_key("retry-after"));
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
+    assert_eq!(body["error"]["type"], "no_codex_account", "{body}");
 
     let rows = server.status_rows().await;
     let codex: Vec<&serde_json::Value> = rows
@@ -878,7 +884,7 @@ async fn status_json_reports_the_route_and_the_refusals_live() {
     assert_eq!(codex.len(), 2, "{rows:?}");
     let traffic = &codex[0]["codexTraffic"];
     assert_eq!(traffic["refused10m"], 1, "{traffic}");
-    assert_eq!(traffic["lastRefusal"], "pool_unavailable", "{traffic}");
+    assert_eq!(traffic["lastRefusal"], "no_codex_account", "{traffic}");
     assert!(traffic["lastRefusalAtMs"].is_i64(), "{traffic}");
     assert_eq!(traffic["unpooled10m"], 0, "{traffic}");
     assert_eq!(
@@ -905,8 +911,8 @@ async fn status_json_reports_the_route_and_the_refusals_live() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.lines().any(|line| line
-            == "[tcr] note codex-refusals: refused_10m=1 last_type=pool_unavailable — tcr \
-                answered codex with a 429 because no Codex account could serve; see the Codex \
+            == "[tcr] note codex-refusals: refused_10m=1 last_type=no_codex_account — tcr \
+                refused codex because no Codex account could serve; see the Codex \
                 rows above"),
         "{stderr}"
     );

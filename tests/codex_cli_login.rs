@@ -242,6 +242,8 @@ impl Scratch {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
         command
             .env("HOME", self.home.path())
+            // Parallel tests spawn many children; bound each child's runtime threads.
+            .env("TOKIO_WORKER_THREADS", "2")
             .env("TCR_CODEX_BIN", &self.codex)
             .env_remove("CODEX_BIN")
             .env("PATH", self.path("empty-path"))
