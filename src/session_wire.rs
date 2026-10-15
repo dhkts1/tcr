@@ -32,7 +32,8 @@
 //! A Codex session is keyed on codex's `session-id` header, not on `metadata.user_id`. Its
 //! calls come from the response stream's finished output items
 //! ([`codex_tool_call_from_item`]), run from the stream's end, and close when the session's
-//! next request arrives ([`WireSessionTracker::record_codex_request`]). None of its request
+//! next Responses turn arrives ([`WireSessionTracker::record_codex_request`]). Auxiliary image,
+//! memory and search calls count on the session but do not close its tools. None of its request
 //! bodies is read.
 //!
 //! `command_head` (capped to 120 chars; the per-tool shape is on
@@ -2208,7 +2209,7 @@ impl WireSessionTracker {
         }
     }
 
-    /// Count one Codex request on `session_id`, creating it as a Codex session, and close
+    /// Count one Codex Responses turn on `session_id`, creating it as a Codex session, and close
     /// every call its previous response started.
     ///
     /// The close is the request's arrival. The request carries those calls' outputs in a body
@@ -2229,6 +2230,25 @@ impl WireSessionTracker {
             });
             for (_, running) in open {
                 Self::complete_call(&mut entry.tools, running, now_ms, false, false);
+            }
+        }
+    }
+
+    /// Count a pooled model request on its Codex session, with the endpoint available
+    /// to distinguish the next conversation turn from auxiliary model work.
+    pub fn record_codex_model_request(
+        &mut self,
+        session_id: &str,
+        account: Option<String>,
+        path: &str,
+        now_ms: i64,
+    ) {
+        if path == crate::provider::CODEX_RESPONSES_PATH {
+            self.record_codex_request(session_id, account, now_ms);
+        } else {
+            self.record_request(session_id, account, None, now_ms, &[], &[]);
+            if let Some(entry) = self.sessions.get_mut(session_id) {
+                entry.provider = crate::provider::Provider::Codex;
             }
         }
     }
@@ -3138,12 +3158,50 @@ mod tests {
         }
     }
 
-    /// A Codex call closes when the NEXT request on its session arrives. That request carries
+    #[test]
+    fn auxiliary_codex_model_calls_leave_the_sessions_tools_running() {
+        for path in [
+            "/backend-api/codex/images/generations",
+            "/backend-api/codex/images/edits",
+            "/backend-api/codex/memories/trace_summarize",
+            "/backend-api/codex/alpha/search",
+        ] {
+            let mut tracker = WireSessionTracker::new();
+            tracker.record_codex_request("sess-c", Some("alice@example.com/codex".into()), 1_000);
+            tracker.record_codex_tool_calls(
+                "sess-c",
+                2_000,
+                &[codex_call("call_1", "exec_command", "cargo build", None)],
+            );
+            tracker.record_codex_model_request("sess-c", None, path, 3_000);
+            let auxiliary = tracker.snapshot(3_000).pop().unwrap().1;
+            assert_eq!(auxiliary.requests, 2, "{path} still counts as a request");
+            assert_eq!(
+                auxiliary.tools.running.len(),
+                1,
+                "{path} is not the next Responses turn"
+            );
+            assert_eq!(auxiliary.tools.calls, 0, "{path} carries no shell result");
+
+            tracker.record_codex_model_request(
+                "sess-c",
+                None,
+                crate::provider::CODEX_RESPONSES_PATH,
+                4_000,
+            );
+            let next_turn = tracker.snapshot(4_000).pop().unwrap().1;
+            assert_eq!(next_turn.requests, 3);
+            assert!(next_turn.tools.running.is_empty());
+            assert_eq!(next_turn.tools.calls, 1);
+        }
+    }
+
+    /// A Codex call closes when the NEXT Responses turn on its session arrives. That request carries
     /// the call's output, in a body tcr does not read, so its arrival is the close. The call
     /// lands in the counts, its tool's bucket and the slowest list as a Claude call does, and
     /// as neither an error nor a timeout, which tcr never saw.
     #[test]
-    fn the_next_request_on_the_session_closes_its_codex_tools() {
+    fn the_next_responses_turn_on_the_session_closes_its_codex_tools() {
         let mut tracker = WireSessionTracker::new();
         tracker.record_codex_request("sess-c", Some("bob@example.com/codex".to_string()), 1_000);
         tracker.record_codex_tool_calls(

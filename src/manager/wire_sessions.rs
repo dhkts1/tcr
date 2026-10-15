@@ -113,20 +113,35 @@ impl Manager {
         self.mark_wire_sessions_dirty();
     }
 
-    /// Count one Codex request on the wire session its `session-id` header named, attributed
-    /// to `account`. A no-op when `session_id` is `None`: a Codex request that names no session
-    /// has nothing for this table to key on.
-    ///
-    /// Called once per client request at the terminal outcome, in place of
-    /// [`Self::record_wire_session`] (same call site in `proxy.rs`, same once-not-per-retry
-    /// rule). Its arrival closes every call the session's previous response started, because
-    /// it carries their outputs in a body tcr does not read. A request tcr answers itself
-    /// never reaches the terminal outcome, so it is not counted and closes nothing, just as a
-    /// Claude `tool_result` in such a request closes nothing.
+    /// Count one Codex Responses turn, whose arrival closes the previous turn's tools.
     pub fn record_codex_wire_session(
         &self,
         session_id: Option<&str>,
         account: Option<String>,
+        now: OffsetDateTime,
+    ) {
+        self.record_codex_wire_request(
+            session_id,
+            account,
+            crate::provider::CODEX_RESPONSES_PATH,
+            now,
+        );
+    }
+
+    /// Count one pooled Codex model call on the wire session its `session-id` header named.
+    /// Only a Responses turn carries the previous turn's tool outputs, so auxiliary image,
+    /// memory and search calls leave tools open. A no-op when `session_id` is `None`.
+    ///
+    /// Called once per client request at the terminal outcome, in place of
+    /// [`Self::record_wire_session`] (same call site in `proxy.rs`, same once-not-per-retry
+    /// rule). A request tcr answers itself never reaches the terminal outcome, so it is
+    /// not counted and closes nothing, just as a Claude `tool_result` in such a request
+    /// closes nothing.
+    pub fn record_codex_wire_request(
+        &self,
+        session_id: Option<&str>,
+        account: Option<String>,
+        path: &str,
         now: OffsetDateTime,
     ) {
         let Some(session_id) = session_id else {
@@ -137,7 +152,7 @@ impl Manager {
             .wire_sessions
             .lock()
             .expect("wire sessions lock poisoned");
-        tracker.record_codex_request(session_id, account, now_ms);
+        tracker.record_codex_model_request(session_id, account, path, now_ms);
         drop(tracker);
         self.mark_wire_sessions_dirty();
     }

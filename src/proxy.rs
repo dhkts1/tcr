@@ -4871,13 +4871,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
         // `None`. Cloned, not moved: the usage-recording arms below (streamed and
         // non-streamed) still need `account_name`/`request_model`/`wire_session_id`.
-        // A Codex request carries no tool events in its body (a zstd body is never read), and its
-        // arrival closes the calls its session's previous response started.
+        // Codex request bodies carry no tool events here. Only a Responses turn closes
+        // calls started by the previous response; auxiliary model calls leave them running.
         match provider {
             crate::provider::Provider::Codex => {
-                manager.record_codex_wire_session(
+                manager.record_codex_wire_request(
                     wire_session_id.as_deref(),
                     account_name.clone(),
+                    &path,
                     served_at,
                 );
             }
