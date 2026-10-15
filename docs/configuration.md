@@ -1,7 +1,9 @@
 # Configuration reference
 
 Everything `tcr` reads out of its config file, with the real default for each key. The file
-is `~/.config/tcr.json`, or `~/.config/teamclaude.json` on an install that has only that one.
+is `~/.config/tcr.json`. An older install's `~/.config/teamclaude.json` is moved there by the
+update (TcrBar's, or `tcr update`), and is read where it is until then; see
+[`tcr migrate`](cli.md#tcr-migrate).
 Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
 
 Cache paths below use `~/.cache/tcr/`. When only the older `~/.cache/teamclaude/` directory

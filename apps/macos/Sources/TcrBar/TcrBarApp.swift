@@ -206,6 +206,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `tcr`'s default; `--no-replace` only restates it for an older binary.
         // `--headless` is the flag that matters here — without it the child dies
         // on startup trying to put a TUI on a pipe.
+        //
+        // First, on the first launch of a new bundle version, move the old
+        // `teamclaude` file names to the `tcr` ones. It has to come before the
+        // server starts: a running server keeps writing the paths it resolved at
+        // boot, so `tcr migrate` refuses beside one. A refusal or failure never
+        // holds up the launch; the server reads the old names where they are.
+        if NameMigrationMarker().noteLaunch(current: AppBuild.buildNumber) {
+            Self.migrateNames()
+        }
         if shell.preference.startServerAtLaunch {
             // The first launch after an UPDATE takes the port; every other
             // launch stands down to an incumbent. When TcrBar quits for an
@@ -234,6 +243,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // anything. `AwakeController.restoreFromPreference` is a no-op unless the
         // stored intent is ON.
         shell.awake.restoreFromPreference()
+    }
+
+    /// Run `tcr migrate --json` with the same `tcr` the server is started from,
+    /// and log what it said. Blocking: it renames at most a handful of paths
+    /// and runs once per update.
+    private static func migrateNames() {
+        switch TcrTool.resolve() {
+        case .failure(let notFound):
+            NSLog(
+                "TcrBar: no tcr found to run `tcr migrate` (searched %@)",
+                notFound.searched.joined(separator: ", "))
+        case .success(let tcr):
+            do {
+                let output = try TcrTool.run(executable: tcr, arguments: ["migrate", "--json"])
+                let result = NameMigrationResult.parse(
+                    exitCode: output.exitCode, stdout: output.stdout, stderr: output.stderr)
+                for line in result.logLines {
+                    NSLog("TcrBar: %@", line)
+                }
+            } catch {
+                NSLog("TcrBar: could not run `%@ migrate`: %@", tcr.path, String(describing: error))
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

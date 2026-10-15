@@ -39,6 +39,7 @@ pub mod handoff;
 pub mod identity;
 pub mod legacy_names;
 pub mod manager;
+pub mod migrate;
 pub mod mint;
 pub mod mitm;
 pub mod model;

@@ -16,7 +16,8 @@ first commit".
 - **No credentials, ever.** OAuth access and refresh tokens, and the proxy API key, are secrets. They do
   not belong in code, tests, logs you paste, or a PR description. A pre-commit `gitleaks` hook is the
   backstop, not the plan.
-- The live config at `~/.config/teamclaude.json` holds **working credentials for real accounts**. Never
+- The live config at `~/.config/tcr.json` (`~/.config/teamclaude.json` on an install no update has moved
+  yet, see `tcr migrate`) holds **working credentials for real accounts**. Never
   copy it into the repo, never commit it, never paste its contents anywhere. Tests write their own
   temp-file configs; do the same.
 

@@ -2,19 +2,22 @@
 //!
 //! The project is being renamed from `teamclaude-rs` to `tcr`. A fresh install
 //! gets the new names, which live in [`crate::paths`]. An install that already
-//! has the old files keeps using them **where they are**: nothing here is ever
-//! moved, copied or symlinked. Two reasons, both expensive:
+//! has the old files keeps using them **where they are** until an update runs
+//! `tcr migrate` ([`crate::migrate`]), which renames the config file and the
+//! cache directory and nothing else. Nothing is ever copied or symlinked:
 //!
 //! - Users were told to `export NODE_EXTRA_CA_CERTS=<path to the CA>`, so the
-//!   CA file can never move without breaking every client that trusts it.
+//!   Node proxy's CA files below can never move without breaking every client
+//!   that trusts them. `tcr migrate` leaves them alone.
 //! - The config is written atomically (temp file plus rename), which replaces a
 //!   symlink with a real file. A symlinked config would split in two on the
-//!   first write.
+//!   first write, which is why the move is one `rename(2)`.
 //!
 //! Each constant says why it still exists. **Deleting this file is how the
 //! aliases get dropped**: the compile errors it leaves behind are the complete
-//! list of places that still honour an old name. That later change has to
-//! decide how existing installs move their files, and the CA is the hard one.
+//! list of places that still honour an old name, `src/migrate.rs` among them.
+//! That change comes a release after the move ships, so installs that update
+//! have had their files renamed; the Node proxy's CA is still the hard one.
 //!
 //! The guard test at the bottom fails if the old name is written in code
 //! anywhere else under `src/`, in any case and any shape (a literal, an

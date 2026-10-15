@@ -102,7 +102,7 @@ Stop the proxy, then delete the binary: `~/.cargo/bin/tcr` from either installer
 removes TcrBar and its login item.
 
 Nothing deletes your data for you. `~/.config/tcr.json` (`~/.config/teamclaude.json` on an older
-install) holds working credentials for every account in the pool, so delete it too, along with
+install no update has moved yet) holds working credentials for every account in the pool, so delete it too, along with
 `~/.cache/tcr/` (or `~/.cache/teamclaude/`) and any
 `ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS` or `CODEX_CA_CERTIFICATE` you exported,
 and any `chatgpt.com` entry you added to `NO_PROXY`. Every file `tcr` keeps is listed in
@@ -150,8 +150,9 @@ sets `CODEX_CA_CERTIFICATE` only when you have not supplied it, and preserves an
 `NODE_EXTRA_CA_CERTS` too. Its shell tools receive an unmarked proxy URL, so their ChatGPT
 requests keep their own TLS and login; explicitly configured child environments can override
 that default. Keep the marker scoped to `tcr run --codex` rather than exporting it to a shell.
-The config lives at `~/.config/tcr.json` (an install that has only
-`~/.config/teamclaude.json` keeps using that), and `name` and
+The config lives at `~/.config/tcr.json`. An older install's `~/.config/teamclaude.json` is moved
+there when you update, by TcrBar's update or by `tcr update`, and is read where it is until then
+([`tcr migrate`](docs/cli.md#tcr-migrate)). `name` and
 `accessToken` are the only required keys. Every other key, its default and the file's permissions
 are in [`docs/configuration.md`](docs/configuration.md).
 

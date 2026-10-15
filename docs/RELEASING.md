@@ -179,7 +179,9 @@ app gets a 404, says nothing, and tries again on the next launch — it records 
 only once notes were actually shown. A fresh install records the current version silently.
 
 The [pending Codex release notes](release-notes-codex.md) include the certificate-chain
-upgrade notice. Copy them into the first release that ships Codex pooling.
+upgrade notice. Copy them into the first release that ships Codex pooling. The
+[pending file-name notes](release-notes-names.md) go into the first release that ships
+`tcr migrate`.
 
 ## What the pipeline does
 

@@ -98,6 +98,10 @@ enum Command {
     Wrap(WrapArgs),
     /// Self-update: `git pull --ff-only` + `cargo build --release` in the checkout.
     Update(UpdateArgs),
+    /// Move an existing install's `teamclaude` config file and cache directory
+    /// to the `tcr` names. Refuses (exit 3) while a tcr server is running.
+    /// TcrBar's first launch after an update and `tcr update` run it for you.
+    Migrate(MigrateArgs),
     /// Render the TUI against fake accounts (for a sanitized README screenshot).
     Demo,
     /// Open TcrBar, the macOS menu-bar app (macOS only).
@@ -1369,6 +1373,13 @@ struct WrapArgs {
 }
 
 #[derive(clap::Args)]
+struct MigrateArgs {
+    /// Print one JSON object saying what moved, what was left and why.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
 struct UpdateArgs {
     /// Rebuild even when `git pull` reports the checkout is already up to date.
     #[arg(long)]
@@ -1629,11 +1640,23 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::List(args)) => run_list(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),
+        Some(Command::Migrate(args)) => run_migrate(args),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
         Some(Command::Ui) => run_ui(),
         Some(Command::Doctor(args)) => run_doctor(args).await,
         Some(Command::Setup(args)) => run_setup(args),
         None => run_server(cli.server).await,
+    }
+}
+
+/// `tcr migrate [--json]`: move the old-name files ([`tcr::migrate`]), exiting
+/// non-zero when it refused or a rename failed.
+fn run_migrate(args: MigrateArgs) -> anyhow::Result<()> {
+    let run = tcr::migrate::run();
+    tcr::migrate::print(&run, args.json);
+    match run.exit_code() {
+        0 => Ok(()),
+        code => std::process::exit(code),
     }
 }
 
