@@ -22285,7 +22285,7 @@ mod tests {
     /// once.** The status document no longer lists it, so `tcr status` words the route as a
     /// pool with no Codex account; the proxy's own Codex count agrees, so its listener stops
     /// intercepting chatgpt.com and a Codex request is told no Codex account is configured. The
-    /// deleted slot is only ever counted for Anthropic.
+    /// deleted slot no longer counts for either provider.
     ///
     /// Watched red: with deleted slots counted for Codex, the proxy's Codex count reads 1.
     #[tokio::test]
@@ -22368,6 +22368,54 @@ mod tests {
         assert_eq!(
             body_json(response).await["error"]["type"],
             "no_codex_account"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_the_last_claude_account_returns_the_no_account_message() {
+        let dir = tempfile::tempdir().expect("temporary config");
+        let path = dir.path().join("teamclaude.json");
+        let config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
+        let write = |accounts: &[Account]| {
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({"accounts": accounts})).unwrap(),
+            )
+            .unwrap();
+        };
+        write(&config.accounts);
+        let codex = config.accounts[1].clone();
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        let _ = manager.snapshot(OffsetDateTime::now_utc());
+        write(&[codex]);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"model":"claude-x","messages":[]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["error"]["message"],
+            "No Claude account is configured in tcr; run `tcr login` to add one."
+        );
+        assert_eq!(
+            manager.provider_account_count(crate::provider::Provider::Anthropic),
+            0
+        );
+        assert_eq!(
+            manager.provider_account_count(crate::provider::Provider::Codex),
+            1
         );
     }
 
