@@ -114,9 +114,12 @@ fn warn_if_server_running(config: &Config) {
 /// call sites: the next verb that needs the config gets the first-run behaviour
 /// by construction, not by remembering.
 fn load_config(config_path: &Path) -> anyhow::Result<Config> {
-    let (config, _created) = config::load_or_init(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
-    Ok(config)
+    load_config_with_creation(config_path).map(|(config, _)| config)
+}
+
+fn load_config_with_creation(config_path: &Path) -> anyhow::Result<(Config, bool)> {
+    config::load_or_init(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))
 }
 
 /// A first run's one chance to arrive with an account already in it: when the
@@ -3711,8 +3714,9 @@ fn probe_failed(a: &AccountSnapshot) -> bool {
 /// code is [`StatusCheck::exit_code`]. Either way stdout is the same bytes.
 pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Result<i32> {
     // Read-only verb: plain load, no clobber-warning (we never save).
-    let config = load_config(config_path)?;
+    let (config, created) = load_config_with_creation(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
+    let first_empty_config = created && config.accounts.is_empty();
     warn_if_no_accounts(&config);
 
     // Read before the match: the offline arm CONSUMES `config`, and the route
@@ -3727,7 +3731,14 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     // ONE read of the running proxy, and the Codex route and traffic are taken from it before
     // the snapshot consumes it. The text form words the route whatever the read gave (offline,
     // that no proxy answered); `--json` carries the route and the traffic only from a live read.
-    let live_read = fetch_live_status(&config).await;
+    // A newly created empty file configures no existing fleet. Its first status
+    // read is offline; do not probe an unrelated process on the default port.
+    let live_read = if first_empty_config {
+        Err(LiveStatusError::NoServer)
+    } else {
+        fetch_live_status(&config).await
+    };
+    let holds_codex = status_holds_provider(&live_read, &config, Provider::Codex);
     let ca = crate::mitm::minted_ca_path();
     let ca_readable = ca.is_file();
     let codex_route = crate::codex_route::codex_route(
@@ -3833,8 +3844,12 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         // elsewhere; exit 3, routed here with nothing answering), and only in
         // the text form. `--json` is a bare array a script pipes into jq, and
         // a line above it would corrupt that contract.
-        let route = crate::doctor::inspect(proxy_port, served_recently);
-        let claude_verdict = (route.exit_code() != 0).then(|| route.verdict());
+        let claude_verdict = if first_empty_config {
+            None
+        } else {
+            let route = crate::doctor::inspect(proxy_port, served_recently);
+            (route.exit_code() != 0).then(|| route.verdict())
+        };
         print!(
             "{}",
             render_status_text(&StatusText {
@@ -3846,6 +3861,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 group_colors: &group_colors,
                 claude_verdict,
                 codex_route: Some(&codex_route),
+                holds_codex,
             })
         );
         // A signed-out Codex row's remedy goes to stderr, below the account lines that name
@@ -3870,6 +3886,22 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         return Ok(0);
     }
     Ok(StatusCheck::of(&snapshot).exit_code())
+}
+
+fn status_holds_provider(
+    live: &Result<StatusPayload, LiveStatusError>,
+    config: &Config,
+    provider: Provider,
+) -> bool {
+    match live {
+        Ok(payload) if payload.mitm.is_some() => {
+            payload.accounts.iter().any(|row| row.provider == provider)
+        }
+        Ok(_) | Err(_) => config
+            .accounts
+            .iter()
+            .any(|account| account.provider == provider),
+    }
 }
 
 /// Does the fleet hold an account of `provider`, in any state?
@@ -3943,6 +3975,9 @@ pub(crate) struct StatusText<'a> {
     /// Whether the running proxy pools codex ([`crate::codex_route::codex_route`]), worded above
     /// the header when the fleet holds a Codex account and codex is not pooled.
     pub codex_route: Option<&'a tcr_status_wire::CodexRoute>,
+    /// Provider presence from live rows, or configured rows when an older proxy
+    /// cannot report providers yet.
+    pub holds_codex: bool,
 }
 
 /// The bytes of `tcr status`'s text form, [`StatusText`]'s lines in order, each ending in a
@@ -3965,7 +4000,7 @@ pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
         .codex_route
         .filter(|route| !route.pooled)
         .and_then(|route| route.reason.as_deref());
-    if let (Some(reason), true) = (unpooled, holds_provider(text.snapshot, Provider::Codex)) {
+    if let (Some(reason), true) = (unpooled, text.holds_codex) {
         let key = if holds_claude {
             "codexVerdict"
         } else {
@@ -4255,10 +4290,7 @@ pub async fn doctor(config_path: &Path, json: bool, codex_only: bool) -> anyhow:
 
     let claude =
         crate::doctor::inspect(config.proxy.port, served_recently).with_config_keys(&config);
-    let holds = |provider: Provider| match &live {
-        Ok(payload) => payload.accounts.iter().any(|row| row.provider == provider),
-        Err(_) => config.accounts.iter().any(|a| a.provider == provider),
-    };
+    let holds = |provider| status_holds_provider(&live, &config, provider);
     let codex = (codex_only || holds(Provider::Codex))
         .then(|| crate::doctor::inspect_codex(config.proxy.port, live.as_ref(), &config));
     let diagnosis = crate::doctor::Diagnosis {
@@ -9330,6 +9362,7 @@ mod tests {
             claude_verdict: claude_verdict.map(str::to_string),
             // Not pooled, and a Claude-only fleet still prints no Codex line.
             codex_route: Some(&js_leaf_route()),
+            holds_codex: holds_provider(&snapshot, Provider::Codex),
         })
     }
 
@@ -9446,6 +9479,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_older_proxy_uses_configured_codex_provider_presence() {
+        let old = live_payload(serde_json::Value::Null, 0, None);
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "accounts": [{"name":"alice@example.com/codex", "provider":"codex", "accessToken":"at-fake"}]
+        })).unwrap();
+        assert!(status_holds_provider(&Ok(old), &config, Provider::Codex));
+        let current = live_payload(
+            serde_json::json!({"interceptedHosts": [], "leaf":"minted"}),
+            0,
+            None,
+        );
+        assert!(
+            !status_holds_provider(&Ok(current), &config, Provider::Codex),
+            "a current server's live deletion overrides stale configured rows"
+        );
+    }
+
     /// `tcr status`'s text form over `snapshot`, as the golden renders it, with the Claude
     /// verdict and the Codex route given.
     fn status_text_of(
@@ -9467,6 +9518,7 @@ mod tests {
             group_colors: &std::collections::BTreeMap::new(),
             claude_verdict: claude_verdict.map(str::to_string),
             codex_route: Some(codex_route),
+            holds_codex: holds_provider(snapshot, Provider::Codex),
         })
     }
 
@@ -11694,6 +11746,7 @@ mod tests {
             group_colors: &group_colors,
             claude_verdict: None,
             codex_route: Some(&pooled),
+            holds_codex: true,
         });
         let header = text
             .lines()

@@ -1,5 +1,5 @@
-//! Proves first-run file creation through the offline accounts verb, and status
-//! output through an empty config on an isolated port. Fresh installs use `~/.config/tcr.json`;
+//! Proves first-run file creation through status and offline accounts, plus status
+//! output through an existing empty config on an isolated port. Fresh installs use `~/.config/tcr.json`;
 //! an install that already has `~/.config/teamclaude.json` keeps using it.
 //!
 //! This is an end-to-end test of the BUILT BINARY rather than a unit test of
@@ -11,8 +11,8 @@
 //! the dmg showed an error in the menu bar while the proxy behind it was up. A
 //! unit test on the config module would have stayed green through all of that.
 //!
-//! `config::load_or_init` and the CLI loader's unit tests cover absent-file initialization.
-//! The status subprocess uses an explicit empty config so it never probes a developer's live port.
+//! An explicit missing config takes the first-empty-fleet offline path before any
+//! port probe. Existing-config status fixtures name an isolated port.
 //!
 //! # Isolation
 //!
@@ -40,19 +40,34 @@ fn legacy_config_path_in(home: &std::path::Path) -> PathBuf {
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
 fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
     if args.first() == Some(&"status") {
-        let config: serde_json::Value = std::fs::read(config_path_in(home))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .expect("a status fixture must configure its own port before the child starts");
-        let port = config["proxy"]["port"]
-            .as_u64()
-            .expect("a status fixture must explicitly configure its port");
-        assert_ne!(port, 3456, "never contact the live proxy");
+        let explicit = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--config").then(|| std::path::PathBuf::from(pair[1])));
+        let path = explicit.clone().unwrap_or_else(|| config_path_in(home));
+        if path.exists() {
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let port = config["proxy"]["port"]
+                .as_u64()
+                .expect("an existing status fixture configures its port");
+            assert_ne!(port, 3456, "never contact the live proxy");
+        } else {
+            assert!(
+                explicit.is_some(),
+                "missing-file status must name its isolated config explicitly"
+            );
+            assert!(
+                path.starts_with(home),
+                "the new file belongs to this fixture's HOME"
+            );
+        }
     }
     let bin = env!("CARGO_BIN_EXE_tcr");
     let out = Command::new(bin)
         .args(args)
         .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
         // A scratch HOME does not scratch the login Keychain: the first-run
         // path now imports this machine's Claude Code login when it finds one,
         // and on a developer's mac that is a REAL credential. Pointing the
@@ -115,6 +130,35 @@ fn status_with_an_empty_config_exits_zero_offline() {
     assert!(
         stderr.contains("no accounts configured — run `tcr login` to add one"),
         "the empty-fleet hint must be on stderr, got: {stderr}"
+    );
+}
+
+/// Status itself initializes a missing file, not only the offline accounts verb.
+/// The creation-aware status path never probes a default port for this empty first run.
+#[test]
+fn status_with_an_explicit_missing_config_creates_an_empty_offline_fleet() {
+    let home = tempfile::tempdir().unwrap();
+    let config = config_path_in(home.path());
+    assert!(!config.exists());
+    let (code, stdout, stderr) = run_tcr(
+        home.path(),
+        &["status", "--json", "--config", config.to_str().unwrap()],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "a first status read must initialize the file: {stderr}"
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    assert_eq!(document["accounts"], serde_json::json!([]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(
+        !stderr.contains("TCR_TEST_PORT_GUARD"),
+        "first-run status performs no live-port probe: {stderr}"
     );
 }
 

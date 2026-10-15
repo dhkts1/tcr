@@ -66,11 +66,19 @@ async fn boot_after(
     let config = dir.join("teamclaude.json");
     std::fs::write(
         &config,
-        format!(r#"{{ "proxy": {{ "port": {port} }}, {extra} "accounts": [{accounts}] }}"#),
+        format!(r#"{{ "proxy": {{ "port": {port} }}, "upstream": "http://127.0.0.1:0", "codexUpstream": "http://127.0.0.1:0", {extra} "accounts": [{accounts}] }}"#),
     )
     .expect("write the scratch config");
     before_load(&config);
     let loaded = tcr::config::load(&config).expect("load the scratch config");
+    assert_eq!(
+        loaded.upstream, "http://127.0.0.1:0",
+        "offline Claude probes must fail closed"
+    );
+    assert_eq!(
+        loaded.codex_upstream, "http://127.0.0.1:0",
+        "offline Codex probes must fail closed"
+    );
     let manager = Manager::with_live_refresher(loaded, follows_file.then(|| config.clone()));
     let served = Arc::clone(&manager);
     tokio::spawn(async move { tcr::mitm::serve(listener, served, None).await });
@@ -116,6 +124,8 @@ async fn tcr(fleet: &Fleet, args: &[&str]) -> Run {
             .arg("--config")
             .arg(&config)
             .env("HOME", &home)
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
             .env_remove("XDG_CACHE_HOME")
             .env("TCR_CLAUDE_CODE_CREDENTIALS", claude_code_login(&home))
             .env("NO_COLOR", "1")

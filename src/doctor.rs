@@ -822,16 +822,14 @@ impl CodexReport {
             problems.push(if marked {
                 format!(
                     "{var} in this shell points at tcr with the Codex marker but without its CA, \
-                     so codex fails TLS: use `tcr run --codex`, or export CODEX_CA_CERTIFICATE \
-                     once the CA is readable"
+                     so codex can fail TLS: use `tcr run --codex` with a CA bundle that \
+                     includes tcr's CA; keep the marker scoped to that launch"
                 )
             } else {
                 format!(
                     "{var} in this shell points at tcr with an unmarked URL, so chatgpt.com is \
-                     tunneled untouched on codex's own login: use `tcr run --codex`, or set \
-                     HTTPS_PROXY=http://tcr-codex@127.0.0.1:{} and CODEX_CA_CERTIFICATE to \
-                     tcr's CA to join the pool",
-                    self.port
+                     tunneled untouched on codex's own login: use `tcr run --codex` to join \
+                     the pool for that launch instead of marking the whole shell"
                 )
             });
         }
@@ -1143,23 +1141,12 @@ impl Diagnosis {
     }
 }
 
-/// The Codex block's I/O half, beside [`inspect`]: build the report for the proxy on `port`
-/// from the one status read the caller made (`live`), this process's environment, and the
-/// files codex and tcr keep.
-///
-/// The rows are the running proxy's Codex rows when it answered, which leave out an account
-/// deleted while it runs, else the config's, which carry no gate. The route is
-/// [`crate::codex_route::codex_route`] over the same read, the decision `tcr run --codex` and
-/// `tcr status` make, so the doctor can never word it differently. The CA is named and checked
-/// for readability, never loaded. The binary is [`crate::codex_local::find_codex`]'s, the one
-/// `tcr run --codex` would launch. codex's login is checked for existence, never read.
-pub fn inspect_codex(
-    port: u16,
+fn codex_rows(
     live: Result<&StatusPayload, &crate::cli::LiveStatusError>,
     config: &crate::config::Config,
-) -> CodexReport {
-    let rows: Vec<CodexRow> = match live {
-        Ok(payload) => payload
+) -> Vec<CodexRow> {
+    match live {
+        Ok(payload) if payload.mitm.is_some() => payload
             .accounts
             .iter()
             .filter(|row| row.provider == crate::provider::Provider::Codex)
@@ -1170,7 +1157,7 @@ pub fn inspect_codex(
                 limit_reached_type: row.limit_reached_type.clone(),
             })
             .collect(),
-        Err(_) => {
+        Ok(_) | Err(_) => {
             let reserved = config.reserved_group_names();
             config
                 .accounts
@@ -1194,7 +1181,25 @@ pub fn inspect_codex(
                 })
                 .collect()
         }
-    };
+    }
+}
+
+/// The Codex block's I/O half, beside [`inspect`]: build the report for the proxy on `port`
+/// from the one status read the caller made (`live`), this process's environment, and the
+/// files codex and tcr keep.
+///
+/// The rows are the running proxy's Codex rows when it answered, which leave out an account
+/// deleted while it runs, else the config's, which carry no gate. The route is
+/// [`crate::codex_route::codex_route`] over the same read, the decision `tcr run --codex` and
+/// `tcr status` make, so the doctor can never word it differently. The CA is named and checked
+/// for readability, never loaded. The binary is [`crate::codex_local::find_codex`]'s, the one
+/// `tcr run --codex` would launch. codex's login is checked for existence, never read.
+pub fn inspect_codex(
+    port: u16,
+    live: Result<&StatusPayload, &crate::cli::LiveStatusError>,
+    config: &crate::config::Config,
+) -> CodexReport {
+    let rows = codex_rows(live, config);
     let ca = crate::mitm::minted_ca_path();
     let ca_readable = ca.is_file();
     let route = crate::codex_route::codex_route(live, port, &ca, ca_readable, rows.len());
@@ -2126,6 +2131,28 @@ mod tests {
     /// reads for an `https://` URL decides, and the problem is dropped when that codex goes
     /// around tcr (`NO_PROXY`), trusts tcr's CA, or meets no interception at all.
     #[test]
+    fn an_older_proxy_uses_configured_codex_rows_for_the_restart_diagnosis() {
+        let payload: StatusPayload = serde_json::from_value(serde_json::json!({
+            "kind": crate::status::STATUS_KIND, "accounts": [], "build": {"sha":"abc1234"}
+        }))
+        .unwrap();
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "accounts": [{"name":"alice@example.com/codex", "provider":"codex", "accessToken":"at-fake"}]
+        })).unwrap();
+        let rows = codex_rows(Ok(&payload), &config);
+        assert_eq!(
+            rows.len(),
+            1,
+            "an older status payload cannot report configured Codex rows"
+        );
+        assert_eq!(rows[0].name, "alice@example.com/codex");
+        assert_eq!(
+            rows[0].gate, None,
+            "configuration is not a measured live gate"
+        );
+    }
+
+    #[test]
     fn an_unmarked_codex_proxy_reports_how_to_join_the_pool() {
         let report = CodexReport {
             env: CodexEnv {
@@ -2136,7 +2163,11 @@ mod tests {
         };
         let problem = &report.problems()[0];
         assert!(problem.contains("unmarked"), "{problem}");
-        assert!(problem.contains("tcr-codex@127.0.0.1:3999"), "{problem}");
+        assert!(problem.contains("tcr run --codex"), "{problem}");
+        assert!(
+            !problem.contains("tcr-codex@"),
+            "do not mark the whole shell: {problem}"
+        );
         assert!(!problem.contains("fails TLS"), "{problem}");
     }
 
@@ -2145,8 +2176,9 @@ mod tests {
         const AT_TCR: &str = "http://tcr-codex@127.0.0.1:3999";
         const CA: &str = "/Users/example/.config/tcr-ca.pem";
         const PROBLEM: &str = "HTTPS_PROXY in this shell points at tcr with the Codex marker \
-                               but without its CA, so codex fails TLS: use `tcr run --codex`, \
-                               or export CODEX_CA_CERTIFICATE once the CA is readable";
+                               but without its CA, so codex can fail TLS: use `tcr run --codex` \
+                               with a CA bundle that includes tcr's CA; keep the marker scoped \
+                               to that launch";
         let with_env = |route: CodexRoute, env: CodexEnv| CodexReport {
             env,
             ..codex_report(route)

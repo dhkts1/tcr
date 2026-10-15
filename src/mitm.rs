@@ -42,7 +42,7 @@
 //! Codex's HTTP client passes proxy URL userinfo to reqwest; its WebSocket client enables
 //! the pinned Tungstenite forks' proxy support (`openai/codex` `http-client/src/outbound_proxy.rs`,
 //! `websocket-client/src/dialer.rs`, `Cargo.toml`). Both send that userinfo as HTTP CONNECT
-//! `Proxy-Authorization: Basic dGNyLWNvZGV4Og==`. The pinned Tungstenite `proxy.rs`
+//! [`CODEX_PROXY_AUTHORIZATION`]. The pinned Tungstenite `proxy.rs`
 //! parses a username without a password and builds the same Basic header as reqwest's
 //! hyper-util matcher. This permits one listener without terminating another client's
 //! `chatgpt.com` TLS. The marker selects routing; it is not an authentication secret.
@@ -96,6 +96,9 @@ use crate::manager::Manager;
 pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com", "chatgpt.com"];
 
 /// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
+/// This is a route marker, not process authentication. The launch makes shell-tool
+/// proxies unmarked through Codex's shell policy; explicit MCP proxy env and other
+/// helper processes can still inherit the marker and must opt out when needed.
 pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
 /// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
 pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
@@ -109,6 +112,9 @@ pub fn codex_proxy_marked(url: &str) -> bool {
 
 /// Read the marker from CONNECT headers only, without exposing or forwarding proxy credentials.
 fn codex_connect_marked(head: &str) -> bool {
+    let (expected_scheme, expected_value) = CODEX_PROXY_AUTHORIZATION
+        .split_once(' ')
+        .expect("the Codex proxy marker has a scheme and value");
     head.lines()
         .skip(1)
         .take_while(|line| !line.is_empty())
@@ -116,7 +122,7 @@ fn codex_connect_marked(head: &str) -> bool {
         .any(|(name, value)| {
             name.eq_ignore_ascii_case("proxy-authorization")
                 && value.trim().split_once(' ').is_some_and(|(scheme, value)| {
-                    scheme.eq_ignore_ascii_case("Basic") && value.trim() == "dGNyLWNvZGV4Og=="
+                    scheme.eq_ignore_ascii_case(expected_scheme) && value.trim() == expected_value
                 })
         })
 }

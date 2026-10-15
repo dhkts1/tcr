@@ -6339,7 +6339,6 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     refuse_group_with_codex(&args)?;
     if args.codex {
         let (mut cmd, codex) = codex_command()?;
-        cmd.args(&args.args);
         mark_run_active(&mut cmd);
         // ONE read of the running proxy answers both "is it listening" and "does
         // it intercept chatgpt.com", so the two cannot disagree. The CA is named,
@@ -6357,6 +6356,8 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
             }
         }
         apply_codex_launch(&mut cmd, port, &launch);
+        // Generated shell-tool defaults precede explicit caller overrides.
+        cmd.args(&args.args);
         let status = cmd
             .status()
             .with_context(|| format!("failed to launch `{}`", codex.display()))?;
@@ -6430,9 +6431,8 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // Claude Code — see `apply_see_through_env` for why we prefer the first.
         // Anything missing from the MITM material lands us in base-URL mode, which
         // always works; there is no half-applied third state.
-        let holds_codex = config.holds_codex();
         match see_through_ca() {
-            Some(ca) => apply_see_through_env(&mut cmd, port, &ca, holds_codex),
+            Some(ca) => apply_see_through_env(&mut cmd, port, &ca),
             None => apply_base_url_env(&mut cmd, port),
         }
     } else {
@@ -6658,8 +6658,21 @@ fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Opti
 fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &CodexLaunch) {
     match launch {
         CodexLaunch::SeeThrough { ca, no_proxy } => {
-            apply_codex_see_through_env(cmd, port, ca);
+            apply_codex_see_through_env(
+                cmd,
+                port,
+                ca,
+                std::env::var_os("CODEX_CA_CERTIFICATE").is_some(),
+            );
             apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
+            // This affects shell-like tools, not Codex's own HTTP/WebSocket clients.
+            // Scalar overrides preserve the caller's other policy entries and filters.
+            for var in ["HTTPS_PROXY", "https_proxy"] {
+                cmd.arg("-c").arg(format!(
+                    "shell_environment_policy.set.{var}=\"http://127.0.0.1:{port}\""
+                ));
+            }
+            eprintln!("[tcr] shell tools use an unmarked proxy and keep their own ChatGPT login. Other helpers can inherit Codex's marker; use unmarked HTTPS_PROXY and https_proxy for those commands.");
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
             }
@@ -6996,43 +7009,29 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
 /// which spelling they read, and one that reads only the one we skipped would go
 /// direct — bypassing rotation entirely, silently.
 ///
-/// `CODEX_CA_CERTIFICATE` names the same CA for the `codex` a Claude tool or
-/// plugin may start inside this session. That process inherits the proxy vars.
-/// This proxy URL has no Codex marker, so the nested codex stays on its own login
-/// through a blind tunnel. `tcr run --codex` opts that process into the pool with
-/// the marker. Claude ignores the extra CA variable.
-fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path, holds_codex: bool) {
+/// A nested codex inherits an unmarked proxy and keeps its own login, so it
+/// never needs tcr's CA. Preserve its inherited CA settings unchanged.
+fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
     let proxy = format!("http://127.0.0.1:{port}");
     cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
     cmd.env("HTTPS_PROXY", &proxy);
     cmd.env("https_proxy", &proxy);
     cmd.env("NODE_EXTRA_CA_CERTS", ca);
-    cmd.env("CODEX_CA_CERTIFICATE", ca);
     // Unnecessary here — we ARE first-party in this mode, so nothing gates them
     // off — but harmless, and they keep the session whole if it ever falls back.
     apply_capability_defaults(cmd);
     eprintln!(
         "[tcr] see-through mode: claude keeps https://api.anthropic.com, tunnelling via {proxy}"
     );
-    eprintln!("{}", see_through_ca_notice(ca, holds_codex));
+    eprintln!("{}", see_through_ca_notice(ca));
 }
 
-/// The line naming the CA a see-through claude session trusts. That session
-/// carries `CODEX_CA_CERTIFICATE` as well, for a codex it starts
-/// ([`apply_see_through_env`]); the line says so once the config holds a Codex
-/// account (`holds_codex`), and reads as it always did otherwise.
-fn see_through_ca_notice(ca: &Path, holds_codex: bool) -> String {
-    if holds_codex {
-        format!(
-            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE={}",
-            ca.display()
-        )
-    } else {
-        format!(
-            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
-            ca.display()
-        )
-    }
+/// The CA a see-through Claude session trusts; Codex's trust settings are untouched.
+fn see_through_ca_notice(ca: &Path) -> String {
+    format!(
+        "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
+        ca.display()
+    )
 }
 
 /// SEE-THROUGH mode for `codex`, the only mode tcr routes it in. `codex` keeps
@@ -7047,7 +7046,12 @@ fn see_through_ca_notice(ca: &Path, holds_codex: bool) -> String {
 /// `ANTHROPIC_BASE_URL`, no `NODE_EXTRA_CA_CERTS`, no capability defaults. A
 /// pooled launch adds `NODE_EXTRA_CA_CERTS` on its own, for a `claude` the
 /// session starts ([`apply_nested_claude_ca`]).
-fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
+fn apply_codex_see_through_env(
+    cmd: &mut std::process::Command,
+    port: u16,
+    ca: &Path,
+    caller_ca_exported: bool,
+) {
     let proxy = format!(
         "http://{}@127.0.0.1:{port}",
         tcr::mitm::CODEX_PROXY_USERNAME
@@ -7056,15 +7060,21 @@ fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &
     cmd.env("https_proxy", &proxy);
     // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
     // NODE_EXTRA_CA_CERTS means nothing to it.
-    cmd.env("CODEX_CA_CERTIFICATE", ca);
+    if !caller_ca_exported {
+        cmd.env("CODEX_CA_CERTIFICATE", ca);
+    }
     eprintln!(
         "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {proxy}; a \
          FedRAMP or residency-routed login runs on its own credential, unpooled"
     );
-    eprintln!(
-        "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
-        ca.display()
-    );
+    if caller_ca_exported {
+        eprintln!("[tcr] keeping the caller's CODEX_CA_CERTIFICATE; its CA bundle must include tcr's CA for pooled TLS");
+    } else {
+        eprintln!(
+            "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
+            ca.display()
+        );
+    }
 }
 
 /// Let a `claude` started inside a pooled codex session trust tcr's leaf: set
@@ -7985,21 +7995,20 @@ mod tests {
         );
     }
 
-    /// Claude's see-through env names its CA for codex too. A `codex` that a
-    /// Claude tool or plugin starts inherits this unmarked `HTTPS_PROXY`, so it
-    /// keeps its own login. An explicit `tcr run --codex` opts into pooling.
+    /// A nested Codex keeps its own login through the unmarked proxy, and keeps
+    /// whichever CA bundle it inherited rather than replacing it with tcr's.
     #[test]
-    fn see_through_env_lets_a_nested_codex_trust_the_leaf() {
+    fn claude_see_through_env_preserves_a_nested_codex_ca_choice() {
         let mut cmd = std::process::Command::new("true");
-        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"), false);
+        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"));
         let set = |name: &str| {
             cmd.get_envs()
                 .find_map(|(k, v)| (k == name).then(|| v.map(|v| v.to_string_lossy().into_owned())))
         };
         assert_eq!(
             set("CODEX_CA_CERTIFICATE"),
-            Some(Some("/tmp/ca.pem".to_string())),
-            "a nested codex must be told which CA signs the leaf"
+            None,
+            "an unmarked nested codex never meets our leaf and keeps its own CA choice"
         );
         assert_eq!(
             set("NODE_EXTRA_CA_CERTS"),
@@ -8020,7 +8029,7 @@ mod tests {
             (
                 "see-through",
                 &(|cmd: &mut std::process::Command| {
-                    apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"), false)
+                    apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"))
                 }) as &dyn Fn(&mut std::process::Command),
             ),
             (
@@ -8046,7 +8055,7 @@ mod tests {
     #[test]
     fn codex_see_through_env_sets_proxy_and_ca_and_nothing_anthropic() {
         let mut cmd = std::process::Command::new("true");
-        apply_codex_see_through_env(&mut cmd, 3999, std::path::Path::new("/tmp/ca.pem"));
+        apply_codex_see_through_env(&mut cmd, 3999, std::path::Path::new("/tmp/ca.pem"), false);
         let env: std::collections::HashMap<_, _> = cmd
             .get_envs()
             .filter_map(|(k, v)| {
@@ -8072,6 +8081,20 @@ mod tests {
         );
         assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
         assert!(!env.contains_key("NODE_EXTRA_CA_CERTS"));
+    }
+
+    #[test]
+    fn codex_see_through_env_respects_the_callers_ca() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("CODEX_CA_CERTIFICATE", "/tmp/corporate-ca.pem");
+        apply_codex_see_through_env(&mut cmd, 3999, Path::new("/tmp/tcr-ca.pem"), true);
+        assert_eq!(
+            cmd.get_envs().find_map(|(key, value)| {
+                (key == "CODEX_CA_CERTIFICATE").then_some(value.unwrap())
+            }),
+            Some(std::ffi::OsStr::new("/tmp/corporate-ca.pem")),
+            "an explicit caller CA must not be replaced"
+        );
     }
 
     /// The re-entry marker must reach the child, and must not be named such that
@@ -10502,19 +10525,12 @@ mod tests {
         assert_eq!(persisted_tls_files(dir.path()), before);
     }
 
-    /// The see-through notice names the CA's second variable once the config holds a Codex
-    /// account: the claude session carries `CODEX_CA_CERTIFICATE` too, for a codex it starts.
-    /// Without one the notice reads as it always did.
+    /// Claude's trust notice names only the setting its own connection needs.
     #[test]
-    fn the_claude_see_through_notice_names_both_cas_with_a_codex_account() {
+    fn the_claude_see_through_notice_names_only_its_ca() {
         let ca = Path::new("/Users/example/.config/tcr-ca.pem");
         assert_eq!(
-            see_through_ca_notice(ca, true),
-            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS and \
-             CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem"
-        );
-        assert_eq!(
-            see_through_ca_notice(ca, false),
+            see_through_ca_notice(ca),
             "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem"
         );
     }
