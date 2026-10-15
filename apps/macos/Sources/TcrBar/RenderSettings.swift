@@ -51,7 +51,9 @@ import TcrBarCore
 /// menu-bar item, polling `tcr`, or touching a server. The panes a fleet
 /// holding both Claude and Codex accounts draws differently (``mixedTabs``)
 /// are rendered once more over such a fleet, as `<tab>-mixed-<appearance>.png`,
-/// and so are the Peers sheets, as `<sheet>-mixed-<appearance>.png`.
+/// and so are the Peers sheets, as `<sheet>-mixed-<appearance>.png`. Groups &
+/// Rotation is rendered once more with its `tcr config show` read failed, as
+/// `groupsRotation-config-unavailable-<appearance>.png`.
 enum RenderSettings {
     static let flag = "--render-settings"
 
@@ -126,8 +128,7 @@ enum RenderSettings {
         for scene in SheetScene.allCases {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(.peers, appearance: appearance, sheet: scene, fleet: fleet, into: directory)
-                {
+                if render(.peers, appearance: appearance, sheet: scene, fleet: fleet, into: directory) {
                     written += 1
                 }
             }
@@ -161,9 +162,34 @@ enum RenderSettings {
             }
         }
 
+        // Groups & Rotation once more with the settings read failed, the way
+        // an older tcr with no `config` verb answers: every value `—`.
+        for appearance in Appearance.allCases {
+            attempted += 1
+            if render(
+                .groupsRotation, appearance: appearance, fleet: fleet,
+                config: .unavailable(reason: "error: unrecognized subcommand 'config'"),
+                nameSuffix: "-config-unavailable", into: directory)
+            {
+                written += 1
+            }
+        }
+
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
     }
+
+    /// What every capture's `tcr config show --json` reads: fake, round, and
+    /// off the shipped defaults in three places (the switch and Fable
+    /// thresholds, a 30-day ledger) so a render cannot be mistaken for one
+    /// that fell back to defaults.
+    static let fixtureConfigSettings = ConfigSettings(
+        configPath: "/Users/alice/.config/tcr.json", switchThreshold: 0.9,
+        controlReserve: 0.05, fableWeeklyThreshold: 1.0, resetUrgencyTierHours: 24,
+        sessionAffinity: true, controlAccount: "alice@example.com", controlPooled: false,
+        accountThrottle: ConfigThrottle(minSpacingMs: 350, burst: 24),
+        fleetThrottle: ConfigThrottle(minSpacingMs: 100, burst: 32), pacing: nil,
+        usageRetentionDays: 30, http1Only: false)
 
     /// Two groups — one parked, one not — so the Groups & Rotation pane shows
     /// both a real member count and a real parked toggle state, the same way
@@ -234,8 +260,7 @@ enum RenderSettings {
     /// The Advanced disclosure is closed in this scene (it is `@State` and no
     /// render run opens it), so nothing below the fold is lost by not growing:
     /// what the grown window used to reveal was the pane's own overflow.
-    private static func windowSize(for tab: SettingsTab, sheet: SheetScene?) -> NSSize {
-        // A SHEET capture is not the fit claim. The mockup measures scene 63's
+    private static func windowSize(for tab: SettingsTab, sheet: SheetScene?) -> NSSize {        // A SHEET capture is not the fit claim. The mockup measures scene 63's
         // card at 844.61 pt and says the window grows to hold it, which is
         // what a macOS sheet does; capturing it in the 540 pt pane window
         // would clip the bottom of the sheet and the PNG would be a picture of
@@ -320,11 +345,13 @@ enum RenderSettings {
         return found.max { $0.bounds.width < $1.bounds.width }
     }
 
-    /// `fleet` is what the pinned poller reads, and `nameSuffix` follows the
-    /// pane's name in the file's: `-mixed` for the mixed pass, empty otherwise.
+    /// `fleet` is what the pinned poller reads, `config` what the pinned
+    /// `tcr config show` reading holds, and `nameSuffix` follows the pane's
+    /// name in the file's: `-mixed` for the mixed pass, empty otherwise.
     @MainActor
     private static func render(
         _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil, fleet: Fleet,
+        config: ConfigSettingsCommand.Reading = .settings(fixtureConfigSettings),
         nameSuffix: String = "", into directory: URL
     ) -> Bool {
         // Two appearances, two mechanisms: `NSApp.appearance` is what the window
@@ -342,8 +369,8 @@ enum RenderSettings {
 
         return withDrawingAppearance(appearance.nsAppearance) {
             renderUnderCurrentAppearance(
-                tab, appearance: appearance, sheet: sheet, fleet: fleet, nameSuffix: nameSuffix,
-                into: directory)
+                tab, appearance: appearance, sheet: sheet, fleet: fleet, config: config,
+                nameSuffix: nameSuffix, into: directory)
         }
     }
 
@@ -357,7 +384,7 @@ enum RenderSettings {
     @MainActor
     private static func renderUnderCurrentAppearance(
         _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, fleet: Fleet,
-        nameSuffix: String, into directory: URL
+        config: ConfigSettingsCommand.Reading, nameSuffix: String, into directory: URL
     ) -> Bool {
         let dependencies = SettingsDependencies(
             poller: StatusPoller(pinnedState: .loaded(fleet), lastPollAt: Date()),
@@ -376,6 +403,8 @@ enum RenderSettings {
             groupController: GroupController(),
             updater: Updater(startingUpdater: false),
             claudeRoute: ClaudeRouteController(pinned: .status(ClaudeRouteStatus(route: .shell))),
+            // Pinned: a render never runs this Mac's tcr or reads its config.
+            configSettings: ConfigSettingsController(pinned: config),
             onWhatsNew: {},
             // A fixed answer, never this Mac's tcr: a command-line tcr that predates
             // Codex accounts. Read only over a fleet holding a Codex account.

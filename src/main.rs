@@ -74,6 +74,9 @@ enum Command {
     Control(ControlArgs),
     /// Manage account group membership (`ls` / `add` / `rm`).
     Group(GroupArgs),
+    /// Read the config file's rotation and limit settings (`show`), defaults
+    /// applied, without asking a running proxy.
+    Config(ConfigArgs),
     /// The LAN peer mesh: find your other Macs, trust one, share accounts with
     /// it, or reach the internet through it.
     Peer(peer_cli::PeerArgs),
@@ -1139,6 +1142,32 @@ struct ControlArgs {
     show: bool,
 }
 
+/// `tcr config show`. A group of its own so a later `set` has a home. TcrBar's
+/// Settings window runs `config show --json`, so that argv is a contract.
+#[derive(clap::Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    action: ConfigAction,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the effective rotation and limit settings: what a server started
+    /// on this file uses, every default applied. Offline; a running proxy
+    /// keeps the values it booted with until it restarts.
+    Show(ConfigShowArgs),
+}
+
+#[derive(clap::Args)]
+struct ConfigShowArgs {
+    /// Path to the config file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Emit one JSON object instead of the table.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(clap::Args)]
 struct GroupArgs {
     #[command(subcommand)]
@@ -1623,6 +1652,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Control(args)) => run_control(args).await,
         Some(Command::Group(args)) => run_group(args),
+        Some(Command::Config(args)) => run_config(args),
         Some(Command::Peer(args)) => run_peer(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Sessions(args)) => run_sessions(args).await,
@@ -5919,6 +5949,16 @@ mod peer_grant_tests {
             tcr_peer_wire::Window::FiveHour,
             "and the 5h one is untouched"
         );
+    }
+}
+
+/// `tcr config show [--json]`: the effective rotation and limit settings.
+fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
+    match args.action {
+        ConfigAction::Show(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::show_config(&config_path, a.json)
+        }
     }
 }
 

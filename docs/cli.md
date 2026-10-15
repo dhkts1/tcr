@@ -1941,6 +1941,40 @@ and nothing else would say why. They never change an exit code.
 
 ---
 
+## `tcr config show [--json]`
+
+Prints the rotation and limit settings a server started on this config file would use, with
+every default applied. It reads the file and never asks a running proxy, so after an edit it
+shows the value the next start uses; the running process keeps what it booted with.
+
+```
+$ tcr config show
+config                 /Users/example/.config/tcr.json
+switchThreshold        95%
+controlReserve         5%
+fableWeeklyThreshold   95%
+resetUrgencyTierHours  24 h
+sessionAffinity        on
+controlAccount         none
+controlPooled          off
+accountThrottle        1 per 350 ms, bursts of 24
+fleetThrottle          1 per 100 ms, bursts of 32
+pacing                 off
+usageRetentionDays     90 days
+http1Only              off
+```
+
+`--json` prints one object with the same settings as values: `configPath`, `switchThreshold`,
+`controlReserve` and `fableWeeklyThreshold` as fractions (`0.95`), `resetUrgencyTierHours`,
+`sessionAffinity`, `controlAccount` (the name, or `null`), `controlPooled`, `accountThrottle` and
+`fleetThrottle` (`{minSpacingMs, burst}`, or `null` when off), `pacing`
+(`{maxInFlightPerAccount, minSpacingMs}`, either `null`, or the whole key `null` when off),
+`usageRetentionDays` and `http1Only`. Each value is the one the server applies: `controlReserve`
+clamped to `[0, 0.5]`, `fableWeeklyThreshold` falling back to `switchThreshold`, a throttle with
+no spacing reported as off, an absent `burst` as `1`. TcrBar's Settings window reads this object.
+
+---
+
 ## `tcr sessions`
 
 `tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the last hour. This is the
