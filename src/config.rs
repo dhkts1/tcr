@@ -1256,7 +1256,10 @@ pub struct Config {
     /// files are deleted then. `0` keeps only today and yesterday (the two the
     /// boot replay reads), which is the floor — the ledger cannot keep less and
     /// still survive a restart, so `crate::usage::prune` refuses to delete
-    /// either of those two days whatever this says.
+    /// either of those two days whatever this says. A fleet holding a Codex
+    /// account replays the six days before those two as well, for its weekly
+    /// window, so there the floor is eight days and `0` keeps all eight
+    /// (`crate::usage::UsageTracker::attach_ledger`).
     #[serde(default = "default_usage_retention_days")]
     pub usage_retention_days: u32,
     #[serde(default)]

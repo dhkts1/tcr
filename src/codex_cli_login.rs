@@ -9,8 +9,9 @@
 //!
 //! # What `codex login` does under tcr
 //!
-//! Read in openai/codex's source at f82e365 and the installed codex-cli 0.162.1's `--help`
-//! (pr-facts-f82e365.md, the row on `codex login` under a pipe), not measured on a real sign-in:
+//! Read in openai/codex's source at f82e365, chiefly `codex-rs/cli/src/login.rs` and
+//! `codex-rs/login/src/server.rs`, and in the installed codex-cli 0.162.1's `--help`, not measured
+//! on a real sign-in:
 //!
 //! - It signs in without a TTY and never reads stdin, so the `--non-interactive` form runs it
 //!   with stdin closed and both streams piped. It waits for the browser with no timeout of its
@@ -63,9 +64,9 @@ use crate::oauth::{self, LoginEvent, LoginRefusal, LoginUi};
 /// Whether `codex login` opens the browser itself, which makes the `browser` event carry
 /// `opened: true` so the caller opens nothing.
 ///
-/// From the record of how `codex login` behaves under a pipe (pr-facts-f82e365.md; openai/codex
-/// f82e365 `login/src/server.rs`): codex calls `webbrowser::open` on the authorize URL before it
-/// prints the URL, ignores the result, and no flag or variable of `codex login` turns that off.
+/// Read in openai/codex at f82e365, `codex-rs/login/src/server.rs` and `codex-rs/cli/src/login.rs`:
+/// codex calls `webbrowser::open` on the authorize URL before it prints the URL, ignores the
+/// result, and no flag or variable of `codex login` turns that off.
 /// No output line can show whether a window actually opened: codex prints "If your browser did
 /// not open, navigate to this URL to authenticate:" either way, and the result it ignored is
 /// never printed. So this is a fact about codex, fixed at build time, not something read off a

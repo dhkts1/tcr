@@ -1599,8 +1599,8 @@ pub fn codex_tool_call_from_item(item: &Value) -> Option<CodexToolCall> {
 
 /// The script an argv runs: the last word of `<shell> -c <script>` or
 /// `<shell> -lc <script>` for `bash`, `sh` or `zsh` (by base name), which is how a shell
-/// call wraps one, and the argv joined by spaces otherwise. `None` for an empty argv or
-/// one that is not an array of strings.
+/// call wraps one, and the argv joined by spaces otherwise. A word that is not a string is
+/// skipped, and `None` is for an argv that is not an array or holds no string.
 fn shell_script(argv: &Value) -> Option<String> {
     let words: Vec<&str> = argv.as_array()?.iter().filter_map(Value::as_str).collect();
     match words.as_slice() {

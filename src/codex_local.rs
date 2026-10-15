@@ -5,12 +5,13 @@
 //! existence check, never a read, and that is deliberate for each one:
 //!
 //! - **The login** ([`codex_login_path`], [`codex_login_exists`]). Codex keeps its ChatGPT login at
-//!   `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`, by default (`openai/codex` f82e365,
-//!   `login/src/auth/storage.rs:47-73,162-163`; `utils/home-dir/src/lib.rs:5-18`, recorded in
-//!   pr-facts' on-disk login row). Its `keyring` and `auto` stores keep it in the system keyring
-//!   instead (the service `"Codex Auth"`, `storage.rs:243`), which tcr never opens. tcr only needs
-//!   to know whether codex could start signed in, and a `metadata` call answers that without
-//!   tcr ever holding a copy of someone else's token: a file tcr cannot read still counts.
+//!   `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`, by default (openai/codex at f82e365,
+//!   `codex-rs/login/src/auth/storage.rs:47-73,162-163` and
+//!   `codex-rs/utils/home-dir/src/lib.rs:5-18`). Its `keyring` and `auto` stores keep it in the
+//!   system keyring instead (the service `"Codex Auth"`, `storage.rs:243`), which tcr never
+//!   opens. tcr only needs to know whether codex could start signed in, and a `metadata` call
+//!   answers that without tcr ever holding a copy of someone else's token: a file tcr cannot
+//!   read still counts.
 //! - **The binary** ([`find_codex`]). One rule finds `codex` for `tcr login --codex`,
 //!   `tcr run --codex` and the doctor, so the three never disagree about which codex a person
 //!   has. A set `TCR_CODEX_BIN` or `CODEX_BIN` always decides and never falls through, so a
@@ -21,11 +22,12 @@
 //! # Why the search looks past `PATH`
 //!
 //! A TcrBar-launched child inherits launchd's `PATH`, `/usr/bin:/bin:/usr/sbin:/sbin`
-//! (`apps/macos/Sources/TcrBarCore/TcrTool.swift:35-36`), so `PATH` alone never reaches the
-//! `codex` a person installed, nor the CLI `tcr` that `scripts/install-cli.sh` puts in
-//! `~/.local/bin`. The search therefore adds TcrBar's own directories (`~/.local/bin`,
-//! `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin`) and, for `codex`, npm's global prefix
-//! (`NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global`; tcr never runs npm).
+//! (`apps/macos/Sources/TcrBarCore/TcrTool.swift:39-40`, the doc of
+//! `TcrTool.fallbackDirectories`), so `PATH` alone never reaches the `codex` a person installed,
+//! nor the CLI `tcr` that `scripts/install-cli.sh` puts in `~/.local/bin`. The search therefore
+//! adds TcrBar's own directories (`~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`,
+//! `/usr/local/bin`) and, for `codex`, npm's global prefix (`NPM_CONFIG_PREFIX`, else
+//! `npm_config_prefix`, else `~/.npm-global`; tcr never runs npm).
 //!
 //! # The two test seams
 //!

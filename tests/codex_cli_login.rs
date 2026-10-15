@@ -104,8 +104,8 @@ fn bob_auth() -> String {
     auth_json_for("bob@example.com", BOB_USER, BOB_WORKSPACE, "pro")
 }
 
-/// The lines of codex's own browser sign-in, as it prints them on stderr (pr-facts-f82e365.md,
-/// the row on `codex login` under a pipe).
+/// The lines of codex's own browser sign-in, as it prints them on stderr: the one `eprintln!` of
+/// the browser flow in openai/codex's login crate at f82e365 (`codex-rs/login/`).
 fn browser_lines() -> String {
     format!(
         "Starting local login server on http://localhost:1455.\nIf your browser did not open, \

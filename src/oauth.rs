@@ -2249,9 +2249,11 @@ pub async fn login_from_claude_code(
 }
 
 /// `tcr login --from-codex` — import the login this machine's `codex` CLI
-/// already holds, read by [`crate::codex_login::read_codex_login`]. The only
-/// Codex login there is: no browser flow, so a second account is logged in with
-/// `CODEX_HOME=<dir> codex login` and imported from that dir (`codex_home`).
+/// already holds, read by [`crate::codex_login::read_codex_login`]. One of the
+/// two Codex logins: `tcr login --codex` ([`crate::codex_cli_login::login`])
+/// signs in one of tcr's own instead. A second account imported this way is
+/// logged in with `CODEX_HOME=<dir> codex login` and imported from that dir
+/// (`codex_home`).
 ///
 /// This is the READ: which file ([`crate::codex_login::auth_path`], which
 /// refuses `TCR_CODEX_AUTH` and `--codex-home` together), and what is in it —

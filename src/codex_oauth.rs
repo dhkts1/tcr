@@ -315,9 +315,9 @@ mod tests {
     /// `{"https://api.openai.com/auth":{}}`: a token naming no user at all.
     const NO_USER_PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ";
 
-    /// The ChatGPT user is read where codex reads it (pr-facts, the access-token expiry row;
-    /// `openai/codex` f82e365, `login/src/token_data.rs:71-105,142-147,174-198`): the auth
-    /// namespace's `chatgpt_user_id`, else its `user_id`, else nothing.
+    /// The ChatGPT user is read where codex reads it (openai/codex at f82e365,
+    /// `codex-rs/login/src/token_data.rs:71-105,142-147,174-198`): the auth namespace's
+    /// `chatgpt_user_id`, else its `user_id`, else nothing.
     ///
     /// Watched red: without the claim, every case reads `None`.
     #[test]

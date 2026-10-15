@@ -228,7 +228,8 @@ pub fn host_allowed(host: &str) -> bool {
 /// Is `host` one [`handle_connect`] intercepts NOW, by policy? [`host_allowed`], plus one
 /// condition that belongs to `chatgpt.com` ([`crate::provider::CODEX_HOST`]) alone: it is
 /// intercepted only while the pool holds a Codex account (`codex_accounts`, which
-/// [`Manager::provider_account_count`] counts in any state). With none, a codex that reached tcr
+/// [`Manager::provider_account_count`] counts in any state, leaving out a Codex account deleted
+/// while the server runs). With none, a codex that reached tcr
 /// could only be answered `no_codex_account`; blind-tunneled, it runs on its own login, as it
 /// did before tcr pooled Codex, with no CA to trust and its WebSocket intact. Asked on every
 /// CONNECT, so an account imported into a running server takes effect on the next tunnel.
