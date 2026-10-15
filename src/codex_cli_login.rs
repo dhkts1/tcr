@@ -48,7 +48,8 @@
 //! codex started (an npm `codex` is a `node` launcher running the native binary), waits up to two
 //! seconds, kills whatever is left, deletes the folder and exits with 128 plus the signal's
 //! number. It signals through sysinfo, one pid at a time, because this crate forbids the unsafe
-//! code a `killpg` would need.
+//! code a `killpg` would need. Every target retains its PID and start time; each signal
+//! refreshes and verifies that identity, including the final SIGKILL after the grace wait.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::process::ExitStatusExt as _;
@@ -304,7 +305,14 @@ async fn run_codex_login(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch `{}`", codex.display()))?;
-    *session.codex_pid.lock().expect("pid lock poisoned") = Some(child.id());
+    let identity = process_identity(child.id()).filter(|identity| identity.start_time > 0);
+    if identity.is_none() {
+        tracing::warn!(
+            pid = child.id(),
+            "could not record codex login process identity; cancellation cannot signal an unverified PID"
+        );
+    }
+    *session.codex_process.lock().expect("process lock poisoned") = identity;
 
     let output = Arc::new(Output::default());
     let (done, drained) = std::sync::mpsc::channel::<()>();
@@ -421,12 +429,33 @@ fn spawn_reader(
     });
 }
 
-/// What the signal handler and the flow share: the folder, codex's pid, whether codex has been
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+impl ProcessIdentity {
+    fn of(process: &sysinfo::Process) -> Self {
+        Self {
+            pid: process.pid().as_u32(),
+            start_time: process.start_time(),
+        }
+    }
+}
+
+fn signal_target_is_current(expected: ProcessIdentity, current: ProcessIdentity) -> bool {
+    expected.pid == current.pid
+        && expected.start_time > 0
+        && expected.start_time == current.start_time
+}
+
+/// What the signal handler and the flow share: the folder, codex's identity, whether codex has been
 /// reaped, and whether tcr has stopped speaking.
 struct Session {
     folder: Mutex<Option<tempfile::TempDir>>,
     path: PathBuf,
-    codex_pid: Mutex<Option<u32>>,
+    codex_process: Mutex<Option<ProcessIdentity>>,
     reaped: AtomicBool,
     quiet: AtomicBool,
 }
@@ -436,7 +465,7 @@ impl Session {
         Self {
             path: folder.path().to_path_buf(),
             folder: Mutex::new(Some(folder)),
-            codex_pid: Mutex::new(None),
+            codex_process: Mutex::new(None),
             reaped: AtomicBool::new(false),
             quiet: AtomicBool::new(false),
         }
@@ -535,22 +564,18 @@ impl Caught {
 /// a live credential behind. It never returns.
 async fn stop_and_exit(session: &Session, caught: Caught) -> std::convert::Infallible {
     session.quiet.store(true, Ordering::SeqCst);
-    let pid = *session.codex_pid.lock().expect("pid lock poisoned");
+    let root = *session.codex_process.lock().expect("process lock poisoned");
     let reaped = || session.reaped.load(Ordering::SeqCst);
-    if let Some(pid) = pid.filter(|_| !reaped()) {
-        let family = family_of(pid);
+    if let Some(root) = root.filter(|_| !reaped()) {
+        let family = family_of(root);
         for &member in &family {
-            if member != pid || !reaped() {
+            if member.pid != root.pid || !reaped() {
                 signal(member, caught.as_sysinfo());
             }
         }
         wait_for(&reaped, STOP_GRACE).await;
         for &member in &family {
-            if member == pid {
-                if !reaped() {
-                    signal(member, sysinfo::Signal::Kill);
-                }
-            } else if is_alive(member) {
+            if member.pid != root.pid || !reaped() {
                 signal(member, sysinfo::Signal::Kill);
             }
         }
@@ -570,20 +595,27 @@ async fn wait_for(done: &dyn Fn() -> bool, limit: Duration) {
     }
 }
 
-/// `root` and every process descended from it, by each process's parent.
-fn family_of(root: u32) -> Vec<u32> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+/// Snapshot the owned root and its descendants, retaining each process's start time.
+fn family_of(root: ProcessIdentity) -> Vec<ProcessIdentity> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let mut system = System::new();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let Some(process) = system.process(Pid::from_u32(root.pid)) else {
+        return Vec::new();
+    };
+    if !signal_target_is_current(root, ProcessIdentity::of(process)) {
+        return Vec::new();
+    }
     let mut family = vec![root];
     let mut next = 0;
     while next < family.len() {
-        let parent = family[next];
-        for (pid, process) in system.processes() {
-            let pid = pid.as_u32();
-            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent) && !family.contains(&pid)
+        let parent = family[next].pid;
+        for process in system.processes().values() {
+            let identity = ProcessIdentity::of(process);
+            if process.parent().map(sysinfo::Pid::as_u32) == Some(parent)
+                && !family.iter().any(|member| member.pid == identity.pid)
             {
-                family.push(pid);
+                family.push(identity);
             }
         }
         next += 1;
@@ -591,23 +623,7 @@ fn family_of(root: u32) -> Vec<u32> {
     family
 }
 
-/// Whether `pid` is still running (a zombie counts as gone).
-fn is_alive(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    system
-        .process(Pid::from_u32(pid))
-        .is_some_and(|process| process.status() != ProcessStatus::Zombie)
-}
-
-/// Send `signal` to `pid` with [`sysinfo::Process::kill_with`], as `singleton::signal_pid` does:
-/// a pid that is already gone needs nothing, and a signal the platform cannot send is logged.
-fn signal(pid: u32, signal: sysinfo::Signal) {
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -615,12 +631,30 @@ fn signal(pid: u32, signal: sysinfo::Signal) {
         true,
         ProcessRefreshKind::nothing(),
     );
-    let Some(process) = system.process(Pid::from_u32(pid)) else {
+    system.process(Pid::from_u32(pid)).map(ProcessIdentity::of)
+}
+
+/// Refresh and verify the captured identity before every signal. A missing process or a zombie
+/// needs nothing, and a signal the platform cannot send is logged.
+fn signal(expected: ProcessIdentity, signal: sysinfo::Signal) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(expected.pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let Some(process) = system.process(Pid::from_u32(expected.pid)) else {
         return;
     };
+    if process.status() == ProcessStatus::Zombie
+        || !signal_target_is_current(expected, ProcessIdentity::of(process))
+    {
+        return;
+    }
     if process.kill_with(signal) != Some(true) {
         tracing::warn!(
-            pid,
+            pid = expected.pid,
             ?signal,
             "could not signal a process codex login started"
         );
@@ -630,6 +664,35 @@ fn signal(pid: u32, signal: sysinfo::Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_pid_is_not_a_codex_login_signal_target() {
+        let original = ProcessIdentity {
+            pid: 111,
+            start_time: 100,
+        };
+        let reused = ProcessIdentity {
+            pid: 111,
+            start_time: 101,
+        };
+        assert!(
+            !signal_target_is_current(original, reused),
+            "a process replacing a collected PID must receive neither the caught signal nor SIGKILL"
+        );
+        assert!(signal_target_is_current(original, original));
+        assert!(!signal_target_is_current(
+            original,
+            ProcessIdentity {
+                pid: 112,
+                start_time: 100
+            },
+        ));
+        let unknown = ProcessIdentity {
+            pid: 111,
+            start_time: 0,
+        };
+        assert!(!signal_target_is_current(unknown, unknown));
+    }
 
     /// The two lines a terminal sign-in prints, around codex's own output, with the plan left
     /// out when it is unknown.
