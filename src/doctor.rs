@@ -462,11 +462,7 @@ impl Report {
                 Some(served) => format!("this proxy has served {served} requests"),
                 None => format!("no proxy answered on 127.0.0.1:{}", self.proxy_port),
             };
-            return format!(
-                "verdict: claude typed in a terminal goes through tcr run (the tcr block in {}); apps that start claude themselves use {} ({source}); {served}",
-                file.display(),
-                self.base_url
-            );
+            return self.shell_verdict(file, &served);
         }
         if !self.routed_here {
             return format!(
@@ -541,23 +537,43 @@ impl Report {
             .collect()
     }
 
-    /// [`Self::verdict`], as it reads beside a Codex block: the served arm says the requests it
-    /// counts are Claude's (`requests10m` counts Claude sessions only), since a reader who
-    /// also sees `codexRequests10m` would otherwise take it for every request the proxy served.
-    /// The other two arms already name Claude's route and keep their words. [`Self::verdict`]
-    /// itself is untouched: a Claude-only fleet's doctor and `tcr status` print it as they
-    /// always did.
+    /// [`Self::verdict`], as it reads beside a Codex block: a served arm, the base URL's or the
+    /// shell route's, says the requests it counts are Claude's (`requests10m` counts Claude
+    /// sessions only), since a reader who also sees `codexRequests10m` would otherwise take it
+    /// for every request the proxy served. The arms with no count already name Claude's route
+    /// and keep their words. [`Self::verdict`] itself is untouched: a Claude-only fleet's doctor
+    /// and `tcr status` print it as they always did.
     pub fn verdict_beside_codex(&self) -> String {
-        match self.requests_in_window {
-            Some(served) if self.routed_here => format!(
-                "verdict: Claude is routed to {} ({}); this proxy has served {served} Claude \
-                 request{}",
+        let claude_requests = |served: u64| {
+            format!(
+                "this proxy has served {served} Claude request{}",
+                if served == 1 { "" } else { "s" }
+            )
+        };
+        match (self.requests_in_window, &self.shell_route) {
+            (Some(served), _) if self.routed_here => format!(
+                "verdict: Claude is routed to {} ({}); {}",
                 self.base_url,
                 self.base_url_source.label(),
-                if served == 1 { "" } else { "s" }
+                claude_requests(served)
             ),
+            (Some(served), Some(file)) if self.routed_by_shell() => {
+                self.shell_verdict(file, &claude_requests(served))
+            }
             _ => self.verdict(),
         }
+    }
+
+    /// The shell route's verdict, around `served`, the clause that says what this proxy served:
+    /// [`Self::verdict`] counts its requests plainly, and [`Self::verdict_beside_codex`] as
+    /// Claude's.
+    fn shell_verdict(&self, file: &Path, served: &str) -> String {
+        format!(
+            "verdict: claude typed in a terminal goes through tcr run (the tcr block in {}); apps that start claude themselves use {} ({}); {served}",
+            file.display(),
+            self.base_url,
+            self.base_url_source.label()
+        )
     }
 
     /// The same report as one JSON object, with the two derived fields the text
@@ -2471,6 +2487,52 @@ mod tests {
         );
         assert_eq!(shape(Some(codex_three.clone()), true, true), 3, "--codex");
         assert_eq!(shape(Some(codex_three), false, true), 3, "--codex");
+    }
+
+    /// The shell route's served verdict says its count is Claude's beside a Codex block, as
+    /// the base-URL arm does: `requests10m` counts Claude sessions alone, and a reader who also
+    /// sees `codexRequests10m` would take "3 requests" for every request the proxy served.
+    /// With no Codex block it keeps its own words, and with no proxy answering it names no
+    /// count to qualify.
+    #[test]
+    fn the_shell_routes_verdict_names_claude_requests_beside_codex() {
+        let shell = |served| {
+            let mut report = report_for(DEFAULT_BASE_URL, BaseUrlSource::Default, served);
+            report.shell_route = Some(PathBuf::from("/home/alice/.zshrc"));
+            report
+        };
+        let head = "verdict: claude typed in a terminal goes through tcr run (the tcr block in \
+                    /home/alice/.zshrc); apps that start claude themselves use \
+                    https://api.anthropic.com (the default); ";
+
+        let report = shell(Some(3));
+        assert_eq!(
+            report.verdict(),
+            format!("{head}this proxy has served 3 requests")
+        );
+        let beside = format!("{head}this proxy has served 3 Claude requests");
+        assert_eq!(report.verdict_beside_codex(), beside);
+        let mixed = Diagnosis {
+            claude: report,
+            codex: Some(codex_report(pooled())),
+            holds_anthropic: true,
+            codex_only: false,
+        };
+        assert_eq!(
+            mixed.render_text().lines().last(),
+            Some(beside.as_str()),
+            "{}",
+            mixed.render_text()
+        );
+        assert_eq!(mixed.to_json()["verdict"], beside.as_str());
+        assert_eq!(mixed.exit_code(), 0, "the shell route is Claude's route");
+
+        assert_eq!(
+            shell(Some(1)).verdict_beside_codex(),
+            format!("{head}this proxy has served 1 Claude request")
+        );
+        let silent = shell(None);
+        assert_eq!(silent.verdict_beside_codex(), silent.verdict());
     }
 
     /// A config's unknown keys ride the Claude half: after `requests10m:` and Claude's
