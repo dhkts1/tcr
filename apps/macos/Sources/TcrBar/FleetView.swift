@@ -51,6 +51,7 @@ struct FleetView: View {
     /// survives the panel closing, and observed so recording one redraws the
     /// lines. The render harness hands each scene its own.
     @ObservedObject var codexNotes: CodexNoteStore
+    @ObservedObject private var codexBannerSnapshot: CodexBannerSnapshot
     /// The tcr inside TcrBar when this Mac has no other, resolved by the shell
     /// beside ``codexPresence``: the Codex line and a saved Codex sign-in say how
     /// to start codex through the pool with it. The render harness passes
@@ -316,6 +317,7 @@ struct FleetView: View {
         // `nil` means a store of the panel's own, made below: a default argument
         // is evaluated off the main actor, where the store cannot be made.
         codexNotes: CodexNoteStore? = nil,
+        codexBannerSnapshot: CodexBannerSnapshot? = nil,
         bundledTcrWithoutCLI: String? = nil,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
@@ -398,6 +400,7 @@ struct FleetView: View {
         self.removeController = removeController
         self.routeController = routeController
         self._startServerAtLaunch = startServerAtLaunch
+        self.codexBannerSnapshot = codexBannerSnapshot ?? CodexBannerSnapshot()
         self.codexPresence = codexPresence
         self.codexNotes = codexNotes ?? CodexNoteStore()
         self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
@@ -449,6 +452,7 @@ struct FleetView: View {
         // `RenderStates.swift`'s sessions-tab fixtures.
         .onAppear {
             if !snapshotMode {
+                codexBannerSnapshot.observe(codexBannerCandidate)
                 refreshSessionFiles()
                 machine = MachineStats.read()
                 refreshClaudeCount()
@@ -457,8 +461,12 @@ struct FleetView: View {
             }
             syncPeersProvider()
         }
+        .onChange(of: codexBannerCandidate) { candidate in
+            if !snapshotMode { codexBannerSnapshot.observe(candidate) }
+        }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
+                codexBannerSnapshot.observe(codexBannerCandidate)
                 refreshSessionFiles()
                 machine = MachineStats.read()
                 refreshClaudeCount()
@@ -646,13 +654,23 @@ struct FleetView: View {
     /// this panel measured or the harness seeded. See ``CodexBanner``. Its
     /// commands are drawn as ``CommandProseText``: without their backticks,
     /// never broken inside a path or a flag, and copied from the line's menu.
-    @ViewBuilder
-    private func codexBanner(_ fleet: Fleet) -> some View {
-        if let banner = CodexBanner.current(
+    private var codexBannerCandidate: CodexBanner? {
+        guard let fleet = poller.state.loadedFleet else { return nil }
+        return currentCodexBanner(fleet)
+    }
+
+    private func currentCodexBanner(_ fleet: Fleet) -> CodexBanner? {
+        CodexBanner.current(
             fleet: fleet, codexProcesses: codexCount,
             codexQuietFor: codexZeroRequestsSince.map { Date().timeIntervalSince($0) },
             peerSharing: peerSharingSeed ?? peers.snapshot.sharing,
             bundledTcrWithoutCLI: snapshotMode ? bundledTcrSeed : bundledTcrWithoutCLI)
+    }
+
+    @ViewBuilder
+    private func codexBanner(_ fleet: Fleet) -> some View {
+        if let banner = snapshotMode && !codexBannerSnapshot.hasOpened
+            ? currentCodexBanner(fleet) : codexBannerSnapshot.shown
         {
             CommandProseText(text: banner.text, size: V4.muteSize)
                 .font(V4.font(V4.muteSize))
@@ -752,8 +770,8 @@ struct FleetView: View {
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
                 // The question about claude follows the Claude line, and the
-                // Codex line comes last: it can appear while the panel is open,
-                // and from below the question it moves none of its buttons.
+                // Codex line comes last. The shell freezes it for this opening,
+                // so polling cannot insert it or move the account list.
                 claudeRoutePrompt
                 codexBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4

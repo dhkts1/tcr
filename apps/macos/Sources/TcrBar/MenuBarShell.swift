@@ -69,6 +69,7 @@ final class MenuBarShell {
     /// as `groupController`: a note that reset every time the panel opened would
     /// be gone by the time anyone looked.
     let codexNotes: CodexNoteStore
+    let codexBannerSnapshot: CodexBannerSnapshot
     /// The claude route: the Accounts tab's one-time prompt and the Settings
     /// row. Owned here because the prompt's show-or-not is decided in
     /// ``openPanel()``, before the popover's first frame.
@@ -165,6 +166,7 @@ final class MenuBarShell {
         self.removeController = removeController ?? RemoveAccountController()
         self.codexPresence = CodexPresenceController()
         self.codexNotes = CodexNoteStore()
+        self.codexBannerSnapshot = CodexBannerSnapshot()
         self.claudeRoute = claudeRoute ?? ClaudeRouteController()
         // The controller's `init` is inert; nothing fetches until `AppDelegate`
         // calls `checkAfterLaunch()`, which the shell probe never does.
@@ -218,6 +220,7 @@ final class MenuBarShell {
                 preference: self.preference, updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
                 codexPresence: self.codexPresence, codexNotes: self.codexNotes,
+                codexBannerSnapshot: self.codexBannerSnapshot,
                 routeController: self.claudeRoute,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
@@ -784,6 +787,7 @@ final class MenuBarShell {
                 preference: preference, updater: updater,
                 groupController: groupController, removeController: removeController,
                 codexPresence: codexPresence, codexNotes: codexNotes,
+                codexBannerSnapshot: codexBannerSnapshot,
                 routeController: claudeRoute,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
@@ -833,6 +837,7 @@ final class MenuBarShell {
         var fleet: Fleet?
         if case .loaded(let loaded) = poller.state { fleet = loaded }
         claudeRoute.decideAtOpen(fleet: fleet)
+        codexBannerSnapshot.decideAtOpen()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
@@ -914,6 +919,7 @@ struct FleetPanel: View {
     @ObservedObject var removeController: RemoveAccountController
     @ObservedObject var codexPresence: CodexPresenceController
     @ObservedObject var codexNotes: CodexNoteStore
+    @ObservedObject var codexBannerSnapshot: CodexBannerSnapshot
     @ObservedObject var routeController: ClaudeRouteController
     var onWhatsNew: () -> Void = {}
     var onSettings: () -> Void = {}
@@ -944,6 +950,7 @@ struct FleetPanel: View {
             startServerAtLaunch: $preference.startServerAtLaunch,
             codexPresence: codexPresence.presence,
             codexNotes: codexNotes,
+            codexBannerSnapshot: codexBannerSnapshot,
             bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,
             onWhatsNew: onWhatsNew,
             onSettings: onSettings,

@@ -1050,7 +1050,10 @@ enum RenderStates {
         // also be drawn without it and the two compared
         // (``hoverCardKeepsPanelSize(without:with:named:)``).
         let panel = {
-            (hoverCard: String?, litAccount: String?, routeController: ClaudeRouteController) in
+            (
+                hoverCard: String?, litAccount: String?, routeController: ClaudeRouteController,
+                bannerSnapshot: CodexBannerSnapshot?
+            ) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -1081,6 +1084,7 @@ enum RenderStates {
                 codexPresence: seeds.presence,
                 // Empty, except in the two scenes that draw a note under a line.
                 codexNotes: CodexNoteStore(notes: codexNotesFixture(for: scene.name)),
+                codexBannerSnapshot: bannerSnapshot,
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
                 initialSessionFiles: sessionFilesFixture(for: scene.name),
@@ -1115,7 +1119,7 @@ enum RenderStates {
         }
         let hoverCard = hoverCardFixture(for: scene.name)
         let litAccount = litAccountFixture(for: scene.name)
-        let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name))
+        let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name), nil)
 
         // The main pass is `.auto`, the shipped default, so its files are
         // `<scene>-auto-<appearance>.png`; the forced `.comfortable` variant's
@@ -1129,19 +1133,66 @@ enum RenderStates {
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
         if hoverCard != nil || litAccount != nil,
             !hoverCardKeepsPanelSize(
-                without: panel(nil, nil, claudeRouteFixture(for: scene.name)), with: view,
+                without: panel(nil, nil, claudeRouteFixture(for: scene.name), nil), with: view,
                 named: name)
         {
             return false
         }
         if scene.name == "25b-claude-route-answered",
             !claudeRoutePromptKeepsPanelSize(
-                before: panel(nil, nil, claudeRouteFixture(for: "25-claude-route-prompt")),
+                before: panel(nil, nil, claudeRouteFixture(for: "25-claude-route-prompt"), nil),
                 after: view, named: name)
         {
             return false
         }
+        if scene.name == "26b-codex-refusals-banner" {
+            let snapshot = CodexBannerSnapshot()
+            guard
+                codexBannerKeepsPanelSize(
+                    snapshot: snapshot,
+                    panel: panel(nil, nil, claudeRouteFixture(for: scene.name), snapshot))
+            else { return false }
+        }
         return rasterise(view, named: name, into: directory)
+    }
+
+    /// Reuse one hosting view through polling and reopening, as the real popover does.
+    /// A new opening must change its height: the positive control rules out a host
+    /// that stopped observing the banner altogether.
+    @MainActor
+    private static func codexBannerKeepsPanelSize<Panel: View>(
+        snapshot: CodexBannerSnapshot, panel: Panel
+    ) -> Bool {
+        snapshot.observe(nil)
+        snapshot.decideAtOpen()
+        let host = NSHostingView(rootView: panel)
+        func size() -> NSSize {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize
+        }
+        let closed = size()
+        snapshot.observe(.notPooled(reason: String(repeating: "An example route is unavailable. ", count: 8)))
+        let polled = size()
+        guard closed == polled else {
+            FileHandle.standardError.write(
+                Data("Codex banner check: polling changed the open panel's size\n".utf8))
+            return false
+        }
+        snapshot.decideAtOpen()
+        let reopened = size()
+        guard reopened.height > closed.height else {
+            FileHandle.standardError.write(
+                Data("Codex banner check: reopening did not show the new banner\n".utf8))
+            return false
+        }
+        snapshot.observe(nil)
+        guard size() == reopened else {
+            FileHandle.standardError.write(Data("Codex banner check: polling removed the open banner\n".utf8))
+            return false
+        }
+        print("  Codex banner check: one persistent host stays fixed until reopened")
+        return true
     }
 
     /// One state of the sign-in sheet, rendered on its own.
@@ -2286,7 +2337,8 @@ enum RenderStates {
             let view =
                 peersPanel(
                     snapshot: trustSheetTab(holdsCodex: holdsCodex), dry: false,
-                    holdsCodex: holdsCodex, appearance: appearance)
+                    holdsCodex: holdsCodex, appearance: appearance
+                )
                 .overlay {
                     ZStack {
                         Color.black.opacity(sheetScrimAlpha)
@@ -4620,14 +4672,16 @@ extension RenderStates {
     /// traffic so no refusal banner draws. alice reports no Codex traffic at all.
     private static var codexReloginRefusedJSON: String {
         let now = Date()
-        return "[\(codexRow(.alice, now: now)),\(codexRow(.erin, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
+        return
+            "[\(codexRow(.alice, now: now)),\(codexRow(.erin, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
     }
 
     /// Scene `25f-codex-group-add-warning`: canonical alice and ivy, both in ORCHARD, ivy with
     /// quiet traffic.
     private static var codexGroupAddWarningJSON: String {
         let now = Date()
-        return "[\(codexRow(.alice, now: now)),\(codexRow(.ivy, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
+        return
+            "[\(codexRow(.alice, now: now)),\(codexRow(.ivy, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
     }
 
     /// One Codex row of scenes 25d and 25f, decoded as those scenes decode it, so a note is
