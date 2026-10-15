@@ -14,11 +14,6 @@ purposes only, as defined in the terms below.
 The full text of the PolyForm Noncommercial License 1.0.0 follows, reproduced
 verbatim from https://polyformproject.org/licenses/noncommercial/1.0.0.txt.
 
-Portions of this project are derived from the original teamclaude, which is
-licensed under the MIT License. Those portions remain under the MIT License,
-and its copyright and permission notice are retained in the final section of
-this file, as that license requires.
-
 ===============================================================================
 
 # PolyForm Noncommercial License 1.0.0
@@ -152,37 +147,3 @@ software under these terms.
 
 **Use** means anything you do with the software requiring one
 of your licenses.
-
-===============================================================================
-
-Retained notice for the original teamclaude (MIT License)
-=========================================================
-
-teamclaude-rs is a Rust rewrite of teamclaude
-(https://github.com/KarpelesLab/teamclaude), ported by reference. Portions of
-this project derived from that original work remain licensed under the MIT
-License. Its copyright and permission notice are retained below in full, as the
-MIT License requires, and the PolyForm terms above do not restrict any right
-the MIT License grants in that original work.
-
-MIT License
-
-Copyright (c) 2026 KarpelesLab (original teamclaude, https://github.com/KarpelesLab/teamclaude)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
