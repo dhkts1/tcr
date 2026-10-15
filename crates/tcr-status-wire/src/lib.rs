@@ -218,12 +218,31 @@ impl CodexRefusalKind {
 pub struct CodexTraffic {
     #[serde(rename = "refused10m")]
     pub refused_10m: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A newer server may report a refusal this client does not name yet. Skip that optional
+    /// label while retaining the counters, timestamp and the rest of the fleet's status.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_known_codex_refusal"
+    )]
     pub last_refusal: Option<CodexRefusalKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refusal_at_ms: Option<i64>,
     #[serde(rename = "unpooled10m")]
     pub unpooled_10m: u64,
+}
+
+fn deserialize_known_codex_refusal<'de, D>(
+    deserializer: D,
+) -> Result<Option<CodexRefusalKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let kind = Option::<String>::deserialize(deserializer)?;
+    Ok(kind.and_then(|kind| {
+        CodexRefusalKind::deserialize(serde::de::value::StringDeserializer::<D::Error>::new(kind))
+            .ok()
+    }))
 }
 
 /// One tool call still awaiting its `tool_result`, on the wire.
@@ -772,16 +791,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_traffic_rejects_an_unknown_refusal_kind() {
-        let result = serde_json::from_value::<CodexTraffic>(serde_json::json!({
+    fn codex_traffic_tolerates_an_unknown_refusal_kind() {
+        let traffic = serde_json::from_value::<CodexTraffic>(serde_json::json!({
             "refused10m": 1,
-            "lastRefusal": "misspelled_refusal",
+            "lastRefusal": "future_refusal",
+            "lastRefusalAtMs": 1_800_000_000_000_i64,
             "unpooled10m": 0,
-        }));
-        assert!(
-            result.is_err(),
-            "unknown refusal kinds must not enter the wire"
-        );
+        }))
+        .expect("a refusal added by a newer server must not break traffic decoding");
+        assert_eq!(traffic.last_refusal, None);
+        assert_eq!(traffic.refused_10m, 1);
+        assert_eq!(traffic.last_refusal_at_ms, Some(1_800_000_000_000));
     }
 
     #[test]

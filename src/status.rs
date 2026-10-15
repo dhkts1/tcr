@@ -2851,6 +2851,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_payload_keeps_the_fleet_when_the_refusal_kind_is_newer() {
+        let payload: StatusPayload = serde_json::from_value(serde_json::json!({
+            "kind": "tcr.status.v1",
+            "accounts": [],
+            "codex_traffic": {
+                "refused10m": 12,
+                "unpooled10m": 3,
+                "lastRefusal": "future_refusal",
+            },
+            "codex_upstream": "http://127.0.0.1:9",
+        }))
+        .expect("a newer refusal kind must not discard the serving process's whole status");
+        let traffic = payload.codex_traffic.unwrap();
+        assert_eq!(traffic.refused_10m, 12);
+        assert_eq!(traffic.unpooled_10m, 3);
+        assert_eq!(traffic.last_refusal, None);
+        assert_eq!(
+            payload.codex_upstream.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+    }
+
     /// An Anthropic account's row on this wire carries none of the Codex keys, its usage
     /// no weekly window and no reasoning tokens, and the payload neither fleet-wide Codex
     /// key; a payload with neither key reads both as `None`.
