@@ -331,38 +331,26 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     }
 
     /// The name column of a live line outside a group, ONE for the whole panel
-    /// (lead ruling on H1b, 2026-10-14). Measured over the live lines that are
-    /// drawn: a group closed to its summary line has none, and counting its
-    /// members would truncate the names on screen to make room for lines that
-    /// are not. In a fleet holding both providers it spans both lists, so the
-    /// bars under the CODEX head start where the ones under CLAUDE do.
+    /// (lead ruling on H1b, 2026-10-14). Measured over every row the tab can
+    /// draw as a line, whatever its band or form and whether or not its group
+    /// is collapsed, with the signal at its widest
+    /// (``AccountLineFit/signalColumn(_:)``). In a fleet holding both providers
+    /// it spans both lists, so the bars under the CODEX head start where the
+    /// ones under CLAUDE do. Measured over the lines drawn at the moment, as it
+    /// was until 2026-10-15, the column moved every bar whenever an account ran
+    /// out, a card opened, a group collapsed or a status changed length.
     ///
-    /// The signals of the same lines size the column at the right, and what a
-    /// short one leaves goes to the names (lead ruling, 2026-10-14).
-    ///
-    /// Every reported window sizes the meters' label column and bar, including
-    /// spent, collapsed and kept-open rows. Their visibility cannot move the bars.
-    /// A fleet that reports only `5h` and `7d` keeps the established widths.
+    /// The meters' label column and bar are sized by every reported window and,
+    /// whenever the fleet holds a Codex account, by a Codex window's widest
+    /// label (``AccountLineFit/panelLabels(_:)``). A fleet of Claude accounts
+    /// alone keeps `5h` and `7d` and the established widths.
     private var liveLineFit: LiveLineFit {
-        var loose: [String] = []
-        var grouped: [String]?
-        var signals: [String] = []
-        for section in lists.flatMap(\.sections) where !isSummarised(section) {
-            for row in section.rows where form(row) == .liveLine {
-                let name = AccountName.localPart(row.account.name)
-                if section.group == .ungrouped {
-                    loose.append(name)
-                } else {
-                    grouped = (grouped ?? []) + [name]
-                }
-                signals.append(row.account.liveSignal(now: now).text)
-            }
-        }
+        let names = AccountLineFit.lineNames(lists.flatMap(\.sections))
         let labels = AccountLineFit.panelLabels(fleet.accounts)
         let bar = V4.lineBarWidth(labels: labels)
         return LiveLineFit(
             nameColumn: AccountLineFit.nameColumn(
-                looseNames: loose, groupedNames: grouped, signals: signals, bar: bar,
+                looseNames: names.loose, groupedNames: names.grouped, bar: bar,
                 V4.lineRoom, V4.lineMetrics, labels: labels),
             labelWidth: AccountLineFit.labelColumn(V4.lineMetrics, labels: labels),
             barWidth: bar)

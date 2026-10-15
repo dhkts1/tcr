@@ -5,8 +5,9 @@ import XCTest
 
 /// The live line's widths (option H, lead rulings on H1b 2026-10-14): one bar
 /// width for the whole panel, every row labelled, every bar at the same x, in a
-/// group box or out of one; the signal column as wide as what it says, the
-/// slack to the names; and a name too long for its column cut in the middle.
+/// group box or out of one; the signal column as wide as the widest signal a
+/// line can draw, decided once (2026-10-15); and a name too long for its column
+/// cut in the middle.
 ///
 /// The tokens are option H's, as `V4` holds them, at the two densities' type
 /// sizes. The room is the panel's: 372 wide, 10 of side padding, 8 of line box
@@ -51,11 +52,9 @@ final class AccountLineFitTests: XCTestCase {
         for (density, m) in densities {
             let bar = AccountLineFit.barWidth(room, m)
             XCTAssertGreaterThan(bar, 0, density)
-            let signals = ["unmeasured", "in 3d 22h"]
-            let signal = AccountLineFit.signalColumn(signals, m)
+            let signal = AccountLineFit.signalColumn(m)
             let loose = AccountLineFit.nameColumn(
-                looseNames: [longName], groupedNames: [longName], signals: signals, bar: bar,
-                room, m)
+                looseNames: [longName], groupedNames: [longName], bar: bar, room, m)
             let grouped = loose - room.groupInset
             XCTAssertLessThanOrEqual(
                 AccountLineFit.lineWidth(name: grouped, bar: bar, signal: signal, m),
@@ -77,38 +76,60 @@ final class AccountLineFitTests: XCTestCase {
         }
     }
 
-    /// The signal column is the widest signal drawn, not a reserve.
-    func testTheSignalColumnIsTheWidestSignalDrawn() {
-        let m = densities[0].1
-        let widest = drawn("in 3d 22h", size: m.signalSize)
-        XCTAssertEqual(
-            AccountLineFit.signalColumn(["ready", "in 3d 22h"], m), widest.rounded(.up))
-    }
-
-    /// What a short signal leaves goes to the names: a panel that says only
-    /// "ready" gives a long name more room than one that says "in 3d 22h".
-    func testAShortSignalGivesItsRoomToTheNames() {
+    /// The signal column holds the longest status a live line can say, so no
+    /// status a poll brings can be wider than the column the names and bars
+    /// were placed against. Sized from what was drawn at the moment, a panel
+    /// saying only "ready" gave its names that room, and the first countdown
+    /// pushed every bar sideways (2026-10-15).
+    func testTheSignalColumnHoldsTheLongestStatusALineCanSay() {
+        let longest = [
+            "ready", "near limit", "unknown", "unmeasured", "re-login", "rejected",
+            "in 6d 23h", "in 23h 59m", "in 7d", "in 47m",
+        ]
         for (density, m) in densities {
-            let bar = AccountLineFit.barWidth(room, m)
-            let ready = AccountLineFit.nameColumn(
-                looseNames: [longName], groupedNames: [longName], signals: ["ready"],
-                bar: bar, room, m)
-            let long = AccountLineFit.nameColumn(
-                looseNames: [longName], groupedNames: [longName], signals: ["in 3d 22h"],
-                bar: bar, room, m)
-            XCTAssertGreaterThan(ready, long, density)
+            let column = AccountLineFit.signalColumn(m)
+            for text in longest {
+                XCTAssertLessThanOrEqual(
+                    drawn(text, size: m.signalSize), column, "\(density): \(text)")
+            }
         }
     }
 
-    /// A fleet of short names keeps option H's own column and bar.
-    func testShortNamesKeepOptionHsColumnAndBar() {
-        let m = densities[0].1
-        let bar = AccountLineFit.barWidth(room, m)
-        XCTAssertEqual(bar, 32)
+    /// The names the column is measured over do not change when an account runs
+    /// out of tokens or a group is collapsed or opened: the same accounts give
+    /// the same names, so the same column and the same bar x. Measured over the
+    /// lines drawn at the moment, the long name leaving the live band shrank
+    /// the column and every bar slid left (2026-10-15).
+    func testTheNamesMeasuredIgnoreBandsAndCollapse() {
+        let long = "\(longName)@example.com"
+        let big = (1...4).map { lineAccount("big-\($0)@example.com", groups: ["big"]) }
+        let calm = Fleet(accounts: [lineAccount("bob@example.com"), lineAccount(long)] + big)
+        let busy = Fleet(
+            accounts: [lineAccount("bob@example.com"), lineAccount(long, quotaState: .spent)]
+                + big)
+        func names(_ fleet: Fleet, open: Set<String> = []) -> AccountLineFit.LineNames {
+            AccountLineFit.lineNames(fleet.accountsTabSections(expandedGroups: open))
+        }
+        XCTAssertEqual(names(calm).loose, ["bob", longName])
+        XCTAssertEqual(names(calm), names(busy), "an account running out moved the column")
         XCTAssertEqual(
-            AccountLineFit.nameColumn(
-                looseNames: ["bob"], groupedNames: ["carol"], signals: ["ready"], bar: bar,
-                room, m), 54)
+            names(calm), names(calm, open: ["g:big"]), "opening a group moved the column")
+        XCTAssertEqual(names(calm).grouped, (1...4).map { "big-\($0)" })
+    }
+
+    /// A fleet of short names keeps option H's own name column at either
+    /// density, with the signal column at its widest: the bars, not the names,
+    /// give up what the widest status needs past option H's 56.
+    func testShortNamesKeepOptionHsColumn() {
+        for (density, m) in densities {
+            let bar = AccountLineFit.barWidth(room, m)
+            XCTAssertGreaterThan(bar, 0, density)
+            XCTAssertLessThanOrEqual(bar, 32, density)
+            XCTAssertEqual(
+                AccountLineFit.nameColumn(
+                    looseNames: ["bob"], groupedNames: ["carol"], bar: bar, room, m), 54,
+                density)
+        }
     }
 
     // MARK: - Cutting a name
@@ -168,12 +189,49 @@ final class AccountLineFitTests: XCTestCase {
                 AccountLineFit.meterWidth(bar: bar, m), density)
             XCTAssertEqual(
                 AccountLineFit.nameColumn(
-                    looseNames: [longName], groupedNames: [longName], signals: ["ready"],
-                    bar: bar, room, m, labels: labels),
+                    looseNames: [longName], groupedNames: [longName], bar: bar, room, m,
+                    labels: labels),
                 AccountLineFit.nameColumn(
-                    looseNames: [longName], groupedNames: [longName], signals: ["ready"],
-                    bar: bar, room, m),
+                    looseNames: [longName], groupedNames: [longName], bar: bar, room, m),
                 density)
         }
     }
+}
+
+/// A measured account in the live band unless `quotaState` says otherwise.
+private func lineAccount(
+    _ name: String, quotaState: QuotaState = .ok, groups: [String]? = nil
+) -> Account {
+    Account(
+        name: name,
+        priority: 1,
+        status: "active",
+        disabled: false,
+        quota: 0.5,
+        quotaState: quotaState,
+        fiveHour: quotaState == .spent ? 1.0 : 0.1,
+        sevenDay: 0.3,
+        sevenDayOi: nil,
+        fiveHourState: nil,
+        sevenDayState: nil,
+        fiveHourResetAtMs: nil,
+        sevenDayResetAtMs: nil,
+        held: [],
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheHitRatio: nil,
+        probeStatus: .ok,
+        probeError: nil,
+        lastStreamError: nil,
+        streamErrorCount: 0,
+        source: .live,
+        serverSha: "abc1234",
+        serverDirty: false,
+        groups: groups,
+        reservedGroups: nil,
+        parkedGroups: nil,
+        groupColors: nil
+    )
 }

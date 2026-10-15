@@ -13,9 +13,12 @@ import AppKit
 /// left is the panel-wide density, which changes the type sizes every line is
 /// measured at.
 ///
-/// The signal at the right is sized to the widest signal the panel actually
-/// draws, not to a reserve, and what that frees goes to the names (lead ruling,
-/// 2026-10-14). A name that still does not fit is cut in the MIDDLE
+/// The signal at the right is sized once, to the widest signal a line can draw
+/// (``signalColumn(_:)``), and the name column to every account the tab can draw
+/// as a line, so nothing on a line moves when a status changes length, an
+/// account changes band, a card opens or a group collapses (2026-10-15). The
+/// 2026-10-14 ruling sized both to what was drawn at the moment, and every bar
+/// slid sideways on a poll. A name that still does not fit is cut in the MIDDLE
 /// (``fitName(_:width:_:)``), so `henry9` and `henry10` stay two names.
 ///
 /// Pure and in the library for the reason ``NameRowFit`` is: the test target
@@ -92,9 +95,17 @@ public enum AccountLineFit {
 
     /// The two meters' labels, measured whole.
     public static let labels = ["5h", "7d"]
-    /// The labels reserved by the panel's shared meter columns.
+    /// The labels reserved by the panel's shared meter columns: every window an
+    /// account has reported and, whenever the fleet holds a Codex account, the
+    /// widest label a Codex window can draw (``codexWidestLabel``), reported or
+    /// not. A Codex account's first probe can answer with a `30d` window while
+    /// the panel is open, and reserved only once reported, the label column
+    /// widened and every bar moved (2026-10-15).
     public static func panelLabels(_ accounts: [Account]) -> [String] {
         var result = labels
+        if accounts.contains(where: { $0.provider == .codex }) {
+            result.append(codexWidestLabel)
+        }
         for account in accounts {
             for label in account.lineSlotLabels.compactMap({ $0 }) where !result.contains(label) {
                 result.append(label)
@@ -102,6 +113,11 @@ public enum AccountLineFit {
         }
         return result
     }
+
+    /// A Codex window labelled by its length in whole days
+    /// (``QuotaFormat/windowLabel(minutes:)``), at two digits. Labels draw in
+    /// tabular digits, so this is exactly as wide as `30d` or any other one.
+    public static let codexWidestLabel = "00d"
 
     /// The widest a percent draws: a full window.
     public static let widestPercent = "100%"
@@ -158,23 +174,33 @@ public enum AccountLineFit {
             + meterWidth(bar: bar, m, labels: labels) + m.gap + signal
     }
 
-    /// The signal column: the widest of `signals` as drawn.
-    public static func signalColumn(_ signals: [String], _ m: Metrics) -> CGFloat {
-        let widest = signals.map { textWidth($0, size: m.signalSize, weight: .regular) }.max()
+    /// The signal column: the widest text a live line's signal can draw
+    /// (``Account/liveSignalWorstCases``), decided once and never from what the
+    /// lines say right now. Digits are tabular here, so the `0`s in a countdown
+    /// template measure as any digit would.
+    public static func signalColumn(_ m: Metrics) -> CGFloat {
+        let widest = Account.liveSignalWorstCases
+            .map { textWidth($0, size: m.signalSize, weight: .regular) }.max()
         return (widest ?? 0).rounded(.up)
     }
 
     /// The one bar width for every line in the panel: option H's bar, or less
     /// when a grouped line at the narrowest name column (option H's, less the
-    /// group's inset) and option H's signal room would not fit both meters at
+    /// group's inset) and the signal column would not fit both meters at
     /// "100%". A whole point, so every bar draws on the same pixels.
+    ///
+    /// The signal is the wider of option H's room and the widest a live line
+    /// can say (``signalColumn(_:)``): `unmeasured` and `in 6d 23h` are a few
+    /// points over option H's 56, and the bars give those points up so that a
+    /// short name keeps option H's column at every status.
     public static func barWidth(
         _ room: Room, _ m: Metrics, labels: [String] = AccountLineFit.labels
     ) -> CGFloat {
         let name = max(0, m.nameMinWidth - room.groupInset)
+        let signal = max(m.signalWidth, signalColumn(m))
         let spare =
             room.groupedWidth
-            - lineWidth(name: name, bar: 0, signal: m.signalWidth, m, labels: labels)
+            - lineWidth(name: name, bar: 0, signal: signal, m, labels: labels)
         return max(0, min(m.barMaxWidth, (spare / 2).rounded(.down)))
     }
 
@@ -183,22 +209,20 @@ public enum AccountLineFit {
     /// above and below it.
     ///
     /// - Parameters:
-    ///   - looseNames: the names drawn on live lines outside a group.
-    ///   - groupedNames: the names drawn on live lines inside a group, `nil`
-    ///     when no live line is in one.
-    ///   - signals: every live line's signal as drawn, which sizes the column
-    ///     at the right (``signalColumn(_:_:)``).
+    ///   - looseNames: the names of every account outside a group.
+    ///   - groupedNames: the names of every account inside a group, `nil` when
+    ///     no account is in one.
     ///
     /// Option H's column at the least, grown to the widest name, and never past
-    /// the room the rest of the line leaves: inside a group when any live line
-    /// is in one, since that is the narrower box. Past that the name is cut
+    /// the room the rest of the line leaves with the signal at its widest
+    /// (``signalColumn(_:)``): inside a group when any account is in one, since
+    /// that is the narrower box. Past that the name is cut
     /// (``fitName(_:width:_:)``) and the labels stay.
     public static func nameColumn(
-        looseNames: [String], groupedNames: [String]?, signals: [String], bar: CGFloat,
+        looseNames: [String], groupedNames: [String]?, bar: CGFloat,
         _ room: Room, _ m: Metrics, labels: [String] = AccountLineFit.labels
     ) -> CGFloat {
-        let rest = lineWidth(
-            name: 0, bar: bar, signal: signalColumn(signals, m), m, labels: labels)
+        let rest = lineWidth(name: 0, bar: bar, signal: signalColumn(m), m, labels: labels)
         var widest = widestName(looseNames, m)
         var most = room.looseWidth - rest
         if let groupedNames {
@@ -206,6 +230,33 @@ public enum AccountLineFit {
             most = min(most, room.groupedWidth - rest + room.groupInset)
         }
         return max(0, min(max(widest.rounded(.up), m.nameMinWidth), most.rounded(.down)))
+    }
+
+    /// The names ``nameColumn(looseNames:groupedNames:bar:_:_:)`` measures: every
+    /// account the tab's sections hold, outside a group and inside one, sorted,
+    /// whatever its band or form and whether or not its group is collapsed.
+    /// None of those is an input, because each changes on a poll or a click and
+    /// would move every bar with it.
+    public struct LineNames: Equatable, Sendable {
+        public let loose: [String]
+        /// `nil` when no account is in a group.
+        public let grouped: [String]?
+    }
+
+    public static func lineNames(_ sections: [FleetSection]) -> LineNames {
+        var loose: [String] = []
+        var grouped: [String]?
+        for section in sections {
+            for row in section.rows {
+                let name = AccountName.localPart(row.account.name)
+                if section.group == .ungrouped {
+                    loose.append(name)
+                } else {
+                    grouped = (grouped ?? []) + [name]
+                }
+            }
+        }
+        return LineNames(loose: loose.sorted(), grouped: grouped?.sorted())
     }
 
     private static func widestName(_ names: [String], _ m: Metrics) -> CGFloat {
