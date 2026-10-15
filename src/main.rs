@@ -167,7 +167,7 @@ struct SetupSettingsArgs {
     /// Replace an ANTHROPIC_BASE_URL that points somewhere else.
     #[arg(long, conflicts_with = "remove")]
     force: bool,
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -180,7 +180,7 @@ struct SetupStatusArgs {
     /// The shell to check: zsh, bash or fish (default: $SHELL).
     #[arg(long, value_parser = parse_shell)]
     shell: Option<teamclaude_rs::setup::Shell>,
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -331,8 +331,7 @@ mod peer_cli {
         /// stores, and to say so when no pinned Mac answers to it.
         #[arg(long)]
         pub peers: Option<PathBuf>,
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory). This is the file the pin is written to.
+        /// Path to the main config. This is the file the pin is written to.
         #[arg(long)]
         pub config: Option<PathBuf>,
         /// Which account to change, by the same query every other account verb
@@ -413,8 +412,7 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerStatusArgs {
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory), read for the port and api-key this asks on.
+        /// Path to the main config, read for the port and api-key this asks on.
         #[arg(long)]
         pub config: Option<PathBuf>,
         /// Emit the peers block as JSON instead of greppable text.
@@ -692,7 +690,7 @@ mod peer_cli {
         /// neighbours; the panel decodes both.
         #[arg(long)]
         pub json: bool,
-        /// Path to the main config (default: ~/.config/teamclaude.json), read
+        /// Path to the main config, read
         /// for the ACCOUNT LABELS the `lentTo` block is keyed by. Nothing else
         /// is taken from it, and a config that is missing or unreadable leaves
         /// `lentTo` empty rather than failing the listing: the peers half of
@@ -808,8 +806,7 @@ mod peer_cli {
         /// disclosure decision than the one the operator took.
         #[arg(long, value_enum)]
         pub mode: Option<PeerLendMode>,
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory). Read only by `--mode hand`, to refuse a grant every
+        /// Path to the main config. Read only by `--mode hand`, to refuse a grant every
         /// account in its scope is strictly pinned away from.
         #[arg(long)]
         pub config: Option<PathBuf>,
@@ -1039,7 +1036,7 @@ mod peer_cli {
 
 #[derive(clap::Args)]
 struct AccountsArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Refresh each account's live quota before listing (network probe).
@@ -1049,7 +1046,7 @@ struct AccountsArgs {
 
 #[derive(clap::Args)]
 struct RemoveArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1059,7 +1056,7 @@ struct RemoveArgs {
 
 #[derive(clap::Args)]
 struct TokenArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1069,7 +1066,7 @@ struct TokenArgs {
 
 #[derive(clap::Args)]
 struct PriorityArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1088,7 +1085,7 @@ struct PriorityArgs {
 
 #[derive(clap::Args)]
 struct EnableArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1098,7 +1095,7 @@ struct EnableArgs {
 
 #[derive(clap::Args)]
 struct DisableArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1108,7 +1105,7 @@ struct DisableArgs {
 
 #[derive(clap::Args)]
 struct ControlArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Omit with
@@ -1166,7 +1163,7 @@ enum GroupAction {
 
 #[derive(clap::Args)]
 struct GroupLsArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit a machine-readable JSON equivalent instead of greppable text.
@@ -1176,7 +1173,7 @@ struct GroupLsArgs {
 
 #[derive(clap::Args)]
 struct GroupAddArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to add.
@@ -1187,7 +1184,7 @@ struct GroupAddArgs {
 
 #[derive(clap::Args)]
 struct GroupRmArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to remove.
@@ -1206,7 +1203,7 @@ struct GroupRmArgs {
 
 #[derive(clap::Args)]
 struct GroupReserveArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to reserve.
@@ -1215,7 +1212,7 @@ struct GroupReserveArgs {
 
 #[derive(clap::Args)]
 struct GroupUnreserveArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to unreserve.
@@ -1224,7 +1221,7 @@ struct GroupUnreserveArgs {
 
 #[derive(clap::Args)]
 struct GroupParkArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to park.
@@ -1233,7 +1230,7 @@ struct GroupParkArgs {
 
 #[derive(clap::Args)]
 struct GroupUnparkArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to unpark.
@@ -1242,7 +1239,7 @@ struct GroupUnparkArgs {
 
 #[derive(clap::Args)]
 struct GroupAllowControlArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to opt in.
@@ -1251,7 +1248,7 @@ struct GroupAllowControlArgs {
 
 #[derive(clap::Args)]
 struct GroupDisallowControlArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to opt out.
@@ -1260,7 +1257,7 @@ struct GroupDisallowControlArgs {
 
 #[derive(clap::Args)]
 struct GroupColorArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to color.
@@ -1278,7 +1275,7 @@ struct GroupColorArgs {
 
 #[derive(clap::Args)]
 struct StatusArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit the fleet status as a JSON array instead of greppable text.
@@ -1313,7 +1310,7 @@ struct DoctorArgs {
 /// only output there is.
 #[derive(clap::Args)]
 struct ListArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit claude-swap's list schema v1 (required: there is no text form).
@@ -1323,7 +1320,7 @@ struct ListArgs {
 
 #[derive(clap::Args)]
 struct SessionsArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit `{"supported": bool, "sessions": [...]}` instead of greppable text.
@@ -1333,8 +1330,8 @@ struct SessionsArgs {
 
 #[derive(clap::Args)]
 struct WrapArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json) —
-    /// consulted only for pricing overrides, never for accounts.
+    /// Path to the config file, consulted only for pricing overrides, never
+    /// for accounts.
     #[arg(long)]
     config: Option<PathBuf>,
     /// How many days back to report, ending today (UTC).
@@ -1354,7 +1351,7 @@ struct UpdateArgs {
 
 #[derive(clap::Args)]
 struct LoginArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Skip the refusal a running proxy would otherwise trigger, and write the
@@ -1423,7 +1420,7 @@ struct LoginArgs {
 
 #[derive(clap::Args)]
 struct MintArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Mint a long-lived token for one existing account — exact name, not a
@@ -1438,7 +1435,7 @@ struct MintArgs {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Serve this session from accounts labelled with this group. Strict by
@@ -1459,7 +1456,7 @@ struct ServerArgs {
     /// Port to bind (overrides `proxy.port` from the config).
     #[arg(long)]
     port: Option<u16>,
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Run without the TUI, logging to stdout.
@@ -1509,9 +1506,51 @@ fn effective_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     out
 }
 
+/// The CLI with every `--config` flag's help ending in the one sentence that
+/// says what the default is ([`teamclaude_rs::paths::config_flag_default_help`]).
+///
+/// Thirty-odd verbs take `--config`, each with its own description of what it
+/// reads the file for. The default used to be hand-copied into every one of
+/// them; appending it here keeps it in one place, so the default cannot be
+/// right on one verb and stale on the next.
+fn cli_command() -> clap::Command {
+    fn with_default(cmd: clap::Command, sentence: &str) -> clap::Command {
+        cmd.mut_args(|arg| {
+            if arg.get_long() != Some("config") {
+                return arg;
+            }
+            let join = |help: &clap::builder::StyledStr| {
+                let help = help.to_string();
+                let help = help.trim_end().trim_end_matches('.');
+                format!("{help}. {sentence}.")
+            };
+            let help = arg.get_help().map_or_else(|| format!("{sentence}."), join);
+            match arg.get_long_help().map(join) {
+                Some(long_help) => arg.help(help).long_help(long_help),
+                None => arg.help(help),
+            }
+        })
+        .mut_subcommands(|sub| with_default(sub, sentence))
+    }
+    with_default(
+        <Cli as clap::CommandFactory>::command(),
+        &teamclaude_rs::paths::config_flag_default_help(),
+    )
+}
+
+/// `Cli::parse_from`, over [`cli_command`] rather than the bare derived command.
+fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
+    let mut cmd = cli_command();
+    let mut matches = cmd
+        .try_get_matches_from_mut(argv)
+        .unwrap_or_else(|err| err.exit());
+    <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+        .unwrap_or_else(|err| err.format(&mut cmd).exit())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse_from(effective_argv(std::env::args_os().collect()));
+    let cli = parse_cli(effective_argv(std::env::args_os().collect()));
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_claude(args),
@@ -5463,7 +5502,7 @@ mod peer_grant_tests {
     /// peers fixtures give: a field added to `Config` later must not turn this
     /// into a compile error.
     fn config_with_account(dir: &Path, egress: &str) -> PathBuf {
-        let path = dir.join("teamclaude.json");
+        let path = dir.join(teamclaude_rs::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             format!(
@@ -7021,42 +7060,33 @@ fn default_config() -> Config {
     serde_json::from_str("{}").expect("an empty JSON object is always a valid default config")
 }
 
-/// Base cache directory: `$XDG_CACHE_HOME/teamclaude`, else `$HOME/.cache/teamclaude`.
-///
-/// Deliberately independent of [`affinity::default_path`] (same env-var
-/// resolution order, duplicated rather than shared) so that a bug or a test
-/// touching the log path can never brush the live session-affinity pin file's
-/// neighbourhood by construction — the two are computed by different code, not
-/// just used at different leaf paths under a shared helper.
-fn cache_base_dir() -> std::path::PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("teamclaude")
-}
-
 /// The one shared, well-known, non-private directory both modes log into:
-/// `~/.cache/teamclaude/logs/` (or `$XDG_CACHE_HOME/teamclaude/logs/`).
+/// `logs/` in the cache directory, `~/.cache/tcr/logs/` on a fresh install and
+/// `~/.cache/teamclaude/logs/` on one that has only the old directory
+/// (`teamclaude_rs::paths::cache_dir`), with the log file prefix that goes
+/// with that directory.
 ///
 /// The path is fixed for **human discoverability** — so `rg 'server started'
-/// ~/.cache/teamclaude/logs/*` always finds the right directory — not because
-/// any code depends on the literal string. Nothing in this codebase opens this
-/// path programmatically outside this module; see `open_log_appender` below and
-/// the doc-comment on `the_log_directory_is_the_shared_cache_location` for the
+/// ~/.cache/tcr/logs/*` always finds the right directory — not because any code
+/// depends on the literal string. Nothing in this codebase opens this path
+/// programmatically outside this module; see `open_log_appender` below and the
+/// doc-comment on `the_log_directory_is_the_shared_cache_location` for the
 /// census that established that.
-fn log_dir_path() -> std::path::PathBuf {
-    cache_base_dir().join("logs")
+///
+/// This used to compute the cache base separately from
+/// `affinity::default_path`, so a log-path bug could not brush the pin file.
+/// It now shares `paths::cache_dir` with it on purpose: two resolutions of
+/// "old directory or new" could disagree, and an install would split its cache
+/// across two folders.
+fn log_location() -> (std::path::PathBuf, &'static str) {
+    let cache = teamclaude_rs::paths::cache_dir();
+    (cache.log_dir(), cache.log_prefix())
 }
 
 /// Open the durable, rotating log directory, injectable for tests so they never
-/// touch the real `~/.cache/teamclaude/logs/` — pass a unique temp dir instead
-/// of routing through [`log_dir_path`].
+/// touch the real cache directory's `logs/` — pass a unique temp dir instead
+/// of routing through [`log_location`]. `prefix` is the file name prefix
+/// rotation and pruning key on, and has to match the directory's own.
 ///
 /// `tracing_appender::rolling` has no per-file `.mode()` hook (checked against
 /// its 0.2.5 source: `create_writer` in its `rolling.rs` opens with
@@ -7116,6 +7146,7 @@ fn log_dir_path() -> std::path::PathBuf {
 /// means the daily boundary lands at 03:00 in Asia/Jerusalem, not midnight.
 fn open_log_appender(
     log_dir: &std::path::Path,
+    prefix: &str,
 ) -> std::io::Result<tracing_appender::rolling::RollingFileAppender> {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -7144,7 +7175,7 @@ fn open_log_appender(
 
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("teamclaude-rs.log")
+        .filename_prefix(prefix)
         .max_log_files(5)
         .build(log_dir)
         .map_err(std::io::Error::other)
@@ -7212,8 +7243,8 @@ fn init_tracing(headless: bool) {
     use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let log_dir = log_dir_path();
-    let file = match open_log_appender(&log_dir) {
+    let (log_dir, log_prefix) = log_location();
+    let file = match open_log_appender(&log_dir, log_prefix) {
         Ok(file) => Some(file),
         Err(err) => {
             eprintln!(
@@ -7548,6 +7579,60 @@ mod tests {
         );
     }
 
+    /// Every `--config` flag, on every verb, says the default once and the same
+    /// way: the new file, and that an existing old one is still used.
+    #[test]
+    fn every_config_flag_states_both_default_files() {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, String)>) {
+            for arg in cmd.get_arguments() {
+                if arg.get_long() == Some("config") {
+                    out.push((
+                        path.to_string(),
+                        arg.get_help().map(ToString::to_string).unwrap_or_default(),
+                        arg.get_long_help()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut flags = Vec::new();
+        walk(&cli_command(), "tcr", &mut flags);
+        // 31 doc comments carried the default before; a few verbs share one
+        // args struct, so the walk sees at least that many flags.
+        assert!(
+            flags.len() >= 31,
+            "found only {} --config flags",
+            flags.len()
+        );
+        let sentence = teamclaude_rs::paths::config_flag_default_help();
+        for (verb, help, long_help) in &flags {
+            assert!(
+                help.ends_with(&format!("{sentence}.")),
+                "`{verb} --config` help must end with the default: {help:?}"
+            );
+            assert_eq!(help.matches("Default:").count(), 1, "`{verb}`: {help:?}");
+            assert!(
+                long_help.is_empty() || long_help.ends_with(&format!("{sentence}.")),
+                "`{verb} --config` long help must end with the default: {long_help:?}"
+            );
+        }
+        // And what a user sees on screen.
+        let rendered = cli_command()
+            .find_subcommand_mut("accounts")
+            .expect("an accounts verb")
+            .render_help()
+            .to_string();
+        assert!(
+            rendered.contains(&format!("~/.config/{}", teamclaude_rs::paths::CONFIG_FILE))
+                && rendered.contains(teamclaude_rs::legacy_names::CONFIG_FILE),
+            "{rendered}"
+        );
+    }
+
     /// `--no-replace` is documented as a deprecated no-op, and used to be wired as
     /// a SILENT VETO over `--replace`: an operator whose launchd plist or alias
     /// already carried it, adding `--replace` to force a rebuilt binary onto the
@@ -7683,7 +7768,8 @@ mod tests {
         // Goes through the production opener: re-implementing the mode here
         // would assert 0o700 == 0o700 and pass however `open_log_appender`
         // drifts.
-        let _appender = open_log_appender(&dir).expect("open temp log dir");
+        let _appender =
+            open_log_appender(&dir, teamclaude_rs::paths::LOG_PREFIX).expect("open temp log dir");
         let dir_mode = std::fs::metadata(&dir)
             .expect("stat temp log dir")
             .permissions()
@@ -7718,7 +7804,8 @@ mod tests {
             "test setup sanity: the pre-created dir must actually be 0755"
         );
 
-        let _appender = open_log_appender(&dir).expect("open pre-existing log dir");
+        let _appender = open_log_appender(&dir, teamclaude_rs::paths::LOG_PREFIX)
+            .expect("open pre-existing log dir");
         let dir_mode = std::fs::metadata(&dir)
             .expect("stat temp log dir")
             .permissions()
@@ -7768,15 +7855,14 @@ mod tests {
     /// This is the "it writes", not merely "it initialised", proof: a dropped
     /// `WorkerGuard` (see `headless_subscriber`'s doc-comment) would make
     /// `init_tracing`-style construction succeed while nothing ever lands here.
-    fn read_the_one_log_file(dir: &std::path::Path) -> String {
+    ///
+    /// `prefix` is the one the appender was opened with: the resolved cache
+    /// directory's own, never a fixed name.
+    fn read_the_one_log_file(dir: &std::path::Path, prefix: &str) -> String {
         let mut matches: Vec<_> = std::fs::read_dir(dir)
             .expect("read temp log dir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("teamclaude-rs.log")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
             .collect();
         assert_eq!(
             matches.len(),
@@ -7795,7 +7881,8 @@ mod tests {
     #[test]
     fn headless_logging_reaches_both_the_file_and_stdout() {
         let dir = unique_log_dir("headless-test");
-        let appender = open_log_appender(&dir).expect("open temp log dir");
+        let prefix = teamclaude_rs::paths::LOG_PREFIX;
+        let appender = open_log_appender(&dir, prefix).expect("open temp log dir");
         let stdout = SharedBuf::default();
         let marker = format!("headless-sink-probe-{}", std::process::id());
 
@@ -7809,7 +7896,7 @@ mod tests {
             tracing::info!("{marker}");
         });
 
-        let on_disk = read_the_one_log_file(&dir);
+        let on_disk = read_the_one_log_file(&dir, prefix);
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             on_disk.contains(&marker),
@@ -7911,14 +7998,23 @@ mod tests {
     /// version of this test justified itself with "this is what `tcr status`
     /// and every diagnostic already read", which was false and is not
     /// repeated here).
+    ///
+    /// Reads this process's real `HOME` to resolve the path, and writes nothing.
     #[test]
     fn the_log_directory_is_the_shared_cache_location() {
-        assert_eq!(log_dir_path(), cache_base_dir().join("logs"));
-        assert!(
-            log_dir_path().ends_with(std::path::Path::new("teamclaude").join("logs")),
-            "log directory must live under the shared teamclaude cache dir: {:?}",
-            log_dir_path()
+        let cache = teamclaude_rs::paths::cache_dir();
+        let (dir, prefix) = log_location();
+        assert_eq!(dir, cache.root().join("logs"));
+        assert_eq!(
+            Some(cache.root()),
+            teamclaude_rs::affinity::default_path().parent(),
+            "logs and the pin file share one cache directory"
         );
+        let expected = match cache.generation() {
+            teamclaude_rs::paths::Generation::Current => teamclaude_rs::paths::LOG_PREFIX,
+            teamclaude_rs::paths::Generation::Legacy => teamclaude_rs::legacy_names::LOG_PREFIX,
+        };
+        assert_eq!(prefix, expected, "the prefix follows the directory");
     }
 
     /// `max_log_files` pruning is real, not merely configured, AND it is the
@@ -7949,7 +8045,18 @@ mod tests {
     /// skipped.
     #[test]
     fn old_log_files_are_pruned_at_max_log_files() {
-        let dir = unique_log_dir("pruning");
+        assert_old_log_files_are_pruned(teamclaude_rs::paths::LOG_PREFIX, "pruning");
+    }
+
+    /// The same pruning in an install that kept the old cache directory, whose
+    /// logs carry the old prefix: a new prefix there would never prune them.
+    #[test]
+    fn old_log_files_are_pruned_under_the_legacy_prefix() {
+        assert_old_log_files_are_pruned(teamclaude_rs::legacy_names::LOG_PREFIX, "pruning-legacy");
+    }
+
+    fn assert_old_log_files_are_pruned(prefix: &str, tag: &str) {
+        let dir = unique_log_dir(tag);
         std::fs::create_dir_all(&dir).expect("create temp log dir");
 
         // Five pre-existing dated files, oldest first, each with a distinct
@@ -7957,7 +8064,7 @@ mod tests {
         let oldest = "2020-02-01";
         let survivors = ["2020-02-02", "2020-02-03", "2020-02-04", "2020-02-05"];
         for date in std::iter::once(&oldest).chain(survivors.iter()) {
-            std::fs::write(dir.join(format!("teamclaude-rs.log.{date}")), b"old\n")
+            std::fs::write(dir.join(format!("{prefix}.{date}")), b"old\n")
                 .expect("write stale log file");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -7965,7 +8072,7 @@ mod tests {
         // Production max_log_files(5): prune keeps (5 - 1) = 4 of the 5
         // existing files, then the appender creates one new file for today —
         // 5 total, with only the single oldest pre-existing file removed.
-        let _appender = open_log_appender(&dir).expect("open temp log dir");
+        let _appender = open_log_appender(&dir, prefix).expect("open temp log dir");
 
         let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
             .expect("read temp log dir")
@@ -7979,12 +8086,12 @@ mod tests {
             "at least 2 files must survive pruning: {remaining:?}"
         );
         assert!(
-            !remaining.contains(&format!("teamclaude-rs.log.{oldest}")),
+            !remaining.contains(&format!("{prefix}.{oldest}")),
             "the single oldest file must have been pruned: {remaining:?}"
         );
         for date in survivors {
             assert!(
-                remaining.contains(&format!("teamclaude-rs.log.{date}")),
+                remaining.contains(&format!("{prefix}.{date}")),
                 "pre-existing file {date} must survive pruning: {remaining:?}"
             );
         }

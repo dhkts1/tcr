@@ -100,8 +100,9 @@ Stop the proxy, then delete the binary: `~/.cargo/bin/tcr` from either installer
 `~/.local/bin/tcr` from `scripts/install-cli.sh`. On macOS, `apps/macos/scripts/uninstall.sh`
 removes TcrBar and its login item.
 
-Nothing deletes your data for you. `~/.config/teamclaude.json` holds working credentials for every
-account in the pool, so delete it too, along with `~/.cache/teamclaude/` and any
+Nothing deletes your data for you. `~/.config/tcr.json` (`~/.config/teamclaude.json` on an older
+install) holds working credentials for every account in the pool, so delete it too, along with
+`~/.cache/tcr/` (or `~/.cache/teamclaude/`) and any
 `ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or `NODE_EXTRA_CA_CERTS` you exported. Every file `tcr` keeps
 is listed in [`docs/architecture.md`](docs/architecture.md#files-on-disk), and the full steps are
 under [Uninstalling](docs/architecture.md#uninstalling).
@@ -131,8 +132,9 @@ export NODE_EXTRA_CA_CERTS=<the CA path tcr logs at boot>
 ```
 
 Forward-proxy mode decrypts TLS with a locally generated certificate, so the client has to trust
-it; `tcr` prints the CA path to use when it starts. The config lives at
-`~/.config/teamclaude.json`, and `name` and `accessToken` are the only required keys. Every other
+it; `tcr` prints the CA path to use when it starts. The config lives at `~/.config/tcr.json`
+(an install that already has `~/.config/teamclaude.json` keeps using that), and `name` and
+`accessToken` are the only required keys. Every other
 key, its default and the file's permissions are in
 [`docs/configuration.md`](docs/configuration.md).
 

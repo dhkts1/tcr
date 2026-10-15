@@ -1,7 +1,7 @@
 # Configuration reference
 
-Everything `tcr` reads out of `~/.config/teamclaude.json`, with the real default for each
-key. Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
+Everything `tcr` reads out of its config file, with the real default for each key. The file
+is `~/.config/tcr.json`, or `~/.config/teamclaude.json` on an install that has only that one. Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
 
 Every default here was derived from the Rust source, not from a live config file. If you
 want to check one, start from `src/config.rs`.

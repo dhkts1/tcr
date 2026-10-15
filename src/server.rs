@@ -3179,7 +3179,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn booting_beside_a_sharing_peers_file_wires_the_peer_lease_fallback() {
         let home = tempfile::tempdir().expect("a temp home");
-        let config_path = home.path().join("teamclaude.json");
+        let config_path = home.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(&config_path, br#"{"accounts": []}"#).expect("the temp config writes");
 
         // The lender: a socket that accepts one connection, records it, and
@@ -3286,10 +3286,9 @@ mod tests {
     fn the_peers_file_is_the_one_beside_the_config_and_nothing_without_one() {
         assert_eq!(peers_file_beside_config(None), None);
 
-        let resolved = peers_file_beside_config(Some(std::path::Path::new(
-            "/tmp/tcr-unit-profile/teamclaude.json",
-        )))
-        .expect("a config path resolves a peers path");
+        let config = PathBuf::from("/tmp/tcr-unit-profile").join(crate::paths::CONFIG_FILE);
+        let resolved =
+            peers_file_beside_config(Some(&config)).expect("a config path resolves a peers path");
         assert_eq!(
             resolved,
             PathBuf::from("/tmp/tcr-unit-profile/tcr-peers.json"),

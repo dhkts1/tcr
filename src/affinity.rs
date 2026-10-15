@@ -173,23 +173,15 @@ pub struct LoadReport {
     pub degraded: Option<String>,
 }
 
-/// Default pin-file path: `$XDG_CACHE_HOME/teamclaude/session-affinity.json`,
-/// else `$HOME/.cache/teamclaude/session-affinity.json`.
+/// Default pin-file path: `session-affinity.json` in the cache directory
+/// ([`crate::paths::cache_dir`]: `$XDG_CACHE_HOME/tcr/`, else
+/// `$HOME/.cache/tcr/`, or the `teamclaude/` directory an older install has).
 ///
 /// A cache dir, not `~/.config`: this is regenerable state written on a timer,
 /// and the config file next door holds live OAuth credentials behind a merge
 /// path that must not acquire a second high-frequency writer.
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("teamclaude").join("session-affinity.json")
+    crate::paths::cache_dir().affinity_file()
 }
 
 /// Write `pins` to `path` atomically at `0600`, keeping at most [`PIN_CAP`] of

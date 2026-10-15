@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
+use teamclaude_rs::paths;
 use teamclaude_rs::singleton::owner_path_in;
 
 /// `handle.shutdown()` is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` = 5s
@@ -134,7 +135,8 @@ fn wait_for_line(
 /// arm still reddens it, which is what `scripts/watch-sigterm-line-fail.sh`
 /// proves.
 fn durable_log_has_line(home: &std::path::Path, predicate: impl Fn(&str) -> bool) -> bool {
-    let logs = home.join(".cache").join("teamclaude").join("logs");
+    // A fresh HOME gets the new cache directory name (`src/paths.rs`).
+    let logs = home.join(".cache").join(paths::CACHE_DIR).join("logs");
     let Ok(entries) = std::fs::read_dir(&logs) else {
         return false;
     };
@@ -211,7 +213,7 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
         panic!("could not parse a port out of the listening line: {listening_line:?}")
     });
 
-    let owner_dir = home.path().join(".cache").join("teamclaude");
+    let owner_dir = home.path().join(".cache").join(paths::CACHE_DIR);
     let owner_path = owner_path_in(&owner_dir, port);
     assert!(
         owner_path.exists(),

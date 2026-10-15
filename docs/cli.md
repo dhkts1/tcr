@@ -13,7 +13,8 @@ and each one was derived from the source, so start from `src/main.rs` to check a
 ## Conventions
 
 `--config <path>` appears on every subcommand except `update`, `demo` and `ui`. Unset, it
-resolves to `~/.config/teamclaude.json`.
+resolves to `~/.config/tcr.json`, or to `~/.config/teamclaude.json` on an install that has only
+that file. The tables below write the default as `~/.config/tcr.json` and mean this rule.
 
 **A config file that does not exist yet is created, not an error.** The first command you run
 on a new machine writes the defaults to that path (`0600`, an empty `accounts` array), prints
@@ -37,7 +38,7 @@ can name it in a script or a launch agent.
 | flag | type | default | effect |
 |---|---|---|---|
 | `--port <u16>` | number | config's `proxy.port` | bind port, overriding the config |
-| `--config <path>` | path | `~/.config/teamclaude.json` | which config to load |
+| `--config <path>` | path | `~/.config/tcr.json` | which config to load |
 | `--headless` | bool | `false` | run without the TUI |
 | `--replace` | bool | `false` | kill a proxy already on the port and take it |
 | `--no-replace` | bool | `false` | **deprecated no-op** |
@@ -92,7 +93,7 @@ Launches Claude Code already pointed at the proxy.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | which config to read the port from |
+| `--config <path>` | path | `~/.config/tcr.json` | which config to read the port from |
 | `-- <args>` | strings | empty | passed verbatim to `claude` |
 
 Trailing args are captured with `trailing_var_arg` and `allow_hyphen_values`, so
@@ -224,7 +225,7 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
+| `--config <path>` | path | `~/.config/tcr.json` | config to write into |
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
@@ -473,7 +474,7 @@ zeroes.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to list |
+| `--config <path>` | path | `~/.config/tcr.json` | config to list |
 | `--probe` | bool | `false` | refresh each account's live quota first, a real network call per account |
 
 ---
@@ -643,7 +644,7 @@ Probes every account's live quota and prints the fleet.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
+| `--config <path>` | path | `~/.config/tcr.json` | config to read |
 | `--json` | bool | `false` (text) | emit a JSON array instead of greppable text |
 | `--check` | bool | `false` | exit **4** when an enabled account's last probe failed; output unchanged |
 
@@ -1057,7 +1058,7 @@ It reports, in order: totals (requests; uncached input, output, cache-write and 
 tokens; cost; and the cache-hit ratio, the share of all prompt tokens read from cache), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
 per-day breakdown with the busiest day marked, the count of distinct sessions plus the three
 longest-running ones by request count, and a comparison against the previous `N`-day period
-(`+12%` / `-3%`). `--config` (default `~/.config/teamclaude.json`) is consulted only for
+(`+12%` / `-3%`). `--config` (default `~/.config/tcr.json`) is consulted only for
 pricing overrides — never for accounts, so a removed account's traffic still shows up under
 the name it was recorded under. `--json` emits the same numbers as one object instead of the
 plain-text layout.
@@ -1198,7 +1199,7 @@ are shown) and `not-shown=<n>` (how many this Mac is holding back past the twelv
 |---|---|---|---|
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
 | `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, and no `node` at all, because a found row carries no key to pin |
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read for the account labels the `lentTo` block is keyed by. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty instead of failing the listing |
+| `--config <path>` | path | `~/.config/tcr.json` | main config to read for the account labels the `lentTo` block is keyed by. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty instead of failing the listing |
 
 ### `tcr peer find <on\|off>`
 
@@ -1434,7 +1435,7 @@ row appears only while a server is up.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read the port and api-key from |
+| `--config <path>` | path | `~/.config/tcr.json` | main config to read the port and api-key from |
 | `--json` | bool | `false` | emit the peers block as JSON instead of greppable text |
 
 Each row carries the pinned key twice: **`id`** is the full wire form, the only spelling

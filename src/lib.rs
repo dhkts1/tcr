@@ -30,11 +30,13 @@ pub mod fallback;
 #[cfg(unix)]
 pub mod handoff;
 pub mod identity;
+pub mod legacy_names;
 pub mod manager;
 pub mod mint;
 pub mod mitm;
 pub mod model;
 pub mod oauth;
+pub mod paths;
 pub mod peer;
 pub mod pricing;
 pub mod probe;

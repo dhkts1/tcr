@@ -124,21 +124,12 @@ pub struct LoadReport {
     pub degraded: Option<String>,
 }
 
-/// Default cache-file path: `$XDG_CACHE_HOME/teamclaude/session-wire.json`,
-/// else `$HOME/.cache/teamclaude/session-wire.json` — same base directory as
+/// Default cache-file path: `session-wire.json` in the cache directory
+/// ([`crate::paths::cache_dir`]) — same directory as
 /// [`crate::affinity::default_path`], a sibling file rather than a subdirectory
 /// so both are equally easy to find and equally easy to delete.
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("teamclaude").join("session-wire.json")
+    crate::paths::cache_dir().session_wire_file()
 }
 
 /// Write `sessions` to `path` atomically at `0600` (`crate::config::write_atomic`
