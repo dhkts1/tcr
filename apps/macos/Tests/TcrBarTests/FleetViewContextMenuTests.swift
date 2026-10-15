@@ -128,7 +128,9 @@ final class ContextMenuReloginAvailabilityTests: XCTestCase {
             "AccountActions.groupItems(for: account", "AccountActions.addToGroupEntries(for: account",
             "RestartAlertCopy.takeoverInformative(holdsCodex:",
         ] {
-            XCTAssertTrue(source.contains(call), "FleetView.swift no longer holds \(call)")
+            XCTAssertTrue(
+                source.filter { !$0.isWhitespace }.contains(call.filter { !$0.isWhitespace }),
+                "FleetView.swift no longer holds \(call)")
         }
         for gone in ["private func parkToggle(", "private var candidateGroupsToAdd"] {
             XCTAssertFalse(source.contains(gone), "FleetView.swift still holds \(gone)")
