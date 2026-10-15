@@ -38,6 +38,17 @@ final class CodexBannerTests: XCTestCase {
             bundledTcrWithoutCLI: bundled)
     }
 
+    func testCredentialRefusalNamesTheLoginOrWorkspaceRemedy() throws {
+        for count in [1, 12] {
+            let fleet = try codexFleet(
+                bobAndDana,
+                traffic: ["refused10m": count, "lastRefusal": "credential_refused", "unpooled10m": 0])
+            let banner = try XCTUnwrap(call(fleet))
+            XCTAssertTrue(banner.text.contains("Check the workspace or sign in again."))
+            XCTAssertFalse(banner.text.contains("retry"))
+        }
+    }
+
     // MARK: - Precedence
 
     /// One line at a time, in the order an operator can act on: a route that is not pooled

@@ -41,6 +41,8 @@ public enum CodexBanner: Equatable, Sendable {
         case usageLimit
         /// `no_codex_account`: the pool held no usable Codex account.
         case noAccount
+        /// The login or workspace was refused; waiting cannot repair it.
+        case credential
         /// Any other type, or none: codex was asked to retry.
         case other
 
@@ -48,6 +50,7 @@ public enum CodexBanner: Equatable, Sendable {
             switch type {
             case "usage_limit_reached": self = .usageLimit
             case "no_codex_account": self = .noAccount
+            case "credential_refused": self = .credential
             default: self = .other
             }
         }
@@ -92,6 +95,10 @@ public enum CodexBanner: Equatable, Sendable {
 
     private static func refusedSentence(count: Int, last: LastRefusal) -> String {
         switch (count == 1, last) {
+        case (_, .credential):
+            let noun = count == 1 ? "request" : "requests"
+            return
+                "tcr refused \(count) Codex \(noun) in the last 10 min: a login or workspace was refused. Check the workspace or sign in again."
         case (true, .usageLimit):
             return "tcr refused 1 Codex request in the last 10 min and told codex its usage limit is reached."
         case (true, .noAccount):

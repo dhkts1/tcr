@@ -4,6 +4,23 @@ import XCTest
 
 final class CodexBannerSnapshotTests: XCTestCase {
     @MainActor
+    func testPollingCannotInsertOrRemoveASessionsNotice() {
+        let snapshot = CodexBannerSnapshot()
+        snapshot.observeSessionsLine(nil)
+        snapshot.decideAtOpen()
+        snapshot.observeSessionsLine("Some Codex requests have no session row.")
+        XCTAssertNil(snapshot.sessionsLine)
+        snapshot.decideAtOpen()
+        let shown = snapshot.sessionsLine
+        snapshot.observeSessionsLine(nil)
+        XCTAssertEqual(snapshot.sessionsLine, shown)
+        snapshot.observeSessionsLine("A longer notice must wait for the next opening.")
+        XCTAssertEqual(snapshot.sessionsLine, shown)
+        snapshot.decideAtOpen()
+        XCTAssertEqual(snapshot.sessionsLine, "A longer notice must wait for the next opening.")
+    }
+
+    @MainActor
     func testPollingCannotInsertABannerIntoAnOpenPanel() {
         let snapshot = CodexBannerSnapshot()
         snapshot.observe(nil)

@@ -43,7 +43,7 @@ public enum SessionsCodexCopy {
 
     /// Explain observed Codex traffic without a session row. A current proxy can
     /// serve requests without a session-id, so this is not evidence of an old build.
-    public static func oldServerLine(_ fleet: Fleet) -> String? {
+    public static func trafficWithoutSessionsLine(_ fleet: Fleet) -> String? {
         guard fleet.holdsCodex, !fleet.sessions.contains(where: { $0.provider == .codex })
         else { return nil }
         let requests = fleet.accounts
@@ -96,7 +96,7 @@ public enum SessionsCodexCopy {
         let codex = pool(.codex, of: fleet)
         var group: [String] = []
         if let tokens = fleet.todayOutputTokens(of: .codex) {
-            group.append("\(QuotaFormat.tokens(tokens)) tokens")
+            group.append("\(QuotaFormat.tokens(tokens)) tokens today")
         }
         if !codex.sessions.isEmpty { group.append(accountRatio(codex)) }
         clauses += named("Codex", group)

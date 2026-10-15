@@ -1145,12 +1145,13 @@ enum RenderStates {
         {
             return false
         }
-        if scene.name == "26b-codex-refusals-banner" {
+        if scene.name == "26b-codex-refusals-banner" || scene.name == "16d-sessions-tab-old-server-codex" {
             let snapshot = CodexBannerSnapshot()
             guard
                 codexBannerKeepsPanelSize(
                     snapshot: snapshot,
-                    panel: panel(nil, nil, claudeRouteFixture(for: scene.name), snapshot))
+                    panel: panel(nil, nil, claudeRouteFixture(for: scene.name), snapshot),
+                    sessions: scene.name == "16d-sessions-tab-old-server-codex")
             else { return false }
         }
         return rasterise(view, named: name, into: directory)
@@ -1161,18 +1162,24 @@ enum RenderStates {
     /// that stopped observing the banner altogether.
     @MainActor
     private static func codexBannerKeepsPanelSize<Panel: View>(
-        snapshot: CodexBannerSnapshot, panel: Panel
+        snapshot: CodexBannerSnapshot, panel: Panel, sessions: Bool = false
     ) -> Bool {
         snapshot.observe(nil)
+        snapshot.observeSessionsLine(nil)
         snapshot.decideAtOpen()
         let host = NSHostingView(rootView: panel)
         func size() -> NSSize {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            CFRunLoopRunInMode(.defaultMode, 0.02, false)
             host.layoutSubtreeIfNeeded()
             return host.fittingSize
         }
         let closed = size()
-        snapshot.observe(.notPooled(reason: String(repeating: "An example route is unavailable. ", count: 8)))
+        let longNotice = String(repeating: "An example route is unavailable. ", count: 8)
+        if sessions {
+            snapshot.observeSessionsLine(longNotice)
+        } else {
+            snapshot.observe(.notPooled(reason: longNotice))
+        }
         let polled = size()
         guard closed == polled else {
             FileHandle.standardError.write(
@@ -1186,7 +1193,7 @@ enum RenderStates {
                 Data("Codex banner check: reopening did not show the new banner\n".utf8))
             return false
         }
-        snapshot.observe(nil)
+        if sessions { snapshot.observeSessionsLine(nil) } else { snapshot.observe(nil) }
         guard size() == reopened else {
             FileHandle.standardError.write(Data("Codex banner check: polling removed the open banner\n".utf8))
             return false

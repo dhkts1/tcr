@@ -456,6 +456,7 @@ struct FleetView: View {
         .onAppear {
             if !snapshotMode {
                 codexBannerSnapshot.observe(codexBannerCandidate)
+                codexBannerSnapshot.observeSessionsLine(codexSessionsNoticeCandidate)
                 refreshSessionFiles()
                 machine = MachineStats.read()
                 refreshClaudeCount()
@@ -464,12 +465,16 @@ struct FleetView: View {
             }
             syncPeersProvider()
         }
+        .onChange(of: codexSessionsNoticeCandidate) { line in
+            if !snapshotMode { codexBannerSnapshot.observeSessionsLine(line) }
+        }
         .onChange(of: codexBannerCandidate) { candidate in
             if !snapshotMode { codexBannerSnapshot.observe(candidate) }
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
                 codexBannerSnapshot.observe(codexBannerCandidate)
+                codexBannerSnapshot.observeSessionsLine(codexSessionsNoticeCandidate)
                 refreshSessionFiles()
                 machine = MachineStats.read()
                 refreshClaudeCount()
@@ -657,6 +662,15 @@ struct FleetView: View {
     /// this panel measured or the harness seeded. See ``CodexBanner``. Its
     /// commands are drawn as ``CommandProseText``: without their backticks,
     /// never broken inside a path or a flag, and copied from the line's menu.
+    private var codexSessionsNoticeCandidate: String? {
+        poller.state.loadedFleet.flatMap(SessionsCodexCopy.trafficWithoutSessionsLine)
+    }
+
+    private func codexSessionsNotice(_ fleet: Fleet) -> String? {
+        snapshotMode && !codexBannerSnapshot.hasOpened
+            ? SessionsCodexCopy.trafficWithoutSessionsLine(fleet) : codexBannerSnapshot.sessionsLine
+    }
+
     private var codexBannerCandidate: CodexBanner? {
         guard let fleet = poller.state.loadedFleet else { return nil }
         return currentCodexBanner(fleet)
@@ -1722,7 +1736,7 @@ struct FleetView: View {
             banner(
                 icon: "person.2",
                 title: "No live sessions",
-                detail: SessionsCodexCopy.oldServerLine(fleet)
+                detail: codexSessionsNotice(fleet)
                     ?? SessionsCodexCopy.emptyDetail(fleet),
                 tint: Tok.inkDim)
         } else {
@@ -1735,29 +1749,29 @@ struct FleetView: View {
             // "Show N more sessions" button already follows.
             let fold = SessionsFold(joined, now: Date())
             let displayed = warmupsExpanded ? joined : fold.visible
-            let oldServerLine = SessionsCodexCopy.oldServerLine(fleet)
+            let trafficNotice = codexSessionsNotice(fleet)
             if snapshotMode {
-                sessionsTabBody(displayed: displayed, fold: fold, oldServerLine: oldServerLine)
+                sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
             } else {
                 ScrollView {
-                    sessionsTabBody(displayed: displayed, fold: fold, oldServerLine: oldServerLine)
+                    sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
                 }
                 .frame(height: visibleRowsHeight(for: fleet))
             }
         }
     }
 
-    /// `oldServerLine` is ``SessionsCodexCopy/oldServerLine(_:)``: above the
+    /// `trafficNotice` is ``SessionsCodexCopy/trafficWithoutSessionsLine(_:)``: above the
     /// list, because the list itself cannot say that its Codex sessions are
     /// missing, only that the ones it has are there.
     private func sessionsTabBody(
-        displayed: [JoinedSession], fold: SessionsFold, oldServerLine: String?
+        displayed: [JoinedSession], fold: SessionsFold, trafficNotice: String?
     ) -> some View {
         VStack(alignment: .leading, spacing: Tok.cardGap) {
-            if let oldServerLine {
-                Text(oldServerLine)
+            if let trafficNotice {
+                Text(trafficNotice)
                     .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.near)
+                    .foregroundStyle(Tok.dim)
                     .fixedSize(horizontal: false, vertical: true)
             }
             sessionsList(displayed)

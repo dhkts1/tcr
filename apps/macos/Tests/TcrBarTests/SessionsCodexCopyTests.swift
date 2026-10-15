@@ -95,17 +95,18 @@ final class SessionsCodexCopyTests: XCTestCase {
         let seven =
             "Codex served 7 requests in the last hour, but no Codex session was reported. Requests without a session-id are counted without a session row."
         XCTAssertEqual(
-            SessionsCodexCopy.oldServerLine(try fleet([alice, bob], sessions: [s.alice])), seven)
+            SessionsCodexCopy.trafficWithoutSessionsLine(try fleet([alice, bob], sessions: [s.alice])), seven)
         XCTAssertEqual(
-            SessionsCodexCopy.oldServerLine(try fleet([alice, bob], sessions: [])), seven)
+            SessionsCodexCopy.trafficWithoutSessionsLine(try fleet([alice, bob], sessions: [])), seven)
         XCTAssertNil(
-            SessionsCodexCopy.oldServerLine(try fleet([alice, bob], sessions: [s.alice, s.bob])))
-        XCTAssertNil(SessionsCodexCopy.oldServerLine(try fleet([alice], sessions: [s.alice])))
+            SessionsCodexCopy.trafficWithoutSessionsLine(
+                try fleet([alice, bob], sessions: [s.alice, s.bob])))
+        XCTAssertNil(SessionsCodexCopy.trafficWithoutSessionsLine(try fleet([alice], sessions: [s.alice])))
         XCTAssertNil(
-            SessionsCodexCopy.oldServerLine(
+            SessionsCodexCopy.trafficWithoutSessionsLine(
                 try fleet([alice, bob], sessions: [s.alice], codexLastHourRequests: 0)))
         XCTAssertEqual(
-            SessionsCodexCopy.oldServerLine(
+            SessionsCodexCopy.trafficWithoutSessionsLine(
                 try fleet([alice, bob], sessions: [s.alice], codexLastHourRequests: 1)),
             "Codex served 1 request in the last hour, but no Codex session was reported. Requests without a session-id are counted without a session row."
         )
@@ -136,7 +137,7 @@ final class SessionsCodexCopyTests: XCTestCase {
             QuotaFormat.usd(claude.todayCost) + " today",
             QuotaFormat.usd(claude.sessionsLiveCost) + " live",
             "1/1 accounts",
-            "Codex " + QuotaFormat.tokens(22_000) + " tokens",
+            "Codex " + QuotaFormat.tokens(22_000) + " tokens today",
             "1/1 accounts",
         ]
         XCTAssertEqual(SessionsCodexCopy.summaryClauses(mixed), expected)
@@ -165,7 +166,7 @@ final class SessionsCodexCopyTests: XCTestCase {
         let s = try canonicalSessions()
         let clauses = try XCTUnwrap(
             SessionsCodexCopy.summaryClauses(try fleet([alice, bob], sessions: [s.alice])))
-        XCTAssertEqual(clauses.last, "Codex " + QuotaFormat.tokens(22_000) + " tokens")
+        XCTAssertEqual(clauses.last, "Codex " + QuotaFormat.tokens(22_000) + " tokens today")
         XCTAssertEqual(clauses.filter { $0.hasSuffix(" accounts") }, ["1/1 accounts"])
     }
 
@@ -174,7 +175,7 @@ final class SessionsCodexCopyTests: XCTestCase {
     func testACodexOnlySummaryCountsNoUnpricedRequests() throws {
         let s = try canonicalSessions()
         let clauses = SessionsCodexCopy.summaryClauses(try fleet([bob, dana], sessions: [s.bob]))
-        XCTAssertEqual(clauses, ["Codex " + QuotaFormat.tokens(282_000) + " tokens", "1/2 accounts"])
+        XCTAssertEqual(clauses, ["Codex " + QuotaFormat.tokens(282_000) + " tokens today", "1/2 accounts"])
         XCTAssertFalse(clauses?.contains { $0.contains("unpriced") } ?? true)
     }
 
