@@ -52,7 +52,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-config="${config:-$HOME/.config/teamclaude.json}"
+if [[ -z "${config:-}" ]]; then
+  # The same rule as src/paths.rs: tcr.json if it exists, else the pre-rename name.
+  config="$HOME/.config/tcr.json"
+  if [[ ! -f "$config" && -f "$HOME/.config/teamclaude.json" ]]; then
+    config="$HOME/.config/teamclaude.json"
+  fi
+fi
 
 if [[ ! -f "$config" ]]; then
   echo "no config at $config" >&2

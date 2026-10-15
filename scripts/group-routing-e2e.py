@@ -6,15 +6,25 @@ fresh metadata.user_id so it gets a fresh affinity key (no pre-existing pin), th
 attributes each one from the proxy log by finding the session key whose FIRST-EVER
 usage line lands inside that probe's window.
 
-Read-only with respect to config: it never writes ~/.config/teamclaude.json and
-never signals the proxy.
+Read-only with respect to config: it never writes the config (~/.config/tcr.json,
+or teamclaude.json on an install that has not moved yet) and never signals the proxy.
 """
 import json, os, re, subprocess, sys, time, uuid
 
 HAIKU = "claude-haiku-4-5-20251001"
 
-LOG = os.path.expanduser("~/.cache/teamclaude/logs/teamclaude-rs.log.%s"
-                         % time.strftime("%Y-%m-%d"))
+
+def _log_path():
+    # The same rule as src/paths.rs: the new cache directory if it exists, else the
+    # pre-rename one, each with its own log prefix.
+    new = os.path.expanduser("~/.cache/tcr")
+    if os.path.isdir(new) or not os.path.isdir(os.path.expanduser("~/.cache/teamclaude")):
+        return os.path.join(new, "logs", "tcr.log.%s" % time.strftime("%Y-%m-%d"))
+    return os.path.expanduser(
+        "~/.cache/teamclaude/logs/teamclaude-rs.log.%s" % time.strftime("%Y-%m-%d"))
+
+
+LOG = _log_path()
 CA = os.path.expanduser("~/.config/tcr-ca.pem")
 PROXY = os.environ.get("HTTPS_PROXY") or "http://127.0.0.1:3456"
 USAGE = re.compile(r'^(\S+)Z\s+INFO (?:tcr|teamclaude_rs)::proxy: request usage '
