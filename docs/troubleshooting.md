@@ -354,7 +354,7 @@ can be adopted, for example because the auth file is missing, unreadable or stal
 access token in a newer file pair is refreshed using that file's refresh token before adoption.
 A failed write-back is retried by the running manager while the file still holds the spent
 source token; fix file access before restarting, because this pending retry is held in memory.
-A symlinked auth file is not replaced. Signing in again with `codex login` in the shared folder
+Import refuses a symlinked auth file; a symlink introduced after import is never replaced. Signing in again with `codex login` in the shared folder
 revokes that login, so tcr may also need sign-in afterward.
 A login can also have expired (`refresh_token_expired`) or been revoked
 (`refresh_token_invalidated`). Meanwhile the pool serves `codex` from its other Codex accounts,

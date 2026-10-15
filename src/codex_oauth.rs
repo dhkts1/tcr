@@ -112,6 +112,10 @@ pub async fn refresh_access_token_at(
 ) -> Result<Tokens, OAuthError> {
     let response = client
         .post(endpoint)
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("tcr/", env!("CARGO_PKG_VERSION")),
+        )
         .timeout(crate::oauth::REFRESH_TIMEOUT)
         .json(&RefreshRequest {
             grant_type: "refresh_token",
@@ -510,6 +514,38 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}/oauth/token"), seen)
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_identifies_tcr_in_the_user_agent() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = captured.clone();
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = headers
+                        .get("user-agent")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    axum::Json(
+                        serde_json::json!({"access_token": "at-fake", "refresh_token": "rt-new"}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        refresh_access_token_at(&client, "rt-old", &format!("http://{address}/oauth/token"))
+            .await
+            .unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some(concat!("tcr/", env!("CARGO_PKG_VERSION")))
+        );
     }
 
     /// The real response carries three fields; its optional id token is retained for imported

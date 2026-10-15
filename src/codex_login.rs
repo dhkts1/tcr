@@ -187,6 +187,12 @@ fn env_path(key: &str) -> Option<PathBuf> {
 /// The login at `path` (from [`auth_path`]): `Ok(None)` when there is no file there; `Err` when
 /// there is one we cannot read or parse, or one that is not a ChatGPT login.
 pub fn read_codex_login(path: &Path) -> anyhow::Result<Option<CodexLogin>> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        anyhow::bail!(
+            "refusing to import symlinked Codex login {}: refreshed tokens cannot be synchronized safely. Use a regular auth.json or tcr login --codex. Nothing was written.",
+            path.display()
+        );
+    }
     read_auth_file(path)
 }
 
@@ -301,6 +307,10 @@ pub async fn check_workspace_routing(
     );
     let mut request = client
         .get(&url)
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("tcr/", env!("CARGO_PKG_VERSION")),
+        )
         .bearer_auth(&login.access_token)
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(crate::probe::PROBE_TIMEOUT);
@@ -321,10 +331,10 @@ pub async fn check_workspace_routing(
     })?;
     let status = response.status();
     if !status.is_success() {
-        let hint = if matches!(status.as_u16(), 401 | 403) {
-            " (the login's access token was refused: run `codex login` again)"
-        } else {
-            ""
+        let hint = match status.as_u16() {
+            401 => " (the access token was refused: run codex once to refresh its login, then retry this import)",
+            403 => " (check Codex's connection and workspace access, then retry this import)",
+            _ => "",
         };
         return Err(WorkspaceRefusal::Unconfirmed(format!(
             "GET {url} answered HTTP {}{hint}",
@@ -615,6 +625,77 @@ mod tests {
     const JWT_HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
     const ACCESS_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyJ9fQ";
     const ID_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8iLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLWZha2UifX0";
+
+    async fn codex_header_stub(
+        status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = captured.clone();
+        let answer = keyed(&[(ACCOUNT_A, workspace("NO_CONSTRAINT", "NO_CONSTRAINT"))]);
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let seen = seen.clone();
+            let answer = answer.clone();
+            async move {
+                *seen.lock().unwrap() = headers
+                    .get("user-agent")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(answer),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), captured)
+    }
+
+    #[tokio::test]
+    async fn codex_workspace_import_check_identifies_tcr_in_the_user_agent() {
+        let (base, captured) = codex_header_stub(200).await;
+        let login = parse_auth_json(&fake_auth_json()).unwrap().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        check_workspace_routing(&client, &base, &login)
+            .await
+            .unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some(concat!("tcr/", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_expired_import_suggests_refreshing_without_revoking_the_login() {
+        let (base, _) = codex_header_stub(401).await;
+        let mut login = parse_auth_json(&fake_auth_json()).unwrap().unwrap();
+        login.expires_at_ms = Some(0);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let Err(WorkspaceRefusal::Unconfirmed(why)) =
+            check_workspace_routing(&client, &base, &login).await
+        else {
+            panic!("the refused access token must leave the workspace unconfirmed")
+        };
+        assert!(why.contains("run codex once"), "{why}");
+        assert!(!why.contains("run `codex login`"), "{why}");
+    }
+
+    #[test]
+    fn codex_import_refuses_a_symlink_before_it_can_promise_token_sharing() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("stored-login.json");
+        let path = crate::paths::codex_auth_file(directory.path());
+        std::fs::write(&original, fake_auth_json()).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        let error = read_codex_login(&path).expect_err("a symlink cannot be synchronized safely");
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(std::fs::read_to_string(original).unwrap(), fake_auth_json());
+        assert!(std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 
     fn fake_auth_json() -> String {
         format!(

@@ -29,9 +29,14 @@ changes ship; that release body is the changelog shown by TcrBar.
   and provide an unmarked proxy URL to their shell tools, without changing Codex's config file.
 - Imported logins can recover a newer refresh token even when its access token has expired.
   Failed write-backs retry in the running manager while the original source token still matches;
-  restarting loses pending retries. Symlinked auth files are preserved. A later `codex login`
+  restarting loses pending retries. New imports refuse symlinked auth files; a symlink introduced
+  after import is preserved. A later `codex login`
   in the shared folder revokes that login and may require tcr to sign in again.
 - The v1 quota endpoint remains Claude-only. Provider-aware status includes Codex, and both
   status and doctor recognize a configured Codex fleet behind an older proxy.
 - TcrBar correctly shows body-only refusals, partially priced totals and unreadable sessions;
   sign-in messages identify the selected tcr executable when available.
+
+- Token refresh and import workspace checks send tcr's own User-Agent. An expired import
+  asks the user to run codex once to refresh its login before trying again, rather than
+  immediately replacing that login with another browser sign-in.

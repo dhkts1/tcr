@@ -966,8 +966,8 @@ plan. After a successful refresh of an imported account, tcr tries to update onl
 refreshed id token when one is returned. tcr serializes its writers with a private advisory
 lock, checks the loaded refresh token, then prepares a `0600` temporary file in the same
 directory. It compares the complete original file again immediately before the atomic rename
-and skips the write if the file changed. A symlinked `auth.json` is preserved and write-back
-is refused. A failed rename removes the temporary file when possible and erases its token
+and skips the write if the file changed. A symlinked `auth.json` is refused at import because token sharing cannot update it safely.
+If a regular imported file is later replaced by a symlink, write-back preserves that symlink and refuses to overwrite it. A failed rename removes the temporary file when possible and erases its token
 contents if the directory prevents removal.
 
 A failed publication is retried while the file still holds the spent source refresh token.
