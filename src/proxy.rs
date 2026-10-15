@@ -1786,7 +1786,7 @@ async fn status_handler(
     // Named only when it is not the default, so a reader is told only of an upstream they did
     // not expect.
     let codex_upstream = manager.upstream_for(crate::provider::Provider::Codex);
-    payload.codex_upstream = (codex_upstream != crate::config::default_codex_upstream())
+    payload.codex_upstream = (!crate::config::is_default_codex_upstream(codex_upstream))
         .then(|| codex_upstream.to_string());
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
@@ -23311,12 +23311,14 @@ mod tests {
             codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9"),
             None,
         );
-        manager.update_quota_with_body(
-            1,
-            &HeaderMap::new(),
-            429,
+        let headers = HeaderMap::new();
+        let refusal = crate::quota::CodexQuotaRefusal::parse(
+            &headers,
             br#"{"error":{"type":"insufficient_quota"}}"#,
-        );
+            OffsetDateTime::now_utc(),
+        )
+        .expect("body quota refusal");
+        manager.update_quota_with_codex_refusal(1, &headers, 429, Some(&refusal));
         manager.mark_codex_quota_limited(1, 6 * 86400);
         manager.apply_usage(
             1,

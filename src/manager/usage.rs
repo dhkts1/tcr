@@ -43,20 +43,9 @@ impl Manager {
         headers: &reqwest::header::HeaderMap,
         status: u16,
     ) -> bool {
-        self.update_quota_with_body(idx, headers, status, &[])
-    }
-
-    /// Include the bounded error body when recognizing a Codex quota refusal.
-    pub fn update_quota_with_body(
-        &self,
-        idx: usize,
-        headers: &reqwest::header::HeaderMap,
-        status: u16,
-        body: &[u8],
-    ) -> bool {
         let refusal = (status == 429)
             .then(|| {
-                crate::quota::CodexQuotaRefusal::parse(headers, body, OffsetDateTime::now_utc())
+                crate::quota::CodexQuotaRefusal::parse(headers, &[], OffsetDateTime::now_utc())
             })
             .flatten();
         self.update_quota_with_codex_refusal(idx, headers, status, refusal.as_ref())

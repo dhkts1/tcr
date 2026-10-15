@@ -36,8 +36,8 @@ pub(crate) fn default_upstream() -> String {
 pub(crate) fn default_codex_upstream() -> String {
     crate::provider::CODEX_UPSTREAM.to_string()
 }
-/// `skip_serializing_if` for [`Config::codex_upstream`].
-fn is_default_codex_upstream(value: &str) -> bool {
+/// The shared default-omission rule for config serialization, status and Codex routing.
+pub(crate) fn is_default_codex_upstream(value: &str) -> bool {
     value == crate::provider::CODEX_UPSTREAM
 }
 fn default_switch_threshold() -> f64 {

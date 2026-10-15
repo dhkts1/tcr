@@ -846,12 +846,6 @@ const CODEX_CREDITS_BALANCE_HEADER: &str = "x-codex-credits-balance";
 /// refusal's kind ([`CodexQuotaFacts::limit_reached_type`]).
 pub const CODEX_REACHED_TYPE_HEADER: &str = "x-codex-rate-limit-reached-type";
 
-/// Is this Codex 429 a quota refusal? Codex recognizes these body types and codes in
-/// `codex-api/src/api_bridge.rs`; the reached-type header is an independent signal.
-pub fn is_codex_quota_refusal(headers: &impl HeaderView, body: &[u8]) -> bool {
-    CodexQuotaRefusal::parse(headers, body, OffsetDateTime::now_utc()).is_some()
-}
-
 /// A quota refusal parsed once for both the quota snapshot and the selection hold.
 /// Only a future body deadline or a full window is evidence for a long hold.
 #[derive(Debug, Clone)]
@@ -861,6 +855,8 @@ pub struct CodexQuotaRefusal {
 }
 
 impl CodexQuotaRefusal {
+    /// Recognize a Codex 429 from the body types/codes in `codex-api/src/api_bridge.rs`
+    /// or the independent reached-type header, and read its recovery deadline once.
     pub fn parse(headers: &impl HeaderView, body: &[u8], now: OffsetDateTime) -> Option<Self> {
         let document = serde_json::from_slice::<serde_json::Value>(body).ok();
         let error = document.as_ref().and_then(|doc| doc.get("error"));
@@ -906,11 +902,6 @@ fn codex_quota_error(error: &serde_json::Value) -> bool {
 /// `resets_at` is Unix seconds, as Codex's `DateTime::from_timestamp(seconds, 0)` reads it.
 /// Ignore elapsed deadlines, including clock-skewed ones, before trying relative seconds
 /// and then header windows. Codex does not itself read `resets_in_seconds`.
-pub fn codex_body_reset(body: &[u8], now: OffsetDateTime) -> Option<OffsetDateTime> {
-    let document: serde_json::Value = serde_json::from_slice(body).ok()?;
-    codex_error_reset(document.get("error")?, now)
-}
-
 fn codex_error_reset(error: &serde_json::Value, now: OffsetDateTime) -> Option<OffsetDateTime> {
     error
         .get("resets_at")
@@ -957,8 +948,9 @@ impl Quota {
     /// `http_status` stands in for Anthropic's `unified-status` header, which Codex has no
     /// equivalent of. A 2xx that carried a window, from either slot, means this account is
     /// being served (`allowed`). A 429 carrying `x-codex-rate-limit-reached-type`
-    /// means it is not (`rejected`); [`Self::update_from_codex_response`] also reads a
-    /// body-only refusal through [`is_codex_quota_refusal`]. The Codex usage probe
+    /// means it is not (`rejected`). The proxy parses body-only refusals once through
+    /// [`CodexQuotaRefusal::parse`] and folds them with [`Self::update_from_codex_refusal`].
+    /// The Codex usage probe
     /// ([`crate::codex_probe`]) is what clears it, as the Anthropic probe clears an Anthropic
     /// rejection: its reading is folded through [`Self::apply_usage`], where
     /// `drop_rejection_if_a_window_rolled` drops the `rejected` once a probed window's
@@ -983,24 +975,14 @@ impl Quota {
         headers: &impl HeaderView,
         http_status: u16,
     ) -> bool {
-        self.update_from_codex_response(headers, http_status, &[])
-    }
-
-    /// Fold Codex quota headers and a bounded error body together. A body-only quota refusal
-    /// is the same rejection as a header refusal; its explicit reset takes precedence.
-    #[must_use]
-    pub fn update_from_codex_response(
-        &mut self,
-        headers: &impl HeaderView,
-        http_status: u16,
-        body: &[u8],
-    ) -> bool {
         let refusal = (http_status == 429)
-            .then(|| CodexQuotaRefusal::parse(headers, body, OffsetDateTime::now_utc()))
+            .then(|| CodexQuotaRefusal::parse(headers, &[], OffsetDateTime::now_utc()))
             .flatten();
         self.update_from_codex_refusal(headers, http_status, refusal.as_ref())
     }
 
+    /// Fold headers and the refusal already parsed by the proxy together. A body-only
+    /// refusal is the same rejection as a header refusal; its reset takes precedence.
     pub(crate) fn update_from_codex_refusal(
         &mut self,
         headers: &impl HeaderView,
@@ -1209,9 +1191,9 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
         let headers = TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]);
         let body = br#"{"error":{"message":"out","resets_at":1900007200}}"#;
-        assert!(is_codex_quota_refusal(&headers, body));
+        let refusal = CodexQuotaRefusal::parse(&headers, body, now).expect("header quota refusal");
         assert_eq!(
-            codex_body_reset(body, now).map(|at| at.unix_timestamp()),
+            refusal.reset.map(|at| at.unix_timestamp()),
             Some(1_900_007_200)
         );
     }
@@ -1231,7 +1213,10 @@ mod tests {
         ] {
             let mut quota = Quota::default();
 
-            let _ = quota.update_from_codex_response(&headers, 429, body.as_bytes());
+            let refusal =
+                CodexQuotaRefusal::parse(&headers, body.as_bytes(), OffsetDateTime::now_utc())
+                    .expect("body quota refusal");
+            let _ = quota.update_from_codex_refusal(&headers, 429, Some(&refusal));
 
             assert_eq!(quota.status.as_deref(), Some("rejected"));
             assert_eq!(
@@ -2341,10 +2326,18 @@ mod tests {
     fn codex_refusal_discards_past_body_resets() {
         let now = OffsetDateTime::now_utc();
         let body = serde_json::json!({"error": {"type": "usage_limit_reached", "resets_at": now.unix_timestamp() - 5}});
-        assert_eq!(codex_body_reset(body.to_string().as_bytes(), now), None);
-        let relative = serde_json::json!({"error": {"resets_at": now.unix_timestamp() - 5, "resets_in_seconds": 30}});
+        let headers = TestHeaders::new(&[]);
         assert_eq!(
-            codex_body_reset(relative.to_string().as_bytes(), now),
+            CodexQuotaRefusal::parse(&headers, body.to_string().as_bytes(), now)
+                .expect("quota refusal with an elapsed reset")
+                .reset,
+            None
+        );
+        let relative = serde_json::json!({"error": {"type": "usage_limit_reached", "resets_at": now.unix_timestamp() - 5, "resets_in_seconds": 30}});
+        assert_eq!(
+            CodexQuotaRefusal::parse(&headers, relative.to_string().as_bytes(), now)
+                .expect("quota refusal with a relative reset")
+                .reset,
             Some(now + Duration::seconds(30))
         );
     }

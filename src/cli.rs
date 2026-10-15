@@ -2909,8 +2909,8 @@ fn account_status_rows_at(
                 // one TcrBar could not otherwise see: `rejected`, the provider's
                 // own refusal. On an Anthropic row that is the
                 // `anthropic-ratelimit-unified-status: rejected` header. On a
-                // Codex row, a 429 that carried `x-codex-rate-limit-reached-type`
-                // (`crate::quota::is_codex_quota_refusal`) reads as the full
+                // Codex row, a 429 parsed as `crate::quota::CodexQuotaRefusal`
+                // from its body or reached-type header reads as the full
                 // window that refused it, else as the live hold while it lasts
                 // (`hold`, or `refused` when an upstream 403 armed it), and as
                 // `rejected` only when neither explains it: the snapshot's

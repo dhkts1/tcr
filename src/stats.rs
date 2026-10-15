@@ -116,8 +116,8 @@ pub enum GateReason {
     Login,
     /// The provider itself refused this account. On an Anthropic account that is
     /// an `anthropic-ratelimit-unified-status: rejected` header; on a Codex account
-    /// it is a 429 that carried `x-codex-rate-limit-reached-type`
-    /// ([`crate::quota::is_codex_quota_refusal`]). Unlike a window it carries no
+    /// it is a 429 whose body or reached-type header identifies a quota refusal
+    /// ([`crate::quota::CodexQuotaRefusal::parse`]). Unlike a window it carries no
     /// reset to wait on, so it names no time. It still ends without a human: a usage
     /// probe that sees one of the account's windows roll clears it, on either
     /// provider, and on a Codex account so does a probe that reads the account

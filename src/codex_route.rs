@@ -117,7 +117,7 @@ pub fn codex_route_in_process(
     codex_accounts: usize,
     codex_upstream: &str,
 ) -> CodexRoute {
-    let upstream = (codex_upstream != crate::config::default_codex_upstream())
+    let upstream = (!crate::config::is_default_codex_upstream(codex_upstream))
         .then(|| codex_upstream.to_string());
     decide(
         mitm,
