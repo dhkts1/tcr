@@ -114,6 +114,9 @@ final class MenuBarShell {
             panelDensityPreference: panelDensityPreference,
             groupController: groupController, updater: updater,
             claudeRoute: claudeRoute,
+            // Built with the window and kept with it, so a re-open shows the
+            // last reading while the new one runs.
+            configSettings: ConfigSettingsController(),
             onWhatsNew: { [weak self] in self?.openWhatsNew() }))
 
     /// The banner, and the memory of what has already been said. Built after

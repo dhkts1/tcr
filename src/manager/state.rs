@@ -38,7 +38,8 @@ impl Manager {
     /// and the client-side prompt-cache hit ratio dropped 0.952 → 0.498 with
     /// cache_creation rising 6.5M/hour → 122M/hour, sustained seven hours — a
     /// single missing key costing roughly 100M re-created tokens per hour.
-    /// Same read pattern as [`Self::probe_interval_seconds`]. When explicitly
+    /// The read itself is [`crate::config::Config::session_affinity_enabled`],
+    /// which `tcr config show` calls too. When explicitly
     /// disabled, the hybrid server injects no `SessionKey` extension, so
     /// `select` always receives `affinity = None` and the disabled path is
     /// inert.
@@ -46,10 +47,7 @@ impl Manager {
         self.config
             .lock()
             .expect("config lock poisoned")
-            .extra
-            .get("sessionAffinity")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
+            .session_affinity_enabled()
     }
 
     /// Over-threshold revalidation-serve is ON by default; set top-level

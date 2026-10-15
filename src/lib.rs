@@ -30,6 +30,7 @@ pub mod codex_route;
 mod codex_token_store;
 pub mod config;
 pub mod config_keys;
+pub mod config_show;
 pub mod control_identity;
 pub mod demo;
 pub mod doctor;

@@ -1281,6 +1281,20 @@ pub fn list_groups(config_path: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tcr config show [--json]`: the rotation and limit settings this file
+/// gives a server, defaults applied. Offline, through the same loader as
+/// [`list_groups`]; see [`crate::config_show`].
+pub fn show_config(config_path: &Path, json: bool) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let settings = crate::config_show::ConfigSettings::from_config(&config, config_path);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&settings)?);
+    } else {
+        print!("{}", settings.render_text());
+    }
+    Ok(())
+}
+
 /// Group name -> the (in-order) names of every account carrying that label,
 /// plus the count of accounts carrying NO label at all. An account in several
 /// groups appears once per group it is in — this is the shared aggregation
