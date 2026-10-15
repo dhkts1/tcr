@@ -45,7 +45,7 @@
 //! holds a Codex line, so a Claude-only ledger's report is byte for byte what it
 //! was.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::Serialize;
@@ -157,11 +157,11 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// One provider's share of the period, for the `by provider` block: `claude` or `codex`.
+/// One provider's share of the period, using the shared provider vocabulary.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRow {
-    pub provider: String,
+    pub provider: Provider,
     pub requests: u64,
     pub cost_usd: f64,
     #[serde(skip_serializing_if = "is_zero")]
@@ -289,7 +289,7 @@ fn accumulate(
     account: &mut BTreeMap<String, Agg>,
     day: &mut BTreeMap<Date, Agg>,
     sessions: &mut BTreeMap<u64, u64>,
-    providers: &mut [Agg; 2],
+    providers: &mut HashMap<Provider, Agg>,
     filed_by_model_id: &mut usize,
 ) -> usize {
     let mut malformed = 0;
@@ -313,11 +313,10 @@ fn accumulate(
             if let Some(session) = line.s {
                 *sessions.entry(session).or_default() += 1;
             }
-            providers[match usage::line_provider(line) {
-                Provider::Anthropic => 0,
-                Provider::Codex => 1,
-            }]
-            .add(pricing, line);
+            providers
+                .entry(usage::line_provider(line))
+                .or_default()
+                .add(pricing, line);
             if usage::filed_by_model_id(line) {
                 *filed_by_model_id += 1;
             }
@@ -341,7 +340,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
     let mut account_agg: BTreeMap<String, Agg> = BTreeMap::new();
     let mut day_agg: BTreeMap<Date, Agg> = BTreeMap::new();
     let mut sessions: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut providers = [Agg::default(); 2];
+    let mut providers = HashMap::new();
     let mut lines_filed_by_model_id = 0;
     let malformed_lines = accumulate(
         dir,
@@ -361,7 +360,7 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
     let mut unused_account = BTreeMap::new();
     let mut unused_day = BTreeMap::new();
     let mut unused_sessions = BTreeMap::new();
-    let mut unused_providers = [Agg::default(); 2];
+    let mut unused_providers = HashMap::new();
     let mut unused_filed_by_model_id = 0;
     accumulate(
         dir,
@@ -376,17 +375,18 @@ pub fn build_report(dir: &Path, days: u32, now_ms: i64, pricing: &PricingTable) 
         &mut unused_filed_by_model_id,
     );
 
-    // One row per provider that served, claude first, and only when the period holds a
-    // Codex line: a Claude-only report has no `by provider` block and no `byProvider` key.
-    let by_provider = (providers[1].requests > 0).then(|| {
-        [("claude", providers[0]), ("codex", providers[1])]
+    // Provider declaration order, and only when Codex served during this period.
+    // A Claude-only report keeps its previous shape.
+    let by_provider = providers.contains_key(&Provider::Codex).then(|| {
+        Provider::ALL
             .into_iter()
-            .filter(|(_, agg)| agg.requests > 0)
-            .map(|(provider, agg)| ProviderRow {
-                provider: provider.to_string(),
-                requests: agg.requests,
-                cost_usd: agg.cost_usd(),
-                unpriced_requests: agg.unpriced,
+            .filter_map(|provider| {
+                providers.get(&provider).map(|agg| ProviderRow {
+                    provider,
+                    requests: agg.requests,
+                    cost_usd: agg.cost_usd(),
+                    unpriced_requests: agg.unpriced,
+                })
             })
             .collect()
     });
@@ -555,7 +555,7 @@ pub fn render_text(report: &WrapReport) -> String {
         for row in rows {
             out.push_str(&format!(
                 "  {:<28} requests={:<8} cost={}\n",
-                row.provider,
+                row.provider.as_str(),
                 row.requests,
                 fmt_cost(row.cost_usd, row.unpriced_requests)
             ));
@@ -1049,7 +1049,7 @@ mod tests {
                 "totals unpriced=3 (Codex requests with no price; the cost above covers priced requests only)\n",
                 "\n",
                 "by provider:\n",
-                "  claude                       requests=2        cost=$12.50\n",
+                "  anthropic                    requests=2        cost=$12.50\n",
                 "  codex                        requests=3        cost=n/a (3 unpriced)\n",
                 "\n",
                 "by model (sorted by cost):\n",
@@ -1214,7 +1214,7 @@ mod tests {
             .iter()
             .map(|row| (row.provider.as_str(), row.requests))
             .collect();
-        assert_eq!(providers, [("claude", 1), ("codex", 4)]);
+        assert_eq!(providers, [("anthropic", 1), ("codex", 4)]);
         assert!(render_text(&report)
             .ends_with("note: 3 older ledger line(s) carry no provider; filed by model id\n"));
         assert!(!serde_json::to_string(&report)
@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&report).expect("serializes")["byProvider"],
             serde_json::json!([
-                { "provider": "claude", "requests": 2, "costUsd": 12.5 },
+                { "provider": "anthropic", "requests": 2, "costUsd": 12.5 },
                 { "provider": "codex", "requests": 3, "costUsd": 0.0, "unpricedRequests": 3 }
             ])
         );

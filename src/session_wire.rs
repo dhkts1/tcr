@@ -1812,6 +1812,10 @@ impl ReqPerMinuteRing {
 /// Model this session has never been attributed a usage record under.
 const UNKNOWN_MODEL: &str = "unknown";
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 /// One model's raw token tally within a session — the input to pricing, kept apart from
 /// [`WireSession::input_tokens`] and friends (the QUOTA counters, unchanged in meaning) so a
 /// session that spans two models can be priced per-model and summed, rather than priced once
@@ -1825,9 +1829,9 @@ pub struct ModelTokenTally {
     pub cache_1h: u64,
     pub cache_read: u64,
     pub output: u64,
-    /// How many usage records this tally holds, so a session can say how many of its requests
-    /// no price covers. `#[serde(default)]` so a cache file written before it still loads.
-    #[serde(default)]
+    /// Codex usage records in this tally, so its session can count unpriced requests.
+    /// Zero and omitted for Claude; older cache files still load with that default.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub requests: u64,
 }
 
@@ -1876,8 +1880,8 @@ pub struct WireSession {
     )]
     pub provider: crate::provider::Provider,
     /// A Codex session's reasoning tokens: the part of `output_tokens` its model spent
-    /// reasoning, already counted inside it. 0 on every Anthropic session.
-    #[serde(default)]
+    /// reasoning, already counted inside it. Zero and omitted on Anthropic sessions.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub reasoning_tokens: u64,
     /// When a Codex session's latest usage was recorded: the stamp of the usage record its
     /// last finished turn produced, which lands when the stream ends, after `last_seen_ms`
@@ -2155,7 +2159,7 @@ impl WireSessionTracker {
 
     /// The token half of a response's usage, shared by [`Self::record_usage`] and
     /// [`Self::record_codex_usage`]: the session's totals and its per-model tally, which also
-    /// counts the usage record, so a session can say how many of its requests no price covers.
+    /// counts Codex usage records so its session can report unpriced requests.
     fn add_usage(
         entry: &mut WireSession,
         model: Option<&str>,
@@ -2178,7 +2182,10 @@ impl WireSessionTracker {
         tally.cache_1h += cache_1h;
         tally.cache_read += cache_read;
         tally.output += output;
-        tally.requests += 1;
+        match entry.provider {
+            crate::provider::Provider::Anthropic => {}
+            crate::provider::Provider::Codex => tally.requests += 1,
+        }
     }
 
     /// Insert tool calls parsed from the RESPONSE this session's last request produced, as
@@ -3320,6 +3327,47 @@ mod tests {
             sessions["sess-claude"].provider,
             crate::provider::Provider::Anthropic
         );
+    }
+
+    #[test]
+    fn claude_session_cache_keeps_its_pre_codex_shape() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_request("sess-claude", None, None, 1_000, &[], &[]);
+        tracker.record_usage("sess-claude", Some("claude-opus-5"), 100, 0, 0, 25, 10);
+        let (_, session) = tracker.snapshot(1_000).pop().unwrap();
+        let wire = serde_json::to_value(&session).unwrap();
+        assert!(wire.get("provider").is_none());
+        assert!(wire.get("reasoning_tokens").is_none(), "{wire}");
+        assert!(
+            wire["by_model"]["claude-opus-5"].get("requests").is_none(),
+            "{wire}"
+        );
+        assert_eq!(
+            wire["requests"], 1,
+            "the existing session request count stays"
+        );
+        assert_eq!(wire["by_model"]["claude-opus-5"]["input"], 100);
+
+        tracker.record_codex_request("sess-codex", None, 1_000);
+        tracker.record_codex_usage(
+            "sess-codex",
+            Some("gpt-5.1-codex"),
+            100,
+            0,
+            0,
+            25,
+            10,
+            4,
+            1_000,
+        );
+        let (_, codex) = tracker
+            .snapshot(1_000)
+            .into_iter()
+            .find(|(id, _)| id == "sess-codex")
+            .unwrap();
+        let wire = serde_json::to_value(codex).unwrap();
+        assert_eq!(wire["reasoning_tokens"], 4);
+        assert_eq!(wire["by_model"]["gpt-5.1-codex"]["requests"], 1);
     }
 
     #[test]
