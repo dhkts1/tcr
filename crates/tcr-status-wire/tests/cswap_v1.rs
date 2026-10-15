@@ -196,6 +196,7 @@ fn base(name: &str) -> AccountStatusRow {
         credits: None,
         login_error: None,
         codex_home: None,
+        token_sync_pending: false,
         codex_route: None,
         codex_traffic: None,
         organization_type: None,
