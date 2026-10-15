@@ -782,6 +782,7 @@ main() {
   if [ "$dry_run" = 1 ]; then
     stage "stage 9/9  publish — SKIPPED (--dry-run)"
     note "would upload $(basename "$dmg") and appcast.xml to $repo release $tag"
+    note "would attach teamclaude-rs-installer.sh (attach-compat-installer.sh $tag)"
   else
     stage "stage 9/9  publish to the GitHub Release"
 
@@ -854,6 +855,15 @@ main() {
              "  Uploading anyway would leave the update feed 404ing on a cached miss."
 
     upload_release_assets "$tag" "$repo" "$dmg" "$appcast_path"
+
+    # The old-name installer every v1.1.21-or-older `tcr update` fetches from
+    # the latest release. Attached while the release is still prerelease, so
+    # it is never `latest` without it. Why it exists: build-compat-installer.sh.
+    "$here/attach-compat-installer.sh" "$tag" --repo "$repo" \
+      || die "could not attach teamclaude-rs-installer.sh; $tag is still prerelease." \
+             "  Fix it, then re-run and reveal by hand:" \
+             "    apps/macos/scripts/attach-compat-installer.sh $tag --repo $repo" \
+             "    gh release edit $tag --prerelease=false --latest --repo $repo"
 
     # Only now is it safe to be the newest thing Sparkle looks at.
     gh release edit "$tag" --prerelease=false --latest --repo "$repo" >/dev/null \
