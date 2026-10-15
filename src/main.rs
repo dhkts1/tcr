@@ -6520,8 +6520,8 @@ impl CodexLaunch {
     }
 }
 
-/// Decide how `tcr run --codex` launches `codex`. Pure: every row is a table
-/// test, and nothing here loads, mints or writes anything.
+/// Decide how `tcr run --codex` launches `codex`. Read-only: caller CA bundles are
+/// checked for tcr's certificate, and nothing here mints or writes a certificate.
 ///
 /// # The running proxy decides
 ///
@@ -6569,8 +6569,17 @@ fn codex_launch(
             .map_or(0, codex_route::listed_codex_accounts),
     );
     if route.pooled {
+        let trusted_ca = match codex_route::codex_ca_for_launch(ca, inherited) {
+            Ok(bundle) => bundle,
+            Err(reason) => {
+                return Ok(CodexLaunch::Direct {
+                    reason,
+                    unset: proxy_vars_at(port, inherited),
+                })
+            }
+        };
         return Ok(CodexLaunch::SeeThrough {
-            ca: ca.to_path_buf(),
+            ca: trusted_ca,
             no_proxy: no_proxy_rewrites(mitm_codex_host(), inherited),
         });
     }
@@ -6662,7 +6671,7 @@ fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &Codex
                 cmd,
                 port,
                 ca,
-                std::env::var_os("CODEX_CA_CERTIFICATE").is_some(),
+                std::env::var_os("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
             );
             apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
             // This affects shell-like tools, not Codex's own HTTP/WebSocket clients.
@@ -8938,6 +8947,67 @@ mod tests {
             "{} row(s) wrong:\n{}",
             wrong.len(),
             wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_codex_launch_keeps_a_corporate_ca_and_runs_direct_when_tcr_is_absent() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ca = scratch.path().join("tcr.pem");
+        let corporate = scratch.path().join("corporate.pem");
+        std::fs::write(&ca, "tcr certificate fixture").unwrap();
+        std::fs::write(&corporate, "different corporate certificate fixture").unwrap();
+        let live = live_status(Some(
+            serde_json::json!({"interceptedHosts": ["chatgpt.com"], "leaf": "minted"}),
+        ));
+        for variable in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
+            let corporate = corporate.to_str().unwrap();
+            let launch = codex_launch(
+                &run_args(CODEX_RUN),
+                3999,
+                &live,
+                &ca,
+                true,
+                &inherited(&[
+                    ("HTTPS_PROXY", "http://127.0.0.1:3999"),
+                    (variable, corporate),
+                ]),
+            )
+            .unwrap();
+            let CodexLaunch::Direct { reason, unset } = launch else {
+                panic!(
+                    "pooling without trust in both CAs must not break a working corporate setup"
+                );
+            };
+            assert!(reason.contains(variable));
+            assert_eq!(unset, ["HTTPS_PROXY"]);
+        }
+    }
+
+    #[test]
+    fn a_pooled_codex_launch_uses_the_callers_complete_ssl_bundle() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ca = scratch.path().join("tcr.pem");
+        let bundle = scratch.path().join("bundle.pem");
+        let generated = rcgen::generate_simple_self_signed(vec!["example.test".into()]).unwrap();
+        let pem = generated.cert.pem();
+        std::fs::write(&ca, &pem).unwrap();
+        std::fs::write(&bundle, format!("# caller bundle\n{pem}")).unwrap();
+        let live = live_status(Some(
+            serde_json::json!({"interceptedHosts": ["chatgpt.com"], "leaf": "minted"}),
+        ));
+        let launch = codex_launch(
+            &run_args(CODEX_RUN),
+            3999,
+            &live,
+            &ca,
+            true,
+            &inherited(&[("SSL_CERT_FILE", bundle.to_str().unwrap())]),
+        )
+        .unwrap();
+        assert!(
+            matches!(launch, CodexLaunch::SeeThrough {ca, ..} if ca == bundle),
+            "setting CODEX_CA_CERTIFICATE must retain the caller's complete bundle"
         );
     }
 

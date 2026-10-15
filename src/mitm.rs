@@ -717,21 +717,35 @@ fn generate_and_persist(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAsse
     })
 }
 
-/// What tcr prints when it mints a fresh CA: the export that makes a client trust it.
-/// `NODE_EXTRA_CA_CERTS` is the variable claude (node) reads; once the config holds a Codex
-/// account (`holds_codex`) the line also names `CODEX_CA_CERTIFICATE`, the one codex reads
-/// (`openai/codex` f82e365, `http-client/src/custom_ca.rs:385-409`), so a codex reaching this
-/// proxy some other way than `tcr run --codex` can trust the leaf too.
-pub fn ca_export_hint(ca: &Path, holds_codex: bool) -> String {
-    let codex = if holds_codex {
-        format!(" CODEX_CA_CERTIFICATE={}", ca.display())
-    } else {
-        String::new()
+/// Compare certificate bytes, so an extra-CA bundle can retain corporate roots and tcr's CA.
+/// An identical path needs no second read; the route already checked tcr's CA exists.
+pub fn ca_bundle_contains(bundle: &Path, ca: &Path) -> bool {
+    if bundle == ca {
+        return true;
+    }
+    let certs = |path: &Path| -> std::io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        let bytes = std::fs::read(path)?;
+        rustls_pemfile::certs(&mut bytes.as_slice()).collect()
     };
-    format!(
-        "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}{codex}",
+    match (certs(bundle), certs(ca)) {
+        (Ok(bundle), Ok(required)) => {
+            !required.is_empty() && required.iter().all(|cert| bundle.contains(cert))
+        }
+        _ => false,
+    }
+}
+
+/// Scope Codex's proxy marker and CA to its launch; never export either for the whole shell.
+/// Claude can keep using its existing NODE_EXTRA_CA_CERTS setup.
+pub fn ca_export_hint(ca: &Path, holds_codex: bool) -> String {
+    let mut line = format!(
+        "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}",
         ca.display()
-    )
+    );
+    if holds_codex {
+        line.push_str("\n[tcr] for Codex, use `tcr run --codex` to scope proxy routing and CA trust to that launch");
+    }
+    line
 }
 
 /// The log line for a leaf re-minted under the persisted CA, which keeps every exported CA
@@ -2188,8 +2202,8 @@ mod tests {
         assert_eq!(
             ca_export_hint(ca, true),
             "[tcr] minted a fresh MITM CA — trust it with:\n         \
-             export NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem \
-             CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem"
+             export NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem\n\
+             [tcr] for Codex, use `tcr run --codex` to scope proxy routing and CA trust to that launch"
         );
         assert_eq!(
             remint_note(false),

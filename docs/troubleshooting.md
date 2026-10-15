@@ -321,9 +321,11 @@ never pooled. `tcr login --from-codex` refuses to import such a login, saying wh
 `codex` takes one extra CA bundle: `CODEX_CA_CERTIFICATE` when it is set, and `SSL_CERT_FILE`
 only when it is not (`openai/codex@f82e365`, `codex-rs/http-client/src/custom_ca.rs:393-411`).
 A Claude `tcr run` leaves `CODEX_CA_CERTIFICATE` unchanged, so a nested unmarked Codex
-connection retains its original CA choice. A pooled `tcr run --codex` preserves an explicit
-`CODEX_CA_CERTIFICATE`; otherwise it sets tcr's CA. If your network also needs a corporate CA,
-point that variable at a PEM bundle containing both certificates before launching. This matters
+connection retains its original CA choice. `tcr run --codex` preserves the selected caller
+bundle, including `SSL_CERT_FILE` when no Codex-specific bundle is set. If that bundle lacks
+tcr's certificate, it launches directly on Codex's own login and prints the reason. To pool,
+use a PEM bundle containing both the corporate CA and tcr's CA before launching. Doctor checks
+the actual certificates in a bundle, including when its path differs from tcr's CA. This matters
 for tunneled hosts such as `auth.openai.com` as well as marked ChatGPT connections. Codex reads
 `SSL_CERT_FILE` only when `CODEX_CA_CERTIFICATE` is unset.
 

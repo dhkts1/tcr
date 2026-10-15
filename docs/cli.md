@@ -221,7 +221,9 @@ launch leaves `codex` on its own backend URL, which is the real `https://chatgpt
 login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to
 `http://tcr-codex@127.0.0.1:<port>`, and sets
 `CODEX_CA_CERTIFICATE` to tcr's CA, `~/.config/tcr-ca.pem`, unless you supplied that variable.
-An explicit bundle is preserved and must include tcr's CA. That variable is where `codex`
+The selected caller bundle (`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`) is preserved
+in full and must include tcr's CA. If it does not, tcr launches Codex directly on its own
+login and explains how to include both certificates. That variable is where `codex`
 takes an extra CA from, and it takes none from `NODE_EXTRA_CA_CERTS`. Of Claude's variables only
 `NODE_EXTRA_CA_CERTS` is set, to the same CA, for a `claude` started inside the session, and not
 when you exported one, which the session then inherits untouched. A login whose ChatGPT
@@ -339,8 +341,8 @@ so: `[tcr] dropped .chatgpt.com from NO_PROXY for codex: it exempts chatgpt.com 
 and the session would bypass tcr`. Every other entry keeps exempting what it did, and a
 variable left with no entries stays set, as an empty value.
 
-**`CODEX_CA_CERTIFICATE` outranks `SSL_CERT_FILE` in `codex`,** so a corporate CA that you
-supply through `SSL_CERT_FILE` stops applying inside a pooled session; see
+**`CODEX_CA_CERTIFICATE` outranks `SSL_CERT_FILE` in `codex`.** tcr keeps the selected
+bundle, including corporate CAs, and pools only when it also contains tcr's certificate; see
 [troubleshooting.md](troubleshooting.md#a-corporate-ssl_cert_file-is-ignored-under-tcr-run-and-tcr-run---codex).
 
 **`--group` is refused.** `tcr run --codex --group <name>` fails before anything launches, with

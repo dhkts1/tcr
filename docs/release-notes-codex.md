@@ -25,8 +25,11 @@ changes ship; that release body is the changelog shown by TcrBar.
 - A Codex quota or rate-limit error inside a successful SSE stream holds its serving account
   so the next pinned turn can rotate. Disabled and otherwise unusable rows cannot hide a spent
   pool's real reset. Other stream errors remain observational.
-- Claude launches preserve Codex CA settings. Codex launches preserve an explicit CA bundle
-  and provide an unmarked proxy URL to their shell tools, without changing Codex's config file.
+- Claude launches preserve Codex CA settings. Codex launches preserve the complete selected
+  CA bundle, including corporate roots from `SSL_CERT_FILE`. A bundle missing tcr's CA causes
+  a direct launch on Codex's own login with an explanation. Shell tools get an unmarked proxy,
+  without changing Codex's config file. Doctor recognizes combined bundles and reports
+  keyring-backed sign-in as unchecked when no auth file exists.
 - Imported logins can recover a newer refresh token even when its access token has expired.
   Failed write-backs retry with backoff while the original source token still matches.
   Pending publication survives restart and appears as `token_sync=pending` in text status,

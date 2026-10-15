@@ -26,6 +26,25 @@ use tcr_status_wire::CodexRoute;
 use crate::cli::LiveStatusError;
 use crate::status::{MitmStatus, StatusPayload};
 
+/// The extra-CA file a launched Codex reads. Preserve the caller's complete bundle;
+/// without tcr's certificate, launching on its own login preserves working corporate TLS.
+pub fn codex_ca_for_launch(
+    ca: &Path,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> Result<std::path::PathBuf, String> {
+    for variable in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
+        if let Some(bundle) = inherited(variable).filter(|value| !value.is_empty()) {
+            let bundle = std::path::PathBuf::from(bundle);
+            return if crate::mitm::ca_bundle_contains(&bundle, ca) {
+                Ok(bundle)
+            } else {
+                Err(format!("{variable} does not include tcr's CA; keep the caller's trust settings and use codex's own login. Add tcr's CA to that bundle before retrying `tcr run --codex` to pool it"))
+            };
+        }
+    }
+    Ok(ca.to_path_buf())
+}
+
 /// Nothing listens on the proxy's port.
 pub const NO_PROXY: &str = "no-proxy";
 /// Something listens, but its status could not be read.

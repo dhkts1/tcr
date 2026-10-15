@@ -696,12 +696,12 @@ impl CodexEnv {
         })
     }
 
-    /// Whether a codex started here trusts `ca`: the CA it reads first names it.
+    /// Whether Codex's selected extra-CA file names or contains tcr's certificate.
     fn trusts(&self, ca: &Path) -> bool {
         self.codex_ca_certificate
             .as_deref()
             .or(self.ssl_cert_file.as_deref())
-            .is_some_and(|file| Path::new(file) == ca)
+            .is_some_and(|file| crate::mitm::ca_bundle_contains(Path::new(file), ca))
     }
 }
 
@@ -846,8 +846,8 @@ impl CodexReport {
         }
         if !self.login_exists {
             problems.push(
-                "codex needs a login of its own to start, even when pooled: run `codex login` \
-                 once"
+                "auth.json is absent; a keyring-backed Codex login is not checked. Run codex \
+                 once to verify its own sign-in before using the pool"
                     .to_string(),
             );
         }
@@ -1202,7 +1202,16 @@ pub fn inspect_codex(
     let rows = codex_rows(live, config);
     let ca = crate::mitm::minted_ca_path();
     let ca_readable = ca.is_file();
-    let route = crate::codex_route::codex_route(live, port, &ca, ca_readable, rows.len());
+    let mut route = crate::codex_route::codex_route(live, port, &ca, ca_readable, rows.len());
+    if route.pooled {
+        if let Err(reason) =
+            crate::codex_route::codex_ca_for_launch(&ca, &|var| std::env::var(var).ok())
+        {
+            route.pooled = false;
+            route.code = Some(crate::codex_route::NO_CA.to_string());
+            route.reason = Some(reason);
+        }
+    }
     let default_upstream = crate::config::default_codex_upstream();
     let (upstream, upstream_is_default) = match live {
         Ok(payload) => match &payload.codex_upstream {
@@ -2081,8 +2090,8 @@ mod tests {
              read)",
         );
         expected.push(
-            "codexProblem: codex needs a login of its own to start, even when pooled: run \
-             `codex login` once"
+            "codexProblem: auth.json is absent; a keyring-backed Codex login is not checked. Run codex \
+             once to verify its own sign-in before using the pool"
                 .to_string(),
         );
         assert_eq!(signed_out.block_lines(), expected);
@@ -2149,6 +2158,57 @@ mod tests {
         assert_eq!(
             rows[0].gate, None,
             "configuration is not a measured live gate"
+        );
+    }
+
+    #[test]
+    fn codex_ca_trust_accepts_a_bundle_containing_the_tcr_certificate() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ca = scratch.path().join("tcr.pem");
+        let bundle = scratch.path().join("bundle.pem");
+        let unrelated = scratch.path().join("other.pem");
+        let generated = rcgen::generate_simple_self_signed(vec!["example.test".into()]).unwrap();
+        let other = rcgen::generate_simple_self_signed(vec!["other.example.test".into()]).unwrap();
+        std::fs::write(&ca, generated.cert.pem()).unwrap();
+        std::fs::write(
+            &bundle,
+            format!("{}\n{}", other.cert.pem(), generated.cert.pem()),
+        )
+        .unwrap();
+        std::fs::write(&unrelated, other.cert.pem()).unwrap();
+        for explicit_codex in [false, true] {
+            let mut env = CodexEnv::default();
+            if explicit_codex {
+                env.codex_ca_certificate = Some(bundle.display().to_string());
+            } else {
+                env.ssl_cert_file = Some(bundle.display().to_string());
+            }
+            assert!(
+                env.trusts(&ca),
+                "a combined bundle trusts the exact certificate"
+            );
+            env.codex_ca_certificate = Some(unrelated.display().to_string());
+            assert!(
+                !env.trusts(&ca),
+                "CODEX_CA_CERTIFICATE takes precedence over SSL_CERT_FILE"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_doctor_does_not_call_an_unchecked_keyring_login_missing() {
+        let report = CodexReport {
+            login_exists: false,
+            ..codex_report(pooled())
+        };
+        let problems = report.problems().join(" ");
+        assert!(
+            problems.contains("keyring"),
+            "the login may use Codex's keyring store: {problems}"
+        );
+        assert!(
+            !problems.contains("codex login"),
+            "do not revoke a possibly healthy keyring login: {problems}"
         );
     }
 

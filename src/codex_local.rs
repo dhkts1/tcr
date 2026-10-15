@@ -9,9 +9,9 @@
 //!   `codex-rs/login/src/auth/storage.rs:47-73,162-163` and
 //!   `codex-rs/utils/home-dir/src/lib.rs:5-18`). Its `keyring` and `auto` stores keep it in the
 //!   system keyring instead (the service `"Codex Auth"`, `storage.rs:243`), which tcr never
-//!   opens. tcr only needs to know whether codex could start signed in, and a `metadata` call
-//!   answers that without tcr ever holding a copy of someone else's token: a file tcr cannot
-//!   read still counts.
+//!   opens. A metadata check proves only that the file exists, not whether a keyring-backed
+//!   login is present. Doctor reports that case as unchecked; a file tcr cannot read still
+//!   counts as a file, without tcr holding a copy of someone else's token.
 //! - **The binary** ([`find_codex`]). One rule finds `codex` for `tcr login --codex`,
 //!   `tcr run --codex` and the doctor, so the three never disagree about which codex a person
 //!   has. A set `TCR_CODEX_BIN` or `CODEX_BIN` always decides and never falls through, so a
