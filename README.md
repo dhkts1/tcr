@@ -207,8 +207,8 @@ a fixed period, and a restart scatters them again instead of lining them up.
 price of its model's own provider, per account and per model, split into input, output, cache
 reads and cache writes. No OpenAI model has a built-in price, so a Codex request stays unpriced
 until [`pricing`](docs/configuration.md#pricing-and-usageretentiondays) names its model. The
-panel shows today's spend, the burn rate over the last hour, the model mix and the cache hit rate;
-the terminal dashboard shows no spend. The ledger reloads from disk at boot, so a restart does
+panel shows today's spend, the burn rate over the last hour and the cache hit rate; the terminal
+dashboard shows no spend. The ledger reloads from disk at boot, so a restart does
 not reset the day. None of this is a bill: these accounts are subscriptions, and list price is
 simply the one unit you can compare across accounts, models and days. Traffic that could not be
 priced shows no figure rather than a zero, an account that served nothing shows a real zero, and

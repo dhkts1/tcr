@@ -529,9 +529,9 @@ left behind) writes nothing, and says how it ended; under `--non-interactive`, w
 The folder is deleted as soon as the login is read, before the workspace check goes out on the
 network, and on every way out tcr can see: a failed sign-in, a refusal, and a cancel. SIGTERM,
 SIGINT or SIGHUP (TcrBar's Cancel, Ctrl-C, a closed terminal) stops `codex login` and everything it
-started, deletes the folder and exits with 128 plus the signal's number. Only a SIGKILL of tcr can
-leave a folder behind, holding a live login; [architecture.md](architecture.md#files-on-disk)
-lists it.
+started, deletes the folder and exits with 128 plus the signal's number. A signal tcr does not trap
+(a SIGKILL above all, or the SIGQUIT that Ctrl-\ sends) can leave a folder behind, holding a live
+login; [architecture.md](architecture.md#files-on-disk) lists it.
 
 ```
 $ tcr login --codex
@@ -1491,10 +1491,10 @@ launch prints, verbatim:
 | `predates` | `the proxy on :<port> (build <sha>) predates Codex interception — restart it on this build at a quiet moment` |
 | `js-leaf` | `the proxy on :<port> is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md` |
 | `mitm-off` | `the proxy on :<port> is running without MITM: its TLS material failed to load at boot — see its log` |
-| `no-codex-account` | `` the proxy on :<port> holds no Codex account, so it blind-tunnels chatgpt.com and codex keeps its own login — add one with `tcr login --codex` `` |
-| `no-ca` | `no readable CA at <path>` |
 | `leaf-missing-host` | `the proxy on :<port> serves a leaf it minted but does not intercept chatgpt.com (it intercepts [<hosts>])` |
 | `unknown-leaf` | `the proxy on :<port> (build <sha>) reports a leaf this build does not know ("<leaf>") — run tcr run --codex from the same build as the proxy` |
+| `no-codex-account` | `` the proxy on :<port> holds no Codex account, so it blind-tunnels chatgpt.com and codex keeps its own login — add one with `tcr login --codex` `` |
+| `no-ca` | `no readable CA at <path>` |
 
 They are tried in that order, and the first that holds wins; what each needs is under
 [`--codex`](#--codex-launching-codex-through-the-pool). `--json` carries a route only from a
@@ -1556,7 +1556,7 @@ tcr status --json | jq '.[] | {name, today: .usage.today.costUsd, hour: .usage.l
 |---|---|---|
 | `usage.today` | totals | the **local calendar day** of the machine the server runs on |
 | `usage.window` | totals + `since` | this account's current 5-hour quota window, read from its provider's own reset header: Anthropic's for a Claude account, Codex's for a Codex one. `null` when that reset is unknown, because then the window's start cannot be named |
-| `usage.sevenDayWindow` | totals + `since` | a Codex account's current weekly quota window. `since` is the weekly reset minus the window's length, which is seven days unless the plan reports another, and the totals are what the account spent since. Absent on a Claude row, and when the weekly reset is unknown. `usage.window` stays the 5-hour window |
+| `usage.sevenDayWindow` | totals + `since` | a Codex account's current weekly quota window. `since` is the weekly reset minus the window's length, which is seven days unless the plan reports another, and the totals are what the account spent since. Absent on a Claude row, when the weekly reset is unknown, and when the window opened more than seven days ago, because tcr keeps only a week of a Codex account's per-minute usage: a 30-day window carries the key only in its first seven days. `usage.window` stays the 5-hour window |
 | `usage.lastHour` | totals | the trailing 60 minutes — burn rate is `lastHour.costUsd` per hour, by definition |
 | `usage.todayByModel` | `{model: totals}` | `today`, split by model id |
 
@@ -1820,7 +1820,7 @@ The block's keys, in order:
 
 | key | what it reads |
 |---|---|
-| `codexAccounts` | the Codex accounts, counted by why each is out, in the words tcr's own 429 gives `codex`: `in rotation`, `on an upstream hold`, `refused upstream (403)`, `in the 5-hour window`, `in the weekly window`, `needing re-login`, `refused by ChatGPT`, `disabled`, `unreachable in a reserved group`, `in a parked group`, in that order. An account ChatGPT refused (its row carries `limitReachedType`) counts as `refused by ChatGPT` whatever its gate, an upstream hold or 403 included, since that refusal outlasts the hold. The rows are the running proxy's, which leave out an account deleted while it runs; with no proxy answering they are the config's, which carry no gate: `2 (no proxy answered)`. `0` with none |
+| `codexAccounts` | the Codex accounts, counted by why each is out, in the words tcr's own 429 gives `codex`: `in rotation`, `on an upstream hold`, `refused upstream (403)`, `in the 5-hour window`, `in the weekly window`, `needing re-login`, `refused by ChatGPT`, `disabled`, `unreachable in a reserved group`, `in a parked group`, in that order. An account held by an upstream hold or 403 while ChatGPT's refusal stands (its row carries `limitReachedType`) counts as `refused by ChatGPT`, since that refusal outlasts the hold; one that a full window refused keeps that window's phrase (`in the 5-hour window` or `in the weekly window`). The rows are the running proxy's, which leave out an account deleted while it runs; with no proxy answering they are the config's, which carry no gate: `2 (no proxy answered)`. `0` with none |
 | `codexIntercept` | whether the proxy terminates `chatgpt.com`: `yes` when `codex` is pooled, and when only tcr's CA file is missing; `no` when the proxy's leaf cannot cover `chatgpt.com`, it runs without MITM, or it holds no Codex account; `unknown` when no proxy answered, its status could not be read, or it is another build, one that predates the report or names a leaf this build does not know |
 | `codexCa` | tcr's CA, `~/.config/tcr-ca.pem`, and whether it is a readable file. It is never loaded |
 | `codexUpstream` | where Codex requests go, `(default)` or `(set by codexUpstream)`: the running proxy's, or the config's when no proxy answered |
