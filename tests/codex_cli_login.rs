@@ -663,6 +663,89 @@ fn login_codex_prints_its_notices_only_when_they_hold() {
     assert_eq!(warned, [n2a], "warned once: {}", says(&out));
 }
 
+/// A `tcr` that answers like 0.2.44 and appends each argv it is run with to `ran`, in `dir`.
+fn planted_tcr(dir: &Path, ran: &Path) {
+    std::fs::create_dir_all(dir).expect("a directory for a planted tcr");
+    write_script(
+        &dir.join("tcr"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo \"tcr \
+             0.2.44\"; fi\n",
+            ran.display()
+        ),
+    );
+}
+
+/// Only an absolute `PATH` entry is searched for an older `tcr`. A relative entry, `.` above
+/// all, names whatever directory the login was started in, so the scan would run a `tcr`
+/// planted there, a freshly cloned repository's, even where the shell would never reach it.
+/// Here such a `tcr` sits in the working directory with `.` on `PATH`: it is never run and
+/// never warned about. The control names the same directory absolutely, and that `tcr` is run
+/// and warned about.
+///
+/// Watched red: without the absolute-entry filter, the planted `tcr` runs and is warned about
+/// as `./tcr`.
+#[test]
+fn a_relative_path_entry_is_never_searched_for_an_older_tcr() {
+    let scratch = Scratch::new("[]");
+    scratch.fake_codex(0, &browser_lines(), Some(&bob_auth()));
+    let cwd = scratch.path("cloned-repo");
+    let ran = scratch.path("planted-tcr-ran.txt");
+    planted_tcr(&cwd, &ran);
+    let out = scratch.login_with(&["--non-interactive"], |command| {
+        command
+            .env(
+                "PATH",
+                format!("{}:.", scratch.path("empty-path").display()),
+            )
+            .current_dir(&cwd);
+    });
+    assert_eq!(out.status.code(), Some(0), "{}", says(&out));
+    assert!(
+        !ran.exists(),
+        "the tcr in the working directory was run: {}",
+        says(&out)
+    );
+    let warned: Vec<String> = notices(&events(&out))
+        .into_iter()
+        .filter(|text| text.starts_with("the tcr at "))
+        .collect();
+    assert!(warned.is_empty(), "{}", says(&out));
+
+    let scratch = Scratch::new("[]");
+    scratch.fake_codex(0, &browser_lines(), Some(&bob_auth()));
+    let cwd = scratch.path("cloned-repo");
+    let ran = scratch.path("planted-tcr-ran.txt");
+    planted_tcr(&cwd, &ran);
+    let out = scratch.login_with(&["--non-interactive"], |command| {
+        command
+            .env(
+                "PATH",
+                format!("{}:{}", scratch.path("empty-path").display(), cwd.display()),
+            )
+            .current_dir(&cwd);
+    });
+    assert_eq!(out.status.code(), Some(0), "{}", says(&out));
+    assert!(
+        ran.exists(),
+        "control: on an absolute entry it is asked: {}",
+        says(&out)
+    );
+    let warned: Vec<String> = notices(&events(&out))
+        .into_iter()
+        .filter(|text| text.starts_with("the tcr at "))
+        .collect();
+    assert_eq!(warned.len(), 1, "{}", says(&out));
+    assert!(
+        warned[0].starts_with(&format!(
+            "the tcr at {} (0.2.44)",
+            cwd.join("tcr").display()
+        )),
+        "{}",
+        says(&out)
+    );
+}
+
 /// The fake for a cancelled sign-in: it logs its pid, its process group and its `CODEX_HOME`,
 /// prints the browser lines, starts a child of its own, logs that child's pid, and waits.
 fn hanging_codex_script(log: &Path) -> String {

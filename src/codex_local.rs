@@ -412,14 +412,19 @@ impl OlderTcr {
     }
 }
 
-/// Every `tcr` this machine can start that predates Codex accounts: a `tcr` in each `PATH`
-/// entry, then in each directory of the search (TcrBar's four, or the [`SEARCH_DIRS_ENV`]
-/// list), then TcrBar's bundled one ([`BUNDLED_TCR_ENV`] overrides where). This binary is never
-/// one of them.
+/// Every `tcr` this machine can start that predates Codex accounts: a `tcr` in each absolute
+/// `PATH` entry, then in each directory of the search (TcrBar's four, or the
+/// [`SEARCH_DIRS_ENV`] list), then TcrBar's bundled one ([`BUNDLED_TCR_ENV`] overrides where).
+/// This binary is never one of them.
+///
+/// A relative `PATH` entry (`.`, or `bin`) names a directory under wherever the login was
+/// started, which can be a repository someone else wrote, and the scan runs every `tcr` it
+/// lists, where the shell would run only the first. So a relative entry is skipped.
 pub fn older_tcrs() -> Vec<OlderTcr> {
     let home = home_dir();
     let mut candidates: Vec<PathBuf> = split_dirs(env_value("PATH").as_deref())
         .into_iter()
+        .filter(|dir| dir.is_absolute())
         .chain(older_tcr_dirs(&env_value, &home))
         .map(|dir| dir.join("tcr"))
         .collect();
@@ -506,8 +511,10 @@ pub fn help_has_whole_token(help: &str, token: &str) -> bool {
 }
 
 /// Run `path args…` with stdin closed and stderr discarded, and answer its stdout when it exits
-/// 0 within `deadline`. One that overruns is killed and answers `None`, as does one that cannot
-/// be started.
+/// 0 and its stdout closes, both within `deadline`. One that overruns is killed and answers
+/// `None`, as does one that cannot be started. One that exits in time while a process it started
+/// still holds its stdout also answers `None` at the deadline: the thread reading the pipe is
+/// left to finish on its own.
 fn run_with_deadline(path: &Path, args: &[&str], deadline: Duration) -> Option<String> {
     let mut child = std::process::Command::new(path)
         .args(args)
@@ -526,6 +533,12 @@ fn run_with_deadline(path: &Path, args: &[&str], deadline: Duration) -> Option<S
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                while !reader.is_finished() {
+                    if started.elapsed() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
                 let text = reader.join().ok()?;
                 return status.success().then_some(text);
             }
@@ -926,5 +939,26 @@ mod tests {
             older_tcrs_from(vec![exe.clone(), link], Some(exe), &run),
             Vec::new()
         );
+    }
+
+    /// The deadline bounds the whole answer, not only the exit. A `tcr` that exits 0 while a
+    /// process it started still holds its stdout answers `None` at the deadline, instead of
+    /// holding the login until that process lets go of the pipe. The script exits well inside
+    /// the deadline (`sh` alone can take a few hundred milliseconds to start), and its
+    /// background `sleep` outlives it by far.
+    ///
+    /// Watched red: waiting for the pipe to close, this answers the version once the `sleep`
+    /// ends, 20 seconds in.
+    #[test]
+    fn a_tcr_that_leaves_its_output_open_answers_none_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tcr");
+        std::fs::write(&script, "#!/bin/sh\n/bin/sleep 20 &\necho tcr 0.2.44\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let answer = run_with_deadline(&script, &["--version"], Duration::from_secs(3));
+        let took = started.elapsed();
+        assert_eq!(answer, None, "answered after {took:?}");
+        assert!(took < Duration::from_secs(10), "answered after {took:?}");
     }
 }

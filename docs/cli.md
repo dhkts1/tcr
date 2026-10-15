@@ -585,12 +585,13 @@ TcrBar started from Finder has neither directory on its `PATH`.
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it before it next starts — …` | a `tcr` at 0.2.45 or older is in reach: it would read this login as a Claude account and send its token to Anthropic |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it — until then it refuses this config, …` | a `tcr` from 0.2.46 on whose `login --help` lacks `--from-codex` is in reach: it refuses the whole config |
 
-The older-`tcr` check runs `--version`, and `login --help` when it needs to, on every `tcr` on
-`PATH`, in the four directories above, and TcrBar's bundled one
-(`/Applications/TcrBar.app/Contents/MacOS/tcr`). It warns once per binary however many ways it is
-reached, never about the `tcr` running the check, and says nothing about a binary that does not
-answer within five seconds or whose version does not parse. `--from-codex` prints the same
-notices.
+The older-`tcr` check runs `--version`, and `login --help` when it needs to, on every `tcr` in an
+absolute `PATH` entry, in the four directories above, and TcrBar's bundled one
+(`/Applications/TcrBar.app/Contents/MacOS/tcr`). A relative `PATH` entry such as `.` is skipped:
+it names a directory under wherever the login was started, and nothing there is run. It warns once
+per binary however many ways it is reached, never about the `tcr` running the check, and says
+nothing about a binary that does not answer within five seconds or whose version does not parse.
+`--from-codex` prints the same notices.
 
 ### `--non-interactive`: driving the login from another program
 

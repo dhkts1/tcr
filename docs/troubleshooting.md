@@ -212,8 +212,9 @@ not after.
 
 **A Codex login warns about the older `tcr`s it can find.** Once the account is saved,
 `tcr login --codex` and `tcr login --from-codex` run `--version`, and `login --help` when they
-need to, on every `tcr` on `PATH`, in `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin` and
-`/usr/local/bin`, and on TcrBar's bundled one (`/Applications/TcrBar.app/Contents/MacOS/tcr`).
+need to, on every `tcr` in an absolute `PATH` entry (a relative one such as `.` is skipped), in
+`~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, and on TcrBar's bundled
+one (`/Applications/TcrBar.app/Contents/MacOS/tcr`).
 Each one that predates Codex accounts gets one warning, naming the binary, its version and what
 it would do:
 
