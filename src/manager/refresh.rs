@@ -21,7 +21,7 @@ impl std::fmt::Debug for PendingCodexWriteback {
     }
 }
 
-pub(crate) const CODEX_SYNC_PENDING_KEY: &str = "codexTokenSyncPending";
+use crate::config::CODEX_SYNC_PENDING_KEY;
 
 impl PendingCodexWriteback {
     pub(super) fn from_config(account: &config::Account) -> Option<Self> {
@@ -45,10 +45,7 @@ impl PendingCodexWriteback {
                     .map(str::to_string),
                 access_token: account.access_token.clone(),
                 refresh_token: account.refresh_token.clone(),
-                expires_at_ms: account
-                    .expires_at
-                    .map(oauth::normalize_expires_at)
-                    .unwrap_or(0),
+                expires_at_ms: account.expires_at.map_or(0, oauth::normalize_expires_at),
             },
             retry_after_ms: 0,
             failures: 0,
@@ -125,14 +122,23 @@ impl Manager {
                 .get(idx)
                 .and_then(|a| a.pending_codex_writeback.as_ref())
                 .is_some_and(|p| crate::now_ms() >= p.retry_after_ms);
+            let access_before = me.access_token(idx);
             if due && me.flush_codex_writeback_locked(idx).await.is_some() {
-                me.persist_codex_sync_state(idx).await;
+                me.persist_codex_sync_state(idx, access_before).await;
             }
         })
         .await;
     }
 
-    async fn persist_codex_sync_state(self: &Arc<Self>, idx: usize) {
+    async fn persist_codex_sync_state(self: &Arc<Self>, idx: usize, access_before: Option<String>) {
+        if self.access_token(idx) == access_before {
+            let me = self.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || me.persist_codex_writeback_record(idx)).await;
+            return;
+        }
+        // Only adopting a genuinely newer file pair changes credentials. Publishing the
+        // already-current pair updates metadata alone and cannot undo a separate re-login.
         let state = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             accounts.get(idx).filter(|a| !a.removed).map(|a| {
@@ -157,6 +163,65 @@ impl Manager {
                 me.persist_tokens(&name, account, org, org_name, provider, &tokens)
             })
             .await;
+        }
+    }
+
+    fn persist_codex_writeback_record(&self, idx: usize) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        if self.mutation_is_released() {
+            return;
+        }
+        let (target, refresh, pending) = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let Some(account) = accounts.get(idx).filter(|a| !a.removed) else {
+                return;
+            };
+            let Some(refresh) = account.refresh_token.clone() else {
+                return;
+            };
+            (
+                crate::identity::probe(
+                    account.provider,
+                    &account.name,
+                    account.account_uuid.clone(),
+                    account.org_uuid.clone(),
+                    account.org_name.clone(),
+                ),
+                refresh,
+                account
+                    .pending_codex_writeback
+                    .as_ref()
+                    .map(PendingCodexWriteback::record),
+            )
+        };
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            if let crate::identity::Resolved::One(index) =
+                crate::identity::resolve(config.accounts.iter().enumerate(), &target)
+            {
+                if config.accounts[index].refresh_token.as_deref() == Some(refresh.as_str()) {
+                    match &pending {
+                        Some(record) => {
+                            config.accounts[index]
+                                .extra
+                                .insert(CODEX_SYNC_PENDING_KEY.to_string(), record.clone());
+                        }
+                        None => {
+                            config.accounts[index].extra.remove(CODEX_SYNC_PENDING_KEY);
+                        }
+                    }
+                }
+            }
+        }
+        if config::save_codex_token_sync_pending(path, &target, &refresh, pending.as_ref()).is_err()
+        {
+            tracing::warn!("could not persist Codex token publication metadata");
         }
     }
 
@@ -562,8 +627,20 @@ impl Manager {
                     match a.provider {
                         crate::provider::Provider::Anthropic => {}
                         crate::provider::Provider::Codex => {
+                            a.pending_codex_writeback = None;
                             a.login_error =
                                 Some(code.map_or_else(|| format!("http_{status}"), str::to_string));
+                        }
+                    }
+                }
+                match provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => {
+                        if let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                me.persist_codex_writeback_record(idx)
+                            })
+                            .await;
                         }
                     }
                 }
@@ -1623,5 +1700,116 @@ mod tests {
         assert!(!config::load(&path).unwrap().accounts[0]
             .extra
             .contains_key("codexTokenSyncPending"));
+    }
+    #[tokio::test]
+    async fn a_dead_codex_refresh_discards_its_pending_publication_durably() {
+        use std::os::unix::fs::PermissionsExt as _;
+        struct RotateThenReject(AtomicUsize);
+        impl TokenRefresher for RotateThenReject {
+            fn refresh(&self, _: crate::provider::Provider, _: String) -> oauth::RefreshFuture {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    if first {
+                        Ok(Tokens {
+                            id_token: None,
+                            access_token: access_token(ACCOUNT_ID, 2, 4_102_444_800),
+                            refresh_token: Some("rt-once".into()),
+                            expires_at_ms: crate::now_ms() + 3_600_000,
+                        })
+                    } else {
+                        Err(oauth::OAuthError::AuthRejected {
+                            status: 401,
+                            code: Some("refresh_token_invalidated"),
+                        })
+                    }
+                })
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        write_auth(&home, &auth_document("rt-old", 1));
+        let (original, _) = imported_manager(&home, None, false);
+        let config = original.config.lock().unwrap().clone();
+        let path = scratch.path().join("tcr.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let manager = Manager::new(
+            config,
+            Arc::new(RotateThenReject(AtomicUsize::new(0))),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Some(path.clone()),
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(manager.ensure_fresh_force(0).await);
+        assert!(manager.accounts.read().unwrap()[0]
+            .pending_codex_writeback
+            .is_some());
+        manager.accounts.write().unwrap()[0].refresh_retry_after_ms = None;
+        assert!(!manager.ensure_fresh_force(0).await);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(manager.account_status(0), Some(AccountStatus::Error));
+        assert!(
+            manager.accounts.read().unwrap()[0]
+                .pending_codex_writeback
+                .is_none(),
+            "never publish a pair whose refresh token is now known dead"
+        );
+        let stored = config::load(&path).unwrap();
+        assert!(
+            !stored.accounts[0]
+                .extra
+                .contains_key("codexTokenSyncPending"),
+            "restart must not restore a known-dead publication"
+        );
+        assert_eq!(read_auth(&home)["tokens"]["refresh_token"], "rt-old");
+    }
+    #[tokio::test]
+    async fn retrying_codex_publication_does_not_replace_a_newer_config_login() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        write_auth(&home, &auth_document("rt-old", 1));
+        let (original, calls) = imported_manager(&home, None, false);
+        let config = original.config.lock().unwrap().clone();
+        let path = scratch.path().join("tcr.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let manager = Manager::new(
+            config,
+            Arc::new(TestRefresh {
+                home: home.clone(),
+                replacement: None,
+                failure_code: None,
+                calls,
+            }),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Some(path.clone()),
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(manager.ensure_fresh_force(0).await);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut fresh: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        fresh["accounts"][0]["accessToken"] = "at-separate-login".into();
+        fresh["accounts"][0]["refreshToken"] = "rt-separate-login".into();
+        fresh["accounts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(CODEX_SYNC_PENDING_KEY);
+        let expected = serde_json::to_vec(&fresh).unwrap();
+        std::fs::write(&path, &expected).unwrap();
+        manager.accounts.write().unwrap()[0]
+            .pending_codex_writeback
+            .as_mut()
+            .unwrap()
+            .retry_after_ms = 0;
+        manager.ensure_fresh(0).await;
+        assert_eq!(read_auth(&home)["tokens"]["refresh_token"], "rt-tcr-new");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "publication metadata must not overwrite a separately re-signed config credential"
+        );
     }
 }

@@ -59,11 +59,19 @@ public enum CodexCardFacts {
         home: String = HomePath.current
     ) -> String? {
         guard account.provider == .codex else { return nil }
-        if account.tokenSyncPending && account.health != .needsRelogin {
-            return "tcr has refreshed this login, but could not update the imported auth.json. "
-                + "It will retry with backoff, including after restart. Keep the imported "
-                + "folder writable, or sign in with tcr to use a separate login."
-        }
+        let help = stateCauseHelp(account, now: now, timeZone: timeZone, home: home)
+        guard account.tokenSyncPending && account.health != .needsRelogin else { return help }
+        let note =
+            "tcr has refreshed this login, but could not update the imported auth.json. "
+            + "It will retry with backoff, including after restart. Keep the imported "
+            + "folder writable, or sign in with tcr to use a separate login."
+        let base = help ?? (account.disabled ? account.stateHelp : nil)
+        return (base.map { $0 + " " } ?? "") + note
+    }
+
+    private static func stateCauseHelp(
+        _ account: Account, now: Date, timeZone: TimeZone, home: String
+    ) -> String? {
         switch FleetTally.Kind(account: account) {
         case .rejected:
             return refusedHelp(account, now: now, timeZone: timeZone)

@@ -265,6 +265,38 @@ impl Default for ProxyConfig {
     }
 }
 
+/// Private recovery metadata stored beside a Codex account's current credentials.
+pub(crate) const CODEX_SYNC_PENDING_KEY: &str = "codexTokenSyncPending";
+
+/// Update publication metadata without replacing any credential or user setting.
+/// A concurrent re-login with another refresh token owns its own recovery record.
+pub(crate) fn save_codex_token_sync_pending(
+    path: &Path,
+    target: &Account,
+    expected_refresh: &str,
+    pending: Option<&Value>,
+) -> Result<(), ConfigError> {
+    let mut document = read_document(path)?;
+    let Ok(entry) = find_account_entry(&mut document, target) else {
+        return Ok(());
+    };
+    if entry.get("refreshToken").and_then(Value::as_str) != Some(expected_refresh)
+        || entry.get(CODEX_SYNC_PENDING_KEY) == pending
+    {
+        return Ok(());
+    }
+    match pending {
+        Some(value) => {
+            entry.insert(CODEX_SYNC_PENDING_KEY.to_string(), value.clone());
+        }
+        None => {
+            entry.remove(CODEX_SYNC_PENDING_KEY);
+        }
+    }
+    write_atomic(path, &serde_json::to_string_pretty(&document)?)?;
+    Ok(())
+}
+
 /// One rotatable upstream account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3026,7 +3058,7 @@ fn merge_tokens(
         match fresh.provider {
             crate::provider::Provider::Anthropic => {}
             crate::provider::Provider::Codex => {
-                let key = "codexTokenSyncPending";
+                let key = CODEX_SYNC_PENDING_KEY;
                 match fresh.extra.get(key) {
                     Some(value) => {
                         object.insert(key.to_string(), value.clone());
@@ -4374,7 +4406,7 @@ fn merge_account(
                 match account.provider {
                     crate::provider::Provider::Anthropic => {}
                     crate::provider::Provider::Codex => {
-                        entry.remove("codexTokenSyncPending");
+                        entry.remove(CODEX_SYNC_PENDING_KEY);
                     }
                 }
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());

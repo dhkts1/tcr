@@ -2468,10 +2468,10 @@ impl Manager {
                             Some(value) => {
                                 account
                                     .extra
-                                    .insert(refresh::CODEX_SYNC_PENDING_KEY.to_string(), value);
+                                    .insert(config::CODEX_SYNC_PENDING_KEY.to_string(), value);
                             }
                             None => {
-                                account.extra.remove(refresh::CODEX_SYNC_PENDING_KEY);
+                                account.extra.remove(config::CODEX_SYNC_PENDING_KEY);
                             }
                         },
                     }
@@ -3909,7 +3909,7 @@ impl Manager {
         match fresh.provider {
             crate::provider::Provider::Anthropic => {}
             crate::provider::Provider::Codex => {
-                for_disk.extra.remove(refresh::CODEX_SYNC_PENDING_KEY);
+                for_disk.extra.remove(config::CODEX_SYNC_PENDING_KEY);
             }
         }
 
@@ -3931,7 +3931,7 @@ impl Manager {
                         entry.refresh_token = for_disk.refresh_token.clone();
                         entry.expires_at = for_disk.expires_at;
                         entry.codex_home = for_disk.codex_home.clone();
-                        entry.extra.remove(refresh::CODEX_SYNC_PENDING_KEY);
+                        entry.extra.remove(config::CODEX_SYNC_PENDING_KEY);
                     }
                 }
                 // No in-memory entry carries this identity either — the disk

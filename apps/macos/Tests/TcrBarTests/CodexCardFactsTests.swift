@@ -22,6 +22,15 @@ final class CodexCardFactsTests: XCTestCase {
         XCTAssertTrue(CodexCardFacts.stateHelp(pending, now: Date())?.contains("retry") == true)
     }
 
+    func testPendingTokenSyncKeepsTheAccountRefusalRemedy() throws {
+        var overrides = forbiddenHold
+        overrides["tokenSyncPending"] = true
+        let account = try canonical("bob@example.com/codex", overrides)
+        let help = try XCTUnwrap(CodexCardFacts.stateHelp(account, now: Date()))
+        XCTAssertTrue(help.contains("403 Forbidden"))
+        XCTAssertTrue(help.contains("auth.json"))
+    }
+
     // MARK: - Which windows draw a row
 
     func testOnlyReportedWindowsAreDrawn() throws {
