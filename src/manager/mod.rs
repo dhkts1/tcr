@@ -2031,7 +2031,8 @@ impl Manager {
     /// The windows come first because the hold is clamped to an hour
     /// (`MAX_RATE_LIMIT_HOLD_SECONDS`): a weekly refusal holds for at most that, while
     /// the account stays rejected until a usage probe sees the window it stored roll, or
-    /// reads the account allowed ([`crate::quota::Quota::apply_usage`]).
+    /// reads the account allowed ([`crate::quota::Quota::apply_usage`]), or a served 2xx that
+    /// carries a window reads it allowed.
     fn rejected_codex_free_at_ms(
         account: &AccountRuntime,
         threshold: f64,
@@ -2078,7 +2079,8 @@ impl Manager {
     /// The stored utilization, not [`crate::quota::QuotaWindow::effective`], which reads a
     /// window past its reset as `0.0`: that the window rolled is the clock's inference, and the
     /// refusal stands until a usage probe reads the new window
-    /// ([`crate::quota::Quota::apply_usage`]).
+    /// ([`crate::quota::Quota::apply_usage`]), or a served 2xx that carries a window reads the
+    /// account allowed.
     fn rolled_codex_window(
         account: &AccountRuntime,
         threshold: f64,
@@ -2113,10 +2115,13 @@ impl Manager {
     /// headers carry its reset, so the account's return is known. Anthropic's `rejected` is its
     /// own verdict and names no window, so an Anthropic row is returned unchanged.
     ///
-    /// Why rule 2: past the reset the window has rolled as far as the clock knows, but the
-    /// refusal stands until a usage probe reads the new window. In those minutes the account is
-    /// still out on that window, so the row keeps reading spent on it; `Rejected` would read a
-    /// window refusal as a refusal no window explains.
+    /// Why rule 2: past the reset the window has rolled as far as the clock knows, but tcr has
+    /// not read the new window, and the refusal stands until a usage probe reads it, or until a
+    /// served response from the account answers 2xx with a window
+    /// (`Quota::update_from_codex_headers`) or refuses again. The row keeps naming that window,
+    /// with no time, so it does not read as a refusal no window explains. The hold the refusal
+    /// armed has lapsed by then, so the account is back in the pool and may be sent a request in
+    /// those minutes.
     ///
     /// Why rule 3 holds even for a refusal that carried no reset: the proxy arms a hold for every
     /// Codex quota refusal, to its windows' reset (`quota::codex_hold_seconds`, clamped to an
@@ -12890,10 +12895,10 @@ mod tests {
     }
 
     /// **The window that refused an account keeps its gate past its reset, with no time, until a
-    /// probe confirms the roll.** The clock says the window has rolled; only a usage probe reads
-    /// the new window and ends the refusal. Reading `Rejected` in between would turn a spent
-    /// row into a refused one for the minutes until the next probe. The hold the refusal armed,
-    /// to that same reset, has lapsed by then too. Weekly and five-hour alike.
+    /// probe confirms the roll.** The clock says the window has rolled; a usage probe, or a
+    /// served 2xx that carries a window, ends the refusal. Reading `Rejected` in between would
+    /// turn a spent row into a refused one for the minutes until the next probe. The hold the
+    /// refusal armed, to that same reset, has lapsed by then too. Weekly and five-hour alike.
     ///
     /// Watched red: without the rolled-window rule, past the reset this reads
     /// `(Rejected, None)`.

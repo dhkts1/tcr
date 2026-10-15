@@ -478,8 +478,11 @@ impl Quota {
     /// this probe path used to move the windows while leaving `status` alone.
     /// Nothing else cleared it: `Quota` is runtime state, never serialized, so only
     /// a restart, a keep-warm response (`warmupSeconds`, off by default) or a human
-    /// ended a rejection. A Codex refusal has a second way out, the backend's own word:
-    /// a probe that reads the account allowed ends it
+    /// ended a rejection. A refused Codex account is not kept from traffic that way: once
+    /// the hold its refusal armed lapses, the pool pick, which never reads `status`, may send
+    /// it a request, and upstream is the oracle, since a 2xx that carries a window reads it
+    /// allowed and another refusal marks it again ([`Quota::update_from_codex_headers`]). A
+    /// probe that reads the account allowed ends the refusal too, the backend's own word
     /// ([`Self::lift_a_codex_refusal_the_probe_reads_allowed`], which runs after this).
     ///
     /// **The signal is a utilization that FELL.** A shared window's utilization only

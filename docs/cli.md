@@ -1518,7 +1518,9 @@ A Codex account at its usage limit reports the window that refused it as its `ga
 `"seven-day"` or `"five-hour"`, with `freeAtMs` and `secondsUntilFree` naming when that window
 rolls. With both windows full, the later of the two binds, since both must roll before the account
 serves. Once that reset has passed, the row keeps the window's `gate`, with a `null` `freeAtMs`,
-until the next usage probe confirms the window rolled. A refusal that no full window explains, such
+while the refusal stands: until a usage probe reads the new window, or a request tcr sends the
+account is answered with a window. It is back in the pool once its hold lapses. A refusal
+that no full window explains, such
 as one for credits or a spend cap, still sets a hold: tcr holds every Codex quota refusal, to its
 windows' reset (at most an hour), else to the 429's `retry-after`, else for 60 seconds. While that
 hold lasts the row reads `"hold"` with `rateLimitedUntilMs`, because the account really is held

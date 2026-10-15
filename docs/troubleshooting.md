@@ -74,8 +74,8 @@ tcr status --json | jq -r '.[] | "\(.name)\t\(.gate)"'
 
 On a Codex row, ChatGPT's usage-limit refusal reads `rejected` only when nothing else explains
 it. It reads as the window that refused it, `five-hour` or `seven-day`, with that window's reset.
-Past the reset the row keeps that window, with no time, until the next quota probe confirms the
-window rolled. A refusal no full window explains, for credits or a spend cap, reads `hold` while
+Past the reset the row keeps that window, with no time, until a quota probe reads the new window
+or a request it serves is answered with one. A refusal no full window explains, for credits or a spend cap, reads `hold` while
 the hold tcr set for it lasts, or `refused` if an upstream 403 holds the account. A quota probe
 ends the refusal when it sees a window roll or reads the account allowed again. The details are
 in [`cli.md`](cli.md#codex-rows-on---json). When an upstream 403 refuses a Codex account and no
