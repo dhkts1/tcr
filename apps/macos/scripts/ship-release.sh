@@ -26,7 +26,8 @@
 #      commands on purpose: chained, a failed `git tag` once let a push go out
 #      that published a stale tag.
 #   3. `release-local.sh vX.Y.Z`: build, sign, notarize, DMG, appcast entry,
-#      upload. It needs TCRBAR_OP_ITEM (see that script); this one checks it is
+#      upload, and the teamclaude-rs-installer.sh compat asset that old CLIs
+#      update through (release-tcrbar.sh stage 9). It needs TCRBAR_OP_ITEM (see that script); this one checks it is
 #      set BEFORE the tag is pushed, not after.
 #   4. With --install only: `install.sh` from the tagged commit. It RESTARTS the
 #      local proxy (quitting TcrBar stops the proxy it supervises), which costs
