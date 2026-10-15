@@ -421,9 +421,9 @@ fn from_codex_reads_the_login_under_the_default_codex_home() {
         "the import must say what it costs an older proxy: {stderr}"
     );
     assert!(
-        stderr.contains("only while auth.json still holds the refresh token tcr loaded")
-            && stderr.contains("newer tokens for the same ChatGPT account")
-            && stderr.contains("changed login is left untouched"),
+        stderr.contains("checks auth.json before writing refreshed tokens")
+            && stderr.contains("replacement tokens for the same ChatGPT account")
+            && stderr.contains("simultaneous codex refresh can still race this update"),
         "the import must explain guarded token sharing: {stderr}"
     );
     assert_no_token_in(&out);

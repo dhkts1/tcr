@@ -347,12 +347,16 @@ stderr for it, the dashboard's words with the command:
 
 **Why it died.** A ChatGPT refresh token works once. For a login imported with
 `tcr login --from-codex`, tcr normally keeps token rotations in sync through the recorded
-`codexHome/auth.json`: it writes refreshed tokens back only while the file still holds the
-refresh token it loaded, and adopts newer, unexpired tokens for the same ChatGPT account if
-the file changes or a refresh reports `refresh_token_reused`. Another login is left untouched.
+`codexHome/auth.json`. It serializes its own writers, checks the loaded refresh token and
+compares the complete file immediately before replacing it. Codex does not take tcr's lock,
+so a simultaneous Codex write can still race that final check and replacement. Use
+`tcr login --codex` for a separate login without this shared-file race.
 
-A reused token reaches the sign-in error only when no matching newer credential can be adopted,
-for example because the auth file is missing, unreadable, stale or contains a different login.
+If the current token is permanently rejected, tcr re-reads the file and can adopt a changed,
+unexpired token pair for the same ChatGPT account even when issuance times are equal or
+unreadable and the file timestamp is equal or missing. Known older tokens and a different
+login are rejected. A reused token reaches the sign-in error only when no matching replacement
+can be adopted, for example because the auth file is missing, unreadable or stale.
 A login can also have expired (`refresh_token_expired`) or been revoked
 (`refresh_token_invalidated`). Meanwhile the pool serves `codex` from its other Codex accounts,
 if it has any.
@@ -389,9 +393,12 @@ cannot build it. Unshallow the clone and build again.
 
 ## Claude sessions fail after upgrading an old certificate chain
 
-When tcr adds `chatgpt.com` to its generated leaf, it signs a new leaf under the persisted
-`tcr-ca.key`. Installs whose chain predates that key have no CA key to reuse, so their next
-start generates a new CA instead. Running `claude` sessions that loaded the old CA then fail
-with `CERT_SIGNATURE_FAILURE` until they restart. Restart those sessions with `tcr run` so
-they load the new CA. Plan this upgrade for a quiet moment; recent installs that already have
-`tcr-ca.key` keep their existing CA.
+At the next proxy server startup, tcr adds `chatgpt.com` to its generated leaf and signs it
+under the persisted `tcr-ca.key`. Installs whose chain predates that key have no CA key to reuse,
+so that server startup generates a new CA instead. Running `claude` sessions that loaded the
+old CA then fail with `CERT_SIGNATURE_FAILURE` until they restart. Restart those sessions with
+`tcr run` so they load the new CA. Plan the proxy restart for a quiet moment; recent installs
+that already have `tcr-ca.key` keep their existing CA.
+
+Client commands such as `tcr run` only read existing certificate material. They never create
+or renew it, so launching a client cannot rotate the CA beneath a running proxy.

@@ -75,7 +75,7 @@ final class CodexSignInCopyTests: XCTestCase {
             "Re-import erin@example.com/codex from ~/.codex?")
         XCTAssertEqual(
             CodexSignInCopy.importText,
-            "This shares the codex CLI's login in that folder. tcr writes refreshed tokens back only while auth.json still holds the refresh token it loaded, and adopts newer tokens for the same ChatGPT account. A changed login is left untouched. Codex account… gives tcr a separate login."
+            "This shares the codex CLI's login in that folder. tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. Codex account… gives tcr a separate login."
         )
         XCTAssertEqual(CodexSignInCopy.importButton, "Import")
         XCTAssertEqual(
@@ -146,7 +146,7 @@ final class CodexSignInCopyTests: XCTestCase {
         )
         XCTAssertEqual(
             CodexSignInCopy.importLinkHelp,
-            "Shares a codex login through guarded auth.json token updates. A changed login is left untouched."
+            "Shares a codex login through guarded auth.json token updates. A simultaneous codex refresh can still race the update."
         )
         XCTAssertEqual(CodexSignInCopy.reloginHint, "Signs in to ChatGPT")
         XCTAssertEqual(
@@ -170,7 +170,7 @@ final class CodexSignInCopyTests: XCTestCase {
         XCTAssertEqual(CodexSignInCopy.reimportItem(shortPath: "~/.codex"), "Re-import from ~/.codex…")
         XCTAssertEqual(
             CodexSignInCopy.reimportHelp(shortPath: "~/.codex"),
-            "Take the login the codex CLI in ~/.codex holds now. Refreshed tokens are shared through guarded auth.json updates; a changed login is left untouched."
+            "Take the login the codex CLI in ~/.codex holds now. Refreshed tokens are shared through guarded auth.json updates; a simultaneous codex refresh can still race the update."
         )
     }
 

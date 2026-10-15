@@ -2135,13 +2135,13 @@ pub const CLAUDE_CODE_IMPORT_CONSEQUENCE: &str =
      so the next time tcr refreshes it, `claude` will ask you to log in again in the browser, \
      once. Sessions started with `tcr run` are not affected.";
 
-/// The guarded token sharing an imported Codex login permits, printed on every import.
-/// Codex refresh tokens rotate and are single-use. The manager keeps both holders in sync
-/// through the recorded auth file, preserving another login and adopting newer matching tokens.
+/// The limits of sharing an imported Codex login, printed on every import.
+/// Codex refresh tokens rotate and are single-use. tcr checks the recorded auth file before
+/// updating it, but Codex does not take tcr's writer lock and can race the replacement.
 pub const CODEX_IMPORT_CONSEQUENCE: &str = "this shares the login the `codex` CLI itself uses. \
-    Codex refresh tokens are single-use: tcr writes refreshed tokens back only while auth.json \
-    still holds the refresh token tcr loaded, and adopts newer tokens for the same ChatGPT \
-    account. A changed login is left untouched. `tcr login --codex` gives tcr a separate login.";
+    Codex refresh tokens are single-use: tcr checks auth.json before writing refreshed tokens \
+    and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh \
+    can still race this update. `tcr login --codex` gives tcr a separate login.";
 
 /// The compatibility notice printed beside [`CODEX_IMPORT_CONSEQUENCE`] on every import:
 /// the config now holds a Codex row, and a tcr built before Codex accounts cannot tell it from a

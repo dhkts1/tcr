@@ -52,8 +52,8 @@ keys is `src/config_keys.rs`.
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account |
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
 | `accountThrottle` | object | `{minSpacingMs: 350, burst: 24}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
-| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 32}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
-| `lockAccount` | string | absent → normal routing | no | pin ALL of one provider's pooled traffic to one account by `name`; the other provider's pooled requests get a 429, see below |
+| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 32}` → **ON** | no | separate fleet ceiling for each provider, insurance only, see below |
+| `lockAccount` | string | absent → normal routing | no | pin its provider's pooled traffic to one account by `name`; the other provider rotates normally, see below |
 | `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"warn"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
@@ -283,8 +283,8 @@ There are two throttle buckets, and they are keyed on different things.
 |---|---|---|---|---|
 | `accountThrottle.minSpacingMs` | u64 | **`350`** with the key absent | no | steady-state emission interval **per organization** |
 | `accountThrottle.burst` | u32 | **`24`** with the key absent | no | sends admitted instantly after that org has been idle |
-| `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across **every** org combined |
-| `fleetThrottle.burst` | u32 | **`32`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
+| `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across every org of **one provider** combined |
+| `fleetThrottle.burst` | u32 | **`32`** with the key absent | no | sends admitted instantly after that provider's fleet has been idle |
 
 `accountThrottle` is the real limiter. Anthropic sets rate limits at the **organization**
 level, so pacing per org is what matches the thing actually being limited, and total capacity
@@ -294,7 +294,8 @@ organization is its ChatGPT workspace, so the seats of one workspace share one b
 `fleetThrottle` is insurance. It exists only in case something shared — an IP, a client id —
 is also limited, which nobody here has measured. Its burst sits above the per-organization
 burst, so it never holds back a wave that bucket lets through, and near the fleet's real peaks,
-so it still engages on a runaway.
+so it still engages on a runaway. Each provider has an independent fleet bucket: Claude sends
+never consume Codex's burst budget, and Codex sends never delay Claude through this ceiling.
 
 > **This replaced a single fleet-wide `throttle` key.** A config still carrying `throttle` is
 > **migrated automatically at load** — the file self-heals the first time the server boots
@@ -469,9 +470,9 @@ warm, whatever the fleet holds.
 
 `lockAccount` pins **all** pooled traffic of its account's provider to the single account whose
 `name` it names. LRU rotation, session affinity and load-balancing migration are all bypassed.
-A lock never crosses providers: while it holds, a pooled request of the other provider has no
-account it may use and gets the 429 an exhausted pool gives. So a lock on a Claude account
-leaves every `codex` turn unserved, and the other way round; calls relayed under the client's
+The lock applies only to that account's provider: a Claude lock leaves the Codex pool
+available, and a Codex lock leaves Claude rotation unchanged. The resolved account slot is
+authoritative even if another row shares its display name. Calls relayed under the client's
 own credential never ask for an account and are unaffected.
 
 The part that bites: a locked account has **no failover**. If it is throttled, disabled or

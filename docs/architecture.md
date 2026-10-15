@@ -217,7 +217,7 @@ minimising `(priority ascending, least-recently-selected, soonest weekly reset)`
 disabled, not in an error state, not under a live rate-limit hold, under the switch
 threshold, and not blocked for this request's model class. Four things change that picture:
 `lockAccount` short-circuits every pooled request of its account's provider to that account
-(the other provider's pooled requests get a 429), an honoured session-affinity pin is served
+while the other provider rotates normally, an honoured session-affinity pin is served
 even over the utilization threshold, the pacing fallback ranks in-flight count above priority,
 and `revalidationServe` (on by default) serves the least-utilized survivor rather than
 returning an error when the whole fleet reads over the soft threshold.
@@ -338,7 +338,8 @@ old name are in `src/paths.rs` and `src/legacy_names.rs`.
 | `~/.config/tcr.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one; the older `teamclaude.json` is used when only it exists | `0600` |
 | `~/.config/.tcr.json.tcr-*.tmp` | Left behind when a config write is killed halfway (`.teamclaude.json.tcr-*.tmp` with the older config name). Same contents as the config, and nothing removes them for you | `0600` |
 | `~/.config/tcr-codex-login.*` | Beside the config file, and only while `tcr login --codex` runs: the `CODEX_HOME` it gives `codex login`, holding that sign-in's `auth.json` until tcr has read it. tcr deletes it on every way out it can see; a SIGKILL of tcr can leave one behind, holding a live ChatGPT login | directory `0700` |
-| `<codexHome>/auth.json` | Imported Codex logins only: refreshed tokens are written here with a matching-token guard; other JSON fields and another login are preserved | replacement `0600` |
+| `<codexHome>/auth.json` | Imported Codex logins only: guarded, best-effort token sharing; tcr preserves other JSON fields and rejects a changed login seen before replacement | replacement `0600` |
+| `<codexHome>/.auth.json.tcr-lock` | Advisory lock that serializes tcr's imported-token writers; Codex does not take this lock | `0600` |
 | `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem`, and so does `CODEX_CA_CERTIFICATE` for `codex` | `0644`, `0600` |
 | `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts and `chatgpt.com`, its key, and the host list it was made for. tcr decrypts marked `chatgpt.com` connections only while the pool holds a Codex account | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
@@ -432,9 +433,17 @@ Nothing below runs for you; there is no uninstall command for the CLI.
 refreshed an imported login, that login's old refresh token no longer works, and `claude`
 asks you to log in through the browser once.
 
-For Codex accounts imported with `--from-codex`, tcr keeps refreshed tokens in sync with the
-recorded `codexHome/auth.json`. It preserves the rest of the JSON document, writes a `0600`
-temporary file beside it, and atomically renames only if the loaded refresh token still matches
-and the file has not changed. A newer, unexpired token pair for the same ChatGPT account is
-adopted when the file changes or a refresh reports `refresh_token_reused`. A different login is
-left untouched. Uninstalling tcr leaves that auth file in place with its current login.
+For Codex accounts imported with `--from-codex`, tcr tries to share refreshed tokens through
+the recorded `codexHome/auth.json`. Its writers take a private advisory lock before reading the
+file. A matching loaded refresh token permits preparing a `0600` temporary file beside it,
+preserving the other JSON fields and updating a returned id token. tcr compares all original
+bytes immediately before the atomic rename and skips a detected change. File reads, writes,
+fsyncs and lock waits run on blocking workers.
+
+Codex's file writer does not take that lock, so its write can still fall between the final
+comparison and rename. This is best-effort sharing, not an atomic compare-and-swap with Codex.
+`tcr login --codex` avoids sharing the file. tcr adopts a changed, unexpired pair for the same
+ChatGPT account when freshness is established; after a permanent refresh rejection it can also
+recover when issuance is equal or unreadable and the file timestamp is equal or missing.
+Known older tokens and different accounts remain rejected. Uninstalling tcr leaves that auth
+file in place with its current login.

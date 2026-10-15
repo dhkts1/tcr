@@ -228,8 +228,10 @@ There is a native macOS menu-bar app and a terminal dashboard.
 kept apart from the Claude accounts: a Codex request is only ever served by a Codex account, and
 a Claude request never by one. `tcr login --codex` signs a Codex account in with a login of tcr's
 own, so the `codex` CLI keeps the login it has. `tcr login --from-codex` imports the login `codex`
-already holds instead. Refreshed tokens stay in sync through guarded updates to that folder's
-`auth.json`; tcr adopts newer tokens for the same ChatGPT account and leaves another login untouched. `tcr run --codex -- exec "…"` launches `codex` through the pool, where those
+already holds instead. tcr shares refreshed tokens through guarded updates to that folder's
+`auth.json` and can recover tokens for the same ChatGPT account. Sharing remains best effort:
+a simultaneous `codex` refresh can race the file update. `tcr login --codex` avoids that shared
+file. `tcr run --codex -- exec "…"` launches `codex` through the pool, where those
 accounts are picked, refreshed and probed the way Claude's are, and `tcr doctor --codex` says
 whether `codex` is pooled and, if it is not, why. The import and its token-sharing guards are in
 [`docs/cli.md`](docs/cli.md#--from-codex-importing-the-login-codex-already-has); what tcr does

@@ -954,20 +954,28 @@ proxies, then a line on using the account, then the notices of
 [`--codex`](#--codex-a-codex-login-of-tcrs-own) that hold:
 
 ```
-[tcr] imported as 'alice@example.com' (ChatGPT Pro); this shares the login the `codex` CLI itself uses. Codex refresh tokens are single-use: tcr writes refreshed tokens back only while auth.json still holds the refresh token tcr loaded, and adopts newer tokens for the same ChatGPT account. A changed login is left untouched. `tcr login --codex` gives tcr a separate login. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
+[tcr] imported as 'alice@example.com' (ChatGPT Pro); this shares the login the `codex` CLI itself uses. Codex refresh tokens are single-use: tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. `tcr login --codex` gives tcr a separate login. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
 [tcr] start a pooled session with `tcr run --codex`
 ```
 
 The plan in parentheses is the label `tcr status` shows, left out when the login names no
-plan. After every successful refresh of an imported account, tcr updates only that recorded
-`codexHome/auth.json`, preserving the document's other fields and token layout. The replacement
-uses a file in the same directory, mode `0600`, followed by an atomic rename. It writes only if
-the file still holds the refresh token tcr loaded and has not changed before the rename.
+plan. After a successful refresh of an imported account, tcr tries to update only the recorded
+`codexHome/auth.json`, preserving the document's other fields and token layout, including a
+refreshed id token when one is returned. tcr serializes its writers with a private advisory
+lock, checks the loaded refresh token, then prepares a `0600` temporary file in the same
+directory. It compares the complete original file again immediately before the atomic rename
+and skips the write if the file changed.
 
-If the file's token changed, or a refresh reports `refresh_token_reused`, tcr re-reads it and
-adopts newer, unexpired tokens for the same ChatGPT account. A different login, a malformed
-file or an unreadable file is left untouched. If no matching newer credential is available,
-a rejected refresh still needs a new login. `tcr login --codex` gives tcr a separate login.
+Codex does not take tcr's advisory lock. A Codex write between that final comparison and the
+rename can still be overwritten; these checks cannot make sharing atomic with Codex.
+`tcr login --codex` gives tcr a separate login and avoids this shared-file race.
+
+When the file holds a changed, unexpired token pair for the same ChatGPT account, tcr can adopt
+it instead. Before refreshing, tcr requires evidence that the file's tokens are newer. After
+the current refresh token is permanently rejected, it can also recover a matching changed pair
+whose issuance time is equal or unreadable and whose file timestamp is equal or missing. Known
+older tokens, a different login, a malformed file or an unreadable file are rejected. If no
+matching replacement is available, a rejected refresh still needs a new login.
 
 **Upgrade every `tcr` before the first import.** A Codex row is written at
 `credentialVersion: 2` ([configuration.md](configuration.md#accounts)), which a `tcr` that

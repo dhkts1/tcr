@@ -59,7 +59,7 @@ public enum CodexSignInCopy {
 
     /// What sharing a codex login permits, said before anything runs.
     public static let importText =
-        "This shares the codex CLI's login in that folder. tcr writes refreshed tokens back only while auth.json still holds the refresh token it loaded, and adopts newer tokens for the same ChatGPT account. A changed login is left untouched. Codex account… gives tcr a separate login."
+        "This shares the codex CLI's login in that folder. tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. Codex account… gives tcr a separate login."
     public static let importButton = "Import"
     public static let importPanelMessage = "Choose the codex folder whose login tcr should share"
     /// The prompt of both pickers, the folder for an import and the codex executable.
@@ -116,7 +116,7 @@ public enum CodexSignInCopy {
     public static let codexAccountHelp =
         "Signs in to ChatGPT through codex's own sign-in, run by tcr in a folder of its own: the codex CLI's login is not touched. The account is written only when the browser comes back."
     public static let importLinkHelp =
-        "Shares a codex login through guarded auth.json token updates. A changed login is left untouched."
+        "Shares a codex login through guarded auth.json token updates. A simultaneous codex refresh can still race the update."
     /// The VoiceOver hint on a Codex row's Re-login button.
     public static let reloginHint = "Signs in to ChatGPT"
     public static let reloginHelp =
@@ -135,7 +135,7 @@ public enum CodexSignInCopy {
     }
 
     public static func reimportHelp(shortPath: String) -> String {
-        "Take the login the codex CLI in \(shortPath) holds now. Refreshed tokens are shared through guarded auth.json updates; a changed login is left untouched."
+        "Take the login the codex CLI in \(shortPath) holds now. Refreshed tokens are shared through guarded auth.json updates; a simultaneous codex refresh can still race the update."
     }
 
     // MARK: - A bundled tcr that cannot read a Codex config
