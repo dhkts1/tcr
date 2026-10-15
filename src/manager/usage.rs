@@ -449,8 +449,10 @@ impl Manager {
                 .codex
                 .refusal_reset
                 .filter(|reset| *reset > now)
-                .map(|reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()))
-                .unwrap_or_else(|| seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS));
+                .map_or_else(
+                    || seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS),
+                    |reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()),
+                );
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms =
                 Some(crate::now_ms().saturating_add(hold.saturating_mul(1000)));

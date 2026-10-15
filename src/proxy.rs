@@ -4730,15 +4730,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                 refusal.as_ref(),
                             );
                             let quota_refusal = refusal.is_some();
-                            let hold = refusal
-                                .as_ref()
-                                .and_then(|refusal| refusal.reset)
-                                .map(|reset| {
+                            let hold = refusal.as_ref().and_then(|refusal| refusal.reset).map_or(
+                                retry_after,
+                                |reset| {
                                     reset
                                         .unix_timestamp()
                                         .saturating_sub(clock.unix_timestamp())
-                                })
-                                .unwrap_or(retry_after);
+                                },
+                            );
                             if quota_refusal {
                                 manager.mark_codex_quota_limited(idx, hold);
                             } else {
