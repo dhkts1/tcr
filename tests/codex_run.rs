@@ -141,6 +141,7 @@ impl Fixture {
             .env_remove("XDG_CACHE_HOME")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("CODEX_CA_CERTIFICATE")
+            .env_remove("SSL_CERT_FILE")
             .env_remove("NODE_EXTRA_CA_CERTS")
             .current_dir(self.home.path());
         for key in [
