@@ -90,12 +90,12 @@ final class CodexCardFactsTests: XCTestCase {
         XCTAssertEqual(
             try help(decoded(removed)), "ChatGPT refused this account's last request, and " + tail)
 
-        // A server older than the refusing-window gate sends a full-window refusal as
-        // `rejected`: that account is spent, and says neither refusal sentence.
-        let older = try canonical("carol@example.com", olderServerRefusal)
-        XCTAssertEqual(FleetTally.Kind(account: older).pillText(for: .codex), "Spent")
-        XCTAssertNil(help(older))
-        XCTAssertNil(older.stateHelp)
+        // A rejected login can have a full window too; report both facts.
+        let refused = try canonical("carol@example.com", rejectedFullWindow)
+        XCTAssertEqual(FleetTally.Kind(account: refused).pillText(for: .codex), "Refused")
+        XCTAssertTrue(help(refused)?.contains("A usage window is also full.") == true)
+        XCTAssertTrue(refused.stateHelp?.contains("ChatGPT") == true)
+
     }
 
     func testTheRefusedHelpWithAKnownHold() throws {
@@ -661,7 +661,7 @@ private let forbiddenHold: [String: Any] = [
 
 /// carol as a server older than the refusing-window gate reports her: a `rejected`
 /// gate with the full window still held and no reached type.
-private let olderServerRefusal: [String: Any] = [
+private let rejectedFullWindow: [String: Any] = [
     "gate": "rejected", "freeAtMs": NSNull(), "secondsUntilFree": NSNull(),
     "limitReachedType": NSNull(), "credits": NSNull(), "quotaWindows": NSNull(),
     "sevenDayWindowMinutes": NSNull(),

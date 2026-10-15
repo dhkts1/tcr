@@ -93,6 +93,10 @@ public enum CodexCardFacts {
             return sentence + ", then tries it again."
         }
         let why = refusalReason(account)
+        if !account.held.isEmpty {
+            return
+                "ChatGPT refused this account's last request\(why). A usage window is also full. Check the reported limit or workspace access."
+        }
         if let freeAtMs = account.freeAtMs, let minutes = wholeMinutes(until: freeAtMs, now: now) {
             return "ChatGPT refused this account's last request\(why) though no usage window is "
                 + "full. tcr holds it until \(clock(freeAtMs, timeZone: timeZone)), in "

@@ -2737,6 +2737,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
                 + "no sweep will."
         }
         if isRejected {
+            if provider == .codex { return CodexCardFacts.stateHelp(self, now: Date()) }
             return "Anthropic has rejected this account, so the router will never "
                 + "select it however healthy its quota looks."
         }
