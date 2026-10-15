@@ -1,5 +1,6 @@
-//! Proves a first run works: `tcr status` on a box with no
-//! `~/.config/teamclaude.json` must exit 0 and leave a real config file behind.
+//! Proves a first run works: `tcr status` on a box with no config must exit 0
+//! and leave a real config file behind, under the new name `~/.config/tcr.json`.
+//! An install that already has `~/.config/teamclaude.json` keeps using it.
 //!
 //! This is an end-to-end test of the BUILT BINARY rather than a unit test of
 //! `config::load_or_init`, because the defect it guards was never in the load
@@ -23,9 +24,15 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// The config path the child will resolve from its own `HOME`
-/// (`config::default_path`).
+/// (`config::default_path`) when nothing is there yet: the new name.
 fn config_path_in(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join("teamclaude.json")
+    home.join(".config").join(teamclaude_rs::paths::CONFIG_FILE)
+}
+
+/// The config an install from before the rename has.
+fn legacy_config_path_in(home: &std::path::Path) -> PathBuf {
+    home.join(".config")
+        .join(teamclaude_rs::legacy_names::CONFIG_FILE)
 }
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
@@ -107,8 +114,39 @@ fn status_with_no_config_exits_zero_and_creates_the_file() {
         "the empty-fleet hint must be on stderr, got: {stderr}"
     );
     assert!(
-        stderr.contains("created") && stderr.contains("teamclaude.json"),
+        stderr.contains("created") && stderr.contains(teamclaude_rs::paths::CONFIG_FILE),
         "creating the config must say so once, got: {stderr}"
+    );
+    assert!(
+        !legacy_config_path_in(home.path()).exists(),
+        "a fresh install gets only the new name"
+    );
+}
+
+/// An install from before the rename keeps its config where it is: the binary
+/// reads `teamclaude.json`, and creates no `tcr.json` beside it, which would
+/// silently take over on the next run with an empty account list.
+#[test]
+fn an_existing_legacy_config_is_used_in_place() {
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let legacy = legacy_config_path_in(home.path());
+    std::fs::create_dir_all(legacy.parent().expect("a parent")).expect("mkdir .config");
+    let body = r#"{"accounts":[{"name":"alice@example.com","accessToken":"at-fake"}]}"#;
+    std::fs::write(&legacy, body).expect("write the legacy config");
+
+    let (code, stdout, stderr) = run_tcr(home.path(), &["accounts"]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("alice@example.com"),
+        "the account in the legacy config must be listed: {stdout}"
+    );
+    assert!(
+        !stderr.contains("created"),
+        "an existing legacy config is not a first run: {stderr}"
+    );
+    assert!(
+        !config_path_in(home.path()).exists(),
+        "no new-name config may appear beside the legacy one"
     );
 }
 

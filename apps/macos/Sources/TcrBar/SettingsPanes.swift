@@ -79,8 +79,10 @@ private func rowTag(_ timing: SettingsRowTiming, inSection section: SettingsRowT
 
 /// Every read-only row's hint (bridge, § Panes): "a key with no write path
 /// today gets a read-only row and a hint", never a hand-rolled rewrite of the
-/// live config, which holds real credentials (`CLAUDE.md`).
-private let readOnlyHint = "Edit in ~/.config/teamclaude.json"
+/// live config, which holds real credentials (`CLAUDE.md`). Names the file this
+/// Mac's `tcr` reads, `tcr.json` or an older install's `teamclaude.json`
+/// (``ConfigFileName``), resolved once when the window first draws a hint.
+private let readOnlyHint = "Edit in \(ConfigFileName.displayPath())"
 
 /// `"1 account"` / `"2 accounts"` — this window's one plural count.
 private func pluralizedAccounts(_ count: Int) -> String {

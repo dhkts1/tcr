@@ -19,7 +19,9 @@ TCR="$(cd "$(dirname "$TCR")" && pwd)/$(basename "$TCR")"
 E2E_HOME="$(mktemp -d)"
 export HOME="$E2E_HOME"
 unset XDG_CACHE_HOME XDG_CONFIG_HOME || true
-CONFIG="$HOME/.config/teamclaude.json"
+# A fresh install gets the new name; `teamclaude.json` is only ever read when
+# it already exists (src/paths.rs).
+CONFIG="$HOME/.config/tcr.json"
 CREDENTIALS="$HOME/.claude/.credentials.json"
 SERVER_PID=""
 

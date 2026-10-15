@@ -287,11 +287,14 @@ pub struct PortHolder {
 /// returns `None` for `tcr run`, which is a tcr by any reading an operator
 /// cares about here.
 pub fn holder_from(pid: u32, name: &str, argv: &[String]) -> PortHolder {
+    let js_bin = crate::legacy_names::JS_PROXY_BIN;
     let is_proxy_program = |token: &str| {
         token == "tcr"
             || token.ends_with("/tcr")
-            || token == "teamclaude"
-            || token.ends_with("/teamclaude")
+            || token == js_bin
+            || token
+                .strip_suffix(js_bin)
+                .is_some_and(|dir| dir.ends_with('/'))
     };
     let is_tcr =
         argv.first().is_some_and(|argv0| is_proxy_program(argv0)) || is_proxy_program(name);

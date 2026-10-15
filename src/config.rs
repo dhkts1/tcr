@@ -1434,14 +1434,15 @@ impl Config {
     }
 }
 
-/// The default config path: `$HOME/.config/teamclaude.json`.
+/// The default config path: `$HOME/.config/tcr.json`, or
+/// `$HOME/.config/teamclaude.json` on an install that has only that one.
 ///
 /// Deliberately NOT the platform config dir (`directories` would pick
 /// `~/Library/Application Support` on macOS) — the JS proxy hard-codes
-/// `~/.config`, and this binary is a drop-in for it.
+/// `~/.config`, and this binary is a drop-in for it. The choice between the two
+/// names is [`crate::paths::config_file`]'s.
 pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".config").join("teamclaude.json")
+    crate::paths::config_file()
 }
 
 /// Whether an on-disk `accounts[]` entry can yield a usable credential, and if
@@ -5275,7 +5276,7 @@ mod tests {
     fn load_or_init_creates_the_file_and_its_parent_dir() {
         let dir = tempfile::tempdir().expect("a scratch dir");
         // Two levels down: a fresh box has no `~/.config` at all.
-        let path = dir.path().join("config").join("teamclaude.json");
+        let path = dir.path().join("config").join(crate::paths::CONFIG_FILE);
         assert!(!path.exists(), "the test must start with no file");
 
         let (config, created) = load_or_init(&path).expect("a missing config must be created");
@@ -5357,7 +5358,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))
             .expect("make the parent unwritable");
 
-        let err = load_or_init(&locked.join("teamclaude.json"))
+        let err = load_or_init(&locked.join(crate::paths::CONFIG_FILE))
             .expect_err("an unwritable parent must be an error");
         assert!(
             matches!(err, ConfigError::Io(_)),
@@ -5996,7 +5997,7 @@ mod tests {
     /// only the final rename fails.
     fn unrenamable_target(tag: &str) -> (PathBuf, PathBuf) {
         let dir = tmp_path(tag).with_extension("d");
-        let target = dir.join("teamclaude.json");
+        let target = dir.join(crate::paths::CONFIG_FILE);
         fs::create_dir_all(&target).expect("create the blocking directory");
         (dir, target)
     }
@@ -6058,7 +6059,7 @@ mod tests {
             .to_string();
 
         assert!(
-            name.starts_with(".teamclaude.json.tcr-"),
+            name.starts_with(&format!(".{}.tcr-", crate::paths::CONFIG_FILE)),
             "an orphan must name its owner and its destination, got {name}"
         );
         assert!(

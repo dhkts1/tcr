@@ -395,7 +395,9 @@ pub fn classify_proxy_server(argv: &[String]) -> Option<ProxyKind> {
         return None;
     }
     let is_node = |t: &str| t == "node" || t.ends_with("/node");
-    let is_teamclaude = |t: &str| t == "teamclaude" || t.ends_with("/teamclaude");
+    let js_bin = crate::legacy_names::JS_PROXY_BIN;
+    let is_teamclaude =
+        |t: &str| t == js_bin || t.strip_suffix(js_bin).is_some_and(|dir| dir.ends_with('/'));
     let is_tcr = |t: &str| t == "tcr" || t.ends_with("/tcr");
 
     // JS proxy: the teamclaude bin must be the executed program (argv0, or the arg
@@ -1388,7 +1390,11 @@ mod tests {
         assert!(!is_proxy_server(&argv(&["/x/tcr", "run"])));
         assert!(!is_proxy_server(&argv(&["/x/tcr", "status"])));
         assert!(!is_proxy_server(&argv(&["/x/tcr", "accounts"])));
-        assert!(!is_proxy_server(&argv(&["grep", "teamclaude", "server"]))); // teamclaude is a search term
+        assert!(!is_proxy_server(&argv(&[
+            "grep",
+            crate::legacy_names::JS_PROXY_BIN,
+            "server"
+        ]))); // teamclaude is a search term
         assert!(!is_proxy_server(&argv(&["rg", "tcr", "server"])));
         assert!(!is_proxy_server(&argv(&["vim", "teamclaude-server.md"])));
         assert!(!is_proxy_server(&argv(&[])));
@@ -1932,7 +1938,7 @@ mod tests {
             match pid {
                 111 => argv(&["node", "/x/teamclaude", "server"]),
                 222 => argv(&["/x/tcr", "server"]),
-                333 => argv(&["grep", "teamclaude", "server"]), // non-proxy on the port
+                333 => argv(&["grep", crate::legacy_names::JS_PROXY_BIN, "server"]), // non-proxy on the port
                 444 => argv(&["/x/tcr", "run"]),
                 _ => Vec::new(),
             }
