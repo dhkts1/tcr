@@ -225,6 +225,91 @@ mod tests {
         );
     }
 
+    /// Every `(line, code)` in `source` that joins `.cache` or `.config` onto a
+    /// path (including `.config/fish`), comments removed. Spacing inside the
+    /// call is ignored, so `.join( ".cache" )` is seen too.
+    fn dot_dir_joins(source: &str) -> Vec<(usize, String)> {
+        strip_comments(source)
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                squeezed.contains("join(\".cache") || squeezed.contains("join(\".config")
+            })
+            .map(|(n, line)| (n + 1, line.trim().to_string()))
+            .collect()
+    }
+
+    /// The one site outside `src/paths.rs` that may join `.config`, named with
+    /// its reason: the fish shell's own config directory, which is fish's path
+    /// and not a `tcr` one.
+    const FISH_DIR_JOIN: (&str, &str) = (
+        "src/setup.rs",
+        ".unwrap_or_else(|| self.home.join(\".config\"))",
+    );
+
+    /// Routing, not names: `src/paths.rs` is the only code that builds the
+    /// `~/.config` and `~/.cache` bases. A `home.join(".cache").join("tcr")`
+    /// written anywhere else picks the new name on an old install and passes
+    /// the name guard above, which is exactly the split cache this rule exists
+    /// to prevent. The walk covers `src/` and every crate under `crates/`; no
+    /// crate builds such a path today, and this keeps it that way.
+    #[test]
+    fn dot_dir_paths_are_built_only_in_paths() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let paths_rs = root.join("src").join("paths.rs");
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        rust_files(&root.join("crates"), &mut files);
+        assert!(
+            files.contains(&paths_rs) && files.iter().any(|f| f.starts_with(root.join("crates"))),
+            "the walk must reach src/paths.rs and the crates, found {} files",
+            files.len()
+        );
+        let mut found = Vec::new();
+        let mut allowed_seen = 0;
+        for file in files.iter().filter(|f| **f != paths_rs) {
+            let rel = file.strip_prefix(root).unwrap_or(file);
+            let source =
+                std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            for (line, code) in dot_dir_joins(&source) {
+                if rel == Path::new(FISH_DIR_JOIN.0) && code == FISH_DIR_JOIN.1 {
+                    allowed_seen += 1;
+                } else {
+                    found.push(format!("{}:{line}: {code}", rel.display()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "`.cache` and `.config` are joined in src/paths.rs only; call its functions:\n{}",
+            found.join("\n")
+        );
+        assert_eq!(
+            allowed_seen, 1,
+            "the allowed fish-directory join moved or vanished: update FISH_DIR_JOIN"
+        );
+    }
+
+    /// The positive control for [`dot_dir_joins`]: it sees the shapes code can
+    /// write, and leaves comments and unrelated joins alone.
+    #[test]
+    fn the_routing_guard_sees_joins_and_ignores_comments() {
+        let code = [
+            "let a = home.join(\".cache\").join(\"tcr\");",
+            "let b = home.join( \".config\" );",
+            "let c = base.join(\".config/fish\");",
+            "let d = home\n    .join(\".cache\");",
+        ]
+        .join("\n");
+        let lines: Vec<usize> = dot_dir_joins(&code).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(lines, vec![1, 2, 3, 5]);
+        assert_eq!(
+            dot_dir_joins("// home.join(\".cache\")\nlet e = home.join(\".claude\");\n"),
+            Vec::new()
+        );
+    }
+
     /// The positive control: the scanner flags the old name in every shape code
     /// can write it and leaves it alone in comments, so a green guard is not a
     /// scanner that sees nothing.

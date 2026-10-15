@@ -1321,7 +1321,7 @@ struct StatusArgs {
 /// configuration, so there is nothing to select.
 #[derive(clap::Args)]
 struct DoctorArgs {
-    /// Path to the config file (default: the usual per-user path).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit one JSON object instead of greppable `key: value` lines.
@@ -7547,7 +7547,7 @@ impl ShutdownTrigger {
     /// the only thing after the match is a `warn!` that fires solely when tasks
     /// had to be aborted. So a shutdown down that path left the durable log
     /// unable to say the process had stopped, let alone why. This repo counts
-    /// boots with `rg 'server started' ~/.cache/teamclaude/logs/*` precisely
+    /// boots with `rg 'server started' <cache dir>/logs/*` precisely
     /// because a restart is the most expensive event in the system; a stop with
     /// no matching line makes that count unreadable.
     ///
@@ -7715,7 +7715,7 @@ fn log_location() -> (std::path::PathBuf, &'static str) {
 /// `OpenOptions::append(true).create(true)` only), so a rotating file cannot be
 /// made owner-only the way the old single file was. Confidentiality is enforced
 /// on the *directory* instead, and it is load-bearing on Linux CI targets, not
-/// belt-and-braces: the parent `~/.cache/teamclaude/` is `0755` (protects its
+/// belt-and-braces: the parent cache directory (`~/.cache/tcr/`, or `~/.cache/teamclaude/` on an install that has it) is `0755` (protects its
 /// existing contents by *file* mode — `session-affinity.json` is `0600`), so
 /// without an owner-only `logs/` subdirectory, files landing at the crate's
 /// default `0644` would be world-readable on any multi-user box. The mode is
@@ -7741,13 +7741,14 @@ fn log_location() -> (std::path::PathBuf, &'static str) {
 /// volume is a legitimate operator setup, and refusing to start over a
 /// symlink would break a working configuration to close a hole that is not a
 /// privilege boundary anyway — planting such a symlink first requires write
-/// access to the 0755, user-owned `~/.cache/teamclaude/` parent, i.e. the
+/// access to the 0755, user-owned cache directory parent, i.e. the
 /// user or root, who already has more reach than this would buy them.
 ///
 /// `.recursive(true)` creates every missing path component, parents included,
 /// **carrying the same `0700` mode** — this is not confined to `logs/` itself.
-/// On a fresh install or in a container where `~/.cache/teamclaude/` (or even
-/// `~/.cache/`) does not yet exist, this call creates it at `0700`, changing a
+/// On a fresh install or in a container where the cache directory
+/// (`~/.cache/tcr/`, or `~/.cache/teamclaude/` on an install that has it, or
+/// even `~/.cache/`) does not yet exist, this call creates it at `0700`, changing a
 /// directory shared with every other application on the machine. That is
 /// invisible on a dev box where both already exist at `0755`, but it is real,
 /// measured behaviour of `DirBuilder::recursive`, not a hypothetical.
@@ -8301,6 +8302,13 @@ mod tests {
                 "`{verb} --config` help must end with the default: {help:?}"
             );
             assert_eq!(help.matches("Default:").count(), 1, "`{verb}`: {help:?}");
+            // A hand-written "(default: ...)" beside the generated sentence
+            // states the default twice (the doctor flag did, once).
+            assert_eq!(
+                help.to_ascii_lowercase().matches("default:").count(),
+                1,
+                "`{verb} --config` states its default more than once: {help:?}"
+            );
             assert!(
                 long_help.is_empty() || long_help.ends_with(&format!("{sentence}.")),
                 "`{verb} --config` long help must end with the default: {long_help:?}"
@@ -9490,7 +9498,7 @@ mod tests {
     }
 
     /// A unique, test-only log directory keyed by pid + nanosecond timestamp.
-    /// Never the real `~/.cache/teamclaude/logs/` — tests must not touch the
+    /// Never the real cache directory's `logs/` — tests must not touch the
     /// live proxy's cache directory (`session-affinity.json` lives one level up
     /// and is being written by a running process).
     fn unique_log_dir(tag: &str) -> std::path::PathBuf {
@@ -9740,7 +9748,7 @@ mod tests {
 
     /// `init_tracing` must target the one shared, well-known cache directory,
     /// not a private/generated path — so a human running the documented
-    /// `rg 'server started' ~/.cache/teamclaude/logs/*` recipe can always find
+    /// `rg 'server started' <cache dir>/logs/*` recipe can always find
     /// it. This is **not** because any code reads it back (a census —
     /// `rg -n 'teamclaude-rs\.log|log_file_path|log_dir_path' src/ scripts/
     /// apps/`, repo-relevant scope, not `src/` alone: a `src/`-only census once
