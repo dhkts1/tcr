@@ -110,7 +110,10 @@ impl Provider {
     /// For `#[serde(skip_serializing_if)]` on `config::Account::provider`: an Anthropic row writes
     /// no key, so an upgraded Anthropic-only config re-saves without a `provider` key.
     pub fn is_anthropic(&self) -> bool {
-        *self == Self::Anthropic
+        match self {
+            Self::Anthropic => true,
+            Self::Codex => false,
+        }
     }
 }
 

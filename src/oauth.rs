@@ -2510,14 +2510,16 @@ pub(crate) async fn import_codex_login_as(
         let is_this_login = match crate::identity::match_one(&config.accounts, wanted) {
             crate::identity::Match::One(idx) => {
                 let row = &config.accounts[idx];
-                if row.provider != crate::provider::Provider::Codex {
-                    return Err(LoginRefusal {
-                        code: LoginRefusal::ACCOUNT_IS_CLAUDE,
-                        reason: claude_account_codex_import_refusal(&row.name),
+                match row.provider {
+                    crate::provider::Provider::Anthropic => {
+                        return Err(LoginRefusal {
+                            code: LoginRefusal::ACCOUNT_IS_CLAUDE,
+                            reason: claude_account_codex_import_refusal(&row.name),
+                        }
+                        .into());
                     }
-                    .into());
+                    crate::provider::Provider::Codex => codex_login_is_row(row, &login),
                 }
-                codex_login_is_row(row, &login)
             }
             crate::identity::Match::None => login.email.as_deref() == Some(wanted),
             crate::identity::Match::Ambiguous(names) => {

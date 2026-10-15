@@ -152,8 +152,9 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
     if !relay_path_is_routable(path) {
         return false;
     }
-    if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
-        return false;
+    match crate::provider::Provider::of_path(path) {
+        crate::provider::Provider::Anthropic => {}
+        crate::provider::Provider::Codex => return false,
     }
     if CLIENT_CREDENTIAL_PREFIXES
         .iter()
@@ -196,10 +197,13 @@ pub fn refused_path_kind(path: &str) -> &'static str {
     if !relay_path_is_routable(path) {
         "an unroutable path (one the upstream URL parser would read differently than it is \
          spelled)"
-    } else if crate::provider::Provider::of_path(path) == crate::provider::Provider::Codex {
-        "a Codex path (Codex is not lent over the mesh in this version)"
     } else {
-        "a client-credential or local-control path"
+        match crate::provider::Provider::of_path(path) {
+            crate::provider::Provider::Anthropic => "a client-credential or local-control path",
+            crate::provider::Provider::Codex => {
+                "a Codex path (Codex is not lent over the mesh in this version)"
+            }
+        }
     }
 }
 

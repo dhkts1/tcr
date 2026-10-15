@@ -254,8 +254,10 @@ impl Manager {
                 // A Codex row's weekly window: its live weekly reset, and the length its plan
                 // reported, or a week when it reported none. `None` on an Anthropic row, which
                 // therefore never carries the key.
-                let seven_day_span = if a.provider == crate::provider::Provider::Codex {
-                    a.quota
+                let seven_day_span = match a.provider {
+                    crate::provider::Provider::Anthropic => None,
+                    crate::provider::Provider::Codex => a
+                        .quota
                         .seven_day
                         .and_then(|w| w.live_reset(now))
                         .map(|reset| {
@@ -265,9 +267,7 @@ impl Manager {
                                     i64::from(minutes) * 60_000
                                 });
                             (odt_to_ms(reset), length_ms)
-                        })
-                } else {
-                    None
+                        }),
                 };
                 AccountSnapshot {
                     // The rotation index, which keys act on: this row's position in the list
@@ -437,8 +437,9 @@ impl Manager {
 ///
 /// An Anthropic row keeps the defaults, whatever its quota holds, so its wire row gains no key.
 fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
-    if a.provider != crate::provider::Provider::Codex {
-        return crate::stats::CodexFacts::default();
+    match a.provider {
+        crate::provider::Provider::Anthropic => return crate::stats::CodexFacts::default(),
+        crate::provider::Provider::Codex => {}
     }
     let windows = a.quota.codex.windows();
     crate::stats::CodexFacts {

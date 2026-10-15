@@ -462,9 +462,11 @@ impl Manager {
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
-            if account.provider != crate::provider::Provider::Codex
-                || account.organization_type.as_deref() == Some(plan_type)
-            {
+            match account.provider {
+                crate::provider::Provider::Anthropic => return,
+                crate::provider::Provider::Codex => {}
+            }
+            if account.organization_type.as_deref() == Some(plan_type) {
                 return;
             }
             let previous = account.organization_type.replace(plan_type.to_string());

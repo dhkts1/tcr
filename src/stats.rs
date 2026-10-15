@@ -382,8 +382,9 @@ impl AccountSnapshot {
     /// folder names that folder (`home` shown as `~`, see [`short_path`]): ChatGPT refresh
     /// tokens are single-use, and the codex CLI sharing the login is what spent it first.
     pub fn relogin_why(&self, home: Option<&Path>) -> Option<String> {
-        if self.provider != Provider::Codex {
-            return None;
+        match self.provider {
+            Provider::Anthropic => return None,
+            Provider::Codex => {}
         }
         let code = self.codex.login_error.as_deref()?;
         Some(match code {
@@ -725,6 +726,20 @@ mod tests {
                 codex_home: codex_home.map(str::to_string),
                 ..CodexFacts::default()
             },
+        }
+    }
+
+    #[test]
+    fn provider_dispatch_keeps_plan_and_login_metadata_separate() {
+        let mut account = signed_out_codex_row(Some("refresh_token_expired"), None);
+        account.organization_type = Some("pro".into());
+        for (provider, plan, why) in [
+            (Provider::Anthropic, "pro", None),
+            (Provider::Codex, "ChatGPT Pro", Some("the login expired")),
+        ] {
+            account.provider = provider;
+            assert_eq!(account.plan_label().as_deref(), Some(plan), "{provider:?}");
+            assert_eq!(account.relogin_why(None).as_deref(), why, "{provider:?}");
         }
     }
 

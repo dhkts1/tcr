@@ -1181,12 +1181,14 @@ fn fit_name(name: &str, room: usize) -> Option<String> {
 /// [`SEVEN_DAY_WINDOW`])? Only a list the plan reported says so: a row whose windows are not
 /// known yet lacks none, and an Anthropic row never does.
 fn plan_lacks(account: &AccountSnapshot, window: &str) -> bool {
-    account.provider == Provider::Codex
-        && account
+    match account.provider {
+        Provider::Anthropic => false,
+        Provider::Codex => account
             .codex
             .quota_windows
             .as_ref()
-            .is_some_and(|windows| !windows.iter().any(|w| w == window))
+            .is_some_and(|windows| !windows.iter().any(|w| w == window)),
+    }
 }
 
 /// The cell of a usage window the plan does not have: `none`, dim. Not `—`, which keeps
@@ -1376,7 +1378,11 @@ fn relogin_hint(
     width: u16,
     home: Option<&std::path::Path>,
 ) -> Option<Line<'static>> {
-    if account.provider != Provider::Codex || account.gate != GateReason::Login {
+    match account.provider {
+        Provider::Anthropic => return None,
+        Provider::Codex => {}
+    }
+    if account.gate != GateReason::Login {
         return None;
     }
     let name = &account.name;
@@ -1549,7 +1555,6 @@ fn account_row(
     // A Codex plan may not have a window at all (ChatGPT Pro reports only
     // its weekly one), and ChatGPT has no model-scoped weekly window, so
     // a Codex row's Fable cell is blank.
-    let codex = account.provider == Provider::Codex;
     let lacks_five_hour = plan_lacks(account, FIVE_HOUR_WINDOW);
     let lacks_seven_day = plan_lacks(account, SEVEN_DAY_WINDOW);
     let priority = Cell::from(account.priority.to_string());
@@ -1593,10 +1598,9 @@ fn account_row(
                 // only: it never gates shared rotation (`eligible` ignores
                 // it), so no quota label — the gate chip already reads
                 // `FABLE-7D` when it parks Fable. `—` until first learned.
-                if codex {
-                    Cell::from("")
-                } else {
-                    Cell::from(bar(account.seven_day_oi))
+                match account.provider {
+                    Provider::Anthropic => Cell::from(bar(account.seven_day_oi)),
+                    Provider::Codex => Cell::from(""),
                 },
                 reqs,
                 input,
@@ -1636,10 +1640,9 @@ fn account_row(
             } else {
                 Cell::from(format!("{}{quota_label}", pct(account.seven_day))).style(quota_style)
             },
-            if codex {
-                Cell::from("")
-            } else {
-                Cell::from(pct(account.seven_day_oi))
+            match account.provider {
+                Provider::Anthropic => Cell::from(pct(account.seven_day_oi)),
+                Provider::Codex => Cell::from(""),
             },
             reqs,
             input,
@@ -2060,9 +2063,12 @@ fn quota_cell(state: QuotaState) -> (&'static str, Style) {
 /// A Codex row speaks ChatGPT's terms where they differ ([`codex_gate_chip`]); every
 /// other gate it shares with a Claude row reads the same on both.
 fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
-    if account.provider == Provider::Codex {
-        if let Some(chip) = codex_gate_chip(account, now) {
-            return chip;
+    match account.provider {
+        Provider::Anthropic => {}
+        Provider::Codex => {
+            if let Some(chip) = codex_gate_chip(account, now) {
+                return chip;
+            }
         }
     }
     let red = Style::default().fg(Color::Red);

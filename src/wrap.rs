@@ -90,8 +90,10 @@ impl Agg {
             Some(price) => {
                 self.cost_nanos += cost_nanos(&price, line.i, line.c5, line.c1, line.r, line.o);
             }
-            None if usage::line_provider(line) == Provider::Codex => self.unpriced += 1,
-            None => {}
+            None => match usage::line_provider(line) {
+                Provider::Anthropic => {}
+                Provider::Codex => self.unpriced += 1,
+            },
         }
     }
 

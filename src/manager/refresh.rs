@@ -210,9 +210,12 @@ impl Manager {
                     // Why a Codex login is dead, for the status wire: the OAuth code when the
                     // rejection named one, else the status it came back with. An Anthropic row
                     // keeps none, so its wire row gains no key.
-                    if a.provider == crate::provider::Provider::Codex {
-                        a.login_error =
-                            Some(code.map_or_else(|| format!("http_{status}"), str::to_string));
+                    match a.provider {
+                        crate::provider::Provider::Anthropic => {}
+                        crate::provider::Provider::Codex => {
+                            a.login_error =
+                                Some(code.map_or_else(|| format!("http_{status}"), str::to_string));
+                        }
                     }
                 }
                 // A REJECTED refresh is the one signal that this credential may truly

@@ -1185,17 +1185,20 @@ impl UsageTracker {
 
         // The week, for a Codex record only. Pruned here, against the newest minute held, so it
         // never holds more than a week.
-        if record.provider == Provider::Codex {
-            account.week.entry(minute).or_default().add(&totals);
-            let newest = account
-                .week
-                .last_key_value()
-                .map_or(minute, |(&held, _)| held);
-            while let Some(oldest) = account.week.first_entry() {
-                if *oldest.key() >= newest - WEEK_MINUTES {
-                    break;
+        match record.provider {
+            Provider::Anthropic => {}
+            Provider::Codex => {
+                account.week.entry(minute).or_default().add(&totals);
+                let newest = account
+                    .week
+                    .last_key_value()
+                    .map_or(minute, |(&held, _)| held);
+                while let Some(oldest) = account.week.first_entry() {
+                    if *oldest.key() >= newest - WEEK_MINUTES {
+                        break;
+                    }
+                    oldest.remove();
                 }
-                oldest.remove();
             }
         }
     }

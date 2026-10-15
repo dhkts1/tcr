@@ -866,12 +866,15 @@ impl DisablePersist {
         disabled: bool,
         provider: crate::provider::Provider,
     ) -> Option<&'static str> {
-        match (self, provider) {
-            (Self::Ambiguous, crate::provider::Provider::Codex) => Some(
-                "NOT SAVED: two config entries share this Codex login — remove the duplicate \
-                 (tcr remove <name>), or re-import it with --name",
-            ),
-            _ => self.warning(disabled),
+        match provider {
+            crate::provider::Provider::Anthropic => self.warning(disabled),
+            crate::provider::Provider::Codex => match self {
+                Self::Ambiguous => Some(
+                    "NOT SAVED: two config entries share this Codex login — remove the duplicate \
+                     (tcr remove <name>), or re-import it with --name",
+                ),
+                _ => self.warning(disabled),
+            },
         }
     }
 }
@@ -1903,10 +1906,10 @@ impl Manager {
     /// fleet whose every account answered a quota refusal used to report the 60-second
     /// sentinel, which the Codex client renders as "resets in 60 seconds" for a window
     /// days away. When EVERY account folded is `rejected`, each Codex one contributes
-    /// when it can be expected back (`Self::rejected_codex_free_at_ms`): the latest
-    /// live reset among its windows at or over its threshold, which the refusal's own
-    /// headers stored, and only with no such window its rate-limit hold's expiry (a hold
-    /// is clamped to an hour, so it is the worse answer whenever a window is known). An
+    /// when it can be expected back (`Self::rejected_codex_free_at_ms`): the refusal body's
+    /// measured reset, then the latest live reset among its windows at or over its threshold,
+    /// and only with neither its rate-limit hold's expiry. Measured Codex quota holds preserve
+    /// that full deadline instead of using the transient hold's one-hour cap. An
     /// Anthropic `rejected` still contributes nothing, so Anthropic's hint is unchanged:
     /// it is upstream's verdict, which need not belong to any window this account stores
     /// (see `rejected_account_reports_a_rejected_gate`).
@@ -1982,10 +1985,13 @@ impl Manager {
                 &parked_groups,
             );
             if reason == GateReason::Rejected {
-                if account.provider == crate::provider::Provider::Codex {
-                    if let Some(at) = Self::rejected_codex_free_at_ms(account, threshold, now) {
-                        rejected_codex_soonest =
-                            Some(rejected_codex_soonest.map_or(at, |best| best.min(at)));
+                match account.provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => {
+                        if let Some(at) = Self::rejected_codex_free_at_ms(account, threshold, now) {
+                            rejected_codex_soonest =
+                                Some(rejected_codex_soonest.map_or(at, |best| best.min(at)));
+                        }
                     }
                 }
             } else {
@@ -2024,15 +2030,15 @@ impl Manager {
 
     /// When a `rejected` CODEX account can be expected back, for the exhaustion hint
     /// alone (see [`Self::exhaustion_hint`]), in epoch ms and only while still ahead of
-    /// `now`: the latest live reset among its windows at or over `threshold` (every one
-    /// of them has to roll before it can serve), else its rate-limit hold's expiry. `None`
-    /// when neither is known.
+    /// `now`: the refusal body's measured reset, then the latest live reset among its
+    /// windows at or over `threshold` (every one has to roll before it can serve), else its
+    /// rate-limit hold's expiry. `None` when none is known.
     ///
-    /// The windows come first because the hold is clamped to an hour
-    /// (`MAX_RATE_LIMIT_HOLD_SECONDS`): a weekly refusal holds for at most that, while
-    /// the account stays rejected until a usage probe sees the window it stored roll, or
-    /// reads the account allowed ([`crate::quota::Quota::apply_usage`]), or a served 2xx that
-    /// carries a window reads it allowed.
+    /// A measured Codex quota deadline keeps its full duration
+    /// ([`Self::mark_codex_quota_limited`]); only transient rate limits use the bounded hold.
+    /// The account stays rejected until a usage probe sees the window it stored roll, reads
+    /// the account allowed ([`crate::quota::Quota::apply_usage`]), or a served 2xx carrying a
+    /// window reads it allowed.
     fn rejected_codex_free_at_ms(
         account: &AccountRuntime,
         threshold: f64,
@@ -2131,8 +2137,9 @@ impl Manager {
     /// those minutes.
     ///
     /// Why rule 3 holds even for a refusal that carried no reset: the proxy arms a hold for every
-    /// Codex quota refusal, to its windows' reset (`quota::codex_hold_seconds`, clamped to an
-    /// hour), else to the 429's `retry-after`, else for 60 seconds. While that hold is live the
+    /// Codex quota refusal, to its body's measured reset, then its windows' reset
+    /// (`quota::codex_hold_seconds`), else to the 429's `retry-after`, else for 60 seconds.
+    /// Measured quota deadlines are preserved in full. While that hold is live the
     /// account really is held, with a known end, so `Hold` and its countdown are the truth; once
     /// the hold lapses, the refusal that still stands reads `Rejected`. The live hold can also be
     /// an upstream 403's ([`Self::mark_refused`]): once the refusal's own hold lapses the account
@@ -2154,7 +2161,11 @@ impl Manager {
         gate: GateReason,
         free_at: Option<OffsetDateTime>,
     ) -> (GateReason, Option<OffsetDateTime>) {
-        if account.provider != crate::provider::Provider::Codex || gate != GateReason::Rejected {
+        match account.provider {
+            crate::provider::Provider::Anthropic => return (gate, free_at),
+            crate::provider::Provider::Codex => {}
+        }
+        if gate != GateReason::Rejected {
             return (gate, free_at);
         }
         if let Some((window, reset)) = Self::rejected_codex_window(account, threshold, now) {
@@ -3531,9 +3542,12 @@ impl Manager {
                         // no longer holds, and the folder it came from (or none, for a login
                         // of tcr's own) is the submission's. Whatever the row's status was, so
                         // neither sits inside the two conditions above.
-                        if account.provider == crate::provider::Provider::Codex {
-                            row.login_error = None;
-                            row.codex_home = account.codex_home.clone();
+                        match account.provider {
+                            crate::provider::Provider::Anthropic => {}
+                            crate::provider::Provider::Codex => {
+                                row.login_error = None;
+                                row.codex_home = account.codex_home.clone();
+                            }
                         }
                         // F6: the submitted type always wins — this route only
                         // ever carries a real credential, so a row whose stored

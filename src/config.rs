@@ -4280,10 +4280,10 @@ fn merge_account(
                     crate::provider::Provider::Anthropic => {
                         entry.remove("provider");
                     }
-                    other => {
+                    crate::provider::Provider::Codex => {
                         entry.insert(
                             "provider".to_string(),
-                            Value::String(other.as_str().to_string()),
+                            Value::String(account.provider.as_str().to_string()),
                         );
                     }
                 }
@@ -4292,15 +4292,16 @@ fn merge_account(
                 // folder to point at, so `None` removes the key. A backfill would keep the
                 // first folder forever, and TcrBar would go on offering to re-import from it.
                 // An Anthropic submission leaves the entry's key alone.
-                if account.provider == crate::provider::Provider::Codex {
-                    match &account.codex_home {
+                match account.provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => match &account.codex_home {
                         Some(folder) => {
                             entry.insert("codexHome".to_string(), Value::String(folder.clone()));
                         }
                         None => {
                             entry.remove("codexHome");
                         }
-                    }
+                    },
                 }
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
                 if !present(entry, "accountUuid") {

@@ -2299,10 +2299,9 @@ fn window_length_label(minutes: u32) -> String {
 /// `30d` where the fixed label would claim `7d`; without a reported length, and on every
 /// Anthropic row, the label is the fixed `5h` or `7d`.
 fn held_windows(a: &AccountSnapshot, threshold: f64) -> Vec<HeldWindow> {
-    let label = |fixed: &str, minutes: Option<u32>| {
-        minutes
-            .filter(|_| a.provider == Provider::Codex)
-            .map_or_else(|| fixed.to_string(), window_length_label)
+    let label = |fixed: &str, minutes: Option<u32>| match a.provider {
+        Provider::Anthropic => fixed.to_string(),
+        Provider::Codex => minutes.map_or_else(|| fixed.to_string(), window_length_label),
     };
     let mut held = Vec::new();
     for (label, util, reset) in [
@@ -2639,11 +2638,10 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
 /// (`"fiveHour"` or `"sevenDay"`), else `None`, leaving the token to [`render_window`]. An
 /// unknown list is not a plan without the window, and a Claude row has no such list at all.
 fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<String> {
-    let reported = a
-        .codex
-        .quota_windows
-        .as_ref()
-        .filter(|_| a.provider == Provider::Codex)?;
+    let reported = match a.provider {
+        Provider::Anthropic => return None,
+        Provider::Codex => a.codex.quota_windows.as_ref()?,
+    };
     (!reported.iter().any(|w| w == window)).then(|| format!("{label}=none"))
 }
 
@@ -2654,8 +2652,9 @@ fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<S
 /// which no Codex request can reach) and ` workspace=` ([`workspace_token`]). Empty on a Claude
 /// row, whatever its Codex facts hold.
 fn codex_tail(a: &AccountSnapshot) -> String {
-    if a.provider != Provider::Codex {
-        return String::new();
+    match a.provider {
+        Provider::Anthropic => return String::new(),
+        Provider::Codex => {}
     }
     let mut tail = String::new();
     if let Some(code) = &a.codex.login_error {
@@ -2864,11 +2863,13 @@ fn account_status_rows_at(
             // The Codex keys are written on a Codex row only. An Anthropic row
             // takes the empty facts and no route or traffic whatever it was
             // given, so every one of its keys is skipped.
-            let codex = a.provider == Provider::Codex;
-            let facts = if codex {
-                a.codex.clone()
-            } else {
-                CodexFacts::default()
+            let (facts, row_route, row_traffic) = match a.provider {
+                Provider::Anthropic => (CodexFacts::default(), None, None),
+                Provider::Codex => (
+                    a.codex.clone(),
+                    codex_route.cloned(),
+                    codex_traffic.cloned(),
+                ),
             };
             let held: Vec<tcr_status_wire::HeldWindowRow> = held_windows(a, threshold)
                 .into_iter()
@@ -3175,8 +3176,10 @@ fn account_status_rows_at(
                 // every row a panel built before this key could decode is the
                 // same bytes it always was (the contract fixture pins both).
                 // A config fact, real on both paths like `groups`.
-                provider: (a.provider != Provider::Anthropic)
-                    .then(|| a.provider.as_str().to_string()),
+                provider: match a.provider {
+                    Provider::Anthropic => None,
+                    Provider::Codex => Some(a.provider.as_str().to_string()),
+                },
                 // What a Codex account reports and an Anthropic one never does
                 // (`CodexFacts`), copied from the snapshot. No `source` guard:
                 // unlike the serving counters above, a fact nobody reported is
@@ -3193,8 +3196,8 @@ fn account_status_rows_at(
                 // Fleet-wide, repeated on every Codex row like `serverSha`:
                 // whether `tcr run --codex` would pool codex, and what the
                 // server did with Codex requests in the last ten minutes.
-                codex_route: codex_route.filter(|_| codex).cloned(),
-                codex_traffic: codex_traffic.filter(|_| codex).cloned(),
+                codex_route: row_route,
+                codex_traffic: row_traffic,
                 // The plan, three raw fields and one label. Real on BOTH paths
                 // like `groups`/`control` above: this is a config fact read
                 // from disk, not a serving counter, so the offline path knows
@@ -3912,10 +3915,7 @@ pub(crate) fn codex_traffic_notes(traffic: &tcr_status_wire::CodexTraffic) -> Ve
             "[tcr] note codex-refusals: refused_10m={} last_type={} — tcr answered codex with a \
              429 because no Codex account could serve; see the Codex rows above",
             traffic.refused_10m,
-            traffic
-                .last_refusal
-                .map(|kind| kind.as_str())
-                .unwrap_or("unknown"),
+            traffic.last_refusal.map_or("unknown", |kind| kind.as_str()),
         ));
     }
     if traffic.unpooled_10m > 0 {
