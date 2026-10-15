@@ -731,6 +731,8 @@ public enum LoginCapability {
         case terminal
         /// A `tcr` that predates Codex accounts altogether, which no script can help.
         case predatesCodex
+        /// The selected tcr could not report its capabilities; launch nothing.
+        case probeFailed
     }
 
     /// `.inSheet` when `--codex` is a whole token of the help, `.terminal` when only
@@ -748,8 +750,8 @@ public enum LoginCapability {
     /// gains `--codex` resolves `--account` as a row name first, so the sheet and the
     /// Terminal script are not interchangeable, and a stale answer would pick the
     /// wrong one. It refreshes the cache ``knownCodexSupport(executable:)`` reads. A
-    /// failed run answers `.terminal`, as a `false` from ``probeCodex(executable:)``
-    /// does.
+    /// failed run answers `.probeFailed`: no temporary Terminal login is started
+    /// when the selected tcr's capabilities are unknown.
     @MainActor
     public static func readCodexPath(
         executable: URL,
@@ -758,7 +760,7 @@ public enum LoginCapability {
         let help = try? await Task.detached(priority: .utility) { try readHelp(executable) }.value
         guard let help else {
             codexCached[executable.path] = false
-            return .terminal
+            return .probeFailed
         }
         let path = codexPath(help: help)
         codexCached[executable.path] = path == .inSheet
@@ -770,6 +772,24 @@ public enum LoginCapability {
         let output = try TcrTool.run(executable: executable, arguments: ["login", "--help"])
         guard output.exitCode == 0 else { throw HelpFailed() }
         return (String(data: output.stdout, encoding: .utf8) ?? "") + output.stderr
+    }
+
+    /// Read a selected executable's version without loading any tcr configuration.
+    @MainActor
+    public static func readVersion(
+        executable: URL,
+        readVersion: @escaping @Sendable (URL) throws -> String = {
+            try LoginCapability.readVersionOutput($0)
+        }
+    ) async -> String? {
+        let output = try? await Task.detached(priority: .utility) { try readVersion(executable) }.value
+        return output.flatMap { TcrTool.version(fromVersionOutput: $0) }
+    }
+
+    public nonisolated static func readVersionOutput(_ executable: URL) throws -> String {
+        let output = try TcrTool.run(executable: executable, arguments: ["--version"])
+        guard output.exitCode == 0 else { throw HelpFailed() }
+        return String(decoding: output.stdout, as: UTF8.self)
     }
 
     private struct HelpFailed: Error {}

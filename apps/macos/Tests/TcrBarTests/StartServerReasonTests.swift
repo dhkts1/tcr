@@ -59,6 +59,15 @@ final class StartServerReasonTests: XCTestCase {
         + "only understands up to 1; refusing to load rather than silently reinterpret its "
         + "credential shape"
 
+    func testAFutureCredentialShapeDoesNotBlameCodex() {
+        let refusal =
+            "account alice@example.com carries credentialVersion 3, which this build only understands up to 2"
+        let displayed = PredatesCodexRefusal.displayed(refusal, executablePath: "/opt/example/tcr")
+        XCTAssertFalse(displayed.contains("Codex"))
+        XCTAssertTrue(displayed.contains("credentials"))
+        XCTAssertTrue(displayed.contains("/opt/example/tcr"))
+    }
+
     func testTheCredentialRefusalNamesTheExecutableThatActuallyRan() {
         let path = "/opt/example/tcr"
         XCTAssertTrue(PredatesCodexRefusal.displayed(refusal, executablePath: path).contains(path))

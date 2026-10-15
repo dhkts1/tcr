@@ -31,6 +31,26 @@ final class LoginCapabilityTests: XCTestCase {
         """#
 
     @MainActor
+    func testAFailedCodexHelpProbeNeverLaunchesATemporaryTerminalLogin() async {
+        struct UnreadableHelp: Error {}
+        let path = await LoginCapability.readCodexPath(
+            executable: URL(fileURLWithPath: "/opt/example/tcr-unreadable-help"),
+            readHelp: { _ in throw UnreadableHelp() })
+        XCTAssertNotEqual(path, .terminal)
+    }
+
+    @MainActor
+    func testVersionProbeRunsOffTheMainThread() async {
+        let version = await LoginCapability.readVersion(
+            executable: URL(fileURLWithPath: "/opt/example/tcr-version-thread"),
+            readVersion: { _ in
+                XCTAssertFalse(Thread.isMainThread)
+                return "tcr 1.2.1"
+            })
+        XCTAssertEqual(version, "1.2.1")
+    }
+
+    @MainActor
     func testAllHelpProbesRunOffTheMainThread() async {
         let executable = URL(fileURLWithPath: "/opt/example/tcr-help-thread-test")
         let read: @Sendable (URL) throws -> String = { _ in

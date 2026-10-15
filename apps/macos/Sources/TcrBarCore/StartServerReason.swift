@@ -76,6 +76,15 @@ public enum PredatesCodexRefusal {
     /// `text` carries the refusal, and otherwise `text` unchanged.
     public static func displayed(_ text: String, executablePath: String? = nil) -> String {
         guard matches(text) else { return text }
+        // Only the initial Codex shape identifies a provider. Future credential
+        // changes can belong to Claude too, so explain the general version refusal.
+        if text.range(
+            of: #"carries credentialVersion 2, which this build only understands up to [01]\b"#,
+            options: .regularExpression) == nil
+        {
+            let selected = executablePath.map { "The tcr at \($0)" } ?? "The selected tcr"
+            return selected + " cannot read this config's credentials. Update that tcr and try again."
+        }
         return CodexSignInCopy.predatesCodexTitle + ". "
             + CodexSignInCopy.predatesCodexDetail(executablePath: executablePath)
     }

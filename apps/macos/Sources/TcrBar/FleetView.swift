@@ -4127,9 +4127,14 @@ struct FleetView: View {
                         loginError = Self.loginFailureMessage(why)
                     }
                     return
+                case .probeFailed:
+                    let reason =
+                        "Could not check Codex sign-in support in \(HomePath.short(executable.path)). Try again or update that tcr."
+                    loginSession = LoginSession(request: request, phase: .failed(reason: reason))
+                    return
                 case .predatesCodex:
                     loginSession = LoginSession(
-                        request: request, phase: .failed(reason: pathTcrFlag(for: executable)))
+                        request: request, phase: .failed(reason: await pathTcrFlag(for: executable)))
                     return
                 }
             }
@@ -4154,12 +4159,8 @@ struct FleetView: View {
     /// The failed sheet's detail for a tcr that predates Codex accounts, naming it
     /// and its version as Settings › Updates does. It runs `tcr --version`, which
     /// reads no config.
-    private func pathTcrFlag(for executable: URL) -> String {
-        let output = try? TcrTool.run(executable: executable, arguments: ["--version"])
-        let version = output.flatMap {
-            $0.exitCode == 0
-                ? TcrTool.version(fromVersionOutput: String(decoding: $0.stdout, as: UTF8.self)) : nil
-        }
+    private func pathTcrFlag(for executable: URL) async -> String {
+        let version = await LoginCapability.readVersion(executable: executable)
         return CodexSignInCopy.pathTcrFlag(path: executable.path, version: version)
     }
 
