@@ -220,7 +220,8 @@ Codex account to serve the session; add one with
 launch leaves `codex` on its own backend URL, which is the real `https://chatgpt.com` for every
 login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to
 `http://tcr-codex@127.0.0.1:<port>`, and sets
-`CODEX_CA_CERTIFICATE` to tcr's CA, `~/.config/tcr-ca.pem`, unless you supplied that variable.
+`CODEX_CA_CERTIFICATE` to the selected caller bundle, or tcr's CA at `~/.config/tcr-ca.pem`
+when neither extra-CA variable is set.
 The selected caller bundle (`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`) is preserved
 in full and must include tcr's CA. If it does not, tcr launches Codex directly on its own
 login and explains how to include both certificates. That variable is where `codex`
@@ -243,9 +244,20 @@ The launch also supplies `shell_environment_policy.set.HTTPS_PROXY` and
 Codex shell tools such as curl, Python and git then tunnel `chatgpt.com` on their own TLS and
 credentials. These two launch overrides replace any proxy values in the config file's shell
 policy while preserving other keys and filters; later explicit `-c` arguments can override
-them. No Codex config file is written. MCP tools do not inherit proxy variables by default,
-but explicit MCP environments and other child helpers can still inherit the marker. For such
-a child, explicitly set an unmarked proxy URL; do not export the marker to your whole shell.
+them. No Codex config file is written.
+
+Codex's default stdio MCP environment omits proxy variables: its MCP launcher clears the
+child environment and restores an allowlist. Explicit MCP `env_vars` can opt back into
+inheriting them. Codex hooks inherit its session environment, so they can also carry the
+marker. Give those helpers unmarked `HTTPS_PROXY` and `https_proxy` values, rather than
+forwarding the marked values. For a shell-based hook, prefix the command with
+`HTTPS_PROXY=http://127.0.0.1:<port> https_proxy=http://127.0.0.1:<port>`.
+
+The checked Codex source is [`rmcp-client/src/utils.rs`](https://github.com/openai/codex/blob/e89b7c442c0433ad5167e72a5a25bb6d0712766a/codex-rs/rmcp-client/src/utils.rs),
+[`utils/pty/src/child_command.rs`](https://github.com/openai/codex/blob/e89b7c442c0433ad5167e72a5a25bb6d0712766a/codex-rs/utils/pty/src/child_command.rs), and
+[`hooks/src/registry.rs`](https://github.com/openai/codex/blob/e89b7c442c0433ad5167e72a5a25bb6d0712766a/codex-rs/hooks/src/registry.rs).
+The marker is routing opt-in, not process authentication; a helper deliberately given the
+marked proxy is opted in as well.
 
 **When no Codex account can serve right now.** A pooled launch whose running proxy reports no
 Codex account able to serve says so first, from the same read, and then launches as usual, since

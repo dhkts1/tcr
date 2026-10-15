@@ -700,8 +700,8 @@ public enum LoginCapability {
 
     /// Ask a binary once whether it has `tcr login --codex`, and remember, the way
     /// ``probe(executable:)`` asks about `--non-interactive`. A failed probe answers
-    /// `false`, which sends a Codex sign-in to the Terminal script, the path every
-    /// `tcr` that can import a codex login takes.
+    /// `false` as a conservative presentation hint. A sign-in click reads the path
+    /// afresh through ``readCodexPath(executable:readHelp:)``; a failed read launches nothing.
     @MainActor
     public static func probeCodex(
         executable: URL,
