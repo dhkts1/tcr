@@ -83,7 +83,8 @@ const _: () =
 ///
 /// A row with no account id sends no `chatgpt-account-id` at all, never a placeholder, exactly
 /// as inference does (`proxy::build_codex_upstream_headers`), so the probe reads the account
-/// the backend serves that bearer on.
+/// the backend serves that bearer on. Like CodexBar's OAuth usage fetcher, the request identifies
+/// its client with a `User-Agent`; tcr sends its own version rather than CodexBar's identity.
 pub async fn fetch_usage(
     client: &reqwest::Client,
     base: &str,
@@ -99,6 +100,10 @@ pub async fn fetch_usage(
         .get(&url)
         .bearer_auth(access_token)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("tcr/", env!("CARGO_PKG_VERSION")),
+        )
         .timeout(crate::probe::PROBE_TIMEOUT);
     if let Some(id) = account_id {
         req = req.header(crate::provider::CODEX_ACCOUNT_HEADER, id);
@@ -921,6 +926,38 @@ mod tests {
         probe_first.apply_usage(&usage_from_payload(&pro_payload));
         let _ = probe_first.update_from_codex_headers(&headers, 200);
         assert_eq!(names(&probe_first), weekly_only, "the probe, then headers");
+    }
+
+    #[tokio::test]
+    async fn fetch_sends_tcr_user_agent() {
+        use axum::{routing::get, Router};
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = seen.clone();
+        let app = Router::new().route(
+            "/backend-api/wham/usage",
+            get(move |headers: axum::http::HeaderMap| async move {
+                *captured.lock().unwrap() = headers
+                    .get(axum::http::header::USER_AGENT)
+                    .map(|value| value.to_str().unwrap().to_string());
+                PAYLOAD
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        fetch_usage(&client, &base, "test-access-token", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(concat!("tcr/", env!("CARGO_PKG_VERSION"))),
+            "the usage request identifies tcr to the upstream"
+        );
+        server.abort();
     }
 
     /// The probe sends the bearer, and the row's account id as `chatgpt-account-id`; a row with
