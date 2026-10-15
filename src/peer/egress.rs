@@ -1076,14 +1076,38 @@ impl PinnedEgressError {
 
     /// The refusal as the client reads it.
     ///
-    /// A 503 with a `retry-after`, the shape this proxy already answers with
-    /// when a request cannot be served for a reason that is nobody's fault
+    /// An unsupported Codex pin is an immediate 400 in Codex's envelope, requiring
+    /// a configuration fix. Other failures are a 503 with a `retry-after`, the shape this
+    /// proxy already answers with when a request cannot be served for a reason that is nobody's fault
     /// upstream, plus `x-should-retry` so a client that knows the header does
     /// the waiting. The envelope is `proxy.rs`'s `error_response` spelled out
     /// rather than called: that function is private to `proxy.rs` and sits in
     /// the half of the file this change does not touch. Making it `pub(crate)`
     /// there would let this call it instead.
     pub fn into_response(self) -> axum::response::Response {
+        if matches!(self, Self::CodexNotCarried { .. }) {
+            let message = format!(
+                "{} Clear this account's peer exit pin before using it with Codex.",
+                self
+            );
+            let kind = tcr_status_wire::CodexRefusalKind::PoolUnavailable;
+            tracing::warn!(
+                status = 400,
+                error.r#type = kind.error_type(),
+                error.message = %message,
+                "account egress: unsupported Codex exit pin requires a config change"
+            );
+            let mut response = crate::proxy::codex_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                crate::proxy::codex_error_body(kind, message).to_string(),
+                None,
+            );
+            response.headers_mut().insert(
+                "x-should-retry",
+                axum::http::HeaderValue::from_static("false"),
+            );
+            return response;
+        }
         // THE DELIVERED CASE IS A DIFFERENT ANSWER, and it has to be: this
         // type's own `Display` says "The request was NOT sent", which is the
         // one thing nobody can promise once the gateway took the carry. The

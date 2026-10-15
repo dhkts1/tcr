@@ -10174,7 +10174,7 @@ mod tests {
 
     /// `tcr peer ls` lists a Codex account's exit pin with what it really does:
     /// a loose pin is inert, because a Codex request always leaves from this Mac,
-    /// and a strict one refuses every request routed to the account, so its line
+    /// and a strict one skips the account during selection, so its line
     /// names the command that clears it. A Claude pin, and a Codex account left
     /// local, get no line.
     #[test]
@@ -10204,7 +10204,7 @@ mod tests {
                     peer.display()
                 ),
                 format!(
-                    "carol@example.com/codex  exits={} (refused: a Codex account cannot exit from another Mac, so tcr refuses every request routed to it; clear it with `tcr peer account carol@example.com/codex --exits-from local --no-must`)",
+                    "carol@example.com/codex  exits={} (refused: a Codex account cannot exit from another Mac, so tcr skips this account; clear it with `tcr peer account carol@example.com/codex --exits-from local --no-must`)",
                     peer.display()
                 ),
             ]

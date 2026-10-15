@@ -210,6 +210,21 @@ impl Manager {
         if tried.contains(&idx) {
             return None;
         }
+        let provider = self
+            .accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)?
+            .provider;
+        let unsupported_exit = match provider {
+            crate::provider::Provider::Anthropic => false,
+            crate::provider::Provider::Codex => {
+                self.codex_accounts_with_unsupported_exit().contains(&idx)
+            }
+        };
+        if unsupported_exit {
+            return None;
+        }
         let now_ms = super::odt_to_ms(now);
         let reserved = self.reserved_groups();
         let parked = self.parked_groups();

@@ -209,8 +209,10 @@ So `tcr peer account <account> --exits-from <peer>` is refused on a Codex accoun
 `--must`, which would make a pin it already has strict; the refusal changes nothing.
 `--exits-from local` and `--no-must` still work on one, so a pin written before this refusal
 existed can be cleared. Such an old pin, if it is not strict, is inert, and `tcr peer ls`
-lists it that way. If it is strict, tcr refuses every request routed to the account until it
-is cleared, and `tcr peer ls` says that instead, with the command that clears it.
+lists it that way. If it is strict, tcr keeps the account for repair but skips it during
+selection; other usable Codex accounts can still serve. `tcr peer ls` names the command
+that clears the pin. If no usable Codex account remains, requests fail immediately with a
+Codex error asking for the configuration to be fixed.
 
 For the same reason, `tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex
 account (`--scope account:<label>`), and change nothing. A zero fraction, `--list`, `--revoke`

@@ -5572,7 +5572,7 @@ pub(crate) fn build_codex_upstream_headers(
 }
 
 /// The common Codex error envelope, with its type and code drawn from one refusal kind.
-fn codex_error_body(kind: CodexRefusalKind, message: impl Into<String>) -> Value {
+pub(crate) fn codex_error_body(kind: CodexRefusalKind, message: impl Into<String>) -> Value {
     serde_json::json!({
         "error": {
             "type": kind.error_type(),
@@ -5584,7 +5584,11 @@ fn codex_error_body(kind: CodexRefusalKind, message: impl Into<String>) -> Value
 
 /// Every tcr-generated Codex refusal uses the same JSON response headers. Only a refusal
 /// that waiting can end carries a retry hint; the body keeps its own provider-specific detail.
-fn codex_error_response(status: StatusCode, body: String, retry_after: Option<i64>) -> Response {
+pub(crate) fn codex_error_response(
+    status: StatusCode,
+    body: String,
+    retry_after: Option<i64>,
+) -> Response {
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response

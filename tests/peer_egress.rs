@@ -4091,11 +4091,19 @@ async fn codex_pinned_account_is_never_carried() {
         .await;
         match (strict, answer) {
             (true, egress::PinnedEgress::Answered(response)) => {
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(response.headers()["x-should-retry"], "false");
+                assert!(!response.headers().contains_key("retry-after"));
                 let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                     .await
                     .expect("the refusal body reads");
                 let body = String::from_utf8_lossy(&body);
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert!(
+                    json.get("type").is_none(),
+                    "the refusal uses Codex's envelope"
+                );
+                assert_eq!(json["error"]["code"], "pool_unavailable");
                 assert!(
                     body.contains("alice@example.com") && body.contains("Codex"),
                     "the refusal names the account and why its pin cannot be honoured: {body}"

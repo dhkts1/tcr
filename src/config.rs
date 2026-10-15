@@ -367,6 +367,15 @@ pub struct Account {
 }
 
 impl Account {
+    /// A strict peer exit cannot be honoured for Codex. Keep the row readable so
+    /// the CLI can clear its pin, but never select it for a pooled request.
+    pub(crate) fn has_unsupported_strict_peer_exit(&self) -> bool {
+        match self.provider {
+            crate::provider::Provider::Anthropic => false,
+            crate::provider::Provider::Codex => self.egress_strict && self.egress.peer().is_some(),
+        }
+    }
+
     /// Whether this account belongs to `group`. An account with no `groups` key
     /// belongs to none — it is reachable only by ungrouped routing.
     pub fn in_group(&self, group: &str) -> bool {

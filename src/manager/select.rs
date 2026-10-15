@@ -408,6 +408,56 @@ impl Manager {
         self.select_with_group(tried, now, model, affinity, path, conn_key, None)
     }
 
+    /// Unsupported strict Codex exits, mapped by account name to stable runtime slots.
+    /// Config positions can shift after a delete, so they are never used as slot indices.
+    /// Each lock is released before the other is taken.
+    pub(crate) fn codex_accounts_with_unsupported_exit(&self) -> HashSet<usize> {
+        let names: HashSet<String> = self
+            .config
+            .lock()
+            .expect("config lock poisoned")
+            .accounts
+            .iter()
+            .filter(|account| account.has_unsupported_strict_peer_exit())
+            .map(|account| account.name.clone())
+            .collect();
+        if names.is_empty() {
+            return HashSet::new();
+        }
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| match account.provider {
+                crate::provider::Provider::Anthropic => false,
+                crate::provider::Provider::Codex => names.contains(&account.name),
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn exclude_unsupported_codex_exits<'a>(
+        &self,
+        tried: &'a HashSet<usize>,
+        provider: crate::provider::Provider,
+    ) -> std::borrow::Cow<'a, HashSet<usize>> {
+        let unsupported = match provider {
+            crate::provider::Provider::Anthropic => return std::borrow::Cow::Borrowed(tried),
+            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
+        };
+        if unsupported.is_empty() {
+            return std::borrow::Cow::Borrowed(tried);
+        }
+        self.affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .retain(|_, (idx, _)| !unsupported.contains(idx));
+        let mut excluded = tried.clone();
+        excluded.extend(unsupported);
+        std::borrow::Cow::Owned(excluded)
+    }
+
     /// Whether `group` has opted in to `spillToPool`, a PREFERENCE, whose own
     /// traffic may be served by a non-member when no member has capacity.
     ///
@@ -514,6 +564,11 @@ impl Manager {
         // `eligible` refuses any other first, and each door below that does
         // not go through `eligible` checks it on its own.
         let provider = crate::provider::Provider::of_path(path);
+
+        // A strict Codex peer exit is a configuration block, not an upstream failure.
+        // Exclude it before locks, affinity and pool picks can select that account.
+        let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
+        let tried = filtered_tried.as_ref();
 
         // Hard account lock: pin ALL traffic to the configured account, bypassing
         // rotation/affinity/migration. `tried` still ends the rotation loop, once the
@@ -1725,6 +1780,8 @@ impl Manager {
         let now_ms = odt_to_ms(now);
         // Derived exactly as `select_with_group` derives them.
         let provider = crate::provider::Provider::of_path(path);
+        let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
+        let tried = filtered_tried.as_ref();
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
         let is_fable = match provider {
             crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
@@ -5386,6 +5443,107 @@ mod provider_filter_tests {
     /// for the pure [`Manager::eligible`] predicate.
     fn runtime(name: &str) -> AccountRuntime {
         AccountRuntime::from_config(&account(name), false)
+    }
+
+    #[test]
+    fn a_loaded_strict_codex_peer_exit_is_skipped_by_every_selection_path() {
+        let peer = tcr_peer_wire::PeerId([0x55; 32]);
+        let mut failures = Vec::new();
+        for door in ["pool", "affinity", "locked", "revalidation", "bound"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(crate::paths::CONFIG_FILE);
+            let mut config = config_with(vec![
+                Account {
+                    egress: crate::config::Egress::Via(peer),
+                    egress_strict: true,
+                    ..codex("alice@example.com/codex")
+                },
+                codex("bob@example.com/codex"),
+            ]);
+            config.proxy.port = 9;
+            if door == "locked" {
+                config.lock_account = Some("alice@example.com/codex".into());
+            }
+            crate::config::save(&path, &config).unwrap();
+            let config = crate::config::load(&path).unwrap();
+            assert_eq!(
+                config.accounts.len(),
+                2,
+                "the row remains available for repair"
+            );
+            assert!(config.accounts[0].egress_strict);
+            let manager = build(config);
+            let now = OffsetDateTime::now_utc();
+            pin(&manager, 77, 0, odt_to_ms(now));
+            let got = match door {
+                "pool" | "locked" => {
+                    manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None)
+                }
+                "affinity" => {
+                    manager.select(&HashSet::new(), now, None, Some(77), CODEX_PATH, None)
+                }
+                "revalidation" => {
+                    manager.select_revalidation(&HashSet::new(), now, None, Some(77), CODEX_PATH)
+                }
+                "bound" => manager.select_bound(
+                    0,
+                    &HashSet::new(),
+                    now,
+                    false,
+                    None,
+                    None,
+                    WarmWindow::DEFAULT,
+                ),
+                _ => unreachable!(),
+            };
+            let expected = if matches!(door, "locked" | "bound") {
+                None
+            } else {
+                Some(1)
+            };
+            if got != expected {
+                failures.push(format!("{door}: selected {got:?}, expected {expected:?}"));
+            }
+            if matches!(door, "affinity" | "revalidation") && pin_of(&manager, 77) != Some(1) {
+                failures.push(format!(
+                    "{door}: retained the unusable account's affinity pin"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn supported_peer_exit_settings_keep_their_selection_behavior() {
+        let peer = tcr_peer_wire::PeerId([0x55; 32]);
+        for (provider, egress, strict) in [
+            (Provider::Anthropic, crate::config::Egress::Via(peer), true),
+            (Provider::Codex, crate::config::Egress::Via(peer), false),
+            (Provider::Codex, crate::config::Egress::Local, true),
+        ] {
+            let manager = build(config_with(vec![Account {
+                provider,
+                egress,
+                egress_strict: strict,
+                ..account("alice@example.com")
+            }]));
+            let path = match provider {
+                Provider::Anthropic => ANTHROPIC_PATH,
+                Provider::Codex => CODEX_PATH,
+            };
+            assert_eq!(
+                manager.select(
+                    &HashSet::new(),
+                    OffsetDateTime::now_utc(),
+                    None,
+                    None,
+                    path,
+                    None
+                ),
+                Some(0),
+                "{provider:?} {egress:?}, strict={strict} remains selectable"
+            );
+        }
     }
 
     fn config_with(accounts: Vec<Account>) -> Config {

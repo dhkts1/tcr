@@ -6,7 +6,7 @@
 //!   token. ChatGPT has no such grant, so a Codex row has nothing to mint.
 //! - **Leaving through a peer.** A Codex request always leaves from this Mac: no Mac lends,
 //!   serves or carries one in this version (`Manager::lend_candidates` skips every Codex
-//!   account, and the exit path refuses a strictly pinned one). So a Codex account cannot be
+//!   account, and selection skips a strictly pinned one). So a Codex account cannot be
 //!   pinned to exit from another Mac, and it cannot be lent.
 //! - **Being reached through a group.** A group is asked for with `tcr run --group`, which
 //!   sets a header that only a Claude session sends. No Codex request carries a group, so a
@@ -136,13 +136,13 @@ pub fn codex_priority_line(name: &str, value: i64, first: bool) -> String {
 pub const INERT_EXIT_SUFFIX: &str = " (inert: Codex accounts always leave from this Mac)";
 
 /// Appended by `tcr peer ls` to a STRICT Codex exit pin naming a peer. That pin is not
-/// inert: the exit path refuses every request routed to the account, because a Codex
-/// account cannot exit from another Mac and a strict pin forbids leaving from this one. So
-/// it names the command that clears the pin.
+/// inert: selection skips the account, because a Codex account cannot exit from another
+/// Mac and a strict pin forbids leaving from this one. So it names the command that clears
+/// the pin.
 pub fn refused_exit_suffix(name: &str) -> String {
     format!(
-        " (refused: a Codex account cannot exit from another Mac, so tcr refuses every request \
-         routed to it; clear it with `tcr peer account {name} --exits-from local --no-must`)"
+        " (refused: a Codex account cannot exit from another Mac, so tcr skips this account; \
+         clear it with `tcr peer account {name} --exits-from local --no-must`)"
     )
 }
 
