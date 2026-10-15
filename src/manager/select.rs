@@ -1916,12 +1916,15 @@ impl Manager {
 
             // A servable candidate exists — spend the anti-storm window now (after
             // selection, so a fleet with nothing to serve never burns the valve).
-            let next_at = self.next_revalidation_at_ms.load(Ordering::Relaxed);
+            let valve = match provider {
+                crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
+                crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
+            };
+            let next_at = valve.load(Ordering::Relaxed);
             if now_ms < next_at {
                 return None;
             }
-            self.next_revalidation_at_ms
-                .store(now_ms + REVALIDATION_MIN_SPACING_MS, Ordering::Relaxed);
+            valve.store(now_ms + REVALIDATION_MIN_SPACING_MS, Ordering::Relaxed);
 
             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
             let util = accounts
@@ -6100,6 +6103,38 @@ mod provider_filter_tests {
     /// Watched red: drop the provider check from `select_revalidation`'s
     /// `hard_ok` and the Anthropic request is revalidated onto the Codex
     /// account (`Some(1)`).
+    #[test]
+    fn codex_and_claude_revalidation_valves_are_independent() {
+        for order in [
+            [(CODEX_PATH, 1), (ANTHROPIC_PATH, 0)],
+            [(ANTHROPIC_PATH, 0), (CODEX_PATH, 1)],
+        ] {
+            let manager = build(config_with(vec![
+                account("alice@example.com"),
+                codex("bob@example.com"),
+            ]));
+            set_window(&manager, 0, |quota| &mut quota.five_hour, 0.99);
+            set_window(&manager, 1, |quota| &mut quota.five_hour, 0.99);
+            let now = OffsetDateTime::now_utc();
+            for (path, index) in order {
+                assert_eq!(
+                    manager.select(&HashSet::new(), now, None, None, path, None),
+                    None
+                );
+                assert_eq!(
+                    manager.select_revalidation(&HashSet::new(), now, None, None, path),
+                    Some(index),
+                    "one provider must not spend the other's revalidation valve"
+                );
+                assert_eq!(
+                    manager.select_revalidation(&HashSet::new(), now, None, None, path),
+                    None,
+                    "same-provider bursts remain bounded"
+                );
+            }
+        }
+    }
+
     #[test]
     fn revalidation_never_serves_the_other_provider() {
         let manager = build(config_with(vec![

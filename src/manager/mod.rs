@@ -1382,6 +1382,8 @@ pub struct Manager {
     /// Anti-storm valve for over-threshold revalidation-serve: epoch-ms before which
     /// no new revalidation serve is issued. See [`Manager::select_revalidation`].
     next_revalidation_at_ms: std::sync::atomic::AtomicI64,
+    /// Codex has its own revalidation budget; a Claude fallback never spends it.
+    next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64,
     /// Connection-scoped affinity for NOISE traffic (`/api/event_logging`,
     /// `/mcp-registry` — see [`select::classify_request`]): connection key
     /// ([`crate::proxy::SessionKey`]'s wrapped `u64`, minted per-connection by
@@ -1731,6 +1733,7 @@ impl Manager {
             wire_sessions_dirty: AtomicBool::new(false),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
+            next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             conn_affinity: Mutex::new(HashMap::new()),
             divert_ledger: Mutex::new(HashMap::new()),
             control_reserve,

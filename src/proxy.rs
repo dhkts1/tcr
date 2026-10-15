@@ -4791,13 +4791,25 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             if quota_refusal {
                                 manager.mark_codex_quota_limited(idx, hold);
                             } else {
-                                manager.mark_rate_limited(idx, hold);
-                                parked_transient.insert(idx);
+                                let count = retried_429.entry(idx).or_insert(0);
+                                let jitter = i64::from(clock.nanosecond())
+                                    % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                                match classify_transient_429(retry_after_raw, *count, jitter) {
+                                    Transient429::InlineWait(wait) => {
+                                        *count += 1;
+                                        tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+                                        next_idx = Some(idx);
+                                        continue;
+                                    }
+                                    Transient429::Park(wait) => {
+                                        manager.mark_rate_limited(idx, wait);
+                                        parked_transient.insert(idx);
+                                    }
+                                }
                             }
                             tracing::info!(
                                 account_index = idx,
                                 quota_refusal,
-                                hold_seconds = hold,
                                 "Codex 429: holding the account and rotating"
                             );
                             tried.insert(idx);
@@ -7217,7 +7229,16 @@ impl CodexStreamLimit {
             .as_ref()
             .and_then(|refusal| refusal.reset)
             .map_or_else(
-                || parse_retry_after(&headers).unwrap_or(60),
+                || {
+                    parse_retry_after(&headers).unwrap_or_else(|| {
+                        if refusal.is_some() {
+                            60
+                        } else {
+                            NO_GUIDANCE_HOLD_SECS
+                                + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1)
+                        }
+                    })
+                },
                 |reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()),
             );
         Some(Self {
@@ -21850,7 +21871,7 @@ mod tests {
     /// hold the account to the weekly reset instead.
     #[tokio::test]
     async fn a_codex_429_without_a_reached_type_holds_on_retry_after_not_the_window() {
-        for (retry_after, expected_hold) in [(Some("30"), 30_i64), (None, 60)] {
+        for (retry_after, expected_hold) in [(Some("30"), 30_i64), (None, 15)] {
             let anthropic_echo = CapturingUpstream::spawn().await;
             let secs = OffsetDateTime::now_utc().unix_timestamp();
             let weekly_reset = secs + 1800;
@@ -21904,8 +21925,9 @@ mod tests {
                 })
                 .unix_timestamp();
             assert!(
-                (until - (before + expected_hold)).abs() <= 2,
-                "retry-after {retry_after:?}: held {expected_hold}s from {before}, not to the \
+                if retry_after.is_some() { (until - (before + expected_hold)).abs() <= 2 }
+                else { (13..=22).contains(&(until - before)) },
+                "retry-after {retry_after:?}: held {expected_hold}s plus optional jitter from {before}, not to the \
                  weekly reset ({weekly_reset}); held until {until}"
             );
             assert_ne!(
@@ -21926,6 +21948,92 @@ mod tests {
     ///
     /// Watched red: drop the `parked_transient` insert from the Codex arm, and the soft-wait
     /// sleeps out the hold, re-admits nothing and answers 429 after one send.
+    #[test]
+    fn codex_stream_burst_limits_have_short_jittered_holds() {
+        for code in ["rate_limit_exceeded", "slow_down"] {
+            let limit = CodexStreamLimit::from_error(&serde_json::json!({"code": code})).unwrap();
+            assert!(limit.refusal.is_none());
+            assert!(
+                (15..=20).contains(&limit.hold_seconds),
+                "{code}: {}",
+                limit.hold_seconds
+            );
+        }
+        let quota =
+            CodexStreamLimit::from_error(&serde_json::json!({"type": "usage_limit_reached"}))
+                .unwrap();
+        assert!(quota.refusal.is_some());
+        assert_eq!(
+            quota.hold_seconds, 60,
+            "quota refusals retain their documented fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_short_burst_retry_keeps_the_same_account_when_a_sibling_is_healthy() {
+        let anthropic = CapturingUpstream::spawn().await;
+        let bearers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bearers.clone();
+        let origin = Router::new().fallback(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                let first = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(
+                        headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_owned(),
+                    );
+                    seen.len() == 1
+                };
+                if first {
+                    Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("retry-after", "1")
+                        .body(Body::from(r#"{"error":{"message":"slow down"}}"#))
+                        .unwrap()
+                } else {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let manager =
+            Manager::with_live_refresher(codex_fleet_with_carol(&anthropic.url, &base), None);
+        let started = tokio::time::Instant::now();
+        let (status, _) = drive(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own"),
+                ("content-type", "application/json"),
+                ("session-id", "short-codex-burst"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = bearers.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0], seen[1],
+            "a one-second burst must keep the warm account"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(850));
+        assert_eq!(anthropic.request_count(), 0);
+    }
+
     #[tokio::test]
     async fn a_codex_account_held_by_a_short_non_quota_429_serves_the_retry() {
         let anthropic_echo = CapturingUpstream::spawn().await;
