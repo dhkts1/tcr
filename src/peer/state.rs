@@ -1700,15 +1700,40 @@ fn replace_section(
     save(path, &state)
 }
 
-/// Write the file at mode 0600, atomically.
+/// Write the file at mode 0600, atomically, unless it already holds exactly these bytes.
+///
+/// The skip exists because most saves change nothing: measured 2026-10-15 on a live proxy,
+/// the file was rewritten every 20 s and consecutive versions were byte-identical. Each
+/// rewrite paid two full disk flushes (this file keeps [`crate::config::Durability::Flushed`],
+/// since it holds bans and pairing windows) and moved the mtime that readers re-read on.
 pub fn save(path: &Path, state: &PeerState) -> Result<()> {
     let file = PeerStateFile {
         version: FORMAT_VERSION,
         state: state.clone(),
     };
     let json = serde_json::to_string_pretty(&file)?;
+    if holds_exactly(path, &json) {
+        return Ok(());
+    }
     crate::config::write_atomic(path, &json)?;
     Ok(())
+}
+
+/// Whether `path` is already the file a write of `json` would leave: a regular file at mode
+/// 0600 holding exactly these bytes. Any doubt, an unreadable file included, answers no, and
+/// the caller then writes as it always did.
+fn holds_exactly(path: &Path, json: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file()
+        || meta.permissions().mode() & 0o777 != 0o600
+        || meta.len() != json.len() as u64
+    {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|bytes| bytes == json.as_bytes())
 }
 
 #[cfg(test)]
@@ -1880,6 +1905,46 @@ mod tests {
             state.pending.len(),
             1,
             "the found sweep must not touch pending, which has its own TTL"
+        );
+    }
+
+    /// A save that changes nothing leaves the file alone; one that changes the state, or finds
+    /// the file at a looser mode, writes it. Read by inode, because every real write is a fresh
+    /// temp file renamed into place, and each comparison is between two files that existed at
+    /// the same moment, so an inode number cannot have been reused between them.
+    #[test]
+    fn an_unchanged_state_is_not_rewritten() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("peer-state.json");
+        let inode = |p: &Path| std::fs::metadata(p).expect("stat").ino();
+        let mut state = PeerState::default();
+
+        save(&path, &state).expect("first save");
+        let first = inode(&path);
+        save(&path, &state).expect("the same state again");
+        assert_eq!(
+            inode(&path),
+            first,
+            "an identical save must not rewrite the file"
+        );
+
+        state.pairing_window_until_ms = Some(1_000);
+        save(&path, &state).expect("a changed state");
+        let second = inode(&path);
+        assert_ne!(second, first, "a changed state must be written");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the mode");
+        save(&path, &state).expect("the same state at a loose mode");
+        assert_ne!(
+            inode(&path),
+            second,
+            "a file at a looser mode must be rewritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+            0o600
         );
     }
 }

@@ -161,7 +161,13 @@ pub fn save(
         saved_at_ms: now_ms,
         sessions,
     };
-    crate::config::write_atomic(path, &serde_json::to_string_pretty(&file)?)?;
+    // A cache rewritten every few seconds, which `load` reads as empty when it is missing or
+    // damaged: atomic, but not flushed to the disk (see `Durability::Cache`).
+    crate::config::write_atomic_with(
+        path,
+        &serde_json::to_string_pretty(&file)?,
+        crate::config::Durability::Cache,
+    )?;
     Ok(count)
 }
 
