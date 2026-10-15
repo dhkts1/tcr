@@ -1,7 +1,13 @@
 # Configuration reference
 
 Everything `tcr` reads out of its config file, with the real default for each key. The file
-is `~/.config/tcr.json`, or `~/.config/teamclaude.json` on an install that has only that one. Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
+is `~/.config/tcr.json`, or `~/.config/teamclaude.json` on an install that has only that one.
+Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
+
+Cache paths below use `~/.cache/tcr/`. When only the older `~/.cache/teamclaude/` directory
+exists, tcr keeps using it; when both exist, `tcr/` wins. `XDG_CACHE_HOME` replaces `~/.cache`
+when set. The usage ledger, session snapshots, peer state and logs follow the same directory;
+nothing is moved or copied.
 
 Every default here was derived from the Rust source, not from a live config file. If you
 want to check one, start from `src/config.rs`.
@@ -41,12 +47,13 @@ keys is `src/config_keys.rs`.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `proxy` | object | `{}` (all sub-defaults) | no | listener settings, see below |
-| `upstream` | string | `"https://api.anthropic.com"` | no | API base URL every rotated request is sent to |
+| `upstream` | string | `"https://api.anthropic.com"` | no | Anthropic API base URL every rotated Claude request is sent to (Codex requests go to `codexUpstream`) |
+| `codexUpstream` | string | `"https://chatgpt.com"` | no | where Codex accounts' requests are sent, where their quota probe goes, where `tcr login --from-codex` checks a login's workspace before importing it, and where every other request under `/backend-api/` is relayed, under the client's own bearer when it sent one; written to the file only when it differs from the default. Their token refresh goes to `https://auth.openai.com` whatever this says |
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account |
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
 | `accountThrottle` | object | `{minSpacingMs: 350, burst: 24}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
-| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 32}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
-| `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
+| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 32}` → **ON** | no | separate fleet ceiling for each provider, insurance only, see below |
+| `lockAccount` | string | absent → normal routing | no | pin its provider's pooled traffic to one account by `name`; the other provider rotates normally, see below |
 | `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"warn"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
@@ -60,34 +67,40 @@ never the shipped value.
 
 ## `pricing` and `usageRetentionDays`
 
-`tcr status --json` reports what each account's traffic **would have cost on Anthropic's API**. The
-accounts are subscriptions, so nothing here is a bill; it is the only unit that compares across
-accounts, models and days.
+`tcr status --json` reports what each account's traffic **would have cost at the API list price of
+its model's own provider**. The accounts are subscriptions, so nothing here is a bill; it is the only
+unit that compares across accounts, models and days.
 
 Prices come from a table built into the binary (`src/pricing.rs`), matched by longest prefix so a
 dated id like `claude-haiku-4-5-20251001` resolves to its family. A model the table has no published
 rate for is reported as `costUsd: null` with `unpricedRequests` counting it — never as `$0.00`, which
-would be a spend nobody measured presented as one.
+would be a spend nobody measured presented as one. No OpenAI model has a built-in price, so a Codex
+account's traffic is unpriced until `pricing` names its model, and `tcr sessions` and `tcr wrap`
+print `n/a` for it, never `$0.00`.
 
 `pricing` is how you add or change a rate. Keys are a model id or any prefix of one; `input` and
 `output` are USD per million tokens and both are required. The three cache dimensions default to the
 same multipliers the built-in table uses — cache read 0.1x input, a 5-minute cache write 1.25x, a
-1-hour cache write 2x — and can be set explicitly:
+1-hour cache write 2x — except that for an OpenAI model id (`gpt-…` or `codex-…`) both cache writes
+default to 1.0x input, because codex reports a cache write inside its input tokens and OpenAI adds no
+write premium. Each can be set explicitly:
 
 ```json
 "pricing": {
   "claude-sonnet-4-5": { "input": 3, "output": 15 },
-  "claude-opus-5": { "input": 5, "output": 25, "cacheRead": 0.5 }
+  "claude-opus-5": { "input": 5, "output": 25, "cacheRead": 0.5 },
+  "gpt-5.1-codex": { "input": 1.25, "output": 10 }
 }
 ```
 
 An override beats the built-in table outright, even when its key is the shorter prefix: a price you
 wrote down is what this proxy should believe.
 
-`usageRetentionDays` bounds the ledger under `~/.cache/teamclaude/usage/`, one `<UTC-date>.jsonl` file
-per day at roughly 2 MB per 17k requests. Files older than this are deleted once, at boot. Only today's
-and yesterday's are ever read back (that is what makes a restart keep the day's totals); the rest are
-history for you to grep.
+`usageRetentionDays` bounds the ledger under `~/.cache/tcr/usage/`, one `<UTC-date>.jsonl` file
+per day at roughly 2 MB per 17k requests. Files older than this are deleted once, at boot. Boot reads
+back today's and yesterday's files (that is what makes a restart keep the day's totals), and, when the
+fleet holds a Codex account, the six before them too, which is what keeps a Codex account's weekly
+window across a restart; the rest are history for you to grep.
 
 Lines are written by a dedicated thread, off the request path, so a stalled disk costs accounting and
 never latency. A clean shutdown drains that thread's queue and waits for it to close the file, so the
@@ -100,7 +113,9 @@ day presented afterwards as a measured one.
 `0` is the floor, and it keeps today AND yesterday: those two files are what the boot replay reads, and
 the pruner never deletes them whatever this is set to. It has to be both — on a UTC+3 machine the first
 three hours of the local day live in yesterday's UTC-named file, so deleting it would cost the second
-restart of the day those hours, silently and while still reporting them as measured.
+restart of the day those hours, silently and while still reporting them as measured. A fleet holding a
+Codex account keeps today and the seven days before it whatever this says, for the same reason: those
+are the files the boot replay reads to rebuild the weekly window.
 
 **"Today" is the local calendar day of the machine the server runs on**, resolved per record against
 that record's own instant, so a day boundary is correct across a daylight-saving change. Ledger FILE
@@ -149,24 +164,37 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
-| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; `"apikey"` rows are quarantined at load, because tcr serves Claude subscriptions only; any other string is a static-key account, kept as written |
-| `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token |
-| `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
+| `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and, on Anthropic, kept warm; `"apikey"` rows are quarantined at load, because tcr serves subscription logins only (a Claude subscription, or a Codex row's ChatGPT login), never API keys; any other string is a static-key account, kept as written |
+| `provider` | `"anthropic"` \| `"codex"` | `"anthropic"` | no | which upstream this credential belongs to. Absent means Anthropic, and the key is never written for an Anthropic row. A Codex row (`tcr login --codex` and `tcr login --from-codex` write one) is refreshed against `auth.openai.com`, probed at `/backend-api/wham/usage`, never kept warm, and serves Codex model calls under `/backend-api/codex/` (`responses`, `images/generations`, `images/edits`, `memories/trace_summarize` and `alpha/search`): a Claude request never reaches it, and a Codex request never reaches a Claude row |
+| `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token. For a Codex row it is the ChatGPT user id, spliced nowhere: what tcr sends is the workspace in `orgUuid` |
+| `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry. For a Codex row it is the ChatGPT workspace id, the login's ChatGPT account id, sent as the `chatgpt-account-id` header. A Codex row is that pair, user and workspace, so one person in two workspaces is two rows, and so are two seats of one workspace |
 | `orgName` | string | absent | no | organization display name; also what a duplicated `name` is renamed from (`Henry Token` → `henry-token`) |
+| `organizationType` | string | absent | no | the plan, verbatim as the provider names it, from which `tcr status` derives its `plan` label: `claude_max`, `claude_team`, `claude_pro`, … from Anthropic's profile endpoint, written at login and backfilled by the quota probe on a row that lacks it. For a Codex row it is the ChatGPT plan, verbatim (`pro`, `plus`, `team`, …): read from the login's `chatgpt_plan_type` claim at import, and kept current by the quota probe, which rewrites this key, and no other, when the plan changes. A word tcr does not know is labelled `ChatGPT {word}`, the word as ChatGPT wrote it (`edu` gives `ChatGPT edu`) |
 | `accessToken` | string | n/a | **yes** | the OAuth access token |
 | `refreshToken` | string | absent | no | used to mint a new access token before expiry — absent means the account cannot refresh itself, see below |
 | `expiresAt` | i64 | absent | no | access-token expiry as **epoch milliseconds** |
 | `priority` | i64 | absent → `0` | no | rotation order, **lower value = preferred** |
 | `switchThreshold` | float | absent → the global value | no | per-account override of the top-level threshold |
 | `disabled` | bool | absent → `false` | no | held out of rotation; this is the key `tcr disable` writes |
-| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Local to this file, never sent over the wire |
+| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Not on a Codex account in this version: its pin is treated as a peer that cannot be reached, see `egressStrict`. Local to this file, never sent over the wire |
 | `egressStrict` | bool | `false` | no | what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
+| `codexHome` | string | absent | no | Codex rows only, written by `tcr`: the folder the login was imported from by `tcr login --from-codex`, as an absolute path, so TcrBar can offer to import from it again. A login of tcr's own (`tcr login --codex`) records none, and signing a row in that way removes the key. A standalone `TCR_CODEX_AUTH` file not named `auth.json` also records none and has no automatic write-back |
+| `credentialVersion` | u64 | absent → backfilled on the next save | no | written by `tcr`, not by hand: `1` on an Anthropic row, `2` on a Codex row. A build refuses the whole file when a row carries a version above what it understands for that row's provider. Upgrade every `tcr` that may boot on the file before importing a Codex login: what an older one does with a Codex row is in [troubleshooting](troubleshooting.md#after-a-codex-import-an-older-proxy-refuses-to-load-the-config) |
 
-`type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
-keep-warm. tcr serves Claude subscriptions only, so an `"apikey"` row is quarantined at
-load with a warning, and the rest of the config loads. Any other string is treated as a
-static key and written back exactly as it was; a `type` that is not a string quarantines
-its row.
+**A Codex row whose `accountUuid` holds the workspace id and that has no `orgUuid`** is the shape
+before the ChatGPT user was stored. It keeps serving, and tcr sends its `accountUuid` as the
+workspace. But no login matches it, neither a re-import nor `tcr login --codex --account`,
+because a login is matched on its ChatGPT user and workspace and the row names no user. To bring
+it to the current shape, `tcr remove` it, then add it again with `tcr login --codex` or
+`tcr login --from-codex`, in that order: a login added first finds its name held by another
+identity, and lands beside the old row as `<email>/codex`, while one added after the removal
+takes the old row's name back. A running proxy takes the removal live, with no restart.
+
+`type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and, on
+Anthropic, keep-warm. tcr serves subscription logins only, a Claude subscription or a Codex
+row's ChatGPT login, never API keys, so an `"apikey"` row is quarantined at load with a
+warning, and the rest of the config loads. Any other string is treated as a static key and
+written back exactly as it was; a `type` that is not a string quarantines its row.
 
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
@@ -255,17 +283,19 @@ There are two throttle buckets, and they are keyed on different things.
 |---|---|---|---|---|
 | `accountThrottle.minSpacingMs` | u64 | **`350`** with the key absent | no | steady-state emission interval **per organization** |
 | `accountThrottle.burst` | u32 | **`24`** with the key absent | no | sends admitted instantly after that org has been idle |
-| `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across **every** org combined |
-| `fleetThrottle.burst` | u32 | **`32`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
+| `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across every org of **one provider** combined |
+| `fleetThrottle.burst` | u32 | **`32`** with the key absent | no | sends admitted instantly after that provider's fleet has been idle |
 
 `accountThrottle` is the real limiter. Anthropic sets rate limits at the **organization**
 level, so pacing per org is what matches the thing actually being limited, and total capacity
-scales *with* the size of your account pool rather than being divided across it.
+scales *with* the size of your account pool rather than being divided across it. A Codex row's
+organization is its ChatGPT workspace, so the seats of one workspace share one bucket.
 
 `fleetThrottle` is insurance. It exists only in case something shared — an IP, a client id —
 is also limited, which nobody here has measured. Its burst sits above the per-organization
 burst, so it never holds back a wave that bucket lets through, and near the fleet's real peaks,
-so it still engages on a runaway.
+so it still engages on a runaway. Each provider has an independent fleet bucket: Claude sends
+never consume Codex's burst budget, and Codex sends never delay Claude through this ceiling.
 
 > **This replaced a single fleet-wide `throttle` key.** A config still carrying `throttle` is
 > **migrated automatically at load** — the file self-heals the first time the server boots
@@ -350,10 +380,11 @@ Consequences worth knowing before you tune either number:
 - A single account's gap between probes is never the number you configured; it is a fresh
   draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
 - An account at or over its switch threshold, or one upstream answered `rejected`, is probed
-  around HALF the cadence (`105..=195s` at the default). It is out of rotation, so no served
-  response refreshes its quota and only a probe sees its window roll. An account serving
-  traffic is not probed any faster: every response's headers already rewrite the same
-  windows a probe reads.
+  around HALF the cadence (`105..=195s` at the default). So is a Codex account ChatGPT refused
+  (its row carries `limitReachedType`), whatever gate its row shows, except `disabled` and
+  `login`, which outrank the refusal. It is out of rotation, so no served response refreshes
+  its quota and only a probe sees its window roll. An account serving traffic is not probed any
+  faster: every response's headers already rewrite the same windows a probe reads.
 - No account is probed more than 20 times in any trailing 60 minutes, whatever the cadence.
   The usage endpoint's budget was measured by claude-swap at about 28 to 30 requests per
   identity in a trailing hour, not a refilling bucket. A `quotaProbeSeconds` under 180 is
@@ -432,10 +463,17 @@ says it outright: it "spends real quota, so it ships dark and is only ever runni
 explicitly enabled". Set it only when you have measured that a cold prefix costs you more
 than the warming requests do.
 
+It never warms a Codex account: a warm is an Anthropic request, so only Claude accounts are kept
+warm, whatever the fleet holds.
+
 ## `lockAccount`: read this before setting it
 
-`lockAccount` pins **all** traffic to the single account whose `name` it names. LRU
-rotation, session affinity and load-balancing migration are all bypassed.
+`lockAccount` pins **all** pooled traffic of its account's provider to the single account whose
+`name` it names. LRU rotation, session affinity and load-balancing migration are all bypassed.
+The lock applies only to that account's provider: a Claude lock leaves the Codex pool
+available, and a Codex lock leaves Claude rotation unchanged. The resolved account slot is
+authoritative even if another row shares its display name. Calls relayed under the client's
+own credential never ask for an account and are unaffected.
 
 The part that bites: a locked account has **no failover**. If it is throttled, disabled or
 down, requests fail: the proxy does not rotate away from it, because rotating away is the
@@ -484,6 +522,7 @@ below in force: `groupSettings.<label>.allowControlAccount` for one group, and
 ```
 group research accounts=1 members=gil@example.com reserved=no parked=no routes=no route_block=control-account-only ...
 group dev      accounts=2 members=a@example.com,b@example.com reserved=no parked=no routes=yes ...
+group lab      accounts=1 members=bob@example.com/codex codex_members=1 reserved=no parked=no routes=no route_block=codex-only ...
 ```
 
 `routes=no` means the group exists and serves nothing. Four ways out: add a second, ordinary
@@ -491,6 +530,14 @@ account to the group; move the control account elsewhere with `tcr control --cle
 one group use it with `tcr group allow-control <label>`; or let the whole pool use it with
 `controlPooled`. `tcr group add` prints the same warning at the moment you create the
 situation.
+
+`routes=` answers whether a Claude session asking for the group can be served by it, so it
+counts Claude accounts only: no Codex request carries a group. A group with a Codex member
+gains `codex_members=<n>` right after `members=`, and a group whose members are all Codex
+accounts reads `routes=no route_block=codex-only`. `--json` carries the same two facts, as
+`codexMembers` (present only when above zero) and `routeBlock: "codex-only"`. A fleet with no
+Codex account lists exactly what it always did. What a Codex member of a group does and does
+not do is [below](#codex-accounts-in-a-group-labelled-and-parked-never-routed).
 
 Reserving solves a different problem, and is no longer the only way to get strictness — every
 group is strict on its own exhaustion by default now, `reserved` or not. `tcr group reserve
@@ -542,6 +589,28 @@ Two things it deliberately is not:
   not re-enable a member you benched by hand: that row stays disabled until `tcr enable`
   says otherwise, and `tcr status` keeps reporting it as `disabled` rather than `parked`.
 
+### Codex accounts in a group: labelled and parked, never routed
+
+A Codex account can carry a group label, and the label does two things: `tcr group park`
+reaches it, and `tcr status` shows it. It never routes. No Codex request carries a group, so a
+Codex account is picked for Codex traffic as if it had no label at all. The group verbs say so:
+
+- **`tcr group add <label> <codex account>`** writes the label and prints a warning on stderr
+  saying what the label does and does not do. It still exits 0.
+- **`tcr group reserve <label>`** counts Claude accounts for its safety rail: it refuses when
+  the reservation would leave no enabled, unreserved Claude account, however many Codex
+  accounts remain, because they cannot serve a Claude session. It also refuses a group that
+  holds a Codex account, in any state, because while the group is reserved its Codex members
+  serve nothing; the refusal names them and the `tcr group rm` that takes one out. `--force`
+  reserves it anyway, warns on stderr, and the success line counts what is left per provider
+  (`… 1 unreserved enabled Claude account(s) and 1 Codex account(s) remain.`). `--force` never
+  lifts the Claude rail. Either refusal leaves the file as it was.
+- **`tcr run --group <label>`** refuses a group with no Claude account, since a Claude session
+  cannot use any of its members, and launches nothing. `spillToPool` does not lift this: the
+  check runs at launch, as the one that refuses a label no account carries does.
+
+A fleet with no Codex account sees none of this: every verb prints what it always printed.
+
 ## `controlIdentity`: the client must BE the control account
 
 `controlAccount` cannot choose which account a client's connectors come from. The claude.ai
@@ -573,8 +642,9 @@ reads. Set `"controlIdentity": "refuse"` on an install where a wrong-account ses
 fail loudly; the intent is to make that the default once a release of warnings has been
 read.
 
-Inert without a `controlAccount`, and for a request that carries no `Authorization:
-Bearer` (an API-key client). Fail-open on anything that is not a verified mismatch: a
+Inert without a `controlAccount`, for a request that carries no `Authorization: Bearer`
+(an API-key client), and for every Codex request: under `refuse`, a Codex client is served
+whatever ChatGPT login it runs under. Fail-open on anything that is not a verified mismatch: a
 profile fetch that fails, or answers with neither email nor uuid, is served and is not
 cached, so a transient upstream failure neither blocks traffic nor pins a wrong answer. A
 bearer the profile endpoint refuses outright (401/403 — an expired or revoked token) is
@@ -583,11 +653,11 @@ a profile round trip before every request. A control account whose name is not a
 and whose row has no `accountUuid` cannot be verified against anything and is never
 refused.
 
-"Pooled" means exactly two paths: `/v1/messages` and `/v1/messages/count_tokens`. Any
-other path a client sends with its own bearer — including one that merely starts with
-`/v1/messages`, such as a batches endpoint — is the client's own call and is relayed
-under the client's own credential and quota, the same split `RequestClass` draws for
-bearer-less traffic.
+For a Claude request, "pooled" means exactly two paths: `/v1/messages` and
+`/v1/messages/count_tokens`. Any other path a client sends with its own bearer — including
+one that merely starts with `/v1/messages`, such as a batches endpoint — is the client's own
+call and is relayed under the client's own credential and quota, the same split
+`RequestClass` draws for bearer-less traffic.
 
 Measured before this existed (2026-09-22): a Claude Code keychain login that silently
 flipped to another account produced two hours of wrong-org 401/403/404 answers on every
@@ -623,8 +693,10 @@ alternatives cost less if they fit:
 
 - **`tcr group allow-control <label>`** — same access, scoped to sessions that explicitly ask
   with `tcr run --group <label>`. The blast radius is one group instead of all traffic.
-- **`tcr control <some-idle-account>`** — move the designation onto an account you were not
-  going to spend anyway. Nothing is sacrificed and no flag is needed.
+- **`tcr control <some-idle-account>`** — move the designation onto a Claude account you were
+  not going to spend anyway (a Codex account cannot be the control account: `tcr control`
+  refuses one, and boot ignores one written by hand). Nothing is sacrificed and no flag is
+  needed.
 - **`tcr control --clear`** — no control account at all. Bookkeeping calls rotate with
   everything else, which is how the proxy behaved before the control account existed.
 
@@ -653,20 +725,39 @@ off. Check `tcr status` (`http1Only=` on the `source=` line, `http1Only` per row
 
 ## Environment overrides
 
-Two keys are not part of the config file; they are read from the process environment by
+Four keys are not part of the config file; they are read from the process environment by
 `tcr run` (and by `--group`'s version check, which also launches `claude`) to decide which
-`claude` binary to run. Neither exists in the file above because neither is a setting a
-config edit can change without a rebuild of the session's shell environment anyway.
+`claude` binary to run, or, with `--codex`, which `codex` binary. `tcr login --codex` reads the
+two `codex` keys too, to pick the `codex` whose `codex login` it runs. None of them exists in the
+file above because none is a setting a config edit can change without a rebuild of the
+session's shell environment anyway.
 
 | env var | default | what it does |
 |---|---|---|
 | `TCR_CLAUDE_BIN` | absent | path or name of the `claude` binary to launch, outranking `CLAUDE_BIN` |
 | `CLAUDE_BIN` | absent | same, as a fallback when `TCR_CLAUDE_BIN` is unset; kept for whatever already sets it outside `tcr` |
+| `TCR_CODEX_BIN` | absent | path or name of the `codex` binary `tcr run --codex` launches and `tcr login --codex` runs, outranking `CODEX_BIN` |
+| `CODEX_BIN` | absent | same, as a fallback when `TCR_CODEX_BIN` is unset |
 
-Neither set falls back to `claude` resolved from `PATH`, today's only behaviour. **An empty
-value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does not
-silently win over a real `CLAUDE_BIN`, and two empty values fall all the way through to the
-`PATH` default.
+With neither of a pair set, `claude` is resolved from `PATH`. `codex` is found by one search
+that serves `tcr run --codex`, `tcr login --codex` and `tcr doctor` alike: `PATH`, then
+`~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, then the `bin` of npm's
+global prefix, which is `NPM_CONFIG_PREFIX`, else `npm_config_prefix`, else `~/.npm-global` (tcr
+never runs npm). **An empty value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by
+a shell does not silently win over a real `CLAUDE_BIN`, and two empty values fall all the way
+through to the default. A set `codex` key always decides and never falls through: a value with a `/` must be
+an executable file, a bare name must be one on `PATH`, and either failing is an error that names
+the key, rather than whatever other `codex` the search would have found.
+
+Two more `codex` keys exist for tcr's own tests, and nothing else should set them.
+`TCR_CODEX_SEARCH_DIRS`, a colon-separated list, replaces every directory the search looks in
+after `PATH`, and the directories the older-`tcr` check of `tcr login --codex` and
+`--from-codex` scans. `TCR_BUNDLED_TCR` replaces the path of TcrBar's bundled `tcr` in that
+check, so setting it outside a test hides that `tcr` from the older-`tcr` warnings.
+
+`tcr login --from-codex` reads `CODEX_HOME` and `TCR_CODEX_AUTH` as well, to find the login
+it imports; they are documented with it in
+[cli.md](cli.md#--from-codex-importing-the-login-codex-already-has).
 
 ## File permissions and secrecy
 
@@ -686,7 +777,7 @@ repo write their own temporary configs with obviously fake values; do the same.
 
 A second file, `tcr-peers.json` in the operator's config directory, mode `0600`, holds everything about the LAN peer
 mesh: who this Mac trusts, what each trusted Mac may do, and the office network key. It is
-never merged into `teamclaude.json` above; a walkthrough of what the mesh does is in
+never merged into the main account config above; a walkthrough of what the mesh does is in
 [peers.md](peers.md), and this section is the file's key reference, read from
 `src/peer/config.rs`.
 
@@ -720,7 +811,7 @@ cache.
 | `deadDrop.store.kind` | `"https"` \| `"gist"` | | boot-time | which surface |
 | `deadDrop.store.url` | string | | boot-time | `https` only: a template containing `{name}`, used for both the write and the read |
 | `deadDrop.store.gistId` | string | | boot-time | `gist` only |
-| `deadDrop.store.token` | string | absent | boot-time | bearer token for the surface. **Held in the clear in this file, mode 0600**, the same as `networkKey` and every `rendezvousSecret`; it goes here and never in `teamclaude.json`, because this is the file whose mode is checked on read |
+| `deadDrop.store.token` | string | absent | boot-time | bearer token for the surface. **Held in the clear in this file, mode 0600**, the same as `networkKey` and every `rendezvousSecret`; it goes here and never in the main account config, because this is the file whose mode is checked on read |
 | `deadDrop.slotSeconds` | int | `3600` | boot-time | how long one drop name is valid. Both Macs must agree: a mismatch means they never meet |
 
 ### One entry in `peers[]`
@@ -772,7 +863,7 @@ replacing the ones already granted:
 | json key | type | what it does |
 |---|---|---|
 | `id` | string (32 hex chars) | the wire lease id this grant mints leases under, the handle `--revoke`/`--relend` take. `0` is a grant written before ids existed; the next save mints one |
-| `scope` | `"all"` \| `{"group": "<name>"}` \| `{"accounts": ["<label>", ...]}` | what this grant lends FROM. Defaults to `"all"`, which is what every grant written before scopes existed already meant. Never crosses the wire |
+| `scope` | `"all"` \| `{"group": "<name>"}` \| `{"accounts": ["<label>", ...]}` | what this grant lends FROM. Defaults to `"all"`, which is what every grant written before scopes existed already meant. Never crosses the wire. A Codex account is never lent, whatever the scope names: `all` and a group draw on Claude accounts only, and `tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex account |
 | `window` | `5h` \| `7d` \| `7d_oi` | which rate-limit window this grant draws from |
 | `fraction` | float | ceiling on any one lease, as a fraction of the SCOPE's headroom. Clamped to `0.0..=0.5`, mirroring the clamp the main config applies to its own reserve |
 | `ttlS` | int | how long a granted lease lives, in seconds, before it needs renewing |
@@ -794,7 +885,7 @@ replacing the ones already granted:
 
 ### File permissions
 
-Same rule as `teamclaude.json`: mode `0600`, enforced before any bytes are written and
+Same rule as the main account config: mode `0600`, enforced before any bytes are written and
 re-checked afterward. `tcr` refuses to trust a peers file it finds in any other mode rather
 than silently loosening it. Never commit this file for the same reason as the main config:
 `node`, `networkKey` and an outstanding invite's `secret` are all live cryptographic material.

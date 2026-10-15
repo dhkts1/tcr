@@ -65,10 +65,11 @@ final class MenuBarKnockWiringTests: XCTestCase {
         XCTAssertTrue(
             shell.contains(
                 "Self.toolTip(\n            state: state, awake: isOn, "
-                    + "showRunningTools: showRunningTools, knocks: knocks)"),
+                    + "showRunningTools: showRunningTools, knocks: knocks,\n            cupPool: cupPool)"),
             "the tooltip stopped being told about knocks, so the amber glyph has no words")
         XCTAssertTrue(
-            shell.contains("tint: Self.cupTint(for: state, awake: isOn),\n            knocks: knocks"),
+            shell.contains(
+                "tint: Self.cupTint(for: state, awake: isOn, cupPool: cupPool),\n            knocks: knocks"),
             "the mark's accessibility description stopped being told about knocks, so "
                 + "VoiceOver says nothing about a Mac waiting on an answer")
     }

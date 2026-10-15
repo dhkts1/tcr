@@ -18,7 +18,8 @@ final class SettingsRowBadgeTests: XCTestCase {
             SettingsRowBadge.proxyRestart, SettingsRowBadge.startServerAtLaunch,
             SettingsRowBadge.pollInterval, SettingsRowBadge.launchAtLogin,
             SettingsRowBadge.keepAwake, SettingsRowBadge.showReadyCount,
-            SettingsRowBadge.showRunningToolCount, SettingsRowBadge.openOnTab,
+            SettingsRowBadge.showRunningToolCount, SettingsRowBadge.cupShows,
+            SettingsRowBadge.openOnTab,
             SettingsRowBadge.textSize, SettingsRowBadge.panelDensity,
             SettingsRowBadge.groupParked,
             SettingsRowBadge.groupReserved, SettingsRowBadge.groupMayServeAsControl,
@@ -32,6 +33,7 @@ final class SettingsRowBadgeTests: XCTestCase {
             SettingsRowBadge.checkNow, SettingsRowBadge.whatsNew,
             SettingsRowBadge.checkAutomatically, SettingsRowBadge.runningServer,
             SettingsRowBadge.installedCli, SettingsRowBadge.updatingReplacesBoth,
+            SettingsRowBadge.serverCodex,
         ]
         for key in declaredKeys {
             XCTAssertNotNil(
@@ -67,6 +69,13 @@ final class SettingsRowBadgeTests: XCTestCase {
             SettingsRowBadge.timing(for: SettingsRowBadge.groupMayServeAsControl), .readOnly)
     }
 
+    /// Which pool the cup shows is a `UserDefaults` write the menu bar reads
+    /// on its next draw, so it applies live.
+    func testCupShowsIsLive() {
+        XCTAssertEqual(SettingsRowBadge.cupShows, "menuBar.cupShows")
+        XCTAssertEqual(SettingsRowBadge.timing(for: SettingsRowBadge.cupShows), .live)
+    }
+
     func testAnUnknownKeyHasNoEntry() {
         XCTAssertNil(SettingsRowBadge.timing(for: "not.a.real.key"))
     }
@@ -95,5 +104,12 @@ final class SettingsRowBadgeTests: XCTestCase {
     func testStartServerAtLaunchHasANonEmptyLabelForVoiceOver() {
         XCTAssertEqual(SettingsRowBadge.startServerAtLaunchLabel, "Start the server at launch")
         XCTAssertFalse(SettingsRowBadge.startServerAtLaunchLabel.isEmpty)
+    }
+
+    /// The Codex row under Server shows what the running proxy reports and offers no
+    /// control, so it reads as read-only.
+    func testTheCodexServerRowIsReadOnly() {
+        XCTAssertEqual(SettingsRowBadge.timing(for: SettingsRowBadge.serverCodex), .readOnly)
+        XCTAssertEqual(SettingsRowBadge.serverCodex, "server.codex")
     }
 }

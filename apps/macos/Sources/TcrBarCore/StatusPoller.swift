@@ -34,7 +34,7 @@ public enum PollState: Equatable {
             // Every row failed to decode. Saying "0 accounts" here would read as
             // "you have none configured", which is a different and much calmer
             // fact than "tcr answered and this build could not read any of it".
-            if n == 0, let unreadable = fleet.unreadableNotice {
+            if n == 0, fleet.unreadableCount > 0, let unreadable = fleet.unreadableNotice {
                 return "no account decoded — \(unreadable)"
             }
             let base =
@@ -64,14 +64,62 @@ public enum PollState: Equatable {
     ///
     /// `nil` for anything but a healthy read of a fleet with at least one
     /// enabled account: the cup's colour and fill already carry "pending",
-    /// "tool missing" and "poll failed" (``MenuBarShell/cupTint(for:awake:)``),
+    /// "tool missing" and "poll failed" (``MenuBarShell/cupTint(for:awake:cupPool:)``),
     /// and an all-disabled fleet has no numerator/denominator worth showing —
     /// `0/0` would read as a fault, not a fact, the same reasoning
     /// ``Fleet/countsSentence`` gives for returning `nil` in the identical
     /// case.
+    ///
+    /// A fleet holding Codex accounts counts each pool apart, Claude first:
+    /// `"3/4 · 0/2"`. ``countsParts`` has the parts.
     public var countsLabel: String? {
+        countsParts?.map(\.text).joined(separator: " · ")
+    }
+
+    /// One part of the menu-bar count: one pool's `ready/enabled`, and whether
+    /// it is drawn amber.
+    public struct CountsPart: Equatable, Sendable {
+        public let text: String
+        /// The pool is near: nothing ready, and something close to its limit.
+        public let isNear: Bool
+
+        public init(text: String, isNear: Bool) {
+            self.text = text
+            self.isNear = isNear
+        }
+    }
+
+    /// The parts of ``countsLabel``, or `nil` when it draws nothing.
+    ///
+    /// A fleet with no Codex account has today's one part, `readyCount` over
+    /// `enabledCount`, amber exactly when ``countIsNearCapacity`` says. A fleet
+    /// holding Codex accounts has one part per pool that has an enabled
+    /// account, Claude first, each amber when its own pool is near, so the
+    /// amber says which pool is short. A pool with no enabled account drops
+    /// out. `nil` on the cases ``countsLabel`` has always been `nil` on, and
+    /// when no pool is left.
+    public var countsParts: [CountsPart]? {
         guard case .loaded(let fleet) = self, !fleet.enabledAccounts.isEmpty else { return nil }
-        return "\(fleet.readyCount)/\(fleet.enabledCount)"
+        guard let pools = fleet.providerPools() else {
+            return [
+                CountsPart(
+                    text: "\(fleet.readyCount)/\(fleet.enabledCount)",
+                    isNear: countIsNearCapacity)
+            ]
+        }
+        let parts = pools.compactMap { pool in
+            pool.countsText.map { CountsPart(text: $0, isNear: pool.isNear) }
+        }
+        return parts.isEmpty ? nil : parts
+    }
+
+    /// Which part of the count is amber, in order; empty when nothing is drawn.
+    public var countsNearHalves: [Bool] { countsParts?.map(\.isNear) ?? [] }
+
+    /// The fleet of a healthy read, and `nil` for every other state.
+    public var loadedFleet: Fleet? {
+        guard case .loaded(let fleet) = self else { return nil }
+        return fleet
     }
 
     /// The cup's fill level: `readyCount / enabledCount`, `0...1`.
@@ -82,9 +130,21 @@ public enum PollState: Equatable {
     /// the two never disagree about which fleets have a real ratio. The mark
     /// draws `nil` as an empty cup (`MenuBarMark.image(fraction:tint:)`), never
     /// a `0` a reader could mistake for a measured "all spent".
-    public var capacityFraction: Double? {
-        guard case .loaded(let fleet) = self, fleet.enabledCount > 0 else { return nil }
-        return Double(fleet.readyCount) / Double(fleet.enabledCount)
+    public var capacityFraction: Double? { capacityFraction(cupPool: .emptier) }
+
+    /// ``capacityFraction`` under the cup's pin. A fleet with no Codex account
+    /// has one pool and today's fill, whatever the pin says. A fleet holding
+    /// Codex accounts fills to its governing pool
+    /// (``Fleet/governingPool(_:now:)``): the emptier one, or the pinned one
+    /// when the fleet holds both providers and that pool has an enabled
+    /// account.
+    public func capacityFraction(cupPool: MenuBarCupPool) -> Double? {
+        guard case .loaded(let fleet) = self else { return nil }
+        guard fleet.holdsCodex else {
+            guard fleet.enabledCount > 0 else { return nil }
+            return Double(fleet.readyCount) / Double(fleet.enabledCount)
+        }
+        return fleet.governingPool(cupPool)?.readyFraction
     }
 
     /// The menu-bar tooltip's own line: ``Fleet/countsSentence`` when there is
@@ -96,12 +156,92 @@ public enum PollState: Equatable {
     /// fleet all fall through to the same `summary` a reader already knows,
     /// rather than growing a second empty-fleet sentence to keep in sync with
     /// the first.
-    public var tooltipSentence: String {
+    public var tooltipSentence: String { tooltipSentence(cupPool: .emptier) }
+
+    /// ``tooltipSentence`` under the cup's pin, with the pools' returns counted
+    /// down from `now`.
+    ///
+    /// - A fleet with no Codex account: today's sentence, whatever the pin.
+    /// - A Codex-only fleet: today's sentence form over its one pool, with
+    ///   "Codex" before "accounts" (`2 of 4 Codex accounts ready`), or
+    ///   ``summary`` when nothing is enabled, as today.
+    /// - A fleet holding both providers: one line per pool,
+    ///   `Claude · 3 of 4 accounts ready · 1 parked`, or `Codex · 2 parked`
+    ///   for a pool with nothing enabled, and ` · shown on the cup` on the
+    ///   line of the pool the cup follows.
+    ///
+    /// An unreadable row's notice closes the last line, as it always has.
+    public func tooltipSentence(cupPool: MenuBarCupPool, now: Date = Date()) -> String {
+        guard case .loaded(let fleet) = self, let pools = fleet.providerPools(now: now) else {
+            return claudeOnlyTooltipSentence
+        }
+        let sentence: String
+        if fleet.holdsBothProviders {
+            let governing = fleet.governingPool(cupPool, now: now)?.provider
+            sentence = pools.map { pool in
+                let line =
+                    "\(pool.name) · " + (pool.countsSentence() ?? "\(pool.parkedCount) parked")
+                return pool.provider == governing ? line + " · shown on the cup" : line
+            }.joined(separator: "\n")
+        } else {
+            guard let only = pools.first?.countsSentence(nounPrefix: "Codex ") else {
+                return summary
+            }
+            sentence = only
+        }
+        guard let unreadable = fleet.unreadableNotice else { return sentence }
+        return "\(sentence) · \(unreadable)"
+    }
+
+    /// Today's tooltip sentence, for a fleet with no Codex account and for
+    /// every state that is not a healthy read.
+    private var claudeOnlyTooltipSentence: String {
         guard case .loaded(let fleet) = self, let sentence = fleet.countsSentence else {
             return summary
         }
         guard let unreadable = fleet.unreadableNotice else { return sentence }
         return "\(sentence) · \(unreadable)"
+    }
+
+    /// The whole menu-bar tooltip.
+    ///
+    /// The menu bar has room for a glyph and nothing else, so this is where the
+    /// poll's own summary is reachable by a human who has not opened the panel.
+    ///
+    /// A one-line sentence (a fleet with one provider, or a read that failed)
+    /// is composed as the menu bar always has: the sentence, then the
+    /// running-tools clause when the segment is shown, then the keep-awake
+    /// clause, with a waiting Mac's sentence and one space in front of it all.
+    /// That order matches the mockup's own (`docs/design/menubar-mark-mockup.html`,
+    /// "… · 2 parked · 3 tools running"), and the sentence already says "near
+    /// their limit" in words, so the amber count is never colour alone.
+    ///
+    /// A fleet holding both providers has one line per pool, so the rest moves
+    /// onto lines of its own: the waiting Mac first, then the pool lines, then
+    /// what the Mac is doing (`3 tools running · Keeping this Mac awake`),
+    /// which is left out when it would be empty.
+    public func menuBarToolTip(
+        awake: Bool, showRunningTools: Bool, knocks: Int, cupPool: MenuBarCupPool,
+        now: Date = Date()
+    ) -> String {
+        let sentence = tooltipSentence(cupPool: cupPool, now: now)
+        let running = runningToolsCount(showRunningTools: showRunningTools).map { count in
+            "\(count) \(count == 1 ? "tool" : "tools") running"
+        }
+        let asking = PeerAdmission.knockBarSentence(count: knocks)
+        guard loadedFleet?.holdsBothProviders == true else {
+            var line = sentence
+            if let running { line += " · \(running)" }
+            if awake { line = "\(line) · \(KeepAwakeGlyph.accessibilityDescription)" }
+            guard let asking else { return line }
+            return "\(asking) \(line)"
+        }
+        let activity = [running, awake ? KeepAwakeGlyph.accessibilityDescription : nil]
+            .compactMap { $0 }
+        var lines = [sentence]
+        if let asking { lines.insert(asking, at: 0) }
+        if !activity.isEmpty { lines.append(activity.joined(separator: " · ")) }
+        return lines.joined(separator: "\n")
     }
 
     /// The running-tools segment count, or `nil` when it must not be shown.
@@ -137,7 +277,7 @@ public enum PollState: Equatable {
     /// so it can live (and be tested) here in `TcrBarCore` rather than in
     /// `MenuBarShell`, which the test target does not link (see
     /// `RunningToolsMarkTests`'s own doc-comment on that boundary). The
-    /// caller (`MenuBarShell.cupTint(for:awake:)`) turns this into a real
+    /// caller (`MenuBarShell.cupTint(for:awake:cupPool:)`) turns this into a real
     /// ``MenuBarMark/Tint`` by attaching `Tok`'s colours.
     ///
     /// Precedence, highest first:
@@ -166,9 +306,21 @@ public enum PollState: Equatable {
     }
 
     public func capacityTintKind(awake: Bool) -> CupTintKind {
+        capacityTintKind(awake: awake, cupPool: .emptier)
+    }
+
+    /// ``capacityTintKind(awake:)`` under the cup's pin. A fleet with no Codex
+    /// account is today's, whatever the pin says. A fleet holding Codex
+    /// accounts is amber when the pool the cup follows is near
+    /// (``PoolCapacity/isNear``), so the cup's colour and its fill describe one
+    /// pool. A failed read, and keep-awake, are as above.
+    public func capacityTintKind(awake: Bool, cupPool: MenuBarCupPool) -> CupTintKind {
         switch self {
         case .toolMissing, .commandFailed, .undecodable:
             return .failed
+        case .loaded(let fleet) where fleet.holdsCodex:
+            if fleet.governingPool(cupPool)?.isNear == true { return .near }
+            return awake ? .awake : .template
         case .loaded(let fleet) where fleet.capacityGlyphState == .near:
             return .near
         case .pending, .loaded:
@@ -186,6 +338,11 @@ public final class StatusPoller: ObservableObject {
 
     @Published public private(set) var state: PollState = .pending
     @Published public private(set) var lastPollAt: Date?
+    /// When the read behind ``state`` began, set with it. Polls are not ordered, so the
+    /// state can predate a change made while its read ran; a change recorded after this
+    /// instant is one that read could not have seen. Not published: it is read when
+    /// ``lastPollAt`` changes, and changes with it.
+    public private(set) var lastPollBegan: Date?
 
     public let interval: TimeInterval
     private var task: Task<Void, Never>?
@@ -234,8 +391,17 @@ public final class StatusPoller: ObservableObject {
     /// depends on that.
     @discardableResult
     public func pollOnce() async -> PollState {
-        let next = await Self.fetch()
+        await pollOnce(through: Self.fetch)
+    }
+
+    /// ``pollOnce()`` through `fetch`, which a test hands a stand-in read so that no `tcr`
+    /// runs. The begin time is taken before the read starts.
+    @discardableResult
+    func pollOnce(through fetch: () async -> PollState) async -> PollState {
+        let began = Date()
+        let next = await fetch()
         state = next
+        lastPollBegan = began
         lastPollAt = Date()
         return next
     }
@@ -303,7 +469,8 @@ public final class StatusPoller: ObservableObject {
     nonisolated static func fetchAccounts(executable: URL) -> PollState {
         do {
             return classify(
-                try TcrTool.run(executable: executable, arguments: ["status", "--json"]))
+                try TcrTool.run(executable: executable, arguments: ["status", "--json"]),
+                executablePath: executable.path)
         } catch {
             return .commandFailed(exitCode: -1, message: error.localizedDescription)
         }
@@ -354,12 +521,15 @@ public final class StatusPoller: ObservableObject {
     }
 
     /// Pure classification of a finished invocation — the part worth testing.
-    public nonisolated static func classify(_ output: TcrTool.Output) -> PollState {
+    public nonisolated static func classify(
+        _ output: TcrTool.Output, executablePath: String? = nil
+    ) -> PollState {
         guard output.exitCode == 0 else {
-            return .commandFailed(
-                exitCode: output.exitCode,
-                message: output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
+            let raw = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message =
+                executablePath == nil
+                ? raw : PredatesCodexRefusal.displayed(raw, executablePath: executablePath)
+            return .commandFailed(exitCode: output.exitCode, message: message)
         }
         do {
             return .loaded(try Fleet.decode(output.stdout))

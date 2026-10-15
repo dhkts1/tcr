@@ -208,7 +208,7 @@ public enum PeerPanelHeight {
 
     /// The authored panel size with the Peers tab selected.
     ///
-    /// ``PanelSize/plan(rowCount:header:footer:geometry:metrics:)``'s own
+    /// ``PanelSize/plan(rowCount:sectionHeads:header:footer:geometry:metrics:)``'s own
     /// header and footer arithmetic, unchanged and not restated, this only
     /// replaces the content region with ``peerSectionHeight(rows:metrics:)``.
     /// Composed rather than copied so a change to the panel's frame or footer

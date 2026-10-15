@@ -99,6 +99,45 @@ final class GroupRoutingTests: XCTestCase {
         XCTAssertFalse(
             GroupRouting.routes(group: "resarch", accounts: accounts, controlName: nil))
     }
+
+    /// Claude routing is judged over the members that can serve a Claude request.
+    ///
+    /// orchard holds alice, the control account, and ivy, a Codex account. ivy
+    /// cannot serve a Claude request, so the group routes nothing. And research,
+    /// whose one member is the Codex row kim, has no Claude member at all.
+    func testRoutingCountsAnthropicMembersOnly() throws {
+        let fleet = try decodeFleet(
+            ["alice@example.com", "ivy@example.com", "kim@example.com"].map {
+                try canonicalRow($0)
+            })
+        let alice = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
+        let ivy = try XCTUnwrap(fleet.accounts.first { $0.name == "ivy@example.com" })
+        let kim = try XCTUnwrap(fleet.accounts.first { $0.name == "kim@example.com" })
+        XCTAssertFalse(
+            GroupRouting.routes(
+                group: "orchard", accounts: [alice, ivy], controlName: "alice@example.com"),
+            "a Codex member made a group whose only Claude member is the control account "
+                + "look routable")
+        XCTAssertFalse(GroupRouting.routes(group: "research", accounts: [kim], controlName: nil))
+    }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
 }
 
 /// Hand-built accounts with the fields this file's assertions touch.

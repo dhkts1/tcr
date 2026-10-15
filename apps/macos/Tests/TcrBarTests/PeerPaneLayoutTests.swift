@@ -288,6 +288,37 @@ final class PeerPaneLayoutTests: XCTestCase {
         XCTAssertFalse(fits(macs: 3, knocks: 1))
     }
 
+    /// The same envelope in a fleet holding a Codex account, which draws one more
+    /// line under the Sharing head: that Codex requests always leave from this Mac.
+    /// It wraps to two head lines, 28 pt, so **two Macs and no knock fit, and a
+    /// knock or a third Mac scrolls.**
+    ///
+    /// That scroll is accepted, in a mixed fleet only: a taller window would move a
+    /// Claude-only fleet's pane too, and the Claude-only figures above do not move.
+    func testAMixedFleetFitsTwoMacsAndNoKnockAndTheNextRowScrolls() {
+        let m = PeerPaneLayout.drawnMetrics
+        func height(macs: Int, knocks: Int, holdsCodex: Bool) -> CGFloat {
+            PeerPaneLayout.height(
+                PeerPaneLayout.drawnContent(
+                    trustedMacs: macs, pendingKnocks: knocks, holdsCodex: holdsCodex),
+                metrics: m)
+        }
+        XCTAssertEqual(
+            height(macs: 2, knocks: 1, holdsCodex: true)
+                - height(macs: 2, knocks: 1, holdsCodex: false),
+            2 * m.sectionSentenceHeight,
+            "the Codex line is charged as something other than two head lines")
+        XCTAssertEqual(
+            height(macs: 2, knocks: 1, holdsCodex: false),
+            PeerPaneLayout.height(
+                PeerPaneLayout.drawnContent(trustedMacs: 2, pendingKnocks: 1), metrics: m),
+            "a Claude-only fleet's pane is charged for a line it does not draw")
+        let window = PeerPaneLayout.visibleDocumentHeight
+        XCTAssertLessThanOrEqual(height(macs: 2, knocks: 0, holdsCodex: true), window)
+        XCTAssertGreaterThan(height(macs: 2, knocks: 1, holdsCodex: true), window)
+        XCTAssertGreaterThan(height(macs: 3, knocks: 0, holdsCodex: true), window)
+    }
+
     /// Nobody trusted yet is a real state, and the first one a new operator
     /// sees. It has to fit.
     func testTheEmptyPaneFits() {

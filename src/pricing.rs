@@ -1,4 +1,4 @@
-//! What a request would have cost on Anthropic's public API.
+//! What a request would have cost at its model's own provider's API list price.
 //!
 //! # What the number means
 //!
@@ -23,6 +23,15 @@
 //! longest-prefix so a dated id resolves to its family, and a future
 //! `claude-opus-5-1` cannot be silently priced as `claude-opus-5` — a longer,
 //! more specific entry always wins over a shorter one.
+//!
+//! # OpenAI models
+//!
+//! [`TABLE`] holds no OpenAI row, because no published, dated OpenAI rate is
+//! sourced in this repo. A Codex model is therefore unpriced (`None`) unless a
+//! `pricing` override names it. Such an override's cache writes default to its
+//! input rate, for the reason [`OPENAI_CACHE_WRITE_MULTIPLIER`] gives: a Codex
+//! turn reports the tokens it wrote to the cache inside its input tokens, and
+//! OpenAI adds no write premium.
 
 use std::collections::BTreeMap;
 
@@ -51,6 +60,19 @@ const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
 /// A 1-hour cache write bills at 2x base input — which is why the ledger has to
 /// keep the two cache-creation dimensions apart at all.
 const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+/// An OpenAI model's cache write bills at its input rate: a Codex turn reports the tokens it
+/// wrote to the cache inside `input_tokens`, and OpenAI adds no write premium. Applies to
+/// both write dimensions of an OpenAI id ([`is_openai_model_id`]), for which no built-in
+/// row exists, so it is the default an override falls back to.
+const OPENAI_CACHE_WRITE_MULTIPLIER: f64 = 1.0;
+
+/// Whether `model` is an OpenAI model id, `gpt-…` or `codex-…`: the ids Codex traffic is
+/// served under. One test for every reader. Pricing uses it for the cache-write default,
+/// and the usage ledger uses it to file a line written before the ledger recorded its
+/// provider.
+pub(crate) fn is_openai_model_id(model: &str) -> bool {
+    model.starts_with("gpt-") || model.starts_with("codex-")
+}
 
 /// `(model-id prefix, input USD/MTok, output USD/MTok, cache read USD/MTok)`,
 /// transcribed from Anthropic's published first-party API rates (the
@@ -99,7 +121,8 @@ const TABLE: &[(&str, f64, f64, Option<f64>)] = &[
 /// A per-model pricing override from `~/.config/teamclaude.json`'s `pricing`
 /// map. `input` and `output` are required (a half-specified price is a mistake,
 /// not a default); the three cache dimensions fall back to the same multipliers
-/// the built-in table uses.
+/// the built-in table uses, except that an OpenAI model's cache writes fall back
+/// to its input rate ([`OPENAI_CACHE_WRITE_MULTIPLIER`]).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PricingOverride {
@@ -114,16 +137,20 @@ pub struct PricingOverride {
 }
 
 impl PricingOverride {
-    fn resolve(&self) -> ModelPrice {
+    /// This override's price for `model`, the id it matched. The model decides the
+    /// cache-write defaults: an OpenAI id's are its input rate, every other id's are
+    /// Anthropic's 1.25x and 2x.
+    fn resolve(&self, model: &str) -> ModelPrice {
+        let (write_5m, write_1h) = if is_openai_model_id(model) {
+            (OPENAI_CACHE_WRITE_MULTIPLIER, OPENAI_CACHE_WRITE_MULTIPLIER)
+        } else {
+            (CACHE_WRITE_5M_MULTIPLIER, CACHE_WRITE_1H_MULTIPLIER)
+        };
         ModelPrice {
             input: self.input,
             output: self.output,
-            cache_write_5m: self
-                .cache_write_5m
-                .unwrap_or(self.input * CACHE_WRITE_5M_MULTIPLIER),
-            cache_write_1h: self
-                .cache_write_1h
-                .unwrap_or(self.input * CACHE_WRITE_1H_MULTIPLIER),
+            cache_write_5m: self.cache_write_5m.unwrap_or(self.input * write_5m),
+            cache_write_1h: self.cache_write_1h.unwrap_or(self.input * write_1h),
             cache_read: self
                 .cache_read
                 .unwrap_or(self.input * CACHE_READ_MULTIPLIER),
@@ -157,7 +184,7 @@ impl PricingTable {
             .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len());
         if let Some((_, price)) = over {
-            return Some(price.resolve());
+            return Some(price.resolve(model));
         }
         let (_, input, output, cache_read) = TABLE
             .iter()
@@ -354,6 +381,52 @@ mod tests {
         assert!(
             table().lookup("claude-sonnet-4-5-20250929").is_none(),
             "no published rate was read for sonnet 4.5, so it must not carry one"
+        );
+    }
+
+    /// An OpenAI model is priced only by a `pricing` override, and its cache writes default to
+    /// its input rate, because a Codex turn reports a cache write inside its input tokens and
+    /// OpenAI adds no write premium. Cache reads keep the tenth, and a rate the override names
+    /// wins as always. A Claude override keeps Anthropic's 1.25x and 2x: that is the control.
+    #[test]
+    fn a_gpt_price_override_bills_cache_writes_at_the_input_rate() {
+        let price = |input: f64, cache_write_5m: Option<f64>| PricingOverride {
+            input,
+            output: 10.0,
+            cache_write_5m,
+            cache_write_1h: None,
+            cache_read: None,
+        };
+        let table = PricingTable::new(BTreeMap::from([
+            ("gpt-5.1-codex".to_string(), price(1.25, None)),
+            ("codex-mini".to_string(), price(1.5, None)),
+            ("gpt-5-mini".to_string(), price(0.25, Some(0.5))),
+            ("claude-opus-5".to_string(), price(1.25, None)),
+        ]));
+        let gpt = table
+            .lookup("gpt-5.1-codex-max")
+            .expect("the override matches by prefix");
+        assert_eq!(
+            (gpt.cache_write_5m, gpt.cache_write_1h, gpt.cache_read),
+            (1.25, 1.25, 0.125)
+        );
+        let codex = table
+            .lookup("codex-mini-latest")
+            .expect("a codex- id is an OpenAI id too");
+        assert_eq!((codex.cache_write_5m, codex.cache_write_1h), (1.5, 1.5));
+        assert_eq!(
+            table.lookup("gpt-5-mini").expect("named").cache_write_5m,
+            0.5,
+            "a named rate wins"
+        );
+        let claude = table.lookup("claude-opus-5").expect("the control");
+        assert_eq!(
+            (claude.cache_write_5m, claude.cache_write_1h),
+            (1.5625, 2.5)
+        );
+        assert!(
+            PricingTable::default().lookup("gpt-5.1-codex").is_none(),
+            "no built-in OpenAI price"
         );
     }
 }

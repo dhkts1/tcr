@@ -206,11 +206,24 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// Already ordered — the caller renders these in array order and derives
     /// nothing.
     public let rows: [FleetSectionRow]
+    /// Whose list this section is in. The Accounts tab splits a fleet holding
+    /// Codex accounts into one list per provider (``Fleet/accountsTabSectionsByProvider(pinning:expandedGroups:)``),
+    /// and each of those sections holds that provider's rows alone.
+    ///
+    /// ``Fleet/sectionsInDisplayOrder(pinning:)`` tags every section `.anthropic`,
+    /// whatever rows it holds: it is the one list of the legacy panel and of a
+    /// fleet with no Codex row, and that tag keeps the key and the identity
+    /// every section had before Codex accounts existed.
+    public let provider: Provider
 
-    public init(band: FleetBand, group: FleetGroupKey, rows: [FleetSectionRow]) {
+    public init(
+        band: FleetBand, group: FleetGroupKey, rows: [FleetSectionRow],
+        provider: Provider = .anthropic
+    ) {
         self.band = band
         self.group = group
         self.rows = rows
+        self.provider = provider
     }
 
     /// The group heading. The band heading is ``FleetBand/title`` and is drawn
@@ -222,7 +235,24 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// appears in more than one band whenever its accounts are in different
     /// states, so the band IS part of a section's identity even though it is
     /// not part of a row's.
-    public var id: String { "\(band.rawValue)\u{1F}\(group.token)" }
+    ///
+    /// A Codex section's identity leads with `codex`: a group holding accounts
+    /// of both providers is drawn once in each list, and the two boxes sit in
+    /// one `ForEach`, where a shared identity paints one onto the other. A
+    /// Claude section keeps the identity it always had.
+    public var id: String {
+        provider == .codex
+            ? "codex\u{1F}\(band.rawValue)\u{1F}\(group.token)"
+            : "\(band.rawValue)\u{1F}\(group.token)"
+    }
+
+    /// The key an operator's open group is stored under. The Claude box keeps
+    /// the key it has always had, the group's ``FleetGroupKey/token``, so groups
+    /// left open stay open once the fleet holds a Codex account; the Codex box
+    /// gets its own, so opening one does not open the other.
+    public var expansionKey: String {
+        provider == .codex ? "codex:\(group.token)" : group.token
+    }
 
     /// True when any row here is the control account — so a view can decorate
     /// the heading without walking `rows` itself.
@@ -321,12 +351,23 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
             counts[FleetTally.Kind(account: row.account), default: 0] += 1
         }
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .needsRelogin, .rejected, .unmeasured, .disabled,
+            .ok, .near, .spent, .unknown, .needsRelogin, .rejected, .unreachable, .unmeasured,
+            .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }
             return FleetTally(kind: kind, count: count)
         }
+    }
+
+    /// `"2 refused"`: one of ``breakdown``'s tallies, in this section's words.
+    ///
+    /// A Codex row is refused by ChatGPT, not rejected by Anthropic, so a Codex
+    /// box says the word its own lines and cards say. Every other tally, and
+    /// every tally of a Claude box, is ``FleetTally/label``.
+    public func tallyLabel(_ tally: FleetTally) -> String {
+        if provider == .codex, tally.kind == .rejected { return "\(tally.count) refused" }
+        return tally.label
     }
 
     /// What this section's accounts spent TODAY, or `nil` when not one of them
@@ -336,11 +377,17 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// silently count as zero — the same rule the per-account line follows.
     /// `today`, never ``UsageRow/windowOrToday``, because the label this feeds
     /// says "today" out loud.
+    ///
+    /// A Codex box never prints `$0.00`: tokens are the Codex default, and an
+    /// account that served nothing today reports a measured zero, so a total
+    /// that prints as `$0.00` (zero, or under half a cent) is `nil` there, and
+    /// the box's line names its accounts alone. A Claude box is unchanged.
     public var todaySpend: Double? {
         var total: Double?
         for row in rows {
             total = UsageTotals.addCost(total, row.account.usage?.today.measuredCost)
         }
+        if provider == .codex, let total, QuotaFormat.usd(total) == "$0.00" { return nil }
         return total
     }
 
@@ -417,14 +464,15 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// ``breakdown`` right there. A row an operator has to act on now is a
     /// different matter: a dead credential or an account out of tokens needs
     /// the card, its reset countdown and its menu, so one of those keeps the
-    /// whole group open. Four is the mockup's own smallest collapsed group
-    /// (six) rounded down to where a group stops being readable at a glance;
-    /// below it the cards cost less height than the summary saves.
+    /// whole group open. An unreachable Codex account is one too: its remedy
+    /// is to take it out of this very group. Four is the mockup's own smallest
+    /// collapsed group (six) rounded down to where a group stops being readable
+    /// at a glance; below it the cards cost less height than the summary saves.
     public var collapsesByDefault: Bool {
         guard case .named = group, band == .live, rows.count >= 4 else { return false }
         return !rows.contains { row in
             switch FleetTally.Kind(account: row.account) {
-            case .spent, .needsRelogin, .rejected: return true
+            case .spent, .needsRelogin, .rejected, .unreachable: return true
             case .ok, .near, .unknown, .unmeasured, .disabled: return false
             }
         }
@@ -515,7 +563,23 @@ extension Fleet {
     /// An account in two groups yields two rows. A group whose accounts differ
     /// in state yields one section per band. Neither is de-duplicated; see this
     /// file's own header for the override that makes that correct.
+    ///
+    /// Every row, whatever its provider, as ``FleetSection/provider`` explains:
+    /// this is the legacy panel's list, and the Accounts tab's for a fleet with
+    /// no Codex row. A fleet holding Codex accounts is drawn one provider at a
+    /// time, by the same rule (``FleetSection/sections(of:provider:pinning:)``).
     public func sectionsInDisplayOrder(pinning controlName: String? = nil) -> [FleetSection] {
+        FleetSection.sections(of: accounts, provider: .anthropic, pinning: controlName)
+    }
+}
+
+extension FleetSection {
+    /// ``Fleet/sectionsInDisplayOrder(pinning:)``'s sections, built over
+    /// `accounts` alone, each tagged with `provider`: the rule and its order are
+    /// that function's, and it is the one place they are written.
+    public static func sections(
+        of accounts: [Account], provider: Provider, pinning controlName: String?
+    ) -> [FleetSection] {
         // One entry per (band, group, account). An account in N groups
         // contributes N of them — the duplication IS the feature, so it happens
         // here, at the point where membership is read, rather than being undone
@@ -552,7 +616,8 @@ extension Fleet {
         return buckets.keys.sorted().flatMap { band -> [FleetSection] in
             let groups = buckets[band] ?? [:]
             return groups.keys.sorted().map { key in
-                FleetSection(band: band, group: key, rows: sortRows(groups[key] ?? []))
+                FleetSection(
+                    band: band, group: key, rows: sortRows(groups[key] ?? []), provider: provider)
             }
         }
     }
@@ -560,11 +625,64 @@ extension Fleet {
     /// By name, with the control account first. A single `sorted(by:)` on the
     /// pair rather than a partition, because the pin here is inside one section
     /// and there is no pre-existing relative order to preserve — unlike
-    /// ``rowsInDisplayOrder(pinning:)``, whose input is already sorted on three
-    /// keys it must not disturb.
-    private func sortRows(_ rows: [FleetSectionRow]) -> [FleetSectionRow] {
+    /// ``Fleet/rowsInDisplayOrder(pinning:)``, whose input is already sorted on
+    /// three keys it must not disturb.
+    private static func sortRows(_ rows: [FleetSectionRow]) -> [FleetSectionRow] {
         rows.sorted {
             ($0.isControl ? 0 : 1, $0.account.name) < ($1.isControl ? 0 : 1, $1.account.name)
         }
+    }
+}
+
+/// One provider's list on the Accounts tab: that provider's rows, in the tab's own order.
+public struct ProviderSections: Equatable, Sendable {
+    public let provider: Provider
+    public let sections: [FleetSection]
+
+    public init(provider: Provider, sections: [FleetSection]) {
+        self.provider = provider
+        self.sections = sections
+    }
+}
+
+/// The head over one provider's list in a fleet holding both: the title `SectionHead`
+/// uppercases, the provider's account count, and what VoiceOver says. Never tinted.
+public struct ProviderSectionHead: Equatable, Sendable {
+    public let provider: Provider
+    /// The provider's accounts, not its rows: an account in two groups draws two lines and
+    /// one strip segment, and is one account here. The head says nothing more on purpose.
+    /// The strip above the list already says how much of each pool is ready and when the
+    /// next account is back, and each band heading says when its first one returns; a
+    /// third reading of the same pool is the repetition the panel's summary was cut down to
+    /// avoid.
+    public let accounts: Int
+
+    public init(provider: Provider, accounts: Int) {
+        self.provider = provider
+        self.accounts = accounts
+    }
+
+    /// `Claude` or `Codex`; `SectionHead` draws it uppercased.
+    public var title: String { provider == .codex ? "Codex" : "Claude" }
+
+    /// `"· 4 accounts"`, `"· 1 account"`: drawn inline beside the title.
+    public var unit: String { "· \(count)" }
+
+    /// `"CLAUDE, 4 accounts"`: the head as VoiceOver reads it, without the dot the unit
+    /// draws.
+    public var spoken: String { "\(title.uppercased()), \(count)" }
+
+    private var count: String { "\(accounts) \(accounts == 1 ? "account" : "accounts")" }
+}
+
+extension Fleet {
+    /// Whether the tab draws a head over each list: only when there are two lists.
+    public var drawsProviderHeads: Bool { holdsBothProviders }
+
+    /// The head over `provider`'s list, or nil when the tab draws no heads.
+    public func sectionHead(for provider: Provider) -> ProviderSectionHead? {
+        guard drawsProviderHeads else { return nil }
+        return ProviderSectionHead(
+            provider: provider, accounts: accounts.filter { $0.provider == provider }.count)
     }
 }

@@ -128,7 +128,19 @@ public struct JoinedSession: Identifiable, Equatable, Sendable {
         return (cwd as NSString).lastPathComponent
     }
 
-    public var activity: SessionActivity { SessionActivity(rawStatus: file?.status) }
+    /// A Claude session's reading comes from its Claude Code session file's `status`.
+    ///
+    /// A Codex session's is the one fact the wire states: `.busy` while one of its tool calls
+    /// is running, `.unknown` otherwise. It is never inferred from codex's transcript, which
+    /// this build does not read, and never from a file's status, which codex does not write;
+    /// the rollout file joined to it gives its project, not its activity. So a Codex session
+    /// is never "idle" or "waiting on you": its row says how long ago it was last seen.
+    public var activity: SessionActivity {
+        if session.provider == .codex {
+            return session.tools.running.isEmpty ? .unknown : .busy
+        }
+        return SessionActivity(rawStatus: file?.status)
+    }
 
     public var lastSeenAt: Date { Date(timeIntervalSince1970: Double(session.lastSeenMs) / 1000) }
 
@@ -149,5 +161,184 @@ public struct JoinedSession: Identifiable, Equatable, Sendable {
 public enum SessionJoin {
     public static func join(sessions: [Session], files: [String: SessionFile]) -> [JoinedSession] {
         sessions.map { JoinedSession(session: $0, file: files[$0.sessionId]) }
+    }
+}
+
+/// The project of a Codex session, from the first line of the rollout file codex writes for
+/// it under `$CODEX_HOME/sessions`.
+///
+/// What is read, and why it is enough. codex names each rollout for its thread,
+/// `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread id>.jsonl`, and after it reverts a thread,
+/// `rollout-<timestamp>-<thread id>_<rollout id>.jsonl`, the thread id first either way. Line 1
+/// is its `session_meta` record: the thread's id and the folder it runs in. The `session-id`
+/// header codex sends, which the proxy names a Codex session by, is that thread's id. So a
+/// session joins the file named for its id whose line 1 names the same id, and keeps the
+/// folder as its project.
+///
+/// Only line 1 is read, and only for an id the proxy's own sessions named. The transcript
+/// after it is never read: activity read from it would cost the privacy this costs none of.
+/// It is the precedent Claude Code's session files already set (``SessionFiles``), which name
+/// a session's folder and nothing it said. A compressed rollout (`.jsonl.zst`) and one codex
+/// archived (`archived_sessions/`, beside `sessions/`) are not read; nor is any file when codex
+/// keys its requests by something other than the thread, in which case no name matches.
+public enum CodexRollouts {
+    /// Files for the ids given that have a rollout with a matching line 1, keyed by id. The
+    /// result's ``SessionFile`` carries the id and the folder only: no name, no status and no
+    /// process, which codex's rollout does not hold.
+    ///
+    /// The walk goes newest first: at every level of `sessions/` the names sort descending, so
+    /// the `YYYY/MM/DD` folders come newest first, and so do a folder's rollouts, by the
+    /// timestamp they are named with. It stops once every id has a file, after the folder it
+    /// is in, so the newest rollout of an id is the one read. A file whose line 1 does not
+    /// hold is passed over for the next newest. Hidden files are skipped, and a symbolic link
+    /// to a folder is not followed.
+    public static func read(
+        codexHome: String, sessionIds: Set<String>,
+        readFirstLine: (URL) -> String? = { firstLine(at: $0) }
+    ) -> [String: SessionFile] {
+        guard !sessionIds.isEmpty else { return [:] }
+        let sessions = URL(fileURLWithPath: codexHome, isDirectory: true)
+            .appendingPathComponent("sessions", isDirectory: true)
+        var found: [String: SessionFile] = [:]
+        _ = walk(sessions, wanted: sessionIds, found: &found, readFirstLine: readFirstLine)
+        return found
+    }
+
+    /// Line 1 of the file at `url`, without its newline, read `chunkSize` bytes at a time and
+    /// no further than the first newline. `nil` when the file cannot be read, when line 1 is
+    /// longer than `limit` bytes, which is read no further than the chunk that passes it, or
+    /// when it is not UTF-8. codex sets no size for line 1; at codex's own instructions it is
+    /// about 20 KB, so the 1 MiB limit is room, not a guess at the size.
+    public static func firstLine(
+        at url: URL, chunkSize: Int = 65_536, limit: Int = 1_048_576,
+        onRead: (Int) -> Void = { _ in }
+    ) -> String? {
+        guard chunkSize > 0, let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var line = Data()
+        while let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            onRead(chunk.count)
+            if let newline = chunk.firstIndex(of: UInt8(ascii: "\n")) {
+                line.append(chunk[chunk.startIndex..<newline])
+                return line.count <= limit ? String(data: line, encoding: .utf8) : nil
+            }
+            line.append(chunk)
+            guard line.count <= limit else { return nil }
+        }
+        // The file ended before a newline: all of it is its first line.
+        return line.isEmpty ? nil : String(data: line, encoding: .utf8)
+    }
+
+    /// Reads one folder, then its subfolders, newest first; `true` once every wanted id has a
+    /// file.
+    private static func walk(
+        _ directory: URL, wanted: Set<String>, found: inout [String: SessionFile],
+        readFirstLine: (URL) -> String?
+    ) -> Bool {
+        guard
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles])
+        else { return false }
+        var folders: [URL] = []
+        var candidates: [String: [URL]] = [:]
+        for entry in entries.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) {
+            if (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                folders.append(entry)
+                continue
+            }
+            guard let head = threadHead(ofRolloutNamed: entry.lastPathComponent) else { continue }
+            for id in wanted where found[id] == nil && head.hasSuffix("-" + id) {
+                candidates[id, default: []].append(entry)
+            }
+        }
+        for (id, urls) in candidates {
+            for url in urls {
+                guard let line = readFirstLine(url), let file = sessionFile(line, id: id)
+                else { continue }
+                found[id] = file
+                break
+            }
+        }
+        if wanted.allSatisfy({ found[$0] != nil }) { return true }
+        for folder in folders {
+            if walk(folder, wanted: wanted, found: &found, readFirstLine: readFirstLine) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// A live rollout's name up to and including its thread id: without `.jsonl`, and without
+    /// the `_<rollout id>` a reverted thread's file adds after the thread id. `nil` for any
+    /// other name, a compressed `.jsonl.zst` included.
+    private static func threadHead(ofRolloutNamed name: String) -> Substring? {
+        guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl") else { return nil }
+        let stem = name.dropLast(".jsonl".count)
+        return stem.split(separator: "_", maxSplits: 1, omittingEmptySubsequences: false).first
+    }
+
+    /// The file line 1 makes for `id`: codex's `session_meta` record whose `payload.id` is
+    /// `id`, with its `payload.cwd` as the folder. `nil` for any other line.
+    private static func sessionFile(_ line: String, id: String) -> SessionFile? {
+        guard
+            let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8)))
+                as? [String: Any],
+            object["type"] as? String == "session_meta",
+            let payload = object["payload"] as? [String: Any],
+            payload["id"] as? String == id
+        else { return nil }
+        return SessionFile(sessionId: id, cwd: payload["cwd"] as? String)
+    }
+}
+
+/// ``CodexRollouts`` across polls: the panel asks every few seconds, and a rollout's line 1
+/// never changes, so a join, once found, is not looked up again while its session is live.
+/// An id with no rollout is not looked up again until a minute has passed, so a session codex
+/// wrote no file for costs one walk a minute rather than one a poll.
+///
+/// What is remembered is for one codex home; pointed at another, the join starts over. A
+/// session that leaves the list is forgotten.
+public struct CodexRolloutJoin: Sendable {
+    /// How long a miss is remembered before its id is looked up again.
+    public static let missRetrySeconds: TimeInterval = 60
+
+    private var codexHome: String?
+    private var found: [String: SessionFile] = [:]
+    private var missed: Set<String> = []
+    /// When ``missed`` was last emptied. Every miss is forgotten once ``missRetrySeconds``
+    /// have passed since then, together, so a poll retries them in one walk.
+    private var missesSince: Date?
+
+    public init() {}
+
+    /// The rollout files for `sessionIds`, keyed by id, looking up only the ids it has neither
+    /// found nor missed in the last minute.
+    public mutating func files(
+        for sessionIds: Set<String>, codexHome: String, now: Date,
+        walk: (String, Set<String>) -> [String: SessionFile] = {
+            CodexRollouts.read(codexHome: $0, sessionIds: $1)
+        }
+    ) -> [String: SessionFile] {
+        if codexHome != self.codexHome {
+            self.codexHome = codexHome
+            found = [:]
+            missed = []
+            missesSince = now
+        }
+        if let since = missesSince, now < since || now.timeIntervalSince(since) >= Self.missRetrySeconds {
+            missed = []
+            missesSince = now
+        }
+        found = found.filter { sessionIds.contains($0.key) }
+        missed.formIntersection(sessionIds)
+        let wanted = sessionIds.subtracting(found.keys).subtracting(missed)
+        if !wanted.isEmpty {
+            let read = walk(codexHome, wanted)
+            for id in wanted {
+                if let file = read[id] { found[id] = file } else { missed.insert(id) }
+            }
+        }
+        return found
     }
 }

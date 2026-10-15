@@ -219,6 +219,38 @@ public struct AccountExit: Decodable, Equatable, Sendable {
     /// Whether the note is the amber one: a promise being kept the hard way,
     /// or being tested right now.
     public var noteIsWarning: Bool { strict && route.peer != nil }
+
+    // MARK: A Codex account's exit
+
+    /// Where a Codex account's requests leave from, said in place of the picker.
+    ///
+    /// No Mac lends, serves or carries a Codex request in this version, so a picker on
+    /// a Codex card would offer peer choices the CLI refuses, every one of them.
+    public static let codexStatement = "Codex accounts always leave from this Mac in this version."
+
+    /// What a Codex card says instead when its exit is locked to another Mac: tcr
+    /// refuses every request routed to it, so the card names the command that clears
+    /// the lock. `tcr peer account` takes the account's own name.
+    public static func codexStrictStatement(name: String) -> String {
+        "Locked to exit from another Mac, which a Codex account cannot do, so tcr refuses every "
+            + "request routed to it. Clear the lock with "
+            + "`tcr peer account \(name) --exits-from local --no-must`."
+    }
+
+    /// The statement a card draws in place of its exit picker, or `nil` when the row
+    /// keeps the picker (``Account/availableActions`` holds ``AccountAction/exitPicker``).
+    ///
+    /// A strict exit through another Mac reads ``codexStrictStatement(name:)``, because
+    /// it makes tcr refuse every request routed to the account. Every other exit, a
+    /// local one, a preference for another Mac, or one that names no Mac, reads
+    /// ``codexStatement``: the request leaves from this Mac either way.
+    public static func statement(for account: Account, exit: AccountExit) -> String? {
+        guard account.availableActions.contains(.exitStatement) else { return nil }
+        if exit.strict, exit.route.peer != nil {
+            return codexStrictStatement(name: account.name)
+        }
+        return codexStatement
+    }
 }
 
 extension PeerCommand {

@@ -558,8 +558,8 @@ fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
         "anthropic-ratelimit-unified-5h-utilization",
         "0.50".parse().expect("a header value"),
     );
-    held.update_quota(0, &roomy);
-    held.update_quota(1, &busier);
+    held.update_quota(0, &roomy, 200);
+    held.update_quota(1, &busier, 200);
     held.mark_rate_limited(0, 600);
     assert_eq!(
         held.handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
@@ -582,8 +582,8 @@ fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
         "anthropic-ratelimit-unified-5h-utilization",
         "0.05".parse().expect("a header value"),
     );
-    uneven.update_quota(0, &spent);
-    uneven.update_quota(1, &fresh);
+    uneven.update_quota(0, &spent, 200);
+    uneven.update_quota(1, &fresh, 200);
     assert_eq!(
         uneven
             .handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
@@ -650,7 +650,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
     // A measured window on both, because a bearer with no baseline is refused
     // for its own reason and this test is about the PIN.
     for index in 0..2 {
-        mixed.update_quota(index, &measured_at("0.10"));
+        mixed.update_quota(index, &measured_at("0.10"), 200);
     }
     let handed = mixed
         .handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
@@ -661,7 +661,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
     );
 
     let all_pinned = manager_with(pinned_account);
-    all_pinned.update_quota(0, &measured_at("0.10"));
+    all_pinned.update_quota(0, &measured_at("0.10"), 200);
     assert!(
         all_pinned
             .handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
@@ -721,8 +721,8 @@ fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
     // LEG ONE: the roomiest account is held by a 429, so the answer is the
     // other one's token AND the other one's room.
     let mixed = manager_with(two);
-    mixed.update_quota(0, &measured_at("0.05"));
-    mixed.update_quota(1, &measured_at("0.40"));
+    mixed.update_quota(0, &measured_at("0.05"), 200);
+    mixed.update_quota(1, &measured_at("0.40"), 200);
     mixed.mark_rate_limited(0, 600);
     let handed = mixed
         .handoff_bearer(&all, Window::FiveHour)
@@ -746,8 +746,8 @@ fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
     // LEG TWO: every account in scope is held, so there is nothing to hand over
     // and nothing to fund with.
     let all_held = manager_with(two);
-    all_held.update_quota(0, &measured_at("0.05"));
-    all_held.update_quota(1, &measured_at("0.05"));
+    all_held.update_quota(0, &measured_at("0.05"), 200);
+    all_held.update_quota(1, &measured_at("0.05"), 200);
     all_held.mark_rate_limited(0, 600);
     all_held.mark_rate_limited(1, 600);
     assert!(
@@ -1222,7 +1222,7 @@ async fn owner_lending_expiring(
                 .parse()
                 .expect("a header value"),
         );
-        manager.update_quota(0, &measured);
+        manager.update_quota(0, &measured, 200);
     }
 
     let key = NodeKey::load_or_mint(home.path()).expect("the owner's node key");

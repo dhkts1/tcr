@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{self};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,13 +35,16 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
+use tcr_status_wire::{CodexRoute, CodexTraffic};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
-use crate::manager::Manager;
+use crate::manager::{DisablePersist, Manager};
 use crate::probe::ProbeStatus;
+use crate::provider::Provider;
 use crate::stats::{
     AccountSnapshot, GateReason, QuotaState, SessionKind, SessionSnapshot, StatsSnapshot,
 };
@@ -297,30 +301,240 @@ fn next_selection(selected: usize, count: usize, action: Action) -> usize {
     }
 }
 
+/// One row of the accounts pane as it was drawn: the account's slot, the index every key acts
+/// through ([`crate::stats::AccountSnapshot::slot`]), its name, which the notices name, and its
+/// provider, which words them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrawnRow {
+    idx: usize,
+    name: String,
+    provider: Provider,
+}
+
+/// The order the accounts pane draws a fleet in, as positions in its list: the Claude rows,
+/// then the Codex rows, each in rotation order. A fleet of one provider is drawn in rotation
+/// order, so nothing moves for it. The manager's own vector is never reordered: its indices are
+/// what every pin, session and key holds.
+fn display_order_of(providers: &[Provider]) -> Vec<usize> {
+    let section = |provider: Provider| match provider {
+        Provider::Anthropic => 0,
+        Provider::Codex => 1,
+    };
+    let mut order: Vec<usize> = (0..providers.len()).collect();
+    // Stable, so each section keeps rotation order.
+    order.sort_by_key(|&pos| section(providers[pos]));
+    order
+}
+
+/// [`display_order_of`] for `snapshot`'s rows.
+fn display_order(snapshot: &StatsSnapshot) -> Vec<usize> {
+    let providers: Vec<Provider> = snapshot.accounts.iter().map(|a| a.provider).collect();
+    display_order_of(&providers)
+}
+
+/// The position in the snapshot's list that display row `selected` draws, or `None` past the
+/// last row.
+fn key_target(order: &[usize], selected: usize) -> Option<usize> {
+    order.get(selected).copied()
+}
+
+/// The table every key acts through: the rows of `snapshot`, in the order [`render_accounts_with`]
+/// draws them ([`display_order`]), each naming its account by slot. Built from the same order
+/// the pane is drawn from, and kept with the frame it was drawn for, so a key always acts on
+/// the row the person sees under the cursor.
+fn drawn_rows(snapshot: &StatsSnapshot) -> Vec<DrawnRow> {
+    display_order(snapshot)
+        .into_iter()
+        .map(|pos| {
+            let account = &snapshot.accounts[pos];
+            DrawnRow {
+                idx: account.slot,
+                name: account.name.clone(),
+                provider: account.provider,
+            }
+        })
+        .collect()
+}
+
+/// Where the cursor goes when the next frame's table replaces the one drawn: the row of the
+/// SAME account, wherever it moved. An account appended to a mixed fleet joins its own section,
+/// which moves every Codex row below it down one, and a row deleted above the cursor moves it
+/// up one; following the slot keeps the cursor on the account the person put it on. When that
+/// account is gone (or nothing was drawn yet), the row number is kept, clamped into the table.
+///
+/// A fleet of one provider only ever grows at its end, so there the cursor keeps its row
+/// number, as it always did.
+fn reanchor(drawn: &[DrawnRow], selected: usize, next: &[DrawnRow]) -> usize {
+    drawn
+        .get(selected)
+        .and_then(|row| next.iter().position(|candidate| candidate.idx == row.idx))
+        .unwrap_or_else(|| clamp_selected(selected, next.len()))
+}
+
+/// `d` or `e` on display row `selected` of the table the screen shows: the account that row
+/// draws is benched or put back, by its slot. No rebuild from the manager's live order, which
+/// may have grown since the frame was drawn, and no lookup by name: a slot is never handed to
+/// another account (appends go at the end, a delete keeps its slot, and a revive returns an
+/// account to its own), and [`Manager::set_disabled`] refuses a slot deleted since the frame.
+fn toggle(
+    manager: &Manager,
+    drawn: &[DrawnRow],
+    selected: usize,
+    disabled: bool,
+) -> Option<Notice> {
+    match drawn.get(selected) {
+        Some(row) => toggle_notice(manager.set_disabled(row.idx, disabled), disabled, Some(row)),
+        None => toggle_notice(DisablePersist::NoSuchAccount, disabled, None),
+    }
+}
+
+/// The notice `d` or `e` leaves on `row` after `persist`, worded for the row's provider
+/// ([`DisablePersist::warning_for`]) and naming the row, so it is never read against another.
+/// `None` when the outcome needs no word. With no row, it is the line that says so, naming no
+/// account.
+fn toggle_notice(
+    persist: DisablePersist,
+    disabled: bool,
+    row: Option<&DrawnRow>,
+) -> Option<Notice> {
+    let provider = row.map_or(Provider::Anthropic, |row| row.provider);
+    persist
+        .warning_for(disabled, provider)
+        .map(|text| Notice::new(text, row.map(|row| row.name.clone())))
+}
+
+/// What the dashboard knows beyond the snapshot, filled once per tick by the run loop
+/// ([`dashboard_facts`]) so drawing never touches the filesystem or the clock itself. Every
+/// field is `None` unless the fleet calls for it, so a Claude-only dashboard reads nothing new.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DashboardFacts {
+    /// Whether this process pools codex, and why not: the decision `tcr status` and
+    /// `tcr run --codex` take too ([`crate::codex_route`]). Only while the fleet holds a Codex
+    /// row.
+    pub(crate) codex_route: Option<CodexRoute>,
+    /// What this process did with Codex requests in the last ten minutes. Only while the fleet
+    /// holds a Codex row.
+    pub(crate) codex_traffic: Option<CodexTraffic>,
+    /// tcr's CA, which the not-pooled `no-ca` reason names. With [`Self::codex_route`].
+    pub(crate) ca_path: Option<PathBuf>,
+    /// The codex CLI's own login file, when one is on disk: found by its existence alone, never
+    /// read. Only for an empty fleet, whose pane points at it.
+    pub(crate) codex_login: Option<PathBuf>,
+    /// The home folder, which a path a person reads shows as `~`.
+    pub(crate) home: Option<PathBuf>,
+}
+
+/// The facts for `snapshot`, each asked for only when the fleet calls for it, as every Codex
+/// surface is gated: `route` (with the number of Codex rows) and `traffic` only when a Codex row
+/// exists, and `codex_login` only on an empty fleet. So a Claude-only fleet's dashboard stats
+/// no file and computes no route.
+fn dashboard_facts(
+    snapshot: &StatsSnapshot,
+    home: Option<PathBuf>,
+    route: impl FnOnce(usize) -> (Option<CodexRoute>, Option<PathBuf>),
+    traffic: impl FnOnce() -> Option<CodexTraffic>,
+    codex_login: impl FnOnce() -> Option<PathBuf>,
+) -> DashboardFacts {
+    let codex_rows = snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Codex)
+        .count();
+    let (codex_route, ca_path) = if codex_rows > 0 {
+        route(codex_rows)
+    } else {
+        (None, None)
+    };
+    DashboardFacts {
+        codex_route,
+        codex_traffic: if codex_rows > 0 { traffic() } else { None },
+        ca_path,
+        codex_login: if snapshot.accounts.is_empty() {
+            codex_login()
+        } else {
+            None
+        },
+        home,
+    }
+}
+
+/// [`dashboard_facts`] for the serving process: its own listener's report, through the one
+/// in-process route decision (`codex_route::codex_route_in_process`), the CA and whether it is
+/// readable as `tcr status` checks it, its own refusal rings, and codex's login file by its
+/// existence alone.
+fn live_facts(manager: &Manager, snapshot: &StatsSnapshot) -> DashboardFacts {
+    dashboard_facts(
+        snapshot,
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from),
+        |codex_rows| {
+            let ca = crate::mitm::minted_ca_path();
+            let ca_readable = ca.is_file();
+            let route = crate::codex_route::codex_route_in_process(
+                &manager.mitm_status(),
+                manager.proxy_port(),
+                &ca,
+                ca_readable,
+                codex_rows,
+                manager.upstream_for(Provider::Codex),
+            );
+            (Some(route), Some(ca))
+        },
+        || Some(manager.codex_traffic(crate::now_ms())),
+        || {
+            let login = crate::codex_local::codex_login_path();
+            crate::codex_local::login_file_exists(&login).then_some(login)
+        },
+    )
+}
+
 /// Run the dashboard until the user quits (`q` or `Ctrl-C`). Returns once the
 /// terminal has been restored by [`TerminalGuard`]'s drop.
 pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
+    run_loop(manager, None).await
+}
+
+/// [`run`] with `facts` fixed for the whole run instead of read from this process each tick:
+/// `tcr demo`, whose fake fleet must show none of this machine's MITM state, CA, codex login
+/// or home folder.
+pub(crate) async fn run_with_facts(manager: Arc<Manager>, facts: DashboardFacts) -> io::Result<()> {
+    run_loop(manager, Some(facts)).await
+}
+
+async fn run_loop(manager: Arc<Manager>, fixed_facts: Option<DashboardFacts>) -> io::Result<()> {
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    // A DISPLAY row of `drawn`, the table the last frame drew.
     let mut selected: usize = 0;
+    let mut drawn: Vec<DrawnRow> = Vec::new();
     // The most recent "that keypress did not stick" warning, if it is still fresh.
     let mut notice: Option<Notice> = None;
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let snapshot = manager.snapshot(OffsetDateTime::now_utc());
-                selected = clamp_selected(selected, snapshot.accounts.len());
+                let now = OffsetDateTime::now_utc();
+                let snapshot = manager.snapshot(now);
+                let facts = match &fixed_facts {
+                    Some(facts) => facts.clone(),
+                    None => live_facts(&manager, &snapshot),
+                };
+                // The cursor follows its account into the table this frame draws, and a
+                // key acts through that same table until the next frame replaces it.
+                let next = drawn_rows(&snapshot);
+                selected = reanchor(&drawn, selected, &next);
+                drawn = next;
                 let live = live_notice(
                     &notice,
                     std::time::Instant::now(),
-                    snapshot.accounts.get(selected).map(|a| a.name.as_str()),
+                    drawn.get(selected).map(|row| row.name.as_str()),
                 );
                 repaint(&mut terminal, &SCREEN_DIRTY, |frame| {
-                    render(frame, &snapshot, selected, live);
+                    render_with(frame, &snapshot, selected, live, &facts, now);
                 });
             }
             maybe_event = events.next() => {
@@ -331,7 +545,9 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                         // arms below read `selected`. The 500ms repaint used to be
                         // the only clamp, so a key acting on the selection could
                         // read an index `Down` had already pushed past the end.
-                        selected = next_selection(selected, manager.account_count(), action);
+                        // Against the table on screen, not the manager's count,
+                        // which includes rows deleted from the config.
+                        selected = next_selection(selected, drawn.len(), action);
                         match action {
                             Action::Quit => break,
                             // Moving off a row abandons whatever was said about it.
@@ -343,12 +559,12 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                             // carries the name of the row it is about, so it cannot
                             // be read against a different one.
                             Action::Disable | Action::Enable => {
-                                let disabled = action == Action::Disable;
-                                let account = manager.account_name(selected);
-                                notice = manager
-                                    .set_disabled(selected, disabled)
-                                    .warning(disabled)
-                                    .map(|text| Notice::new(text, account));
+                                notice = toggle(
+                                    &manager,
+                                    &drawn,
+                                    selected,
+                                    action == Action::Disable,
+                                );
                             }
                             // Asked for by hand: the user can see damage we could
                             // not detect. Consumed by the next tick.
@@ -439,9 +655,30 @@ fn accounts_title(shown: u16, total: u16) -> String {
 }
 
 /// Paint the whole frame: accounts table on top, sessions pane in the middle,
-/// request log below.
+/// request log below. No facts beyond the snapshot, at the clock's now: see
+/// [`render_with`], which the run loop draws through with the facts it read.
+#[cfg(test)]
 fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize, notice: Option<&str>) {
-    let now = OffsetDateTime::now_utc();
+    render_with(
+        frame,
+        snapshot,
+        selected,
+        notice,
+        &DashboardFacts::default(),
+        OffsetDateTime::now_utc(),
+    );
+}
+
+/// [`render`], with the facts the run loop read this tick and the instant it read them at.
+/// Draws only: it touches neither the filesystem nor the clock.
+fn render_with(
+    frame: &mut Frame,
+    snapshot: &StatsSnapshot,
+    selected: usize,
+    notice: Option<&str>,
+    facts: &DashboardFacts,
+    now: OffsetDateTime,
+) {
     let area = frame.area();
     // A single-row fleet banner sits above everything — the fleet aggregate the
     // per-row table can't show (how many accounts are actually in rotation, and
@@ -460,7 +697,7 @@ fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize, notice: 
             Constraint::Min(0),
         ])
         .split(area);
-    render_fleet_banner(frame, outer[0], snapshot, now);
+    render_fleet_banner(frame, outer[0], snapshot, facts, now);
     if let Some(text) = notice {
         render_notice(frame, outer[1], text);
     }
@@ -469,7 +706,7 @@ fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize, notice: 
     // thing clipped. SESSIONS absorbs the vertical slack (grows when the terminal
     // is tall); the recent-log lives in whatever remains, so it shrinks/vanishes
     // before any account row is dropped.
-    let acct_h = account_area_height(body.height, snapshot.accounts.len() as u16);
+    let acct_h = account_area_height(body.height, accounts_pane_rows(snapshot, facts));
     let rest = body.height.saturating_sub(acct_h);
     let log_h = rest.saturating_sub(SESSIONS_MIN).min(9);
     let sessions_h = rest.saturating_sub(log_h);
@@ -481,9 +718,29 @@ fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize, notice: 
             Constraint::Length(log_h),
         ])
         .split(body);
-    render_accounts(frame, chunks[0], snapshot, selected, now);
+    render_accounts_with(frame, chunks[0], snapshot, selected, facts, now);
     render_sessions(frame, chunks[1], snapshot, now);
     render_log(frame, chunks[2], snapshot, now);
+}
+
+/// The rows the accounts pane holds besides its title, header and bottom border: one per
+/// account, and in a fleet of both providers one more for the divider between them, so a
+/// divider never costs an account its row. An empty fleet with a codex login on disk holds the
+/// two lines that point at it.
+fn accounts_pane_rows(snapshot: &StatsSnapshot, facts: &DashboardFacts) -> u16 {
+    let rows = snapshot.accounts.len() as u16;
+    if rows == 0 && facts.codex_login.is_some() {
+        2
+    } else if holds(snapshot, Provider::Anthropic) && holds(snapshot, Provider::Codex) {
+        rows + 1
+    } else {
+        rows
+    }
+}
+
+/// Does the fleet hold an account of `provider`, in any state?
+fn holds(snapshot: &StatsSnapshot, provider: Provider) -> bool {
+    snapshot.accounts.iter().any(|a| a.provider == provider)
 }
 
 /// One row per account is the wrong altitude for "is the whole fleet up?" — the
@@ -504,6 +761,15 @@ struct FleetStatus {
 /// gates selection honours. When none are, the soonest known `free_at` names the
 /// first account to return. Pure and terminal-free so it can be unit-tested.
 fn fleet_status(accounts: &[AccountSnapshot], now: OffsetDateTime) -> FleetStatus {
+    fleet_status_of(accounts, now)
+}
+
+/// [`fleet_status`] over any set of rows, so the banner can take one per provider.
+fn fleet_status_of<'a>(
+    accounts: impl IntoIterator<Item = &'a AccountSnapshot>,
+    now: OffsetDateTime,
+) -> FleetStatus {
+    let accounts: Vec<&AccountSnapshot> = accounts.into_iter().collect();
     let total = accounts.len();
     let eligible = accounts
         .iter()
@@ -525,34 +791,189 @@ fn fleet_status(accounts: &[AccountSnapshot], now: OffsetDateTime) -> FleetStatu
     }
 }
 
-/// The single-row fleet banner: `FLEET n/total eligible`, turning red with a
-/// `· next free <account> in <rel>` (or `· next free unknown`) tail the moment no
-/// account is in rotation — the fleet-exhausted client-facing 429's honest mirror.
+/// The single-row fleet banner: how many accounts are in rotation, of how many, and the moment
+/// none are, which one returns first and when, in red.
+///
+/// It mirrors the 429 a client gets when nothing can serve it, so it counts the accounts that
+/// client could get. A Claude request is served only by Claude accounts and a Codex request only
+/// by Codex ones, and each provider's 429 counts its own, so a fleet holding both gets one
+/// segment per provider (`CLAUDE 1/3 eligible │ CODEX 2/4 eligible`), each with its own count,
+/// its own next-free account and its own alarm: one count over both would show a spent Claude
+/// fleet green because a Codex account was ready. A fleet of one provider keeps one segment,
+/// and a Claude-only fleet's is the `FLEET` banner it always had. See [`fleet_banner_line`].
 fn render_fleet_banner(
     frame: &mut Frame,
     area: Rect,
     snapshot: &StatsSnapshot,
+    facts: &DashboardFacts,
     now: OffsetDateTime,
 ) {
-    let status = fleet_status(&snapshot.accounts, now);
-    let mut text = format!("FLEET {}/{} eligible", status.eligible, status.total);
+    frame.render_widget(
+        Paragraph::new(fleet_banner_line(snapshot, facts, now, area.width)),
+        area,
+    );
+}
+
+/// How much of its next-free tail a banner segment carries. The fitting steps shorten every
+/// segment's tail together.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// ` · next free {name} in {rel}`.
+    Named,
+    /// ` · next free in {rel}`.
+    Short,
+    /// None at all.
+    Dropped,
+}
+
+/// One segment's text: `{label} {ready}/{total} eligible`, and when none is ready its next-free
+/// tail, `unknown` when no account has a known free time. A fleet with no Codex account has
+/// one segment, labelled `FLEET`.
+fn segment_text(label: &str, status: &FleetStatus, tail: Tail) -> String {
+    let mut text = format!("{label} {}/{} eligible", status.eligible, status.total);
     if status.eligible == 0 {
-        match status.next_free {
-            Some((name, delta)) => {
-                text.push_str(&format!(" · next free {name} in {}", rel(delta)));
+        match (&status.next_free, tail) {
+            (_, Tail::Dropped) => {}
+            (Some((name, delta)), Tail::Named) => {
+                text.push_str(&format!(" · next free {name} in {}", rel(*delta)));
             }
-            None => text.push_str(" · next free unknown"),
+            (Some((_, delta)), Tail::Short) => {
+                text.push_str(&format!(" · next free in {}", rel(*delta)));
+            }
+            (None, _) => text.push_str(" · next free unknown"),
         }
     }
-    // The alarm style when the fleet is down (0 eligible); a calm green otherwise.
-    let style = if status.eligible == 0 {
+    text
+}
+
+/// A segment's style: the alarm when none of its accounts is ready, a calm green otherwise.
+fn segment_style(status: &FleetStatus) -> Style {
+    if status.eligible == 0 {
         alarm_style()
     } else {
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Why codex is not pooled, in the banner's few words, keyed on the route's code: the decision
+/// `tcr status` and `tcr run --codex` word in full. `None` when it is pooled, and for a code the
+/// in-process route never gives (it is this process, so it always answers, with its own
+/// listener, and the dashboard asks only while it holds a Codex account).
+fn not_pooled_reason(route: &CodexRoute, ca_path: Option<&std::path::Path>) -> Option<String> {
+    if route.pooled {
+        return None;
+    }
+    Some(match route.code.as_deref()? {
+        crate::codex_route::JS_LEAF => "JS leaf covers api.anthropic.com only".to_string(),
+        crate::codex_route::MITM_OFF => "MITM off (TLS material failed to load)".to_string(),
+        crate::codex_route::LEAF_MISSING_HOST => "leaf does not cover chatgpt.com".to_string(),
+        crate::codex_route::NO_CA => match ca_path {
+            Some(ca) => format!("no readable CA at {}", ca.display()),
+            // The route's own reason is the same sentence, with the path it checked.
+            None => route.reason.clone()?,
+        },
+        crate::codex_route::UNKNOWN_LEAF => "leaf state unknown".to_string(),
+        _ => return None,
+    })
+}
+
+/// The fleet banner as one line, fitted to `width` chars. See [`render_fleet_banner`].
+///
+/// A fleet with no Codex account draws the one `FLEET` segment it always had, whatever the width:
+/// the fitting below never runs for it. An empty fleet with a codex login on disk reads `FLEET
+/// 0/0 eligible`, dim, since nothing is down; there is nothing yet.
+///
+/// A fleet holding Codex accounts gets a segment per provider, and the CODEX segment carries what
+/// tcr knows about codex, each only while it holds: why codex is not pooled, how many Codex
+/// requests tcr refused in the last ten minutes, and how many it relayed unpooled. When that does
+/// not fit, the least urgent words go first: the unpooled count, then the refused count, then
+/// the names in every next-free tail, then the tails. Last, the not-pooled reason is cut, with a
+/// visible `…`, to the room left. The counts and ` · not pooled: ` always stay.
+fn fleet_banner_line(
+    snapshot: &StatsSnapshot,
+    facts: &DashboardFacts,
+    now: OffsetDateTime,
+    width: u16,
+) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let yellow = Style::default().fg(Color::Yellow);
+    if !holds(snapshot, Provider::Codex) {
+        if snapshot.accounts.is_empty() && facts.codex_login.is_some() {
+            return Line::from(Span::styled("FLEET 0/0 eligible", dim));
+        }
+        let status = fleet_status(&snapshot.accounts, now);
+        return Line::from(Span::styled(
+            segment_text("FLEET", &status, Tail::Named),
+            segment_style(&status),
+        ));
+    }
+
+    let of = |provider: Provider| {
+        fleet_status_of(
+            snapshot.accounts.iter().filter(|a| a.provider == provider),
+            now,
+        )
     };
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+    let claude = holds(snapshot, Provider::Anthropic).then(|| of(Provider::Anthropic));
+    let codex = of(Provider::Codex);
+    let reason = facts
+        .codex_route
+        .as_ref()
+        .and_then(|route| not_pooled_reason(route, facts.ca_path.as_deref()));
+    let refused = facts.codex_traffic.as_ref().map_or(0, |t| t.refused_10m);
+    let unpooled = facts.codex_traffic.as_ref().map_or(0, |t| t.unpooled_10m);
+    let spans = |tail: Tail, with_refused: bool, with_unpooled: bool, reason: Option<&str>| {
+        let mut spans = Vec::new();
+        if let Some(claude) = &claude {
+            spans.push(Span::styled(
+                segment_text("CLAUDE", claude, tail),
+                segment_style(claude),
+            ));
+            spans.push(Span::styled(" │ ", dim));
+        }
+        spans.push(Span::styled(
+            segment_text("CODEX", &codex, tail),
+            segment_style(&codex),
+        ));
+        if let Some(reason) = reason {
+            spans.push(Span::styled(format!(" · not pooled: {reason}"), yellow));
+        }
+        if with_refused && refused > 0 {
+            spans.push(Span::styled(format!(" · {refused} refused in 10m"), yellow));
+        }
+        if with_unpooled && unpooled > 0 {
+            spans.push(Span::styled(format!(" · {unpooled} unpooled in 10m"), dim));
+        }
+        spans
+    };
+    let chars = |spans: &[Span]| -> usize { spans.iter().map(|s| s.content.chars().count()).sum() };
+    let width = usize::from(width);
+    for (tail, with_refused, with_unpooled) in [
+        (Tail::Named, true, true),
+        (Tail::Named, true, false),
+        (Tail::Named, false, false),
+        (Tail::Short, false, false),
+        (Tail::Dropped, false, false),
+    ] {
+        let line = spans(tail, with_refused, with_unpooled, reason.as_deref());
+        if chars(&line) <= width {
+            return Line::from(line);
+        }
+    }
+    match reason {
+        Some(reason) => {
+            let room = width.saturating_sub(chars(&spans(Tail::Dropped, false, false, Some(""))));
+            Line::from(spans(
+                Tail::Dropped,
+                false,
+                false,
+                Some(&truncate(&reason, room)),
+            ))
+        }
+        None => Line::from(spans(Tail::Dropped, false, false, None)),
+    }
 }
 
 /// The one style for "this needs you NOW", shared by the two rows that raise an
@@ -632,6 +1053,23 @@ const FULL_COLUMNS: [&str; 14] = [
 /// * `Err` (4) — the decayed in-band SSE error count, or `-`.
 const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 22, 27, 15, 6, 8, 7, 8, 6, 4];
 
+/// The Account column's width: the Full layout's first column, which the
+/// Compact layout reuses, so a name cell can be fitted to it once — see
+/// [`codex_name_cell`].
+const ACCOUNT_COLUMN_WIDTH: u16 = FULL_COLUMN_WIDTHS[0];
+
+/// What the Account column leaves a name and its plan after the 2-cell marker.
+const NAME_ROOM: usize = ACCOUNT_COLUMN_WIDTH as usize - 2;
+
+/// The fewest characters of a name's head a cut may leave beside the plan. Fewer do not say
+/// whose login the row is, so the plan gives way to the name instead.
+const MIN_NAME_HEAD: usize = 3;
+
+/// The usage windows a Codex row's `quota_windows` can list, by the status wire's names
+/// (`quota::CodexWindows::wire_names`).
+const FIVE_HOUR_WINDOW: &str = "fiveHour";
+const SEVEN_DAY_WINDOW: &str = "sevenDay";
+
 /// The narrowest terminal width that still fits the full 14-column table without
 /// the constraint solver clipping a column. Kept a literal with the arithmetic
 /// shown so a future column edit must update it *consciously* rather than
@@ -664,11 +1102,104 @@ fn accounts_layout(width: u16) -> AccountsLayout {
     }
 }
 
-/// The accounts table. Responsive: [`AccountsLayout::Full`] renders all 14
-/// columns; [`AccountsLayout::Compact`] (below [`FULL_LAYOUT_MIN_WIDTH`]) drops
-/// Probe/Cache and renders the quota buckets as bar-less percentages so the
-/// utilization numbers stay visible on a narrow pane instead of being silently
-/// clipped by the constraint solver.
+/// The Account cell: the selection marker, the name, and the plan dim beside it.
+///
+/// An Anthropic row is drawn exactly as it always was, its name and plan clipped by the column.
+/// A Codex row is fitted to the column by [`codex_name_cell`] instead, because its name says
+/// which seat of a login it is at the END (`/codex`, `/codex-2`), the part a clip would cut.
+fn account_name_cell(marker: &str, account: &AccountSnapshot) -> Cell<'static> {
+    let (name, plan) = match account.provider {
+        Provider::Anthropic => (account.name.clone(), account.plan_label()),
+        Provider::Codex => codex_name_cell(&account.name, short_plan(account).as_deref()),
+    };
+    let text = format!("{marker}{name}");
+    match plan {
+        Some(plan) => Cell::from(Line::from(vec![
+            Span::raw(text),
+            Span::styled(
+                format!(" {plan}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])),
+        None => Cell::from(text),
+    }
+}
+
+/// A Codex row's plan, short: its label without the leading `ChatGPT ` (`Pro`, `Plus`,
+/// `Team`, `Business`). The section already says these are ChatGPT accounts, and the six
+/// characters are what the name needs.
+fn short_plan(account: &AccountSnapshot) -> Option<String> {
+    account
+        .plan_label()
+        .map(|label| match label.strip_prefix("ChatGPT ") {
+            Some(short) => short.to_string(),
+            None => label,
+        })
+}
+
+/// A Codex row's name fitted to the [`NAME_ROOM`] cells after the marker, beside its short
+/// plan: the name's text, and the plan to draw dim after it, or `None` when it gave way.
+///
+/// The name gets `NAME_ROOM` less the plan and its space. A name that fits is drawn whole. One
+/// that does not keeps its trailing `/suffix` whole, since that tells two seats of one login
+/// apart, and its head is cut with `…` (`bob@e…/codex`); a name with no `/` is cut at its end
+/// ([`truncate`]). When the cut would leave fewer than [`MIN_NAME_HEAD`] characters of the head,
+/// the plan is dropped and the name gets the whole room, and a name that still cannot keep that
+/// much of its head is cut at its end.
+fn codex_name_cell(name: &str, short_plan: Option<&str>) -> (String, Option<String>) {
+    if let Some(plan) = short_plan {
+        let room = NAME_ROOM.saturating_sub(1 + plan.chars().count());
+        if let Some(text) = fit_name(name, room) {
+            return (text, Some(plan.to_string()));
+        }
+    }
+    (cut_name(name, NAME_ROOM), None)
+}
+
+/// A Codex account's `name` in `room` cells: [`fit_name`], or a plain [`truncate`] when the
+/// suffix would leave too little of the head to read.
+fn cut_name(name: &str, room: usize) -> String {
+    fit_name(name, room).unwrap_or_else(|| truncate(name, room))
+}
+
+/// `name` in `room` cells: whole when it fits, else its trailing `/suffix` kept and its head
+/// cut with `…`, or `None` when that leaves fewer than [`MIN_NAME_HEAD`] head characters. A
+/// name with no `/` has an empty suffix, so this is [`truncate`] for it.
+fn fit_name(name: &str, room: usize) -> Option<String> {
+    if name.chars().count() <= room {
+        return Some(name.to_string());
+    }
+    let (head, suffix) = name.rfind('/').map_or((name, ""), |at| name.split_at(at));
+    let head_room = room.checked_sub(suffix.chars().count() + 1)?;
+    (head_room >= MIN_NAME_HEAD).then(|| {
+        let head: String = head.chars().take(head_room).collect();
+        format!("{head}…{suffix}")
+    })
+}
+
+/// Does this Codex row's plan lack the usage window `window` ([`FIVE_HOUR_WINDOW`],
+/// [`SEVEN_DAY_WINDOW`])? Only a list the plan reported says so: a row whose windows are not
+/// known yet lacks none, and an Anthropic row never does.
+fn plan_lacks(account: &AccountSnapshot, window: &str) -> bool {
+    match account.provider {
+        Provider::Anthropic => false,
+        Provider::Codex => account
+            .codex
+            .quota_windows
+            .as_ref()
+            .is_some_and(|windows| !windows.iter().any(|w| w == window)),
+    }
+}
+
+/// The cell of a usage window the plan does not have: `none`, dim. Not `—`, which keeps
+/// meaning "not measured yet".
+fn none_cell() -> Cell<'static> {
+    Cell::from("none").style(Style::default().add_modifier(Modifier::DIM))
+}
+
+/// The accounts pane with no facts beyond the snapshot. See [`render_accounts_with`], which
+/// [`render_with`] draws through.
+#[cfg(test)]
 fn render_accounts(
     frame: &mut Frame,
     area: Rect,
@@ -676,144 +1207,279 @@ fn render_accounts(
     selected: usize,
     now: OffsetDateTime,
 ) {
-    let layout = accounts_layout(area.width);
+    render_accounts_with(
+        frame,
+        area,
+        snapshot,
+        selected,
+        &DashboardFacts::default(),
+        now,
+    );
+}
 
-    let header = match layout {
+/// The rows a mixed pane spends on anything but accounts: its title border, the column
+/// header, the divider between the two sections, and the bottom border.
+const MIXED_ACCOUNTS_CHROME: u16 = ACCOUNTS_CHROME + 1;
+
+/// The border of the Codex section in a mixed pane. Its top is the divider: drawn as part of
+/// the border, it costs one row and reads as one pane split in two, where a second block would
+/// cost two and read as two panes.
+const DIVIDER: symbols::border::Set = symbols::border::Set {
+    top_left: symbols::line::VERTICAL_RIGHT,
+    top_right: symbols::line::VERTICAL_LEFT,
+    ..symbols::border::PLAIN
+};
+
+/// A section's title: ` {label} ({total}) `, or ` {label} ({shown}/{total} ▼) ` when rows are
+/// clipped, as [`accounts_title`] reads for a pane of one provider.
+fn section_title(label: &str, shown: u16, total: u16) -> String {
+    if shown >= total {
+        format!(" {label} ({total}) ")
+    } else {
+        format!(" {label} ({shown}/{total} ▼) ")
+    }
+}
+
+/// The accounts table. Responsive: [`AccountsLayout::Full`] renders all 14
+/// columns; [`AccountsLayout::Compact`] (below [`FULL_LAYOUT_MIN_WIDTH`]) drops
+/// Probe/Cache and renders the quota buckets as bar-less percentages so the
+/// utilization numbers stay visible on a narrow pane instead of being silently
+/// clipped by the constraint solver.
+///
+/// One pane, in two sections when the fleet holds both providers: the Claude rows under the
+/// pane's title and the column header, then a divider drawn into the border, ` codex (n) `,
+/// and the Codex rows, in columns that line up with the ones above. Each section marks the
+/// account serving its own provider. When the rows do not fit, [`split_rows`] decides how many
+/// each section keeps. A fleet of one provider is one section: a Claude-only pane is exactly
+/// the pane it always was, and a Codex-only one is titled as such.
+///
+/// `selected` is a DISPLAY row, an index into [`display_order`].
+fn render_accounts_with(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &StatsSnapshot,
+    selected: usize,
+    facts: &DashboardFacts,
+    now: OffsetDateTime,
+) {
+    let layout = accounts_layout(area.width);
+    let order = display_order(snapshot);
+    let first_codex = order
+        .iter()
+        .position(|&pos| match snapshot.accounts[pos].provider {
+            Provider::Anthropic => false,
+            Provider::Codex => true,
+        })
+        .unwrap_or(order.len());
+    let (claude, codex) = order.split_at(first_codex);
+    let under_cursor = key_target(&order, selected).map(|pos| &snapshot.accounts[pos]);
+    // The pane's bottom border is the last block's, whichever path draws it.
+    let hint =
+        under_cursor.and_then(|account| relogin_hint(account, area.width, facts.home.as_deref()));
+
+    if claude.is_empty() || codex.is_empty() {
+        // Rows that actually fit = panel height minus header + 2 borders, clamped to
+        // the pool size. When `shown < total` the title flags the clip so a hidden
+        // account is never silent.
+        let total = order.len() as u16;
+        let shown = area.height.saturating_sub(ACCOUNTS_CHROME).min(total);
+        let title = if codex.is_empty() {
+            accounts_title(shown, total)
+        } else {
+            section_title("tcr · accounts · codex", shown, total)
+        };
+        let mut block = Block::default().borders(Borders::ALL).title(title);
+        if let Some(hint) = hint {
+            block = block.title_bottom(hint);
+        }
+        let table = Table::new(
+            section_rows(snapshot, &order, 0, selected, layout, now),
+            accounts_widths(layout),
+        )
+        .header(accounts_header(layout))
+        .block(block);
+        frame.render_widget(table, area);
+        if let (true, Some(login)) = (order.is_empty(), &facts.codex_login) {
+            render_codex_login_hint(frame, area, login, facts.home.as_deref());
+        }
+        return;
+    }
+
+    let (claude_shown, codex_shown) = split_rows(
+        area.height.saturating_sub(MIXED_ACCOUNTS_CHROME),
+        claude.len() as u16,
+        codex.len() as u16,
+        under_cursor.is_some_and(|account| match account.provider {
+            Provider::Anthropic => false,
+            Provider::Codex => true,
+        }),
+    );
+    // The Claude section takes its title, the header and its rows; the Codex section takes
+    // the rest of the pane, so its bottom border is the pane's.
+    let claude_area = Rect {
+        height: area.height.min(2 + claude_shown),
+        ..area
+    };
+    let codex_area = Rect {
+        y: area.y + claude_area.height,
+        height: area.height - claude_area.height,
+        ..area
+    };
+    let claude_table = Table::new(
+        section_rows(
+            snapshot,
+            &claude[..usize::from(claude_shown)],
+            0,
+            selected,
+            layout,
+            now,
+        ),
+        accounts_widths(layout),
+    )
+    .header(accounts_header(layout))
+    .block(
+        Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .title(section_title(
+                "tcr · accounts · claude",
+                claude_shown,
+                claude.len() as u16,
+            )),
+    );
+    frame.render_widget(claude_table, claude_area);
+    let codex_table = Table::new(
+        section_rows(
+            snapshot,
+            &codex[..usize::from(codex_shown)],
+            claude.len(),
+            selected,
+            layout,
+            now,
+        ),
+        accounts_widths(layout),
+    )
+    .block({
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(DIVIDER)
+            .title(section_title("codex", codex_shown, codex.len() as u16));
+        match hint {
+            Some(hint) => block.title_bottom(hint),
+            None => block,
+        }
+    });
+    frame.render_widget(codex_table, codex_area);
+}
+
+/// The hint the pane's bottom border carries while the cursor is on a signed-out Codex row:
+/// ` {name} needs re-login: {why} — tcr login --codex --account {name} `, in DIM. `None` on
+/// any other row.
+///
+/// The name and the command are what a person acts on, so they always stay whole: the why is
+/// cut, with a visible `…`, to the room `width` leaves after them, the two corners and the
+/// title's two spaces. With fewer than two cells left for it, or no recorded login error to
+/// word, the `: {why}` part is left out.
+fn relogin_hint(
+    account: &AccountSnapshot,
+    width: u16,
+    home: Option<&std::path::Path>,
+) -> Option<Line<'static>> {
+    match account.provider {
+        Provider::Anthropic => return None,
+        Provider::Codex => {}
+    }
+    if account.gate != GateReason::Login {
+        return None;
+    }
+    let name = &account.name;
+    let lead = format!("{name} needs re-login");
+    let command = format!(" — tcr login --codex --account {name}");
+    let fixed = lead.chars().count() + ": ".chars().count() + command.chars().count();
+    let room = usize::from(width).saturating_sub(4).saturating_sub(fixed);
+    let text = match account.relogin_why(home) {
+        Some(why) if room >= 2 => format!(" {lead}: {}{command} ", truncate(&why, room)),
+        _ => format!(" {lead}{command} "),
+    };
+    Some(Line::from(Span::styled(
+        text,
+        Style::default().add_modifier(Modifier::DIM),
+    )))
+}
+
+/// The two lines an empty pane shows under its header when the codex CLI has a login of its
+/// own on this machine: how to add an account of either provider, and where that login is, with
+/// the reminder that `tcr login --codex` gives tcr a login of its own rather than sharing it.
+/// The login is found by its existence alone and never read.
+fn render_codex_login_hint(
+    frame: &mut Frame,
+    area: Rect,
+    login: &std::path::Path,
+    home: Option<&std::path::Path>,
+) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let below_header = Rect {
+        y: inner.y.saturating_add(1),
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let path = crate::stats::short_path(&login.to_string_lossy(), home);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("no accounts — tcr login (Claude) · tcr login --codex (Codex)"),
+            Line::from(Span::styled(
+                format!(
+                    "found a codex login at {path} — tcr login --codex gives tcr a login of its own"
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+        ]),
+        below_header,
+    );
+}
+
+/// How many rows each section of a mixed pane shows, given `available` rows for data: each
+/// keeps `min(rows, 2)`, so neither provider's accounts vanish, and the rest goes first to the
+/// section holding the cursor, then to the other. When even those minimums do not fit, the
+/// cursor's section is filled first, because the row under the cursor is the one a key acts on.
+fn split_rows(available: u16, claude: u16, codex: u16, cursor_in_codex: bool) -> (u16, u16) {
+    // (the cursor's section, the other), and back.
+    let (mine, theirs) = if cursor_in_codex {
+        (codex, claude)
+    } else {
+        (claude, codex)
+    };
+    let (min_mine, min_theirs) = (mine.min(2), theirs.min(2));
+    let (shown_mine, shown_theirs) = if min_mine + min_theirs > available {
+        let shown_mine = mine.min(available);
+        (shown_mine, theirs.min(available - shown_mine))
+    } else {
+        let rest = available - min_mine - min_theirs;
+        let more_mine = (mine - min_mine).min(rest);
+        let more_theirs = (theirs - min_theirs).min(rest - more_mine);
+        (min_mine + more_mine, min_theirs + more_theirs)
+    };
+    if cursor_in_codex {
+        (shown_theirs, shown_mine)
+    } else {
+        (shown_mine, shown_theirs)
+    }
+}
+
+/// The accounts table's bold column header, for `layout`.
+fn accounts_header(layout: AccountsLayout) -> Row<'static> {
+    match layout {
         AccountsLayout::Full => Row::new(FULL_COLUMNS.to_vec()),
         AccountsLayout::Compact => Row::new(vec![
             "Account", "Pri", "Status", "Gate", "5h", "7d", "Fable", "Reqs", "In", "Out", "Last",
         ]),
     }
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(Style::default().add_modifier(Modifier::BOLD))
+}
 
-    let rows: Vec<Row> = snapshot
-        .accounts
-        .iter()
-        .enumerate()
-        .map(|(i, account)| {
-            let is_current = snapshot.current == Some(i);
-            let marker = if is_current { "▶ " } else { "  " };
-            // The weekly quota annotation: an account parked out of rotation on its
-            // cap reads as "near"/"full" (yellow/red), while its Status stays
-            // "active" — the red "error" is reserved for a dead cred. Same pairing
-            // in both layouts (compact keeps the label on the bar-less percentage).
-            let (quota_label, quota_style) = quota_cell(account.quota_state);
-            // Why this account is out of rotation and when it returns — the
-            // per-row half of the fleet banner (`OK` / `5H 47m` / `LOGIN` / …).
-            let (gate_label, gate_style) = gate_chip(account, now);
-            let last_used = fmt_age_opt(account.last_used, now);
-
-            // Columns shared by both layouts, in their shared order.
-            //
-            // The plan rides IN the name cell, dim, rather than taking a column
-            // of its own: it is a fact ABOUT the name — the thing that tells two
-            // identically-named rows apart — and a column would cost width on
-            // every row to say nothing about the fifteen that share a plan.
-            // Absent (not "unknown") for an account that has never been
-            // profiled, matching the plain-text renderer's omitted `plan=`.
-            let name = match tcr_status_wire::plan_label(
-                account.organization_type.as_deref(),
-                account.rate_limit_tier.as_deref(),
-                account.seat_tier.as_deref(),
-            ) {
-                Some(plan) => Cell::from(Line::from(vec![
-                    Span::raw(format!("{marker}{}", account.name)),
-                    Span::styled(
-                        format!(" {plan}"),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                ])),
-                None => Cell::from(format!("{marker}{}", account.name)),
-            };
-            let priority = Cell::from(account.priority.to_string());
-            let status = Cell::from(account.status.clone()).style(status_style(&account.status));
-            let gate = Cell::from(gate_label).style(gate_style);
-            let reqs = Cell::from(account.requests.to_string());
-            let input = Cell::from(fmt_tokens(account.input_tokens));
-            let output = Cell::from(fmt_tokens(account.output_tokens));
-            let last = Cell::from(last_used);
-
-            let cells = match layout {
-                // Full mode: the probe cell, the three 8-cell bars, and the cache
-                // ratio — exactly the pre-responsive column set.
-                AccountsLayout::Full => {
-                    let (probe_label, probe_style) = probe_cell(account, now);
-                    vec![
-                        name,
-                        priority,
-                        status,
-                        gate,
-                        Cell::from(probe_label).style(probe_style),
-                        Cell::from(bar_with_reset(
-                            account.five_hour,
-                            account.five_hour_reset,
-                            now,
-                        )),
-                        Cell::from(format!(
-                            "{}{quota_label}",
-                            bar_with_reset(account.seven_day, account.seven_day_reset, now)
-                        ))
-                        .style(quota_style),
-                        // Model-scoped weekly (the Fable `7d_oi` bucket). Visibility
-                        // only: it never gates shared rotation (`eligible` ignores
-                        // it), so no quota label — the gate chip already reads
-                        // `FABLE-7D` when it parks Fable. `—` until first learned.
-                        Cell::from(bar(account.seven_day_oi)),
-                        reqs,
-                        input,
-                        Cell::from(fmt_cache_ratio(
-                            account.cache_read_tokens,
-                            account.input_tokens,
-                        )),
-                        output,
-                        last,
-                        // Stream failures — in-band SSE `error` events plus streams
-                        // that hit EOF without `message_stop` (decayed count),
-                        // observability only — never a routing input. `-` when none
-                        // observed.
-                        Cell::from(if account.stream_error_count > 0 {
-                            account.stream_error_count.to_string()
-                        } else {
-                            "-".to_string()
-                        }),
-                    ]
-                }
-                // Compact mode: Probe and Cache dropped; each quota bucket becomes a
-                // bare percentage (`pct`) so the number itself is the cell and
-                // survives further squeeze. The 7d bucket keeps its "near"/"full"
-                // label + style, exactly as in full mode.
-                AccountsLayout::Compact => vec![
-                    name,
-                    priority,
-                    status,
-                    gate,
-                    Cell::from(pct(account.five_hour)),
-                    Cell::from(format!("{}{quota_label}", pct(account.seven_day)))
-                        .style(quota_style),
-                    Cell::from(pct(account.seven_day_oi)),
-                    reqs,
-                    input,
-                    output,
-                    last,
-                ],
-            };
-
-            let mut row = Row::new(cells);
-            if account.disabled {
-                row = row.style(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                );
-            }
-            if i == selected {
-                row = row.style(Style::default().add_modifier(Modifier::REVERSED));
-            }
-            row
-        })
-        .collect();
-
-    let widths = match layout {
+/// The accounts table's column widths, for `layout`. One list for every section, so the
+/// columns of a mixed pane line up across its divider.
+fn accounts_widths(layout: AccountsLayout) -> Vec<Constraint> {
+    match layout {
         // Straight from the declared widths, so the table ratatui lays out and the
         // number `FULL_LAYOUT_MIN_WIDTH` is computed from can never be two things.
         AccountsLayout::Full => FULL_COLUMN_WIDTHS
@@ -824,7 +1490,7 @@ fn render_accounts(
         // collapse to bare percentages and Probe/Cache are gone. The stream-error
         // column stays Full-only — Compact is already the narrow-terminal squeeze.
         AccountsLayout::Compact => vec![
-            Constraint::Length(18),
+            Constraint::Length(ACCOUNT_COLUMN_WIDTH),
             Constraint::Length(3),
             Constraint::Length(9),
             Constraint::Length(15),
@@ -839,21 +1505,170 @@ fn render_accounts(
             Constraint::Length(8),
             Constraint::Length(6),
         ],
+    }
+}
+
+/// The table rows of the accounts at `positions` (positions in the snapshot's list), the first
+/// of them display row `first`: the one at `selected` reversed under the cursor.
+fn section_rows(
+    snapshot: &StatsSnapshot,
+    positions: &[usize],
+    first: usize,
+    selected: usize,
+    layout: AccountsLayout,
+    now: OffsetDateTime,
+) -> Vec<Row<'static>> {
+    positions
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| account_row(snapshot, pos, first + i == selected, layout, now))
+        .collect()
+}
+
+/// The table row of the account at position `pos` of the snapshot's list. ▶ marks the account
+/// serving its provider right now ([`StatsSnapshot::serving`]).
+fn account_row(
+    snapshot: &StatsSnapshot,
+    pos: usize,
+    under_cursor: bool,
+    layout: AccountsLayout,
+    now: OffsetDateTime,
+) -> Row<'static> {
+    let account = &snapshot.accounts[pos];
+    let is_current = snapshot.serving(account.provider) == Some(pos);
+    let marker = if is_current { "▶ " } else { "  " };
+    // The weekly quota annotation: an account parked out of rotation on its
+    // cap reads as "near"/"full" (yellow/red), while its Status stays
+    // "active" — the red "error" is reserved for a dead cred. Same pairing
+    // in both layouts (compact keeps the label on the bar-less percentage).
+    let (quota_label, quota_style) = quota_cell(account.quota_state);
+    // Why this account is out of rotation and when it returns — the
+    // per-row half of the fleet banner (`OK` / `5H 47m` / `LOGIN` / …).
+    let (gate_label, gate_style) = gate_chip(account, now);
+    let last_used = fmt_age_opt(account.last_used, now);
+
+    // Columns shared by both layouts, in their shared order.
+    //
+    // The plan rides IN the name cell, dim, rather than taking a column
+    // of its own: it is a fact ABOUT the name — the thing that tells two
+    // identically-named rows apart — and a column would cost width on
+    // every row to say nothing about the fifteen that share a plan.
+    // Absent (not "unknown") for an account that has never been
+    // profiled, matching the plain-text renderer's omitted `plan=`. A
+    // Codex row fits its name and short plan to the column: see
+    // `codex_name_cell`.
+    let name = account_name_cell(marker, account);
+    // A Codex plan may not have a window at all (ChatGPT Pro reports only
+    // its weekly one), and ChatGPT has no model-scoped weekly window, so
+    // a Codex row's Fable cell is blank.
+    let lacks_five_hour = plan_lacks(account, FIVE_HOUR_WINDOW);
+    let lacks_seven_day = plan_lacks(account, SEVEN_DAY_WINDOW);
+    let priority = Cell::from(account.priority.to_string());
+    let status = Cell::from(account.status.clone()).style(status_style(&account.status));
+    let gate = Cell::from(gate_label).style(gate_style);
+    let reqs = Cell::from(account.requests.to_string());
+    let input = Cell::from(fmt_tokens(account.input_tokens));
+    let output = Cell::from(fmt_tokens(account.output_tokens));
+    let last = Cell::from(last_used);
+
+    let cells = match layout {
+        // Full mode: the probe cell, the three 8-cell bars, and the cache
+        // ratio — exactly the pre-responsive column set.
+        AccountsLayout::Full => {
+            let (probe_label, probe_style) = probe_cell(account, now);
+            vec![
+                name,
+                priority,
+                status,
+                gate,
+                Cell::from(probe_label).style(probe_style),
+                if lacks_five_hour {
+                    none_cell()
+                } else {
+                    Cell::from(bar_with_reset(
+                        account.five_hour,
+                        account.five_hour_reset,
+                        now,
+                    ))
+                },
+                if lacks_seven_day {
+                    none_cell()
+                } else {
+                    Cell::from(format!(
+                        "{}{quota_label}",
+                        bar_with_reset(account.seven_day, account.seven_day_reset, now)
+                    ))
+                    .style(quota_style)
+                },
+                // Model-scoped weekly (the Fable `7d_oi` bucket). Visibility
+                // only: it never gates shared rotation (`eligible` ignores
+                // it), so no quota label — the gate chip already reads
+                // `FABLE-7D` when it parks Fable. `—` until first learned.
+                match account.provider {
+                    Provider::Anthropic => Cell::from(bar(account.seven_day_oi)),
+                    Provider::Codex => Cell::from(""),
+                },
+                reqs,
+                input,
+                Cell::from(fmt_cache_ratio(
+                    account.cache_read_tokens,
+                    account.input_tokens,
+                )),
+                output,
+                last,
+                // Stream failures — in-band SSE `error` events plus streams
+                // that hit EOF without `message_stop` (decayed count),
+                // observability only — never a routing input. `-` when none
+                // observed.
+                Cell::from(if account.stream_error_count > 0 {
+                    account.stream_error_count.to_string()
+                } else {
+                    "-".to_string()
+                }),
+            ]
+        }
+        // Compact mode: Probe and Cache dropped; each quota bucket becomes a
+        // bare percentage (`pct`) so the number itself is the cell and
+        // survives further squeeze. The 7d bucket keeps its "near"/"full"
+        // label + style, exactly as in full mode.
+        AccountsLayout::Compact => vec![
+            name,
+            priority,
+            status,
+            gate,
+            if lacks_five_hour {
+                none_cell()
+            } else {
+                Cell::from(pct(account.five_hour))
+            },
+            if lacks_seven_day {
+                none_cell()
+            } else {
+                Cell::from(format!("{}{quota_label}", pct(account.seven_day))).style(quota_style)
+            },
+            match account.provider {
+                Provider::Anthropic => Cell::from(pct(account.seven_day_oi)),
+                Provider::Codex => Cell::from(""),
+            },
+            reqs,
+            input,
+            output,
+            last,
+        ],
     };
 
-    // Rows that actually fit = panel height minus header + 2 borders, clamped to
-    // the pool size. When `shown < total` the title flags the clip so a hidden
-    // account is never silent.
-    let total = snapshot.accounts.len() as u16;
-    let shown = area.height.saturating_sub(ACCOUNTS_CHROME).min(total);
-    render_table(
-        frame,
-        area,
-        header,
-        widths,
-        rows,
-        accounts_title(shown, total),
-    );
+    let mut row = Row::new(cells);
+    if account.disabled {
+        row = row.style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        );
+    }
+    if under_cursor {
+        row = row.style(Style::default().add_modifier(Modifier::REVERSED));
+    }
+    row
 }
 
 /// One row in the sessions pane's account→session tree: either an account
@@ -863,6 +1678,9 @@ enum TreeRow {
     /// total, and the youngest `last_seen` across the group.
     Account {
         name: String,
+        /// The provider of the account the group is pinned to, which decides how its name is
+        /// cut and whether the header carries the ` codex` mark.
+        provider: Provider,
         count: usize,
         requests: u64,
         last_seen: Option<OffsetDateTime>,
@@ -877,6 +1695,9 @@ enum TreeRow {
         /// was held. `None` on the normal case. The session still lives under its
         /// pinned account's header; this only annotates the row.
         diverted_to: Option<String>,
+        /// The session's provider: a Codex session is only ever diverted to another Codex
+        /// account, whose name is cut keeping its `/suffix`.
+        provider: Provider,
     },
     /// The single collapsed aggregate for ALL [`SessionKind::Fallback`] sessions
     /// — those with no pin at all. [`SessionKind::Prefix`] sessions are NOT
@@ -950,6 +1771,8 @@ fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
         let last_seen = members.iter().filter_map(|s| s.last_seen).max();
         rows.push(TreeRow::Account {
             name: account.to_string(),
+            // Every member is pinned to this one account, so they share its provider.
+            provider: members[0].provider,
             count: members.len(),
             requests,
             last_seen,
@@ -963,6 +1786,7 @@ fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
                 // last differs from the one the session is pinned to.
                 diverted_to: (session.last_served_account != session.account)
                     .then(|| session.last_served_account.clone()),
+                provider: session.provider,
             });
         }
     }
@@ -988,6 +1812,12 @@ fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
 /// request during a short hold) keeps its row under its own account and gets a dim
 /// `→<account>` suffix naming where that one request actually went. That is the
 /// honest reading: the pin did not move, so neither does the row.
+///
+/// A Codex account's name is cut keeping its trailing `/suffix`, the part that tells two seats
+/// of one login apart, in its header and in a divert. In a fleet of both providers its header
+/// also carries a dim ` codex` mark after the count, and its name gives the mark the room:
+/// 14 cells instead of 20, so the header still fits the 28-cell column. Claude headers and
+/// diverts are drawn as they always were.
 fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now: OffsetDateTime) {
     let header = Row::new(vec!["Session", "Reqs", "Last"])
         .style(Style::default().add_modifier(Modifier::BOLD));
@@ -999,6 +1829,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
     ];
 
     let age = |seen: Option<OffsetDateTime>| fmt_age_opt(seen, now);
+    let mixed = holds(snapshot, Provider::Anthropic) && holds(snapshot, Provider::Codex);
 
     let capacity = area.height.saturating_sub(3) as usize;
     let rows: Vec<Row> = if snapshot.sessions.is_empty() {
@@ -1013,11 +1844,30 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
             .map(|row| match row {
                 TreeRow::Account {
                     name,
+                    provider,
                     count,
                     requests,
                     last_seen,
                 } => Row::new(vec![
-                    Cell::from(format!("▾ {} · {count}", truncate(&name, 20))),
+                    match (provider, mixed) {
+                        (Provider::Anthropic, _) => {
+                            Cell::from(format!("▾ {} · {count}", truncate(&name, 20)))
+                        }
+                        // 2 + 14 + 4 + 6 = 26 cells, inside the 28-cell column. The mark is a
+                        // secondary fact, so it drops the header's bold.
+                        (Provider::Codex, true) => Cell::from(Line::from(vec![
+                            Span::raw(format!("▾ {} · {count}", cut_name(&name, 14))),
+                            Span::styled(
+                                " codex",
+                                Style::default()
+                                    .add_modifier(Modifier::DIM)
+                                    .remove_modifier(Modifier::BOLD),
+                            ),
+                        ])),
+                        (Provider::Codex, false) => {
+                            Cell::from(format!("▾ {} · {count}", cut_name(&name, 20)))
+                        }
+                    },
                     Cell::from(requests.to_string()),
                     Cell::from(age(last_seen)),
                 ])
@@ -1032,6 +1882,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
                     requests,
                     last_seen,
                     diverted_to,
+                    provider,
                 } => {
                     // Four-space indent nests the session under its PINNED account.
                     let mut spans = vec![Span::raw(format!("    {}", truncate(&id, 10)))];
@@ -1039,8 +1890,12 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
                         // Dim so the row still reads as belonging to its pin: the
                         // session did not move, one request went elsewhere. Widths:
                         // 4 + 10 + 2 + 10 = 26, inside the 28-cell column.
+                        let account = match provider {
+                            Provider::Anthropic => truncate(&account, 10),
+                            Provider::Codex => cut_name(&account, 10),
+                        };
                         spans.push(Span::styled(
-                            format!(" →{}", truncate(&account, 10)),
+                            format!(" →{account}"),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::DIM),
@@ -1082,13 +1937,17 @@ fn render_log(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now: Offs
         .iter()
         .take(capacity)
         .map(|entry| {
+            let path = match entry.provider {
+                Provider::Anthropic => entry.path.clone(),
+                Provider::Codex => codex_log_path(&entry.path),
+            };
             Line::from(vec![
                 Span::styled(
                     format!("{:>3} ", entry.status),
                     Style::default().fg(status_color(entry.status)),
                 ),
                 Span::raw(format!("{:<6} ", entry.method)),
-                Span::raw(format!("{:<24} ", truncate(&entry.path, 24))),
+                Span::raw(format!("{:<24} ", truncate(&path, 24))),
                 Span::styled(entry.account.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw(format!("  {} ago", fmt_age(now - entry.time))),
             ])
@@ -1101,6 +1960,19 @@ fn render_log(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now: Offs
             .title(" recent · q quit · ↑↓/jk select · d/e disable/enable · r redraw "),
     );
     frame.render_widget(log, area);
+}
+
+/// A Codex request's path as the log shows it: its query dropped, and a path of more than two
+/// segments shown as `…/` and its last two (`/backend-api/codex/responses` reads
+/// `…/codex/responses`). The head is the same on every Codex call, and the 24-cell cut used to
+/// take the end, which is the part that tells one call from another.
+fn codex_log_path(path: &str) -> String {
+    let path = path.split('?').next().unwrap_or_default();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        [.., second_last, last] if segments.len() > 2 => format!("…/{second_last}/{last}"),
+        _ => path.to_string(),
+    }
 }
 
 /// An 8-cell utilization bar plus a percentage, or a dash if never learned.
@@ -1184,15 +2056,27 @@ fn quota_cell(state: QuotaState) -> (&'static str, Style) {
 /// The per-row gate chip: WHY this account is out of rotation and WHEN it
 /// returns, mirroring the [`GateReason`] the manager computed and formatting the
 /// `free_at` clear-instant as a compact back-when. `OK`/`OFF` are dim (not a
-/// problem); the two gates that can show no countdown at all — a dead
-/// credential's `LOGIN` and an upstream-`REJECTED` account — are red-bold; every
+/// problem); the gates that can show no countdown at all — a dead
+/// credential's `LOGIN`, an upstream-`REJECTED` account, and on a Codex row a
+/// `REFUSED` with no known end and an `UNREACHABLE` one — are red-bold; every
 /// quota/hold gate is red. Red-bold is about the missing countdown and NOT about
 /// needing a person: this line used to say "the gates only a human clears",
 /// which is true of `LOGIN` and false of `REJECTED` (see the `REJECTED` arm
 /// below, and `Quota::drop_rejection_if_a_window_rolled`). An
 /// unknown clear-instant drops the back-when (a bare
 /// `5H`) — the display never invents a time the manager could not promise.
+///
+/// A Codex row speaks ChatGPT's terms where they differ ([`codex_gate_chip`]); every
+/// other gate it shares with a Claude row reads the same on both.
 fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
+    match account.provider {
+        Provider::Anthropic => {}
+        Provider::Codex => {
+            if let Some(chip) = codex_gate_chip(account, now) {
+                return chip;
+            }
+        }
+    }
     let red = Style::default().fg(Color::Red);
     let dim = Style::default()
         .fg(Color::DarkGray)
@@ -1231,9 +2115,11 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         // Anthropic's own verdict, read from `anthropic-ratelimit-unified-status`
-        // (`Quota::update_from_headers`). Red-bold like LOGIN because it is not a
-        // countdown: no single instant is known at which this account returns, which
-        // is why `account_gate` reports `free_at = None` here.
+        // (`Quota::update_from_headers`). Only a Claude row reaches this arm: a Codex
+        // row's refusal is ChatGPT's, and `codex_gate_chip` draws it REFUSED. Red-bold
+        // like LOGIN because it is not a countdown: no single instant is known at
+        // which this account returns, which is why `account_gate` reports
+        // `free_at = None` here.
         //
         // It is no longer permanent, though, and this comment twice said otherwise.
         // The trap was that `update_from_headers` needs a SERVED response while
@@ -1266,6 +2152,62 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         // key holding the whole group back — so it wears the same dim treatment
         // rather than the red of a gate nobody chose.
         GateReason::Parked => ("PARKED".to_string(), dim),
+    }
+}
+
+/// The chips a Codex row wears where ChatGPT's terms differ from Anthropic's, or `None` for a
+/// gate both providers read alike (`OK`, `LOGIN`, `OFF`, `PARKED`, a plain rate-limit `HOLD`,
+/// and an upstream 403's own short hold, `REFUSED {n}s`).
+///
+/// - **`REFUSED`** is ChatGPT refusing the account where no full window explains it (credits,
+///   a spend cap): the `Rejected` gate. While a hold counts that refusal down (`Hold`, or
+///   `Refused` when an upstream 403 armed the hold) the chip carries the time left, `REFUSED
+///   {rel}`, in the timed-chip style, and `limit_reached_type` is what tells it from a plain
+///   hold. Not REJECTED, Anthropic's word, because the two clear differently: ChatGPT's refusal
+///   clears when a probe reads the account allowed, or sees one of its windows roll
+///   (`Quota::apply_usage`); Anthropic's only on a probed window roll.
+/// - **`UNREACHABLE`** is a Codex member of a reserved group: a reserved group serves only the
+///   requests that ask for it, and a Codex request carries no group, so nothing reaches the
+///   account. Red, not the dim of PARKED: the operator chose a reservation, not to pause it.
+/// - **A window that ran out** is named by its length, as the plan reported it (`30D`, `5H`),
+///   because a ChatGPT plan's windows are not always five hours and seven days. With no
+///   reported length it reads `5H`/`7D`, as on a Claude row.
+fn codex_gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> Option<(String, Style)> {
+    let red = Style::default().fg(Color::Red);
+    let red_bold = red.add_modifier(Modifier::BOLD);
+    let back = |prefix: String| match account.free_at {
+        Some(f) if f > now => format!("{prefix} {}", rel(f - now)),
+        _ => prefix,
+    };
+    let refused_by_chatgpt = account.codex.limit_reached_type.is_some();
+    Some(match account.gate {
+        GateReason::Rejected => ("REFUSED".to_string(), red_bold),
+        GateReason::Hold | GateReason::Refused if refused_by_chatgpt => match account.free_at {
+            Some(f) if f > now => (format!("REFUSED {}", rel(f - now)), red),
+            _ => ("REFUSED".to_string(), red_bold),
+        },
+        GateReason::Reserved => ("UNREACHABLE".to_string(), red_bold),
+        GateReason::FiveHour => (
+            back(window_label(account.codex.five_hour_window_minutes, "5H")),
+            red,
+        ),
+        GateReason::SevenDay => (
+            back(window_label(account.codex.seven_day_window_minutes, "7D")),
+            red,
+        ),
+        _ => return None,
+    })
+}
+
+/// A usage window's chip prefix from its length in minutes: whole days read `{n}D`, whole hours
+/// `{n}H`, anything else `{n}M`. With no length reported, `fallback`.
+fn window_label(minutes: Option<u32>, fallback: &str) -> String {
+    const DAY: u32 = 24 * 60;
+    match minutes {
+        Some(m) if m > 0 && m % DAY == 0 => format!("{}D", m / DAY),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{}H", m / 60),
+        Some(m) if m > 0 => format!("{m}M"),
+        _ => fallback.to_string(),
     }
 }
 
@@ -1805,6 +2747,7 @@ mod tests {
             last_served_account: account.to_string(),
             requests,
             last_seen: last_seen.map(at),
+            provider: Provider::Anthropic,
             kind: SessionKind::Stable,
         }
     }
@@ -2032,7 +2975,9 @@ mod tests {
     /// banner read — everything else defaulted — for those render tests.
     fn snap_gate(name: &str, gate: GateReason, free_at: Option<OffsetDateTime>) -> AccountSnapshot {
         AccountSnapshot {
+            slot: 0,
             name: name.to_string(),
+            provider: Provider::Anthropic,
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
@@ -2068,6 +3013,7 @@ mod tests {
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage: None,
+            codex: Default::default(),
         }
     }
 
@@ -2228,6 +3174,7 @@ mod tests {
         StatsSnapshot {
             accounts: vec![account],
             current: Some(0),
+            current_by_provider: crate::stats::CurrentByProvider::default(),
             recent: vec![],
             sessions: vec![],
             wire_sessions: vec![],
@@ -2428,6 +3375,1385 @@ mod tests {
         assert!(!text.contains("Cache"), "compact drops the Cache column");
     }
 
+    /// [`snap_gate`] as a Codex account.
+    fn codex_gate(
+        name: &str,
+        gate: GateReason,
+        free_at: Option<OffsetDateTime>,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            provider: Provider::Codex,
+            ..snap_gate(name, gate, free_at)
+        }
+    }
+
+    /// A snapshot of `accounts`, each row's slot its position (no row was deleted), with no
+    /// account serving, no sessions and no log.
+    fn snapshot_of(accounts: Vec<AccountSnapshot>) -> StatsSnapshot {
+        StatsSnapshot {
+            accounts: accounts
+                .into_iter()
+                .enumerate()
+                .map(|(slot, account)| AccountSnapshot { slot, ..account })
+                .collect(),
+            current: None,
+            current_by_provider: crate::stats::CurrentByProvider::default(),
+            recent: vec![],
+            sessions: vec![],
+            wire_sessions: vec![],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+        }
+    }
+
+    /// Draw `snapshot`'s accounts pane at `width` x `height` with display row `selected` under
+    /// the cursor, and return the buffer.
+    fn accounts_buffer(
+        snapshot: &StatsSnapshot,
+        width: u16,
+        height: u16,
+        selected: usize,
+    ) -> Buffer {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_accounts(frame, frame.area(), snapshot, selected, anchor()))
+            .expect("render succeeds");
+        terminal.backend().buffer().clone()
+    }
+
+    /// The row of `rows` that holds `needle`, with its index, or a panic that shows the pane.
+    fn row_holding<'a>(rows: &'a [String], needle: &str) -> (usize, &'a str) {
+        let Some((y, row)) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.contains(needle))
+        else {
+            panic!("no row holds {needle:?}:\n{}", rows.join("\n"));
+        };
+        (y, row.as_str())
+    }
+
+    /// A Codex row keeps the END of its name, where `/codex` and `/codex-2` tell two seats of one
+    /// login apart, and shows its plan short (`Pro`, not `ChatGPT Pro`) beside it. The provider
+    /// tag that used to stand there ate half the name and said nothing the section does not.
+    #[test]
+    fn codex_names_keep_their_suffix_and_plan() {
+        let mut first = codex_gate("alice@example.com/codex", GateReason::Ok, None);
+        first.organization_type = Some("pro".to_string());
+        let mut second = codex_gate("alice@example.com/codex-2", GateReason::Ok, None);
+        second.organization_type = Some("pro".to_string());
+        let snapshot = snapshot_of(vec![first, second]);
+        for width in [FULL_LAYOUT_MIN_WIDTH, 110] {
+            let rows = buffer_rows(&accounts_buffer(&snapshot, width, 8, 0));
+            for start in ["│  alice…/codex Pro ", "│  ali…/codex-2 Pro "] {
+                assert!(
+                    rows.iter().any(|row| row.starts_with(start)),
+                    "no row starts {start:?} at {width} columns:\n{}",
+                    rows.join("\n")
+                );
+            }
+        }
+
+        for (name, plan, text, kept) in [
+            (
+                "bob@example.com/codex",
+                Some("Pro"),
+                "bob@e…/codex",
+                Some("Pro"),
+            ),
+            (
+                "erin@example.com/codex",
+                Some("Team"),
+                "erin…/codex",
+                Some("Team"),
+            ),
+            (
+                "carol@example.com",
+                Some("Pro"),
+                "carol@examp…",
+                Some("Pro"),
+            ),
+            (
+                "jo@example.com",
+                Some("Business"),
+                "jo@exa…",
+                Some("Business"),
+            ),
+            // Fewer than three characters of the head would be left beside the plan, so the
+            // plan gives way and the name gets the whole cell.
+            (
+                "alice@example.com/codex-2",
+                Some("Business"),
+                "alice@e…/codex-2",
+                None,
+            ),
+            ("dana@example.com", None, "dana@example.com", None),
+        ] {
+            assert_eq!(
+                codex_name_cell(name, plan),
+                (text.to_string(), kept.map(str::to_string)),
+                "{name} beside {plan:?}"
+            );
+        }
+    }
+
+    /// The x of `needle`'s first character in `row`, counted in cells.
+    fn cell_x(row: &str, needle: &str) -> u16 {
+        let at = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not in {row:?}"));
+        row[..at].chars().count() as u16
+    }
+
+    /// A plan that reports only its weekly window (ChatGPT Pro) reads `none` in the 5h cell,
+    /// dim: the window does not exist on that plan, which is not the same as not measured yet
+    /// (`—`). The weekly cell is drawn as any other.
+    #[test]
+    fn weekly_only_codex_row_reads_none() {
+        let mut bob = codex_gate("bob@example.com/codex", GateReason::Ok, None);
+        bob.codex.quota_windows = Some(vec!["sevenDay".to_string()]);
+        bob.seven_day = Some(0.34);
+        bob.seven_day_reset = Some(anchor() + TimeDuration::days(4) + TimeDuration::seconds(30));
+        bob.five_hour = None;
+        let snapshot = snapshot_of(vec![bob]);
+
+        let full = accounts_buffer(&snapshot, FULL_LAYOUT_MIN_WIDTH, 6, 0);
+        let rows = buffer_rows(&full);
+        let (y, row) = row_holding(&rows, "bob@");
+        assert!(row.contains("none"), "{row}");
+        assert!(row.contains(&bar(Some(0.34))), "{row}");
+        assert!(
+            !row.contains(&bar(None)),
+            "no cell of a weekly-only row reads as never measured: {row}"
+        );
+        let x = cell_x(row, "none");
+        assert!(
+            full[(x, y as u16)].modifier.contains(Modifier::DIM),
+            "`none` is dim: {:?}",
+            full[(x, y as u16)]
+        );
+
+        let compact = buffer_rows(&accounts_buffer(&snapshot, 110, 6, 0));
+        let (_, row) = row_holding(&compact, "bob@");
+        let after = &row[row.find("none").expect("compact reads none") + "none".len()..];
+        assert!(after.contains(&pct(Some(0.34))), "{row}");
+    }
+
+    /// A plan that reports no usage window at all reads `none` in both window cells. The Fable
+    /// cell is blank on every Codex row: ChatGPT has no model-scoped weekly window.
+    #[test]
+    fn no_window_codex_row_reads_none_none() {
+        let mut jo = codex_gate("jo@example.com", GateReason::Ok, None);
+        jo.codex.quota_windows = Some(vec![]);
+        let snapshot = snapshot_of(vec![jo]);
+
+        let rows = buffer_rows(&accounts_buffer(&snapshot, FULL_LAYOUT_MIN_WIDTH, 6, 0));
+        let header = &rows[1];
+        let (_, row) = row_holding(&rows, "jo@");
+        let cells: Vec<char> = row.chars().collect();
+        let cell = |label: &str, width: usize| {
+            let x = usize::from(cell_x(header, label));
+            cells[x..x + width].iter().collect::<String>()
+        };
+        assert_eq!(cell("5h", 4), "none", "{row}");
+        assert_eq!(cell("7d", 4), "none", "{row}");
+        assert_eq!(cell("Fable", 15).trim(), "", "{row}");
+
+        let compact = buffer_rows(&accounts_buffer(&snapshot, 110, 6, 0));
+        let (_, row) = row_holding(&compact, "jo@");
+        assert!(row.contains("none none"), "{row}");
+    }
+
+    /// The gate chip a Codex row wears speaks ChatGPT's terms. A refusal no full window explains
+    /// is REFUSED, with the time left while a hold counts it down; a window that ran out is named
+    /// by its length; a Codex member of a reserved group is UNREACHABLE. An upstream 403's short
+    /// hold keeps the chip it has on every row. Claude rows keep REJECTED and RESERVED.
+    #[test]
+    fn codex_chips() {
+        let now = anchor();
+        let at = |secs: i64| Some(now + TimeDuration::seconds(secs));
+        let red = Style::default().fg(Color::Red);
+        let red_bold = red.add_modifier(Modifier::BOLD);
+        let refused_by_chatgpt = |gate: GateReason, free_at: Option<OffsetDateTime>| {
+            let mut row = codex_gate("bob@example.com/codex", gate, free_at);
+            row.codex.limit_reached_type = Some("rate_limit_reached".to_string());
+            row
+        };
+        let windowed = |gate: GateReason, minutes: Option<u32>, free_at| {
+            let mut row = codex_gate("bob@example.com/codex", gate, free_at);
+            match gate {
+                GateReason::FiveHour => row.codex.five_hour_window_minutes = minutes,
+                _ => row.codex.seven_day_window_minutes = minutes,
+            }
+            row
+        };
+        let cases: Vec<(&str, AccountSnapshot, &str, Option<Style>)> = vec![
+            (
+                "a ChatGPT refusal no window explains",
+                codex_gate("bob@example.com/codex", GateReason::Rejected, None),
+                "REFUSED",
+                Some(red_bold),
+            ),
+            (
+                "ChatGPT's refusal while its hold counts down",
+                refused_by_chatgpt(GateReason::Hold, at(47 * 60 + 30)),
+                "REFUSED 47m",
+                Some(red),
+            ),
+            (
+                "ChatGPT's refusal with no known end",
+                refused_by_chatgpt(GateReason::Hold, None),
+                "REFUSED",
+                Some(red_bold),
+            ),
+            (
+                "a rate-limit hold that is not a refusal",
+                codex_gate("bob@example.com/codex", GateReason::Hold, at(12)),
+                "HOLD 12s",
+                None,
+            ),
+            (
+                "ChatGPT's refusal under an upstream 403's hold",
+                refused_by_chatgpt(GateReason::Refused, at(107)),
+                "REFUSED 1m",
+                Some(red),
+            ),
+            (
+                "an upstream 403's hold alone",
+                codex_gate("bob@example.com/codex", GateReason::Refused, at(107)),
+                "REFUSED 107s",
+                Some(red),
+            ),
+            (
+                "a Codex member of a reserved group",
+                codex_gate("bob@example.com/codex", GateReason::Reserved, None),
+                "UNREACHABLE",
+                Some(red_bold),
+            ),
+            (
+                "a 30-day window",
+                windowed(GateReason::SevenDay, Some(43_200), at(12 * 86_400 + 30)),
+                "30D 12d",
+                Some(red),
+            ),
+            (
+                "a weekly window of no reported length",
+                windowed(GateReason::SevenDay, None, at(3 * 86_400 + 30)),
+                "7D 3d",
+                Some(red),
+            ),
+            (
+                "a five-hour window",
+                windowed(
+                    GateReason::FiveHour,
+                    Some(300),
+                    at(2 * 3_600 + 59 * 60 + 30),
+                ),
+                "5H 2h59m",
+                Some(red),
+            ),
+            (
+                "Anthropic's own verdict",
+                snap_gate("alice@example.com", GateReason::Rejected, None),
+                "REJECTED",
+                None,
+            ),
+            (
+                "a Claude member of a reserved group",
+                snap_gate("alice@example.com", GateReason::Reserved, None),
+                "RESERVED",
+                None,
+            ),
+            (
+                "an upstream 403's hold on a Claude row",
+                snap_gate("alice@example.com", GateReason::Refused, at(107)),
+                "REFUSED 107s",
+                Some(red),
+            ),
+            (
+                "an upstream 403's hold on a Claude row, no end known",
+                snap_gate("alice@example.com", GateReason::Refused, None),
+                "REFUSED",
+                None,
+            ),
+        ];
+        for (what, row, text, style) in cases {
+            let (label, drawn) = gate_chip(&row, now);
+            assert_eq!(label, text, "{what}");
+            if let Some(style) = style {
+                assert_eq!(drawn, style, "{what}");
+            }
+        }
+    }
+
+    /// The mixed fleet the section tests draw, in rotation order: alice (Claude, slot 0), bob
+    /// (Codex, 1), frank (Claude, 2), dana (Codex, 3). Interleaved, as a config that gained its
+    /// Codex accounts one at a time is.
+    fn interleaved_fleet() -> StatsSnapshot {
+        snapshot_of(vec![
+            snap_gate("alice@example.com", GateReason::Ok, None),
+            codex_gate("bob@example.com/codex", GateReason::Ok, None),
+            snap_gate("frank@example.com", GateReason::Ok, None),
+            codex_gate("dana@example.com", GateReason::Ok, None),
+        ])
+    }
+
+    /// The dashboard draws Claude rows first, then Codex rows, each in rotation order, and maps
+    /// a display row back to the account it draws: the manager's own order is never changed,
+    /// because its indices are what every pin and session holds.
+    #[test]
+    fn display_row_maps_to_rotation_index() {
+        use Provider::{Anthropic as A, Codex as X};
+        let order = display_order_of(&[A, X, A, X]);
+        assert_eq!(order, vec![0, 2, 1, 3]);
+        assert_eq!(display_order_of(&[A, A, A]), vec![0, 1, 2]);
+        assert_eq!(display_order_of(&[X, X]), vec![0, 1]);
+        assert_eq!(key_target(&order, 1), Some(2));
+        assert_eq!(key_target(&order, 9), None);
+
+        let buffer = accounts_buffer(&interleaved_fleet(), FULL_LAYOUT_MIN_WIDTH, 12, 1);
+        let rows = buffer_rows(&buffer);
+        let (frank, _) = row_holding(&rows, "frank@");
+        let (bob, _) = row_holding(&rows, "bob@");
+        assert!(
+            buffer[(1, frank as u16)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "display row 1 is frank's, the second Claude row:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            !buffer[(1, bob as u16)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "bob is rotation index 1, not display row 1"
+        );
+    }
+
+    /// Each section marks the account serving its own provider. One marker for the whole pane
+    /// showed only whichever provider served last, so the account serving the other one
+    /// vanished from the screen every time it did.
+    #[test]
+    fn one_cursor_marker_per_provider() {
+        let mut snapshot = interleaved_fleet();
+        snapshot.current_by_provider = crate::stats::CurrentByProvider {
+            anthropic: Some(2),
+            codex: Some(3),
+        };
+        snapshot.current = Some(3);
+        let rows = buffer_rows(&accounts_buffer(&snapshot, FULL_LAYOUT_MIN_WIDTH, 12, 0));
+        let marked: Vec<&String> = rows.iter().filter(|row| row.starts_with("│▶ ")).collect();
+        assert_eq!(marked.len(), 2, "{}", rows.join("\n"));
+        assert!(marked[0].contains("frank@"), "{}", marked[0]);
+        assert!(marked[1].contains("dana@"), "{}", marked[1]);
+        let divider = rows
+            .iter()
+            .position(|row| row.starts_with('├'))
+            .expect("a mixed pane has a divider");
+        let (frank, _) = row_holding(&rows, "frank@");
+        let (dana, _) = row_holding(&rows, "dana@");
+        assert!(frank < divider && divider < dana, "{}", rows.join("\n"));
+    }
+
+    /// The pane's titles: a mixed fleet's Claude section under the pane title, the Codex
+    /// section under a divider drawn into the border, and a Codex-only pane titled as such. A
+    /// Claude-only pane keeps the title it always had.
+    #[test]
+    fn pane_titles_split_by_provider() {
+        let rows = buffer_rows(&accounts_buffer(
+            &interleaved_fleet(),
+            FULL_LAYOUT_MIN_WIDTH,
+            12,
+            0,
+        ));
+        let pane = rows.join("\n");
+        assert!(
+            rows[0].starts_with("┌ tcr · accounts · claude (2) "),
+            "{pane}"
+        );
+        let divider = rows[1..]
+            .iter()
+            .find(|row| row.starts_with('├'))
+            .unwrap_or_else(|| panic!("no divider:\n{pane}"));
+        assert!(divider.starts_with("├ codex (2) "), "{pane}");
+        assert!(divider.ends_with('┤'), "{pane}");
+        assert!(rows[rows.len() - 1].starts_with('└'), "{pane}");
+
+        let codex_only = snapshot_of(vec![
+            codex_gate("bob@example.com/codex", GateReason::Ok, None),
+            codex_gate("dana@example.com", GateReason::Ok, None),
+        ]);
+        let rows = buffer_rows(&accounts_buffer(&codex_only, FULL_LAYOUT_MIN_WIDTH, 12, 0));
+        assert!(
+            rows[0].starts_with("┌ tcr · accounts · codex (2) "),
+            "{}",
+            rows.join("\n")
+        );
+
+        let claude_only = snapshot_of(vec![
+            snap_gate("alice@example.com", GateReason::Ok, None),
+            snap_gate("frank@example.com", GateReason::Ok, None),
+        ]);
+        let rows = buffer_rows(&accounts_buffer(&claude_only, FULL_LAYOUT_MIN_WIDTH, 12, 0));
+        assert!(
+            rows[0].starts_with("┌ tcr · accounts (2) "),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    /// When the rows do not fit, each section keeps two (or all it has, if fewer), the rest goes
+    /// to the section holding the cursor and then to the other, and a section that cannot keep
+    /// even that is the cursor's to fill first. Each clipped section says so in its title.
+    #[test]
+    fn clipping_keeps_two_rows_per_section_and_gives_the_rest_to_the_cursor() {
+        assert_eq!(split_rows(20, 3, 4, false), (3, 4));
+        assert_eq!(split_rows(6, 5, 5, false), (4, 2));
+        assert_eq!(split_rows(6, 5, 5, true), (2, 4));
+        assert_eq!(split_rows(3, 5, 5, true), (0, 3));
+        assert_eq!(split_rows(5, 1, 9, false), (1, 4));
+
+        let mut accounts: Vec<AccountSnapshot> = ["alice", "erin", "frank"]
+            .iter()
+            .map(|name| snap_gate(&format!("{name}@example.com"), GateReason::Ok, None))
+            .collect();
+        accounts.extend(
+            ["bob", "carol", "dana", "gil", "hal"]
+                .iter()
+                .map(|name| codex_gate(&format!("{name}@example.com/codex"), GateReason::Ok, None)),
+        );
+        // 9 rows: the title, the header, the divider and the bottom border leave 5 for data.
+        // The cursor is on the second Codex row, display row 4.
+        let rows = buffer_rows(&accounts_buffer(
+            &snapshot_of(accounts),
+            FULL_LAYOUT_MIN_WIDTH,
+            9,
+            4,
+        ));
+        let pane = rows.join("\n");
+        assert!(
+            rows[0].starts_with("┌ tcr · accounts · claude (2/3 ▼) "),
+            "{pane}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("├ codex (3/5 ▼) ")),
+            "{pane}"
+        );
+    }
+
+    /// The table a key acts through is the one the screen shows: display row `n` of the last
+    /// frame names its account by slot.
+    #[test]
+    fn the_drawn_row_lookup_is_pure() {
+        let drawn = drawn_rows(&interleaved_fleet());
+        assert_eq!(
+            drawn.get(1),
+            Some(&DrawnRow {
+                idx: 2,
+                name: "frank@example.com".to_string(),
+                provider: Provider::Anthropic,
+            })
+        );
+        assert_eq!(drawn.get(4), None);
+    }
+
+    /// A manager over the inline `accounts` array, with no config file behind it.
+    fn manager_of(accounts: &str) -> Arc<Manager> {
+        let config: crate::config::Config =
+            serde_json::from_str(&format!(r#"{{"accounts": {accounts}}}"#))
+                .expect("the inline test config parses");
+        Manager::with_live_refresher(config, None)
+    }
+
+    /// Each account's name and whether it is benched, as the manager now holds them.
+    fn benched(manager: &Manager) -> Vec<(String, bool)> {
+        manager
+            .snapshot(OffsetDateTime::now_utc())
+            .accounts
+            .into_iter()
+            .map(|a| (a.name, a.disabled))
+            .collect()
+    }
+
+    const ALICE: &str = r#"{"name": "alice@example.com", "accessToken": "at-alice"}"#;
+    const BOB: &str = r#"{"name": "bob@example.com/codex", "provider": "codex", "accountUuid": "22222222-2222-4222-8222-222222222222", "accessToken": "at-bob"}"#;
+    const CAROL: &str = r#"{"name": "carol@example.com/codex", "provider": "codex", "accountUuid": "33333333-3333-4333-8333-333333333333", "accessToken": "at-carol"}"#;
+    const FRANK: &str = r#"{"name": "frank@example.com", "accessToken": "at-frank"}"#;
+
+    /// `d` benches the account under the cursor as the screen drew it, even when the rotation
+    /// grew between the frame and the key. An appended Claude account lands among the Claude
+    /// rows, so every Codex row moves down one: a key mapped through the live order would bench
+    /// whichever account moved into the cursor's place.
+    #[test]
+    fn a_key_acts_on_the_row_drawn_not_a_shifted_one() {
+        let manager = manager_of(&format!("[{ALICE}, {BOB}, {FRANK}]"));
+        let drawn = drawn_rows(&manager.snapshot(OffsetDateTime::now_utc()));
+        let names: Vec<&str> = drawn.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "alice@example.com",
+                "frank@example.com",
+                "bob@example.com/codex"
+            ]
+        );
+        manager.add_account(
+            serde_json::from_str(r#"{"name": "carol@example.com", "accessToken": "at-carol"}"#)
+                .expect("an account"),
+        );
+
+        toggle(&manager, &drawn, 2, true);
+        assert_eq!(
+            benched(&manager),
+            [
+                ("alice@example.com".to_string(), false),
+                ("bob@example.com/codex".to_string(), true),
+                ("frank@example.com".to_string(), false),
+                ("carol@example.com".to_string(), false),
+            ]
+        );
+    }
+
+    /// The cursor stays on its ACCOUNT from one frame to the next. An append in a mixed fleet
+    /// moves the Codex rows down one, and a row deleted above the cursor moves it up one; a
+    /// Claude-only table only ever grows at its end, so there the cursor keeps its row, as it
+    /// always did.
+    #[test]
+    fn the_cursor_follows_its_account_across_an_append() {
+        let row = |idx: usize, name: &str, provider: Provider| DrawnRow {
+            idx,
+            name: name.to_string(),
+            provider,
+        };
+        let alice = row(0, "alice@example.com", Provider::Anthropic);
+        let bob = row(1, "bob@example.com/codex", Provider::Codex);
+        let frank = row(2, "frank@example.com", Provider::Anthropic);
+        let carol = row(3, "carol@example.com", Provider::Anthropic);
+
+        let drawn = [alice.clone(), frank.clone(), bob.clone()];
+        assert_eq!(
+            reanchor(
+                &drawn,
+                2,
+                &[alice.clone(), frank.clone(), carol.clone(), bob.clone()]
+            ),
+            3,
+            "bob moved down one, and the cursor with him"
+        );
+        assert_eq!(
+            reanchor(&drawn, 1, &[frank.clone(), bob.clone()]),
+            0,
+            "alice was deleted above frank, and the cursor stays on frank"
+        );
+        assert_eq!(
+            reanchor(
+                &[alice.clone(), frank.clone()],
+                1,
+                &[alice.clone(), frank.clone(), carol.clone()]
+            ),
+            1,
+            "a Claude-only table grows at its end"
+        );
+        assert_eq!(
+            reanchor(&[], 5, &[alice, frank]),
+            1,
+            "nothing drawn yet: clamped"
+        );
+    }
+
+    /// The notice a refused key raises names the row it was raised for, and a Codex row's
+    /// duplicate notice names the Codex remedy.
+    #[test]
+    fn toggle_notice_names_the_row_and_its_provider() {
+        use crate::manager::DisablePersist;
+        let bob = DrawnRow {
+            idx: 1,
+            name: "bob@example.com/codex".to_string(),
+            provider: Provider::Codex,
+        };
+        let alice = DrawnRow {
+            idx: 0,
+            name: "alice@example.com".to_string(),
+            provider: Provider::Anthropic,
+        };
+
+        let notice = toggle_notice(DisablePersist::Ambiguous, true, Some(&bob))
+            .expect("a duplicate is never saved");
+        assert_eq!(
+            notice.text,
+            "NOT SAVED: two config entries share this Codex login — remove the duplicate \
+             (tcr remove <name>), or re-import it with --name"
+        );
+        assert_eq!(notice.account.as_deref(), Some("bob@example.com/codex"));
+
+        let notice = toggle_notice(DisablePersist::Ambiguous, true, Some(&alice))
+            .expect("a duplicate is never saved");
+        assert_eq!(Some(notice.text), DisablePersist::Ambiguous.warning(true));
+        assert!(notice.text.ends_with("give each its own orgUuid"));
+        assert_eq!(notice.account.as_deref(), Some("alice@example.com"));
+
+        let notice = toggle_notice(DisablePersist::NoSuchAccount, false, None)
+            .expect("no row is never saved");
+        assert_eq!(
+            Some(notice.text),
+            DisablePersist::NoSuchAccount.warning(false)
+        );
+        assert_eq!(notice.account, None);
+
+        assert!(toggle_notice(DisablePersist::Persisted, true, Some(&bob)).is_none());
+    }
+
+    /// What the dashboard asks the process each tick is gated on its fleet, as every Codex
+    /// surface is: a Claude-only fleet asks nothing about codex at all, an empty one asks only
+    /// whether a codex login is on disk, and a fleet holding Codex rows asks for the route with
+    /// their count and never for a login.
+    #[test]
+    fn dashboard_facts_are_gated_on_the_fleet() {
+        let home = Some(PathBuf::from("/Users/example"));
+        let claude_only = snapshot_of(vec![snap_gate("alice@example.com", GateReason::Ok, None)]);
+        let facts = dashboard_facts(
+            &claude_only,
+            home.clone(),
+            |_| panic!("a Claude-only fleet asks for no Codex route"),
+            || panic!("a Claude-only fleet asks for no Codex traffic"),
+            || panic!("a fleet with accounts checks for no codex login"),
+        );
+        assert_eq!(facts.codex_route, None);
+        assert_eq!(facts.ca_path, None);
+        assert_eq!(facts.codex_traffic, None);
+        assert_eq!(facts.codex_login, None);
+        assert_eq!(facts.home, home);
+
+        let login = PathBuf::from("/Users/example/.codex/auth.json");
+        let facts = dashboard_facts(
+            &snapshot_of(vec![]),
+            home.clone(),
+            |_| panic!("an empty fleet asks for no Codex route"),
+            || panic!("an empty fleet asks for no Codex traffic"),
+            || Some(login.clone()),
+        );
+        assert_eq!(facts.codex_login, Some(login));
+
+        let asked = std::cell::Cell::new(None);
+        let ca = PathBuf::from("/Users/example/.config/tcr-ca.pem");
+        let facts = dashboard_facts(
+            &snapshot_of(vec![
+                snap_gate("alice@example.com", GateReason::Ok, None),
+                codex_gate("bob@example.com/codex", GateReason::Ok, None),
+            ]),
+            home,
+            |codex_rows| {
+                asked.set(Some(codex_rows));
+                (
+                    Some(CodexRoute {
+                        pooled: true,
+                        ..Default::default()
+                    }),
+                    Some(ca.clone()),
+                )
+            },
+            || Some(CodexTraffic::default()),
+            || panic!("a fleet with accounts checks for no codex login"),
+        );
+        assert_eq!(asked.get(), Some(1), "asked with its one Codex row");
+        assert!(facts.codex_route.is_some_and(|route| route.pooled));
+        assert_eq!(facts.ca_path, Some(ca));
+        assert_eq!(facts.codex_traffic, Some(CodexTraffic::default()));
+        assert_eq!(facts.codex_login, None);
+    }
+
+    /// A manager over the inline `accounts` array, its config written to a fresh file in the
+    /// temp folder, never a real one.
+    fn manager_on_disk(tag: &str, accounts: &str) -> (Arc<Manager>, PathBuf) {
+        let config: crate::config::Config =
+            serde_json::from_str(&format!(r#"{{"accounts": {accounts}}}"#))
+                .expect("the inline test config parses");
+        let path = std::env::temp_dir().join(format!(
+            "tcr-tui-{tag}-{}-{}.json",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        crate::config::save(&path, &config).expect("write the test config");
+        (
+            Manager::with_live_refresher(config, Some(path.clone())),
+            path,
+        )
+    }
+
+    /// Rewrite the config at `path` to hold only `accounts`, as `tcr remove` does while the
+    /// dashboard runs. The sleep moves the file's mtime, which is what the reload watches.
+    fn rewrite_config(path: &std::path::Path, accounts: &str) {
+        std::thread::sleep(Duration::from_millis(20));
+        let config: crate::config::Config =
+            serde_json::from_str(&format!(r#"{{"accounts": {accounts}}}"#))
+                .expect("the inline test config parses");
+        crate::config::save(path, &config).expect("rewrite the test config");
+    }
+
+    /// A row deleted from the config keeps its slot and leaves the list, so the slot, never the
+    /// position, is what a key acts on, and a frame drawn before the delete cannot reach it.
+    #[test]
+    fn a_key_never_reaches_a_row_deleted_from_the_config() {
+        let (manager, path) =
+            manager_on_disk("deleted-row-key", &format!("[{ALICE}, {BOB}, {FRANK}]"));
+        let before = drawn_rows(&manager.snapshot(OffsetDateTime::now_utc()));
+        let slots = |rows: &[DrawnRow]| -> Vec<(String, usize)> {
+            rows.iter().map(|row| (row.name.clone(), row.idx)).collect()
+        };
+        assert_eq!(
+            slots(&before),
+            [
+                ("alice@example.com".to_string(), 0),
+                ("frank@example.com".to_string(), 2),
+                ("bob@example.com/codex".to_string(), 1),
+            ]
+        );
+
+        rewrite_config(&path, &format!("[{BOB}, {FRANK}]"));
+        let after = drawn_rows(&manager.snapshot(OffsetDateTime::now_utc()));
+        assert_eq!(
+            slots(&after),
+            [
+                ("frank@example.com".to_string(), 2),
+                ("bob@example.com/codex".to_string(), 1),
+            ],
+            "the reload left alice out"
+        );
+
+        toggle(&manager, &after, 1, true);
+        assert_eq!(
+            benched(&manager),
+            [
+                ("bob@example.com/codex".to_string(), true),
+                ("frank@example.com".to_string(), false),
+            ]
+        );
+
+        let notice = toggle(&manager, &before, 0, false);
+        assert_eq!(
+            notice.map(|n| n.text),
+            crate::manager::DisablePersist::NoSuchAccount.warning(false),
+            "a key on a frame drawn before the delete reaches no row"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The serving markers are positions in the list, so a row deleted above the account
+    /// serving codex moves its marker up with it rather than off the screen.
+    #[test]
+    fn one_cursor_marker_per_provider_past_a_deleted_row() {
+        let (manager, path) =
+            manager_on_disk("deleted-row-marker", &format!("[{ALICE}, {BOB}, {CAROL}]"));
+        manager.set_current(0);
+        manager.set_current(2);
+        rewrite_config(&path, &format!("[{ALICE}, {CAROL}]"));
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let names: Vec<&str> = snapshot.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["alice@example.com", "carol@example.com/codex"]);
+
+        let rows = buffer_rows(&accounts_buffer(&snapshot, FULL_LAYOUT_MIN_WIDTH, 10, 0));
+        let marked: Vec<&String> = rows.iter().filter(|row| row.starts_with("│▶ ")).collect();
+        assert_eq!(marked.len(), 2, "{}", rows.join("\n"));
+        assert!(marked[0].contains("alice@"), "{}", marked[0]);
+        assert!(marked[1].contains("carol@"), "{}", marked[1]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The text of `line`, its spans joined.
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The style of the one span of `line` whose text is `text`, or a panic naming the spans.
+    fn span_style(line: &Line, text: &str) -> Style {
+        let Some(span) = line.spans.iter().find(|span| span.content == text) else {
+            panic!("no span reads {text:?}: {:?}", line.spans);
+        };
+        span.style
+    }
+
+    fn green_bold() -> Style {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn dim() -> Style {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+
+    /// The banner gives each provider a segment of its own, counted over its own accounts and
+    /// naming its own next free account, so it says what each client's 429 says: a spent Claude
+    /// fleet is never shown green because a Codex account is ready. Each segment takes its own
+    /// style; a fleet of one provider keeps one segment.
+    #[test]
+    fn fleet_banner_splits_by_provider() {
+        let now = anchor();
+        let at = |secs: i64| Some(now + TimeDuration::seconds(secs));
+        let banner = |accounts: Vec<AccountSnapshot>| {
+            fleet_banner_line(&snapshot_of(accounts), &DashboardFacts::default(), now, 174)
+        };
+
+        let claude_out = banner(vec![
+            snap_gate(
+                "alice@example.com",
+                GateReason::FiveHour,
+                at(2 * 3_600 + 59 * 60 + 30),
+            ),
+            snap_gate(
+                "frank@example.com",
+                GateReason::SevenDay,
+                at(3 * 86_400 + 30),
+            ),
+            snap_gate("erin@example.com", GateReason::Login, None),
+            codex_gate("bob@example.com/codex", GateReason::Ok, None),
+            codex_gate("dana@example.com", GateReason::Ok, None),
+        ]);
+        assert_eq!(
+            line_text(&claude_out),
+            "CLAUDE 0/3 eligible · next free alice@example.com in 2h59m │ CODEX 2/2 eligible"
+        );
+        assert_eq!(
+            span_style(
+                &claude_out,
+                "CLAUDE 0/3 eligible · next free alice@example.com in 2h59m"
+            ),
+            alarm_style()
+        );
+        assert_eq!(span_style(&claude_out, " │ "), dim());
+        assert_eq!(span_style(&claude_out, "CODEX 2/2 eligible"), green_bold());
+
+        let codex_out = banner(vec![
+            snap_gate("alice@example.com", GateReason::Ok, None),
+            snap_gate("frank@example.com", GateReason::Ok, None),
+            codex_gate(
+                "bob@example.com/codex",
+                GateReason::SevenDay,
+                at(4 * 86_400 + 30),
+            ),
+            codex_gate(
+                "carol@example.com",
+                GateReason::SevenDay,
+                at(3 * 86_400 + 30),
+            ),
+        ]);
+        assert_eq!(
+            line_text(&codex_out),
+            "CLAUDE 2/2 eligible │ CODEX 0/2 eligible · next free carol@example.com in 3d"
+        );
+        assert_eq!(span_style(&codex_out, "CLAUDE 2/2 eligible"), green_bold());
+        assert_eq!(
+            span_style(
+                &codex_out,
+                "CODEX 0/2 eligible · next free carol@example.com in 3d"
+            ),
+            alarm_style()
+        );
+
+        let codex_only = banner(vec![
+            codex_gate("bob@example.com/codex", GateReason::Ok, None),
+            codex_gate("dana@example.com", GateReason::Ok, None),
+            codex_gate(
+                "carol@example.com",
+                GateReason::SevenDay,
+                at(3 * 86_400 + 30),
+            ),
+            codex_gate("erin@example.com", GateReason::Login, None),
+        ]);
+        assert_eq!(line_text(&codex_only), "CODEX 2/4 eligible");
+        assert_eq!(span_style(&codex_only, "CODEX 2/4 eligible"), green_bold());
+
+        let both_out = banner(vec![
+            snap_gate(
+                "alice@example.com",
+                GateReason::FiveHour,
+                at(2 * 3_600 + 59 * 60 + 30),
+            ),
+            codex_gate(
+                "bob@example.com/codex",
+                GateReason::FiveHour,
+                at(5 * 60 + 30),
+            ),
+        ]);
+        assert_eq!(
+            line_text(&both_out),
+            "CLAUDE 0/1 eligible · next free alice@example.com in 2h59m │ \
+             CODEX 0/1 eligible · next free bob@example.com/codex in 5m",
+            "each tail names its own provider's account"
+        );
+
+        let claude_only = banner(vec![
+            snap_gate("alice@example.com", GateReason::FiveHour, at(47 * 60 + 30)),
+            snap_gate("frank@example.com", GateReason::Login, None),
+        ]);
+        assert_eq!(
+            claude_only.spans,
+            vec![Span::styled(
+                "FLEET 0/2 eligible · next free alice@example.com in 47m",
+                alarm_style()
+            )],
+            "a Claude-only fleet keeps its one FLEET segment"
+        );
+    }
+
+    /// A fleet of two Claude accounts out and a Codex pool whose two accounts are both spent,
+    /// carol first: the fleet the fitting tests shorten.
+    fn spent_codex_pool() -> StatsSnapshot {
+        let now = anchor();
+        let at = |secs: i64| Some(now + TimeDuration::seconds(secs));
+        snapshot_of(vec![
+            snap_gate("alice@example.com", GateReason::Ok, None),
+            snap_gate("frank@example.com", GateReason::FiveHour, at(3_600 + 30)),
+            snap_gate("erin@example.com", GateReason::Login, None),
+            codex_gate(
+                "bob@example.com/codex",
+                GateReason::SevenDay,
+                at(4 * 86_400 + 30),
+            ),
+            codex_gate(
+                "carol@example.com",
+                GateReason::SevenDay,
+                at(3 * 86_400 + 30),
+            ),
+        ])
+    }
+
+    /// A route that does not pool codex, with `code`.
+    fn not_pooled(code: &str) -> CodexRoute {
+        CodexRoute {
+            pooled: false,
+            code: Some(code.to_string()),
+            reason: Some(format!("the launcher's sentence for {code}")),
+            upstream: None,
+        }
+    }
+
+    /// When codex is not pooled the CODEX segment says why, in a few words keyed on the route's
+    /// code: the same decision `tcr status` words in full.
+    #[test]
+    fn not_pooled_suffix_uses_codex_route() {
+        let snapshot = snapshot_of(vec![codex_gate(
+            "bob@example.com/codex",
+            GateReason::Ok,
+            None,
+        )]);
+        let yellow = Style::default().fg(Color::Yellow);
+        for (code, suffix) in [
+            (
+                "js-leaf",
+                " · not pooled: JS leaf covers api.anthropic.com only",
+            ),
+            (
+                "mitm-off",
+                " · not pooled: MITM off (TLS material failed to load)",
+            ),
+            (
+                "leaf-missing-host",
+                " · not pooled: leaf does not cover chatgpt.com",
+            ),
+            (
+                "no-ca",
+                " · not pooled: no readable CA at /Users/example/.config/tcr-ca.pem",
+            ),
+            ("unknown-leaf", " · not pooled: leaf state unknown"),
+        ] {
+            let facts = DashboardFacts {
+                codex_route: Some(not_pooled(code)),
+                ca_path: Some(PathBuf::from("/Users/example/.config/tcr-ca.pem")),
+                ..DashboardFacts::default()
+            };
+            let line = fleet_banner_line(&snapshot, &facts, anchor(), 174);
+            assert_eq!(
+                line_text(&line),
+                format!("CODEX 1/1 eligible{suffix}"),
+                "{code}"
+            );
+            assert_eq!(span_style(&line, suffix), yellow, "{code}");
+        }
+
+        let pooled = DashboardFacts {
+            codex_route: Some(CodexRoute {
+                pooled: true,
+                ..Default::default()
+            }),
+            ..DashboardFacts::default()
+        };
+        assert_eq!(
+            line_text(&fleet_banner_line(&snapshot, &pooled, anchor(), 174)),
+            "CODEX 1/1 eligible"
+        );
+    }
+
+    /// A banner that does not fit gives up its least urgent words first: the unpooled count,
+    /// then the refused count, then the names in the next-free tails, then the tails. The
+    /// counts themselves always stay.
+    #[test]
+    fn the_banner_drops_unpooled_then_refused_then_shortens_next_free() {
+        let snapshot = spent_codex_pool();
+        let facts = DashboardFacts {
+            codex_traffic: Some(CodexTraffic {
+                refused_10m: 12,
+                unpooled_10m: 3,
+                ..Default::default()
+            }),
+            ..DashboardFacts::default()
+        };
+        let line = |width: u16| fleet_banner_line(&snapshot, &facts, anchor(), width);
+
+        let full = line(116);
+        assert_eq!(
+            line_text(&full),
+            "CLAUDE 1/3 eligible │ CODEX 0/2 eligible · next free carol@example.com in 3d \
+             · 12 refused in 10m · 3 unpooled in 10m"
+        );
+        assert_eq!(
+            span_style(&full, " · 12 refused in 10m"),
+            Style::default().fg(Color::Yellow)
+        );
+        assert_eq!(span_style(&full, " · 3 unpooled in 10m"), dim());
+        assert_eq!(
+            line_text(&line(110)),
+            "CLAUDE 1/3 eligible │ CODEX 0/2 eligible · next free carol@example.com in 3d \
+             · 12 refused in 10m"
+        );
+        assert_eq!(
+            line_text(&line(90)),
+            "CLAUDE 1/3 eligible │ CODEX 0/2 eligible · next free carol@example.com in 3d"
+        );
+        assert_eq!(
+            line_text(&line(70)),
+            "CLAUDE 1/3 eligible │ CODEX 0/2 eligible · next free in 3d"
+        );
+    }
+
+    /// A not-pooled reason is never dropped: when nothing else is left to give, the reason is
+    /// cut, visibly, and ` · not pooled: ` stays whole.
+    #[test]
+    fn not_pooled_reason_is_truncated_visibly() {
+        let facts = DashboardFacts {
+            codex_route: Some(not_pooled("no-ca")),
+            ca_path: Some(PathBuf::from("/Users/example/.config/tcr-ca.pem")),
+            ..DashboardFacts::default()
+        };
+        let line = fleet_banner_line(&spent_codex_pool(), &facts, anchor(), 100);
+        let text = line_text(&line);
+        assert_eq!(
+            text,
+            "CLAUDE 1/3 eligible │ CODEX 0/2 eligible · not pooled: no readable CA at \
+             /Users/example/.config/tcr…"
+        );
+        assert_eq!(text.chars().count(), 100);
+        assert_eq!(
+            span_style(
+                &line,
+                " · not pooled: no readable CA at /Users/example/.config/tcr…"
+            ),
+            Style::default().fg(Color::Yellow)
+        );
+    }
+
+    /// An empty fleet on a Mac where the codex CLI has a login of its own says how to add a
+    /// Codex account, and where that login is, by its existence alone. Its banner is not the
+    /// alarm, since nothing is down: there is nothing yet. Without such a login, the empty
+    /// fleet draws as it always did.
+    #[test]
+    fn empty_fleet_with_codex_login_drops_next_free() {
+        let empty = snapshot_of(vec![]);
+        let facts = DashboardFacts {
+            codex_login: Some(PathBuf::from("/Users/example/.codex/auth.json")),
+            home: Some(PathBuf::from("/Users/example")),
+            ..DashboardFacts::default()
+        };
+        let banner = fleet_banner_line(&empty, &facts, anchor(), 110);
+        assert_eq!(
+            banner.spans,
+            vec![Span::styled("FLEET 0/0 eligible", dim())]
+        );
+
+        let draw = |facts: &DashboardFacts| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(110, 12)).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render_with(frame, &empty, 0, None, facts, anchor()))
+                .expect("render succeeds");
+            terminal.backend().buffer().clone()
+        };
+        let buffer = draw(&facts);
+        let rows = buffer_rows(&buffer);
+        let (y, row) = row_holding(
+            &rows,
+            "no accounts — tcr login (Claude) · tcr login --codex (Codex)",
+        );
+        let x = cell_x(row, "no accounts");
+        assert_eq!(buffer[(x, y as u16)].modifier, Modifier::empty(), "{row}");
+        let (y, row) = row_holding(
+            &rows,
+            "found a codex login at ~/.codex/auth.json — tcr login --codex gives tcr a login of its own",
+        );
+        let x = cell_x(row, "found");
+        assert!(
+            buffer[(x, y as u16)].modifier.contains(Modifier::DIM),
+            "{row}"
+        );
+
+        let without = draw(&DashboardFacts::default());
+        let mut terminal =
+            Terminal::new(TestBackend::new(110, 12)).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render(frame, &empty, 0, None))
+            .expect("render succeeds");
+        assert_eq!(
+            &without,
+            terminal.backend().buffer(),
+            "with no codex login, the empty fleet draws as it always did"
+        );
+    }
+
+    /// A signed-out Codex row under the cursor names, in the pane's bottom border, who needs a
+    /// re-login, why, and the command that does it. The why gives way first: the name and the
+    /// command are what a person copies, so they always stay whole.
+    #[test]
+    fn relogin_hint_keeps_name_and_command() {
+        let fleet = |login_error: Option<&str>| {
+            let mut erin = codex_gate("erin@example.com", GateReason::Login, None);
+            erin.status = "error".to_string();
+            erin.organization_type = Some("team".to_string());
+            erin.codex.login_error = login_error.map(str::to_string);
+            erin.codex.codex_home = Some("/Users/example/.codex".to_string());
+            snapshot_of(vec![
+                codex_gate("bob@example.com", GateReason::Ok, None),
+                erin,
+            ])
+        };
+        let facts = DashboardFacts {
+            home: Some(PathBuf::from("/Users/example")),
+            ..DashboardFacts::default()
+        };
+        let draw = |snapshot: &StatsSnapshot, width: u16, height: u16, selected: usize| {
+            let mut terminal = Terminal::new(TestBackend::new(width, height))
+                .expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| {
+                    render_accounts_with(frame, frame.area(), snapshot, selected, &facts, anchor())
+                })
+                .expect("render succeeds");
+            terminal.backend().buffer().clone()
+        };
+        let bottom = |buffer: &Buffer| buffer_rows(buffer).pop().expect("the pane has rows");
+        // Three rows of data under the title and the header, then the bottom border.
+        let height = 3 + ACCOUNTS_CHROME;
+
+        let reused = fleet(Some("refresh_token_reused"));
+        let narrow = draw(&reused, 110, height, 1);
+        assert_eq!(
+            bottom(&narrow),
+            "└ erin@example.com needs re-login: the codex CLI in ~/.codex… — tcr login --codex --account erin@example.com ┘"
+        );
+        let y = height - 1;
+        for x in 1..109 {
+            assert!(
+                narrow[(x, y)].modifier.contains(Modifier::DIM),
+                "the hint's cell {x} is DIM"
+            );
+        }
+
+        let wide = bottom(&draw(&reused, 174, height, 1));
+        assert!(
+            wide.starts_with(
+                "└ erin@example.com needs re-login: the codex CLI in ~/.codex refreshed this shared login first — tcr login --codex --account erin@example.com "
+            ),
+            "{wide}"
+        );
+        assert!(wide.ends_with('┘'), "{wide}");
+
+        let on_bob = bottom(&draw(&reused, 110, height, 0));
+        assert!(!on_bob.contains("needs re-login"), "{on_bob}");
+
+        let unknown = bottom(&draw(&fleet(None), 110, height, 1));
+        assert!(
+            unknown.starts_with(
+                "└ erin@example.com needs re-login — tcr login --codex --account erin@example.com "
+            ),
+            "{unknown}"
+        );
+        assert!(unknown.ends_with('┘'), "{unknown}");
+
+        // In a fleet of both providers the hint is on the Codex section's border, which is the
+        // pane's bottom one, and only while the cursor is on the signed-out row.
+        let mut mixed = fleet(Some("refresh_token_reused"));
+        mixed
+            .accounts
+            .insert(0, snap_gate("alice@example.com", GateReason::Ok, None));
+        let mixed = snapshot_of(mixed.accounts);
+        let height = 3 + MIXED_ACCOUNTS_CHROME;
+        let on_erin = bottom(&draw(&mixed, 110, height, 2));
+        assert_eq!(
+            on_erin,
+            "└ erin@example.com needs re-login: the codex CLI in ~/.codex… — tcr login --codex --account erin@example.com ┘"
+        );
+        let on_alice = bottom(&draw(&mixed, 110, height, 0));
+        assert!(!on_alice.contains("needs re-login"), "{on_alice}");
+    }
+
+    /// A Codex account's sessions header keeps the end of its name, where `/codex` tells two
+    /// seats of one login apart, and in a fleet of both providers says ` codex` after the count,
+    /// dim. A Codex divert keeps its suffix the same way. Claude headers and diverts are drawn as
+    /// they always were.
+    #[test]
+    fn codex_sessions_carry_a_mark_and_keep_their_suffix() {
+        let codex_session = |id: &str, served_by: &str| SessionSnapshot {
+            provider: Provider::Codex,
+            ..diverted(id, "bob@example.com/codex", served_by, 7, Some(100))
+        };
+        let draw = |snapshot: &StatsSnapshot| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(48, 8)).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render_sessions(frame, frame.area(), snapshot, at(160)))
+                .expect("render succeeds");
+            terminal.backend().buffer().clone()
+        };
+
+        let mut mixed = snapshot_of(vec![
+            snap_gate("alice@example.com", GateReason::Ok, None),
+            codex_gate("bob@example.com/codex", GateReason::Ok, None),
+        ]);
+        mixed.sessions = vec![
+            codex_session("c0de", "carol@example.com/codex"),
+            diverted(
+                "a1f3",
+                "alice@example.com",
+                "frank@example.com",
+                4,
+                Some(90),
+            ),
+        ];
+        let buffer = draw(&mixed);
+        let rows = buffer_rows(&buffer);
+        let (y, row) = row_holding(&rows, "▾ bob@exa…/codex · 1 codex");
+        let y = y as u16;
+        let mark = cell_x(row, "· 1 codex") + 4;
+        for x in mark..mark + 5 {
+            assert!(
+                buffer[(x, y)].modifier.contains(Modifier::DIM),
+                "the mark is dim: {row}"
+            );
+        }
+        let name = cell_x(row, "bob@exa");
+        assert!(
+            !buffer[(name, y)].modifier.contains(Modifier::DIM),
+            "the name is not: {row}"
+        );
+        row_holding(&rows, "▾ alice@example.com · 1");
+        row_holding(&rows, "→car…/codex");
+        row_holding(&rows, "→frank@exa…");
+
+        let mut codex_only = snapshot_of(vec![codex_gate(
+            "bob@example.com/codex",
+            GateReason::Ok,
+            None,
+        )]);
+        codex_only.sessions = vec![codex_session("c0de", "bob@example.com/codex")];
+        let rows = buffer_rows(&draw(&codex_only));
+        let (_, row) = row_holding(&rows, "▾ bob@example.c…/codex · 1");
+        assert!(
+            !row.contains("· 1 codex"),
+            "no mark without Claude rows: {row}"
+        );
+    }
+
+    /// A Codex request's path is long and its end is what tells one call from another, so the
+    /// log keeps its last two segments behind `…/`. Every Claude path is cut as it always was.
+    #[test]
+    fn codex_log_path_keeps_its_tail() {
+        let mut snapshot = snapshot_of(vec![]);
+        snapshot.recent = vec![
+            crate::stats::RequestLogEntry {
+                provider: Provider::Codex,
+                ..log_entry(
+                    200,
+                    "POST",
+                    "/backend-api/codex/responses",
+                    "bob@example.com/codex",
+                    anchor(),
+                )
+            },
+            log_entry(200, "POST", "/v1/messages", "alice@example.com", anchor()),
+            log_entry(
+                200,
+                "GET",
+                "/v1/messages/count_tokens?beta=true",
+                "alice@example.com",
+                anchor(),
+            ),
+        ];
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 6)).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_log(frame, frame.area(), &snapshot, anchor()))
+            .expect("render succeeds");
+        let rows = buffer_rows(terminal.backend().buffer());
+        let (_, codex) = row_holding(&rows, "…/codex/responses");
+        assert!(codex.contains("bob@example.com/codex"), "{codex}");
+        row_holding(&rows, "/v1/messages ");
+        row_holding(&rows, "/v1/messages/count_toke…");
+    }
+
+    /// What `tcr demo` draws on its first tick, cursor on the first row and no notice, at the
+    /// Full layout's width and at a Compact one: both providers, each in its own banner segment
+    /// and its own section with its own ▶, and Codex traffic in the sessions tree and the log.
+    /// `--nocapture` prints both frames.
+    #[test]
+    fn the_demo_draws_both_providers() {
+        let manager = crate::demo::demo_manager();
+        let facts = crate::demo::demo_facts();
+        let now = OffsetDateTime::now_utc();
+        let snapshot = manager.snapshot(now);
+        for width in [FULL_LAYOUT_MIN_WIDTH, 110] {
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, 40)).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render_with(frame, &snapshot, 0, None, &facts, now))
+                .expect("render succeeds");
+            let rows = buffer_rows(terminal.backend().buffer());
+            let frame = rows.join("\n");
+            println!("== {width}x40\n{frame}");
+
+            assert!(
+                rows[0].starts_with("CLAUDE ") && rows[0].contains(" │ CODEX "),
+                "{frame}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.starts_with("┌ tcr · accounts · claude (6) ")),
+                "{frame}"
+            );
+            assert!(
+                rows.iter().any(|row| row.starts_with("├ codex (3) ")),
+                "{frame}"
+            );
+            let marked: Vec<&String> = rows.iter().filter(|row| row.starts_with("│▶ ")).collect();
+            assert_eq!(marked.len(), 2, "one ▶ per provider\n{frame}");
+            assert!(
+                marked.iter().any(|row| row.contains("team-prod")),
+                "{frame}"
+            );
+            assert!(
+                marked.iter().any(|row| row.contains("bob@e…/codex")),
+                "{frame}"
+            );
+            let (_, bob) = row_holding(&rows, "bob@e…/codex");
+            assert!(bob.contains("none"), "{frame}");
+            let (_, carol) = row_holding(&rows, "carol@examp…");
+            assert!(carol.contains("7D 3d"), "{frame}");
+            row_holding(&rows, "▾ bob@exa…/codex · 1 codex");
+            row_holding(&rows, "…/codex/responses");
+        }
+    }
+
     /// The person who pressed `d` must find out the write failed WITHOUT reading a
     /// log file. `tracing` goes to a file in TUI mode, so a failed persist was
     /// invisible while the row kept rendering as benched — the warning has to be on
@@ -2602,6 +4928,7 @@ mod tests {
         let snapshot = StatsSnapshot {
             accounts: vec![],
             current: None,
+            current_by_provider: crate::stats::CurrentByProvider::default(),
             recent: vec![],
             sessions: vec![diverted("a1f3", "alice", "bob", 24, Some(100))],
             wire_sessions: vec![],
@@ -2638,6 +4965,302 @@ mod tests {
         assert!(
             rows[session_row].contains("→bob"),
             "the divert stays visible as a marker on the row\n{text}"
+        );
+    }
+
+    /// A session sitting on its pin, last seen at `last_seen`. The golden times its rows from
+    /// the clock `render` reads, so [`snap`]'s seconds after the epoch do not fit it.
+    fn snap_at(
+        id: &str,
+        account: &str,
+        requests: u64,
+        last_seen: OffsetDateTime,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            last_seen: Some(last_seen),
+            ..snap(id, account, requests, None)
+        }
+    }
+
+    /// [`diverted`], last seen at `last_seen`.
+    fn diverted_at(
+        id: &str,
+        account: &str,
+        served_by: &str,
+        requests: u64,
+        last_seen: OffsetDateTime,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            last_seen: Some(last_seen),
+            ..diverted(id, account, served_by, requests, None)
+        }
+    }
+
+    /// One line of the recent-request log, served at `time`.
+    fn log_entry(
+        status: u16,
+        method: &str,
+        path: &str,
+        account: &str,
+        time: OffsetDateTime,
+    ) -> crate::stats::RequestLogEntry {
+        crate::stats::RequestLogEntry {
+            time,
+            method: method.to_string(),
+            path: path.to_string(),
+            status,
+            account: account.to_string(),
+            provider: Provider::Anthropic,
+        }
+    }
+
+    /// The Claude-only fleet the golden pins: eight accounts, one in each gate the dashboard
+    /// draws a chip for, three sessions (one of them diverted) and three log lines.
+    ///
+    /// HOLD is left out on purpose: its chip counts raw seconds, so two runs a second apart
+    /// would draw two different frames. Every other time sits a whole unit plus 30 seconds from
+    /// `now`, so the few milliseconds between building this snapshot and `render` reading its own
+    /// clock cannot move a printed age or countdown.
+    fn claude_only_golden_snapshot(now: OffsetDateTime, alice_eligible: bool) -> StatsSnapshot {
+        let after = |secs: i64| now + TimeDuration::seconds(secs);
+        let before = |secs: i64| now - TimeDuration::seconds(secs);
+        const MINUTE: i64 = 60;
+        const HOUR: i64 = 3_600;
+        const DAY: i64 = 86_400;
+
+        let mut alice = if alice_eligible {
+            snap_gate("alice@example.com", GateReason::Ok, None)
+        } else {
+            snap_gate(
+                "alice@example.com",
+                GateReason::FiveHour,
+                Some(after(47 * MINUTE + 30)),
+            )
+        };
+        alice.organization_type = Some("claude_max".to_string());
+        alice.rate_limit_tier = Some("default_claude_max_20x".to_string());
+        alice.five_hour = Some(0.47);
+        alice.five_hour_reset = Some(after(2 * HOUR + 39 * MINUTE + 30));
+        alice.seven_day = Some(0.20);
+        alice.seven_day_reset = Some(after(4 * DAY + 30));
+        alice.seven_day_oi = Some(0.62);
+        alice.seven_day_oi_reset = Some(after(4 * DAY + 30));
+        alice.requests = 1200;
+        alice.input_tokens = 4_200_000;
+        alice.output_tokens = 310_000;
+        alice.cache_read_tokens = 3_900_000;
+        alice.last_used = Some(before(3 * MINUTE + 30));
+        alice.probe_status = ProbeStatus::Ok;
+        alice.last_probe = Some(before(12 * MINUTE + 30));
+
+        let mut frank = snap_gate(
+            "frank@example.com",
+            GateReason::SevenDay,
+            Some(after(3 * DAY + 30)),
+        );
+        frank.organization_type = Some("claude_team".to_string());
+        frank.rate_limit_tier = Some("default_claude_max_5x".to_string());
+        frank.seat_tier = Some("team_tier_1".to_string());
+        frank.five_hour = Some(0.10);
+        frank.five_hour_reset = Some(after(4 * HOUR + 10 * MINUTE + 30));
+        frank.seven_day = Some(0.96);
+        frank.seven_day_reset = Some(after(3 * DAY + 30));
+        frank.quota_state = QuotaState::NearLimit;
+        frank.probe_status = ProbeStatus::RateLimited;
+        frank.last_probe = Some(before(2 * MINUTE + 30));
+        frank.stream_error_count = 2;
+        frank.requests = 2100;
+
+        let mut erin = snap_gate("erin@example.com", GateReason::Login, None);
+        erin.status = "error".to_string();
+        erin.probe_status = ProbeStatus::Error;
+        erin.last_probe = Some(before(45 * MINUTE + 30));
+
+        let mut grace = snap_gate("grace@example.com", GateReason::Disabled, None);
+        grace.organization_type = Some("claude_pro".to_string());
+        grace.seven_day = Some(0.30);
+        grace.seven_day_reset = Some(after(5 * DAY + 30));
+
+        let mut henry = snap_gate("henry@example.com", GateReason::Reserved, None);
+        henry.seven_day = Some(1.00);
+        henry.seven_day_reset = Some(after(2 * DAY + 30));
+        henry.quota_state = QuotaState::Exhausted;
+        henry.groups = vec!["research".to_string()];
+        henry.reserved_groups = vec!["research".to_string()];
+
+        let mut ivy = snap_gate("ivy@example.com", GateReason::Rejected, None);
+        ivy.five_hour = Some(0.88);
+        ivy.five_hour_reset = Some(after(HOUR + 30));
+
+        let mut jack = snap_gate(
+            "jack@example.com",
+            GateReason::FableWeekly,
+            Some(after(2 * DAY + 30)),
+        );
+        jack.seven_day_oi = Some(1.00);
+        jack.seven_day_oi_reset = Some(after(2 * DAY + 30));
+
+        let mut kate = snap_gate("kate@example.com", GateReason::Parked, None);
+        kate.groups = vec!["orchard".to_string()];
+        kate.parked_groups = vec!["orchard".to_string()];
+
+        StatsSnapshot {
+            accounts: vec![alice, frank, erin, grace, henry, ivy, jack, kate],
+            current: Some(0),
+            current_by_provider: crate::stats::CurrentByProvider::default(),
+            recent: vec![
+                log_entry(
+                    200,
+                    "POST",
+                    "/v1/messages",
+                    "alice@example.com",
+                    before(MINUTE + 30),
+                ),
+                log_entry(
+                    429,
+                    "POST",
+                    "/v1/messages",
+                    "frank@example.com",
+                    before(2 * MINUTE + 30),
+                ),
+                log_entry(
+                    500,
+                    "GET",
+                    "/v1/messages/count_tokens?beta=true",
+                    "ivy@example.com",
+                    before(3 * MINUTE + 30),
+                ),
+            ],
+            sessions: vec![
+                snap_at("a1f3c2", "alice@example.com", 24, before(MINUTE + 30)),
+                diverted_at(
+                    "b2c7d4",
+                    "alice@example.com",
+                    "frank@example.com",
+                    6,
+                    before(2 * MINUTE + 30),
+                ),
+                snap_at("c3d8e5", "frank@example.com", 12, before(5 * MINUTE + 30)),
+            ],
+            wire_sessions: vec![],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+        }
+    }
+
+    /// A snapshot with no accounts, no sessions and no log: a fleet nobody has logged into.
+    fn empty_snapshot() -> StatsSnapshot {
+        StatsSnapshot {
+            accounts: vec![],
+            current: None,
+            current_by_provider: crate::stats::CurrentByProvider::default(),
+            recent: vec![],
+            sessions: vec![],
+            wire_sessions: vec![],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+        }
+    }
+
+    /// The switch that rewrites the golden below instead of comparing against it.
+    const UPDATE_TUI_GOLDEN: &str = "TCR_UPDATE_TUI_GOLDEN";
+
+    /// **The Claude-only guarantee for the dashboard.** Four frames of a fleet with no Codex
+    /// account, captured from the dashboard before it learned about Codex accounts: 174 columns
+    /// (the full layout) and 110 columns (the compact one) with one account eligible, 110
+    /// columns with nothing eligible, and an empty fleet. The frames are ratatui's `Buffer`
+    /// debug form, which prints every cell's text and every change of style, so a colour or a
+    /// modifier that moves fails this as surely as a character does.
+    ///
+    /// Its four account titles follow main's project rename to `tcr`; every other cell and
+    /// style remains the original baseline. The golden is never regenerated to fit a change.
+    /// A Claude-only frame that differs from it
+    /// is a change a Claude-only user sees, and that is the bug.
+    #[test]
+    fn claude_only_frames_are_unchanged() {
+        let mut text = String::new();
+        let frames: [(&str, u16, Option<bool>); 4] = [
+            (
+                "174 columns, one account eligible",
+                FULL_LAYOUT_MIN_WIDTH,
+                Some(true),
+            ),
+            ("110 columns, one account eligible", 110, Some(true)),
+            ("110 columns, nothing eligible", 110, Some(false)),
+            ("110 columns, an empty fleet", 110, None),
+        ];
+        for (label, width, alice_eligible) in frames {
+            let snapshot = match alice_eligible {
+                Some(eligible) => claude_only_golden_snapshot(OffsetDateTime::now_utc(), eligible),
+                None => empty_snapshot(),
+            };
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, 40)).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render(frame, &snapshot, 2, None))
+                .expect("render succeeds");
+            text.push_str(&format!("== {label}\n{:?}\n", terminal.backend().buffer()));
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tui-claude-only.golden");
+        if std::env::var_os(UPDATE_TUI_GOLDEN).is_some() {
+            std::fs::write(&path, &text)
+                .unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));
+            return;
+        }
+        let golden = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "cannot read the golden at {} ({err}); it is written once, by \
+                 {UPDATE_TUI_GOLDEN}=1, before the change it guards",
+                path.display()
+            )
+        });
+        assert_eq!(
+            text, golden,
+            "a Claude-only dashboard frame changed. The golden is never regenerated with \
+             {UPDATE_TUI_GOLDEN} to fit a change: a Claude-only frame that differs from it is a \
+             change every Claude-only user sees"
+        );
+    }
+
+    /// Is `cell` painted in exactly `style`: its colour where `style` sets one, and exactly its
+    /// modifiers?
+    fn painted_with(cell: &ratatui::buffer::Cell, style: Style) -> bool {
+        style.fg.is_none_or(|fg| cell.fg == fg)
+            && style.bg.is_none_or(|bg| cell.bg == bg)
+            && cell.modifier == style.add_modifier
+    }
+
+    /// An empty fleet with no codex login on disk is today's, word for word: the alarm banner
+    /// with no time to promise, and the empty accounts pane. Nothing on it may mention codex.
+    #[test]
+    fn empty_fleet_without_evidence_is_unchanged() {
+        let snapshot = empty_snapshot();
+        let mut terminal =
+            Terminal::new(TestBackend::new(110, 12)).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render(frame, &snapshot, 0, None))
+            .expect("render succeeds");
+        let buffer = terminal.backend().buffer();
+        let rows = buffer_rows(buffer);
+        let screen = rows.join("\n");
+
+        assert_eq!(
+            rows[0].trim_end(),
+            "FLEET 0/0 eligible · next free unknown",
+            "{screen}"
+        );
+        assert!(
+            painted_with(&buffer[(0, 0)], alarm_style()),
+            "the banner of an empty fleet is the alarm: {:?}",
+            buffer[(0, 0)]
+        );
+        assert!(
+            rows.iter().any(|row| row.contains(" tcr · accounts (0) ")),
+            "{screen}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.to_lowercase().contains("codex")),
+            "an empty fleet with no codex login says nothing about codex:\n{screen}"
         );
     }
 }

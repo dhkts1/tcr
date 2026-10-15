@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use super::*;
-use crate::session_wire::{ToolResultEvent, ToolUseEvent};
+use crate::session_wire::{CodexToolCall, ToolResultEvent, ToolUseEvent};
 use crate::session_wire_persist::{self, LoadReport};
 
 impl Manager {
@@ -113,6 +113,117 @@ impl Manager {
         self.mark_wire_sessions_dirty();
     }
 
+    /// Count one Codex Responses turn, whose arrival closes the previous turn's tools.
+    pub fn record_codex_wire_session(
+        &self,
+        session_id: Option<&str>,
+        account: Option<String>,
+        now: OffsetDateTime,
+    ) {
+        self.record_codex_wire_request(
+            session_id,
+            account,
+            crate::provider::CODEX_RESPONSES_PATH,
+            now,
+        );
+    }
+
+    /// Count one pooled Codex model call on the wire session its `session-id` header named.
+    /// Only a Responses turn carries the previous turn's tool outputs, so auxiliary image,
+    /// memory and search calls leave tools open. A no-op when `session_id` is `None`.
+    ///
+    /// Called once per client request at the terminal outcome, in place of
+    /// [`Self::record_wire_session`] (same call site in `proxy.rs`, same once-not-per-retry
+    /// rule). A request tcr answers itself never reaches the terminal outcome, so it is
+    /// not counted and closes nothing, just as a Claude `tool_result` in such a request
+    /// closes nothing.
+    pub fn record_codex_wire_request(
+        &self,
+        session_id: Option<&str>,
+        account: Option<String>,
+        path: &str,
+        now: OffsetDateTime,
+    ) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let now_ms = odt_to_ms(now);
+        let mut tracker = self
+            .wire_sessions
+            .lock()
+            .expect("wire sessions lock poisoned");
+        tracker.record_codex_model_request(session_id, account, path, now_ms);
+        drop(tracker);
+        self.mark_wire_sessions_dirty();
+    }
+
+    /// Start the tool calls a Codex response's finished output items asked for, as running
+    /// from `now` (the instant its stream ended), each with its own timeout. The Codex twin of
+    /// [`Self::record_wire_session_tool_uses`], and a no-op on the same terms: `session_id` is
+    /// `None` or the call list is empty.
+    pub fn record_codex_wire_session_calls(
+        &self,
+        session_id: Option<&str>,
+        now: OffsetDateTime,
+        calls: &[CodexToolCall],
+    ) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if calls.is_empty() {
+            return;
+        }
+        let now_ms = odt_to_ms(now);
+        let mut tracker = self
+            .wire_sessions
+            .lock()
+            .expect("wire sessions lock poisoned");
+        tracker.record_codex_tool_calls(session_id, now_ms, calls);
+        drop(tracker);
+        self.mark_wire_sessions_dirty();
+    }
+
+    /// Add a Codex response's usage to its wire session. The arguments are the same
+    /// [`crate::usage::UsageRecord`] fields [`Self::record_wire_session_usage`] takes, plus the
+    /// turn's reasoning tokens and the record's own stamp (`ts_ms`), so the account ledger and
+    /// the session never disagree about what a response carried, or when. Unlike its Claude
+    /// twin it stamps no Anthropic cache TTL, and the usage's model names the session — see
+    /// [`crate::session_wire::WireSessionTracker::record_codex_usage`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_codex_wire_session_usage(
+        &self,
+        session_id: Option<&str>,
+        model: Option<&str>,
+        base_input: u64,
+        cache_5m: u64,
+        cache_1h: u64,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+        ts_ms: i64,
+    ) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let mut tracker = self
+            .wire_sessions
+            .lock()
+            .expect("wire sessions lock poisoned");
+        tracker.record_codex_usage(
+            session_id,
+            model,
+            base_input,
+            cache_5m,
+            cache_1h,
+            cache_read_tokens,
+            output_tokens,
+            reasoning_tokens,
+            ts_ms,
+        );
+        drop(tracker);
+        self.mark_wire_sessions_dirty();
+    }
+
     /// The live wire-session table, projected onto [`tcr_status_wire::SessionRow`] — what
     /// [`Self::snapshot`] hangs onto [`crate::stats::StatsSnapshot::wire_sessions`].
     pub(super) fn wire_sessions_snapshot(
@@ -127,97 +238,111 @@ impl Manager {
         tracker
             .snapshot(now_ms)
             .into_iter()
-            .map(|(session_id, s)| tcr_status_wire::SessionRow {
-                session_id,
-                account: s.account,
-                model: s.model,
-                first_seen_ms: s.first_seen_ms,
-                last_seen_ms: s.last_seen_ms,
-                requests: s.requests,
-                input_tokens: s.input_tokens,
-                output_tokens: s.output_tokens,
-                cache_read_tokens: s.cache_read_tokens,
-                cache_creation_tokens: s.cache_creation_tokens,
-                tools: tcr_status_wire::SessionToolsRow {
-                    calls: s.tools.calls,
-                    errors: s.tools.errors,
-                    timeouts: s.tools.timeouts,
-                    timeouts_by_class: s.tools.timeouts_by_class.clone(),
-                    timed_out: s
-                        .tools
-                        .timed_out
-                        .iter()
-                        .map(|t| tcr_status_wire::SlowToolRow {
-                            tool: t.tool.clone(),
-                            seconds: t.seconds,
-                            command_head: t.command_head.clone(),
-                            command_class: t.command_class.map(|c| c.as_str().to_string()),
-                            ended_ms: t.ended_ms,
-                        })
-                        .collect(),
-                    over_one_minute: s.tools.over_one_minute,
-                    subagents_running: s
-                        .tools
-                        .running
-                        .values()
-                        .filter(|r| {
-                            (r.tool == "Agent" || r.tool == "Task")
-                                && !crate::session_wire::running_tool_is_lost(
-                                    &r.tool,
-                                    r.started_ms,
-                                    now_ms,
-                                )
-                        })
-                        .count() as u64,
-                    // Belt and braces beside `WireSessionTracker::restore`'s own drop: an
-                    // entry too old to still be running is a LOST result, whatever put it
-                    // there — see `crate::session_wire::running_tool_is_lost`.
-                    running: s
-                        .tools
-                        .running
-                        .into_values()
-                        .filter(|r| {
-                            !crate::session_wire::running_tool_is_lost(
-                                &r.tool,
-                                r.started_ms,
-                                now_ms,
-                            )
-                        })
-                        .map(|r| tcr_status_wire::RunningToolRow {
-                            tool: r.tool,
-                            started_ms: r.started_ms,
-                            command_head: r.command_head,
-                            command_class: r.command_class.map(|c| c.as_str().to_string()),
-                        })
-                        .collect(),
-                    slowest: s
-                        .tools
-                        .slowest
-                        .into_iter()
-                        .map(|t| tcr_status_wire::SlowToolRow {
-                            tool: t.tool,
-                            seconds: t.seconds,
-                            command_head: t.command_head,
-                            command_class: t.command_class.map(|c| c.as_str().to_string()),
-                            ended_ms: t.ended_ms,
-                        })
-                        .collect(),
-                    by_tool: s
-                        .tools
-                        .by_tool
-                        .iter()
-                        .map(|(name, bucket)| tcr_status_wire::ToolBucketRow {
-                            tool: name.clone(),
-                            calls: bucket.calls,
-                            errors: bucket.errors,
-                            seconds_p50: bucket.seconds_p50(),
-                            over_one_minute: bucket.over_one_minute,
-                        })
-                        .collect(),
-                },
-                req_per_minute: s.req_per_minute.projected(now_ms),
-                cost_usd: Self::price_session(&self.usage, &s.by_model),
-                cache_ttl_secs: s.cache_ttl_secs,
+            .map(|(session_id, s)| {
+                let (cost_usd, unpriced, priced) = Self::price_session(&self.usage, &s.by_model);
+                tcr_status_wire::SessionRow {
+                    session_id,
+                    account: s.account,
+                    model: s.model,
+                    first_seen_ms: s.first_seen_ms,
+                    last_seen_ms: s.last_seen_ms,
+                    requests: s.requests,
+                    input_tokens: s.input_tokens,
+                    output_tokens: s.output_tokens,
+                    cache_read_tokens: s.cache_read_tokens,
+                    cache_creation_tokens: s.cache_creation_tokens,
+                    tools: tcr_status_wire::SessionToolsRow {
+                        calls: s.tools.calls,
+                        errors: s.tools.errors,
+                        timeouts: s.tools.timeouts,
+                        timeouts_by_class: s.tools.timeouts_by_class.clone(),
+                        timed_out: s
+                            .tools
+                            .timed_out
+                            .iter()
+                            .map(|t| tcr_status_wire::SlowToolRow {
+                                tool: t.tool.clone(),
+                                seconds: t.seconds,
+                                command_head: t.command_head.clone(),
+                                command_class: t.command_class.map(|c| c.as_str().to_string()),
+                                ended_ms: t.ended_ms,
+                            })
+                            .collect(),
+                        over_one_minute: s.tools.over_one_minute,
+                        subagents_running: s
+                            .tools
+                            .running
+                            .values()
+                            .filter(|r| {
+                                (r.tool == "Agent" || r.tool == "Task")
+                                    && !crate::session_wire::running_call_is_lost(r, now_ms)
+                            })
+                            .count() as u64,
+                        // Belt and braces beside `WireSessionTracker::restore`'s own drop: an
+                        // entry too old to still be running is a LOST result, whatever put it
+                        // there — see `crate::session_wire::running_call_is_lost`.
+                        running: s
+                            .tools
+                            .running
+                            .into_values()
+                            .filter(|r| !crate::session_wire::running_call_is_lost(r, now_ms))
+                            .map(|r| tcr_status_wire::RunningToolRow {
+                                tool: r.tool,
+                                started_ms: r.started_ms,
+                                command_head: r.command_head,
+                                command_class: r.command_class.map(|c| c.as_str().to_string()),
+                                timeout_seconds: r.timeout_seconds,
+                            })
+                            .collect(),
+                        slowest: s
+                            .tools
+                            .slowest
+                            .into_iter()
+                            .map(|t| tcr_status_wire::SlowToolRow {
+                                tool: t.tool,
+                                seconds: t.seconds,
+                                command_head: t.command_head,
+                                command_class: t.command_class.map(|c| c.as_str().to_string()),
+                                ended_ms: t.ended_ms,
+                            })
+                            .collect(),
+                        by_tool: s
+                            .tools
+                            .by_tool
+                            .iter()
+                            .map(|(name, bucket)| tcr_status_wire::ToolBucketRow {
+                                tool: name.clone(),
+                                calls: bucket.calls,
+                                errors: bucket.errors,
+                                seconds_p50: bucket.seconds_p50(),
+                                over_one_minute: bucket.over_one_minute,
+                            })
+                            .collect(),
+                    },
+                    req_per_minute: s.req_per_minute.projected(now_ms),
+                    cost_usd,
+                    cache_ttl_secs: s.cache_ttl_secs,
+                    // Absent for Anthropic, so a Claude-only fleet's rows serialize as they
+                    // always have.
+                    provider: (!s.provider.is_anthropic()).then(|| s.provider.as_str().to_string()),
+                    // Codex sessions only. A Claude session on a model this build cannot price
+                    // keeps the zero it has always shown and no count: changing that changes a
+                    // Claude-only fleet's output.
+                    //
+                    // Counted out of `requests`, not only out of the usage records: a request
+                    // is counted when its response's headers arrive and its usage only when the
+                    // stream ends, and a turn that ends with no usage never adds one. So a turn
+                    // still streaming, or one that reported no usage, is a request no price
+                    // covers, and a session nothing was priced for always reads at least as
+                    // many unpriced requests as requests, the rule TcrBar draws no dollars by.
+                    unpriced_requests: match s.provider {
+                        crate::provider::Provider::Anthropic => 0,
+                        crate::provider::Provider::Codex => {
+                            unpriced.max(s.requests.saturating_sub(priced))
+                        }
+                    },
+                    reasoning_tokens: s.reasoning_tokens,
+                }
             })
             .collect()
     }
@@ -225,30 +350,39 @@ impl Manager {
     /// Price one session's per-model token tallies against the account ledger's OWN pricing
     /// table (`crate::usage::UsageTracker::price_for`) and sum — one model's price at a time,
     /// so a session that spans two models is priced correctly rather than averaged. A model
-    /// this table has no entry for contributes `0.0`, the same "unpriced" outcome
-    /// `crate::pricing` documents for the account-level ledger, just not surfaced as a
-    /// separate count here — `SessionRow::cost_usd` is a plain total, not an
-    /// `Option`/`unpriced_requests` pair.
+    /// this table has no entry for contributes `0.0` to the cost, the same "unpriced" outcome
+    /// `crate::pricing` documents for the account-level ledger, so `SessionRow::cost_usd` stays
+    /// a plain total, never an `Option`. The second value counts the usage records the cost
+    /// leaves out, from each unpriced model's tally, and the third the usage records it covers;
+    /// the projection reports the requests no price covers as `SessionRow::unpriced_requests`
+    /// on Codex sessions only, so a Claude session on a model this build cannot price keeps the
+    /// bare zero it has always shown.
     fn price_session(
         usage: &crate::usage::UsageTracker,
         by_model: &std::collections::HashMap<String, crate::session_wire::ModelTokenTally>,
-    ) -> f64 {
+    ) -> (f64, u64, u64) {
+        let (mut unpriced, mut priced) = (0, 0);
         let nanos: u64 = by_model
             .iter()
-            .filter_map(|(model, tally)| {
-                usage.price_for(model).map(|price| {
-                    crate::pricing::cost_nanos(
+            .filter_map(|(model, tally)| match usage.price_for(model) {
+                Some(price) => {
+                    priced += tally.requests;
+                    Some(crate::pricing::cost_nanos(
                         &price,
                         tally.input,
                         tally.cache_5m,
                         tally.cache_1h,
                         tally.cache_read,
                         tally.output,
-                    )
-                })
+                    ))
+                }
+                None => {
+                    unpriced += tally.requests;
+                    None
+                }
             })
             .sum();
-        nanos as f64 / 1_000_000_000.0
+        (nanos as f64 / 1_000_000_000.0, unpriced, priced)
     }
 
     /// Fleet-wide tool-call totals, summed across every row `Self::wire_sessions_snapshot`
@@ -493,6 +627,58 @@ mod tests {
         assert_eq!(
             row.tools.subagents_running, 1,
             "the count and the list agree about what is running"
+        );
+    }
+
+    /// A Codex call that named its own timeout is lost once that timeout, and the same minute
+    /// of grace a Claude `Bash` call gets, has passed: codex ended the command by then, so a
+    /// call still running is one whose closing request never reached this process. A Codex
+    /// call with no timeout keeps the six-hour line every tool with no deadline gets.
+    ///
+    /// Watched red: with every Codex call held to the six-hour line, the timed call is still
+    /// projected as running past its timeout.
+    #[test]
+    fn a_codex_call_past_its_own_timeout_is_not_projected_as_running() {
+        use crate::session_wire::CodexToolCall;
+        let started = OffsetDateTime::now_utc();
+        let call = |id: &str, timeout_seconds: Option<u64>| CodexToolCall {
+            event: ToolUseEvent {
+                id: id.to_string(),
+                name: Some("exec_command".to_string()),
+                command_head: Some("cargo test".to_string()),
+                command_class: None,
+            },
+            timeout_seconds,
+        };
+        let manager = Manager::from_runtimes(vec![]);
+        manager.record_codex_wire_session(Some("sess-codex"), None, started);
+        manager.record_codex_wire_session_calls(
+            Some("sess-codex"),
+            started,
+            &[call("call_timed", Some(30)), call("call_open", None)],
+        );
+        let running = |after_ms: i64| -> Vec<Option<u64>> {
+            let mut timeouts: Vec<Option<u64>> = manager
+                .snapshot(started + Duration::milliseconds(after_ms))
+                .wire_sessions[0]
+                .tools
+                .running
+                .iter()
+                .map(|r| r.timeout_seconds)
+                .collect();
+            timeouts.sort();
+            timeouts
+        };
+
+        assert_eq!(
+            running((30 + 60) * 1_000),
+            [None, Some(30)],
+            "at the line both are still running"
+        );
+        assert_eq!(
+            running((30 + 60) * 1_000 + 1),
+            [None],
+            "the timed call is lost, the call with no timeout stays"
         );
     }
 
@@ -778,6 +964,345 @@ mod tests {
         assert!(
             !manager.take_wire_sessions_dirty(),
             "a second read without an intervening write finds nothing new"
+        );
+    }
+
+    /// A Codex session is unpriced until a price names its model. Instead of passing a zero off
+    /// as measured, it says how many of its requests no price covers, while `costUsd` keeps
+    /// its 0.0-for-unpriced meaning. Priced in part, it reports the priced part and the count it
+    /// leaves out. A Claude session on a model this build cannot price reports no count and
+    /// carries none of the Codex keys, so a Claude-only fleet's rows serialize as they did.
+    #[test]
+    fn codex_requests_count_as_unpriced() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![]);
+        manager.record_codex_wire_session(
+            Some("sess-codex"),
+            Some("bob@example.com/codex".to_string()),
+            now,
+        );
+        for _ in 0..3 {
+            manager.record_codex_wire_session_usage(
+                Some("sess-codex"),
+                Some("gpt-5.1-codex"),
+                1_000,
+                0,
+                0,
+                0,
+                10,
+                2,
+                odt_to_ms(now),
+            );
+        }
+        manager.record_wire_session(
+            Some("sess-claude"),
+            Some("alice@example.com".to_string()),
+            Some("claude-opus-4-5".to_string()),
+            now,
+            &[],
+            &[],
+        );
+        manager.record_wire_session_usage(
+            Some("sess-claude"),
+            Some("claude-opus-4-5"),
+            1_000,
+            0,
+            0,
+            0,
+            10,
+        );
+        let rows: std::collections::HashMap<String, tcr_status_wire::SessionRow> = manager
+            .snapshot(now)
+            .wire_sessions
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect();
+        let codex = &rows["sess-codex"];
+        assert_eq!(codex.provider.as_deref(), Some("codex"));
+        assert_eq!(codex.unpriced_requests, 3);
+        assert_eq!(codex.cost_usd, 0.0);
+        assert_eq!(codex.reasoning_tokens, 6);
+        let claude = &rows["sess-claude"];
+        assert_eq!(
+            (claude.provider.as_deref(), claude.unpriced_requests),
+            (None, 0)
+        );
+        let json = serde_json::to_value(claude).expect("a session row serializes");
+        for key in ["provider", "unpricedRequests", "reasoningTokens"] {
+            assert!(json.get(key).is_none(), "a Claude session carries no {key}");
+        }
+
+        let config: crate::config::Config =
+            serde_json::from_str(r#"{"pricing":{"gpt-5.1-codex":{"input":1.25,"output":10}}}"#)
+                .expect("a config with one price");
+        let priced = Manager::with_live_refresher(config, None);
+        priced.record_codex_wire_session(Some("sess-mixed"), None, now);
+        for model in ["gpt-5.1-codex", "gpt-5.1-codex", "codex-mini-latest"] {
+            priced.record_codex_wire_session_usage(
+                Some("sess-mixed"),
+                Some(model),
+                1_000_000,
+                0,
+                0,
+                0,
+                0,
+                0,
+                odt_to_ms(now),
+            );
+        }
+        let row = priced.snapshot(now).wire_sessions.remove(0);
+        assert!(
+            (row.cost_usd - 2.5).abs() < 1e-9,
+            "two priced requests at $1.25: {}",
+            row.cost_usd
+        );
+        assert_eq!(row.unpriced_requests, 1);
+    }
+
+    /// TcrBar's rule for a Codex session's dollars (`Session.pricedCostUsd`): none while its
+    /// unpriced requests are at least its requests. Mirrored here so the producer is checked
+    /// against the reader it feeds.
+    fn tcrbar_draws_dollars(row: &tcr_status_wire::SessionRow) -> bool {
+        !(row.provider.as_deref() == Some("codex") && row.unpriced_requests >= row.requests)
+    }
+
+    /// A Codex request no price covers counts as unpriced from the moment it is served: while
+    /// its turn streams, and for good when the turn ends with no usage (an interrupted stream,
+    /// a forwarded error). Counted from the usage records alone, a streaming turn left
+    /// `unpricedRequests` behind `requests` with a `costUsd` of 0.0, and TcrBar drew that zero
+    /// as `$0.00`. A priced session with a turn in flight keeps its dollars, and counts the one
+    /// turn they leave out.
+    ///
+    /// Watched red: counted from the usage records, the streaming session reads 0 unpriced of
+    /// 1, then 1 of 2, and the priced one 0 of 2.
+    #[test]
+    fn a_codex_request_with_no_usage_yet_counts_as_unpriced() {
+        let now = OffsetDateTime::now_utc();
+        let row = |manager: &Manager, id: &str| -> tcr_status_wire::SessionRow {
+            manager
+                .snapshot(now)
+                .wire_sessions
+                .into_iter()
+                .find(|row| row.session_id == id)
+                .expect("the session")
+        };
+
+        let manager = Manager::from_runtimes(vec![]);
+        manager.record_codex_wire_session(Some("sess-streaming"), None, now);
+        let first = row(&manager, "sess-streaming");
+        assert_eq!((first.requests, first.unpriced_requests), (1, 1));
+        assert_eq!(first.cost_usd, 0.0);
+        assert!(
+            !tcrbar_draws_dollars(&first),
+            "no $0.00 while the first turn streams"
+        );
+
+        // The first turn's usage lands; the second turn streams, or ends with no usage.
+        manager.record_codex_wire_session_usage(
+            Some("sess-streaming"),
+            Some("gpt-5.1-codex"),
+            1_000,
+            0,
+            0,
+            0,
+            10,
+            0,
+            odt_to_ms(now),
+        );
+        manager.record_codex_wire_session(Some("sess-streaming"), None, now);
+        let second = row(&manager, "sess-streaming");
+        assert_eq!((second.requests, second.unpriced_requests), (2, 2));
+        assert!(
+            !tcrbar_draws_dollars(&second),
+            "no $0.00 while the second turn streams"
+        );
+
+        let config: crate::config::Config =
+            serde_json::from_str(r#"{"pricing":{"gpt-5.1-codex":{"input":1.25,"output":10}}}"#)
+                .expect("a config with one price");
+        let priced = Manager::with_live_refresher(config, None);
+        priced.record_codex_wire_session(Some("sess-priced"), None, now);
+        priced.record_codex_wire_session_usage(
+            Some("sess-priced"),
+            Some("gpt-5.1-codex"),
+            1_000_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            odt_to_ms(now),
+        );
+        priced.record_codex_wire_session(Some("sess-priced"), None, now);
+        let partial = row(&priced, "sess-priced");
+        assert!(
+            (partial.cost_usd - 1.25).abs() < 1e-9,
+            "the priced turn keeps its $1.25: {}",
+            partial.cost_usd
+        );
+        assert_eq!((partial.requests, partial.unpriced_requests), (2, 1));
+        assert!(
+            tcrbar_draws_dollars(&partial),
+            "a partly priced session keeps its dollars"
+        );
+    }
+
+    /// The producer proof for the canonical Codex session: the row TcrBar's decoder and the
+    /// wire renderer are both tested against. Seven requests on one `session-id`, the calls
+    /// their responses asked for, and their usage, fed through the Manager in time order,
+    /// project onto exactly the fixture's row.
+    ///
+    /// Each call starts when its response's stream ends and closes when the session's next
+    /// request arrives, and the last call is still running, with no timeout. Every
+    /// `exec_command` call here, the last included, is codex's default interactive schema,
+    /// which carries no timeout; the one-shot schema's timeout is proved inline, by
+    /// `a_codex_timeout_is_whole_seconds_rounded_up` and
+    /// `a_codex_function_call_starts_a_running_tool_with_its_timeout`.
+    ///
+    /// `byTool` is compared by tool name, because the server builds it from a map and promises
+    /// no order.
+    #[test]
+    fn codex_sessions_are_produced_in_the_canonical_shape() {
+        use crate::session_wire::{CodexToolCall, CommandClass, ToolUseEvent};
+        const NOW: i64 = 1_767_225_600_000;
+        const ID: &str = "019a3c5e-0000-7000-8000-000000000002";
+        let at = |ms: i64| {
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+                .expect("a valid instant")
+        };
+        let call = |id: &str,
+                    tool: &str,
+                    head: &str,
+                    class: Option<CommandClass>,
+                    timeout_seconds: Option<u64>| {
+            CodexToolCall {
+                event: ToolUseEvent {
+                    id: id.to_string(),
+                    name: Some(tool.to_string()),
+                    command_head: Some(head.to_string()),
+                    command_class: class,
+                },
+                timeout_seconds,
+            }
+        };
+        let build = Some(CommandClass::Build);
+        // (request at, (its stream's end, the call it asked for), base input, cache read, output,
+        // reasoning)
+        type Turn = (i64, Option<(i64, CodexToolCall)>, u64, u64, u64, u64);
+        // Every exec_command here is the default interactive schema, so none carries a timeout.
+        let turns: [Turn; 7] = [
+            (1_767_225_425_000, None, 35_000, 0, 1_100, 400),
+            (
+                1_767_225_470_000,
+                Some((
+                    1_767_225_481_000,
+                    call("call_1", "exec_command", "cargo test", build, None),
+                )),
+                10_000,
+                20_000,
+                500,
+                200,
+            ),
+            (1_767_225_485_000, None, 10_000, 20_000, 500, 200),
+            (
+                1_767_225_500_000,
+                Some((
+                    1_767_225_505_000,
+                    call("call_2", "apply_patch", "apply_patch", None, None),
+                )),
+                10_000,
+                20_000,
+                500,
+                200,
+            ),
+            (
+                1_767_225_505_200,
+                Some((
+                    1_767_225_540_500,
+                    call("call_3", "exec_command", "cargo check", build, None),
+                )),
+                10_000,
+                20_000,
+                500,
+                200,
+            ),
+            (1_767_225_544_500, None, 10_000, 0, 500, 0),
+            (
+                1_767_225_550_000,
+                Some((
+                    1_767_225_555_000,
+                    call("call_4", "exec_command", "cargo build", build, None),
+                )),
+                10_000,
+                0,
+                500,
+                0,
+            ),
+        ];
+        let manager = Manager::from_runtimes(vec![]);
+        for (requested, started, input, cache_read, output, reasoning) in turns {
+            manager.record_codex_wire_session(
+                Some(ID),
+                Some("bob@example.com/codex".to_string()),
+                at(requested),
+            );
+            if let Some((ended, call)) = started {
+                manager.record_codex_wire_session_calls(
+                    Some(ID),
+                    at(ended),
+                    std::slice::from_ref(&call),
+                );
+            }
+            manager.record_codex_wire_session_usage(
+                Some(ID),
+                Some("gpt-5.1-codex"),
+                input,
+                0,
+                0,
+                cache_read,
+                output,
+                reasoning,
+                requested,
+            );
+        }
+        let row = manager
+            .snapshot(at(NOW))
+            .wire_sessions
+            .into_iter()
+            .find(|row| row.session_id == ID)
+            .expect("the produced Codex session");
+        let mut produced = serde_json::to_value(&row).expect("a session row serializes");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("apps/macos/Tests/Fixtures/codex-sessions.json"),
+            )
+            .expect("the canonical sessions fixture"),
+        )
+        .expect("the fixture is JSON");
+        let mut expected = fixture["sessions"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["sessionId"] == ID))
+            .cloned()
+            .expect("the fixture's Codex session");
+        for value in [&mut produced, &mut expected] {
+            if let Some(buckets) = value["tools"]["byTool"].as_array_mut() {
+                buckets.sort_by(|a, b| a["tool"].as_str().cmp(&b["tool"].as_str()));
+            }
+        }
+        let keys: std::collections::BTreeSet<String> = produced
+            .as_object()
+            .into_iter()
+            .chain(expected.as_object())
+            .flat_map(|fields| fields.keys().cloned())
+            .collect();
+        let differing: Vec<&String> = keys
+            .iter()
+            .filter(|key| produced.get(key.as_str()) != expected.get(key.as_str()))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "the produced Codex session differs from the fixture's in {differing:?}\nproduced: {produced:#}\nfixture:  {expected:#}"
         );
     }
 }

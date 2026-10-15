@@ -2,6 +2,24 @@ import XCTest
 
 @testable import TcrBarCore
 
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
 /// The `usage` object: decoding it, summing it, and rendering it.
 ///
 /// One rule is under test throughout, in three shapes the wire produces
@@ -788,6 +806,49 @@ final class UsageStatsTests: XCTestCase {
         XCTAssertEqual(
             alice.usage?.today.cacheCreationTokens, 1_600_000,
             "the quantity itself is not lost — it is on the usage bucket, which is read")
+    }
+
+    // MARK: Each provider's own figures
+
+    /// alice, bob and carol: one Claude row and two Codex rows, all measured today.
+    private func mixedCanonicalFleet() throws -> Fleet {
+        let fleet = try decodeFleet(
+            try ["alice@example.com", "bob@example.com/codex", "carol@example.com"].map {
+                try canonicalRow($0)
+            })
+        XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+        return fleet
+    }
+
+    /// The cache figure beside Claude's spend is Claude's prompt cache: 6,000,000 cache reads
+    /// of alice's 8,000,000 input-side tokens. Folding the Codex rows in would report a cache
+    /// Claude does not have.
+    func testMixedCacheIsClaudesPromptCacheOnly() throws {
+        let fleet = try mixedCanonicalFleet()
+        XCTAssertEqual(try XCTUnwrap(fleet.todayCacheHitRatio(of: .anthropic)), 0.75, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(fleet.todayCacheHitRatio), 11_708_000.0 / 14_500_000.0, accuracy: 1e-9)
+    }
+
+    /// "N unpriced today" says Claude's dollar figure is a floor, so it counts Claude
+    /// requests only. Every Codex request is unpriced, by design.
+    func testUnpricedTodayCountsClaudeRequestsOnly() throws {
+        let fleet = try mixedCanonicalFleet()
+        XCTAssertEqual(fleet.todayUnpricedRequests(of: .anthropic), 0)
+        XCTAssertEqual(fleet.todayUnpricedRequests, 352)
+    }
+
+    /// Codex usage is counted in output tokens: bob's 22,000 and carol's 61,000 today. A day
+    /// with unpriced requests is not fully priced, and a fleet with no Codex row has no
+    /// Codex figure at all, rather than a zero.
+    func testCodexOutputTokensToday() throws {
+        let fleet = try mixedCanonicalFleet()
+        XCTAssertEqual(fleet.todayOutputTokens(of: .codex), 83_000)
+        XCTAssertEqual(QuotaFormat.tokens(83_000), "83k")
+        XCTAssertFalse(fleet.todayIsFullyPriced(of: .codex))
+
+        let claudeOnly = try decodeFleet([canonicalRow("alice@example.com")])
+        XCTAssertNil(claudeOnly.todayOutputTokens(of: .codex))
     }
 
     // MARK: Builders

@@ -27,9 +27,9 @@ fn throttle_exempt(class: RequestClass) -> bool {
     class == RequestClass::Noise
 }
 
-/// Pure bucket-key derivation, split out of [`Manager::throttle_bucket_key`] so
-/// both branches are unit-testable without building a `Manager` (same pattern as
-/// [`throttle_slot`]).
+/// The identity part of a bucket key, split out of [`Manager::throttle_bucket_key`]
+/// so both branches are unit-testable without building a `Manager` (same pattern
+/// as [`throttle_slot`]). The full key also includes the account's provider.
 ///
 /// Prefers the ORG identity via [`crate::identity::org_key_of`] (uuid, else name),
 /// falling back to the account index when neither is known. Both arms are
@@ -76,8 +76,8 @@ impl Manager {
             .unwrap_or(false)
     }
 
-    /// The GCRA bucket key for account `idx`: its ORGANIZATION when known,
-    /// otherwise an account-scoped fallback.
+    /// The GCRA bucket key for account `idx`: its provider and ORGANIZATION when
+    /// known, otherwise its provider and an account-scoped fallback.
     ///
     /// Keyed on org rather than account because that is what Anthropic limits.
     /// The two coincide on a fleet where every account is its own org (which is the
@@ -85,24 +85,30 @@ impl Manager {
     /// account-keying would hand that org double its intended rate, the exact bug
     /// class this split exists to fix.
     ///
-    /// Both arms are namespaced (`org:` / `acct:`) so a fallback key can never
-    /// collide with an organization whose name happens to look like one.
+    /// The provider prefix keeps separate upstreams independent even when their
+    /// organization UUIDs or names match. Within each provider, the `org:` / `acct:`
+    /// namespaces keep a fallback key from colliding with an organization name.
     ///
     /// **A key can change once, mid-life.** A newly-added account starts with no
     /// `org_uuid` and gets one backfilled after identity resolution
     /// (`manager/mod.rs`, `add_or_update_account`), so its first requests bucket
-    /// under `acct:<idx>` and later move to `org:<uuid>`. That re-key resets one
+    /// under `<provider>:acct:<idx>` and later move to `<provider>:org:<uuid>`.
+    /// That re-key resets one
     /// bucket's TAT once, permitting a single unpaced burst for that one account.
     /// Accepted deliberately: pinning the key at first use would instead hold a
     /// WRONG key forever in the case where the backfill is what corrects it.
     fn throttle_bucket_key(&self, idx: usize) -> String {
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account = accounts.get(idx);
-        bucket_key_for(
+        let identity = bucket_key_for(
             account.and_then(|a| a.org_uuid.as_deref()),
             account.and_then(|a| a.org_name.as_deref()),
             idx,
-        )
+        );
+        match account {
+            Some(account) => format!("{}:{identity}", account.provider.as_str()),
+            None => identity,
+        }
     }
 
     /// Outbound-initiation throttle: two independent GCRA buckets at the single
@@ -113,7 +119,7 @@ impl Manager {
     /// 1. **Per-organization** ([`Manager::account_throttle`]), keyed by
     ///    [`Self::throttle_bucket_key`]. The real limiter, because Anthropic's
     ///    limits are per-organization. Capacity scales WITH the account pool.
-    /// 2. **Fleet-wide ceiling** ([`Manager::fleet_throttle`]). Insurance against a
+    /// 2. **Provider fleet ceiling** ([`Manager::fleet_throttle`]). Insurance against a
     ///    shared-identity limit nobody has measured; set far looser so it does not
     ///    bind in normal use.
     ///
@@ -160,7 +166,11 @@ impl Manager {
 
         if let Some(spacing_ms) = self.fleet_throttle.effective_min_spacing() {
             let burst = self.fleet_throttle.effective_burst();
-            let mut tat = self.fleet_tat_ms.lock().await;
+            let Some(provider) = self.provider(idx) else {
+                return;
+            };
+            let mut tats = self.fleet_tat_ms.lock().await;
+            let tat = tats.entry(provider).or_insert(0);
             let (new_tat, fleet_allow_at) = throttle_slot(*tat, now, spacing_ms as i64, burst);
             *tat = new_tat;
             allow_at = allow_at.max(fleet_allow_at);

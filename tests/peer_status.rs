@@ -1260,7 +1260,11 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
     let store = PeerStore::open(&peers_path).expect("the peers file opens");
     let lent_to = tcr::peer::lease::lent_to(
         &store,
-        &[("alice@example.com".to_string(), vec!["work".to_string()])],
+        &[(
+            "alice@example.com".to_string(),
+            vec!["work".to_string()],
+            tcr::provider::Provider::Anthropic,
+        )],
     );
 
     // `until`/`ended` are the CLI's own derivation and it lives in the binary,

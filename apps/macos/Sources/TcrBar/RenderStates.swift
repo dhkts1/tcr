@@ -232,6 +232,117 @@ enum RenderStates {
             // (``claudeRoutePromptKeepsPanelSize(before:after:named:)``).
             ("25-claude-route-prompt", .loaded(fleet(healthyJSON)), false, nil),
             ("25b-claude-route-answered", .loaded(fleet(healthyJSON)), false, nil),
+            // A fleet holding both providers: both Claude accounts out of
+            // tokens, one Codex account ready and one held on its week. The
+            // strip counts each pool on its own row, and the money line adds
+            // the Codex tokens. See ``mixedFleetJSON``.
+            ("24-mixed-fleet", .loaded(fleet(mixedFleetJSON)), false, nil),
+            // A Codex account's card in its states, kept open so each draws as a
+            // card: a Pro plan's one weekly row (bob), spent on its week with
+            // credits (carol), both windows (dana), and refused (gil). See
+            // ``codexScene(_:)``.
+            ("25-codex-cards", .loaded(fleet(codexScene([.bob, .carol, .dana, .gil]))), false, nil),
+            // The other four: refused with a known hold (hal), signed out with its
+            // reason under its card (erin), a plan that reports no window (jo), and
+            // a reserved Codex account no request can reach (kim, in RESEARCH).
+            ("25b-codex-cards-b", .loaded(fleet(codexScene([.hal, .erin, .jo, .kim]))), false, nil),
+            // Every canonical row kept open, at the compact density ten rows take.
+            (
+                "25c-codex-cards-compact", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))),
+                false, nil
+            ),
+            // A Codex account before its first probe: unmeasured, both rows empty.
+            ("25e-codex-unmeasured", .loaded(fleet(unmeasuredCodexJSON)), false, nil),
+            // Every canonical row as the tab draws it, one line each, nothing pinned.
+            ("25g-codex-lines", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))), false, nil),
+            // The same lines, with the signed-out Codex account's hover card showing.
+            (
+                "25h-codex-hover-card", .loaded(fleet(codexScene(CanonicalCodexRow.allCases))),
+                false, nil
+            ),
+            // Both providers at compact density: ORCHARD is drawn once under each head, each
+            // box holding its own provider's members. See ``mixedFleetCompactJSON``.
+            ("24b-mixed-fleet-compact", .loaded(fleet(mixedFleetCompactJSON)), false, nil),
+            // A fleet of Codex accounts alone: one list and no head.
+            ("24c-codex-only", .loaded(fleet(codexScene([.bob, .dana, .carol, .erin]))), false, nil),
+            // Both providers, every Codex account switched off: the head still counts them.
+            ("24d-mixed-codex-all-parked", .loaded(fleet(mixedCodexAllParkedJSON)), false, nil),
+            // The empty fleet on a Mac holding a codex login: one more line under its detail.
+            // See ``codexSeeds(for:)``.
+            ("07b-empty-fleet-codex-login", .loaded(fleet("[]")), false, nil),
+            // A proxy serving the JS leaf, which cannot pool codex: the Codex line says why.
+            (
+                "26-codex-not-pooled-banner",
+                .loaded(
+                    fleet(
+                        codexRows(
+                            [.bob, .dana],
+                            extra: ["codexRoute": jsLeafRoute, "codexTraffic": quietCodexTraffic]))),
+                false, nil
+            ),
+            // The canonical refusals, while this Mac shares its accounts with trusted Macs.
+            ("26b-codex-refusals-banner", .loaded(fleet(codexRows([.bob, .carol]))), false, nil),
+            // Requests that ran on their own login, the one Codex line drawn dim.
+            (
+                "26c-codex-unpooled-banner",
+                .loaded(
+                    fleet(codexRows([.bob], extra: ["codexTraffic": ["refused10m": 0, "unpooled10m": 3]]))
+                ),
+                false, nil
+            ),
+            // Two codex sessions running and no Codex request reaching tcr for ten minutes.
+            ("26d-codex-no-requests-banner", .loaded(fleet(idleCodexJSON)), false, nil),
+            // The same, on a Mac running Claude Code too: no Claude account, so no Claude line.
+            ("26e-codex-only-no-claude-nag", .loaded(fleet(idleCodexJSON)), false, nil),
+            // A route that is not pooled and refusals at once: only the route's line shows.
+            (
+                "26f-codex-banner-precedence",
+                .loaded(fleet(codexRows([.bob, .dana], extra: ["codexRoute": jsLeafRoute]))),
+                false, nil
+            ),
+            // 26d with no command-line tcr on this Mac: the line names the tcr inside TcrBar.
+            ("26g-codex-no-requests-banner-no-path-tcr", .loaded(fleet(idleCodexJSON)), false, nil),
+            // Scene 22's Claude account beside a Codex account that is serving: the Claude
+            // line names Claude, and no Codex line shows.
+            ("26h-mixed-claude-no-requests-banner", .loaded(fleet(mixedClaudeQuietJSON)), false, nil),
+            // The tcr inside TcrBar is too old for a config holding a Codex account: the
+            // poll's banner names that tcr and the fix, where tcr's words name a version.
+            (
+                "09b-bundled-tcr-predates-codex",
+                .commandFailed(
+                    exitCode: 1,
+                    message:
+                        "error: could not read /Users/example/.config/teamclaude.json: account "
+                        + "\"bob@example.com/codex\" carries credentialVersion 2, which this build "
+                        + "only understands up to 1; refusing to load rather than silently "
+                        + "reinterpret its credential shape"),
+                false, nil
+            ),
+            // A Codex re-login tcr refused, its reason kept under erin's line for this app
+            // run. See ``codexNotesFixture(for:)``.
+            ("25d-codex-relogin-refused", .loaded(fleet(codexReloginRefusedJSON)), false, nil),
+            // ivy added to ORCHARD: tcr's warning that no Codex request can ask for a
+            // group, kept under her line.
+            ("25f-codex-group-add-warning", .loaded(fleet(codexGroupAddWarningJSON)), false, nil),
+            // The Sessions tab of a fleet holding both providers: alice's Claude
+            // session and bob's Codex one, both in teamclaude-rs, bob's joined by
+            // the first line of his rollout file. It shows the mixed fleet's
+            // footer, the `Codex` lead on bob's subtitle and the summary's two
+            // clause groups.
+            // See ``sessionsTabMixedFleet``.
+            ("16b-sessions-tab-mixed", .loaded(sessionsTabMixedFleet), false, nil),
+            // A Codex-only fleet with no session and no Codex request in the last
+            // hour: the Codex-only empty line and footer.
+            ("16c-sessions-tab-codex-only-empty", .loaded(codexOnlyQuietSessionsFleet), false, nil),
+            // A proxy too old to record Codex sessions: bob served seven requests
+            // in the last hour and the list holds alice's session alone, so the
+            // tab says why bob's is missing above it.
+            ("16d-sessions-tab-old-server-codex", .loaded(oldServerCodexSessionsFleet), false, nil),
+            // The Tools tab with a running Codex call: bob's one-shot
+            // `exec_command` filling its own 120s ring, red with 20s left, beside
+            // alice's calm Bash ring and its ✕, `no Kill` in bob's slot, and the
+            // Codex categories in BY TOOL. See ``toolsTabCodexFleet``.
+            ("17c-tools-tab-codex", .loaded(toolsTabCodexFleet), false, nil),
         ]
     }
 
@@ -308,6 +419,23 @@ enum RenderStates {
             ])
     }
 
+    /// The Codex notes scenes 25d and 25f draw under a line, recorded against the rows
+    /// those scenes draw. Every other scene gets none, so a note an operator's own run
+    /// recorded never reaches a render.
+    private static func codexNotesFixture(for sceneName: String) -> CodexNotes {
+        var notes = CodexNotes()
+        switch sceneName {
+        case "25d-codex-relogin-refused":
+            notes.recordReloginRefusal(routedRefusal, for: sceneRow(.erin))
+        case "25f-codex-group-add-warning":
+            notes.recordGroupAddNotice(
+                orchardWarning, group: "orchard", for: sceneRow(.ivy).ref)
+        default:
+            break
+        }
+        return notes
+    }
+
     /// Seeds for scene 22, the one scene that needs
     /// ``FleetView``'s `initialZeroRequestsSince`/`initialClaudeCount`/
     /// `initialClaudeRoute`. Every other scene leaves all three `nil`, which
@@ -315,6 +443,50 @@ enum RenderStates {
     private static let noRequestsBannerZeroSince = Date().addingTimeInterval(-600)
     private static let noRequestsBannerRoute = ClaudeRouteRead.Route(
         url: "http://127.0.0.1:9443", source: "settings.json")
+
+    /// The scenes that seed the Claude line's clock, count and route: scene 22,
+    /// and the two Codex scenes that show what that line does beside a Codex
+    /// account.
+    private static let claudeBannerScenes: Set<String> = [
+        "22-no-requests-banner", "26e-codex-only-no-claude-nag",
+        "26h-mixed-claude-no-requests-banner",
+    ]
+
+    /// What a scene tells the panel about codex on this Mac and about its Codex
+    /// line's inputs. The harness never reads the process table, the clock, the
+    /// peers file, the bundle or the disk for these, so a scene that needs one
+    /// names it here.
+    private struct CodexSeeds {
+        var codexCount: Int?
+        var codexZeroSince: Date?
+        var peerSharing: Bool?
+        var presence: CodexPresence = .absent
+        var home: String?
+        var bundledTcr: String?
+    }
+
+    /// The seeds for one scene: none, the panel's own default, for every scene
+    /// but these.
+    private static func codexSeeds(for sceneName: String) -> CodexSeeds {
+        switch sceneName {
+        case "07b-empty-fleet-codex-login":
+            return CodexSeeds(
+                presence: CodexPresence(codexHome: "/Users/example/.codex", hasLoginFile: true),
+                home: "/Users/example")
+        case "26b-codex-refusals-banner":
+            return CodexSeeds(peerSharing: true)
+        case "26d-codex-no-requests-banner":
+            return CodexSeeds(codexCount: 2, codexZeroSince: noRequestsBannerZeroSince)
+        case "26e-codex-only-no-claude-nag":
+            return CodexSeeds(codexCount: 1, codexZeroSince: noRequestsBannerZeroSince)
+        case "26g-codex-no-requests-banner-no-path-tcr":
+            return CodexSeeds(
+                codexCount: 2, codexZeroSince: noRequestsBannerZeroSince,
+                bundledTcr: "/Applications/TcrBar.app/Contents/MacOS/tcr")
+        default:
+            return CodexSeeds()
+        }
+    }
 
     /// The ``UpdateState`` a scene's `Updater` should report, or `nil` for
     /// every scene not about the update row — the same by-name lookup
@@ -377,6 +549,80 @@ enum RenderStates {
         ]
     }
 
+    /// The sheet for a Codex account: the chooser, the sign-in in each of its phases,
+    /// the import, and what the sheet says when tcr cannot find codex. Every reason and
+    /// notice is inlined as tcr sends it, because a render never reads the test bundle.
+    private static var codexSheetScenes:
+        [(name: String, phase: LoginPhase, url: URL?, facts: LoginSheetFacts)]
+    {
+        let authorize = URL(
+            string: "https://auth.openai.com/oauth/authorize?client_id=app_EXAMPLE&state=RENDER-FIXTURE")
+        let signIn = LoginSheetFacts(request: .codex(account: nil))
+        let home = "/Users/example/.codex"
+        let saved = LoginSheetFacts(
+            request: .codex(account: nil),
+            notices: [
+                "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep "
+                    + "the marker scoped to that launch, since unmarked connections keep their own login",
+                "codex needs a login of its own to start, even when pooled, and none is at "
+                    + "/Users/example/.codex/auth.json: unless codex keeps its login in the "
+                    + "keyring, run `codex login` once",
+                "the tcr at /usr/local/bin/tcr (0.2.44) predates Codex accounts: update it before "
+                    + "it next starts — it would read this login as a Claude account and send its "
+                    + "token to Anthropic",
+            ],
+            savedPlan: "ChatGPT Pro")
+        var savedWithoutPathTcr = saved
+        savedWithoutPathTcr.notices = Array(saved.notices.prefix(2))
+        savedWithoutPathTcr.bundledTcrWithoutCLI = "/Applications/TcrBar.app/Contents/MacOS/tcr"
+        let missing = LoginSheetFacts(request: .codex(account: nil), failureCode: "codex-missing")
+        var refusedChoice = missing
+        refusedChoice.refusedCodexChoice = "~/Downloads/codex is not an executable file."
+        let missingReason =
+            "could not find the codex CLI (searched TCR_CODEX_BIN, CODEX_BIN, PATH, "
+            + "/Users/example/.local/bin, /Users/example/.cargo/bin, /opt/homebrew/bin, "
+            + "/usr/local/bin, /Users/example/.npm-global/bin). Install it, or set TCR_CODEX_BIN "
+            + "to its path. Nothing was written."
+        return [
+            ("20e-login-choose", .choosing, nil, LoginSheetFacts()),
+            ("20f-login-codex-opening", .opening, nil, signIn),
+            ("20g-login-codex-waiting", .waitingForBrowser(email: nil), authorize, signIn),
+            ("20h-login-codex-waiting-no-url", .waitingForBrowser(email: nil), nil, signIn),
+            ("20i-login-codex-saved", .saved(account: "bob@example.com"), nil, saved),
+            (
+                "20j-login-codex-refused", .failed(reason: routedRefusal), nil,
+                LoginSheetFacts(request: .codex(account: nil), failureCode: "codex-routed")
+            ),
+            ("20k-login-codex-missing", .failed(reason: missingReason), nil, missing),
+            (
+                "20l-login-codex-identity",
+                .failed(
+                    reason:
+                        "the ChatGPT login that came back is carol@example.com, not the one "
+                        + "'erin@example.com/codex' holds. Sign out of chatgpt.com in the browser "
+                        + "first, or use a private window, then retry "
+                        + "`tcr login --codex --account erin@example.com/codex`. Nothing was written."),
+                nil,
+                LoginSheetFacts(
+                    request: .codex(account: "erin@example.com/codex"), failureCode: "codex-identity")
+            ),
+            (
+                "20m-codex-import-confirm", .confirmingImport(home: home, account: nil), nil,
+                LoginSheetFacts(request: .codexImport(home: home, account: nil))
+            ),
+            (
+                "20n-codex-import-saved", .saved(account: "bob@example.com"), nil,
+                LoginSheetFacts(
+                    request: .codexImport(home: home, account: nil), savedPlan: "ChatGPT Pro")
+            ),
+            (
+                "20i-login-codex-saved-no-path-tcr", .saved(account: "bob@example.com"), nil,
+                savedWithoutPathTcr
+            ),
+            ("20o-login-codex-choice-refused", .failed(reason: missingReason), nil, refusedChoice),
+        ]
+    }
+
     /// Which tab a scene opens on — `.accounts` for every scene above scene
     /// 16, so this stays a lookup by name rather than a fifth tuple element
     /// every existing scene would have to grow.
@@ -384,10 +630,11 @@ enum RenderStates {
         switch sceneName {
         case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
             "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed",
-            "22b-sessions-tab-real-fleet":
+            "22b-sessions-tab-real-fleet", "16b-sessions-tab-mixed",
+            "16c-sessions-tab-codex-only-empty", "16d-sessions-tab-old-server-codex":
             return .sessions
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
-            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet":
+            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex":
             return .tools
         default: return .accounts
         }
@@ -404,6 +651,9 @@ enum RenderStates {
             return FleetSectionRow.id(group: .ungrouped, accountID: "spent-5@example.com")
         case "15c-parked-group-hover":
             return FleetSectionRow.id(group: .named("dev"), accountID: "carol@example.com")
+        case "25h-codex-hover-card":
+            return FleetSectionRow.id(
+                group: .ungrouped, accountID: CanonicalCodexRow.erin.rawValue)
         default: return nil
         }
     }
@@ -415,6 +665,16 @@ enum RenderStates {
         switch sceneName {
         case "02e-mixed-thirteen-kept-open":
             return KeptOpenCards(["ok-2@example.com", "spent-2@example.com"])
+        // The Codex card scenes keep their accounts' cards open, so each state
+        // draws as the card it is.
+        case "25-codex-cards":
+            return KeptOpenCards([CanonicalCodexRow.bob, .carol, .dana, .gil].map(\.rawValue))
+        case "25b-codex-cards-b":
+            return KeptOpenCards([CanonicalCodexRow.hal, .erin, .jo, .kim].map(\.rawValue))
+        case "25c-codex-cards-compact":
+            return KeptOpenCards(CanonicalCodexRow.allCases.map(\.rawValue))
+        case "25e-codex-unmeasured":
+            return KeptOpenCards(["lee@example.com/codex"])
         default: return KeptOpenCards()
         }
     }
@@ -496,6 +756,23 @@ enum RenderStates {
                     cwd: "/Users/bob/git/demo-ui", name: "demo-ui-b2", status: "busy"),
             ]
         }
+        // The canonical sessions' files: alice's Claude Code session file, and
+        // the file the join makes for bob from line 1 of his codex rollout,
+        // which carries his folder and nothing else. The old-server scene has
+        // no Codex session to join.
+        let alice = SessionFile(
+            sessionId: "a1f3c2d4-0000-4000-8000-000000000001",
+            cwd: "/Users/example/git/teamclaude-rs", name: "teamclaude-rs-c7", status: "busy")
+        let bob = SessionFile(
+            sessionId: "019a3c5e-0000-7000-8000-000000000002",
+            cwd: "/Users/example/git/teamclaude-rs")
+        switch sceneName {
+        case "16b-sessions-tab-mixed", "17c-tools-tab-codex":
+            return [alice.sessionId: alice, bob.sessionId: bob]
+        case "16d-sessions-tab-old-server-codex":
+            return [alice.sessionId: alice]
+        default: break
+        }
         guard
             sceneName == "16-sessions-tab" || sceneName == "17-tools-tab"
                 || sceneName == "17b-tools-tab-timeout-class-open"
@@ -526,6 +803,10 @@ enum RenderStates {
 
     @MainActor
     static func run(into directory: URL) -> Never {
+        // A Codex row's note shortens its codex home against the home folder, and
+        // the fixtures' homes are `/Users/example`: so every scene reads the same
+        // on every Mac, and none names this one's user.
+        HomePath.current = "/Users/example"
         do {
             try FileManager.default.createDirectory(
                 at: directory, withIntermediateDirectories: true)
@@ -571,16 +852,48 @@ enum RenderStates {
                 if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        // The Codex sheets, the same way, each with what it says beyond its phase.
+        for scene in codexSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderSheet(
+                    (scene.name, scene.phase, scene.url), appearance: appearance, into: directory,
+                    facts: scene.facts)
+                {
+                    written += 1
+                }
+            }
+        }
         for scene in peerSceneList {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeer(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        // The same peers, with a Codex account in the fleet.
+        for scene in mixedPeerScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeer(scene, appearance: appearance, holdsCodex: true, into: directory) {
+                    written += 1
+                }
+            }
+        }
         for scene in peerSheetScenes {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerSheet(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        // Two of those sheets again, with a Codex account in the fleet.
+        for scene in mixedPeerSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeerSheet(
+                    scene, appearance: appearance, holdsCodex: true, into: directory)
+                {
+                    written += 1
+                }
             }
         }
         for scene in peerMovedSheetScenes {
@@ -729,11 +1042,18 @@ enum RenderStates {
             UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
         }
 
+        // Computed once, so the panel drawn with a pin and without it carry the
+        // same seeds.
+        let seeds = codexSeeds(for: scene.name)
+
         // A closure over the hover pin, so a scene that pins a hover card can
         // also be drawn without it and the two compared
         // (``hoverCardKeepsPanelSize(without:with:named:)``).
         let panel = {
-            (hoverCard: String?, litAccount: String?, routeController: ClaudeRouteController) in
+            (
+                hoverCard: String?, litAccount: String?, routeController: ClaudeRouteController,
+                bannerSnapshot: CodexBannerSnapshot?
+            ) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -759,6 +1079,12 @@ enum RenderStates {
                 removeController: removeControllerFixture(for: scene.name),
                 routeController: routeController,
                 startServerAtLaunch: .constant(false),
+                // Render mode never looks at this Mac's codex: `.absent`, except in
+                // the one scene that names a presence of its own.
+                codexPresence: seeds.presence,
+                // Empty, except in the two scenes that draw a note under a line.
+                codexNotes: CodexNoteStore(notes: codexNotesFixture(for: scene.name)),
+                codexBannerSnapshot: bannerSnapshot,
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
                 initialSessionFiles: sessionFilesFixture(for: scene.name),
@@ -766,11 +1092,16 @@ enum RenderStates {
                 initialRunningProcesses: runningProcessesFixture(
                     for: scene.name, state: scene.state),
                 initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name),
-                initialZeroRequestsSince: scene.name == "22-no-requests-banner"
+                initialZeroRequestsSince: claudeBannerScenes.contains(scene.name)
                     ? noRequestsBannerZeroSince : nil,
-                initialClaudeCount: scene.name == "22-no-requests-banner" ? 1 : nil,
-                initialClaudeRoute: scene.name == "22-no-requests-banner"
+                initialClaudeCount: claudeBannerScenes.contains(scene.name) ? 1 : nil,
+                initialClaudeRoute: claudeBannerScenes.contains(scene.name)
                     ? noRequestsBannerRoute : nil,
+                initialCodexCount: seeds.codexCount,
+                initialCodexZeroRequestsSince: seeds.codexZeroSince,
+                initialPeerSharing: seeds.peerSharing,
+                initialHomeDirectory: seeds.home,
+                initialBundledTcrWithoutCLI: seeds.bundledTcr,
                 initialHoverCard: hoverCard,
                 initialLitAccount: litAccount,
                 initialKeptOpen: keptOpenFixture(for: scene.name)
@@ -788,32 +1119,87 @@ enum RenderStates {
         }
         let hoverCard = hoverCardFixture(for: scene.name)
         let litAccount = litAccountFixture(for: scene.name)
-        let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name))
+        let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name), nil)
 
-        // The shipped default stays unsuffixed — every existing filename this
-        // harness produces is unchanged — and only the forced `.comfortable`
-        // variant gets `-comfortable`, per `densityVariantScenes`. Computed
-        // here rather than in `rasterise`, which is shared with the sheet
-        // scenes and has no density of its own.
+        // The main pass is `.auto`, the shipped default, so its files are
+        // `<scene>-auto-<appearance>.png`; the forced `.comfortable` variant's
+        // are `<scene>-comfortable-<appearance>.png`, per
+        // `densityVariantScenes`. Only a `.compact` render, which no pass asks
+        // for, would be unsuffixed. Computed here rather than in `rasterise`,
+        // which is shared with the sheet scenes and has no density of its own.
         let name =
             density == .compact
             ? "\(scene.name)-\(appearance.rawValue).png"
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
         if hoverCard != nil || litAccount != nil,
             !hoverCardKeepsPanelSize(
-                without: panel(nil, nil, claudeRouteFixture(for: scene.name)), with: view,
+                without: panel(nil, nil, claudeRouteFixture(for: scene.name), nil), with: view,
                 named: name)
         {
             return false
         }
         if scene.name == "25b-claude-route-answered",
             !claudeRoutePromptKeepsPanelSize(
-                before: panel(nil, nil, claudeRouteFixture(for: "25-claude-route-prompt")),
+                before: panel(nil, nil, claudeRouteFixture(for: "25-claude-route-prompt"), nil),
                 after: view, named: name)
         {
             return false
         }
+        if scene.name == "26b-codex-refusals-banner" || scene.name == "16d-sessions-tab-old-server-codex" {
+            let snapshot = CodexBannerSnapshot()
+            guard
+                codexBannerKeepsPanelSize(
+                    snapshot: snapshot,
+                    panel: panel(nil, nil, claudeRouteFixture(for: scene.name), snapshot),
+                    sessions: scene.name == "16d-sessions-tab-old-server-codex")
+            else { return false }
+        }
         return rasterise(view, named: name, into: directory)
+    }
+
+    /// Reuse one hosting view through polling and reopening, as the real popover does.
+    /// A new opening must change its height: the positive control rules out a host
+    /// that stopped observing the banner altogether.
+    @MainActor
+    private static func codexBannerKeepsPanelSize<Panel: View>(
+        snapshot: CodexBannerSnapshot, panel: Panel, sessions: Bool = false
+    ) -> Bool {
+        snapshot.observe(nil)
+        snapshot.observeSessionsLine(nil)
+        snapshot.decideAtOpen()
+        let host = NSHostingView(rootView: panel)
+        func size() -> NSSize {
+            CFRunLoopRunInMode(.defaultMode, 0.02, false)
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize
+        }
+        let closed = size()
+        let longNotice = String(repeating: "An example route is unavailable. ", count: 8)
+        if sessions {
+            snapshot.observeSessionsLine(longNotice)
+        } else {
+            snapshot.observe(.notPooled(reason: longNotice))
+        }
+        let polled = size()
+        guard closed == polled else {
+            FileHandle.standardError.write(
+                Data("Codex banner check: polling changed the open panel's size\n".utf8))
+            return false
+        }
+        snapshot.decideAtOpen()
+        let reopened = size()
+        guard reopened.height > closed.height else {
+            FileHandle.standardError.write(
+                Data("Codex banner check: reopening did not show the new banner\n".utf8))
+            return false
+        }
+        if sessions { snapshot.observeSessionsLine(nil) } else { snapshot.observe(nil) }
+        guard size() == reopened else {
+            FileHandle.standardError.write(Data("Codex banner check: polling removed the open banner\n".utf8))
+            return false
+        }
+        print("  Codex banner check: one persistent host stays fixed until reopened")
+        return true
     }
 
     /// One state of the sign-in sheet, rendered on its own.
@@ -821,14 +1207,22 @@ enum RenderStates {
     /// Same appearance dance as ``render(_:appearance:into:)`` and the same
     /// writer, and deliberately NO controller of any kind: a ``LoginSession``
     /// would spawn `tcr login`. The harness draws a phase, never a login.
+    ///
+    /// `facts` is everything a Codex sheet says beyond its phase, empty for the Claude
+    /// sheets, and `displayHome` the home a codex folder is shortened against: always
+    /// `/Users/example`, never the rendering Mac's.
     @MainActor
     private static func renderSheet(
         _ scene: (name: String, phase: LoginPhase, url: URL?),
         appearance: Appearance,
-        into directory: URL
+        into directory: URL,
+        facts: LoginSheetFacts = LoginSheetFacts(),
+        displayHome: String = "/Users/example"
     ) -> Bool {
         return withDrawingAppearance(appearance.nsAppearance) {
-            renderSheetUnderCurrentAppearance(scene, appearance: appearance, into: directory)
+            renderSheetUnderCurrentAppearance(
+                scene, appearance: appearance, into: directory, facts: facts,
+                displayHome: displayHome)
         }
     }
 
@@ -839,7 +1233,9 @@ enum RenderStates {
     private static func renderSheetUnderCurrentAppearance(
         _ scene: (name: String, phase: LoginPhase, url: URL?),
         appearance: Appearance,
-        into directory: URL
+        into directory: URL,
+        facts: LoginSheetFacts,
+        displayHome: String
     ) -> Bool {
         // The panel underneath is the ordinary healthy Accounts tab, built the
         // same way every other scene builds one — pinned state, harness
@@ -859,6 +1255,7 @@ enum RenderStates {
                 removeController: RemoveAccountController(),
                 routeController: ClaudeRouteController(pinned: nil),
                 startServerAtLaunch: .constant(false),
+                codexPresence: .absent,
                 snapshotMode: true,
                 initialTab: .accounts,
                 initialSessionFiles: [:],
@@ -877,9 +1274,12 @@ enum RenderStates {
                     // an offscreen layer whose backing showed as white corners
                     // around the light-mode sheet, which is not a surface this
                     // app has.
-                    LoginSheet(phase: scene.phase, authorizeURL: scene.url, snapshotMode: true)
-                        .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
-                        .shadow(radius: sheetShadowRadius)
+                    LoginSheet(
+                        phase: scene.phase, authorizeURL: scene.url,
+                        snapshotMode: true, facts: facts, displayHome: displayHome
+                    )
+                    .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
+                    .shadow(radius: sheetShadowRadius)
                 }
             }
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
@@ -1005,60 +1405,15 @@ enum RenderStates {
             // 3. Two found, neither trusted, the second with its name NOT
             //    announced (decision row 9), so this side has an address and
             //    no name and the row is drawn rather than hidden.
-            (
-                "47-peers-found-untrusted",
-                peersSnapshot(
-                    PeerListDocument(
-                        finding: true,
-                        peers: [
-                            .init(
-                                name: "studio-mac", address: "studio-mac.local:7749",
-                                lastSeenMs: peerMsAgo(2)),
-                            .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6)),
-                        ])),
-                false
-            ),
+            ("47-peers-found-untrusted", peersSnapshot(foundUntrustedPeers), false),
             // 4. The safe steady state, and the one most operators stay in:
             //    one Mac trusted and carrying, sharing still off.
-            (
-                "48-peers-trusted-share-off",
-                peersSnapshot(
-                    PeerListDocument(
-                        finding: true,
-                        peers: [
-                            .init(
-                                id: "tcr-4b8we1r0zp", name: "studio-mac",
-                                address: "studio-mac.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(3), carries: true),
-                            .init(
-                                name: "attic-nuc", address: "attic-nuc.local:7749",
-                                lastSeenMs: peerMsAgo(40)),
-                        ])),
-                false
-            ),
+            ("48-peers-trusted-share-off", peersSnapshot(trustedShareOffPeers), false),
             // 5. The one screen where plaintext crosses a machine boundary, so
             //    the one screen that uses the reserved hue: sharing on, with
             //    the meter that says how much. The second row reads `nothing
             //    yet` rather than a blank, zero spent is a measurement.
-            (
-                "49-peers-share-on",
-                peersSnapshot(
-                    PeerListDocument(
-                        finding: true, sharing: true,
-                        peers: [
-                            .init(
-                                id: "tcr-4b8we1r0zp", name: "studio-mac",
-                                address: "studio-mac.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
-                                leaseSpent: 0.34, leaseTtlSeconds: 240),
-                            .init(
-                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
-                                address: "attic-nuc.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(5), carries: true, serves: true,
-                                leaseSpent: 0, leaseTtlSeconds: 300),
-                        ])),
-                false
-            ),
+            ("49-peers-share-on", peersSnapshot(shareOnPeers), false),
             // 6. The other direction, and the reason the mesh exists: this
             //    Mac's own accounts are dry (`dry: true` puts the header's
             //    summary line in its own honest state) and studio-mac is
@@ -1701,6 +2056,71 @@ enum RenderStates {
         ]
     }
 
+    /// Scene 47's peers: two found, neither trusted, the second announcing no name.
+    private static let foundUntrustedPeers = PeerListDocument(
+        finding: true,
+        peers: [
+            .init(
+                name: "studio-mac", address: "studio-mac.local:7749",
+                lastSeenMs: peerMsAgo(2)),
+            .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6)),
+        ])
+
+    /// Scene 48's peers: one Mac trusted and carrying, sharing still off.
+    private static let trustedShareOffPeers = PeerListDocument(
+        finding: true,
+        peers: [
+            .init(
+                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                address: "studio-mac.local:7749", trusted: true,
+                lastSeenMs: peerMsAgo(3), carries: true),
+            .init(
+                name: "attic-nuc", address: "attic-nuc.local:7749",
+                lastSeenMs: peerMsAgo(40)),
+        ])
+
+    /// Scene 49's peers: sharing on, two Macs trusted and serving.
+    private static let shareOnPeers = PeerListDocument(
+        finding: true, sharing: true,
+        peers: [
+            .init(
+                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                address: "studio-mac.local:7749", trusted: true,
+                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
+                leaseSpent: 0.34, leaseTtlSeconds: 240),
+            .init(
+                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                address: "attic-nuc.local:7749", trusted: true,
+                lastSeenMs: peerMsAgo(5), carries: true, serves: true,
+                leaseSpent: 0, leaseTtlSeconds: 300),
+        ])
+
+    /// Scenes 47 to 49 again: the same peers, with a Codex account in the fleet.
+    ///
+    /// No Mac lends, serves or carries a Codex request, so each promise names Claude,
+    /// and a line under the Share card says where Codex requests go instead.
+    private static var mixedPeerScenes:
+        [(
+            name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal,
+            detailsOpen: Bool
+        )]
+    {
+        [
+            (
+                "47b-peers-found-untrusted-mixed",
+                peersSnapshot(foundUntrustedPeers, holdsCodex: true), false, PeerRefusal(), false
+            ),
+            (
+                "48b-peers-trusted-share-off-mixed",
+                peersSnapshot(trustedShareOffPeers, holdsCodex: true), false, PeerRefusal(), false
+            ),
+            (
+                "49b-peers-share-on-mixed",
+                peersSnapshot(shareOnPeers, holdsCodex: true), false, PeerRefusal(), false
+            ),
+        ]
+    }
+
     /// The fixture Settings > Peers renders under `--render-settings`, which
     /// is the Settings > Peers mockup (kept outside the tree)'s own scene 58:
     /// sharing on, two Macs trusted, one asleep, and the five This Mac
@@ -1805,8 +2225,11 @@ enum RenderStates {
     /// rendered as three ended rows.
     static let peerNow = Date(timeIntervalSince1970: 1_786_000_000)
 
-    private static func peersSnapshot(_ document: PeerListDocument) -> PeersSnapshot {
-        PeersSnapshotBuilder.snapshot(from: document, now: peerNow)
+    /// `holdsCodex` builds the snapshot a fleet holding a Codex account reads.
+    private static func peersSnapshot(_ document: PeerListDocument, holdsCodex: Bool = false)
+        -> PeersSnapshot
+    {
+        PeersSnapshotBuilder.snapshot(from: document, now: peerNow, holdsCodex: holdsCodex)
     }
 
     /// One Peers-tab state, drawn inside the REAL panel shell.
@@ -1815,6 +2238,8 @@ enum RenderStates {
     /// composed into it, which is what lets these scenes carry the header, the
     /// summary line and the four-tab strip with Peers selected, the mockup's
     /// own frame, without `FleetView` needing a way to inject fixture peers.
+    ///
+    /// `holdsCodex` draws the tab of a fleet holding a Codex account.
     @MainActor
     private static func renderPeer(
         _ scene: (
@@ -1822,13 +2247,15 @@ enum RenderStates {
             detailsOpen: Bool
         ),
         appearance: Appearance,
+        holdsCodex: Bool = false,
         into directory: URL
     ) -> Bool {
         withDrawingAppearance(appearance.nsAppearance) {
             rasterise(
                 peersPanel(
                     snapshot: scene.snapshot, dry: scene.dry, refusal: scene.refusal,
-                    detailsOpen: scene.detailsOpen, appearance: appearance),
+                    detailsOpen: scene.detailsOpen, holdsCodex: holdsCodex,
+                    appearance: appearance),
                 named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
         }
     }
@@ -1888,18 +2315,37 @@ enum RenderStates {
         ]
     }
 
+    /// Scenes 58 and 60 again, with a Codex account in the fleet: a trusted Mac
+    /// never carries a Codex request, so what the pin buys is named as Claude
+    /// traffic, over the tab that fleet draws.
+    private static var mixedPeerSheetScenes:
+        [(name: String, state: PeerPairState, typed: String, expiresIn: TimeInterval?)]
+    {
+        [
+            ("58b-trust-compare-mixed", .comparing(code: "418902"), "", nil),
+            ("60b-trust-done-mixed", .done(peer: "tcr-4b8we1r0zp"), "", nil),
+        ]
+    }
+
     /// One Trust sheet state, over the found-rows tab it opens from.
+    ///
+    /// `holdsCodex` draws the sheet, and the tab under it, in a fleet holding a
+    /// Codex account.
     @MainActor
     private static func renderPeerSheet(
         _ scene: (name: String, state: PeerPairState, typed: String, expiresIn: TimeInterval?),
         appearance: Appearance,
+        holdsCodex: Bool = false,
         into directory: URL
     ) -> Bool {
         withDrawingAppearance(appearance.nsAppearance) {
             let run = PeerPairRun(pinned: scene.state)
             run.compare.set(scene.typed)
             let view =
-                peersPanel(snapshot: trustSheetTab, dry: false, appearance: appearance)
+                peersPanel(
+                    snapshot: trustSheetTab(holdsCodex: holdsCodex), dry: false,
+                    holdsCodex: holdsCodex, appearance: appearance
+                )
                 .overlay {
                     ZStack {
                         Color.black.opacity(sheetScrimAlpha)
@@ -1908,7 +2354,8 @@ enum RenderStates {
                             state: scene.state,
                             compare: .constant(run.compare),
                             expiresIn: scene.expiresIn,
-                            snapshotMode: true
+                            snapshotMode: true,
+                            holdsCodex: holdsCodex
                         )
                         .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
                         .shadow(radius: sheetShadowRadius)
@@ -2230,7 +2677,8 @@ enum RenderStates {
 
     /// The tab underneath every Trust sheet: the found row the sheet was
     /// opened from, already waiting, which is what the live panel draws.
-    private static var trustSheetTab: PeersSnapshot {
+    /// `holdsCodex` builds it for a fleet holding a Codex account.
+    private static func trustSheetTab(holdsCodex: Bool) -> PeersSnapshot {
         PeersSnapshotBuilder.waiting(
             peersSnapshot(
                 PeerListDocument(
@@ -2239,15 +2687,19 @@ enum RenderStates {
                         .init(
                             name: "studio-mac", address: "studio-mac.local:7749",
                             lastSeenMs: peerMsAgo(8))
-                    ])),
+                    ]),
+                holdsCodex: holdsCodex),
             knocked: ["studio-mac.local:7749"])
     }
 
     /// The Peers tab as a panel, for the scene renderers above.
     @MainActor
+    ///
+    /// `holdsCodex` is the pinned controller's: the tab of a fleet holding a Codex
+    /// account.
     private static func peersPanel(
         snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal = PeerRefusal(),
-        detailsOpen: Bool = false,
+        detailsOpen: Bool = false, holdsCodex: Bool = false,
         appearance: Appearance
     ) -> some View {
         // Density: absent, which is `PanelDensityPreference`'s own
@@ -2286,7 +2738,8 @@ enum RenderStates {
                 },
                 content: {
                     PeersTabV4(
-                        controller: PeerController.pinned(scene.snapshot, refusal: refusal),
+                        controller: PeerController.pinned(
+                            scene.snapshot, refusal: refusal, holdsCodex: holdsCodex),
                         snapshotMode: true,
                         refusalDetailsOpen: detailsOpen)
                 },
@@ -2505,6 +2958,16 @@ enum RenderStates {
                             mode: .serve,
                             handedKeyUntil: Int64(peerNow.timeIntervalSince1970) + 166,
                             peer: "studio-mac", now: peerNow)))),
+            // A Codex account's card with the waiting scene's exit: must-locked to
+            // a Mac that is down. A Codex request always leaves from this Mac, so
+            // the card draws no picker, no must switch and no waiting pill, and
+            // says instead that tcr refuses the account, and how to clear the lock.
+            ControlScene(
+                name: "w12-exits-codex",
+                view: exitsCodexCard(
+                    .init(
+                        route: .via(exitPeerId), strict: true, peerDown: true,
+                        waitingSeconds: 40))),
         ]
     }
 
@@ -2548,6 +3011,24 @@ enum RenderStates {
         // file's own fixture stopped decoding, so the scene draws nothing
         // rather than a card invented here.
         guard let account = fleet(exitsAliceJSON).accounts.first else {
+            return AnyView(EmptyView())
+        }
+        return AnyView(
+            AccountCard(
+                account: account, shape: .full, now: peerNow,
+                exit: exit, exitPeers: ["studio-mac", "attic-nuc"],
+                exitPeerRows: exitPeerRows, snapshotMode: true,
+                actions: { EmptyView() }
+            )
+            .frame(width: V4.panelWidth))
+    }
+
+    /// ``exitsCard(_:)`` over canonical bob, a Codex account, with every instant
+    /// pinned to ``peerNow``: the same card arguments, so the only difference is
+    /// what a Codex card draws for an exit.
+    @MainActor
+    private static func exitsCodexCard(_ exit: AccountExit) -> AnyView {
+        guard let account = fleet("[\(codexRow(.bob, now: peerNow))]").accounts.first else {
             return AnyView(EmptyView())
         }
         return AnyView(
@@ -2642,7 +3123,8 @@ enum RenderStates {
         -> [String: RunningCallStats]
     {
         guard
-            sceneName == "17-tools-tab" || sceneName == "17b-tools-tab-timeout-class-open",
+            sceneName == "17-tools-tab" || sceneName == "17b-tools-tab-timeout-class-open"
+                || sceneName == "17c-tools-tab-codex",
             case .loaded(let fleet) = state,
             let entry = fleet.toolsRunning.first(where: { $0.call.tool == "Bash" })
         else { return [:] }
@@ -2829,7 +3311,14 @@ enum RenderStates {
         // reset offsets are measured from the same fixed instant its card
         // renders against, rather than a real `Date()` that keeps moving
         // out from under a `now` that does not.
-        now: Date = Date()
+        now: Date = Date(),
+        // Wire `"provider"`. `nil` omits the key, the Anthropic row and the
+        // older-server row alike, which every existing scene keeps.
+        provider: String? = nil,
+        // Any other wire keys, laid over the row last, so they win. Empty for
+        // every existing scene, which therefore builds the same text it always
+        // has.
+        extra: [String: Any] = [:]
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
@@ -2871,7 +3360,7 @@ enum RenderStates {
         let planFragment = plan.map { "\"plan\":\"\($0)\"," } ?? ""
         let orgFragment = orgUuid.map { "\"orgUuid\":\"\($0)\"," } ?? ""
         let gateFragment = gate.map { "\"gate\":\"\($0)\"," } ?? ""
-        return """
+        let row = """
             {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
              \(planFragment)\(orgFragment)\(gateFragment)
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
@@ -2888,6 +3377,13 @@ enum RenderStates {
              "source":"\(source)","serverSha":"abc1234","serverDirty":false,
              "usage":\(usage)}
             """
+        guard provider != nil || !extra.isEmpty else { return row }
+        guard
+            var object = (try? JSONSerialization.jsonObject(with: Data(row.utf8)))
+                as? [String: Any]
+        else { preconditionFailure("account(\(name)) did not build a JSON object") }
+        if let provider { object["provider"] = provider }
+        return jsonText(object, laying: extra)
     }
 
     // MARK: Usage fixtures
@@ -3113,7 +3609,14 @@ enum RenderStates {
     /// an offline `nil`), and zero requests served: the colleague's fleet
     /// this feature exists for.
     private static var zeroRequestsJSON: String {
-        "[\(account("colleague@example.com", quota: "0.0", state: "ok", source: "live", plan: "Team Standard", orgUuid: "33333333-3333-3333-3333-333333333333", requests: 0))]"
+        "[\(colleagueRow)]"
+    }
+
+    /// Scene 22's one account: live, and at zero requests.
+    private static var colleagueRow: String {
+        account(
+            "colleague@example.com", quota: "0.0", state: "ok", source: "live", plan: "Team Standard",
+            orgUuid: "33333333-3333-3333-3333-333333333333", requests: 0)
     }
 
     /// F1's wire shape, attached to
@@ -4016,4 +4519,1583 @@ enum RenderStates {
             "carol@example.com", quota: "0.12", state: "ok", probe: "ok", status: "error")
         return "[\(alice),\(carol)]"
     }
+}
+
+// MARK: - The canonical Codex rows
+
+extension RenderStates {
+    /// The ten rows of `apps/macos/Tests/Fixtures/codex-status.json`, by name; alice is the one
+    /// Claude row. A Codex scene draws these, so it shows what the fixture says.
+    enum CanonicalCodexRow: String, CaseIterable {
+        case alice = "alice@example.com"
+        case bob = "bob@example.com/codex"
+        case carol = "carol@example.com"
+        case dana = "dana@example.com"
+        case erin = "erin@example.com/codex"
+        case gil = "gil@example.com"
+        case hal = "hal@example.com"
+        case ivy = "ivy@example.com"
+        case jo = "jo@example.com"
+        case kim = "kim@example.com"
+    }
+
+    /// One canonical row as a JSON object for a scene's array: the fixture's facts, with every
+    /// absolute instant moved to sit as far from `now` as it sits from the fixture's own clock,
+    /// so carol frees in 3d 4h and hal is held for 47m whenever the render runs. `extra` is
+    /// laid over the row last, as `account(...)`'s is, for a scene that varies one fact.
+    /// `RenderFixtureRow`, in TcrBarCore, builds the row, where the shim tests it.
+    static func codexRow(_ row: CanonicalCodexRow, now: Date, extra: [String: Any] = [:]) -> String {
+        guard
+            let text = RenderFixtureRow.json(
+                named: row.rawValue, in: canonicalCodexStatusJSON, now: now, extra: extra)
+        else { preconditionFailure("the canonical Codex rows hold no \(row.rawValue)") }
+        return text
+    }
+
+    /// `object` with `extra` laid over it (`extra` wins), as JSON text with sorted keys, written
+    /// by `RenderFixtureRow.jsonText(_:laying:)`. A value is anything `JSONSerialization` writes:
+    /// a string, a number, a `Bool`, `NSNull()` for `null`, or an array or dictionary of those.
+    private static func jsonText(_ object: [String: Any], laying extra: [String: Any]) -> String {
+        guard let text = RenderFixtureRow.jsonText(object, laying: extra)
+        else { preconditionFailure("a render fixture row is not valid JSON: \(object), with \(extra)") }
+        return text
+    }
+
+    /// Codex traffic with nothing refused and nothing sent around the pool in the last ten
+    /// minutes. The canonical Codex rows carry refusals, which draw the refusal banner, so a
+    /// scene about something else lays this over each of its Codex rows. Never over a Claude
+    /// row, which reports no Codex traffic at all.
+    private static let quietCodexTraffic: [String: Any] = ["refused10m": 0, "unpooled10m": 0]
+
+    /// Scene `24-mixed-fleet`, at the real clock: Claude's two accounts both out of tokens
+    /// (``mixedClaudeRows(now:)``), and Codex's two split: bob is ready and carol is held on
+    /// her week, both canonical, with quiet traffic.
+    private static var mixedFleetJSON: String {
+        let now = Date()
+        let bob = codexRow(.bob, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        let carol = codexRow(.carol, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        return "[\((mixedClaudeRows(now: now) + [bob, carol]).joined(separator: ","))]"
+    }
+
+    /// Scene `24-mixed-fleet`'s two Claude accounts, both out of tokens, which scene
+    /// `24d-mixed-codex-all-parked` draws too.
+    ///
+    /// - alice is the canonical row with her 5-hour window full and held, her week at 41%,
+    ///   and in no group.
+    /// - frank is a second Claude account: his 5-hour window at 22%, his week spent and
+    ///   held, and alice's day of usage, so the money line totals two of her days.
+    private static func mixedClaudeRows(now: Date) -> [String] {
+        func atMs(_ minutes: Int) -> Int64 {
+            Int64((now.timeIntervalSince1970 + Double(minutes) * 60) * 1000)
+        }
+        // `extra` is laid over the row after its instants move, so its own instants are
+        // written from `now` here.
+        let alice = codexRow(
+            .alice, now: now,
+            extra: [
+                "quotaState": "spent", "quota": 1.0, "fiveHour": 1.0, "fiveHourState": "spent",
+                "held": [["window": "5h", "minutesUntilReset": 159, "resetAtMs": atMs(159)]],
+                "sevenDay": 0.41, "groups": [String](),
+            ])
+        let frank = account(
+            "frank@example.com", quota: "1.0", state: "spent",
+            held: #"[{"window":"7d","minutesUntilReset":4320,"resetAtMs":\#(atMs(4320))}]"#,
+            fiveHour: "0.22", fiveHourState: "ok", sevenDay: "1.0", sevenDayState: "spent",
+            fiveHourResetInMinutes: 250, sevenDayResetInMinutes: 4320,
+            sevenDayOi: "0.40", sevenDayOiState: "ok", usage: frankUsage(now: now),
+            plan: "Max 20x", now: now)
+        return [alice, frank]
+    }
+
+    /// Scene `24b-mixed-fleet-compact`, at the real clock: seven accounts, so `.auto` draws
+    /// it compact. Claude's are nina (near her 5-hour limit), grace (switched off), henry and
+    /// canonical alice, both in ORCHARD; Codex's are bob, erin (signed out) and ivy, in
+    /// ORCHARD too, with quiet traffic. ORCHARD holds members of both providers, so it is
+    /// drawn once under each head.
+    private static var mixedFleetCompactJSON: String {
+        let now = Date()
+        let claude = [
+            account(
+                "nina@example.com", quota: "0.91", state: "near", fiveHour: "0.91",
+                fiveHourState: "near", sevenDay: "0.25", sevenDayState: "ok",
+                fiveHourResetInMinutes: 72, sevenDayResetInMinutes: 7200, plan: "Max 5x",
+                orgUuid: "44444444-4444-4444-8444-444444444444"),
+            account(
+                "grace@example.com", quota: "0.12", state: "ok", disabled: true, fiveHour: "0.08",
+                sevenDay: "0.12", fiveHourResetInMinutes: 181, sevenDayResetInMinutes: 8640,
+                plan: "Max 20x", orgUuid: "55555555-5555-4555-8555-555555555555", requests: 0),
+            account(
+                "henry@example.com", quota: "0.30", state: "ok", fiveHour: "0.30", sevenDay: "0.15",
+                fiveHourResetInMinutes: 100, sevenDayResetInMinutes: 5760, groups: ["orchard"],
+                groupColors: ["orchard": "#30d158"], plan: "Team 5x",
+                orgUuid: "66666666-6666-4666-8666-666666666666"),
+            codexRow(.alice, now: now),
+        ]
+        let codex = [CanonicalCodexRow.bob, .erin, .ivy].map {
+            codexRow($0, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        }
+        return "[\((claude + codex).joined(separator: ","))]"
+    }
+
+    /// Scene `24d-mixed-codex-all-parked`: scene 24's two Claude accounts, and bob and carol
+    /// switched off. No Codex account can serve, so no Codex line can show, and the rows
+    /// need no quiet traffic.
+    private static var mixedCodexAllParkedJSON: String {
+        let now = Date()
+        let codex = [CanonicalCodexRow.bob, .carol].map {
+            codexRow($0, now: now, extra: ["disabled": true])
+        }
+        return "[\((mixedClaudeRows(now: now) + codex).joined(separator: ","))]"
+    }
+
+    /// The canonical `rows` at the real clock, each with `extra` laid over it, as one scene's
+    /// array. Unlike ``codexScene(_:)``, each row keeps the fixture's traffic, twelve
+    /// refusals, unless `extra` lays its own: these scenes are about the Codex line.
+    private static func codexRows(_ rows: [CanonicalCodexRow], extra: [String: Any] = [:]) -> String {
+        let now = Date()
+        return "[\(rows.map { codexRow($0, now: now, extra: extra) }.joined(separator: ","))]"
+    }
+
+    /// The route of a proxy serving the JS teamclaude leaf, which cannot pool codex, in the
+    /// words `tcr status --json` gives it.
+    private static let jsLeafRoute: [String: Any] = [
+        "pooled": false, "code": "js-leaf",
+        "reason":
+            "the proxy on :3456 is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md",
+    ]
+
+    /// Scenes `26d`, `26e` and `26g`: bob and dana at zero requests, with quiet traffic.
+    private static var idleCodexJSON: String {
+        codexRows([.bob, .dana], extra: ["requests": 0, "codexTraffic": quietCodexTraffic])
+    }
+
+    /// Scene `26h`: scene 22's live Claude account at zero requests, beside canonical bob,
+    /// who has served 42, with quiet traffic.
+    private static var mixedClaudeQuietJSON: String {
+        "[\(colleagueRow),\(codexRow(.bob, now: Date(), extra: ["codexTraffic": quietCodexTraffic]))]"
+    }
+
+    /// Scene `25d-codex-relogin-refused`: canonical alice, and erin, signed out, with quiet
+    /// traffic so no refusal banner draws. alice reports no Codex traffic at all.
+    private static var codexReloginRefusedJSON: String {
+        let now = Date()
+        return
+            "[\(codexRow(.alice, now: now)),\(codexRow(.erin, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
+    }
+
+    /// Scene `25f-codex-group-add-warning`: canonical alice and ivy, both in ORCHARD, ivy with
+    /// quiet traffic.
+    private static var codexGroupAddWarningJSON: String {
+        let now = Date()
+        return
+            "[\(codexRow(.alice, now: now)),\(codexRow(.ivy, now: now, extra: ["codexTraffic": quietCodexTraffic]))]"
+    }
+
+    /// One Codex row of scenes 25d and 25f, decoded as those scenes decode it, so a note is
+    /// recorded against the row the scene draws.
+    private static func sceneRow(_ row: CanonicalCodexRow) -> Account {
+        let json = "[\(codexRow(row, now: Date(), extra: ["codexTraffic": quietCodexTraffic]))]"
+        guard let account = try? Fleet.decode(Data(json.utf8)).accounts.first else {
+            preconditionFailure("the canonical \(row.rawValue) does not decode")
+        }
+        return account
+    }
+
+    /// tcr's refusal of a Codex login whose ChatGPT workspace is served away from
+    /// chatgpt.com, as `tcr login --codex` sends it.
+    private static let routedRefusal =
+        "this Codex login's ChatGPT workspace is not served at https://chatgpt.com with no "
+        + "routing of its own (workspace_backend_origin is \"https://gov.chatgpt.com\"): codex "
+        + "sends that workspace's traffic to its own backend, or routes it by residency, and tcr "
+        + "pools a Codex login only at https://chatgpt.com. Nothing was written."
+
+    /// What `tcr group add orchard ivy@example.com` prints on stderr when it succeeds.
+    private static let orchardWarning =
+        "warning: 'ivy@example.com' is a Codex account. A Codex session cannot ask for a group, "
+        + "so 'orchard' labels it and can park it, but never routes to it; while 'orchard' is "
+        + "reserved, it serves nothing."
+
+    /// frank's `usage`: canonical alice's, so his day is hers, with his own window on his
+    /// card, `$9.02 · 31k`.
+    private static func frankUsage(now: Date) -> String {
+        guard
+            let row = try? JSONSerialization.jsonObject(
+                with: Data(codexRow(.alice, now: now).utf8)) as? [String: Any],
+            var usage = row["usage"] as? [String: Any],
+            var window = usage["window"] as? [String: Any]
+        else { preconditionFailure("canonical alice carries no usage window") }
+        window["costUsd"] = 9.02
+        window["outputTokens"] = 31_000
+        usage["window"] = window
+        return jsonText(usage, laying: [:])
+    }
+
+    /// The canonical rows `rows`, at the real clock, as one scene's array. Every Codex row
+    /// lays ``quietCodexTraffic`` over its own, because the canonical rows carry refusals,
+    /// which draw the refusal banner; alice, the one Claude row, reports no Codex traffic.
+    private static func codexScene(_ rows: [CanonicalCodexRow]) -> String {
+        let now = Date()
+        let built = rows.map { row in
+            row == .alice
+                ? codexRow(row, now: now)
+                : codexRow(row, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        }
+        return "[\(built.joined(separator: ","))]"
+    }
+
+    /// Scene `25e-codex-unmeasured`: one Codex account before its first probe, with no
+    /// quota, no usage, and no word yet on which windows its plan has.
+    private static var unmeasuredCodexJSON: String {
+        "["
+            + account(
+                "lee@example.com/codex", quota: "null", state: "ok", probe: "never",
+                usage: "null", plan: "ChatGPT Plus", provider: "codex")
+            + "]"
+    }
+
+    // MARK: The Sessions and Tools scenes
+
+    /// Scene `16b-sessions-tab-mixed`: canonical alice and bob, with both canonical sessions.
+    private static var sessionsTabMixedFleet: Fleet {
+        let now = Date()
+        return fleet("[\(codexRow(.alice, now: now)),\(codexRow(.bob, now: now))]")
+            .withSessions(canonicalSessionsRead(now: now))
+    }
+
+    /// Scene `16c-sessions-tab-codex-only-empty`: canonical bob and dana with an hour that
+    /// served nothing, and no session, on a live channel. The canonical rows served 7 and 9
+    /// requests in the last hour, which would rightly draw the old-server line instead.
+    private static var codexOnlyQuietSessionsFleet: Fleet {
+        let now = Date()
+        let rows = [CanonicalCodexRow.bob, .dana].map { row in
+            codexRow(row, now: now, extra: ["usage": usageWithQuietHour(row, now: now)])
+        }
+        return fleet("[\(rows.joined(separator: ","))]")
+            .withSessions(Fleet.SessionsRead(sessions: [], channel: .live))
+    }
+
+    /// Scene `16d-sessions-tab-old-server-codex`: canonical alice and bob, bob's last hour
+    /// at 7 requests, and alice's session alone, as a proxy built before Codex sessions lists
+    /// them: no session carries a provider.
+    private static var oldServerCodexSessionsFleet: Fleet {
+        let now = Date()
+        return fleet("[\(codexRow(.alice, now: now)),\(codexRow(.bob, now: now))]")
+            .withSessions(canonicalSessionsRead(now: now, includingBob: false))
+    }
+
+    /// Scene `17c-tools-tab-codex`: canonical alice and bob with both sessions, bob's whole
+    /// timeline 55 s earlier so his call, started 100 s ago, still starts after his last
+    /// request. That call is codex's one-shot `exec_command`, the one schema that carries a
+    /// timeout (`timeout_ms` 120000, so 120 s), which the canonical call, codex's default
+    /// interactive `exec_command`, does not: 100 s into its 120 its ring is red with 20 s left,
+    /// where the Bash tool's 600 s would call it calm.
+    private static var toolsTabCodexFleet: Fleet {
+        let now = Date()
+        return fleet("[\(codexRow(.alice, now: now)),\(codexRow(.bob, now: now))]")
+            .withSessions(
+                canonicalSessionsRead(now: now, bobEarlierBy: 55, bobTimeoutSeconds: 120))
+    }
+
+    /// The canonical row's `usage` with a last hour that served nothing, shaped as the wire
+    /// writes an idle hour, and every instant already moved to `now`.
+    private static func usageWithQuietHour(_ row: CanonicalCodexRow, now: Date) -> [String: Any] {
+        guard
+            let object = try? JSONSerialization.jsonObject(
+                with: Data(codexRow(row, now: now).utf8)) as? [String: Any],
+            var usage = object["usage"] as? [String: Any]
+        else { preconditionFailure("canonical \(row.rawValue) carries no usage") }
+        usage["lastHour"] = [
+            "cacheCreation1hTokens": 0, "cacheCreationTokens": 0, "cacheReadTokens": 0,
+            "costUsd": 0.0, "inputTokens": 0, "outputTokens": 0, "requests": 0,
+            "unpricedRequests": 0,
+        ]
+        return usage
+    }
+
+    /// `apps/macos/Tests/Fixtures/codex-sessions.json`'s two sessions, every instant written
+    /// as far before `now` as it sits before the fixture's clock, decoded through
+    /// `Fleet.decodeSessions`: alice first seen 40 min ago and last seen 3 s ago, her Bash
+    /// `cargo test` started 20 s ago; bob first seen 175 s ago and last seen 50 s ago, his
+    /// `cargo build` started 45 s ago.
+    ///
+    /// `bobEarlierBy` moves every one of bob's instants that many seconds earlier, and
+    /// `bobTimeoutSeconds` lays a timeout on his running call. `includingBob: false` leaves his
+    /// session out.
+    private static func canonicalSessionsRead(
+        now: Date, includingBob: Bool = true, bobEarlierBy: TimeInterval = 0,
+        bobTimeoutSeconds: Int? = nil
+    ) -> Fleet.SessionsRead {
+        func ago(_ seconds: TimeInterval) -> Int64 {
+            Int64(((now.timeIntervalSince1970 - seconds) * 1000).rounded())
+        }
+        func bobAgo(_ seconds: TimeInterval) -> Int64 { ago(seconds + bobEarlierBy) }
+        let alice = """
+            {"account": "alice@example.com", "cacheCreationTokens": 12000,
+             "cacheReadTokens": 160000, "cacheTtlSecs": 3600, "costUsd": 1.2034,
+             "firstSeenMs": \(ago(2400)), "inputTokens": 180000, "lastSeenMs": \(ago(3)),
+             "model": "claude-opus-5", "outputTokens": 9200,
+             "reqPerMinute": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              1, 2, 3, 2, 4, 3, 5, 0],
+             "requests": 24, "sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+             "tools": {
+               "byTool": [
+                 {"calls": 8, "errors": 0, "overOneMinute": 0, "secondsP50": 2.5, "tool": "Bash"},
+                 {"calls": 4, "errors": 0, "overOneMinute": 0, "secondsP50": 0.1, "tool": "Read"}],
+               "calls": 12, "errors": 0, "overOneMinute": 0,
+               "running": [
+                 {"commandClass": "build", "commandHead": "cargo test",
+                  "startedMs": \(ago(20)), "tool": "Bash"}],
+               "slowest": [
+                 {"commandClass": "build", "commandHead": "cargo build --release",
+                  "endedMs": \(ago(295)), "seconds": 12.0, "tool": "Bash"},
+                 {"commandClass": "build", "commandHead": "cargo build",
+                  "endedMs": \(ago(230)), "seconds": 6.0, "tool": "Bash"},
+                 {"commandClass": "search", "commandHead": "rg -n TODO",
+                  "endedMs": \(ago(175)), "seconds": 3.0, "tool": "Bash"},
+                 {"commandClass": "build", "commandHead": "cargo test -p example",
+                  "endedMs": \(ago(250)), "seconds": 2.5, "tool": "Bash"},
+                 {"commandClass": "git-local", "commandHead": "git status",
+                  "endedMs": \(ago(160)), "seconds": 2.5, "tool": "Bash"},
+                 {"commandClass": "git-local", "commandHead": "git status",
+                  "endedMs": \(ago(320)), "seconds": 2.0, "tool": "Bash"},
+                 {"commandClass": "build", "commandHead": "cargo test",
+                  "endedMs": \(ago(110)), "seconds": 2.0, "tool": "Bash"},
+                 {"commandClass": "git-local", "commandHead": "git status",
+                  "endedMs": \(ago(125)), "seconds": 1.5, "tool": "Bash"},
+                 {"commandClass": null,
+                  "commandHead": "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+                  "endedMs": \(ago(280)), "seconds": 0.4, "tool": "Read"},
+                 {"commandClass": null,
+                  "commandHead": "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+                  "endedMs": \(ago(350)), "seconds": 0.1, "tool": "Read"}],
+               "subagentsRunning": 0, "timedOut": [], "timeouts": 0, "timeoutsByClass": {}}}
+            """
+        let timeout = bobTimeoutSeconds.map { #", "timeoutSeconds": \#($0)"# } ?? ""
+        let bob = """
+            {"account": "bob@example.com/codex", "cacheCreationTokens": 0,
+             "cacheReadTokens": 80000, "costUsd": 0.0, "firstSeenMs": \(bobAgo(175)),
+             "inputTokens": 95000, "lastSeenMs": \(bobAgo(50)), "model": "gpt-5.1-codex",
+             "outputTokens": 4100, "provider": "codex", "reasoningTokens": 1200,
+             "reqPerMinute": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              0, 0, 0, 0, 2, 3, 2, 0],
+             "requests": 7, "sessionId": "019a3c5e-0000-7000-8000-000000000002",
+             "tools": {
+               "byTool": [
+                 {"calls": 2, "errors": 0, "overOneMinute": 0, "secondsP50": 4.0,
+                  "tool": "exec_command"},
+                 {"calls": 1, "errors": 0, "overOneMinute": 0, "secondsP50": 0.2,
+                  "tool": "apply_patch"}],
+               "calls": 3, "errors": 0, "overOneMinute": 0,
+               "running": [
+                 {"commandClass": "build", "commandHead": "cargo build",
+                  "startedMs": \(bobAgo(45)), "tool": "exec_command"\(timeout)}],
+               "slowest": [
+                 {"commandClass": "build", "commandHead": "cargo test",
+                  "endedMs": \(bobAgo(115)), "seconds": 4.0, "tool": "exec_command"},
+                 {"commandClass": "build", "commandHead": "cargo check",
+                  "endedMs": \(bobAgo(55.5)), "seconds": 4.0, "tool": "exec_command"},
+                 {"commandClass": null, "commandHead": "apply_patch",
+                  "endedMs": \(bobAgo(94.8)), "seconds": 0.2, "tool": "apply_patch"}],
+               "subagentsRunning": 0, "timedOut": [], "timeouts": 0, "timeoutsByClass": {}},
+             "unpricedRequests": 7}
+            """
+        let sessions = includingBob ? [alice, bob] : [alice]
+        let document = #"{"supported": true, "sessions": [\#(sessions.joined(separator: ","))]}"#
+        guard let read = try? Fleet.decodeSessions(Data(document.utf8)),
+            read.unreadable.isEmpty, read.sessions.count == sessions.count
+        else { preconditionFailure("the canonical sessions no longer decode") }
+        return read
+    }
+
+    /// `apps/macos/Tests/Fixtures/codex-status.json`, verbatim, indented to sit here.
+    /// `RenderStatesCanonicalRowsTests` holds it equal to the fixture.
+    private static let canonicalCodexStatusJSON = #"""
+        [
+          {
+            "cacheCreationTokens": 1600000,
+            "cacheHitRatio": 0.75,
+            "cacheReadTokens": 6000000,
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.47,
+            "fiveHourResetAtMs": 1767235140000,
+            "fiveHourState": "ok",
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [
+              "orchard"
+            ],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 8000000,
+            "lastProbeMs": null,
+            "lastStreamError": "overloaded_error",
+            "name": "alice@example.com",
+            "orgName": "Example Personal",
+            "orgUuid": "11111111-1111-1111-1111-111111111111",
+            "organizationType": "claude_max",
+            "outputTokens": 31860,
+            "parkedGroups": [],
+            "plan": "Max 20x",
+            "priority": 0,
+            "probeError": null,
+            "probeStatus": "ok",
+            "quota": 0.62,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "rateLimitTier": "default_claude_max_20x",
+            "rateLimitedUntilMs": null,
+            "requests": 102,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.2,
+            "sevenDayOi": 0.62,
+            "sevenDayOiResetAtMs": 1767571200000,
+            "sevenDayOiState": "ok",
+            "sevenDayResetAtMs": 1767571200000,
+            "sevenDayState": "ok",
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 2,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 47000,
+                "cacheCreationTokens": 188000,
+                "cacheReadTokens": 705000,
+                "costUsd": 1.6413,
+                "inputTokens": 47000,
+                "outputTokens": 3756,
+                "requests": 12,
+                "unpricedRequests": 0
+              },
+              "today": {
+                "cacheCreation1hTokens": 400000,
+                "cacheCreationTokens": 1600000,
+                "cacheReadTokens": 6000000,
+                "costUsd": 14.1657,
+                "inputTokens": 400000,
+                "outputTokens": 31860,
+                "requests": 102,
+                "unpricedRequests": 0
+              },
+              "todayByModel": {
+                "claude-opus-5": {
+                  "cacheCreation1hTokens": 280000,
+                  "cacheCreationTokens": 1120000,
+                  "cacheReadTokens": 4200000,
+                  "costUsd": 12.0785,
+                  "inputTokens": 280000,
+                  "outputTokens": 21140,
+                  "requests": 70,
+                  "unpricedRequests": 0
+                },
+                "claude-sonnet-5": {
+                  "cacheCreation1hTokens": 120000,
+                  "cacheCreationTokens": 480000,
+                  "cacheReadTokens": 1800000,
+                  "costUsd": 2.0872,
+                  "inputTokens": 120000,
+                  "outputTokens": 10720,
+                  "requests": 32,
+                  "unpricedRequests": 0
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 157000,
+                "cacheCreationTokens": 628000,
+                "cacheReadTokens": 2355000,
+                "costUsd": 5.6141,
+                "inputTokens": 157000,
+                "outputTokens": 12476,
+                "requests": 40,
+                "since": 1767217140000,
+                "unpricedRequests": 0
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.82,
+            "cacheReadTokens": 902000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 1100000,
+            "lastProbeMs": 1767225570000,
+            "lastStreamError": null,
+            "name": "bob@example.com/codex",
+            "orgName": null,
+            "orgUuid": "55555555-5555-4555-8555-555555555555",
+            "organizationType": "pro",
+            "outputTokens": 22000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 1,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.34,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 42,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.34,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767571200000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 160000,
+                "costUsd": null,
+                "inputTokens": 30000,
+                "outputTokens": 4100,
+                "reasoningTokens": 1200,
+                "requests": 7,
+                "unpricedRequests": 7
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 50000000,
+                "costUsd": null,
+                "inputTokens": 11000000,
+                "outputTokens": 1100000,
+                "reasoningTokens": 420000,
+                "requests": 1480,
+                "since": 1766966400000,
+                "unpricedRequests": 1480
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 902000,
+                "costUsd": null,
+                "inputTokens": 198000,
+                "outputTokens": 22000,
+                "reasoningTokens": 9000,
+                "requests": 42,
+                "unpricedRequests": 42
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 902000,
+                  "costUsd": null,
+                  "inputTokens": 198000,
+                  "outputTokens": 22000,
+                  "reasoningTokens": 9000,
+                  "requests": 42,
+                  "unpricedRequests": 42
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.89,
+            "cacheReadTokens": 4806000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "credits": {
+              "balance": "12.50",
+              "hasCredits": true,
+              "unlimited": false
+            },
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": 1767499200000,
+            "gate": "seven-day",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [
+              {
+                "minutesUntilReset": 4560,
+                "resetAtMs": 1767499200000,
+                "window": "7d"
+              }
+            ],
+            "http1Only": false,
+            "inputTokens": 5400000,
+            "lastProbeMs": 1767225570000,
+            "lastStreamError": null,
+            "limitReachedType": "rate_limit_reached",
+            "name": "carol@example.com",
+            "orgName": null,
+            "orgUuid": "66666666-6666-4666-8666-666666666666",
+            "organizationType": "pro",
+            "outputTokens": 61000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 2,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 1.0,
+            "quotaState": "spent",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 310,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": 273600,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 1.0,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767499200000,
+            "sevenDayState": "spent",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 140000000,
+                "costUsd": null,
+                "inputTokens": 20000000,
+                "outputTokens": 5400000,
+                "reasoningTokens": 2100000,
+                "requests": 2900,
+                "since": 1766894400000,
+                "unpricedRequests": 2900
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 4806000,
+                "costUsd": null,
+                "inputTokens": 594000,
+                "outputTokens": 61000,
+                "reasoningTokens": 21000,
+                "requests": 310,
+                "unpricedRequests": 310
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 4806000,
+                  "costUsd": null,
+                  "inputTokens": 594000,
+                  "outputTokens": 61000,
+                  "reasoningTokens": 21000,
+                  "requests": 310,
+                  "unpricedRequests": 310
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.85,
+            "cacheReadTokens": 1700000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.18,
+            "fiveHourResetAtMs": 1767236520000,
+            "fiveHourState": "ok",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 2000000,
+            "lastProbeMs": 1767225570000,
+            "lastStreamError": null,
+            "name": "dana@example.com",
+            "orgName": null,
+            "orgUuid": "77777777-7777-4777-8777-777777777777",
+            "organizationType": "plus",
+            "outputTokens": 260000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Plus",
+            "priority": 3,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.25,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 96,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.25,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767657600000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 150000,
+                "costUsd": null,
+                "inputTokens": 30000,
+                "outputTokens": 24000,
+                "reasoningTokens": 6000,
+                "requests": 9,
+                "unpricedRequests": 9
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 7600000,
+                "costUsd": null,
+                "inputTokens": 1400000,
+                "outputTokens": 640000,
+                "reasoningTokens": 180000,
+                "requests": 400,
+                "since": 1767052800000,
+                "unpricedRequests": 400
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 1700000,
+                "costUsd": null,
+                "inputTokens": 300000,
+                "outputTokens": 260000,
+                "reasoningTokens": 70000,
+                "requests": 96,
+                "unpricedRequests": 96
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 1700000,
+                  "costUsd": null,
+                  "inputTokens": 300000,
+                  "outputTokens": 260000,
+                  "reasoningTokens": 70000,
+                  "requests": 96,
+                  "unpricedRequests": 96
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 540000,
+                "costUsd": null,
+                "inputTokens": 100000,
+                "outputTokens": 210000,
+                "reasoningTokens": 55000,
+                "requests": 31,
+                "since": 1767218520000,
+                "unpricedRequests": 31
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": null,
+            "cacheReadTokens": 0,
+            "codexHome": "/Users/example/.codex",
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.0,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": "ok",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": null,
+            "gate": "login",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 0,
+            "lastProbeMs": 1767225540000,
+            "lastStreamError": null,
+            "loginError": "refresh_token_reused",
+            "name": "erin@example.com/codex",
+            "orgName": null,
+            "orgUuid": "88888888-8888-4888-8888-888888888888",
+            "organizationType": "team",
+            "outputTokens": 0,
+            "parkedGroups": [],
+            "plan": "ChatGPT Team",
+            "priority": 4,
+            "probeError": "refresh_token_reused",
+            "probeStatus": "error",
+            "provider": "codex",
+            "quota": 0.4,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 0,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.4,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767398400000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "error",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 4000000,
+                "costUsd": null,
+                "inputTokens": 1000000,
+                "outputTokens": 140000,
+                "reasoningTokens": 50000,
+                "requests": 120,
+                "since": 1766793600000,
+                "unpricedRequests": 120
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "todayByModel": {}
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.71,
+            "cacheReadTokens": 284000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.15,
+            "fiveHourResetAtMs": 1767236520000,
+            "fiveHourState": "ok",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": null,
+            "gate": "rejected",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 400000,
+            "lastProbeMs": 1767225540000,
+            "lastStreamError": null,
+            "limitReachedType": "rate_limit_reached",
+            "name": "gil@example.com",
+            "orgName": null,
+            "orgUuid": "99999999-9999-4999-8999-999999999999",
+            "organizationType": "team",
+            "outputTokens": 52000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Team",
+            "priority": 5,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.15,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 24,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.1,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767744000000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "spendControlReached": true,
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 21000,
+                "costUsd": null,
+                "inputTokens": 9000,
+                "outputTokens": 3000,
+                "reasoningTokens": 800,
+                "requests": 2,
+                "unpricedRequests": 2
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 2100000,
+                "costUsd": null,
+                "inputTokens": 900000,
+                "outputTokens": 310000,
+                "reasoningTokens": 90000,
+                "requests": 140,
+                "since": 1767139200000,
+                "unpricedRequests": 140
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 284000,
+                "costUsd": null,
+                "inputTokens": 116000,
+                "outputTokens": 52000,
+                "reasoningTokens": 14000,
+                "requests": 24,
+                "unpricedRequests": 24
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 284000,
+                  "costUsd": null,
+                  "inputTokens": 116000,
+                  "outputTokens": 52000,
+                  "reasoningTokens": 14000,
+                  "requests": 24,
+                  "unpricedRequests": 24
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 234000,
+                "costUsd": null,
+                "inputTokens": 96000,
+                "outputTokens": 48000,
+                "reasoningTokens": 13000,
+                "requests": 20,
+                "since": 1767218520000,
+                "unpricedRequests": 20
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.8,
+            "cacheReadTokens": 1520000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": 1767228420000,
+            "gate": "hold",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 1900000,
+            "lastProbeMs": 1767225480000,
+            "lastStreamError": null,
+            "limitReachedType": "rate_limit_reached",
+            "name": "hal@example.com",
+            "orgName": null,
+            "orgUuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "organizationType": "pro",
+            "outputTokens": 40000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 6,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.6,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": 1767228420000,
+            "requests": 77,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": 2820,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.6,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767657600000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "throttled",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 32000000,
+                "costUsd": null,
+                "inputTokens": 8000000,
+                "outputTokens": 1900000,
+                "reasoningTokens": 700000,
+                "requests": 900,
+                "since": 1767052800000,
+                "unpricedRequests": 900
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 1520000,
+                "costUsd": null,
+                "inputTokens": 380000,
+                "outputTokens": 40000,
+                "reasoningTokens": 15000,
+                "requests": 77,
+                "unpricedRequests": 77
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 1520000,
+                  "costUsd": null,
+                  "inputTokens": 380000,
+                  "outputTokens": 40000,
+                  "reasoningTokens": 15000,
+                  "requests": 77,
+                  "unpricedRequests": 77
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.78,
+            "cacheReadTokens": 1014000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": 0.88,
+            "fiveHourResetAtMs": 1767228720000,
+            "fiveHourState": "near",
+            "fiveHourWindowMinutes": 300,
+            "freeAtMs": 1767228720000,
+            "gate": "five-hour",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [
+              "orchard"
+            ],
+            "held": [
+              {
+                "minutesUntilReset": 52,
+                "resetAtMs": 1767228720000,
+                "window": "5h"
+              }
+            ],
+            "http1Only": false,
+            "inputTokens": 1300000,
+            "lastProbeMs": 1767225560000,
+            "lastStreamError": null,
+            "name": "ivy@example.com",
+            "orgName": null,
+            "orgUuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "organizationType": "plus",
+            "outputTokens": 260000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Plus",
+            "priority": 7,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.88,
+            "quotaState": "near",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "fiveHour",
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 60,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": 3120,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.17,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767744000000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 330000,
+                "costUsd": null,
+                "inputTokens": 90000,
+                "outputTokens": 80000,
+                "reasoningTokens": 22000,
+                "requests": 20,
+                "unpricedRequests": 20
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 5400000,
+                "costUsd": null,
+                "inputTokens": 1600000,
+                "outputTokens": 900000,
+                "reasoningTokens": 250000,
+                "requests": 300,
+                "since": 1767139200000,
+                "unpricedRequests": 300
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 1014000,
+                "costUsd": null,
+                "inputTokens": 286000,
+                "outputTokens": 260000,
+                "reasoningTokens": 70000,
+                "requests": 60,
+                "unpricedRequests": 60
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 1014000,
+                  "costUsd": null,
+                  "inputTokens": 286000,
+                  "outputTokens": 260000,
+                  "reasoningTokens": 70000,
+                  "requests": 60,
+                  "unpricedRequests": 60
+                }
+              },
+              "window": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 860000,
+                "costUsd": null,
+                "inputTokens": 240000,
+                "outputTokens": 210000,
+                "reasoningTokens": 60000,
+                "requests": 52,
+                "since": 1767210720000,
+                "unpricedRequests": 52
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": 0.75,
+            "cacheReadTokens": 225000,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "credits": {
+              "hasCredits": true,
+              "unlimited": true
+            },
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": null,
+            "gate": "ok",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 300000,
+            "lastProbeMs": 1767225550000,
+            "lastStreamError": null,
+            "name": "jo@example.com",
+            "orgName": null,
+            "orgUuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "organizationType": "business",
+            "outputTokens": 6000,
+            "parkedGroups": [],
+            "plan": "ChatGPT Business",
+            "priority": 8,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": null,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 30,
+            "reservedGroups": [],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": null,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": null,
+            "sevenDayState": null,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 225000,
+                "costUsd": null,
+                "inputTokens": 75000,
+                "outputTokens": 6000,
+                "reasoningTokens": 1000,
+                "requests": 30,
+                "unpricedRequests": 30
+              },
+              "todayByModel": {
+                "gpt-5.1-codex": {
+                  "cacheCreation1hTokens": 0,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 225000,
+                  "costUsd": null,
+                  "inputTokens": 75000,
+                  "outputTokens": 6000,
+                  "reasoningTokens": 1000,
+                  "requests": 30,
+                  "unpricedRequests": 30
+                }
+              }
+            }
+          },
+          {
+            "cacheCreationTokens": 0,
+            "cacheHitRatio": null,
+            "cacheReadTokens": 0,
+            "codexRoute": {
+              "pooled": true
+            },
+            "codexTraffic": {
+              "lastRefusal": "usage_limit_reached",
+              "lastRefusalAtMs": 1767225560000,
+              "refused10m": 12,
+              "unpooled10m": 3
+            },
+            "control": false,
+            "controlAllowedGroups": [],
+            "disabled": false,
+            "fiveHour": null,
+            "fiveHourResetAtMs": null,
+            "fiveHourState": null,
+            "freeAtMs": null,
+            "gate": "reserved",
+            "groupColors": {
+              "orchard": "#30d158",
+              "research": "#bf5af2"
+            },
+            "groups": [
+              "research"
+            ],
+            "held": [],
+            "http1Only": false,
+            "inputTokens": 0,
+            "lastProbeMs": 1767225420000,
+            "lastStreamError": null,
+            "name": "kim@example.com",
+            "orgName": null,
+            "orgUuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "organizationType": "pro",
+            "outputTokens": 0,
+            "parkedGroups": [],
+            "plan": "ChatGPT Pro",
+            "priority": 9,
+            "probeError": null,
+            "probeStatus": "ok",
+            "provider": "codex",
+            "quota": 0.05,
+            "quotaState": "ok",
+            "quotaUpdatedAtMs": null,
+            "quotaWindows": [
+              "sevenDay"
+            ],
+            "rateLimitTier": null,
+            "rateLimitedUntilMs": null,
+            "requests": 0,
+            "reservedGroups": [
+              "research"
+            ],
+            "seatTier": null,
+            "secondsUntilFree": null,
+            "serverDirty": false,
+            "serverSha": "abc1234",
+            "sevenDay": 0.05,
+            "sevenDayOi": null,
+            "sevenDayOiResetAtMs": null,
+            "sevenDayOiState": null,
+            "sevenDayResetAtMs": 1767744000000,
+            "sevenDayState": "ok",
+            "sevenDayWindowMinutes": 10080,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0,
+            "usage": {
+              "lastHour": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "sevenDayWindow": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 700000,
+                "costUsd": null,
+                "inputTokens": 200000,
+                "outputTokens": 30000,
+                "reasoningTokens": 9000,
+                "requests": 40,
+                "since": 1767139200000,
+                "unpricedRequests": 40
+              },
+              "today": {
+                "cacheCreation1hTokens": 0,
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": 0.0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "requests": 0,
+                "unpricedRequests": 0
+              },
+              "todayByModel": {}
+            }
+          }
+        ]
+        """#
 }

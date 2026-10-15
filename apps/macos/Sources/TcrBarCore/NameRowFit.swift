@@ -52,6 +52,33 @@ public enum NameRowFit {
         return image.size.width
     }()
 
+    /// The width of the `Re-login…` button a card draws in its header beside the
+    /// actions menu, on an account that needs signing in again.
+    ///
+    /// Measured the way ``actionsSlotWidth`` measures its glyph: as the control
+    /// itself. The card's button is a bordered SwiftUI `Button` at the small
+    /// control size, which draws its label at the small control font, 11 pt,
+    /// whatever font its view asks for, and fits exactly the width this push
+    /// button at the same size and font reports. Read on the main thread, where
+    /// the card is drawn.
+    public static let reloginButtonWidth: CGFloat = {
+        let button = NSButton(title: "Re-login\u{2026}", target: nil, action: nil)
+        button.bezelStyle = .push
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: NSFont.systemFontSize(for: .small))
+        return button.fittingSize.width
+    }()
+
+    /// The width the header's trailing controls take: the actions menu, and, when
+    /// the card reserves it, the `Re-login…` button `gap` ahead of it.
+    ///
+    /// Only a Codex card reserves the button (``Account/reservesReloginInNameRow``).
+    /// A Claude card drawing the same button still subtracts the menu alone, as it
+    /// always has, so every Claude card keeps its name room to the point.
+    public static func actionsWidth(reservesRelogin: Bool, gap: CGFloat) -> CGFloat {
+        reservesRelogin ? actionsSlotWidth + reloginButtonWidth + gap : actionsSlotWidth
+    }
+
     /// The narrowest a truncated handle is still drawn at: `@` and the
     /// ellipsis the truncation puts after it.
     ///

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tcr::cli::snapshot_offline;
 use tcr::oauth::NoRefresh;
-use tcr::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
+use tcr::probe::{ProbeCredential, ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
 use tcr::status::StatusPayload;
 
 /// The exit code `--check` reports a failed probe with
@@ -35,7 +35,7 @@ const PROBE_FAILED_EXIT: i32 = 4;
 /// Rejects every token the way the usage endpoint rejects a dead one.
 struct RejectingProber;
 impl UsageProber for RejectingProber {
-    fn probe(&self, _access_token: String) -> ProbeFuture {
+    fn probe(&self, _credential: ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: Some(401),
@@ -50,7 +50,7 @@ impl UsageProber for RejectingProber {
 /// text carries no countdown that could change between two runs.
 struct HealthyProber;
 impl UsageProber for HealthyProber {
-    fn probe(&self, _access_token: String) -> ProbeFuture {
+    fn probe(&self, _credential: ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Ok(Usage {
                 five_hour: Some(UsageBucket {
@@ -60,6 +60,7 @@ impl UsageProber for HealthyProber {
                 seven_day: None,
                 seven_day_oi: None,
                 extra_usage_usd: None,
+                codex: None,
             })
         })
     }

@@ -140,6 +140,7 @@ impl Manager {
                     org_name: account.org_name.clone(),
                     touched_at_ms,
                     extended_ttl: extended.contains(&key),
+                    provider: account.provider,
                 })
             })
             .collect()
@@ -171,6 +172,7 @@ impl Manager {
                 .iter()
                 .map(|a| {
                     identity::probe(
+                        a.provider,
                         &a.name,
                         a.account_uuid.clone(),
                         a.org_uuid.clone(),
@@ -222,6 +224,7 @@ mod tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some("org-1".to_string()),
             org_name: None,
@@ -237,6 +240,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -302,6 +306,65 @@ mod tests {
         let restored = pins_of(&second);
         assert_eq!(restored.get(&11).map(|&(i, _)| i), Some(0));
         assert_eq!(restored.get(&22).map(|&(i, _)| i), Some(1));
+    }
+
+    /// A Codex account's pin comes back to the Codex row after a restart, beside an
+    /// Anthropic row of the same name. Neither row carries a uuid, so the name
+    /// fallback alone calls them one account and only the provider the pin stored
+    /// tells them apart. The Anthropic row's own pin, written beside it with no
+    /// provider key at all, comes back to the Anthropic row: a pin written before
+    /// the field existed reads as Anthropic.
+    ///
+    /// Watched red, twice: drop the provider guard from `identity::same_identity` and
+    /// both pins tie and are dropped as ambiguous; read the stored provider back as
+    /// Anthropic and the Codex pin lands on the Anthropic row.
+    #[test]
+    fn a_codex_pin_restores_to_the_codex_row_beside_a_same_named_anthropic_row() {
+        let path = tmp("codex-beside-anthropic");
+        let named = |provider| Account {
+            provider,
+            account_uuid: None,
+            org_uuid: None,
+            ..account("alice@example.com", "unused")
+        };
+        let anthropic = named(crate::provider::Provider::Anthropic);
+        let codex = named(crate::provider::Provider::Codex);
+        let now = crate::now_ms();
+
+        let first = manager_over(&[anthropic.clone(), codex.clone()]);
+        seed_pins(&first, &[(11, 0, now), (22, 1, now)]);
+        assert_eq!(first.flush_affinity(&path).expect("flush"), 2);
+        let raw = std::fs::read_to_string(&path).expect("read pin file");
+        assert_eq!(
+            raw.matches(r#""provider": "codex""#).count(),
+            1,
+            "the Codex pin is written with its provider: {raw}"
+        );
+        assert_eq!(
+            raw.matches("provider").count(),
+            1,
+            "and the Anthropic pin with none, as before this field existed: {raw}"
+        );
+
+        // Next boot, the two rows in the other order.
+        let second = manager_over(&[codex, anthropic]);
+        let report = second.restore_affinity(&path, PIN_TTL_MS);
+        assert_eq!(
+            (report.degraded, report.unresolved, report.ambiguous),
+            (None, 0, 0),
+            "both pins resolve to exactly one row"
+        );
+        let restored = pins_of(&second);
+        assert_eq!(
+            restored.get(&22).map(|&(i, _)| i),
+            Some(0),
+            "the Codex pin follows the Codex row to position 0"
+        );
+        assert_eq!(
+            restored.get(&11).map(|&(i, _)| i),
+            Some(1),
+            "the Anthropic pin follows the Anthropic row to position 1"
+        );
     }
 
     /// The index trap, at the layer that can actually commit it. Session 11 is

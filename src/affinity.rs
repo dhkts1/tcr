@@ -17,8 +17,9 @@
 //!    somewhere cold while the proxy believes it is warm, and the migration logic
 //!    sees a settled pin and leaves it alone. So each pin stores the identity
 //!    fields [`crate::identity`] already treats as an account's identity
-//!    (`account_uuid` + org, falling back to `name`) and is resolved back to an
-//!    index at load through [`crate::identity::resolve`]. Anything that does not
+//!    (`account_uuid` + org, falling back to `name`, within the account's
+//!    provider) and is resolved back to an index at load through
+//!    [`crate::identity::resolve`]. Anything that does not
 //!    resolve to EXACTLY one account is DROPPED — a [`Resolved::Many`] tie is
 //!    refused here for the same reason `save_disabled` refuses one: a guess that
 //!    lands on the wrong record is the failure being prevented, not a lesser
@@ -49,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Account, ConfigError};
 use crate::identity::{self, Resolved};
+use crate::provider::Provider;
 
 /// How stale a pin may be at load and still be restored: **15 minutes** since
 /// its last touch (a pin's stamp is the time of the last request served on it).
@@ -124,6 +126,16 @@ pub struct StoredPin {
     /// the caller intended.
     #[serde(default)]
     pub extended_ttl: bool,
+    /// The provider of the pinned account: part of its identity, since
+    /// [`identity::same_identity`] never matches records of different providers.
+    /// Written only for a Codex account, the rule `config::Account::provider`
+    /// follows, so a file written for an Anthropic-only fleet is exactly what it
+    /// was. Absent reads as Anthropic, which is right for every pin written before
+    /// this field existed: every account was Anthropic then. Without it a Codex
+    /// account's pin would read back as Anthropic after a restart and match no row
+    /// of its own provider.
+    #[serde(default, skip_serializing_if = "Provider::is_anthropic")]
+    pub provider: Provider,
 }
 
 impl StoredPin {
@@ -131,6 +143,7 @@ impl StoredPin {
     /// [`identity::resolve`] compares against stored records.
     fn probe(&self) -> Account {
         identity::probe(
+            self.provider,
             &self.name,
             self.account_uuid.clone(),
             self.org_uuid.clone(),
@@ -350,6 +363,7 @@ mod tests {
 
     fn acct(name: &str, uuid: Option<&str>, org: Option<&str>) -> Account {
         identity::probe(
+            Provider::Anthropic,
             name,
             uuid.map(str::to_string),
             org.map(str::to_string),
@@ -377,6 +391,7 @@ mod tests {
             org_name: None,
             touched_at_ms: touched,
             extended_ttl,
+            provider: Provider::Anthropic,
         }
     }
 

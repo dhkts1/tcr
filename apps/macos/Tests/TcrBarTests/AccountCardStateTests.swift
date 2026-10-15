@@ -147,6 +147,65 @@ final class AccountCardStateTests: XCTestCase {
         XCTAssertNotEqual(FleetTally.Kind.disabled.pillText, FleetTally.Kind.disabled.phrase)
     }
 
+    // MARK: - Codex cards
+
+    /// Every state a Codex card can be in has its own pill word, read from the same
+    /// classifier the tally and the strip read: the nine canonical Codex rows, and one
+    /// before its first probe.
+    func testEachCodexCardStateHasItsPill() throws {
+        let expected: [(String, [String: Any], FleetTally.Kind, String)] = [
+            ("bob@example.com/codex", [:], .ok, "OK"),
+            ("carol@example.com", [:], .spent, "Spent"),
+            ("dana@example.com", [:], .ok, "OK"),
+            ("erin@example.com/codex", [:], .needsRelogin, "Needs re-login"),
+            ("gil@example.com", [:], .rejected, "Refused"),
+            ("hal@example.com", [:], .rejected, "Refused"),
+            ("ivy@example.com", [:], .near, "Near"),
+            ("jo@example.com", [:], .ok, "OK"),
+            ("kim@example.com", [:], .unreachable, "Unreachable"),
+            (
+                "bob@example.com/codex",
+                ["quota": NSNull(), "quotaWindows": NSNull(), "probeStatus": "never"],
+                .unmeasured, "Unmeasured"
+            ),
+        ]
+        for (name, overrides, kind, word) in expected {
+            let account = try canonical(name, overrides)
+            XCTAssertEqual(FleetTally.Kind(account: account), kind, name)
+            XCTAssertEqual(
+                FleetTally.Kind(account: account).pillText(for: account.provider), word, name)
+        }
+    }
+
+    /// A Codex account in a reserved group cannot be reached by any Codex request, so
+    /// its UNREACHABLE pill is its whole story. A second `Group only` pill would say it
+    /// serves its group's requests, and no Codex request carries a group. The same
+    /// group facts on a Claude account keep their pill, which is true there.
+    func testAnUnreachableCodexCardDrawsOnePill() throws {
+        let kim = try canonical("kim@example.com")
+        XCTAssertTrue(kim.servesGroupTrafficOnly)
+        XCTAssertNil(kim.rotation, "kim draws a Group only pill beside UNREACHABLE")
+
+        let alice = try canonical(
+            "alice@example.com", ["groups": ["research"], "reservedGroups": ["research"]])
+        XCTAssertEqual(alice.rotation, .groupOnly)
+    }
+
+    /// The Claude pill words are the register main pins in
+    /// ``testEveryKindDrawsItsOwnPillWord``, untouched by the Codex word: the one
+    /// word main's list does not hold is checked here, and the Claude-provider form
+    /// is the register itself for every kind.
+    func testEveryClaudePillWordIsTodays() {
+        XCTAssertEqual(FleetTally.Kind.unreachable.pillText, "Unreachable")
+        let kinds: [FleetTally.Kind] = [
+            .ok, .near, .spent, .unknown, .needsRelogin, .rejected, .unmeasured, .disabled,
+            .unreachable,
+        ]
+        for kind in kinds {
+            XCTAssertEqual(kind.pillText(for: .anthropic), kind.pillText, kind.token)
+        }
+    }
+
     func testADeadCredentialStillOutranksAParkedGroupsQuotaCases() {
         let broken = stateAccount("iris@example.com", status: "error", quota: 0.1, probeStatus: .ok)
         XCTAssertEqual(FleetTally.Kind(account: broken), .needsRelogin)
@@ -216,6 +275,31 @@ final class AccountCardStateTests: XCTestCase {
             sections.first { $0.title == "codereview" }?.breakdown.map(\.label),
             ["2 disabled"])
     }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// The canonical row, decoded, failing the test if it does not decode.
+private func canonical(_ name: String, _ overrides: [String: Any] = [:]) throws -> Account {
+    let fleet = try decodeFleet([try canonicalRow(name, overrides)])
+    XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+    return try XCTUnwrap(fleet.accounts.first)
 }
 
 private func stateAccount(

@@ -187,11 +187,12 @@ impl Manager {
     ///
     /// # One set, two questions
     ///
-    /// The eligibility a lease of ANY mode needs is here and nowhere else: not
-    /// disabled, not [`AccountStatus::Error`], and covered by the scope. What
-    /// separates the two modes is then a property of the candidate, never a
-    /// second filter written out twice: [`LendCandidate::bearer`] is present
-    /// only for an account whose token may leave this Mac right now.
+    /// The eligibility a lease of ANY mode needs is here and nowhere else: an
+    /// Anthropic account, not disabled, not [`AccountStatus::Error`], and
+    /// covered by the scope. What separates the two modes is then a property of
+    /// the candidate, never a second filter written out twice:
+    /// [`LendCandidate::bearer`] is present only for an account whose token may
+    /// leave this Mac right now.
     ///
     /// A [`AccountStatus::Throttled`] account is still a candidate, because a
     /// hold is a timer and a lease outlives it, so counting it keeps the
@@ -227,6 +228,8 @@ impl Manager {
         accounts
             .iter()
             .enumerate()
+            // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
+            .filter(|(_, account)| account.provider == crate::provider::Provider::Anthropic)
             .filter(|(_, account)| !account.disabled && account.status != AccountStatus::Error)
             .filter(|(_, account)| {
                 // An account whose own name is not a label (an email, a uuid)
@@ -538,6 +541,8 @@ impl crate::peer::serve::WindowUtilization for Manager {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             accounts
                 .iter()
+                // Lending a Codex account over the mesh is unmeasured (the borrower's proxy would need the chatgpt-account-id swap too), so this version never lends one.
+                .filter(|account| account.provider == crate::provider::Provider::Anthropic)
                 .filter(|account| !account.disabled && account.status != AccountStatus::Error)
                 .filter(|account| {
                     let label = tcr_peer_wire::sanitize_label(&account.name).unwrap_or_default();
@@ -907,6 +912,47 @@ mod tests {
                 now
             ) > 0.0
         );
+    }
+
+    /// A Codex account lends nothing, however much room it has: lending one
+    /// over the mesh is unmeasured, so this version never does. Both readers
+    /// the lease layer asks are covered, `lendable_fraction` (through
+    /// `lend_candidates`, which `handoff_bearer` shares) and `lendable` (through
+    /// its own filter); the same account on the Anthropic upstream is the
+    /// control.
+    ///
+    /// Watched red: drop either provider filter and that reader answers the
+    /// account's room.
+    #[test]
+    fn a_codex_account_lends_nothing() {
+        use crate::peer::serve::WindowUtilization as _;
+        let now = OffsetDateTime::now_utc();
+
+        let mut codex = account("alice-fake");
+        codex.provider = crate::provider::Provider::Codex;
+        codex.quota.seven_day = measured(0.10, now);
+        let manager = Manager::from_runtimes(vec![codex]);
+        assert_eq!(
+            manager.lendable_fraction(&ALL, tcr_peer_wire::Window::SevenDay, now),
+            0.0,
+            "a Codex account's room must never size a lease"
+        );
+        assert_eq!(
+            manager.lendable(&ALL, tcr_peer_wire::Window::SevenDay),
+            None,
+            "a fleet whose only measured account is a Codex one has nothing measured to lend"
+        );
+
+        let mut anthropic = account("alice-fake");
+        anthropic.quota.seven_day = measured(0.10, now);
+        let manager = Manager::from_runtimes(vec![anthropic]);
+        assert!(
+            manager.lendable_fraction(&ALL, tcr_peer_wire::Window::SevenDay, now) > 0.0,
+            "the control: the same account on the Anthropic upstream lends"
+        );
+        assert!(manager
+            .lendable(&ALL, tcr_peer_wire::Window::SevenDay)
+            .is_some_and(|fraction| fraction > 0.0));
     }
 
     /// An empty fleet lends nothing, and does not panic reaching for a maximum

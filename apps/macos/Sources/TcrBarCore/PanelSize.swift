@@ -131,6 +131,11 @@ public enum PanelSize {
         /// about.
         public let fixedControlsHeight: CGFloat
 
+        /// The line a provider's head takes over its list, in a fleet holding
+        /// both providers (``sectionHeadCount(for:)``). Zero for a caller that
+        /// declares none, which then sizes the list as it always did.
+        public let sectionHeadHeight: CGFloat
+
         public init(
             panelWidth: CGFloat,
             gutter: CGFloat,
@@ -139,7 +144,8 @@ public enum PanelSize {
             rowSpacing: CGFloat,
             hairlineWidth: CGFloat,
             rowHeight: CGFloat,
-            fixedControlsHeight: CGFloat
+            fixedControlsHeight: CGFloat,
+            sectionHeadHeight: CGFloat = 0
         ) {
             self.panelWidth = panelWidth
             self.gutter = gutter
@@ -149,6 +155,7 @@ public enum PanelSize {
             self.hairlineWidth = hairlineWidth
             self.rowHeight = rowHeight
             self.fixedControlsHeight = fixedControlsHeight
+            self.sectionHeadHeight = sectionHeadHeight
         }
 
         /// The width a chrome string is really drawn at: the panel less both
@@ -209,13 +216,26 @@ public enum PanelSize {
     /// and not on the panel — its own doc-comment says so
     /// (`PanelHeight.swift:44-50`). Capping the total instead is precisely how
     /// a long header came out of the footer.
-    public static func listHeight(rowCount: Int, geometry: Geometry) -> CGFloat {
+    ///
+    /// `sectionHeads` is how many provider heads the list draws over its rows
+    /// (``sectionHeadCount(for:)``): each costs its own line and one gap, added
+    /// before the bias and the cap like any row.
+    public static func listHeight(
+        rowCount: Int, sectionHeads: Int = 0, geometry: Geometry
+    ) -> CGFloat {
         guard rowCount > 0 else { return 0 }
         let natural =
             CGFloat(rowCount) * geometry.rowHeight
             + CGFloat(rowCount - 1) * geometry.rowSpacing
+            + CGFloat(sectionHeads) * (geometry.sectionHeadHeight + geometry.rowSpacing)
         let biased = natural - geometry.rowHeight - geometry.rowSpacing
         return min(PanelHeight.panelMaxHeight, max(geometry.rowHeight, biased))
+    }
+
+    /// How many provider heads the Accounts tab draws over its list: one over
+    /// each provider's list in a fleet holding both, and none otherwise.
+    public static func sectionHeadCount(for fleet: Fleet) -> Int {
+        fleet.drawsProviderHeads ? 2 : 0
     }
 
     /// The height of one stack of chrome lines: every line measured at the
@@ -246,8 +266,12 @@ public enum PanelSize {
     /// usage. Reserving a line that is not rendered is the same failure
     /// `PanelHeight.headerOverflow`'s `lineIsDrawn` parameter exists to
     /// prevent, arriving from the other end.
+    ///
+    /// `sectionHeads` is the provider heads over the list
+    /// (``listHeight(rowCount:sectionHeads:geometry:)``).
     public static func plan(
         rowCount: Int,
+        sectionHeads: Int = 0,
         header: [Line],
         footer: [Line],
         geometry: Geometry,
@@ -267,17 +291,20 @@ public enum PanelSize {
             width: geometry.panelWidth,
             headerHeight: headerText,
             footerHeight: footerText + gapAboveControls + geometry.fixedControlsHeight,
-            listHeight: listHeight(rowCount: rowCount, geometry: geometry),
+            listHeight: listHeight(
+                rowCount: rowCount, sectionHeads: sectionHeads, geometry: geometry),
             frameHeight: 2 * geometry.gutter + 2 * geometry.hairlineWidth
                 + CGFloat(bodyChildren - 1) * geometry.sectionSpacing
         )
     }
 
-    /// ``plan(rowCount:header:footer:geometry:metrics:)`` for a decoded fleet.
+    /// ``plan(rowCount:sectionHeads:header:footer:geometry:metrics:)`` for a
+    /// decoded fleet.
     ///
     /// Counts `accounts`, which is every row the list draws — an unreadable row
     /// is reported in the header's own words (`Fleet.unreadableNotice`) and
-    /// draws no card, so it is chrome here and not a row.
+    /// draws no card, so it is chrome here and not a row — and the provider
+    /// heads over them (``sectionHeadCount(for:)``).
     public static func forFleet(
         _ fleet: Fleet,
         header: [Line],
@@ -287,6 +314,7 @@ public enum PanelSize {
     ) -> CGSize {
         plan(
             rowCount: fleet.accounts.count,
+            sectionHeads: sectionHeadCount(for: fleet),
             header: header,
             footer: footer,
             geometry: geometry,

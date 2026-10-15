@@ -116,6 +116,121 @@ final class AccountCardAccessibilityTests: XCTestCase {
         XCTAssertFalse(account.cardSummaryLabel(now: now).contains("control"))
     }
 
+    // MARK: - Which provider a card serves
+
+    /// A fleet with no Codex account builds today's string: the third parameter
+    /// defaults to `false`, and `false` changes nothing.
+    func testNamesProviderDefaultsToFalseAndBuildsTodaysString() throws {
+        let accounts = [
+            try canonical("alice@example.com"),
+            cardAccount(
+                "alice@example.com", plan: "Max 20x", quota: 0.12,
+                fiveHour: 0.12, fiveHourState: .ok, fiveHourResetAtMs: resetIn(minutes: 130),
+                sevenDay: 0.30, sevenDayState: .ok),
+            cardAccount("bob@example.com", quota: 0.5, fiveHour: 0.5, sevenDay: 0.5),
+            cardAccount(
+                "carol@example.com", quota: 0.5, fiveHour: 0.5, sevenDay: 0.5,
+                sevenDayOi: 0.71, sevenDayOiState: .near),
+            cardAccount(
+                "dave@example.com", quota: 0.1, fiveHour: 0.1, sevenDay: 0.1,
+                groups: ["codereview"], parkedGroups: ["codereview"]),
+            cardAccount(
+                "mira@example.com", plan: "Max 20x", quota: 0.12, fiveHour: 0.12,
+                fiveHourState: .ok, sevenDay: 0.30, sevenDayState: .ok),
+            cardAccount(
+                "nadia@example.com", quota: 0.2, fiveHour: 0.2, sevenDay: 0.2,
+                groups: ["research"], reservedGroups: ["research"]),
+            cardAccount(
+                "erin@example.com", quota: 0.98, fiveHour: nil, sevenDay: 0.98,
+                sevenDayState: .spent),
+            cardAccount(
+                "kate@example.com", plan: "Max 20x", quota: 0.12,
+                fiveHour: 0.12, fiveHourState: .ok, sevenDay: 0.30, sevenDayState: .ok),
+            cardAccount("liam@example.com", quota: 0.5, fiveHour: 0.5, sevenDay: 0.5),
+            cardAccount(
+                "frank@example.com", quota: 0.1, fiveHour: 0.1, sevenDay: 0.1,
+                groups: ["codereview"], parkedGroups: ["codereview"]),
+            cardAccount("gina@example.com", disabled: true),
+            cardAccount("hank@example.com", status: "error"),
+            cardAccount("iris@example.com", quota: 0.12, fiveHour: 0.12, sevenDay: 0.12),
+            cardAccount(
+                "jane@example.com", quota: 0.1, fiveHour: 0.1, sevenDay: 0.1,
+                groups: ["research"], reservedGroups: ["research"]),
+        ]
+        for account in accounts {
+            XCTAssertEqual(
+                account.cardSummaryLabel(now: now),
+                account.cardSummaryLabel(now: now, isControl: false, namesProvider: false),
+                account.name)
+            XCTAssertEqual(
+                account.cardSummaryLabel(now: now, isControl: true),
+                account.cardSummaryLabel(now: now, isControl: true, namesProvider: false),
+                account.name)
+        }
+    }
+
+    /// In a fleet that also holds Codex accounts, a Claude card says which provider
+    /// it serves, right after its name, and nothing else in it moves.
+    func testAClaudeCardInAMixedFleetSaysClaudeAccount() throws {
+        let alice = try canonical("alice@example.com")
+        let today = alice.cardSummaryLabel(now: fixtureNow)
+        let name = try XCTUnwrap(today.range(of: "alice@example.com, "))
+        XCTAssertEqual(
+            alice.cardSummaryLabel(now: fixtureNow, namesProvider: true),
+            today.replacingCharacters(in: name, with: "alice@example.com, Claude account, "))
+    }
+
+    func testTheCodexCardLabels() throws {
+        let expected: [(String, [String: Any], String)] = [
+            (
+                "bob@example.com/codex", [:],
+                "bob@example.com/codex, Codex account, ChatGPT Pro, ready, weekly window only, "
+                    + "7d 34% used, within limit, resets 4d"
+            ),
+            (
+                "jo@example.com", [:],
+                "jo@example.com, Codex account, ChatGPT Business, ready, no usage windows "
+                    + "reported, credits unlimited"
+            ),
+            (
+                "gil@example.com", [:],
+                "gil@example.com, Codex account, ChatGPT Team, refused by ChatGPT, 5h 15% used, "
+                    + "within limit, resets 3h 2m, 7d 10% used, within limit, resets 6d"
+            ),
+            (
+                "kim@example.com", [:],
+                "kim@example.com, Codex account, ChatGPT Pro, unreachable, weekly window only, "
+                    + "7d 5% used, within limit, resets 6d"
+            ),
+            (
+                "carol@example.com", [:],
+                "carol@example.com, Codex account, ChatGPT Pro, spent, weekly window only, "
+                    + "7d 100% used, spent, resets 3d 4h, credits 12.50"
+            ),
+            (
+                "bob@example.com/codex", ["sevenDayWindowMinutes": 43200],
+                "bob@example.com/codex, Codex account, ChatGPT Pro, ready, 30d window only, "
+                    + "30d 34% used, within limit, resets 4d"
+            ),
+            (
+                "bob@example.com/codex",
+                [
+                    "gate": "refused", "freeAtMs": 1_767_225_690_000,
+                    "rateLimitedUntilMs": 1_767_225_690_000, "secondsUntilFree": 90,
+                ],
+                "bob@example.com/codex, Codex account, ChatGPT Pro, refused by ChatGPT, weekly "
+                    + "window only, 7d 34% used, within limit, resets 4d"
+            ),
+        ]
+        for (name, overrides, label) in expected {
+            let account = try canonical(name, overrides)
+            XCTAssertEqual(account.cardSummaryLabel(now: fixtureNow), label, name)
+            XCTAssertEqual(
+                account.cardSummaryLabel(now: fixtureNow, namesProvider: true), label,
+                "a Codex card says the same whatever the fleet holds: \(name)")
+        }
+    }
+
     // MARK: - The sentences behind the pills (review #13)
 
     /// A PARKED pill names a state. Without its help it names nothing the
@@ -160,6 +275,34 @@ final class AccountCardAccessibilityTests: XCTestCase {
         XCTAssertTrue(help.contains("research"))
         XCTAssertTrue(help.contains("no pool traffic"))
     }
+}
+
+/// 2026-01-01T00:00:00Z: the clock every canonical timestamp is written against.
+private let fixtureNow = Date(timeIntervalSince1970: 1_767_225_600)
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// The canonical row, decoded, failing the test if it does not decode.
+private func canonical(_ name: String, _ overrides: [String: Any] = [:]) throws -> Account {
+    let fleet = try decodeFleet([try canonicalRow(name, overrides)])
+    XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+    return try XCTUnwrap(fleet.accounts.first)
 }
 
 private func cardAccount(

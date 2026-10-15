@@ -5,10 +5,11 @@ import SwiftUI
 ///
 /// Every running call draws one (Gil, 2026-09-13, on his own Tools crop: the
 /// row closest to the timeout was the ONLY row with no ring). The panel knows
-/// exactly one denominator — the 600 s tool timeout — and the section head says
-/// so out loud in its `.unit`, which is what makes a ring with a shared
-/// denominator honest: the reader is told what the whole is before reading any
-/// fraction of it. The earlier rule (a ring for `Bash` only, because the
+/// each ring's denominator — the 600 s Bash tool timeout, or the timeout a codex
+/// call named — and the ring says which on its own help and in its spoken value
+/// ("4m 18s of 600s"), which is what makes it honest: the reader is told what
+/// the whole is where the fraction is drawn. The section head carries a count
+/// alone (``SectionHead``). The earlier rule (a ring for `Bash` only, because the
 /// timeout is the Bash tool's) left the reader to notice that an unringed row
 /// meant "no denominator" rather than "nothing to worry about", and the row it
 /// silently applied to was the one at 9m 40s.

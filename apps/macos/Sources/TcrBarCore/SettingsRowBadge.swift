@@ -60,12 +60,18 @@ public enum SettingsRowBadge {
     /// would drift from the visible one the next time either changed.
     public static let startServerAtLaunchLabel = "Start the server at launch"
     public static let pollInterval = "server.pollInterval"
+    /// Whether the running proxy pools Codex, shown only on a fleet holding a Codex
+    /// account.
+    public static let serverCodex = "server.codex"
     /// `This Mac` section, General pane.
     public static let launchAtLogin = "mac.launchAtLogin"
     public static let keepAwake = "mac.keepAwake"
     /// `In the menu bar` section, Menu Bar pane.
     public static let showReadyCount = "menuBar.showReadyCount"
     public static let showRunningToolCount = "menuBar.showRunningToolCount"
+    /// Which pool the cup shows, drawn only for a fleet holding both Claude
+    /// and Codex accounts.
+    public static let cupShows = "menuBar.cupShows"
     /// `When the panel opens` section, Menu Bar pane.
     public static let openOnTab = "menuBar.openOnTab"
     public static let textSize = "menuBar.textSize"
@@ -111,10 +117,16 @@ public enum SettingsRowBadge {
         // file, and this key never touches that file at all.
         startServerAtLaunch: .nextLaunch,
         pollInterval: .live,
+        // TcrBar only displays what the running proxy reports about Codex; this
+        // window has no control that changes it.
+        serverCodex: .readOnly,
         launchAtLogin: .live,
         keepAwake: .live,
         showReadyCount: .live,
         showRunningToolCount: .live,
+        // A `UserDefaults` write the menu bar's mark pipeline observes, so the
+        // cup redraws at once.
+        cupShows: .live,
         openOnTab: .live,
         textSize: .readOnly,
         // A `UserDefaults` write, read back on the panel's next draw

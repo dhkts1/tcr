@@ -60,6 +60,7 @@ fn boot_and_stop(home: &Path) -> u16 {
     let mut child = Command::new(bin)
         .args(["server", "--headless", "--port", "0"])
         .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
         .env_remove("XDG_CACHE_HOME")
         .env(
             "TCR_CLAUDE_CODE_CREDENTIALS",

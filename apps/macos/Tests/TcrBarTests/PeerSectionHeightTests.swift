@@ -292,4 +292,70 @@ final class PeerSectionHeightTests: XCTestCase {
             plan(1).footerHeight, plan(0).footerHeight,
             "the knock came out of the footer, which is the bug this file exists for")
     }
+
+    // MARK: - A fleet holding a Codex account
+
+    /// That fleet draws one more line on the tab, under the Share card: Codex
+    /// requests always leave from this Mac. It wraps to two mute lines, and the
+    /// budget charges them to the fixed chrome, so at every peer count the growth
+    /// comes out of neither the capped list nor the footer. A Claude-only fleet's
+    /// figures are the ones above, unchanged.
+    ///
+    /// The mixed figures are `comfortable`'s with those two 17 pt lines added, which
+    /// is what `PeersTabV4.heightMetrics(holdsCodex:)` adds; the source check at the
+    /// end holds the panel to it.
+    func testACodexAccountsLineIsChargedToTheChromeNeverToTheList() throws {
+        let mixed = PeerPanelHeight.Metrics(
+            nameLineHeight: 21,
+            subLineHeight: 17,
+            meterHeight: 27,
+            cardChrome: 22,
+            cardGap: 14,
+            fixedChrome: 216 + 2 * 17,
+            knockCardHeight: 160
+        )
+        for count in [0, 2, 40] {
+            XCTAssertEqual(
+                PeerPanelHeight.peerSectionHeight(rows: trusted(count), metrics: mixed)
+                    - PeerPanelHeight.peerSectionHeight(rows: trusted(count), metrics: comfortable),
+                34, "the Codex line was not charged in full at \(count) peers")
+            XCTAssertEqual(
+                PeerPanelHeight.listViewportHeight(rows: trusted(count), metrics: mixed),
+                PeerPanelHeight.listViewportHeight(rows: trusted(count), metrics: comfortable),
+                "the Codex line came out of the peer list at \(count) peers")
+        }
+        func plan(_ metrics: PeerPanelHeight.Metrics) -> PanelSize.Plan {
+            PeerPanelHeight.plan(
+                rows: trusted(40),
+                header: [PanelSize.Line("13 accounts, 6 with headroom", fontSize: 15)],
+                footer: [PanelSize.Line("2 Macs found, 1 trusted", fontSize: 12.5)],
+                geometry: geometry(), metrics: metrics,
+                textMetrics: FixedMetrics(perLine: 18))
+        }
+        XCTAssertEqual(plan(mixed).footerHeight, plan(comfortable).footerHeight)
+        XCTAssertEqual(plan(mixed).listHeight - plan(comfortable).listHeight, 34)
+
+        let tab = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()  // TcrBarTests
+                .deletingLastPathComponent()  // Tests
+                .deletingLastPathComponent()  // apps/macos
+                .deletingLastPathComponent()  // apps
+                .deletingLastPathComponent()  // repo root
+                .appendingPathComponent("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift"),
+            encoding: .utf8)
+        let start = try XCTUnwrap(
+            tab.range(of: "static func heightMetrics(holdsCodex: Bool) -> PeerPanelHeight.Metrics {"),
+            "the Peers tab's budget no longer takes the fleet's Codex flag")
+        let end = try XCTUnwrap(
+            tab.range(of: "private func pillHelp", range: start.upperBound..<tab.endIndex))
+        let budget = tab[start.upperBound..<end.lowerBound]
+        XCTAssertTrue(
+            budget.contains("(holdsCodex ? codexLineLines * V4.lineHeight(V4.muteSize) : 0)"),
+            "the budget charges the Codex line in some other way, or in every fleet")
+        XCTAssertTrue(tab.contains("static let codexLineLines: CGFloat = 2"))
+        XCTAssertTrue(
+            tab.contains("Self.heightMetrics(holdsCodex: controller.holdsCodex)"),
+            "the drawn list is sized from a budget that does not know the fleet")
+    }
 }

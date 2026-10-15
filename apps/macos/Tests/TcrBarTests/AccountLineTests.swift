@@ -252,6 +252,74 @@ final class AccountLineTests: XCTestCase {
         XCTAssertEqual(cut, [.lines([rows[0]]), .keptOpen(rows[1]), .lines([rows[2], rows[3]])])
         XCTAssertEqual(rows.lineRuns { $0.account.name == "a@example.com" }.first, .keptOpen(rows[0]))
     }
+
+    // MARK: - Codex lines
+
+    /// A Codex line draws a meter only for a window its plan reports, under the
+    /// label its length gives it. The slot of a window it does not report is
+    /// blank, so every bar in the panel still starts at one x.
+    func testACodexLineLeavesAnUnreportedSlotBlank() throws {
+        XCTAssertEqual(try canonical("bob@example.com/codex").lineSlotLabels, [nil, "7d"])
+        XCTAssertEqual(try canonical("dana@example.com").lineSlotLabels, ["5h", "7d"])
+        XCTAssertEqual(try canonical("alice@example.com").lineSlotLabels, ["5h", "7d"])
+        XCTAssertEqual(
+            try canonical("bob@example.com/codex", ["sevenDayWindowMinutes": 43200])
+                .lineSlotLabels,
+            [nil, "30d"])
+        XCTAssertEqual(
+            try canonical(
+                "bob@example.com/codex",
+                ["quota": NSNull(), "quotaWindows": NSNull(), "probeStatus": "never"]
+            ).lineSlotLabels,
+            ["5h", "7d"])
+    }
+
+    /// A plan that reports no window says so across both meter slots, once a probe
+    /// has said it; before that the row is unmeasured, like any other.
+    func testANoWindowPlanReadsNoUsageWindows() throws {
+        let jo = try canonical("jo@example.com")
+        XCTAssertEqual(jo.lineNoWindowsText, "no usage windows")
+        XCTAssertEqual(jo.lineSlotLabels, [nil, nil])
+        XCTAssertNil(try canonical("jo@example.com", ["probeStatus": "never"]).lineNoWindowsText)
+        XCTAssertNil(try canonical("bob@example.com/codex").lineNoWindowsText)
+        XCTAssertNil(try canonical("alice@example.com").lineNoWindowsText)
+    }
+
+    func testTheCodexSignalWords() throws {
+        let forbiddenHold: [String: Any] = [
+            "gate": "refused", "freeAtMs": 1_767_225_690_000,
+            "rateLimitedUntilMs": 1_767_225_690_000, "secondsUntilFree": 90,
+        ]
+        for account in [
+            try canonical("gil@example.com"), try canonical("hal@example.com"),
+            try canonical("bob@example.com/codex", forbiddenHold),
+        ] {
+            XCTAssertEqual(
+                account.liveSignal(now: fixtureNow), AccountLineText("refused", .bad), account.name)
+        }
+        XCTAssertEqual(
+            try canonical("kim@example.com").liveSignal(now: fixtureNow),
+            AccountLineText("unreachable", .bad))
+        XCTAssertEqual(
+            try canonical("alice@example.com", ["gate": "rejected"]).liveSignal(now: fixtureNow),
+            AccountLineText("rejected", .bad))
+    }
+
+    /// A waiting Codex line names the window its figure is from: `week` for a
+    /// 7-day window, the label for any other length. Each figure is used out of 100
+    /// of that one account's weekly-slot window.
+    func testTheCodexWaitingLineNamesItsWindow() throws {
+        XCTAssertEqual(try canonical("carol@example.com").waitingLineText, "week 100% used")
+        XCTAssertEqual(
+            try canonical("carol@example.com", ["sevenDayWindowMinutes": 43200]).waitingLineText,
+            "30d 100% used")
+        XCTAssertEqual(
+            try canonical("jo@example.com", ["disabled": true]).waitingLineText,
+            "no usage windows")
+        XCTAssertEqual(
+            try canonical("alice@example.com", ["disabled": true]).waitingLineText,
+            "week 20% used")
+    }
 }
 
 private func hold(_ window: String, _ resetAtMs: Int64) -> HeldWindow {
@@ -307,4 +375,32 @@ private func lineAccount(
         parkedGroups: parkedGroups,
         groupColors: nil
     )
+}
+
+/// 2026-01-01T00:00:00Z: the clock every canonical timestamp is written against.
+private let fixtureNow = Date(timeIntervalSince1970: 1_767_225_600)
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// The canonical row, decoded, failing the test if it does not decode.
+private func canonical(_ name: String, _ overrides: [String: Any] = [:]) throws -> Account {
+    let fleet = try decodeFleet([try canonicalRow(name, overrides)])
+    XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+    return try XCTUnwrap(fleet.accounts.first)
 }

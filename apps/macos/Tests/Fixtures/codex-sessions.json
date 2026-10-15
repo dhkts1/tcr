@@ -1,0 +1,260 @@
+{
+  "sessions": [
+    {
+      "account": "alice@example.com",
+      "cacheCreationTokens": 12000,
+      "cacheReadTokens": 160000,
+      "cacheTtlSecs": 3600,
+      "costUsd": 1.2034,
+      "firstSeenMs": 1767223200000,
+      "inputTokens": 180000,
+      "lastSeenMs": 1767225597000,
+      "model": "claude-opus-5",
+      "outputTokens": 9200,
+      "reqPerMinute": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        3,
+        2,
+        4,
+        3,
+        5,
+        0
+      ],
+      "requests": 24,
+      "sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+      "tools": {
+        "byTool": [
+          {
+            "calls": 8,
+            "errors": 0,
+            "overOneMinute": 0,
+            "secondsP50": 2.5,
+            "tool": "Bash"
+          },
+          {
+            "calls": 4,
+            "errors": 0,
+            "overOneMinute": 0,
+            "secondsP50": 0.1,
+            "tool": "Read"
+          }
+        ],
+        "calls": 12,
+        "errors": 0,
+        "overOneMinute": 0,
+        "running": [
+          {
+            "commandClass": "build",
+            "commandHead": "cargo test",
+            "startedMs": 1767225580000,
+            "tool": "Bash"
+          }
+        ],
+        "slowest": [
+          {
+            "commandClass": "build",
+            "commandHead": "cargo build --release",
+            "endedMs": 1767225305000,
+            "seconds": 12.0,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "build",
+            "commandHead": "cargo build",
+            "endedMs": 1767225370000,
+            "seconds": 6.0,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "search",
+            "commandHead": "rg -n TODO",
+            "endedMs": 1767225425000,
+            "seconds": 3.0,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "build",
+            "commandHead": "cargo test -p example",
+            "endedMs": 1767225350000,
+            "seconds": 2.5,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "git-local",
+            "commandHead": "git status",
+            "endedMs": 1767225440000,
+            "seconds": 2.5,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "git-local",
+            "commandHead": "git status",
+            "endedMs": 1767225280000,
+            "seconds": 2.0,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "build",
+            "commandHead": "cargo test",
+            "endedMs": 1767225490000,
+            "seconds": 2.0,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": "git-local",
+            "commandHead": "git status",
+            "endedMs": 1767225475000,
+            "seconds": 1.5,
+            "tool": "Bash"
+          },
+          {
+            "commandClass": null,
+            "commandHead": "Read /Users/example/git/tcr/src/session_wire.rs",
+            "endedMs": 1767225320000,
+            "seconds": 0.4,
+            "tool": "Read"
+          },
+          {
+            "commandClass": null,
+            "commandHead": "Read /Users/example/git/tcr/src/proxy.rs",
+            "endedMs": 1767225250000,
+            "seconds": 0.1,
+            "tool": "Read"
+          }
+        ],
+        "subagentsRunning": 0,
+        "timedOut": [],
+        "timeouts": 0,
+        "timeoutsByClass": {}
+      }
+    },
+    {
+      "account": "bob@example.com/codex",
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 80000,
+      "costUsd": 0.0,
+      "firstSeenMs": 1767225425000,
+      "inputTokens": 95000,
+      "lastSeenMs": 1767225550000,
+      "model": "gpt-5.1-codex",
+      "outputTokens": 4100,
+      "provider": "codex",
+      "reasoningTokens": 1200,
+      "reqPerMinute": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        3,
+        2,
+        0
+      ],
+      "requests": 7,
+      "sessionId": "019a3c5e-0000-7000-8000-000000000002",
+      "tools": {
+        "byTool": [
+          {
+            "calls": 2,
+            "errors": 0,
+            "overOneMinute": 0,
+            "secondsP50": 4.0,
+            "tool": "exec_command"
+          },
+          {
+            "calls": 1,
+            "errors": 0,
+            "overOneMinute": 0,
+            "secondsP50": 0.2,
+            "tool": "apply_patch"
+          }
+        ],
+        "calls": 3,
+        "errors": 0,
+        "overOneMinute": 0,
+        "running": [
+          {
+            "commandClass": "build",
+            "commandHead": "cargo build",
+            "startedMs": 1767225555000,
+            "tool": "exec_command"
+          }
+        ],
+        "slowest": [
+          {
+            "commandClass": "build",
+            "commandHead": "cargo test",
+            "endedMs": 1767225485000,
+            "seconds": 4.0,
+            "tool": "exec_command"
+          },
+          {
+            "commandClass": "build",
+            "commandHead": "cargo check",
+            "endedMs": 1767225544500,
+            "seconds": 4.0,
+            "tool": "exec_command"
+          },
+          {
+            "commandClass": null,
+            "commandHead": "apply_patch",
+            "endedMs": 1767225505200,
+            "seconds": 0.2,
+            "tool": "apply_patch"
+          }
+        ],
+        "subagentsRunning": 0,
+        "timedOut": [],
+        "timeouts": 0,
+        "timeoutsByClass": {}
+      },
+      "unpricedRequests": 7
+    }
+  ],
+  "supported": true
+}

@@ -321,11 +321,14 @@ final class RealWorldDecodeTests: XCTestCase {
             fleet.unreadable.isEmpty,
             "every row of the committed contract must decode; unreadable: \(fleet.unreadable)"
         )
-        XCTAssertEqual(fleet.accounts.count, 4)
+        XCTAssertEqual(fleet.accounts.count, 5)
+        // The fifth row is a Codex account, and decodes as one: its `provider` key is read
+        // (``testCommittedContractFixtureHasNoCodexKeys``), and costs the row nothing.
         XCTAssertEqual(
             fleet.accounts.map(\.name),
             [
                 "alice@example.com", "bob@example.com", "carol@example.com", "dave@example.com",
+                "bob@example.com/codex",
             ]
         )
     }
@@ -430,6 +433,31 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertEqual(fleet.unmeasuredCount, 0, "every ENABLED row here has been probed")
         XCTAssertEqual(fleet.source, .live)
         XCTAssertEqual(fleet.serverSha, "abc1234")
+    }
+
+    /// The contract's Codex row names its provider and carries none of the Codex facts, so
+    /// this is what a row with no Codex data decodes to: each fact absent, which reads as
+    /// unknown, never as a value. The canonical Codex fixture is the proof of the present
+    /// half (`CodexDecodeTests`).
+    func testCommittedContractFixtureHasNoCodexKeys() throws {
+        let fleet = try Fleet.decode(contractFixtureData())
+
+        XCTAssertEqual(
+            fleet.accounts.map(\.provider), [.anthropic, .anthropic, .anthropic, .anthropic, .codex])
+        let codex = try XCTUnwrap(fleet.accounts.last)
+        XCTAssertEqual(codex.name, "bob@example.com/codex")
+        XCTAssertNil(codex.quotaWindows)
+        XCTAssertNil(codex.credits)
+        XCTAssertNil(codex.fiveHourWindowMinutes)
+        XCTAssertNil(codex.sevenDayWindowMinutes)
+        XCTAssertNil(codex.limitReachedType)
+        XCTAssertNil(codex.loginError)
+        XCTAssertNil(codex.codexHome)
+        XCTAssertNil(codex.codexRoute)
+        XCTAssertNil(codex.codexTraffic)
+        XCTAssertNil(codex.usage?.sevenDayWindow)
+        XCTAssertFalse(codex.spendControlReached)
+        XCTAssertEqual(codex.usage?.today.reasoningTokens, 0)
     }
 
     /// The `unknown` variant, which the committed fixture cannot contain.

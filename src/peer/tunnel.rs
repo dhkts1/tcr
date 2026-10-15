@@ -490,7 +490,7 @@ async fn sleep_or_never(at: Option<tokio::time::Instant>) {
 /// Splice two streams until either closes, returning `(bytes_a_to_b,
 /// bytes_b_to_a)`, the two figures the gateway meters and the only two it has.
 ///
-/// `src/mitm.rs:805`'s body, over two generic halves. **Two `TcpStream`
+/// `mitm::tunnel`'s body, over two generic halves. **Two `TcpStream`
 /// parameters would not do**: neither end
 /// of a peer carry is a bare socket on both sides (the gateway splices a
 /// [`NoiseStream`] against a `TcpStream`, the requester splices a loopback

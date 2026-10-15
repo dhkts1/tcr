@@ -120,15 +120,29 @@ public enum PeerPaneLayout {
 
     /// What the drawn pane draws: no top-level row carries its own sentence,
     /// and two section heads carry one.
+    ///
+    /// In a fleet holding a Codex account (`holdsCodex`) the Sharing head also
+    /// carries the line that says Codex requests always leave from this Mac, which
+    /// wraps to ``codexHeadLines``. That costs this pane its fit: two trusted Macs
+    /// and no pairing request still fit, and a request or a third Mac scrolls.
+    /// The scroll is accepted, in a mixed fleet only, because the other lever, a
+    /// taller window, would move a Claude-only fleet's pane too.
     public static func drawnContent(
         trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool = false,
-        advancedRows: Int = 7
+        advancedRows: Int = 7, holdsCodex: Bool = false
     ) -> Content {
         Content(
             trustedMacs: trustedMacs, pendingKnocks: pendingKnocks,
             advancedOpen: advancedOpen, advancedRows: advancedRows,
-            explainedRows: 0, sectionSentences: 2)
+            explainedRows: 0, sectionSentences: 2,
+            headLines: holdsCodex ? codexHeadLines : 0)
     }
+
+    /// How many lines the Codex line under the Sharing head takes: "Codex requests
+    /// always leave from this Mac: no Mac lends, serves or carries them in this
+    /// version." is about 465 pt at the head's 10 pt caption, so it wraps to two in
+    /// the pane's column.
+    public static let codexHeadLines = 2
 
     /// What each part of the short pane charges. Every value is an input.
     public struct Metrics: Equatable, Sendable {
@@ -223,10 +237,15 @@ public enum PeerPaneLayout {
         public let explainedRows: Int
         /// How many section HEADS carry a sentence instead.
         public let sectionSentences: Int
+        /// Lines a section head carries after its sentence, each charged as one
+        /// more line of a head: the Codex line under the Sharing head, in a fleet
+        /// holding a Codex account. Zero in every other fleet, and in the mockup.
+        public let headLines: Int
 
         public init(
             trustedMacs: Int, pendingKnocks: Int, advancedOpen: Bool = false,
-            advancedRows: Int = 7, explainedRows: Int = 3, sectionSentences: Int = 0
+            advancedRows: Int = 7, explainedRows: Int = 3, sectionSentences: Int = 0,
+            headLines: Int = 0
         ) {
             self.trustedMacs = trustedMacs
             self.pendingKnocks = pendingKnocks
@@ -234,6 +253,7 @@ public enum PeerPaneLayout {
             self.advancedRows = advancedRows
             self.explainedRows = explainedRows
             self.sectionSentences = sectionSentences
+            self.headLines = headLines
         }
     }
 
@@ -269,7 +289,7 @@ public enum PeerPaneLayout {
         // have one, or in the second line of a section head.
         let sentences =
             CGFloat(content.explainedRows) * m.rowDetailHeight
-            + CGFloat(content.sectionSentences) * m.sectionSentenceHeight
+            + CGFloat(content.sectionSentences + content.headLines) * m.sectionSentenceHeight
         // Three gaps between the four groups, and the last one is smaller:
         // the Advanced group has no head above it.
         return thisMac + sharing + trusted + advanced + sentences
