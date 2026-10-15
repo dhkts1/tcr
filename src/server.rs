@@ -2071,31 +2071,46 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         // megabytes — a 5-second timer would rewrite all of it twelve times a minute, forever.
         // The cost of the wider window is what a SIGKILL inside it loses: up to a minute of
         // newly minted tokens, whose conversations then route as they did before this feature.
+        // A CLEAN shutdown loses none of them: on the shutdown signal the map is written one
+        // last time if it changed. Before that, every restart (a TcrBar update is one) dropped
+        // the last minute of mints, which are the live conversations' newest tokens; the first
+        // requests after the boot then found bound history with no minted token known.
+        //
+        // The final write is inside this task on purpose: `ServerHandle::shutdown_within` sends
+        // the signal and then JOINS each background task, so the task, write included, finishes
+        // before `shutdown` returns. Only a task still running at the grace deadline is aborted,
+        // and a write already under way is synchronous, so the abort cannot cut it in half.
         let flusher = manager.clone();
         let flush_path = bound_token_path.clone();
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("bound-token-flusher", async move {
+            let write_if_dirty = || {
+                if !flusher.take_bound_tokens_dirty() {
+                    return;
+                }
+                if let Err(err) = flusher.flush_bound_tokens(&flush_path) {
+                    tracing::warn!(
+                        path = %flush_path.display(),
+                        error = %err,
+                        "could not write the bound-token file; conversations bound this boot may be re-keyed after a restart"
+                    );
+                }
+            };
             let flush = async {
                 let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
-                    if !flusher.take_bound_tokens_dirty() {
-                        continue;
-                    }
-                    if let Err(err) = flusher.flush_bound_tokens(&flush_path) {
-                        tracing::warn!(
-                            path = %flush_path.display(),
-                            error = %err,
-                            "could not write the bound-token file; conversations bound this boot may be re-keyed after a restart"
-                        );
-                    }
+                    write_if_dirty();
                 }
             };
             tokio::select! {
                 _ = flush => {}
                 _ = stop.changed() => {}
             }
+            // The timer loop never ends, so reaching here means the shutdown signal (or the
+            // sender's drop) arrived: write whatever changed since the last tick.
+            write_if_dirty();
         })));
     }
 
@@ -2795,6 +2810,68 @@ mod tests {
             None,
         );
         assert_eq!(handle.shutdown().await.affinity, AffinityFlush::Disabled);
+    }
+
+    /// A token minted inside the bound-token flusher's minute must reach the disk on a CLEAN
+    /// shutdown. The flusher used to stop on the signal without writing, so every restart lost
+    /// the newest mints, which are exactly the live conversations' tokens; after the next boot
+    /// their requests found bound history and no minted token to route by.
+    ///
+    /// The timer's first tick fires at once, so the test waits past it before recording; the
+    /// next tick is a minute away, so only the final write on the shutdown signal can have
+    /// written the token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_shutdown_writes_the_bound_token_map() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-server-bound-tokens-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("creating the test's temp dir");
+        let affinity_path = dir.join("session-affinity.json");
+        let config = boot_line_test_config();
+        let accounts = config.accounts.clone();
+
+        let mut handle = serve(ServeOptions {
+            tls: TlsSetup::Disabled,
+            affinity_path: Some(affinity_path.clone()),
+            ..ServeOptions::new(config)
+        })
+        .await
+        .expect("serving on port 0")
+        .expect_started();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let token = "msg_fake_1";
+        handle.manager().record_bound_tokens(
+            &[(
+                crate::bound_tokens::BoundTokenKind::MessageId,
+                token.to_string(),
+            )],
+            0,
+            crate::now_ms(),
+        );
+        handle.shutdown().await;
+
+        let report = crate::bound_tokens::load(
+            &crate::bound_tokens::path_beside(&affinity_path),
+            &accounts,
+            crate::now_ms(),
+            crate::bound_tokens::BOUND_TOKEN_TTL_MS,
+        );
+        let restored = report
+            .tokens
+            .get(&crate::bound_tokens::hash_token(token))
+            .map(|(idx, kind, _)| (*idx, *kind));
+        std::fs::remove_dir_all(&dir).expect("removing the test's temp dir");
+        assert_eq!(
+            restored,
+            Some((0, crate::bound_tokens::BoundTokenKind::MessageId)),
+            "a token minted before a clean shutdown must be on disk, bound to account 0; \
+             load report: degraded={:?} restored={}",
+            report.degraded,
+            report.tokens.len()
+        );
     }
 
     /// `Drop` must also SIGNAL — the accept loop and every background loop stop
