@@ -770,7 +770,8 @@ fn hanging_codex_script(log: &Path) -> String {
 }
 
 /// Whether `pid` is gone, or a zombie nobody will run again.
-fn gone(pid: u32) -> bool {
+fn gone(expected: (u32, u64)) -> bool {
+    let pid = expected.0;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -778,12 +779,25 @@ fn gone(pid: u32) -> bool {
         true,
         ProcessRefreshKind::nothing(),
     );
-    system
-        .process(Pid::from_u32(pid))
-        .is_none_or(|process| process.status() == ProcessStatus::Zombie)
+    system.process(Pid::from_u32(pid)).is_none_or(|process| {
+        process.status() == ProcessStatus::Zombie
+            || !cleanup_identity_is_current(expected, (pid, process.start_time()))
+    })
 }
 
-fn kill_hard(pid: u32) {
+fn cleanup_identity_is_current(expected: (u32, u64), current: (u32, u64)) -> bool {
+    expected.0 == current.0 && expected.1 > 0 && expected.1 == current.1
+}
+
+#[test]
+fn cleanup_will_not_signal_a_reused_fixture_pid() {
+    assert!(!cleanup_identity_is_current((111, 100), (111, 101)));
+    assert!(cleanup_identity_is_current((111, 100), (111, 100)));
+    assert!(!cleanup_identity_is_current((111, 0), (111, 0)));
+}
+
+fn kill_hard(expected: (u32, u64)) {
+    let pid = expected.0;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -792,7 +806,11 @@ fn kill_hard(pid: u32) {
         ProcessRefreshKind::nothing(),
     );
     if let Some(process) = system.process(Pid::from_u32(pid)) {
-        let _ = process.kill_with(Signal::Kill);
+        if process.status() != sysinfo::ProcessStatus::Zombie
+            && cleanup_identity_is_current(expected, (pid, process.start_time()))
+        {
+            let _ = process.kill_with(Signal::Kill);
+        }
     }
 }
 
@@ -852,10 +870,23 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
                 .is_empty()),
             "the fake started its child"
         );
-        let pids: Vec<u32> = ["pid ", "child "]
+        let pids: Vec<(u32, u64)> = ["pid ", "child "]
             .iter()
             .flat_map(|prefix| logged(&scratch.log, prefix))
-            .map(|pid| pid.trim().parse().expect("a logged pid"))
+            .map(|pid| {
+                use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+                let pid: u32 = pid.trim().parse().expect("a logged pid");
+                let mut system = System::new();
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+                    true,
+                    ProcessRefreshKind::nothing(),
+                );
+                let process = system
+                    .process(Pid::from_u32(pid))
+                    .expect("the owned fixture is running");
+                (pid, process.start_time())
+            })
             .collect();
         let home = PathBuf::from(&scratch.homes()[0]);
 
@@ -1233,4 +1264,32 @@ fn login_codex_is_refused_by_a_live_proxy_that_names_no_providers() {
     );
     assert!(scratch.homes().is_empty(), "codex never ran");
     assert_eq!(std::fs::read(&scratch.config).expect("the config"), before);
+}
+
+#[test]
+fn a_failed_codex_login_reports_its_folder_cleanup_failure_too() {
+    let scratch = Scratch::new("[]");
+    let auth = scratch.path("prepared-auth.json");
+    std::fs::write(&auth, bob_auth()).unwrap();
+    write_script(&scratch.codex, &format!(
+        "#!/bin/sh\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\nexit 7\n",
+        log=scratch.log.display(), auth=auth.display(),
+    ));
+    let out = scratch
+        .tcr()
+        .args(["login", "--codex", "--non-interactive", "--config"])
+        .arg(&scratch.config)
+        .output()
+        .unwrap();
+    let folder = PathBuf::from(scratch.homes().remove(0));
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("exited with 7")
+            && stderr.contains("removing")
+            && stderr.contains("delete it by hand"),
+        "the sign-in and cleanup failures must both be reported: {stderr}"
+    );
+    assert_eq!(events(&out)[0]["code"], "codex-login-failed");
 }

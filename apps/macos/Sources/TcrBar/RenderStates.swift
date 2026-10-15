@@ -562,9 +562,8 @@ enum RenderStates {
         let saved = LoginSheetFacts(
             request: .codex(account: nil),
             notices: [
-                "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`, or set "
-                    + "HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port> and CODEX_CA_CERTIFICATE to "
-                    + "tcr's CA; unmarked connections keep their own login",
+                "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep "
+                    + "the marker scoped to that launch, since unmarked connections keep their own login",
                 "codex needs a login of its own to start, even when pooled, and none is at "
                     + "/Users/example/.codex/auth.json: unless codex keeps its login in the "
                     + "keyring, run `codex login` once",

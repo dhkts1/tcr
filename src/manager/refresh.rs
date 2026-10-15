@@ -2,6 +2,22 @@
 
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct PendingCodexWriteback {
+    expected_refresh: String,
+    tokens: Tokens,
+}
+
+impl std::fmt::Debug for PendingCodexWriteback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingCodexWriteback")
+            .field("expected_refresh", &"<redacted>")
+            .field("tokens", &"<redacted>")
+            .finish()
+    }
+}
+
 impl Manager {
     /// Refresh account `idx`'s token if it is hard-expired OR within the proactive
     /// [`oauth::EXPIRING_SOON_MS`] buffer of expiry, coalescing concurrent callers
@@ -18,6 +34,66 @@ impl Manager {
     /// so the caller (the proxy 401 arm) rotates instead of retrying a dead token.
     pub async fn ensure_fresh_force(&self, idx: usize) -> bool {
         self.ensure_fresh_inner(idx, true).await
+    }
+
+    async fn retry_codex_writeback(&self, idx: usize) {
+        let lock = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let Some(account) = accounts.get(idx) else {
+                return;
+            };
+            if account.pending_codex_writeback.is_none() {
+                return;
+            }
+            account.refresh_lock.clone()
+        };
+        let _guard = lock.lock().await;
+        let _ = self.flush_codex_writeback_locked(idx).await;
+    }
+
+    /// The per-account refresh lock is held by every caller. Pending state is in memory;
+    /// restarting before publication succeeds loses this retry queue, not tcr's fresh tokens.
+    async fn flush_codex_writeback_locked(&self, idx: usize) -> Option<std::io::Result<bool>> {
+        let (home, pending, name) = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let account = accounts.get(idx)?;
+            if account.removed {
+                return None;
+            }
+            match account.provider {
+                crate::provider::Provider::Anthropic => return None,
+                crate::provider::Provider::Codex => {}
+            }
+            (
+                account.codex_home.clone()?,
+                account.pending_codex_writeback.clone()?,
+                account.name.clone(),
+            )
+        };
+        if self.mutation_is_released() {
+            return None;
+        }
+        let result = crate::codex_token_store::write_back_async(
+            std::path::Path::new(&home),
+            &pending.expected_refresh,
+            &pending.tokens,
+        )
+        .await;
+        match &result {
+            Ok(_) => {
+                if let Some(account) = self
+                    .accounts
+                    .write()
+                    .expect("accounts lock poisoned")
+                    .get_mut(idx)
+                {
+                    account.pending_codex_writeback = None;
+                }
+            }
+            Err(error) => tracing::warn!(account = %name, error_kind = ?error.kind(),
+                "could not synchronize refreshed tokens with the imported Codex login; will retry while the source token still matches"),
+        }
+        Some(result)
     }
 
     /// Returns `true` iff [`Self::apply_refresh`] ran (a new token was applied).
@@ -37,6 +113,9 @@ impl Manager {
     /// the coalescing lock inward moved into [`Self::refresh_locked`] so the lock is
     /// held by the task doing the work, never by a caller that may vanish.
     async fn ensure_fresh_inner(&self, idx: usize, force: bool) -> bool {
+        // A previous POST may have rotated the shared token while auth.json was temporarily
+        // unwritable. Retry its guarded publication even when this access token is still valid.
+        self.retry_codex_writeback(idx).await;
         // Decide whether to refresh and snapshot the access token we intend to
         // replace — all before taking the (async) coalescing lock.
         let Some((refresh_token, access_before)) = self.refresh_plan(idx, force, crate::now_ms())
@@ -160,51 +239,77 @@ impl Manager {
                     })
             }
         };
-        // Codex may have refreshed since this row was loaded. Adopt its live pair before
-        // spending the stale single-use refresh token, and check again after an upstream race.
+        // An expired file access token can still carry the newest working refresh token.
+        // Only a live candidate is applied directly; an expired candidate is refreshed first.
         let preexisting = newer_in_file(None, false).await;
-        let result = if let Some(tokens) = preexisting {
-            Ok(tokens)
+        let result = if let Some(tokens) = preexisting
+            .as_ref()
+            .filter(|tokens| tokens.expires_at_ms > crate::now_ms())
+        {
+            Ok(tokens.clone())
         } else {
+            let mut posted_refresh = preexisting
+                .as_ref()
+                .and_then(|tokens| tokens.refresh_token.clone())
+                .unwrap_or_else(|| refresh_token.clone());
             tracing::info!(account = %name, "refreshing OAuth token");
-            match self
+            let mut refreshed = self
                 .refresher
-                .refresh(provider, refresh_token.clone())
-                .await
-            {
-                Ok(mut tokens) => {
-                    if let Some(home) = imported_home.as_deref() {
-                        match crate::codex_token_store::write_back_async(
-                            home,
-                            &refresh_token,
-                            &tokens,
-                        )
+                .refresh(provider, posted_refresh.clone())
+                .await;
+            if let Err(error) = &refreshed {
+                let rejected = matches!(error, oauth::OAuthError::AuthRejected { .. });
+                if let Some(replacement) =
+                    newer_in_file(loaded_refresh_ms, rejected)
                         .await
+                        .filter(|tokens| {
+                            tokens.refresh_token.as_deref() != Some(posted_refresh.as_str())
+                        })
+                {
+                    if replacement.expires_at_ms > crate::now_ms() {
+                        refreshed = Ok(replacement);
+                    } else if let Some(token) = replacement.refresh_token {
+                        posted_refresh = token;
+                        refreshed = self
+                            .refresher
+                            .refresh(provider, posted_refresh.clone())
+                            .await;
+                    }
+                }
+            }
+            match refreshed {
+                Ok(mut tokens) => {
+                    if imported_home.is_some() {
                         {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                if let Some(newer) = newer_in_file(loaded_refresh_ms, false).await {
-                                    tokens = newer;
-                                }
+                            let mut accounts =
+                                self.accounts.write().expect("accounts lock poisoned");
+                            if let Some(account) = accounts.get_mut(idx) {
+                                let expected_refresh = account
+                                    .pending_codex_writeback
+                                    .as_ref()
+                                    .map(|pending| pending.expected_refresh.clone())
+                                    .unwrap_or_else(|| posted_refresh.clone());
+                                account.pending_codex_writeback = Some(PendingCodexWriteback {
+                                    expected_refresh,
+                                    tokens: tokens.clone(),
+                                });
                             }
-                            Err(error) => tracing::warn!(
-                                account = %name,
-                                error_kind = ?error.kind(),
-                                "could not synchronize refreshed tokens with the imported Codex login"
-                            ),
+                        }
+                        if matches!(
+                            self.flush_codex_writeback_locked(idx).await,
+                            Some(Ok(false))
+                        ) {
+                            if let Some(newer) = newer_in_file(loaded_refresh_ms, false)
+                                .await
+                                .filter(|candidate| candidate.expires_at_ms > crate::now_ms())
+                            {
+                                tokens = newer;
+                            }
                         }
                     }
                     Ok(tokens)
                 }
-                // A concurrent Codex rotation can change the file during any failed POST,
-                // not only one that names a reused token. A different live pair for the same
-                // account is stronger evidence than this stale token's failure.
-                Err(error) => {
-                    let rejected = matches!(&error, oauth::OAuthError::AuthRejected { .. });
-                    newer_in_file(loaded_refresh_ms, rejected)
-                        .await
-                        .ok_or(error)
-                }
+                Err(error) => Err(error),
             }
         };
         match result {
@@ -675,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reused_imported_codex_refresh_rejects_foreign_expired_or_older_file_tokens() {
+    async fn a_reused_imported_codex_refresh_rejects_foreign_missing_or_older_file_tokens() {
         let mut foreign = auth_document("rt-other", 2);
         foreign["tokens"]["account_id"] = json!("33333333-3333-4333-8333-333333333333");
         foreign["tokens"]["access_token"] = json!(access_token(
@@ -683,11 +788,11 @@ mod tests {
             2,
             4_102_444_800,
         ));
-        let mut expired = auth_document("rt-expired", 2);
-        expired["tokens"]["access_token"] = json!(access_token(ACCOUNT_ID, 2, 1));
+        let mut missing_refresh = auth_document("rt-missing", 2);
+        missing_refresh["tokens"]["refresh_token"] = Value::Null;
         let mut older = auth_document("rt-older", 2);
         older["last_refresh"] = json!("2026-09-01T00:00:00Z");
-        for document in [foreign, expired, older, auth_document("rt-old", 2)] {
+        for document in [foreign, missing_refresh, older, auth_document("rt-old", 2)] {
             let home = tempfile::tempdir().unwrap();
             write_auth(home.path(), &auth_document("rt-old", 1));
             let (manager, _) = imported_manager(home.path(), Some(document.clone()), true);
@@ -983,5 +1088,140 @@ mod tests {
             heartbeat < std::time::Duration::from_millis(250),
             "config token persistence stalled the runtime for {heartbeat:?}"
         );
+    }
+    #[tokio::test]
+    async fn an_expired_imported_access_token_can_refresh_its_newer_file_login() {
+        struct RefreshFileToken {
+            home: PathBuf,
+            changed_during_post: bool,
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl TokenRefresher for RefreshFileToken {
+            fn refresh(&self, _: crate::provider::Provider, token: String) -> oauth::RefreshFuture {
+                self.calls.lock().unwrap().push(token.clone());
+                let home = self.home.clone();
+                let changed_during_post = self.changed_during_post;
+                Box::pin(async move {
+                    if token == "rt-old" {
+                        assert!(changed_during_post);
+                        let mut expired = auth_document("rt-file-new", 2);
+                        expired["tokens"]["access_token"] = json!(access_token(ACCOUNT_ID, 2, 1));
+                        write_auth(&home, &expired);
+                        return Err(oauth::OAuthError::AuthRejected {
+                            status: 401,
+                            code: Some("refresh_token_reused"),
+                        });
+                    }
+                    assert_eq!(token, "rt-file-new");
+                    Ok(Tokens {
+                        id_token: Some("fresh-id-token".to_owned()),
+                        access_token: access_token(ACCOUNT_ID, 3, 4_102_444_800),
+                        refresh_token: Some("rt-file-refreshed".to_owned()),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                })
+            }
+        }
+        for changed_during_post in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut document = auth_document("rt-file-new", 2);
+            document["tokens"]["access_token"] = json!(access_token(ACCOUNT_ID, 2, 1));
+            let original = auth_document("rt-old", 1);
+            write_auth(
+                home.path(),
+                if changed_during_post {
+                    &original
+                } else {
+                    &document
+                },
+            );
+            let (original, _) = imported_manager(home.path(), None, false);
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let manager = Manager::new(
+                original.config.lock().unwrap().clone(),
+                Arc::new(RefreshFileToken {
+                    home: home.path().to_path_buf(),
+                    changed_during_post,
+                    calls: Arc::clone(&calls),
+                }),
+                Arc::new(NoNetwork),
+                Arc::new(NoNetwork),
+                None,
+            );
+            assert!(
+                manager.ensure_fresh_force(0).await,
+                "expired file access must not discard its working newer refresh token"
+            );
+            assert_eq!(manager.account_status(0), Some(AccountStatus::Active));
+            assert_eq!(
+                read_auth(home.path())["tokens"]["refresh_token"],
+                "rt-file-refreshed"
+            );
+            let expected = if changed_during_post {
+                vec!["rt-old", "rt-file-new"]
+            } else {
+                vec!["rt-file-new"]
+            };
+            assert_eq!(*calls.lock().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_imported_codex_writeback_retries_the_latest_tokens_without_refreshing_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        struct Rotate(Arc<AtomicUsize>);
+        impl TokenRefresher for Rotate {
+            fn refresh(&self, _: crate::provider::Provider, _: String) -> oauth::RefreshFuture {
+                let generation = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                Box::pin(async move {
+                    Ok(Tokens {
+                        id_token: Some(format!("id-{generation}")),
+                        access_token: access_token(
+                            ACCOUNT_ID,
+                            generation as i64 + 1,
+                            4_102_444_800,
+                        ),
+                        refresh_token: Some(format!("rt-{generation}")),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                })
+            }
+        }
+        for rotations in [1, 2] {
+            let home = tempfile::tempdir().unwrap();
+            write_auth(home.path(), &auth_document("rt-old", 1));
+            let (original, _) = imported_manager(home.path(), None, false);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let manager = Manager::new(
+                original.config.lock().unwrap().clone(),
+                Arc::new(Rotate(Arc::clone(&calls))),
+                Arc::new(NoNetwork),
+                Arc::new(NoNetwork),
+                None,
+            );
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            for _ in 0..rotations {
+                {
+                    let mut accounts = manager.accounts.write().unwrap();
+                    accounts[0].refresh_retry_after_ms = None;
+                    accounts[0].expires_at_ms = Some(0);
+                }
+                assert!(manager.ensure_fresh_force(0).await);
+            }
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            manager.ensure_fresh(0).await;
+            let stored = read_auth(home.path());
+            assert_eq!(
+                stored["tokens"]["refresh_token"],
+                format!("rt-{rotations}"),
+                "retry must retain the original spent source token and publish the latest pair"
+            );
+            assert_eq!(stored["tokens"]["id_token"], format!("id-{rotations}"));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                rotations,
+                "a writeback retry must not spend another refresh token"
+            );
+        }
     }
 }

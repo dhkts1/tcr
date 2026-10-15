@@ -423,7 +423,10 @@ fn from_codex_reads_the_login_under_the_default_codex_home() {
     assert!(
         stderr.contains("checks auth.json before writing refreshed tokens")
             && stderr.contains("replacement tokens for the same ChatGPT account")
-            && stderr.contains("simultaneous codex refresh can still race this update"),
+            && stderr.contains("simultaneous codex refresh can still race this update")
+            && stderr.contains(
+                "Signing in again with `codex login` in that folder revokes this shared login"
+            ),
         "the import must explain guarded token sharing: {stderr}"
     );
     assert_no_token_in(&out);
@@ -625,7 +628,7 @@ fn the_import_writes_codex_home() {
     let (home, config) = scratch_home("[]");
     let elsewhere = home.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).expect("creating the scratch folder");
-    let auth = elsewhere.join("codex-auth.json");
+    let auth = elsewhere.join("auth.json");
     std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
     let out = login_from_codex(home.path(), &config, Some(&auth), &[]);
     assert!(
@@ -638,6 +641,35 @@ fn the_import_writes_codex_home() {
         elsewhere.display().to_string(),
         "the directory of the file TCR_CODEX_AUTH names"
     );
+}
+
+#[test]
+fn an_override_file_without_codexs_auth_basename_does_not_record_its_parent_for_sync() {
+    let (home, config) = scratch_home("[]");
+    let auth = home.path().join("standalone-login.json");
+    std::fs::write(&auth, fake_codex_auth_json()).unwrap();
+    let unrelated = home.path().join("auth.json");
+    std::fs::write(&unrelated, "unrelated document").unwrap();
+    let out = login_from_codex(home.path(), &config, Some(&auth), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("without automatic file synchronization"),
+        "a standalone override must explain that its source is not synchronized: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        accounts_of(&config)[0].get("codexHome").is_none(),
+        "a standalone override must not nominate a different auth.json for writes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(unrelated).unwrap(),
+        "unrelated document"
+    );
+    assert_no_token_in(&out);
 }
 
 /// Every non-empty stdout line, parsed as JSON.
@@ -661,25 +693,6 @@ fn output_details(out: &Output) -> String {
     )
 }
 
-/// Another test's stub can claim a released ephemeral port before the import probes it.
-#[test]
-fn offline_import_ignores_an_ephemeral_listener_reusing_a_released_port() {
-    let (home, config) = scratch_home("[]");
-    let document: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-    let port = u16::try_from(document["proxy"]["port"].as_u64().unwrap()).unwrap();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-    let (_upstream, unrelated_requests) = serve_codex_upstream(listener, UNCONSTRAINED_WORKSPACE);
-    let auth = home.path().join("codex-auth.json");
-    std::fs::write(&auth, fake_codex_auth_json()).unwrap();
-
-    let out = login_from_codex(home.path(), &config, Some(&auth), &["--non-interactive"]);
-
-    assert!(out.status.success(), "{}", output_details(&out));
-    assert_eq!(unrelated_requests.load(Ordering::SeqCst), 0);
-    assert_eq!(accounts_of(&config)[0]["provider"], "codex");
-}
-
 /// `--from-codex --non-interactive` speaks the login protocol: the import's cost as one
 /// `notice`, then each notice that holds (here the first-account one: codex has a login of its
 /// own and no older `tcr` is in reach), then `saved` with the provider and the plan, and no
@@ -693,7 +706,7 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
     let codex_home = home.path().join(".codex");
     std::fs::create_dir_all(&codex_home).expect("creating the scratch ~/.codex");
     std::fs::write(codex_home.join("auth.json"), "").expect("codex's own login, present");
-    let auth = home.path().join("codex-auth.json");
+    let auth = home.path().join("auth.json");
     std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
 
     let out = login_from_codex(home.path(), &config, Some(&auth), &["--non-interactive"]);

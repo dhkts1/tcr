@@ -82,7 +82,9 @@ pub(crate) async fn write_back_async(
 }
 
 impl ImportedAuth {
-    /// A changed, live token pair for the same ChatGPT workspace, and the same user when known.
+    /// A changed token pair for the same ChatGPT workspace, and the same user when known.
+    /// An expired access token still carries a potentially usable refresh token; the manager
+    /// refreshes that pair before applying it.
     /// JWT issuance must advance, or an unchanged/missing issuance time needs an advancing
     /// file timestamp whose baseline belonged to the current refresh token. A different live
     /// pair alone proves no freshness: a failed writeback can leave an older pair on disk.
@@ -140,10 +142,7 @@ impl ImportedAuth {
                 return None;
             }
         }
-        let expires_at_ms = self
-            .login
-            .expires_at_ms
-            .filter(|&expiry| expiry > crate::now_ms())?;
+        let expires_at_ms = self.login.expires_at_ms.unwrap_or(0);
         Some(Tokens {
             id_token: self
                 .document
@@ -159,8 +158,49 @@ impl ImportedAuth {
     }
 }
 
-/// `false` means the file changed: no destination bytes were written. Unknown fields and the
-/// original id token are retained unless the refresh endpoint returned a replacement.
+/// Erase unpublished credentials before unlinking, including when the parent directory has
+/// become read-only. A successful rename disarms this guard without touching auth.json.
+struct PrivateTokenFile {
+    temporary: Option<tempfile::NamedTempFile>,
+}
+
+impl PrivateTokenFile {
+    fn file_mut(&mut self) -> &mut tempfile::NamedTempFile {
+        self.temporary
+            .as_mut()
+            .expect("unpublished token temporary")
+    }
+
+    fn publish(mut self, destination: &Path) -> io::Result<()> {
+        let temporary = self.temporary.take().expect("unpublished token temporary");
+        match temporary.persist(destination) {
+            Ok(_) => Ok(()),
+            Err(failure) => {
+                self.temporary = Some(failure.file);
+                Err(failure.error)
+            }
+        }
+    }
+}
+
+impl Drop for PrivateTokenFile {
+    fn drop(&mut self) {
+        let Some(temporary) = self.temporary.as_ref() else {
+            return;
+        };
+        if let Err(error) = temporary
+            .as_file()
+            .set_len(0)
+            .and_then(|()| temporary.as_file().sync_all())
+        {
+            tracing::warn!(error_kind = ?error.kind(), "could not clear an unpublished Codex token temporary file");
+        }
+    }
+}
+
+/// `false` means the source refresh token changed: no destination bytes were written.
+/// A byte conflict retaining that token is retryable, so the manager keeps its pending pair.
+/// Unknown fields and the original id token are retained unless a replacement was returned.
 pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -> io::Result<bool> {
     write_back_before_commit(home, previous_refresh, tokens, || {})
 }
@@ -183,6 +223,13 @@ fn write_back_before_commit(
     // Keep this handle alive through the final comparison and rename. Codex does not take
     // this advisory lock; it protects cooperating tcr writers, not uncooperative processes.
     let _writer_lock = writer_lock;
+    let path = crate::paths::codex_auth_file(home);
+    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "refusing to replace a symlinked Codex login",
+        ));
+    }
     let mut auth = read(home)?;
     if auth.login.refresh_token != previous_refresh {
         return Ok(false);
@@ -219,26 +266,47 @@ fn write_back_before_commit(
     auth.document["last_refresh"] = Value::String(refreshed_at);
     let mut bytes = serde_json::to_vec_pretty(&auth.document).map_err(|_| invalid_document())?;
     bytes.push(b'\n');
-    let mut temporary = tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o600))
-        .prefix(crate::paths::CODEX_AUTH_TEMP_PREFIX)
-        .suffix(".tmp")
-        .tempfile_in(home)?;
-    temporary.write_all(&bytes)?;
-    temporary.as_file().sync_all()?;
+    let mut temporary = PrivateTokenFile {
+        temporary: Some(
+            tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o600))
+                .prefix(crate::paths::CODEX_AUTH_TEMP_PREFIX)
+                .suffix(".tmp")
+                .tempfile_in(home)?,
+        ),
+    };
+    temporary.file_mut().write_all(&bytes)?;
+    temporary.file_mut().as_file().sync_all()?;
     // Compare all bytes so an unrelated field edited while the temp was prepared is preserved
     // too. A Codex write completed before this read is preserved. Codex ignores our lock,
     // so a later external write can still race the rename; this is not an atomic CAS.
     before_commit();
-    if fs::read(&auth.path)? != auth.original {
-        return Ok(false);
+    if fs::symlink_metadata(&auth.path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "refusing to replace a symlinked Codex login",
+        ));
     }
-    if let Err(failure) = temporary.persist(&auth.path) {
-        let error = failure.error;
-        // Preserve the private, fully written recovery file if publication itself failed.
-        let _ = failure.file.keep();
-        return Err(error);
+    let current = fs::read(&auth.path)?;
+    if current != auth.original {
+        let current_document = serde_json::from_slice::<Value>(&current).ok();
+        let refresh_changed = current_document
+            .as_ref()
+            .and_then(|document| document.get("tokens"))
+            .and_then(|tokens| tokens.get("refresh_token"))
+            .and_then(Value::as_str)
+            .is_some_and(|refresh| refresh != previous_refresh);
+        if refresh_changed {
+            return Ok(false);
+        }
+        // Preserve a metadata edit or a temporarily incomplete Codex write, while retaining
+        // the latest pending rotation for a later attempt against the same spent source token.
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Codex login changed during token synchronization; retry the guarded write",
+        ));
     }
+    temporary.publish(&auth.path)?;
     let _ = fs::File::open(home).and_then(|directory| directory.sync_all());
     Ok(true)
 }
@@ -293,6 +361,29 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_metadata_edit_keeps_the_spent_source_token_retryable() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::paths::codex_auth_file(home.path());
+        fs::write(&path, auth("rt-old").to_string()).unwrap();
+        let mut edited = auth("rt-old");
+        edited["codex_cli_field"] = Value::Bool(true);
+        let original = edited.to_string();
+        let result = write_back_before_commit(home.path(), "rt-old", &tokens("rt-new"), || {
+            fs::write(&path, &original).unwrap();
+        });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a metadata conflict must retain the manager's pending token publication"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(write_back(home.path(), "rt-old", &tokens("rt-new")).unwrap());
+        let stored: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["tokens"]["refresh_token"], "rt-new");
+        assert_eq!(stored["codex_cli_field"], true);
+    }
+
+    #[test]
     fn two_tcr_writers_serialize_and_recheck_the_imported_refresh_token() {
         let home = tempfile::tempdir().unwrap();
         let path = crate::paths::codex_auth_file(home.path());
@@ -334,5 +425,82 @@ mod tests {
         );
         let stored: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(stored["tokens"]["refresh_token"], "rt-first");
+    }
+    #[test]
+    fn a_symlinked_codex_auth_file_is_not_replaced() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("linked-login.json");
+        let path = crate::paths::codex_auth_file(home.path());
+        let original = auth("rt-old").to_string();
+        fs::write(&target, &original).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let result = write_back(home.path(), "rt-old", &tokens("rt-new"));
+        assert!(
+            result.is_err(),
+            "symlinked credentials require an explicit writeback refusal"
+        );
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(target).unwrap(), original);
+    }
+
+    #[test]
+    fn a_failed_codex_auth_rename_leaves_no_live_temporary_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::paths::codex_auth_file(home.path());
+        let original = auth("rt-old").to_string();
+        fs::write(&path, &original).unwrap();
+        let result = write_back_before_commit(home.path(), "rt-old", &tokens("rt-new"), || {
+            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        });
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "the read-only directory must prevent the rename"
+        );
+        let leftovers: Vec<_> = fs::read_dir(home.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(crate::paths::CODEX_AUTH_TEMP_PREFIX) && name.ends_with(".tmp")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .collect();
+        assert!(
+            leftovers.iter().all(|&length| length == 0),
+            "failed publication left live credentials in temporary files: {leftovers:?}"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn a_codex_conflict_in_a_read_only_home_leaves_no_temporary_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::paths::codex_auth_file(home.path());
+        fs::write(&path, auth("rt-old").to_string()).unwrap();
+        let mut edited = auth("rt-old");
+        edited["codex_cli_field"] = Value::Bool(true);
+        let original = edited.to_string();
+        let result = write_back_before_commit(home.path(), "rt-old", &tokens("rt-new"), || {
+            fs::write(&path, &original).unwrap();
+            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        });
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        let lengths: Vec<_> = fs::read_dir(home.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .collect();
+        assert!(
+            lengths.iter().all(|&length| length == 0),
+            "an early conflict left live temporary credentials: {lengths:?}"
+        );
     }
 }

@@ -25,6 +25,15 @@ final class LoginEventCodexTests: XCTestCase {
             ])
         XCTAssertTrue(
             try field("text", ofLine: 2).hasPrefix("tcr pools marked Codex connections to chatgpt.com: "))
+        let renderFile = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/TcrBar/RenderStates.swift")
+        let render = try String(contentsOf: renderFile, encoding: .utf8)
+        let joinedLiterals = render.replacingOccurrences(
+            of: #""\s*\+\s*""#, with: "", options: .regularExpression)
+        XCTAssertTrue(
+            joinedLiterals.contains("\"\(try field("text", ofLine: 2))\""),
+            "the saved-account render must show the notice the login command emits")
         XCTAssertTrue(
             try field("reason", ofLine: 4).hasPrefix(
                 "the ChatGPT login that came back is carol@example.com, "))

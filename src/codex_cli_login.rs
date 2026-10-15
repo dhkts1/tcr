@@ -164,9 +164,24 @@ pub async fn login(
         result = &mut flow => result,
     };
     let closed = session.close_folder();
-    let saved = result?;
-    closed?;
-    Ok(saved)
+    match (result, closed) {
+        (Ok(saved), Ok(())) => Ok(saved),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => {
+            // The machine protocol extracts LoginRefusal's reason, so attach cleanup to that
+            // reason as well as preserving its code instead of hiding it in anyhow context.
+            if let Some(refusal) = error.downcast_ref::<LoginRefusal>() {
+                Err(LoginRefusal {
+                    code: refusal.code,
+                    reason: format!("{}; {cleanup:#}", refusal.reason),
+                }
+                .into())
+            } else {
+                Err(error.context(format!("{cleanup:#}")))
+            }
+        }
+    }
 }
 
 /// The flow from `codex login` to the notices, with the folder already made.

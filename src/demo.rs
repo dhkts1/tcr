@@ -90,6 +90,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         hold_cause: crate::manager::HoldCause::RateLimit,
         login_error: None,
         codex_home: None,
+        pending_codex_writeback: None,
         refresh_retry_after_ms: None,
         error_retry_after_ms: None,
         error_backoff_ms: 0,

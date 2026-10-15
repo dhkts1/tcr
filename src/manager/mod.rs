@@ -446,6 +446,8 @@ pub struct AccountRuntime {
     /// [`config::Account::codex_home`]: the imported login's folder, for guarded token sharing
     /// and the status wire. A re-login replaces it with the submission's.
     pub codex_home: Option<String>,
+    /// Latest shared tokens awaiting guarded auth.json publication; never part of status.
+    pub(crate) pending_codex_writeback: Option<refresh::PendingCodexWriteback>,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -777,6 +779,7 @@ impl AccountRuntime {
             hold_cause: HoldCause::RateLimit,
             login_error: None,
             codex_home: account.codex_home.clone(),
+            pending_codex_writeback: None,
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,

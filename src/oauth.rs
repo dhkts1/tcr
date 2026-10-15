@@ -7,9 +7,10 @@
 //! out of rotation until re-login), whereas a `5xx`/network failure is transient
 //! (keep the current token and fail this one request over to another account).
 //! A Codex account refreshes against `auth.openai.com` instead
-//! ([`crate::codex_oauth`], dispatched by [`LiveRefresher`]), where only a `401`, or a
-//! `400` naming one of its dead-token codes, means that; every other status there, a
-//! `403` included, is transient.
+//! ([`crate::codex_oauth`], dispatched by [`LiveRefresher`]). Every Codex `401` and the
+//! `refresh_token_expired`, `refresh_token_reused` and `refresh_token_invalidated` codes at
+//! any error status are permanent, as is `invalid_grant` on a `400`. Other failures are
+//! transient.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -622,9 +623,8 @@ pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
 /// state, enabled, disabled or needing a re-login. The account enables marked Codex connections
 /// to join the pool (`mitm::handle_connect`); unmarked clients keep their own TLS and login.
 pub const CODEX_FIRST_ACCOUNT_NOTICE: &str =
-    "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`, or set \
-    HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port> and CODEX_CA_CERTIFICATE to tcr's CA; \
-    unmarked connections keep their own login";
+    "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep \
+    the marker scoped to that launch, since unmarked connections keep their own login";
 
 /// The warning for a `tcr` at `path`, reporting `version`, that is 0.2.45 or older: it predates
 /// the `credentialVersion` check, so it would read a Codex row as a Claude account and send its
@@ -2141,7 +2141,14 @@ pub const CLAUDE_CODE_IMPORT_CONSEQUENCE: &str =
 pub const CODEX_IMPORT_CONSEQUENCE: &str = "this shares the login the `codex` CLI itself uses. \
     Codex refresh tokens are single-use: tcr checks auth.json before writing refreshed tokens \
     and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh \
-    can still race this update. `tcr login --codex` gives tcr a separate login.";
+    can still race this update. Signing in again with `codex login` in that folder revokes \
+    this shared login; tcr may then need sign-in. `tcr login --codex` gives tcr a separate login.";
+
+/// A standalone override names no Codex auth.json to synchronize after a refresh.
+pub const CODEX_IMPORT_STANDALONE_CONSEQUENCE: &str = "this imports a shared Codex login \
+    without automatic file synchronization. Codex refresh tokens are single-use: refreshing \
+    here can leave the original store stale, and signing in again with `codex login` there \
+    revokes this shared login. `tcr login --codex` gives tcr a separate login.";
 
 /// The compatibility notice printed beside [`CODEX_IMPORT_CONSEQUENCE`] on every import:
 /// the config now holds a Codex row, and a tcr built before Codex accounts cannot tell it from a
@@ -2255,8 +2262,9 @@ pub async fn login_from_claude_code(
 /// [`CODEX_IMPORT_CONSEQUENCE`] and [`CODEX_IMPORT_OLDER_PROXY`] print on every
 /// import.
 ///
-/// The row records the folder the login was read from (`codexHome`, the auth file's
-/// directory, made absolute), for guarded token sharing and TcrBar's re-import. `ui` decides how the
+/// An auth.json import records its absolute parent (`codexHome`) for guarded token sharing
+/// and TcrBar's re-import. A differently named override file is imported without a sync folder:
+/// its parent does not identify the auth.json that Codex writes. `ui` decides how the
 /// import speaks: the terminal gets its lines on stderr, then [`CODEX_IMPORT_RUN_LINE`], then
 /// each notice that holds ([`crate::codex_local::codex_notices`]); [`LoginUi::Machine`] gets the
 /// import's cost as one `notice` event, then those notices as events, then `saved` with the
@@ -2279,22 +2287,32 @@ pub async fn login_from_codex(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let folder = std::path::absolute(folder)
-        .with_context(|| format!("making {} absolute", folder.display()))?;
+    let folder = (path.file_name() == Some(std::ffi::OsStr::new(crate::paths::CODEX_AUTH_FILE)))
+        .then(|| {
+            std::path::absolute(folder)
+                .with_context(|| format!("making {} absolute", folder.display()))
+        })
+        .transpose()?;
     let plan = tcr_status_wire::codex_plan_label(login.plan_type.as_deref());
     let first = holds_no_codex_row(config_path)?;
-    let saved = import_codex_login(config_path, force, name, account, login, Some(&folder)).await?;
+    let saved =
+        import_codex_login(config_path, force, name, account, login, folder.as_deref()).await?;
     let first_account = if first {
         Some(read_first_codex_account_notice(config_path).await)
     } else {
         None
     };
     let notices = crate::codex_local::codex_notices(first_account);
+    let consequence = if folder.is_some() {
+        CODEX_IMPORT_CONSEQUENCE
+    } else {
+        CODEX_IMPORT_STANDALONE_CONSEQUENCE
+    };
     match ui {
         LoginUi::Terminal => {
             // The plan as `tcr status` names it (`ChatGPT Pro`), not the raw claim (`pro`).
             eprintln!(
-                "[tcr] imported as '{saved}'{}; {CODEX_IMPORT_CONSEQUENCE} {CODEX_IMPORT_OLDER_PROXY}",
+                "[tcr] imported as '{saved}'{}; {consequence} {CODEX_IMPORT_OLDER_PROXY}",
                 plan.as_deref()
                     .map_or_else(String::new, |label| format!(" ({label})"))
             );
@@ -2302,7 +2320,7 @@ pub async fn login_from_codex(
             say_codex_notices(ui, &notices);
         }
         LoginUi::Machine => {
-            let consequence = format!("{CODEX_IMPORT_CONSEQUENCE} {CODEX_IMPORT_OLDER_PROXY}");
+            let consequence = format!("{consequence} {CODEX_IMPORT_OLDER_PROXY}");
             ui.emit(LoginEvent::Notice { text: &consequence });
             say_codex_notices(ui, &notices);
             ui.emit(LoginEvent::SavedCodex {
@@ -8544,7 +8562,8 @@ mod tests {
         }));
         assert_eq!(
             first_codex_account_notice(&minted, NOTICE_PORT, notice_ca(), true, false),
-            CODEX_FIRST_ACCOUNT_NOTICE
+            "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep \
+             the marker scoped to that launch, since unmarked connections keep their own login"
         );
         assert_eq!(
             first_codex_account_notice(
