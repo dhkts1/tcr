@@ -45,9 +45,13 @@ struct V4Pill: View {
     /// the way out names the state without naming anything the operator can do
     /// about it. The pre-v4 row already wrote these sentences.
     var help: String?
+    /// A pill naming a STATE is uppercase; one carrying a MEASUREMENT keeps
+    /// its units' case. A duration drew as "9M 43S" beside RUNNING NOW's
+    /// "4m 18s", and in uppercase `M` reads as months or millions.
+    var uppercased = true
 
     var body: some View {
-        Text(text.uppercased())
+        Text(uppercased ? text.uppercased() : text)
             .font(V4.font(V4.pillFontSize, .bold))
             .tracking(V4.pillTracking)
             .foregroundStyle(role.tint)

@@ -81,13 +81,22 @@ enum V4 {
     /// sides, on every tab. Without it a tab wider than its quarter of the
     /// strip ("Sessions" with a badge) drew its pill flush against the icon
     /// and the badge while "Accts" kept the leftover of its quarter as room.
-    /// 4 is what the strip can pay at its widest counts (`Sessions 120`,
-    /// `Tools 12`): eight insets on top of the four contents still fit, and
+    /// The badge takes no room (it sits over the tab's corner), so eight
+    /// insets on top of the four labels fit at every count, and
     /// `SegmentedTabsFitTests` fails if they stop fitting.
     static let tabInset: CGFloat = 4
     static let badgeRadius: CGFloat = 9
     static let badgePaddingH: CGFloat = 6
     static let badgeFillAlpha: Double = 0.14
+    /// The tab's count is drawn small over its pill's top-trailing corner,
+    /// not at the mockup's inline `.badge` size beside the label: inline, every
+    /// count change moved the strip, and a slot reserved for the widest count
+    /// does not fit (`TabStripFit`). At the mockup's 11 pt the corner badge
+    /// reached down into the label's letters; 9 pt with 4 pt of padding, lifted
+    /// so its top sits above the pill, clears them.
+    static let tabBadgeSize: CGFloat = 9
+    static let tabBadgePaddingH: CGFloat = 4
+    static let tabBadgeLift: CGFloat = 5
 
     // MARK: - Card (`.card` / `.row`)
 
@@ -274,10 +283,10 @@ enum V4 {
     static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
     /// The Bash tool's own timeout — the denominator a Claude `Bash` call's ring
-    /// fills toward, and the figure the RUNNING NOW section head states out
-    /// loud. It is ``ToolCall/bashTimeoutSeconds``, the figure the running
-    /// list's sort and the near-timeout count read, so the three cannot drift.
-    /// A codex call that carries its own timeout fills toward that instead.
+    /// fills toward, and the figure the ring's help and spoken value state. It
+    /// is ``ToolCall/bashTimeoutSeconds``, the figure the running list's sort
+    /// and the near-timeout count read, so the three cannot drift. A codex call
+    /// that carries its own timeout fills toward that instead.
     static let toolTimeoutSeconds: Double = ToolCall.bashTimeoutSeconds
     /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
     /// and the row says how long is left (Gil, 2026-09-13: "red plus

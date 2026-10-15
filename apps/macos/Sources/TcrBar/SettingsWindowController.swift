@@ -117,6 +117,7 @@ struct SettingsDependencies {
     var panelDensityPreference: PanelDensityPreference
     var groupController: GroupController
     var updater: Updater
+    var claudeRoute: ClaudeRouteController
     var onWhatsNew: () -> Void = {}
     /// The command-line tcr a shell on this Mac would run, its version, and whether
     /// it predates Codex accounts, for Settings › Updates. Blocking: the pane runs

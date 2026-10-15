@@ -56,51 +56,45 @@ final class SegmentedTabsFitTests: XCTestCase {
                 + "of residual overflow once shortened")
     }
 
-    /// An equal quarter share is not enough for "Sessions" beside a two-digit
-    /// badge, and no token can close the gap: the strip has 3 pt of gap to give
-    /// and the label is over twenty short. What IS enough is the strip letting
-    /// each segment take its own width, because the four together want less
-    /// than the strip has. Measured at the widest counts this panel can reach.
-    ///
-    /// Without that the label WRAPS, which is what the released panel drew:
-    /// `Sess` over `ions` beside its badge. This gate says the fix is
-    /// available, so a strip that asks each segment for its ideal width and a
-    /// label that refuses to wrap cannot overflow the panel.
-    func testTheFourSegmentsTogetherFitTheStripAtTheirOwnWidths() throws {
-        let accountsLabel = try panelTabTitle("accounts")
-        let sessions = try panelTabTitle("sessions")
-        let tools = try panelTabTitle("tools")
-        let segGap = try token("segGap")
-        let available =
-            try token("panelWidth") - 2 * (try token("panelPaddingSide"))
-            - 2 * (try token("segPadding")) - segGap * 3
-
-        // The widest two-digit and three-digit counts a fleet this size
-        // reaches: sessions run to three figures, tools to two.
-        let widest =
-            try idealSegmentWidth(label: accountsLabel, badge: nil)
-            + (try idealSegmentWidth(label: sessions, badge: 120))
-            + (try idealSegmentWidth(label: tools, badge: 12))
-            + (try idealSegmentWidth(label: "Peers", badge: nil))
-
-        XCTAssertLessThan(
-            widest, available,
-            "the four segments want \(String(format: "%.1f", widest)) pt of the strip's "
-                + "\(String(format: "%.1f", available)) pt, so at their own widths they do not "
-                + "fit and a label has to wrap or be cut")
+    /// Why the badge is drawn over its tab's corner and not beside its label:
+    /// a slot beside the label, reserved at its worst case so a count could
+    /// never move the strip, does not fit three badged tabs. Even a slot for a
+    /// single digit on Sessions, Tools and Peers overflows the strip once every
+    /// tab keeps its inset. If a later change makes room, this goes red and
+    /// the trade (``TabStripFit``'s doc-comment) can be revisited.
+    func testAnInlineBadgeSlotOnEveryBadgedTabDoesNotFitTheStrip() throws {
+        let inset = try token("tabInset")
+        let tabGap = try token("tabGap")
+        let badgePaddingH = try token("badgePaddingH")
+        let labels = try stripTabs(badges: [:]).map(\.content).reduce(0, +)
+        let digit = badgeWidth("9", size: try token("badgeSize"))
+        let slot = tabGap + digit + 2 * badgePaddingH
         XCTAssertGreaterThan(
-            try idealSegmentWidth(label: sessions, badge: 22),
-            try allottedSegmentWidth(tabCount: 4),
-            "\"\(sessions)\" now fits an equal quarter share, so this gate is measuring "
-                + "nothing: it exists because it does not")
+            labels + 8 * inset + 3 * slot, try stripContentWidth(),
+            "three single-digit badge slots now fit beside the labels, so the badge could "
+                + "go back inline at a reserved width")
     }
 
-    /// The arithmetic above says the fit is AVAILABLE. Whether the strip takes
-    /// it is a property of the view, and only the view can be asked.
-    ///
-    /// Each item is `.frame(maxWidth: .infinity)`, so without these two the
-    /// label accepts an equal quarter of the strip and breaks in half rather
-    /// than asking for the width it needs: the released panel drew `Sess` over
+    /// The four labels, icons and insets fit an equal quarter each, so the
+    /// strip is four equal quarters, which is the panel people look at most.
+    /// With the badge taking no room that holds at every count.
+    func testTheStripIsFourEqualQuartersAtEveryCount() throws {
+        let quarter = try allottedSegmentWidth(tabCount: 4)
+        for count in [nil, 1, 10, 120] as [Int?] {
+            let frames = try stripFrames(
+                badges: ["sessions": count, "tools": count, "peers": count])
+            for frame in frames {
+                XCTAssertEqual(
+                    frame.width, quarter, accuracy: 0.01,
+                    "a tab is \(frame.width) pt wide, not its \(quarter) pt quarter, at \(String(describing: count))"
+                )
+            }
+        }
+    }
+
+    /// Without `lineLimit(1)` and `fixedSize` a label offered a narrower share
+    /// than it needs breaks in half rather than asking for its width: the
+    /// released panel once drew `Sess` over
     /// `ions`. Pinned at the source, because a wrap is invisible to every
     /// assertion that measures a string instead of a rendered line.
     func testTheTabLabelAsksForItsOwnWidthAndNeverWraps() throws {
@@ -120,39 +114,34 @@ final class SegmentedTabsFitTests: XCTestCase {
     }
 
     /// Every tab keeps at least `V4.tabInset` between its pill edge and its
-    /// content, on both sides, at the widest counts the strip is measured at
-    /// above. Equal quarters cannot give it there: "Sessions 120" is wider
-    /// than a quarter, so before this its pill ended exactly at its badge.
-    func testEveryTabKeepsTheInsetAtTheWidestCounts() throws {
-        try assertEveryTabKeepsTheInset(sessions: 120, tools: 12)
-    }
-
-    /// The counts Gil saw the defect at (2026-10-14): "Sessions 5" selected,
-    /// pill flush against the icon and the badge, "Tools 3" starting where it
-    /// ended.
-    func testEveryTabKeepsTheInsetAtSessionsFiveToolsThree() throws {
-        try assertEveryTabKeepsTheInset(sessions: 5, tools: 3)
-    }
-
-    /// The Accts-selected panel with no badges looks as it did: four equal
-    /// quarters, because every tab's content and its insets fit a quarter.
-    /// A layout that sized every tab from its content would pass the inset
-    /// tests and still move every pill on the panel people look at most.
-    func testWithoutBadgesTheStripKeepsFourEqualQuarters() throws {
-        let contents = try contentWidths(sessions: nil, tools: nil)
-        let quarter = try allottedSegmentWidth(tabCount: 4)
-        let widths = TabStripFit.widths(
-            contentWidths: contents.map(\.width), inset: try token("tabInset"),
-            available: try stripContentWidth())
-        for (tab, width) in zip(contents, widths) {
-            XCTAssertEqual(
-                width, quarter, accuracy: 0.01,
-                "\"\(tab.label)\" is \(width) pt wide, not its \(quarter) pt quarter, with no badges")
+    /// content, on both sides (#480: "the buttons for sessions has no padding,
+    /// only accts"), at the counts Gil saw that at and at the widest.
+    func testEveryTabKeepsTheInsetAtEveryCount() throws {
+        let inset = try token("tabInset")
+        let leading = try token("tabIconBox") + (try token("tabGap"))
+        for count in [nil, 3, 5, 12, 120] as [Int?] {
+            let badges = ["sessions": count, "tools": count, "peers": count]
+            let frames = try stripFrames(badges: badges)
+            XCTAssertLessThanOrEqual(
+                (frames.last.map { $0.x + $0.width } ?? 0),
+                try stripContentWidth() + 3 * (try token("segGap")) + 0.01,
+                "the strip runs past its width at \(String(describing: count))")
+            for frame in frames {
+                let before = frame.labelX - leading - frame.x
+                let after = frame.x + frame.width - frame.labelX - frame.labelWidth
+                XCTAssertGreaterThanOrEqual(
+                    min(before, after), inset - 0.01,
+                    "a tab's content runs to \(String(format: "%.1f", min(before, after))) pt "
+                        + "from its pill edge at \(String(describing: count)), under the "
+                        + "\(inset) pt inset")
+            }
         }
     }
 
-    /// The view lays the strip out with ``TabStripFit`` and `V4.tabInset`, so
-    /// the arithmetic the three tests above check is the arithmetic drawn.
+    /// The view lays the strip out with ``TabStripFit`` and `V4.tabInset`, and
+    /// draws the badge as an overlay on the tab's top-trailing corner, so the
+    /// arithmetic the tests here check is the arithmetic drawn. An overlay
+    /// takes no room; a badge back inside the `HStack` would.
     func testTheStripIsLaidOutByTabStripFit() throws {
         let source = try panelSource("PanelV4/SegmentedTabs.swift")
         XCTAssertTrue(
@@ -161,44 +150,110 @@ final class SegmentedTabsFitTests: XCTestCase {
         XCTAssertTrue(
             source.contains("inset: V4.tabInset"),
             "SegmentedTabs no longer passes V4.tabInset to TabStripFit")
+        XCTAssertTrue(
+            source.contains(".overlay(alignment: .topTrailing)"),
+            "the badge is no longer an overlay on the tab's corner")
+        XCTAssertTrue(
+            source.contains("TabStripFit.badgeText("),
+            "the badge no longer draws TabStripFit.badgeText, so its cap is not the one tested")
+        let row = try XCTUnwrap(
+            source.range(of: "HStack(spacing: V4.tabGap) {").map { String(source[$0.upperBound...]) },
+            "the tab's content HStack is not in the shape this test reads")
+        let rowBody = try XCTUnwrap(row.components(separatedBy: "\n            }").first)
+        XCTAssertFalse(
+            rowBody.lowercased().contains("badge"),
+            "the badge is back inside the tab's content row, where it takes room and "
+                + "moves the strip when a count changes")
     }
 
-    private func assertEveryTabKeepsTheInset(
-        sessions: Int, tools: Int, file: StaticString = #filePath, line: UInt = #line
-    ) throws {
-        let inset = try token("tabInset")
-        let available = try stripContentWidth()
-        let contents = try contentWidths(sessions: sessions, tools: tools)
-        let widths = TabStripFit.widths(
-            contentWidths: contents.map(\.width), inset: inset, available: available)
-        XCTAssertEqual(widths.count, contents.count, file: file, line: line)
-        XCTAssertLessThanOrEqual(
-            widths.reduce(0, +), available + 0.01,
-            "the tabs want \(widths.reduce(0, +)) pt of the strip's \(available) pt",
-            file: file, line: line)
-        for (tab, width) in zip(contents, widths) {
-            let room = (width - tab.width) / 2
-            XCTAssertGreaterThanOrEqual(
-                room, inset - 0.01,
-                "\"\(tab.label)\" at Sessions \(sessions), Tools \(tools): its content runs to "
-                    + "\(String(format: "%.1f", room)) pt from its pill edge, under the "
-                    + "\(inset) pt inset (pill \(String(format: "%.1f", width)) pt, content "
-                    + "\(String(format: "%.1f", tab.width)) pt)",
-                file: file, line: line)
+    /// Nothing in the strip moves because data changed (Gil, 2026-10-14: "avoid
+    /// layout shifts ... whats going on with our tabs is horrible"). Every tab's
+    /// frame and every label's frame are the same whether a badge is absent,
+    /// shows one digit, two, or the cap, on each tab that can carry one, alone
+    /// and all at once.
+    func testNoTabOrLabelMovesWhenABadgeAppearsVanishesOrChangesDigits() throws {
+        let counts: [Int?] = [nil, 0, 1, 9, 10, 99, 100, 1000, 120_000]
+        let baseline = try stripFrames(badges: [:])
+        for tab in ["sessions", "tools", "peers"] {
+            for count in counts {
+                let frames = try stripFrames(badges: [tab: count])
+                XCTAssertEqual(
+                    frames, baseline,
+                    "the strip moved with \(tab) at \(count.map(String.init) ?? "no badge")")
+            }
+        }
+        for count in counts {
+            let frames = try stripFrames(
+                badges: ["sessions": count, "tools": count, "peers": count])
+            XCTAssertEqual(
+                frames, baseline,
+                "the strip moved with every badge at \(count.map(String.init) ?? "none")")
         }
     }
 
-    /// The four tabs' content widths, in the strip's order.
-    private func contentWidths(sessions: Int?, tools: Int?) throws -> [(label: String, width: CGFloat)] {
-        let accounts = try panelTabTitle("accounts")
-        let sessionsLabel = try panelTabTitle("sessions")
-        let toolsLabel = try panelTabTitle("tools")
-        return [
-            (accounts, try idealSegmentWidth(label: accounts, badge: nil)),
-            (sessionsLabel, try idealSegmentWidth(label: sessionsLabel, badge: sessions)),
-            (toolsLabel, try idealSegmentWidth(label: toolsLabel, badge: tools)),
-            ("Peers", try idealSegmentWidth(label: "Peers", badge: nil)),
+    /// A count past the cap reads `99+`, so the widest badge is known before
+    /// any count arrives.
+    func testTheBadgeCapsAtNinetyNinePlus() {
+        XCTAssertNil(TabStripFit.badgeText(nil))
+        XCTAssertNil(TabStripFit.badgeText(0))
+        XCTAssertEqual(TabStripFit.badgeText(1), "1")
+        XCTAssertEqual(TabStripFit.badgeText(99), "99")
+        XCTAssertEqual(TabStripFit.badgeText(100), "99+")
+        XCTAssertEqual(TabStripFit.badgeText(120_000), "99+")
+    }
+
+    /// The selection only repaints: `isOn` may choose a colour, a fill, a
+    /// shadow, an animation and an accessibility trait, and nothing that takes
+    /// room. A selected label in a heavier weight, or a selected pill with its
+    /// own padding, would move the strip on every click.
+    func testTheSelectionNeverTouchesGeometry() throws {
+        let source = try panelSource("PanelV4/SegmentedTabs.swift")
+        let lines = source.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.contains("isOn") && !$0.hasPrefix("//") }
+        let allowed = [
+            "let isOn = tab == selected", ".foregroundStyle(isOn", ".fill(isOn",
+            "color: isOn", ".animation(", ".accessibilityAddTraits(isOn",
         ]
+        XCTAssertFalse(lines.isEmpty, "no `isOn` in SegmentedTabs: this test reads nothing")
+        for line in lines {
+            XCTAssertTrue(
+                allowed.contains { line.hasPrefix($0) },
+                "the selection reaches something other than paint: `\(line)`")
+        }
+    }
+
+    /// The four tabs, in the strip's order, with the badge each would draw for
+    /// `badges` (tab case name to count).
+    private func stripTabs(badges: [String: Int?]) throws -> [TabStripFit.Tab] {
+        let leading = try token("tabIconBox") + (try token("tabGap"))
+        let labelSize = try token("tabLabelSize_comfortable")
+        let tracking = try token("tabLabelTracking")
+        let badgeSize = try token("badgeSize")
+        let badgePaddingH = try token("badgePaddingH")
+        return try ["accounts", "sessions", "tools", "peers"].map { name in
+            let label = try panelTabTitle(name)
+            let text = TabStripFit.badgeText(badges[name] ?? nil)
+            return TabStripFit.Tab(
+                leading: leading,
+                label: measure(label, size: labelSize, weight: .semibold) + tracking,
+                badge: text.map { badgeWidth($0, size: badgeSize) + 2 * badgePaddingH })
+        }
+    }
+
+    /// The strip's frames for `badges`, from the same ``TabStripFit`` the view
+    /// lays out with.
+    private func stripFrames(badges: [String: Int?]) throws -> [TabStripFit.Frame] {
+        TabStripFit.frames(
+            try stripTabs(badges: badges), inset: try token("tabInset"),
+            spacing: try token("segGap"), available: try stripContentWidth())
+    }
+
+    /// The badge's text width: `V4.font` is the system font with tabular digits.
+    private func badgeWidth(_ text: String, size: CGFloat) -> CGFloat {
+        (text as NSString).size(withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular)
+        ]).width
     }
 
     /// The strip's width for its four tabs, after its padding and three gaps.
@@ -267,7 +322,7 @@ final class SegmentedTabsFitTests: XCTestCase {
     /// Scoped to the `enum PanelTab { … }` block specifically, not the whole
     /// file: `FleetView.swift` has at least one OTHER switch over the same
     /// cases with completely different strings (`v4FooterLeading`'s `case
-    /// .sessions: return "proxy + Claude Code session files"`), and a
+    /// .sessions: return "proxy + session files"`), and a
     /// file-wide `firstMatch` grabbed that one instead the first time this
     /// test was written.
     private func panelTabTitle(_ caseName: String) throws -> String {

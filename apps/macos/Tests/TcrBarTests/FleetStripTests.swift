@@ -53,6 +53,31 @@ final class FleetStripTests: XCTestCase {
         XCTAssertEqual(strip.headline, "2 of 6 can take work now")
     }
 
+    /// An account whose login is dead sits in the live band (it is neither
+    /// spent nor parked) but the router sends it nothing, so it is not
+    /// capacity: `FleetTally.Kind.needsRelogin` exists for exactly this. The
+    /// headline read "2 of 2 can take work now" over a fleet whose second
+    /// line said re-login.
+    func testAnAccountThatNeedsReloginIsNotCountedAsTakingWork() {
+        let fleet = Fleet(accounts: [
+            stripAccount("alice@example.com"),
+            stripAccount("dave@example.com", fiveHour: nil, status: "error"),
+        ])
+        XCTAssertEqual(strip(fleet).headline, "1 of 2 can take work now")
+        XCTAssertFalse(strip(fleet).isOutOfCapacity)
+    }
+
+    /// "0 of 3 can take work now" drew in the ready green.
+    func testAFleetWithNothingToServeIsOutOfCapacity() {
+        let fleet = Fleet(accounts: [
+            stripAccount("frank@example.com", quotaState: .spent, fiveHour: 1.0),
+            stripAccount("dave@example.com", fiveHour: nil, status: "error"),
+        ])
+        XCTAssertEqual(strip(fleet).headline, "0 of 2 can take work now")
+        XCTAssertTrue(strip(fleet).isOutOfCapacity)
+        XCTAssertFalse(strip(mixed).isOutOfCapacity)
+    }
+
     /// The same figure as the out-of-tokens heading's "first back in".
     func testNextBackIsTheSoonestFirstBack() {
         let fleet = mixed
@@ -280,12 +305,13 @@ private func stripAccount(
     fiveHour: Double? = 0.1,
     fiveHourState: QuotaState? = nil,
     held: [HeldWindow] = [],
-    groups: [String]? = nil
+    groups: [String]? = nil,
+    status: String = "active"
 ) -> Account {
     Account(
         name: name,
         priority: 1,
-        status: "active",
+        status: status,
         disabled: disabled,
         quota: quota,
         quotaState: quotaState,

@@ -107,6 +107,87 @@ enum Command {
     /// account or with --codex. Exits 0 when it is, 2 when another base URL
     /// owns the route, 3 when the route points here and no proxy answers.
     Doctor(DoctorArgs),
+    /// Send the `claude` command through tcr: from your shell (`setup shell`),
+    /// or on every launch (`setup claude-settings`). Each refuses rather than
+    /// overwrite a `claude` alias, function or base URL already in place, and
+    /// each takes `--remove`.
+    Setup(SetupArgs),
+}
+
+/// `tcr setup …`: install, remove or report the two routes that make typing
+/// `claude` go through tcr. See `src/setup.rs` for what each writes.
+#[derive(clap::Args)]
+struct SetupArgs {
+    #[command(subcommand)]
+    action: SetupAction,
+}
+
+#[derive(Subcommand)]
+enum SetupAction {
+    /// Add a `claude` function to your shell's startup file that runs
+    /// `tcr run`. Covers terminals; an app that starts claude itself is not
+    /// covered.
+    Shell(SetupShellArgs),
+    /// Point every claude launch at this proxy: set
+    /// `env.ANTHROPIC_BASE_URL` in ~/.claude/settings.json. With tcr not
+    /// running, claude then cannot reach Anthropic until tcr starts or this
+    /// is removed.
+    ClaudeSettings(SetupSettingsArgs),
+    /// Say which route is installed, and anything in the way of either.
+    Status(SetupStatusArgs),
+    /// Link `tcr-run` beside the `tcr` on PATH: `tcr run` under another name,
+    /// for a tool that takes a Claude Code executable path.
+    TcrRun(SetupTcrRunArgs),
+}
+
+#[derive(clap::Args)]
+struct SetupTcrRunArgs {
+    /// Take the link back out (only the symlink tcr made).
+    #[arg(long)]
+    remove: bool,
+}
+
+/// Parse `--shell` through the one recogniser `src/setup.rs` uses for
+/// `$SHELL`, so the flag and the variable can never disagree on a name.
+fn parse_shell(value: &str) -> Result<teamclaude_rs::setup::Shell, String> {
+    teamclaude_rs::setup::Shell::from_name(value)
+        .ok_or_else(|| format!("{value} is not one of zsh, bash, fish"))
+}
+
+#[derive(clap::Args)]
+struct SetupShellArgs {
+    /// Take tcr's block back out of every shell startup file that has one.
+    #[arg(long)]
+    remove: bool,
+    /// The shell to set up: zsh, bash or fish (default: $SHELL).
+    #[arg(long, value_parser = parse_shell)]
+    shell: Option<teamclaude_rs::setup::Shell>,
+}
+
+#[derive(clap::Args)]
+struct SetupSettingsArgs {
+    /// Take out the key tcr wrote, and nothing else.
+    #[arg(long)]
+    remove: bool,
+    /// Replace an ANTHROPIC_BASE_URL that points somewhere else.
+    #[arg(long, conflicts_with = "remove")]
+    force: bool,
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct SetupStatusArgs {
+    /// Emit one JSON object (TcrBar reads this).
+    #[arg(long)]
+    json: bool,
+    /// The shell to check: zsh, bash or fish (default: $SHELL).
+    #[arg(long, value_parser = parse_shell)]
+    shell: Option<teamclaude_rs::setup::Shell>,
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// `tcr peer …`, the argument shape for the LAN peer mesh.
@@ -1456,9 +1537,32 @@ struct ServerArgs {
     no_replace: bool,
 }
 
+/// The name under which this binary is `tcr run`: a symlink called `tcr-run`
+/// (`tcr setup tcr-run`) gives a tool that takes a Claude Code executable path
+/// one path to point at.
+const TCR_RUN_ALIAS: &str = "tcr-run";
+
+/// The argv clap parses: this process's own, or, when it was started as
+/// [`TCR_RUN_ALIAS`], `tcr run` followed by every argument exactly as given.
+/// Rewriting the argv rather than building a `RunArgs` by hand means
+/// `tcr-run X` and `tcr run X` go through one parser and cannot drift.
+fn effective_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let invoked_as_alias = argv.first().is_some_and(|argv0| {
+        Path::new(argv0)
+            .file_name()
+            .is_some_and(|name| name == TCR_RUN_ALIAS)
+    });
+    if !invoked_as_alias {
+        return argv;
+    }
+    let mut out = vec![std::ffi::OsString::from("tcr"), "run".into()];
+    out.extend(argv.into_iter().skip(1));
+    out
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(effective_argv(std::env::args_os().collect()));
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_harness(args).await,
@@ -1481,6 +1585,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
         Some(Command::Ui) => run_ui(),
         Some(Command::Doctor(args)) => run_doctor(args).await,
+        Some(Command::Setup(args)) => run_setup(args),
         None => run_server(cli.server).await,
     }
 }
@@ -5860,6 +5965,91 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
 /// exit 0 and there is no way to say 2 or 3 through it. `std::process::exit`
 /// after the printing is done, the same shape `run_server`'s stand-down path
 /// uses.
+/// `tcr setup shell|claude-settings|status`. A refusal is an error, so the
+/// exit code is non-zero and the conflict lines are on stderr.
+fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
+    use teamclaude_rs::setup;
+    let homes = setup::Homes::from_env()?;
+    match args.action {
+        SetupAction::Shell(args) => {
+            let changes = if args.remove {
+                setup::remove_shell(&homes)?
+            } else {
+                let Some(shell) = setup::chosen_shell(args.shell) else {
+                    anyhow::bail!(
+                        "$SHELL does not name zsh, bash or fish; pass --shell to choose one"
+                    );
+                };
+                setup::install_shell(shell, &homes, &setup::tcr_word()?)?
+            };
+            println!("{}", setup::describe_changes(&changes));
+            if !args.remove {
+                println!("open a new terminal (or source the file) for `claude` to go through tcr");
+            }
+        }
+        SetupAction::ClaudeSettings(args) => {
+            let change = if args.remove {
+                setup::remove_settings(&homes)?
+            } else {
+                let config_path = args.config.unwrap_or_else(config::default_path);
+                let port = setup::configured_port(&config_path)?;
+                setup::install_settings(&homes, port, args.force)?
+            };
+            let path = change.path.display();
+            let var = teamclaude_rs::doctor::BASE_URL_VAR;
+            println!(
+                "{}",
+                match change.change {
+                    setup::Change::Added | setup::Change::Updated =>
+                        format!("set env.{var} in {path}"),
+                    setup::Change::Removed => format!("removed env.{var} from {path}"),
+                    setup::Change::Unchanged | setup::Change::Deleted =>
+                        format!("nothing to change in {path}"),
+                }
+            );
+            if !args.remove && change.change != setup::Change::Unchanged {
+                println!(
+                    "every claude launch now goes through tcr; while tcr is not running, claude cannot reach Anthropic (undo: tcr setup claude-settings --remove)"
+                );
+            }
+        }
+        SetupAction::TcrRun(args) => {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let Some(dir) = setup::tcr_dir_on_path(&path) else {
+                anyhow::bail!(
+                    "no tcr on PATH; tcr-run is linked beside it, so put tcr on PATH first"
+                );
+            };
+            let change = if args.remove {
+                setup::remove_tcr_run(&dir)?
+            } else {
+                setup::install_tcr_run(&dir)?
+            };
+            let link = change.path.display();
+            println!(
+                "{}",
+                match change.change {
+                    setup::Change::Added => format!("linked {link} -> tcr"),
+                    setup::Change::Deleted => format!("removed {link}"),
+                    _ if args.remove => format!("no {link} to remove"),
+                    _ => format!("already linked: {link} -> tcr"),
+                }
+            );
+        }
+        SetupAction::Status(args) => {
+            let config_path = args.config.unwrap_or_else(config::default_path);
+            let port = setup::configured_port(&config_path)?;
+            let status = setup::status(setup::chosen_shell(args.shell), &homes, port)?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("{}", status.render_text());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let code = cli::doctor(&config_path, args.json, args.codex).await?;

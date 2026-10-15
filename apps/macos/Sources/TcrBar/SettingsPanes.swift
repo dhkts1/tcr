@@ -214,6 +214,12 @@ struct GeneralSettingsPane: View {
             }
 
             Section {
+                ClaudeRouteSettingsRow(controller: dependencies.claudeRoute)
+            } header: {
+                SectionHeader(title: "The claude command", timing: .live)
+            }
+
+            Section {
                 HStack {
                     Text(
                         "Quitting stops the proxy this app supervises, so every live "
@@ -229,7 +235,10 @@ struct GeneralSettingsPane: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .formContentTopMarginIfAvailable(8)
-        .onAppear { loginItem.refresh() }
+        .onAppear {
+            loginItem.refresh()
+            Task { await dependencies.claudeRoute.refresh() }
+        }
     }
 
     /// Same cost statement `CLAUDE.md` gives, and the same confirm-before-act

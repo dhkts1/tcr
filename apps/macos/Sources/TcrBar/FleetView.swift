@@ -30,6 +30,10 @@ struct FleetView: View {
     /// Deleting an account from each row's gear menu. See
     /// ``RemoveAccountController``.
     @ObservedObject var removeController: RemoveAccountController
+    /// The one-time "Send `claude` through tcr?" prompt. Whether it shows is
+    /// decided by the shell before the panel opens, never by this view. See
+    /// ``ClaudeRouteController``.
+    @ObservedObject var routeController: ClaudeRouteController
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -304,6 +308,7 @@ struct FleetView: View {
         updater: Updater,
         groupController: GroupController,
         removeController: RemoveAccountController,
+        routeController: ClaudeRouteController,
         startServerAtLaunch: Binding<Bool>,
         codexPresence: CodexPresence,
         // `nil` means a store of the panel's own, made below: a default argument
@@ -389,6 +394,7 @@ struct FleetView: View {
         self.updater = updater
         self.groupController = groupController
         self.removeController = removeController
+        self.routeController = routeController
         self._startServerAtLaunch = startServerAtLaunch
         self.codexPresence = codexPresence
         self.codexNotes = codexNotes ?? CodexNoteStore()
@@ -654,6 +660,26 @@ struct FleetView: View {
         }
     }
 
+    /// "Send `claude` through tcr?", drawn when the shell decided at open that
+    /// this opening shows it (``ClaudeRouteController/promptShown``). It is
+    /// never added or removed while the panel is open; answering swaps its
+    /// buttons for one line in the same space. See ``ClaudeRoutePromptView``.
+    @ViewBuilder
+    private var claudeRoutePrompt: some View {
+        if routeController.promptShown {
+            ClaudeRoutePromptView(
+                outcome: routeController.promptOutcome,
+                pending: routeController.pending,
+                onAnswer: { answer in
+                    if answer == .everyLaunch, !ClaudeRouteConfirm.everyLaunch() { return }
+                    Task { await routeController.answerPrompt(answer) }
+                }
+            )
+            .padding(.horizontal, V4.summaryPaddingSide)
+            .padding(.bottom, V4.summaryPaddingBottom)
+        }
+    }
+
     /// Is there a fleet to draw tabs over? `.loaded` with at least one account
     /// — the exact case ``v4Content`` gives a tab body to. Every other state
     /// (pending, tool missing, command failed, undecodable, empty fleet) falls
@@ -721,6 +747,10 @@ struct FleetView: View {
                 if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
+                // The question about claude follows the Claude line, and the
+                // Codex line comes last: it can appear while the panel is open,
+                // and from below the question it moves none of its buttons.
+                claudeRoutePrompt
                 codexBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
             // header at ``header`` has always carried and the v4 summary block
@@ -1103,16 +1133,21 @@ struct FleetView: View {
     private var v4FooterLeading: String {
         switch visibleTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
+        // Both Claude-only lines, here and in ``SessionsCodexCopy``, are sized
+        // to fit beside their trailing fact at 372 pt: the longer "proxy +
+        // Claude Code session files" and "from request bodies only · nothing
+        // logged" both drew truncated, and the second is the panel's one
+        // privacy claim.
         case .sessions:
             if case .loaded(let fleet) = poller.state {
                 return SessionsCodexCopy.sessionsFooter(fleet)
             }
-            return "proxy + Claude Code session files"
+            return "proxy + session files"
         case .tools:
             if case .loaded(let fleet) = poller.state {
                 return SessionsCodexCopy.toolsFooter(holdsCodex: fleet.holdsCodex)
             }
-            return "from request bodies only · nothing logged"
+            return "request bodies only · nothing logged"
         case .peers: return "peer mesh · nothing built yet"
         }
     }
@@ -1487,11 +1522,15 @@ struct FleetView: View {
                 // someone to go and type a command is the worst version of an
                 // empty state — it names work the panel can do for them.
                 VStack(alignment: .leading, spacing: V4.buttonGap) {
+                    // An empty fleet is a starting point, not a reading this
+                    // build cannot classify: it drew the unreadable-row
+                    // triangle in the `unknown` purple, the glyph and colour
+                    // the panel keeps for an account row it failed to decode.
                     banner(
-                        icon: Tok.unreadableGlyph,
+                        icon: "tray",
                         title: "No accounts configured",
                         detail: "tcr answered, and the fleet is empty. Add one to start serving.",
-                        tint: Tok.unknown,
+                        tint: Tok.dim,
                         // Only on evidence of codex: with none there is no line,
                         // and the empty fleet is the one it always was.
                         extra: codexPresence.emptyFleetHint(home: homeDirectory)
@@ -2101,15 +2140,12 @@ struct FleetView: View {
             let visible =
                 toolsRunningExpanded ? entries : Array(entries.prefix(Self.runningVisibleItems))
             let hidden = entries.count - visible.count
-            // Finding 5: state the denominator the ring fills toward, rather
-            // than drawing a fraction with no stated whole. Once a running
-            // call is codex's, a ring may fill toward that call's own timeout,
-            // so the head stops naming the Bash tool's 600s for all of them.
-            toolsSection(
-                "RUNNING NOW",
-                subtitle: SessionsCodexCopy.runningUnit(
-                    count: entries.count, anyCodex: entries.contains { $0.provider == .codex })
-            ) {
+            // Finding 5 stated the denominator the ring fills toward here, as
+            // "· ring fills toward the 600s timeout". It now sits on the ring
+            // itself (its help and its spoken "4m 18s of 600s"): no
+            // explanatory captions over the rows (Gil, 2026-10-14). That holds
+            // for a codex call too, whose ring may fill toward its own timeout.
+            toolsSection("RUNNING NOW", subtitle: "\(entries.count)") {
                 ForEach(Array(visible.enumerated()), id: \.offset) { index, entry in
                     if index > 0 { itemRule }
                     runningToolItem(entry)
@@ -2133,7 +2169,7 @@ struct FleetView: View {
     private func timedOutSection(_ fleet: Fleet) -> some View {
         if let classes = fleet.toolsTimeoutClasses, !classes.isEmpty {
             let total = classes.reduce(0) { $0 + $1.count }
-            toolsSection("TIMED OUT TODAY", subtitle: "\(total) · by command class") {
+            toolsSection("TIMED OUT TODAY", subtitle: "\(total)") {
                 ForEach(classes) { timeoutClass in
                     timeoutClassRow(timeoutClass, total: total)
                     if expandedTimeoutClasses.contains(timeoutClass.name) {
@@ -2358,7 +2394,11 @@ struct FleetView: View {
                             accessibilityText: elapsed.map {
                                 "\(durationLabel($0)) of \(Int(cap))s"
                             },
-                            size: V4.toolRowRingSize)
+                            size: V4.toolRowRingSize
+                        )
+                        // The denominator, where the ring is: the section
+                        // head used to carry it as a caption over every row.
+                        .help("Fills toward the \(Int(bashTimeoutSeconds))s tool timeout")
                     }
                     // Elapsed and "20s left" are ONE reading, so they are one
                     // Text: a call in the warning band is red AND says how
@@ -2668,10 +2708,12 @@ struct FleetView: View {
                     // alone, and the spoken value says it too.
                     let spoken = ToolCallLabel.spoken(
                         seconds: seconds, timeout: bashTimeoutSeconds)
+                    let timedOut = ToolCallLabel.timedOut(
+                        seconds: seconds, timeout: bashTimeoutSeconds)
                     V4Pill(
                         text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
-                        role: ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
-                            ? .bad : .neutral
+                        role: timedOut ? .bad : .neutral,
+                        uppercased: timedOut
                     )
                     .accessibilityValue(spoken ?? "")
                     .help(spoken ?? "")
@@ -3704,8 +3746,11 @@ struct FleetView: View {
     private func offlineNotice(_ source: StatusSource) -> some View {
         HStack(spacing: Tok.tightSpacing) {
             Image(systemName: "wifi.slash")
-            Text("source: \(source.token) — quota is real, all serving counters are structurally zero.")
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                "Source: \(source.token). Quota is real; request and token counts show zero "
+                    + "because they were not measured."
+            )
+            .fixedSize(horizontal: false, vertical: true)
         }
         .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
         .foregroundStyle(Tok.offline)

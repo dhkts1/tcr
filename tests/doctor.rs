@@ -137,6 +137,10 @@ fn run_tcr(
         .args(args)
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
+        // doctor looks for `tcr setup shell`'s block in the shell's startup
+        // files; neither variable may point that read outside the scratch HOME.
+        .env_remove("ZDOTDIR")
+        .env_remove("XDG_CONFIG_HOME")
         // A scratch HOME does not scratch the login Keychain, see
         // `tests/first_run_no_config.rs` for why this override is set to a path
         // that does not exist.
@@ -553,6 +557,10 @@ fn run_tcr_codex(
         .args(args)
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
+        // doctor looks for `tcr setup shell`'s block in the shell's startup
+        // files; neither variable may point that read outside the scratch HOME.
+        .env_remove("ZDOTDIR")
+        .env_remove("XDG_CONFIG_HOME")
         .env(
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-credentials.json"),
@@ -647,6 +655,7 @@ fn a_mixed_fleet_doctor_keeps_claudes_exit_code() {
         tail,
         [
             "requests10m: 3",
+            "shellRoute: not installed",
             "codexAccounts: 1 (1 in rotation)",
             "codexIntercept: no",
             "codexCa: <home>/.config/tcr-ca.pem (not readable)",

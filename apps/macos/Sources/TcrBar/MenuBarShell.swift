@@ -69,6 +69,10 @@ final class MenuBarShell {
     /// as `groupController`: a note that reset every time the panel opened would
     /// be gone by the time anyone looked.
     let codexNotes: CodexNoteStore
+    /// The claude route: the Accounts tab's one-time prompt and the Settings
+    /// row. Owned here because the prompt's show-or-not is decided in
+    /// ``openPanel()``, before the popover's first frame.
+    let claudeRoute: ClaudeRouteController
     /// Owned here for the same reason as the rest, plus one of its own: the
     /// delegate's `tcrbar://check-for-updates` handler reaches through the shell
     /// to find it, so an updater that only existed while the panel was open would
@@ -108,6 +112,7 @@ final class MenuBarShell {
             defaultTabPreference: defaultTabPreference,
             panelDensityPreference: panelDensityPreference,
             groupController: groupController, updater: updater,
+            claudeRoute: claudeRoute,
             onWhatsNew: { [weak self] in self?.openWhatsNew() }))
 
     /// The banner, and the memory of what has already been said. Built after
@@ -136,6 +141,7 @@ final class MenuBarShell {
         updater: Updater? = nil,
         groupController: GroupController? = nil,
         removeController: RemoveAccountController? = nil,
+        claudeRoute: ClaudeRouteController? = nil,
         whatsNew: WhatsNewController? = nil,
         runningToolsPreference: ShowRunningToolsPreference? = nil,
         defaultTabPreference: DefaultTabPreference? = nil,
@@ -159,6 +165,7 @@ final class MenuBarShell {
         self.removeController = removeController ?? RemoveAccountController()
         self.codexPresence = CodexPresenceController()
         self.codexNotes = CodexNoteStore()
+        self.claudeRoute = claudeRoute ?? ClaudeRouteController()
         // The controller's `init` is inert; nothing fetches until `AppDelegate`
         // calls `checkAfterLaunch()`, which the shell probe never does.
         self.whatsNew =
@@ -211,6 +218,7 @@ final class MenuBarShell {
                 preference: self.preference, updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
                 codexPresence: self.codexPresence, codexNotes: self.codexNotes,
+                routeController: self.claudeRoute,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
                 runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
@@ -312,57 +320,57 @@ final class MenuBarShell {
     @MainActor
     private static func hosting(rootView: FleetPanel) -> NSHostingController<FleetPanel> {
         let hosting = NSHostingController(rootView: rootView)
-    // Without this the popover takes a default size and the panel is clipped.
-    //
-    // This is the specific thing `MenuBarExtra` did for free. `FleetView`
-    // measures its own row height through a `GeometryReader` preference
-    // (`FleetView.swift:44-56, 178-189`), which exists precisely because a
-    // scroll view's ideal height collapses to about one row, so a shell
-    // that does not propagate the preferred size up to the popover
-    // reproduces that exact bug, and it looks like a SwiftUI layout problem
-    // rather than a missing line here. `--shell-probe` assertion 5 checks
-    // the resulting `contentSize` numerically.
-    hosting.sizingOptions = [.preferredContentSize]
-    // The line above sizes the popover; it is also one half of a layout
-    // cycle that aborts the app. The other half is safe-area.
-    // `NSHostingView` observes its own frame through KVO, and every frame
-    // change runs `invalidateSafeAreaInsets()`, which requests another
-    // SwiftUI update, which marks the window as needing another
-    // update-constraints pass. The popover resizes itself from those
-    // constraints, the hosting view's frame changes again, and AppKit
-    // throws from `_postWindowNeedsUpdateConstraints` once the pass count
-    // passes its guard. Nothing catches that `NSException`, so `abort()`.
-    //
-    // Three crash reports from a 0.2.43 build (2026-09-09, macOS 26.6.2,
-    // all three throwing at that same frame) show the cycle with no TcrBar
-    // frame anywhere in it: it runs entirely between `_NSPopoverWindow`,
-    // `NSPopoverFrame` and `NSHostingView`, driven from `stepIdle` with no
-    // user event in the stack.
-    //
-    // `PanelHeight.settled` damps the OTHER loop, the one that runs
-    // through `onPreferenceChange`. Its predecessor `PanelHeight.quantized`
-    // shipped in that same 0.2.43 build, which is the evidence that damping
-    // that loop is not sufficient alone: preference quantization cannot
-    // reach a cycle that never reads a preference, and none of the three
-    // 0.2.43 stacks contains a TcrBar frame at all.
-    //
-    // `quantized` is no longer called from this target: `settled` owns the
-    // publish path and calls it internally, and it was made internal to
-    // `TcrBarCore` so that re-adding it at a `GeometryReader` emitter fails
-    // to compile rather than silently reverting the fix.
-    //
-    // A popover has no safe area to inset against: no notch, no title bar,
-    // no keyboard. Opting out is correct on its own terms, and it is the
-    // edge of the cycle that can be cut without giving up the preferred
-    // size that assertion 5 checks.
-    //
-    // Not reproduced locally: the machine that crashes is one point
-    // release ahead (26.6.2 vs 26.6.1) and the panel is stable here across
-    // days. This cuts a documented edge of the cycle in the crash stack;
-    // it has not been watched to fail and then pass.
-    if #available(macOS 13.3, *) {
-        hosting.safeAreaRegions = []
-    }
+        // Without this the popover takes a default size and the panel is clipped.
+        //
+        // This is the specific thing `MenuBarExtra` did for free. `FleetView`
+        // measures its own row height through a `GeometryReader` preference
+        // (`FleetView.swift:44-56, 178-189`), which exists precisely because a
+        // scroll view's ideal height collapses to about one row, so a shell
+        // that does not propagate the preferred size up to the popover
+        // reproduces that exact bug, and it looks like a SwiftUI layout problem
+        // rather than a missing line here. `--shell-probe` assertion 5 checks
+        // the resulting `contentSize` numerically.
+        hosting.sizingOptions = [.preferredContentSize]
+        // The line above sizes the popover; it is also one half of a layout
+        // cycle that aborts the app. The other half is safe-area.
+        // `NSHostingView` observes its own frame through KVO, and every frame
+        // change runs `invalidateSafeAreaInsets()`, which requests another
+        // SwiftUI update, which marks the window as needing another
+        // update-constraints pass. The popover resizes itself from those
+        // constraints, the hosting view's frame changes again, and AppKit
+        // throws from `_postWindowNeedsUpdateConstraints` once the pass count
+        // passes its guard. Nothing catches that `NSException`, so `abort()`.
+        //
+        // Three crash reports from a 0.2.43 build (2026-09-09, macOS 26.6.2,
+        // all three throwing at that same frame) show the cycle with no TcrBar
+        // frame anywhere in it: it runs entirely between `_NSPopoverWindow`,
+        // `NSPopoverFrame` and `NSHostingView`, driven from `stepIdle` with no
+        // user event in the stack.
+        //
+        // `PanelHeight.settled` damps the OTHER loop, the one that runs
+        // through `onPreferenceChange`. Its predecessor `PanelHeight.quantized`
+        // shipped in that same 0.2.43 build, which is the evidence that damping
+        // that loop is not sufficient alone: preference quantization cannot
+        // reach a cycle that never reads a preference, and none of the three
+        // 0.2.43 stacks contains a TcrBar frame at all.
+        //
+        // `quantized` is no longer called from this target: `settled` owns the
+        // publish path and calls it internally, and it was made internal to
+        // `TcrBarCore` so that re-adding it at a `GeometryReader` emitter fails
+        // to compile rather than silently reverting the fix.
+        //
+        // A popover has no safe area to inset against: no notch, no title bar,
+        // no keyboard. Opting out is correct on its own terms, and it is the
+        // edge of the cycle that can be cut without giving up the preferred
+        // size that assertion 5 checks.
+        //
+        // Not reproduced locally: the machine that crashes is one point
+        // release ahead (26.6.2 vs 26.6.1) and the panel is stable here across
+        // days. This cuts a documented edge of the cycle in the crash stack;
+        // it has not been watched to fail and then pass.
+        if #available(macOS 13.3, *) {
+            hosting.safeAreaRegions = []
+        }
         return hosting
     }
 
@@ -776,6 +784,7 @@ final class MenuBarShell {
                 preference: preference, updater: updater,
                 groupController: groupController, removeController: removeController,
                 codexPresence: codexPresence, codexNotes: codexNotes,
+                routeController: claudeRoute,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
                 runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
@@ -815,7 +824,16 @@ final class MenuBarShell {
         // Deprecated on macOS 14+ and used deliberately anyway: the cooperative
         // replacement has no way to express "the user asked for this window".
         NSApp.activate(ignoringOtherApps: true)
+        // Before the show, so the prompt is in the panel's first frame or not
+        // at all: nothing may be inserted while the panel is open (Gil,
+        // 2026-10-14, no layout shifts). Decided from the status read cached
+        // by launch or the previous open, never one in flight.
+        var hasFleet = false
+        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty { hasFleet = true }
+        claudeRoute.decideAtOpen(hasFleet: hasFleet)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // For the NEXT opening; the one on screen keeps what it decided.
+        Task { await claudeRoute.refresh() }
         // Every re-read the panel needs, started AFTER it is on screen.
         //
         // The panel draws the last snapshot immediately and each of these
@@ -894,6 +912,7 @@ struct FleetPanel: View {
     @ObservedObject var removeController: RemoveAccountController
     @ObservedObject var codexPresence: CodexPresenceController
     @ObservedObject var codexNotes: CodexNoteStore
+    @ObservedObject var routeController: ClaudeRouteController
     var onWhatsNew: () -> Void = {}
     var onSettings: () -> Void = {}
     /// The shell's picker runner, which keeps the panel up while a picker runs.
@@ -919,6 +938,7 @@ struct FleetPanel: View {
             updater: updater,
             groupController: groupController,
             removeController: removeController,
+            routeController: routeController,
             startServerAtLaunch: $preference.startServerAtLaunch,
             codexPresence: codexPresence.presence,
             codexNotes: codexNotes,

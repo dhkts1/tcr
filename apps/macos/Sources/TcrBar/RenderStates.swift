@@ -225,6 +225,13 @@ enum RenderStates {
             // refused "Delete Account…" looked like a click that did nothing.
             // See ``removeControllerFixture(for:)``.
             ("24-delete-outcomes", .loaded(fleet(healthyJSON)), false, nil),
+            // The one-time "Send claude through tcr?" prompt on the Accounts
+            // tab, then the same opening after "In my shell" was answered:
+            // the outcome line in the buttons' place. The second scene also
+            // checks that answering changed no size and did draw
+            // (``claudeRoutePromptKeepsPanelSize(before:after:named:)``).
+            ("25-claude-route-prompt", .loaded(fleet(healthyJSON)), false, nil),
+            ("25b-claude-route-answered", .loaded(fleet(healthyJSON)), false, nil),
             // A fleet holding both providers: both Claude accounts out of
             // tokens, one Codex account ready and one held on its week. The
             // strip counts each pool on its own row, and the money line adds
@@ -336,6 +343,60 @@ enum RenderStates {
             // Codex categories in BY TOOL. See ``toolsTabCodexFleet``.
             ("17c-tools-tab-codex", .loaded(toolsTabCodexFleet), false, nil),
         ]
+    }
+
+    /// The claude-route controller a scene draws with: scenes 25 and 25b get
+    /// one pinned to the prompt (asked, then answered); every other scene a
+    /// pinned controller that shows nothing. Pinned controllers never run
+    /// `tcr` and never write the operator's defaults.
+    @MainActor
+    private static func claudeRouteFixture(for sceneName: String) -> ClaudeRouteController {
+        let off = ClaudeRouteCommand.Reading.status(ClaudeRouteStatus(route: .off))
+        switch sceneName {
+        case "25-claude-route-prompt":
+            return ClaudeRouteController(pinned: off, promptShown: true)
+        case "25b-claude-route-answered":
+            return ClaudeRouteController(
+                pinned: off, promptShown: true,
+                promptOutcome: ClaudeRoutePrompt.outcome(for: .shell, failure: nil))
+        default:
+            return ClaudeRouteController(pinned: off)
+        }
+    }
+
+    /// Answering the prompt must move nothing (Gil, 2026-10-14): the panel
+    /// with the question and the panel with its outcome line are the same
+    /// size, and they are different pictures (a swap that drew nothing would
+    /// pass the size half alone). Prints what failed and answers `false`,
+    /// which fails the run, the same contract as
+    /// ``hoverCardKeepsPanelSize(without:with:named:)``.
+    @MainActor
+    private static func claudeRoutePromptKeepsPanelSize<A: View, B: View>(
+        before: A, after: B, named name: String
+    ) -> Bool {
+        let asked = ImageRenderer(content: before)
+        let answered = ImageRenderer(content: after)
+        asked.scale = 2
+        answered.scale = 2
+        guard let a = asked.nsImage, let b = answered.nsImage else {
+            FileHandle.standardError.write(Data("prompt check: \(name) did not render\n".utf8))
+            return false
+        }
+        if a.size != b.size {
+            FileHandle.standardError.write(
+                Data(
+                    ("prompt check: \(name) is \(Int(b.size.width))x\(Int(b.size.height))pt "
+                        + "answered and \(Int(a.size.width))x\(Int(a.size.height))pt asked: "
+                        + "answering changed the panel's size\n").utf8))
+            return false
+        }
+        if a.tiffRepresentation == b.tiffRepresentation {
+            FileHandle.standardError.write(
+                Data("prompt check: \(name) drew the same picture asked and answered\n".utf8))
+            return false
+        }
+        print("  prompt check: \(name) \(Int(b.size.width))x\(Int(b.size.height))pt either way")
+        return true
     }
 
     /// The delete outcomes scene 24 draws; every other scene gets a controller
@@ -865,6 +926,12 @@ enum RenderStates {
                 if renderControl(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        for scene in tabStripScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderTabStrip(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
 
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
@@ -982,7 +1049,8 @@ enum RenderStates {
         // A closure over the hover pin, so a scene that pins a hover card can
         // also be drawn without it and the two compared
         // (``hoverCardKeepsPanelSize(without:with:named:)``).
-        let panel = { (hoverCard: String?, litAccount: String?) in
+        let panel = {
+            (hoverCard: String?, litAccount: String?, routeController: ClaudeRouteController) in
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
                 // A scene in `supervisedScenes` has its server pinned to the
@@ -1006,6 +1074,7 @@ enum RenderStates {
                 updater: updater,
                 groupController: GroupController(),
                 removeController: removeControllerFixture(for: scene.name),
+                routeController: routeController,
                 startServerAtLaunch: .constant(false),
                 // Render mode never looks at this Mac's codex: `.absent`, except in
                 // the one scene that names a presence of its own.
@@ -1046,7 +1115,7 @@ enum RenderStates {
         }
         let hoverCard = hoverCardFixture(for: scene.name)
         let litAccount = litAccountFixture(for: scene.name)
-        let view = panel(hoverCard, litAccount)
+        let view = panel(hoverCard, litAccount, claudeRouteFixture(for: scene.name))
 
         // The main pass is `.auto`, the shipped default, so its files are
         // `<scene>-auto-<appearance>.png`; the forced `.comfortable` variant's
@@ -1059,7 +1128,16 @@ enum RenderStates {
             ? "\(scene.name)-\(appearance.rawValue).png"
             : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
         if hoverCard != nil || litAccount != nil,
-            !hoverCardKeepsPanelSize(without: panel(nil, nil), with: view, named: name)
+            !hoverCardKeepsPanelSize(
+                without: panel(nil, nil, claudeRouteFixture(for: scene.name)), with: view,
+                named: name)
+        {
+            return false
+        }
+        if scene.name == "25b-claude-route-answered",
+            !claudeRoutePromptKeepsPanelSize(
+                before: panel(nil, nil, claudeRouteFixture(for: "25-claude-route-prompt")),
+                after: view, named: name)
         {
             return false
         }
@@ -1117,6 +1195,7 @@ enum RenderStates {
                 updater: Updater(startingUpdater: false),
                 groupController: GroupController(),
                 removeController: RemoveAccountController(),
+                routeController: ClaudeRouteController(pinned: nil),
                 startServerAtLaunch: .constant(false),
                 codexPresence: .absent,
                 snapshotMode: true,
@@ -2614,6 +2693,67 @@ enum RenderStates {
             .fixedSize()
     }
 
+    // MARK: - The tab strip at its badge extremes
+
+    /// One strip, one selection, one set of counts.
+    private struct TabStripScene {
+        let name: String
+        let selected: PanelTab
+        let badges: [PanelTab: Int]
+    }
+
+    /// The strip alone, at every badge extreme and two selections, so
+    /// `apps/macos/scripts/check-tab-strip-still.swift` can prove that nothing in it
+    /// moves when a count changes: every PNG of one selection must match the
+    /// no-badge one outside the badge corners (Gil, 2026-10-14: "avoid layout
+    /// shifts"). `100` draws the cap, `99+`.
+    private static var tabStripScenes: [TabStripScene] {
+        let sets: [(name: String, count: Int?)] = [
+            ("none", nil), ("1", 1), ("9", 9), ("10", 10), ("99", 99), ("cap", 100),
+        ]
+        var out: [TabStripScene] = []
+        for selected in [PanelTab.accounts, .sessions] {
+            for set in sets {
+                var badges: [PanelTab: Int] = [:]
+                if let count = set.count {
+                    badges = [.sessions: count, .tools: count, .peers: count]
+                }
+                out.append(
+                    TabStripScene(
+                        name: "70-tab-strip-\(selected.rawValue)-\(set.name)",
+                        selected: selected, badges: badges))
+            }
+            out.append(
+                TabStripScene(
+                    name: "70-tab-strip-\(selected.rawValue)-mixed",
+                    selected: selected, badges: [.sessions: 120, .tools: 3, .peers: 1]))
+        }
+        return out
+    }
+
+    @MainActor
+    private static func renderTabStrip(
+        _ scene: TabStripScene, appearance: Appearance, into directory: URL
+    ) -> Bool {
+        UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key)
+        PanelDensityPreference.setAccountCount(13)
+        return withDrawingAppearance(appearance.nsAppearance) {
+            let view =
+                SegmentedTabs(
+                    tabs: PanelTab.allCases, selected: scene.selected, badges: scene.badges,
+                    onSelect: { _ in }
+                )
+                .padding(.top, V4.panelPaddingTop)
+                .padding(.horizontal, V4.panelPaddingSide)
+                .frame(width: V4.panelWidth)
+                .background(Tok.panel)
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+                .fixedSize()
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
+
     // MARK: - Settings > Peers controls
 
     /// One control, one state, one PNG.
@@ -2632,9 +2772,45 @@ enum RenderStates {
         let view: AnyView
     }
 
+    /// Settings > General's "Send claude through tcr" row, one PNG per thing
+    /// it can say: off, each route, and a conflict in the way. The live row is a menu `Picker`, which
+    /// `ImageRenderer` cannot draw, so the row's snapshot mode shows the
+    /// current choice as text.
+    @MainActor
+    private static var claudeRouteSettingsScenes: [ControlScene] {
+        let row = { (reading: ClaudeRouteCommand.Reading) in
+            AnyView(
+                ClaudeRouteSettingsRow(
+                    controller: ClaudeRouteController(pinned: reading), snapshotMode: true))
+        }
+        return [
+            ControlScene(
+                name: "26-claude-route-settings-off",
+                view: row(.status(ClaudeRouteStatus(route: .off)))),
+            ControlScene(
+                name: "26b-claude-route-settings-shell",
+                view: row(.status(ClaudeRouteStatus(route: .shell)))),
+            ControlScene(
+                name: "26c-claude-route-settings-every-launch",
+                view: row(.status(ClaudeRouteStatus(route: .everyLaunch)))),
+            ControlScene(
+                name: "26d-claude-route-settings-conflict",
+                view: row(
+                    .status(
+                        ClaudeRouteStatus(
+                            route: .off,
+                            conflicts: [
+                                ClaudeRouteConflict(
+                                    route: "shell", kind: "alias",
+                                    path: "/Users/alice/.zshrc", line: 40,
+                                    text: "alias claude='claude --verbose'")
+                            ])))),
+        ]
+    }
+
     @MainActor
     private static var controlScenes: [ControlScene] {
-        [
+        claudeRouteSettingsScenes + [
             // The "Reachable from the internet" row, one PNG per state it can
             // be in: the switch off, the router being asked, a mapping held,
             // a router that never answered, that question asked again from

@@ -21,7 +21,7 @@ public enum SessionsCodexCopy {
     /// beside a Codex session from the first line of codex's rollout file.
     public static func sessionsFooter(_ fleet: Fleet) -> String {
         switch pools(fleet) {
-        case .claudeOnly: return "proxy + Claude Code session files"
+        case .claudeOnly: return "proxy + session files"
         case .mixed: return "proxy + Claude Code and codex session files"
         case .codexOnly: return "proxy + codex session files"
         }
@@ -124,7 +124,7 @@ public enum SessionsCodexCopy {
     public static func toolsFooter(holdsCodex: Bool) -> String {
         holdsCodex
             ? "from request and response bodies · nothing logged"
-            : "from request bodies only · nothing logged"
+            : "request bodies only · nothing logged"
     }
 
     /// What a running Codex call's row shows where a Claude call's ✕ goes. tcr cannot match a

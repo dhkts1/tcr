@@ -65,7 +65,7 @@ final class SessionsCodexCopyTests: XCTestCase {
         let s = try canonicalSessions()
         XCTAssertEqual(
             SessionsCodexCopy.sessionsFooter(try fleet([alice], sessions: [s.alice])),
-            "proxy + Claude Code session files")
+            "proxy + session files")
         XCTAssertEqual(
             SessionsCodexCopy.sessionsFooter(try fleet([alice, bob], sessions: [s.alice, s.bob])),
             "proxy + Claude Code and codex session files")
@@ -195,7 +195,7 @@ final class SessionsCodexCopyTests: XCTestCase {
             "from request and response bodies · nothing logged")
         XCTAssertEqual(
             SessionsCodexCopy.toolsFooter(holdsCodex: false),
-            "from request bodies only · nothing logged")
+            "request bodies only · nothing logged")
     }
 
     func testNoKillIsSaidInTheSlot() {

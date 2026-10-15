@@ -375,6 +375,7 @@ enum RenderSettings {
             panelDensityPreference: PanelDensityPreference(),
             groupController: GroupController(),
             updater: Updater(startingUpdater: false),
+            claudeRoute: ClaudeRouteController(pinned: .status(ClaudeRouteStatus(route: .shell))),
             onWhatsNew: {},
             // A fixed answer, never this Mac's tcr: a command-line tcr that predates
             // Codex accounts. Read only over a fleet holding a Codex account.

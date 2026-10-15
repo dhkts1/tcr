@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "teamclaude-rs"
-version = "1.1.21"
+version = "1.1.22"
 dependencies = [
  "anyhow",
  "axum",
