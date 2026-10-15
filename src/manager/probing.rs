@@ -343,8 +343,9 @@ impl Manager {
         // A Codex account's plan is a claim in its id token, read when the codex CLI's login is
         // imported. The profile endpoint asked below is Anthropic's and has no Codex twin:
         // asking it would only hand a Codex bearer to the wrong provider.
-        if self.provider(idx) == Some(crate::provider::Provider::Codex) {
-            return;
+        match self.provider(idx) {
+            Some(crate::provider::Provider::Anthropic) => {}
+            Some(crate::provider::Provider::Codex) | None => return,
         }
         let (already_known, token) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
