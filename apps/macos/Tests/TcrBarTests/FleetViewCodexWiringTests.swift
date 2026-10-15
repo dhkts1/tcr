@@ -49,7 +49,8 @@ final class FleetViewCodexWiringTests: XCTestCase {
         let add = try slice(
             source, from: "private func addAccount() {", to: "private func reloginAccount(")
         for call in [
-            "effectivePresence.isPresent", "phase: .choosing", "LoginCapability.probeCodex(executable:",
+            "presence.isPresent", "await resolveCodexPresenceForLogin()", "phase: .choosing",
+            "LoginCapability.probeCodex(executable:",
             "beginLogin(.claude(account: nil))",
         ] {
             XCTAssertTrue(

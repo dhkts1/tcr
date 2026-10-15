@@ -1268,7 +1268,7 @@ enum RenderStates {
                     // around the light-mode sheet, which is not a surface this
                     // app has.
                     LoginSheet(
-                        phase: scene.phase, codexPresence: .absent, authorizeURL: scene.url,
+                        phase: scene.phase, authorizeURL: scene.url,
                         snapshotMode: true, facts: facts, displayHome: displayHome
                     )
                     .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))

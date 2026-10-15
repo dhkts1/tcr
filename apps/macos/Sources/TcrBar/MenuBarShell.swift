@@ -124,6 +124,7 @@ final class MenuBarShell {
     let popover: NSPopover
 
     private var marks: Set<AnyCancellable> = []
+    private var openingWhenPresenceResolves = false
 
     /// `nil` means "the real one". A default argument is evaluated in a
     /// *nonisolated* context, and every controller here is `@MainActor`, so
@@ -142,6 +143,7 @@ final class MenuBarShell {
         updater: Updater? = nil,
         groupController: GroupController? = nil,
         removeController: RemoveAccountController? = nil,
+        codexPresence: CodexPresenceController? = nil,
         claudeRoute: ClaudeRouteController? = nil,
         whatsNew: WhatsNewController? = nil,
         runningToolsPreference: ShowRunningToolsPreference? = nil,
@@ -164,7 +166,7 @@ final class MenuBarShell {
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
         self.removeController = removeController ?? RemoveAccountController()
-        self.codexPresence = CodexPresenceController()
+        self.codexPresence = codexPresence ?? CodexPresenceController()
         self.codexNotes = CodexNoteStore()
         self.codexBannerSnapshot = CodexBannerSnapshot()
         self.claudeRoute = claudeRoute ?? ClaudeRouteController()
@@ -801,6 +803,18 @@ final class MenuBarShell {
 
     func openPanel() {
         guard let button = statusItem.button else { return }
+        // The first frame and an immediate Add account click need resolved absence,
+        // not the controller's initial placeholder. This stat-only read is off main.
+        guard codexPresence.isResolved else {
+            guard !openingWhenPresenceResolves else { return }
+            openingWhenPresenceResolves = true
+            Task {
+                await codexPresence.refresh(fleetHoldsCodex: poller.state.loadedFleet?.holdsCodex == true)
+                openingWhenPresenceResolves = false
+                openPanel()
+            }
+            return
+        }
         // Without activation the panel opens without key focus, and
         // `.textSelection(.enabled)` on the account name (`FleetView.swift:537`)
         // stops working.
@@ -949,6 +963,10 @@ struct FleetPanel: View {
             routeController: routeController,
             startServerAtLaunch: $preference.startServerAtLaunch,
             codexPresence: codexPresence.presence,
+            resolveCodexPresenceForLogin: {
+                await codexPresence.resolvedForLogin(
+                    fleetHoldsCodex: poller.state.loadedFleet?.holdsCodex == true)
+            },
             codexNotes: codexNotes,
             codexBannerSnapshot: codexBannerSnapshot,
             bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,

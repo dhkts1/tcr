@@ -196,20 +196,49 @@ public struct CodexPresence: Equatable, Sendable {
 /// passes ``CodexPresence/absent`` instead.
 @MainActor
 public final class CodexPresenceController: ObservableObject {
-    @Published public private(set) var presence: CodexPresence = .absent
-    /// Set only when codex is in evidence or the fleet holds a Codex account: it words how
-    /// to start codex through the pool, which a Mac without codex does not need.
+    @Published public private(set) var presence: CodexPresence
+    @Published public private(set) var isResolved: Bool
     @Published public private(set) var bundledTcrWithoutCLI: String?
+    private let resolver: @Sendable () -> (CodexPresence, String?)
+    private var pending: Task<(CodexPresence, String?), Never>?
+    private var generation = 0
+    private var fleetHoldsCodex = false
 
-    public init() {}
+    public init(
+        initialPresence: CodexPresence? = nil,
+        resolver: @escaping @Sendable () -> (CodexPresence, String?) = {
+            (CodexPresence.resolve(), TcrTool.bundledTcrWithoutCLI())
+        }
+    ) {
+        presence = initialPresence ?? .absent
+        isResolved = initialPresence != nil
+        self.resolver = resolver
+    }
 
     /// Resolve again, off the main thread, and publish what changed.
     public func refresh(fleetHoldsCodex: Bool) async {
-        let (resolved, bundled) = await Task.detached(priority: .utility) {
-            (CodexPresence.resolve(), TcrTool.bundledTcrWithoutCLI())
-        }.value
+        self.fleetHoldsCodex = fleetHoldsCodex
+        if pending == nil {
+            let resolver = resolver
+            generation += 1
+            pending = Task.detached(priority: .utility) { resolver() }
+        }
+        let readingGeneration = generation
+        guard let pending else { return }
+        let (resolved, bundled) = await pending.value
+        guard readingGeneration == generation else { return }
+        self.pending = nil
         if presence != resolved { presence = resolved }
-        let tail = resolved.isPresent || fleetHoldsCodex ? bundled : nil
+        let tail = resolved.isPresent || self.fleetHoldsCodex ? bundled : nil
         if bundledTcrWithoutCLI != tail { bundledTcrWithoutCLI = tail }
+        if !isResolved { isResolved = true }
+    }
+
+    /// An Add account click needs resolved absence before it can bypass the chooser.
+    public func resolvedForLogin(fleetHoldsCodex: Bool) async -> CodexPresence {
+        if !isResolved { await refresh(fleetHoldsCodex: fleetHoldsCodex) }
+        var result = presence
+        result.fleetHoldsCodex = fleetHoldsCodex
+        return result
     }
 }

@@ -16,10 +16,6 @@ import TcrBarCore
 /// without claiming to be transcribed from a design that does not cover it.
 struct LoginSheet: View {
     let phase: LoginPhase
-    /// What this Mac shows of codex, decided by the caller once per panel open.
-    /// Nothing reads it yet. It is a parameter for the same reason
-    /// ``snapshotMode`` is: the render harness passes `.absent`.
-    let codexPresence: CodexPresence
     /// The authorize URL, for the one recovery this flow needs: the browser did
     /// not come forward, or opened as the wrong user.
     var authorizeURL: URL?
@@ -288,7 +284,6 @@ struct LoginSheetHost: View {
     var body: some View {
         LoginSheet(
             phase: session.phase,
-            codexPresence: .absent,
             authorizeURL: session.authorizeURL,
             onCopyLink: { if let url = session.authorizeURL { onCopyLink(url) } },
             onCancel: onCancel,

@@ -46,6 +46,7 @@ struct FleetView: View {
     /// Add account… and the sign-in sheet read it through ``effectivePresence``,
     /// which also counts the fleet's own Codex rows.
     let codexPresence: CodexPresence
+    let resolveCodexPresenceForLogin: (() async -> CodexPresence)?
     /// What the panel keeps under a Codex account's line for this app run: a
     /// refused re-login and a group add's warning. Owned by the shell so a note
     /// survives the panel closing, and observed so recording one redraws the
@@ -314,6 +315,7 @@ struct FleetView: View {
         routeController: ClaudeRouteController,
         startServerAtLaunch: Binding<Bool>,
         codexPresence: CodexPresence,
+        resolveCodexPresenceForLogin: (() async -> CodexPresence)? = nil,
         // `nil` means a store of the panel's own, made below: a default argument
         // is evaluated off the main actor, where the store cannot be made.
         codexNotes: CodexNoteStore? = nil,
@@ -402,6 +404,7 @@ struct FleetView: View {
         self._startServerAtLaunch = startServerAtLaunch
         self.codexBannerSnapshot = codexBannerSnapshot ?? CodexBannerSnapshot()
         self.codexPresence = codexPresence
+        self.resolveCodexPresenceForLogin = resolveCodexPresenceForLogin
         self.codexNotes = codexNotes ?? CodexNoteStore()
         self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
         self.snapshotMode = snapshotMode
@@ -4007,7 +4010,13 @@ struct FleetView: View {
         guard !checkingLoginCapability else { return }
         checkingLoginCapability = true
         defer { checkingLoginCapability = false }
-        guard effectivePresence.isPresent else {
+        guard !snapshotMode else { return }
+        var presence = effectivePresence
+        if let resolveCodexPresenceForLogin {
+            presence = await resolveCodexPresenceForLogin()
+            presence.fleetHoldsCodex = poller.state.loadedFleet?.holdsCodex == true
+        }
+        guard presence.isPresent else {
             beginLogin(.claude(account: nil))
             return
         }
@@ -4017,7 +4026,7 @@ struct FleetView: View {
         case .failure(let missing):
             loginError = Self.loginFailureMessage(.toolMissing(searched: missing.searched))
         case .success(let tcr):
-            let codex = effectivePresence.codexExecutable
+            let codex = presence.codexExecutable
             loginSession = LoginSession(
                 request: nil, phase: .choosing,
                 codexSupported: await LoginCapability.probeCodex(executable: tcr),
