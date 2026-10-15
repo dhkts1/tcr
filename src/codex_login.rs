@@ -168,18 +168,12 @@ pub fn auth_path_from(override_path: Option<&Path>, codex_home: Option<&Path>) -
     if let Some(path) = override_path {
         return path.to_path_buf();
     }
-    codex_home
-        .map_or_else(default_codex_home, Path::to_path_buf)
-        .join("auth.json")
+    crate::paths::codex_auth_file(&codex_home.map_or_else(default_codex_home, Path::to_path_buf))
 }
 
 /// [`default_codex_home`] over the values of [`CODEX_HOME_ENV`] and `HOME`, already read.
 fn codex_home_from(codex_home: Option<PathBuf>, user_home: Option<PathBuf>) -> PathBuf {
-    codex_home.unwrap_or_else(|| {
-        user_home
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".codex")
-    })
+    crate::paths::codex_home_in(codex_home, user_home)
 }
 
 /// An environment variable as a path, `None` when it is unset or empty: an empty `CODEX_HOME` is

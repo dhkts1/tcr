@@ -288,10 +288,12 @@ pub fn codex_login_path() -> PathBuf {
 
 /// [`codex_login_path`] over values already read. An empty `CODEX_HOME` is no `CODEX_HOME`.
 pub fn codex_login_path_from(codex_home: Option<&Path>, home: &Path) -> PathBuf {
-    codex_home
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map_or_else(|| home.join(".codex"), Path::to_path_buf)
-        .join("auth.json")
+    crate::paths::codex_auth_file(&crate::paths::codex_home_in(
+        codex_home
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf),
+        Some(home.to_path_buf()),
+    ))
 }
 
 /// Whether codex has a login file of its own ([`login_file_exists`] at [`codex_login_path`]).

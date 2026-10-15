@@ -35,7 +35,7 @@ fn invalid_document() -> io::Error {
 }
 
 pub(crate) fn read(home: &Path) -> io::Result<ImportedAuth> {
-    let path = home.join("auth.json");
+    let path = crate::paths::codex_auth_file(home);
     let original = fs::read(&path)?;
     let text = std::str::from_utf8(&original).map_err(|_| invalid_document())?;
     let document: Value = serde_json::from_str(text).map_err(|_| invalid_document())?;
@@ -54,6 +54,28 @@ pub(crate) fn read(home: &Path) -> io::Result<ImportedAuth> {
         login,
         last_refresh_ms,
     })
+}
+
+/// Read the imported document without putting filesystem latency on a tokio worker.
+pub(crate) async fn read_async(home: &Path) -> io::Result<ImportedAuth> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || read(&home))
+        .await
+        .map_err(|_| io::Error::other("Codex login read task failed"))?
+}
+
+/// Keep the compare, private temporary write, fsyncs and rename on one blocking task.
+pub(crate) async fn write_back_async(
+    home: &Path,
+    previous_refresh: &str,
+    tokens: &Tokens,
+) -> io::Result<bool> {
+    let home = home.to_path_buf();
+    let previous_refresh = previous_refresh.to_string();
+    let tokens = tokens.clone();
+    tokio::task::spawn_blocking(move || write_back(&home, &previous_refresh, &tokens))
+        .await
+        .map_err(|_| io::Error::other("Codex login write task failed"))?
 }
 
 impl ImportedAuth {
@@ -114,6 +136,13 @@ impl ImportedAuth {
             .expires_at_ms
             .filter(|&expiry| expiry > crate::now_ms())?;
         Some(Tokens {
+            id_token: self
+                .document
+                .get("tokens")?
+                .get("id_token")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned),
             access_token: self.login.access_token.clone(),
             refresh_token: Some(self.login.refresh_token.clone()),
             expires_at_ms,
@@ -122,7 +151,7 @@ impl ImportedAuth {
 }
 
 /// `false` means the file changed: no destination bytes were written. Unknown fields and the
-/// original `id_token` are retained; the refresher currently returns only access/refresh tokens.
+/// original id token are retained unless the refresh endpoint returned a replacement.
 pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -> io::Result<bool> {
     let mut auth = read(home)?;
     if auth.login.refresh_token != previous_refresh {
@@ -143,6 +172,9 @@ pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -
         .get_mut("tokens")
         .and_then(Value::as_object_mut)
         .ok_or_else(invalid_document)?;
+    if let Some(id_token) = &tokens.id_token {
+        stored.insert("id_token".to_string(), Value::String(id_token.clone()));
+    }
     stored.insert(
         "access_token".to_string(),
         Value::String(tokens.access_token.clone()),
@@ -159,7 +191,7 @@ pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -
     bytes.push(b'\n');
     let mut temporary = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o600))
-        .prefix(".auth.json.tcr-")
+        .prefix(crate::paths::CODEX_AUTH_TEMP_PREFIX)
         .suffix(".tmp")
         .tempfile_in(home)?;
     temporary.write_all(&bytes)?;

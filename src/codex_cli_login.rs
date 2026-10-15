@@ -31,12 +31,13 @@
 //! # The folder
 //!
 //! `tcr-codex-login.*` beside the config, mode `0700`, holding the sign-in's `auth.json` until tcr
-//! has read it. It is deleted on every path tcr can observe: success, every refusal, codex's
-//! non-zero exit, and SIGTERM, SIGINT or SIGHUP, which also stop `codex login` and everything it
+//! has read it. Deletion is attempted on every path tcr can observe: success, every refusal,
+//! codex's non-zero exit, and SIGTERM, SIGINT or SIGHUP, which also stop `codex login` and everything it
 //! started. It is closed as soon as the login is in memory, before the identity check, the
 //! import's route probe and its workspace check, which wait on the network. A forced kill of tcr
 //! (SIGKILL) runs no handler, and can leave the folder behind, holding a live login; nothing
-//! sweeps old folders.
+//! sweeps old folders. A failed cancellation cleanup names the remaining folder and asks the
+//! user to delete it by hand.
 //!
 //! # Signals
 //!
@@ -181,7 +182,7 @@ async fn sign_in(
 ) -> anyhow::Result<String> {
     let folder = session.folder_path();
     let ran = run_codex_login(&session, &codex, &folder, ui).await?;
-    let auth = folder.join("auth.json");
+    let auth = crate::paths::codex_auth_file(&folder);
     let status = describe(ran.status);
     let said = ran.said.as_deref();
     if !ran.status.success() {
@@ -466,13 +467,10 @@ impl Session {
 /// here, so it exists before codex runs (codex refuses a `CODEX_HOME` that does not).
 fn throwaway_folder(config_path: &Path) -> anyhow::Result<tempfile::TempDir> {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = config_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let dir = crate::paths::codex_login_parent(config_path);
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     tempfile::Builder::new()
-        .prefix("tcr-codex-login.")
+        .prefix(crate::paths::CODEX_LOGIN_PREFIX)
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(dir)
         .with_context(|| format!("creating a sign-in folder in {}", dir.display()))
@@ -533,7 +531,8 @@ impl Caught {
 }
 
 /// Stop `codex login` and everything it started, delete the folder, and exit with 128 plus the
-/// signal's number, saying nothing more. It never returns.
+/// signal's number. A failed folder deletion is reported before exiting, since it can leave
+/// a live credential behind. It never returns.
 async fn stop_and_exit(session: &Session, caught: Caught) -> std::convert::Infallible {
     session.quiet.store(true, Ordering::SeqCst);
     let pid = *session.codex_pid.lock().expect("pid lock poisoned");
@@ -557,7 +556,9 @@ async fn stop_and_exit(session: &Session, caught: Caught) -> std::convert::Infal
         }
         wait_for(&reaped, STOP_GRACE).await;
     }
-    let _ = session.close_folder();
+    if let Err(error) = session.close_folder() {
+        eprintln!("[tcr] {error:#}");
+    }
     std::process::exit(128 + caught.number());
 }
 

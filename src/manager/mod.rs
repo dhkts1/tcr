@@ -4178,6 +4178,7 @@ mod tests {
                 // up on the coalescing lock.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 Ok::<Tokens, OAuthError>(Tokens {
+                    id_token: None,
                     access_token: "fresh-access".to_string(),
                     refresh_token: Some("fresh-refresh".to_string()),
                     expires_at_ms: crate::now_ms() + 3_600_000,
@@ -4218,6 +4219,7 @@ mod tests {
                     ))
                 } else {
                     Ok(Tokens {
+                        id_token: None,
                         access_token: "fresh-access".to_string(),
                         refresh_token: Some("fresh-refresh".to_string()),
                         expires_at_ms: crate::now_ms() + 3_600_000,
@@ -4686,6 +4688,7 @@ mod tests {
             None,
             crate::provider::Provider::Anthropic,
             &Tokens {
+                id_token: None,
                 access_token: "at-a-rotated".to_string(),
                 refresh_token: Some("rt-a-rotated".to_string()),
                 expires_at_ms: crate::now_ms() + 3_600_000,
@@ -4742,6 +4745,7 @@ mod tests {
             None,
             crate::provider::Provider::Codex,
             &Tokens {
+                id_token: None,
                 access_token: "at-codex-rotated".to_string(),
                 refresh_token: Some("rt-codex-rotated".to_string()),
                 expires_at_ms: crate::now_ms() + 3_600_000,
@@ -5436,6 +5440,7 @@ mod tests {
                     })
                 } else {
                     Ok(crate::oauth::Tokens {
+                        id_token: None,
                         access_token: "at-fresh".to_string(),
                         refresh_token: Some("rt-fresh".to_string()),
                         expires_at_ms: crate::now_ms() + 3_600_000,
@@ -9258,6 +9263,7 @@ mod tests {
                         None,
                         crate::provider::Provider::Anthropic,
                         &Tokens {
+                            id_token: None,
                             access_token: format!("new-at-{i}"),
                             refresh_token: Some(format!("new-rt-{i}")),
                             expires_at_ms: crate::now_ms() + 3_600_000,
@@ -9308,6 +9314,7 @@ mod tests {
                 started.notify_one();
                 release.notified().await;
                 Ok::<Tokens, OAuthError>(Tokens {
+                    id_token: None,
                     access_token: "fresh-access".to_string(),
                     refresh_token: Some("fresh-refresh".to_string()),
                     expires_at_ms: crate::now_ms() + 3_600_000,
@@ -9430,6 +9437,7 @@ mod tests {
                 .push(provider);
             Box::pin(async {
                 Ok::<Tokens, OAuthError>(Tokens {
+                    id_token: None,
                     access_token: "fresh-access".to_string(),
                     refresh_token: Some("fresh-refresh".to_string()),
                     expires_at_ms: crate::now_ms() + 3_600_000,

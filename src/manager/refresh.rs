@@ -127,29 +127,41 @@ impl Manager {
 
         let imported_home = match provider {
             crate::provider::Provider::Anthropic => None,
-            crate::provider::Provider::Codex => codex_home.as_deref().map(std::path::Path::new),
+            crate::provider::Provider::Codex => codex_home.map(std::path::PathBuf::from),
         };
-        let file_before = imported_home.and_then(|home| crate::codex_token_store::read(home).ok());
+        let file_before = match imported_home.as_deref() {
+            Some(home) => crate::codex_token_store::read_async(home).await.ok(),
+            None => None,
+        };
         let loaded_refresh_ms = file_before
             .as_ref()
             .filter(|auth| auth.login.refresh_token == refresh_token)
             .and_then(|auth| auth.last_refresh_ms);
         let newer_in_file = |after_ms| {
-            imported_home
-                .and_then(|home| crate::codex_token_store::read(home).ok())
-                .and_then(|auth| {
-                    auth.newer_tokens(
-                        &refresh_token,
-                        &access_before,
-                        org_uuid.as_deref(),
-                        account_uuid.as_deref(),
-                        after_ms,
-                    )
-                })
+            let home = imported_home.clone();
+            let refresh_token = refresh_token.clone();
+            let access_before = access_before.clone();
+            let org_uuid = org_uuid.clone();
+            let account_uuid = account_uuid.clone();
+            async move {
+                let home = home?;
+                crate::codex_token_store::read_async(&home)
+                    .await
+                    .ok()
+                    .and_then(|auth| {
+                        auth.newer_tokens(
+                            &refresh_token,
+                            &access_before,
+                            org_uuid.as_deref(),
+                            account_uuid.as_deref(),
+                            after_ms,
+                        )
+                    })
+            }
         };
         // Codex may have refreshed since this row was loaded. Adopt its live pair before
         // spending the stale single-use refresh token, and check again after an upstream race.
-        let preexisting = newer_in_file(None);
+        let preexisting = newer_in_file(None).await;
         let result = if let Some(tokens) = preexisting {
             Ok(tokens)
         } else {
@@ -160,11 +172,17 @@ impl Manager {
                 .await
             {
                 Ok(mut tokens) => {
-                    if let Some(home) = imported_home {
-                        match crate::codex_token_store::write_back(home, &refresh_token, &tokens) {
+                    if let Some(home) = imported_home.as_deref() {
+                        match crate::codex_token_store::write_back_async(
+                            home,
+                            &refresh_token,
+                            &tokens,
+                        )
+                        .await
+                        {
                             Ok(true) => {}
                             Ok(false) => {
-                                if let Some(newer) = newer_in_file(loaded_refresh_ms) {
+                                if let Some(newer) = newer_in_file(loaded_refresh_ms).await {
                                     tokens = newer;
                                 }
                             }
@@ -180,7 +198,7 @@ impl Manager {
                 // A concurrent Codex rotation can change the file during any failed POST,
                 // not only one that names a reused token. A different live pair for the same
                 // account is stronger evidence than this stale token's failure.
-                Err(error) => newer_in_file(loaded_refresh_ms).ok_or(error),
+                Err(error) => newer_in_file(loaded_refresh_ms).await.ok_or(error),
             }
         };
         match result {
@@ -194,7 +212,29 @@ impl Manager {
                 // write lives in apply_refresh.
                 let cooldown_after = force.then(Self::cooldown_deadline);
                 self.apply_refresh(idx, &tokens, cooldown_after);
-                self.persist_tokens(&name, account_uuid, org_uuid, org_name, provider, &tokens);
+                if let Some(manager) = self.me.get().and_then(std::sync::Weak::upgrade) {
+                    let persisted_name = name.clone();
+                    let persisted_tokens = tokens.clone();
+                    if tokio::task::spawn_blocking(move || {
+                        manager.persist_tokens(
+                            &persisted_name,
+                            account_uuid,
+                            org_uuid,
+                            org_name,
+                            provider,
+                            &persisted_tokens,
+                        );
+                    })
+                    .await
+                    .is_err()
+                    {
+                        tracing::error!(account = %name, "refreshed token persistence task failed");
+                    }
+                } else {
+                    // Only manually constructed managers lack the Arc installed by assemble;
+                    // retain their existing inline refresh/persistence fallback.
+                    self.persist_tokens(&name, account_uuid, org_uuid, org_name, provider, &tokens);
+                }
                 tracing::info!(account = %name, "token refreshed");
                 true
             }
@@ -450,6 +490,7 @@ mod tests {
                     })
                 } else {
                     Ok(Tokens {
+                        id_token: None,
                         access_token: "at-tcr-new".to_string(),
                         refresh_token: Some("rt-tcr-new".to_string()),
                         expires_at_ms: crate::now_ms() + 3_600_000,
@@ -717,6 +758,7 @@ mod tests {
                 let generation = calls.len();
                 Box::pin(async move {
                     Ok(Tokens {
+                        id_token: None,
                         access_token: access_token(
                             ACCOUNT_ID,
                             generation as i64 + 1,
@@ -777,6 +819,76 @@ mod tests {
         assert!(
             rollbacks.is_empty(),
             "stale file login replaced newer runtime tokens: {rollbacks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_codex_file_io_keeps_the_async_runtime_responsive() {
+        use std::io::Write as _;
+        let home = tempfile::tempdir().unwrap();
+        let auth_path = home.path().join("auth.json");
+        assert!(std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&auth_path)
+            .status()
+            .unwrap()
+            .success());
+        let (manager, _) = imported_manager(home.path(), None, false);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&auth_path)
+                .unwrap();
+            // The first read holds the FIFO inode; later reads see a normal fixture file.
+            std::fs::remove_file(&auth_path).unwrap();
+            let body = auth_document("rt-old", 1).to_string();
+            std::fs::write(&auth_path, &body).unwrap();
+            fifo.write_all(body.as_bytes()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let refresh = tokio::spawn(async move { manager.ensure_fresh_force(0).await });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let heartbeat = started.elapsed();
+        assert!(refresh.await.unwrap());
+        writer.join().unwrap();
+        assert!(
+            heartbeat < std::time::Duration::from_millis(250),
+            "blocking auth.json read stalled the runtime for {heartbeat:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_token_config_persistence_keeps_the_async_runtime_responsive() {
+        let home = tempfile::tempdir().unwrap();
+        let (original, _) = imported_manager(home.path(), None, false);
+        let mut config = original.config.lock().unwrap().clone();
+        config.accounts[0].codex_home = None;
+        let path = home.path().join(crate::paths::CONFIG_FILE);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let manager = Manager::new(
+            config,
+            Arc::clone(&original.refresher),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Some(path),
+        );
+        let lock = Arc::clone(&manager.config_write);
+        let (ready, acquired) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _guard = lock.lock().unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        acquired.recv().unwrap();
+        let started = std::time::Instant::now();
+        let refresh = tokio::spawn(async move { manager.ensure_fresh_force(0).await });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let heartbeat = started.elapsed();
+        assert!(refresh.await.unwrap());
+        writer.join().unwrap();
+        assert!(
+            heartbeat < std::time::Duration::from_millis(250),
+            "config token persistence stalled the runtime for {heartbeat:?}"
         );
     }
 }

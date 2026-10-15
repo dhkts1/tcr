@@ -913,6 +913,69 @@ fn login_codex_stops_codex_and_removes_its_folder_when_cancelled() {
     }
 }
 
+#[test]
+fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
+    let scratch = Scratch::new("[]");
+    let auth = scratch.path("prepared-auth.json");
+    std::fs::write(&auth, bob_auth()).unwrap();
+    write_script(&scratch.codex, &format!(
+        "#!/bin/sh\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\necho ready >> '{log}'\nwhile :; do /bin/sleep 1; done\n",
+        log = scratch.log.display(), auth = auth.display(),
+    ));
+    let error_log = scratch.path("cancel.stderr");
+    let event_log = scratch.path("cancel.stdout");
+    let mut child = scratch
+        .tcr()
+        .args(["login", "--codex", "--non-interactive", "--config"])
+        .arg(&scratch.config)
+        .stdout(std::fs::File::create(&event_log).unwrap())
+        .stderr(std::fs::File::create(&error_log).unwrap())
+        .spawn()
+        .unwrap();
+    let ready = within(Duration::from_secs(10), || {
+        std::fs::read_to_string(&scratch.log)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "fake codex never became ready: stderr={} stdout={}",
+            std::fs::read_to_string(&error_log).unwrap_or_default(),
+            std::fs::read_to_string(&event_log).unwrap_or_default()
+        );
+    }
+    let folder = scratch.homes().remove(0);
+    let sent = Command::new("/bin/kill")
+        .args(["-s", "INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let mut status = None;
+    let exited = within(Duration::from_secs(10), || {
+        status = child.try_wait().unwrap();
+        status.is_some()
+    });
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stderr = std::fs::read_to_string(&error_log).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(exited, "cancelled login did not exit");
+    assert_eq!(status.unwrap().code(), Some(130));
+    assert!(
+        folder.join("auth.json").is_file(),
+        "the failed deletion retained the fixture login"
+    );
+    assert!(
+        stderr.contains(&format!("removing {}", folder.display()))
+            && stderr.contains("delete it by hand"),
+        "cleanup failure must identify the folder and recovery: {stderr}"
+    );
+}
+
 /// The folder is deleted as soon as the login is read, before the import's workspace check
 /// goes out on the network: a cancel during that wait finds no login on disk.
 ///

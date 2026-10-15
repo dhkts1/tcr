@@ -43,11 +43,12 @@ struct RefreshRequest<'a> {
     refresh_token: &'a str,
 }
 
-/// The two fields a refresh reads. The response's `id_token` is not modelled: a refresh changes
-/// nothing tcr stores about whose account this is, so serde's default of ignoring unknown keys
-/// drops it.
+/// The fields Codex's refresh endpoint returns. A new id token travels with the credential
+/// pair so an imported auth.json keeps Codex's own plan/workspace claims current.
 #[derive(Deserialize, Default)]
 struct RefreshResponse {
+    #[serde(default)]
+    id_token: Option<String>,
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
@@ -199,6 +200,7 @@ pub async fn refresh_access_token_at(
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| refresh_token.to_string());
     Ok(Tokens {
+        id_token: parsed.id_token.filter(|token| !token.is_empty()),
         access_token,
         refresh_token: Some(refresh_token),
         expires_at_ms,
@@ -510,8 +512,8 @@ mod tests {
         (format!("http://{addr}/oauth/token"), seen)
     }
 
-    /// The real response carries three fields; `id_token` rides along and is ignored, since
-    /// `RefreshResponse` does not model it. The access token's `exp` is in 2100, so it is a
+    /// The real response carries three fields; its optional id token is retained for imported
+    /// logins. The access token's `exp` is in 2100, so it is a
     /// future `exp`, kept as-is, on whatever day this runs: one in the past is no `exp` at all
     /// (`an_exp_already_past_takes_the_default_lifetime`).
     #[tokio::test]
@@ -539,6 +541,38 @@ mod tests {
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["client_id"], CLIENT_ID);
         assert_eq!(body["refresh_token"], "rt-1");
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_id_token_is_written_back_and_an_omitted_one_is_preserved() {
+        for returned in [Some(id_jwt()), None] {
+            let home = tempfile::tempdir().unwrap();
+            let original_id = access_jwt();
+            let auth = serde_json::json!({"tokens": {
+                "access_token": "at-old", "refresh_token": "rt-old",
+                "id_token": original_id, "account_id": "11111111-1111-4111-8111-111111111111"
+            }, "unknown": {"keep": true}});
+            std::fs::write(home.path().join("auth.json"), auth.to_string()).unwrap();
+            let mut response =
+                serde_json::json!({"access_token": access_jwt(), "refresh_token": "rt-new"});
+            if let Some(id) = &returned {
+                response["id_token"] = serde_json::json!(id);
+            }
+            let (url, _) = stub(200, Box::leak(response.to_string().into_boxed_str())).await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let tokens = refresh_access_token_at(&client, "rt-old", &url)
+                .await
+                .unwrap();
+            assert!(crate::codex_token_store::write_back(home.path(), "rt-old", &tokens).unwrap());
+            let written: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(home.path().join("auth.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                written["tokens"]["id_token"],
+                returned.as_deref().unwrap_or(&original_id)
+            );
+            assert_eq!(written["unknown"], auth["unknown"]);
+        }
     }
 
     #[tokio::test]

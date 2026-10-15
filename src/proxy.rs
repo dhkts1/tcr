@@ -16048,6 +16048,7 @@ mod tests {
             ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
                     Ok(crate::oauth::Tokens {
+                        id_token: None,
                         access_token: "fresh-access".into(),
                         refresh_token: Some("fresh-refresh".into()),
                         expires_at_ms: crate::now_ms() + 3_600_000,

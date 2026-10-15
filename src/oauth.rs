@@ -35,6 +35,9 @@ pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Freshly-minted OAuth credentials returned by a refresh.
 #[derive(Debug, Clone)]
 pub struct Tokens {
+    /// A refreshed Codex id token, when returned: carried to the imported auth.json so Codex
+    /// reads current plan/workspace claims. Other OAuth producers leave it absent.
+    pub id_token: Option<String>,
     pub access_token: String,
     /// `None` only for a `claude setup-token` credential ([`login_with_token`]):
     /// that mint carries only the `user:inference` scope, and the CLI that
@@ -223,6 +226,7 @@ pub async fn refresh_access_token_at(
         );
 
         return Ok(Tokens {
+            id_token: None,
             access_token: data.access_token,
             refresh_token: Some(
                 data.refresh_token
@@ -1067,6 +1071,7 @@ fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Exchanged> {
 
     Ok(Exchanged {
         tokens: Tokens {
+            id_token: None,
             access_token: data.access_token,
             refresh_token: Some(refresh_token),
             expires_at_ms,
@@ -2068,6 +2073,7 @@ pub async fn login_with_token(
 
     let access_token = read_setup_token()?;
     let tokens = Tokens {
+        id_token: None,
         access_token,
         refresh_token: None,
         expires_at_ms: crate::now_ms() + SETUP_TOKEN_ASSUMED_LIFETIME_MS,
@@ -2173,6 +2179,7 @@ fn plan_suffix(subscription_type: Option<&str>) -> String {
 /// find out when it dies, and this one has both.
 fn tokens_from_claude_code_login(login: crate::claude_code_login::ClaudeCodeLogin) -> Tokens {
     Tokens {
+        id_token: None,
         access_token: login.access_token,
         refresh_token: login.refresh_token,
         expires_at_ms: login
@@ -4300,6 +4307,7 @@ mod tests {
 
     fn tokens(access: &str, refresh: &str, expires: i64) -> Tokens {
         Tokens {
+            id_token: None,
             access_token: access.to_string(),
             refresh_token: Some(refresh.to_string()),
             expires_at_ms: expires,
@@ -6490,6 +6498,7 @@ mod tests {
         let mut config = load_or_default(&path).unwrap();
 
         let setup_tokens = Tokens {
+            id_token: None,
             access_token: "at-setup".to_string(),
             refresh_token: None,
             expires_at_ms: 1_893_456_000_000,
