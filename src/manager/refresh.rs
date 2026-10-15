@@ -284,11 +284,11 @@ impl Manager {
                             let mut accounts =
                                 self.accounts.write().expect("accounts lock poisoned");
                             if let Some(account) = accounts.get_mut(idx) {
-                                let expected_refresh = account
-                                    .pending_codex_writeback
-                                    .as_ref()
-                                    .map(|pending| pending.expected_refresh.clone())
-                                    .unwrap_or_else(|| posted_refresh.clone());
+                                let expected_refresh =
+                                    account.pending_codex_writeback.as_ref().map_or_else(
+                                        || posted_refresh.clone(),
+                                        |pending| pending.expected_refresh.clone(),
+                                    );
                                 account.pending_codex_writeback = Some(PendingCodexWriteback {
                                     expected_refresh,
                                     tokens: tokens.clone(),
