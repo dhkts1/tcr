@@ -57,6 +57,7 @@ use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
     InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
+use crate::provider::Provider;
 use crate::quota::{quota_rejections, UnifiedRejectionKind};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
@@ -2688,6 +2689,39 @@ fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) 
     matches!(err, tokio::sync::mpsc::error::TrySendError::Full(_))
 }
 
+/// Whether a Codex 403 actually rejects the pooled login. Codex only attempts authentication
+/// recovery for a 401 (`model-provider/src/provider.rs`); its 403s also include Cloudflare and
+/// policy blocks (`codex-api/src/api_bridge.rs`). Require the explicit JSON authentication
+/// signals CLIProxyAPI recognizes (`codex_executor_terminal.go`), and let a challenge header
+/// override even an authentication-shaped body. Unknown errors are passed through unchanged.
+fn codex_forbidden_is_auth_error(headers: &HeaderMap, body: &[u8]) -> bool {
+    if headers
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("challenge"))
+    {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = parsed.get("error") else {
+        return false;
+    };
+    error
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("authentication_error"))
+        || error
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| {
+                ["invalid_api_key", "unauthorized"]
+                    .iter()
+                    .any(|known| code.trim().eq_ignore_ascii_case(known))
+            })
+}
+
 /// The catch-all proxy handler.
 async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
@@ -4418,12 +4452,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             continue;
         }
 
-        // 403 → upstream refuses the credential WE injected. The client never saw
+        // A JSON auth 403 → upstream refuses the credential WE injected. The client never saw
         // it and can do nothing about it, so this must never reach them as-is:
         // Claude Code reads a 403 as "your own session is dead" and drops the
         // user's login over an account problem that is not theirs. Rotate away, as
-        // the 401 branch above does — this account may simply be disabled or
-        // region-blocked while its siblings are fine.
+        // the 401 branch above does — this account may simply be disabled while its
+        // siblings are fine. Codex challenges, region/policy blocks and
+        // other non-auth 403s keep their upstream response and receive a short generic hold.
         //
         // Deliberately does NOT set the terminal `Error` account status, for the
         // same reason the 401 branch above does not: `Error` is permanent, skipped
@@ -4439,29 +4474,68 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // while `tcr status` read the row as `gate: ok`; the hold's gate reads
         // `refused` instead.
         if status == StatusCode::FORBIDDEN {
+            // Upstream's own words for the refusal, read capped in size and time
+            // exactly as the 429 arm reads its body, so a body that never
+            // completes cannot become a hang. A Codex body can also be forwarded, so it gets
+            // the ordinary response cap rather than the smaller diagnostic-only cap.
+            let body_cap = match provider {
+                Provider::Anthropic => RATE_LIMIT_BODY_CAP,
+                Provider::Codex => MAX_BODY_BYTES,
+            };
+            let body = match tokio::time::timeout(
+                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                read_capped_body(resp.bytes_stream(), body_cap),
+            )
+            .await
+            {
+                Ok(Ok(body)) => {
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                    Some(body)
+                }
+                Ok(Err(_)) | Err(_) => {
+                    tracing::warn!(
+                        account = account_name.as_deref().unwrap_or("?"),
+                        account_index = idx,
+                        "upstream 403 body could not be read within the cap"
+                    );
+                    None
+                }
+            };
+            match provider {
+                Provider::Codex => {
+                    let auth_error = body
+                        .as_deref()
+                        .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
+                    if !auth_error {
+                        manager.mark_rate_limited(idx, crate::manager::REFUSED_HOLD_SECONDS);
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            "upstream Codex access block — holding account without rejecting its login"
+                        );
+                        return match body {
+                            Some(body) => build_response(
+                                status,
+                                &up_headers,
+                                Body::from(body),
+                                ServedBy::PooledAccount,
+                            ),
+                            None => error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "proxy_error",
+                                "Failed to read the upstream access-denied response.",
+                                None,
+                            ),
+                        };
+                    }
+                }
+                Provider::Anthropic => {}
+            }
             tracing::warn!(
                 account = account_name.as_deref().unwrap_or("?"),
                 account_index = idx,
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
-            // Upstream's own words for the refusal, read capped in size and time
-            // exactly as the 429 arm reads its body, so a body that never
-            // completes cannot become a hang.
-            match tokio::time::timeout(
-                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
-                read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
-            )
-            .await
-            {
-                Ok(Ok(body)) => {
-                    log_upstream_error_body(idx, account_name.as_deref(), status, &body)
-                }
-                Ok(Err(_)) | Err(_) => tracing::warn!(
-                    account = account_name.as_deref().unwrap_or("?"),
-                    account_index = idx,
-                    "upstream 403 body could not be read within the cap"
-                ),
-            }
             manager.mark_refused(idx);
             refused_403.push((idx, account_name.clone()));
             tried.insert(idx);
@@ -21089,7 +21163,7 @@ mod tests {
                             .header(CONTENT_TYPE, "application/json")
                             .header("x-codex-rate-limit-reached-type", "primary")
                             .body(Body::from(
-                                r#"{"error":{"type":"forbidden","message":"workspace blocked"}}"#,
+                                r#"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"login refused"}}"#,
                             ))
                             .expect("403 response");
                     }
@@ -21114,7 +21188,7 @@ mod tests {
         (format!("http://{addr}"), refused, served)
     }
 
-    /// **A Codex 403 holds its account briefly, as #459 holds an Anthropic one, and reads
+    /// **A Codex JSON auth 403 holds its account briefly, as an Anthropic one does, and reads
     /// `refused`, never a quota verdict.** The 403 arm is reached only for an account
     /// `select` picked within the request's provider, so the hold lands on the Codex
     /// account that answered, and `Manager::mark_refused` arms the flat
@@ -22610,6 +22684,98 @@ mod tests {
         );
     }
 
+    async fn assert_codex_block_is_forwarded(
+        content_type: &'static str,
+        challenge: bool,
+        body: &'static str,
+    ) {
+        let origin = Router::new().fallback(move || async move {
+            let mut response = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(CONTENT_TYPE, content_type)
+                .header("cf-ray", "test-ray");
+            if challenge {
+                response = response.header("cf-mitigated", "challenge");
+            }
+            response.body(Body::from(body)).expect("403 response")
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Codex origin");
+        let addr = listener.local_addr().expect("Codex origin addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, origin).await;
+        });
+        let anthropic_echo = CapturingUpstream::spawn().await;
+        let manager = Manager::with_live_refresher(
+            codex_fleet(&anthropic_echo.url, &format!("http://{addr}")),
+            None,
+        );
+        let response = send_codex_turn(&manager).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[CONTENT_TYPE], content_type);
+        assert_eq!(response.headers()["cf-ray"], "test-ray");
+        assert_eq!(
+            response
+                .headers()
+                .get("cf-mitigated")
+                .and_then(|value| value.to_str().ok()),
+            challenge.then_some("challenge")
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("403 body");
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_bytes(),
+            "the upstream body survives"
+        );
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        let account = &snapshot.accounts[1];
+        assert_eq!(
+            account.gate,
+            GateReason::Hold,
+            "a block is not a login refusal"
+        );
+        assert_eq!(account.codex.login_error, None);
+        let held_until = account.rate_limited_until.expect("the account is held");
+        let remaining = held_until - OffsetDateTime::now_utc();
+        assert!(remaining.whole_seconds() > 0);
+        assert!(remaining.whole_seconds() <= crate::manager::REFUSED_HOLD_SECONDS);
+        assert_eq!(snapshot.accounts[0].gate, GateReason::Ok);
+        assert_eq!(anthropic_echo.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_codex_cloudflare_html_403_is_forwarded_without_blaming_the_login() {
+        assert_codex_block_is_forwarded(
+            "text/html",
+            false,
+            "<!DOCTYPE html><html><body>Cloudflare blocked this request</body></html>",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_codex_region_403_is_forwarded_without_blaming_the_login() {
+        assert_codex_block_is_forwarded(
+            "application/json",
+            false,
+            r#"{"error":{"code":"unsupported_country_region_territory","message":"Country, region, or territory not supported"}}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_codex_challenge_header_overrides_an_auth_shaped_403_body() {
+        assert_codex_block_is_forwarded(
+            "application/json",
+            true,
+            r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#,
+        )
+        .await;
+    }
+
     /// A Codex origin that refuses EVERY request with a 403, recording each bearer in order.
     async fn spawn_codex_origin_forbidding_all() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let refused: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -22631,7 +22797,7 @@ mod tests {
                     .status(StatusCode::FORBIDDEN)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"error":{"type":"forbidden","message":"workspace blocked"}}"#,
+                        r#"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"login refused"}}"#,
                     ))
                     .expect("403 response")
             }
