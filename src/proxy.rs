@@ -3875,7 +3875,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             // written once, inside `exhausted_or_fallback`, so it
                             // holds for this arm and for the two below it rather
                             // than only for the arm somebody remembered.
-                            if manager.locked_account_name().is_some() {
+                            if manager.locked_account_for(provider).is_some() {
                                 return exhausted_or_fallback(
                                     &manager,
                                     now,
@@ -7274,7 +7274,7 @@ async fn exhausted_or_fallback(
     //
     // Checked HERE rather than at the three call sites: a terminal somebody
     // adds later gets the rule for free, and the rule has one spelling.
-    let locked = manager.locked_account_name().is_some();
+    let locked = manager.locked_account_for(provider).is_some();
     // `None` is a path this seam refused to build an `Ask` for at all, a
     // client-credential path, which no provider may be offered. See the arm at
     // `:2352`.

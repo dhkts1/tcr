@@ -167,7 +167,8 @@ impl Manager {
     /// mixed fleet answers an Anthropic request exactly as its Anthropic half alone would.
     ///
     /// Deleted slots never count: they cannot serve another request. Refresh the file's
-    /// account list before counting so a request sees a live delete before selection runs.
+    /// account list before counting so a request sees a completed live delete before selection
+    /// runs. An in-flight file writer is never waited on by the request path.
     pub fn provider_account_count(&self, provider: crate::provider::Provider) -> usize {
         self.reload_groups_if_changed();
         self.accounts
@@ -188,7 +189,7 @@ impl Manager {
         let unsupported = self.codex_accounts_with_unsupported_exit();
         let parked = self.parked_groups();
         let reserved = self.reserved_groups();
-        let locked = self.locked_account_name();
+        let locked = self.locked_account_for(crate::provider::Provider::Codex);
         self.accounts
             .read()
             .expect("accounts lock poisoned")
@@ -199,7 +200,7 @@ impl Manager {
                 crate::provider::Provider::Codex => {
                     !account.removed
                         && bound_to.is_none_or(|bound| bound == idx)
-                        && locked.as_ref().is_none_or(|name| name == &account.name)
+                        && locked.is_none_or(|locked_idx| locked_idx == idx)
                         && !account.disabled
                         && account.status != AccountStatus::Error
                         && !Self::parked_blocks(account, &parked)
@@ -207,6 +208,18 @@ impl Manager {
                         && !unsupported.contains(&idx)
                 }
             })
+    }
+
+    /// The live locked slot, when the lock belongs to this request's provider.
+    /// A lock never disables another provider's independent pool.
+    pub(crate) fn locked_account_for(&self, provider: crate::provider::Provider) -> Option<usize> {
+        let idx = self.locked_idx?;
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .filter(|account| !account.removed && account.provider == provider)
+            .map(|_| idx)
     }
 
     #[cfg(test)]

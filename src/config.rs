@@ -139,11 +139,11 @@ fn default_account_throttle() -> ThrottleConfig {
     }
 }
 
-/// Default fleet-wide ceiling: ON, and deliberately far looser than
+/// Default ceiling for each provider's fleet: ON, and deliberately far looser than
 /// [`default_account_throttle`].
 ///
 /// This is INSURANCE against a mechanism nobody here has measured: that something
-/// SHARED across the accounts (the source IP, the client_id) is rate-limited in
+/// SHARED across one provider's accounts (the source IP, the client_id) is rate-limited in
 /// addition to the per-organization limits. Whether such a limiter exists is
 /// genuinely unknown — see [`ThrottleConfig`]'s note on what the evidence does and
 /// does not show.
@@ -978,8 +978,8 @@ impl PacingConfig {
 pub struct ThrottleConfig {
     /// Steady-state emission interval T (ms): after the burst budget is spent, at
     /// most one upstream send is initiated per this many ms **within whatever this
-    /// bucket is keyed on** — one organization for `accountThrottle`, the whole
-    /// fleet for `fleetThrottle`.
+    /// bucket is keyed on** — one organization for `accountThrottle`, one
+    /// provider's fleet for `fleetThrottle`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_spacing_ms: Option<u64>,
     /// Bucket capacity B: how many sends may fire instantly after an idle period.
@@ -1143,8 +1143,9 @@ pub struct Config {
     /// `"accountThrottle": {}` to disable it (all knobs `None`). Read at boot.
     #[serde(default = "default_account_throttle")]
     pub account_throttle: ThrottleConfig,
-    /// Fleet-wide ceiling across every organization — insurance, not the primary
-    /// limiter. Absent → [`default_fleet_throttle`] (ON: `minSpacingMs: 100,
+    /// Ceiling across every organization of one provider — insurance, not the primary
+    /// limiter. Each provider has its own bucket, so Claude and Codex never pace
+    /// each other through this ceiling. Absent → [`default_fleet_throttle`] (ON: `minSpacingMs: 100,
     /// burst: 32`). Set `"fleetThrottle": {}` to disable it. Read at boot.
     ///
     /// Disabling BOTH is what the old `"throttle": {}` escape hatch used to mean.
@@ -1155,9 +1156,10 @@ pub struct Config {
     /// can preserve what the operator meant (see [`load`]).
     #[serde(default = "default_fleet_throttle")]
     pub fleet_throttle: ThrottleConfig,
-    /// Hard account lock: when set to an account `name`, ALL traffic is pinned to
-    /// that one account — LRU rotation, session affinity, and load-balancing
-    /// migration are ALL bypassed. Absent → normal routing (default). Tradeoff:
+    /// Hard account lock: when set to an account `name`, its provider's pooled
+    /// traffic is pinned to that exact account slot. The other provider rotates
+    /// normally. LRU rotation, session affinity, and load-balancing migration are
+    /// bypassed for the locked provider. Absent → normal routing (default). Tradeoff:
     /// a locked account has NO failover; if it is throttled/disabled/down, requests
     /// fail rather than rotating. Set to the exact `accounts[].name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

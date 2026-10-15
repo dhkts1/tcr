@@ -1216,11 +1216,10 @@ pub struct Manager {
     codex_unpooled: Mutex<MinuteRing>,
     /// The config file's mtime as of the last successful (or unmodified-since)
     /// [`Self::reload_groups_if_changed`] check. `None` before the first check.
-    /// Guarded by `config_write` at every access — see that lock's doc and
-    /// `reload_groups_if_changed`'s for why: this and the file read it gates
-    /// must move together, or two racing reload calls could both see a stale
-    /// `None`/old value and redundantly re-parse (harmless) or, worse, one
-    /// could advance it past a write the other hasn't applied yet.
+    /// Read under its own mutex for the unchanged-file fast path; advanced only
+    /// under `config_write` after applying a complete file snapshot. Reloads also
+    /// recheck it under that write guard, so racing checks cannot advance past an
+    /// edit another reload has not applied.
     groups_reload_mtime: Mutex<Option<std::time::SystemTime>>,
     /// Per-account request pacing knobs, snapshotted from the config at
     /// construction. Default (all `None`) → inert → selection is byte-identical to
@@ -1249,8 +1248,9 @@ pub struct Manager {
     /// no path ever runs the other way round.
     usage: crate::usage::UsageTracker,
     /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
-    /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
-    /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
+    /// or `None` when unlocked / the name did not match. For its own provider,
+    /// [`Self::select`] returns `i` (bypassing rotation/affinity/migration) with
+    /// no failover; the other provider's pool remains independent.
     locked_idx: Option<usize>,
     /// The resolved identity-bound control account (index of the account named
     /// by `config.controlAccount`), or `None` when unset / the name did not
@@ -1280,10 +1280,10 @@ pub struct Manager {
     /// Lock order: taken ALONE. [`Self::throttle_send`] releases this guard before
     /// touching [`Self::fleet_tat_ms`] — the two are never held together.
     org_tat_ms: AsyncMutex<HashMap<String, i64>>,
-    /// GCRA theoretical-arrival-time (epoch ms) for the fleet-wide ceiling. Same
-    /// discipline as [`Self::org_tat_ms`]: held only for the O(1) update, released
-    /// before any sleep.
-    fleet_tat_ms: AsyncMutex<i64>,
+    /// GCRA theoretical-arrival-times (epoch ms) for each provider's fleet ceiling.
+    /// Independent upstreams never spend one another's burst budget. Same discipline
+    /// as [`Self::org_tat_ms`]: held only for the O(1) update, released before sleep.
+    fleet_tat_ms: AsyncMutex<HashMap<crate::provider::Provider, i64>>,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
     /// The slot that most recently served each provider, as [`Self::current`] is for either:
@@ -1710,7 +1710,7 @@ impl Manager {
             locked_idx,
             control_idx: RwLock::new(control_idx),
             org_tat_ms: AsyncMutex::new(HashMap::new()),
-            fleet_tat_ms: AsyncMutex::new(0),
+            fleet_tat_ms: AsyncMutex::new(HashMap::new()),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
             current_by_provider: Mutex::new(crate::stats::CurrentByProvider::default()),
@@ -1742,7 +1742,7 @@ impl Manager {
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
             tracing::warn!(
                 account = %name, idx = i,
-                "ACCOUNT LOCK ACTIVE — all traffic pinned to one account; rotation/affinity/migration bypassed, no failover"
+                "ACCOUNT LOCK ACTIVE — this provider's traffic pinned to one account; rotation/affinity/migration bypassed, no failover"
             );
         }
 
@@ -2540,12 +2540,11 @@ impl Manager {
     /// those, or this would fight [`Self::persist_now`] / [`Self::persist_tokens`]
     /// / [`Self::persist_disabled`]'s read-modify-write of the SAME file.
     ///
-    /// Takes `config_write` (INV1, see that field's doc) across the mtime
-    /// check AND the file read/parse — the same discipline every writer of
-    /// this file already uses, so a reload can never straddle a concurrent
-    /// persist's write. [`config::write_atomic`]'s temp-file-then-rename
-    /// already rules out a torn read on its own; this keeps reload from being
-    /// the one reader that does not bother.
+    /// Checks the cached mtime before touching `config_write`. When a file change
+    /// needs reloading, takes that lock without waiting and checks mtime again under
+    /// the guard, keeping the same read/parse serialization as config writers.
+    /// Requests use the last completed snapshot during an in-flight write or fsync;
+    /// the next cadence check after the writer releases applies its completed edit.
     ///
     /// A file that cannot be stat'd, read, or parsed **keeps every current
     /// in-memory value** and logs a warning — never blanks the fleet's groups
@@ -2557,29 +2556,43 @@ impl Manager {
         let Some(path) = &self.config_path else {
             return;
         };
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
-        let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(m) => m,
+        let read_mtime = || match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => Some(mtime),
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     path = %path.display(),
                     "group reload: could not stat config file, keeping current groups"
                 );
-                return;
+                None
             }
         };
+        let Some(mtime) = read_mtime() else {
+            return;
+        };
+        if *self
+            .groups_reload_mtime
+            .lock()
+            .expect("groups reload mtime lock poisoned")
+            == Some(mtime)
         {
-            let last = self
-                .groups_reload_mtime
-                .lock()
-                .expect("groups reload mtime lock poisoned");
-            if *last == Some(mtime) {
-                return;
-            }
+            return;
+        }
+        let _writing = match self.config_write.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("config write lock poisoned"),
+        };
+        let Some(mtime) = read_mtime() else {
+            return;
+        };
+        if *self
+            .groups_reload_mtime
+            .lock()
+            .expect("groups reload mtime lock poisoned")
+            == Some(mtime)
+        {
+            return;
         }
         match config::load(path) {
             Ok(fresh) => {

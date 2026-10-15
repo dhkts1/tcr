@@ -408,31 +408,17 @@ impl Manager {
         self.select_with_group(tried, now, model, affinity, path, conn_key, None)
     }
 
-    /// Unsupported strict Codex exits, mapped by account name to stable runtime slots.
-    /// Config positions can shift after a delete, so they are never used as slot indices.
-    /// Each lock is released before the other is taken.
+    /// Unsupported strict Codex exits at their exact runtime slots. The manager's
+    /// cached config and runtime vectors are append-only and stay index-aligned;
+    /// deleting a file row marks its runtime slot removed rather than shifting it.
     pub(crate) fn codex_accounts_with_unsupported_exit(&self) -> HashSet<usize> {
-        let names: HashSet<String> = self
-            .config
+        self.config
             .lock()
             .expect("config lock poisoned")
             .accounts
             .iter()
-            .filter(|account| account.has_unsupported_strict_peer_exit())
-            .map(|account| account.name.clone())
-            .collect();
-        if names.is_empty() {
-            return HashSet::new();
-        }
-        self.accounts
-            .read()
-            .expect("accounts lock poisoned")
-            .iter()
             .enumerate()
-            .filter(|(_, account)| match account.provider {
-                crate::provider::Provider::Anthropic => false,
-                crate::provider::Provider::Codex => names.contains(&account.name),
-            })
+            .filter(|(_, account)| account.has_unsupported_strict_peer_exit())
             .map(|(idx, _)| idx)
             .collect()
     }
@@ -570,7 +556,7 @@ impl Manager {
         let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
         let tried = filtered_tried.as_ref();
 
-        // Hard account lock: pin ALL traffic to the configured account, bypassing
+        // Hard account lock: pin its provider's traffic to the configured account, bypassing
         // rotation/affinity/migration. `tried` still ends the rotation loop, once the
         // locked account has failed this request, return None (no failover to the pool).
         //
@@ -594,34 +580,13 @@ impl Manager {
         // satisfies both, and the honest answer is the one a strict ask is
         // always owed. The caller's next rung is the 429 it already has.
         //
-        // # A LOCK NEVER CROSSES PROVIDERS
+        // # A LOCK ONLY BINDS ITS OWN PROVIDER
         //
-        // Refused for the same reason: the lock names one account, that account
-        // belongs to one provider, and a request of the other provider has no
-        // account that is both. Serving it would hand the request a credential
-        // its own upstream does not know.
+        // The other upstream keeps its own independent pool; it must never be
+        // disabled by this lock or receive the locked account's credential.
         //
-        // A locked account deleted from the config is no lock at all: the next
-        // boot resolves `lockAccount` to nothing and rotates normally, so this
-        // process does the same now rather than serve a deleted account. That
-        // is decided first, so a deleted lock rotates either provider's request
-        // and only a live one refuses the other provider's.
-        let locked = self.locked_idx.filter(|&li| {
-            !self
-                .accounts
-                .read()
-                .expect("accounts lock poisoned")
-                .get(li)
-                .is_some_and(|a| a.removed)
-        });
-        if let Some(li) = locked {
-            let same_provider = {
-                let accounts = self.accounts.read().expect("accounts lock poisoned");
-                accounts.get(li).is_some_and(|a| a.provider == provider)
-            };
-            if !same_provider {
-                return None;
-            }
+        // A deleted lock no longer restricts either provider.
+        if let Some(li) = self.locked_account_for(provider) {
             if let Some(g) = strict_group {
                 let in_group = {
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
@@ -5745,14 +5710,8 @@ mod provider_filter_tests {
         );
     }
 
-    /// **THE HARD LOCK'S DOOR.** `lockAccount` returns its account without
-    /// asking `eligible`, so the provider has to be asked there too. A lock
-    /// means "this account and no other"; a request of the other provider has
-    /// no account that satisfies both, so it is refused, exactly like the
-    /// strict-group refusal beside it.
-    ///
-    /// Watched red: delete the lock arm's provider check and the Anthropic
-    /// request is served on the locked Codex account.
+    /// A hard lock constrains its own provider only. The other provider still
+    /// selects from its own pool and never receives the locked credential.
     #[test]
     fn a_hard_account_lock_never_serves_the_other_provider() {
         let mut config = config_with(vec![codex("alice@example.com"), account("bob@example.com")]);
@@ -5761,8 +5720,8 @@ mod provider_filter_tests {
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, ANTHROPIC_PATH, None),
-            None,
-            "a lock on a Codex account must never serve an Anthropic request"
+            Some(1),
+            "a Codex lock must leave the Anthropic pool available"
         );
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None),
@@ -5771,13 +5730,8 @@ mod provider_filter_tests {
         );
     }
 
-    /// The lock's door in the other direction: a lock on an ANTHROPIC account
-    /// refuses a Codex request. The check compares the locked row's provider
-    /// with the request's, so neither direction is special-cased; this pins
-    /// the half the test above does not reach.
-    ///
-    /// Watched red: delete the lock arm's provider check and the Codex request
-    /// is served on the locked Anthropic account (`Some(0)`).
+    /// A Claude lock leaves Codex selection independent, while its own
+    /// provider continues to use the exact locked slot.
     #[test]
     fn a_hard_account_lock_on_an_anthropic_account_never_serves_a_codex_request() {
         let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
@@ -5786,14 +5740,251 @@ mod provider_filter_tests {
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None),
-            None,
-            "a lock on an Anthropic account must never serve a Codex request"
+            Some(1),
+            "a Claude lock must leave the Codex pool available"
         );
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, ANTHROPIC_PATH, None),
             Some(0),
             "the lock still holds for its own provider's requests"
         );
+    }
+
+    #[test]
+    fn provider_isolation_claude_lock_does_not_hide_codex_capacity() {
+        let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+        config.lock_account = Some("alice@example.com".into());
+        let manager = build(config);
+        assert!(manager.codex_account_can_serve_eventually(None));
+        assert!(manager.codex_account_can_serve_eventually(Some(1)));
+        assert!(!manager.codex_account_can_serve_eventually(Some(0)));
+        assert_eq!(
+            manager.select(
+                &HashSet::from([0]),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                ANTHROPIC_PATH,
+                None
+            ),
+            None,
+            "the lock still prevents failover within its own provider"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_codex_lock_uses_its_slot_not_a_shared_name() {
+        let mut config = config_with(vec![
+            Account {
+                disabled: Some(true),
+                account_uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+                ..codex("alice@example.com")
+            },
+            Account {
+                account_uuid: Some("22222222-2222-2222-2222-222222222222".into()),
+                ..codex("alice@example.com")
+            },
+        ]);
+        config.lock_account = Some("alice@example.com".into());
+        let manager = build(config);
+        assert!(
+            !manager.codex_account_can_serve_eventually(None),
+            "a healthy same-named row is not the locked slot"
+        );
+        assert!(!manager.codex_account_can_serve_eventually(Some(1)));
+        assert_eq!(
+            manager.select(
+                &HashSet::from([0]),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                CODEX_PATH,
+                None
+            ),
+            None,
+            "a failed locked slot never falls through to its same-named sibling"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_unsupported_exit_excludes_only_its_exact_slot() {
+        let manager = build(config_with(vec![
+            Account {
+                account_uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+                egress: crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32])),
+                egress_strict: true,
+                ..codex("alice@example.com")
+            },
+            Account {
+                account_uuid: Some("22222222-2222-2222-2222-222222222222".into()),
+                ..codex("alice@example.com")
+            },
+        ]));
+        let now = OffsetDateTime::now_utc();
+        pin(&manager, 77, 1, odt_to_ms(now));
+        assert_eq!(
+            manager.codex_accounts_with_unsupported_exit(),
+            HashSet::from([0])
+        );
+        assert!(manager.codex_account_can_serve_eventually(Some(1)));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(77), CODEX_PATH, None),
+            Some(1)
+        );
+        assert_eq!(
+            pin_of(&manager, 77),
+            Some(1),
+            "the healthy same-named account keeps its pin"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_request_reads_do_not_wait_for_a_config_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
+        let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+        config.proxy.port = 9;
+        crate::config::save(&path, &config).unwrap();
+        let manager = Manager::new(
+            config.clone(),
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            Some(path.clone()),
+        );
+        assert_eq!(manager.provider_account_count(Provider::Anthropic), 1);
+        let writing = manager.config_write.lock().unwrap();
+        config.accounts.remove(0);
+        crate::config::save(&path, &config).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let count = worker_manager.provider_account_count(Provider::Anthropic);
+            let selected = worker_manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                ANTHROPIC_PATH,
+                None,
+            );
+            let codex_available = worker_manager.codex_account_can_serve_eventually(None);
+            done_tx.send((count, selected, codex_available)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let result = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(writing);
+        worker.join().unwrap();
+        assert_eq!(
+            result.expect("request reads must use cached state during an in-flight config write"),
+            (1, Some(0), true)
+        );
+        assert_eq!(
+            manager.provider_account_count(Provider::Anthropic),
+            0,
+            "the completed delete is reloaded on the next request"
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                ANTHROPIC_PATH,
+                None
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_isolation_fleet_throttle_does_not_pace_the_other_upstream() {
+        for first in [Provider::Anthropic, Provider::Codex] {
+            let mut config =
+                config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+            config.fleet_throttle = ThrottleConfig {
+                min_spacing_ms: Some(60_000),
+                burst: Some(1),
+            };
+            let manager = build(config);
+            let first_idx = match first {
+                Provider::Anthropic => 0,
+                Provider::Codex => 1,
+            };
+            let second_idx = 1 - first_idx;
+            let paths = [ANTHROPIC_PATH, CODEX_PATH];
+            manager.throttle_send(paths[first_idx], first_idx).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                manager.throttle_send(paths[second_idx], second_idx),
+            )
+            .await
+            .expect("the other provider has its own fleet burst");
+            for idx in [first_idx, second_idx] {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        manager.throttle_send(paths[idx], idx)
+                    )
+                    .await
+                    .is_err(),
+                    "same-provider requests still consume the fleet throttle"
+                );
+            }
+        }
+    }
+
+    async fn assert_org_throttle_is_provider_scoped(org_uuid: Option<&str>) {
+        for first_idx in [0, 1] {
+            let mut accounts = vec![
+                account("alice@example.com"),
+                codex("bob@example.com"),
+                account("carol@example.com"),
+                codex("dave@example.com"),
+            ];
+            for account in &mut accounts {
+                account.org_uuid = org_uuid.map(str::to_string);
+                account.org_name = Some("Example Org".into());
+            }
+            let mut config = config_with(accounts);
+            config.account_throttle = ThrottleConfig {
+                min_spacing_ms: Some(60_000),
+                burst: Some(1),
+            };
+            let manager = build(config);
+            let second_idx = 1 - first_idx;
+            let paths = [ANTHROPIC_PATH, CODEX_PATH];
+            manager.throttle_send(paths[first_idx], first_idx).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                manager.throttle_send(paths[second_idx], second_idx),
+            )
+            .await
+            .expect("equal organization identities on different providers have independent bursts");
+            for idx in [first_idx, second_idx] {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        manager.throttle_send(paths[idx], idx + 2)
+                    )
+                    .await
+                    .is_err(),
+                    "accounts in one organization on the same provider still share its throttle"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_isolation_org_throttle_uuid_does_not_pace_the_other_upstream() {
+        assert_org_throttle_is_provider_scoped(Some("11111111-1111-1111-1111-111111111111")).await;
+    }
+
+    #[tokio::test]
+    async fn provider_isolation_org_throttle_name_does_not_pace_the_other_upstream() {
+        assert_org_throttle_is_provider_scoped(None).await;
     }
 
     /// **A SESSION'S PIN NEVER CROSSES PROVIDERS.** The affinity fast path
