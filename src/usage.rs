@@ -1260,7 +1260,10 @@ impl UsageTracker {
         // replays the eight UTC files its lines can be in (today and the seven before it), oldest
         // first, and never prunes one of them. A Claude-only fleet replays yesterday and today and
         // prunes as it always has.
-        let holds_codex = accounts.iter().any(|a| a.provider == Provider::Codex);
+        let holds_codex = accounts.iter().any(|a| match a.provider {
+            Provider::Anthropic => false,
+            Provider::Codex => true,
+        });
         let days_back: i64 = if holds_codex { 7 } else { 1 };
         for back in (0..=days_back).rev() {
             let date = ledger_date(now_ms - back * 86_400_000);

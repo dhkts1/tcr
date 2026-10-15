@@ -320,10 +320,11 @@ impl Manager {
                     // still streaming, or one that reported no usage, is a request no price
                     // covers, and a session nothing was priced for always reads at least as
                     // many unpriced requests as requests, the rule TcrBar draws no dollars by.
-                    unpriced_requests: if s.provider.is_anthropic() {
-                        0
-                    } else {
-                        unpriced.max(s.requests.saturating_sub(priced))
+                    unpriced_requests: match s.provider {
+                        crate::provider::Provider::Anthropic => 0,
+                        crate::provider::Provider::Codex => {
+                            unpriced.max(s.requests.saturating_sub(priced))
+                        }
                     },
                     reasoning_tokens: s.reasoning_tokens,
                 }

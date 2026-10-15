@@ -1266,7 +1266,10 @@ fn render_accounts_with(
     let order = display_order(snapshot);
     let first_codex = order
         .iter()
-        .position(|&pos| snapshot.accounts[pos].provider == Provider::Codex)
+        .position(|&pos| match snapshot.accounts[pos].provider {
+            Provider::Anthropic => false,
+            Provider::Codex => true,
+        })
         .unwrap_or(order.len());
     let (claude, codex) = order.split_at(first_codex);
     let under_cursor = key_target(&order, selected).map(|pos| &snapshot.accounts[pos]);
@@ -1306,7 +1309,10 @@ fn render_accounts_with(
         area.height.saturating_sub(MIXED_ACCOUNTS_CHROME),
         claude.len() as u16,
         codex.len() as u16,
-        under_cursor.is_some_and(|account| account.provider == Provider::Codex),
+        under_cursor.is_some_and(|account| match account.provider {
+            Provider::Anthropic => false,
+            Provider::Codex => true,
+        }),
     );
     // The Claude section takes its title, the header and its rows; the Codex section takes
     // the rest of the pane, so its bottom border is the pane's.
