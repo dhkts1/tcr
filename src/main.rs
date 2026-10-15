@@ -9113,6 +9113,48 @@ mod tests {
         }
     }
 
+    /// The command `tcr doctor`'s pooled Codex verdict names parses, in the sentence for one
+    /// request and in the one for several.
+    #[test]
+    fn the_pooled_codex_verdict_names_a_command_that_parses() {
+        for requests in [1, 2] {
+            let verdict = teamclaude_rs::doctor::CodexReport {
+                port: 3999,
+                rows: Vec::new(),
+                route: tcr_status_wire::CodexRoute {
+                    pooled: true,
+                    code: None,
+                    reason: None,
+                    upstream: None,
+                },
+                ca: PathBuf::from("/Users/example/.config/tcr-ca.pem"),
+                ca_readable: true,
+                upstream: "https://chatgpt.com".to_string(),
+                upstream_is_default: true,
+                bin: Ok((PathBuf::from("/opt/homebrew/bin/codex"), "PATH".to_string())),
+                env: teamclaude_rs::doctor::CodexEnv::default(),
+                login: PathBuf::from("/Users/example/.codex/auth.json"),
+                login_exists: true,
+                requests_10m: Some(requests),
+                traffic: None,
+            }
+            .verdict();
+            let commands: Vec<&str> = verdict
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("tcr "))
+                .collect();
+            assert!(!commands.is_empty(), "names no tcr command: {verdict}");
+            for command in commands {
+                let argv: Vec<&str> = command.split_whitespace().collect();
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    panic!("the verdict names `{command}`, which does not parse: {e}");
+                }
+            }
+        }
+    }
+
     /// `tcr login --help` carries `--codex` as a whole token, beside the tokens TcrBar already
     /// probes for: `LoginCapability` decides between the in-app Codex sign-in and Terminal by
     /// finding it, so a help that renamed it would silently send every Codex sign-in to

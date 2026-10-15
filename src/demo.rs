@@ -192,7 +192,8 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     backup.last_probe_ms = Some(ago_ms(45));
 
     // bob@example.com/codex — ChatGPT Pro, whose plan has the weekly window only, so
-    // its 5h cell reads `none`. The account serving Codex (the Codex section's ▶).
+    // its 5h cell reads `none`. The account serving Codex (the Codex section's ▶), in use
+    // as its seven-request session and its log line from a second ago say it is.
     let mut codex_bob = codex(
         "bob@example.com/codex",
         "pro",
@@ -202,6 +203,10 @@ fn demo_accounts() -> Vec<AccountRuntime> {
         },
     );
     codex_bob.quota.seven_day = Some(seven_day(0.34));
+    codex_bob.requests = 140;
+    codex_bob.input_tokens = 2_900_000;
+    codex_bob.output_tokens = 120_000;
+    codex_bob.last_used_ms = Some(ago_ms(1));
 
     // dana — ChatGPT Plus, with both windows.
     let mut dana = codex(
@@ -430,6 +435,40 @@ mod tests {
         assert_eq!(
             snapshot.serving(Provider::Codex),
             Some(position("bob@example.com/codex"))
+        );
+    }
+
+    /// The account serving Codex in the demo reads as in use, as its seven-request session and
+    /// its log line from a second ago say it is: at least its session's requests, tokens of its
+    /// own, and a last use a second ago, not the idle zeros of an account nothing touched.
+    ///
+    /// Watched red: bob's Codex row reads 0 requests and no last-used time.
+    #[test]
+    fn the_demo_codex_account_in_use_reads_as_used() {
+        let now = OffsetDateTime::now_utc();
+        let snapshot = demo_manager().snapshot(now);
+        let bob = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.name == "bob@example.com/codex")
+            .expect("the demo seeds bob's Codex account");
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|s| s.provider == Provider::Codex)
+            .expect("bob's Codex session");
+        assert!(
+            bob.requests >= session.requests,
+            "the account served at least its session's {} requests, not {}",
+            session.requests,
+            bob.requests
+        );
+        assert!(bob.input_tokens > 0 && bob.output_tokens > 0);
+        let last_used = bob.last_used.expect("a last-used time");
+        assert!(
+            now - last_used < Duration::seconds(5),
+            "last used a second ago, not {}",
+            now - last_used
         );
     }
 }

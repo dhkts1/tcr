@@ -848,10 +848,11 @@ impl CodexReport {
     /// and why, in the words `tcr run --codex` and `tcr status` use for the same decision.
     pub fn verdict(&self) -> String {
         if self.route.pooled {
+            let requests = self.requests_10m.unwrap_or(0);
+            let noun = if requests == 1 { "request" } else { "requests" };
             return format!(
                 "codex is pooled: `tcr run --codex` routes chatgpt.com through this proxy, which \
-                 served {} Codex requests in the last {REQUEST_WINDOW_MINUTES} min",
-                self.requests_10m.unwrap_or(0)
+                 served {requests} Codex {noun} in the last {REQUEST_WINDOW_MINUTES} min"
             );
         }
         format!(
@@ -2321,6 +2322,35 @@ mod tests {
             ..codex_report(pooled())
         };
         assert!(offline.problems().is_empty(), "{:?}", offline.problems());
+    }
+
+    /// The pooled verdict counts its requests in the right number: one Codex request reads
+    /// `1 Codex request`, and any other count, none included, reads `requests`.
+    ///
+    /// Watched red: with the noun always plural, one request reads `1 Codex requests`.
+    #[test]
+    fn the_pooled_verdict_says_one_request_in_the_singular() {
+        let verdict = |requests: u64| {
+            CodexReport {
+                requests_10m: Some(requests),
+                ..codex_report(pooled())
+            }
+            .verdict()
+        };
+        assert_eq!(
+            verdict(1),
+            "codex is pooled: `tcr run --codex` routes chatgpt.com through this proxy, which \
+             served 1 Codex request in the last 10 min"
+        );
+        for requests in [0, 2] {
+            assert!(
+                verdict(requests).ends_with(&format!(
+                    "served {requests} Codex requests in the last 10 min"
+                )),
+                "{}",
+                verdict(requests)
+            );
+        }
     }
 
     /// The Codex verdict reuses the doctor's exit codes: 0 pooled, 2 when codex would not be
