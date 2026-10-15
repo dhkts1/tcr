@@ -1281,7 +1281,7 @@ fn a_failed_codex_login_reports_its_folder_cleanup_failure_too() {
         .arg(&scratch.config)
         .output()
         .unwrap();
-    let folder = PathBuf::from(scratch.homes().remove(0));
+    let folder = scratch.homes().remove(0);
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
