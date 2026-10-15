@@ -57,6 +57,44 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A command's default files belong to its fixture, including the node key a
+/// join loads separately from `--peers`. Reusing this home within one fixture
+/// preserves its identity without sharing files with another test.
+fn tcr_command(home: &std::path::Path) -> std::process::Command {
+    let config_dir = home.join(".config");
+    let codex_home = home.join("codex");
+    std::fs::create_dir_all(&config_dir).expect("create the fixture's config directory");
+    std::fs::create_dir_all(&codex_home).expect("create the fixture's Codex directory");
+    let default_config = config_dir.join("teamclaude.json");
+    if !default_config.exists() {
+        std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
+            .expect("write the fixture's offline default config");
+    }
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .env("HOME", home)
+        .env("CFFIXED_USER_HOME", home)
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("CODEX_HOME", &codex_home)
+        .env("TCR_CODEX_AUTH", codex_home.join("auth.json"))
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("claude-credentials.json"),
+        );
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// One Mac's files: a peers file at 0600, a state file beside it, and a node
 /// key in the same directory.
 struct Node {
@@ -1948,7 +1986,7 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
     let rendered = token.to_token();
     let secret_field = tcr_peer_wire::encode_key32(&token.secret);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let mut child = tcr_command(&dir.join("cli-home"))
         .args([
             "peer",
             "join",
@@ -2034,17 +2072,61 @@ fn the_stdin_reader_takes_one_line_and_refuses_an_empty_one() {
 fn run_tcr(peers: &std::path::Path, args: &[&str]) -> (String, String, bool) {
     let mut full = vec!["peer"];
     full.extend_from_slice(args);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
-        .arg("peer")
-        .args(args)
-        .args(["--peers", peers.to_str().expect("a utf-8 path")])
-        .output()
-        .unwrap_or_else(|err| panic!("spawn tcr {full:?}: {err}"));
+    let output = tcr_command(
+        &peers
+            .parent()
+            .expect("the peers fixture has a directory")
+            .join("cli-home"),
+    )
+    .arg("peer")
+    .args(args)
+    .args(["--peers", peers.to_str().expect("a utf-8 path")])
+    .output()
+    .unwrap_or_else(|err| panic!("spawn tcr {full:?}: {err}"));
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
         output.status.success(),
     )
+}
+
+#[test]
+fn peer_commands_keep_their_node_keys_in_separate_fixture_homes() {
+    let first = scratch("first-cli-home");
+    let second = scratch("second-cli-home");
+    let token = pair::JoinToken::new(
+        vec!["127.0.0.1:1".parse().expect("a loopback address")],
+        PeerId([0x88; 32]),
+        [0x99; 32],
+    )
+    .to_token();
+    let join = |dir: &std::path::Path| {
+        let peers = dir.join("tcr-peers.json");
+        config::save(&peers, &PeerFile::default()).expect("write the peers file");
+        let (out, err, ok) = run_tcr(&peers, &["join", &token]);
+        assert!(
+            !ok,
+            "the deliberately closed registrar must refuse: {out}{err}"
+        );
+        assert!(
+            err.contains("127.0.0.1:1"),
+            "the command must reach the fixture's registrar address: {out}{err}"
+        );
+        std::fs::read(dir.join("cli-home/.config/tcr-node.pub"))
+            .expect("the node key must stay inside this fixture's temporary HOME")
+    };
+
+    let first_key = join(&first);
+    assert_eq!(
+        join(&first),
+        first_key,
+        "one fixture keeps its node identity"
+    );
+    assert_ne!(
+        join(&second),
+        first_key,
+        "separate fixtures have separate node identities"
+    );
 }
 
 /// **The five approval verbs work on a real pending row, and `ls --json`
@@ -2627,7 +2709,7 @@ async fn a_stalled_knock_after_message_1_is_bounded_and_releases_its_reservation
 /// comment.
 #[test]
 fn the_announce_name_help_says_it_is_off_by_default() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_command(&scratch("announce-name-help-home"))
         .args(["peer", "find", "--help"])
         .output()
         .expect("spawn tcr peer find --help");
@@ -3196,10 +3278,20 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
 
 /// Run the `tcr` this build produced, against one Mac's files.
 fn tcr(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
-        .args(args)
-        .output()
-        .expect("the tcr this build produced runs")
+    let peers = args
+        .windows(2)
+        .find(|pair| pair[0] == "--peers")
+        .map(|pair| std::path::Path::new(pair[1]))
+        .expect("every peer command must name its fixture's peers file");
+    tcr_command(
+        &peers
+            .parent()
+            .expect("the peers fixture has a directory")
+            .join("cli-home"),
+    )
+    .args(args)
+    .output()
+    .expect("the tcr this build produced runs")
 }
 
 /// **A join link carrying a network key does not replace one this Mac already
@@ -4463,10 +4555,9 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     // invite` loads this node's keypair from the config directory and a test
     // may not read or write the operator's real one.
     let home = scratch("invite-cli-home");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_command(&home)
         .args(["peer", "invite", "--label", "laptop-2"])
         .args(["--peers", node.peers.to_str().expect("a utf-8 path")])
-        .env("HOME", &home)
         .output()
         .expect("spawn tcr peer invite");
     let out = String::from_utf8_lossy(&output.stdout).to_string();
@@ -4524,10 +4615,9 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
     friend.write_file(&friend_file);
     let friend_home = scratch("sealed-friend-home");
 
-    let mint = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let mint = tcr_command(&inviter_home)
         .args(["peer", "invite", "--sealed"])
         .args(["--peers", inviter.peers.to_str().expect("a utf-8 path")])
-        .env("HOME", &inviter_home)
         .output()
         .expect("spawn tcr peer invite --sealed");
     let mint_out = String::from_utf8_lossy(&mint.stdout).to_string();
@@ -4546,10 +4636,9 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
         "an ask names no address at a glance: {ask_line}"
     );
 
-    let mut answer = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let mut answer = tcr_command(&friend_home)
         .args(["peer", "join", "--stdin"])
         .args(["--peers", friend.peers.to_str().expect("a utf-8 path")])
-        .env("HOME", &friend_home)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4579,10 +4668,9 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
         "a reply names no address at a glance either: {reply_line}"
     );
 
-    let mut open = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let mut open = tcr_command(&inviter_home)
         .args(["peer", "invite", "--reply", "--stdin"])
         .args(["--peers", inviter.peers.to_str().expect("a utf-8 path")])
-        .env("HOME", &inviter_home)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4629,10 +4717,9 @@ fn tcr_peer_invite_plain_mints_the_readable_key() {
     node.write_file(&file);
 
     let home = scratch("invite-cli-plain-home");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let output = tcr_command(&home)
         .args(["peer", "invite", "--label", "laptop-2", "--plain"])
         .args(["--peers", node.peers.to_str().expect("a utf-8 path")])
-        .env("HOME", &home)
         .output()
         .expect("spawn tcr peer invite --plain");
     let out = String::from_utf8_lossy(&output.stdout).to_string();

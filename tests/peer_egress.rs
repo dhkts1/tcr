@@ -2398,7 +2398,42 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
 
 /// `tcr peer <args>` out of this build, never the installed binary.
 fn run_tcr_peer(peers: &std::path::Path, args: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let home = peers
+        .parent()
+        .expect("the peers fixture has a directory")
+        .join("cli-home");
+    let config_dir = home.join(".config");
+    let codex_home = home.join("codex");
+    std::fs::create_dir_all(&config_dir).expect("create the fixture's config directory");
+    std::fs::create_dir_all(&codex_home).expect("create the fixture's Codex directory");
+    let default_config = config_dir.join("teamclaude.json");
+    if !default_config.exists() {
+        std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
+            .expect("write the fixture's offline default config");
+    }
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .env("HOME", &home)
+        .env("CFFIXED_USER_HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("CODEX_HOME", &codex_home)
+        .env("TCR_CODEX_AUTH", codex_home.join("auth.json"))
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("claude-credentials.json"),
+        );
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    let output = command
         .arg("peer")
         .args(args)
         .arg("--peers")
