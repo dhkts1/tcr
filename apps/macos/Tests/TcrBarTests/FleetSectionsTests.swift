@@ -798,6 +798,20 @@ extension FleetSectionsTests {
         }
     }
 
+    /// The tab strip is drawn straight after the panel header and before the summary
+    /// block. Every tab's summary is a different height, so a strip drawn after it moved
+    /// by up to 33 pt on each tab switch (2026-10-16).
+    func testTheTabStripSitsAboveEveryTabsSummary() throws {
+        let panel = try viewCode("PanelV4/PanelV4.swift")
+        let header = try XCTUnwrap(panel.range(of: squashed("PanelHeader(title:")))
+        let tabs = try XCTUnwrap(panel.range(of: squashed("SegmentedTabs(")))
+        let summary = try XCTUnwrap(panel.range(of: squashed("summary()")))
+        XCTAssertLessThan(header.lowerBound, tabs.lowerBound, "the tabs moved above the header")
+        XCTAssertLessThan(
+            tabs.lowerBound, summary.lowerBound,
+            "the summary is drawn above the tabs again, so they move with its height")
+    }
+
     /// The code of `relative`, under apps/macos/Sources/TcrBar: comment lines dropped, then
     /// every whitespace character removed.
     private func viewCode(_ relative: String) throws -> String {
