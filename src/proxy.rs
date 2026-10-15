@@ -47,6 +47,7 @@ use bytes::Bytes;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::Value;
+use tcr_status_wire::CodexRefusalKind;
 use time::OffsetDateTime;
 
 use crate::bound_tokens::BoundTokenKind;
@@ -5458,6 +5459,33 @@ pub(crate) fn build_codex_upstream_headers(
     out
 }
 
+/// The common Codex error envelope, with its type and code drawn from one refusal kind.
+fn codex_error_body(kind: CodexRefusalKind, message: impl Into<String>) -> Value {
+    serde_json::json!({
+        "error": {
+            "type": kind.error_type(),
+            "code": kind,
+            "message": message.into(),
+        }
+    })
+}
+
+/// Every tcr-generated Codex refusal uses the same JSON response headers. Only a refusal
+/// that waiting can end carries a retry hint; the body keeps its own provider-specific detail.
+fn codex_error_response(status: StatusCode, body: String, retry_after: Option<i64>) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(seconds) = retry_after {
+        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+            response.headers_mut().insert("retry-after", value);
+        }
+    }
+    response
+}
+
 /// The 429 body a Codex client gets when the pool is out on a quota
 /// ([`codex_limit_is_quota`]: the gate that times the wait is a five-hour or weekly window or a
 /// refusal, or, with no gate timing it, every account out is out on one of those), which is the
@@ -5492,20 +5520,17 @@ pub(crate) fn codex_exhausted_body(
             "No pooled Codex account can take this request now, and none reports when it frees; retry in {resets_in_seconds} seconds."
         )
     };
-    let mut error = serde_json::json!({
-        "type": "usage_limit_reached",
-        "code": "usage_limit_reached",
-        "message": message,
-        "resets_in_seconds": resets_in_seconds,
-        "plan_type": serde_json::Value::Null
-    });
+    let mut body = codex_error_body(CodexRefusalKind::UsageLimitReached, message);
+    let error = &mut body["error"];
+    error["resets_in_seconds"] = resets_in_seconds.into();
+    error["plan_type"] = Value::Null;
     if reset_measured {
         error["resets_at"] = now
             .unix_timestamp()
             .saturating_add(i64::try_from(resets_in_seconds).unwrap_or(i64::MAX))
             .into();
     }
-    serde_json::json!({ "error": error }).to_string()
+    body.to_string()
 }
 
 /// Is the pool out on a QUOTA, so that its 429 may tell a Codex client its usage limit is
@@ -5554,15 +5579,9 @@ pub(crate) fn codex_pool_unavailable_body(wait_secs: u64, wait_measured: bool) -
             "No pooled Codex account can serve this request right now, and none reports when it frees; retry in {wait_secs} seconds."
         )
     };
-    serde_json::json!({
-        "error": {
-            "type": "pool_unavailable",
-            "code": "pool_unavailable",
-            "message": message,
-            "resets_in_seconds": wait_secs
-        }
-    })
-    .to_string()
+    let mut body = codex_error_body(CodexRefusalKind::PoolUnavailable, message);
+    body["error"]["resets_in_seconds"] = wait_secs.into();
+    body.to_string()
 }
 
 /// The 429 body a Codex client gets when the fleet has NO Codex account at all, which
@@ -5574,13 +5593,10 @@ pub(crate) fn codex_pool_unavailable_body(wait_secs: u64, wait_measured: bool) -
 /// not print this message. The message, which names the fix, is for a person reading the raw
 /// body; the operator learns the cause from the warn line in [`exhausted_response`].
 pub(crate) fn codex_no_account_body() -> String {
-    serde_json::json!({
-        "error": {
-            "type": "no_codex_account",
-            "code": "no_codex_account",
-            "message": "No Codex account is configured in tcr; run `tcr login --codex` to add one."
-        }
-    })
+    codex_error_body(
+        CodexRefusalKind::NoCodexAccount,
+        "No Codex account is configured in tcr; run `tcr login --codex` to add one.",
+    )
     .to_string()
 }
 
@@ -7139,13 +7155,8 @@ fn exhausted_response(
             "returning 429 to a Codex client: no Codex account is configured; add one with \
              `tcr login --codex`"
         );
-        manager.note_codex_refusal("no_codex_account", now_ms);
-        let mut response = Response::new(Body::from(codex_no_account_body()));
-        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        return response;
+        manager.note_codex_refusal(CodexRefusalKind::NoCodexAccount, now_ms);
+        return codex_error_response(StatusCode::TOO_MANY_REQUESTS, codex_no_account_body(), None);
     }
     // Bound history is the narrowest scope there is — one account — so it wins over a group.
     let hint = match bound_to {
@@ -7170,24 +7181,20 @@ fn exhausted_response(
         let (body, error_type) = if usage_limit {
             (
                 codex_exhausted_body(now, real_wait_secs, hint.free_at.is_some()),
-                "usage_limit_reached",
+                CodexRefusalKind::UsageLimitReached,
             )
         } else {
             (
                 codex_pool_unavailable_body(real_wait_secs, hint.free_at.is_some()),
-                "pool_unavailable",
+                CodexRefusalKind::PoolUnavailable,
             )
         };
         manager.note_codex_refusal(error_type, now_ms);
-        let mut response = Response::new(Body::from(body));
-        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Ok(value) = HeaderValue::from_str(&advertised_retry_after.to_string()) {
-            response.headers_mut().insert("retry-after", value);
-        }
-        return response;
+        return codex_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            body,
+            Some(advertised_retry_after),
+        );
     }
     let causes = describe_gates(&hint.gated);
     let when = match hint.free_at {
@@ -7438,9 +7445,16 @@ fn gate_phrase(reason: GateReason) -> &'static str {
 /// `: 3 in the 5-hour window, 1 on an upstream hold` — or empty when nothing is
 /// gated, so the message never ends in a dangling colon.
 pub fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
+    describe_gates_with(gated, gate_phrase)
+}
+
+fn describe_gates_with(
+    gated: &std::collections::BTreeMap<GateReason, usize>,
+    phrase: fn(GateReason) -> &'static str,
+) -> String {
     let parts: Vec<String> = gated
         .iter()
-        .map(|(reason, n)| format!("{n} {}", gate_phrase(*reason)))
+        .map(|(reason, n)| format!("{n} {}", phrase(*reason)))
         .collect();
     if parts.is_empty() {
         String::new()
@@ -7464,15 +7478,7 @@ fn codex_gate_phrase(reason: GateReason) -> &'static str {
 /// [`describe_gates`] in [`codex_gate_phrase`]'s words, for a tally of Codex accounts:
 /// `: 1 in the weekly window, 1 needing re-login`, or empty when nothing is gated.
 pub fn describe_codex_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
-    let parts: Vec<String> = gated
-        .iter()
-        .map(|(reason, n)| format!("{n} {}", codex_gate_phrase(*reason)))
-        .collect();
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", parts.join(", "))
-    }
+    describe_gates_with(gated, codex_gate_phrase)
 }
 
 /// `HH:MM:SS UTC` for a message a human reads next to a seconds count, with the date in front
@@ -7681,19 +7687,11 @@ fn codex_credential_refused_response(refused: &[(usize, Option<String>)]) -> Res
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let body = serde_json::json!({
-        "error": {
-            "type": "proxy_error",
-            "code": "credential_refused",
-            "message": message,
-        }
-    });
-    let mut response = Response::new(Body::from(body.to_string()));
-    *response.status_mut() = StatusCode::FORBIDDEN;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
+    codex_error_response(
+        StatusCode::FORBIDDEN,
+        codex_error_body(CodexRefusalKind::CredentialRefused, message).to_string(),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -22073,9 +22071,76 @@ mod tests {
     }
 
     /// The refused count and the latest refusal's type, as `tcr status` will read them.
-    fn refusals(manager: &Manager) -> (u64, Option<String>) {
+    fn refusals(manager: &Manager) -> (u64, Option<CodexRefusalKind>) {
         let traffic = manager.codex_traffic(crate::now_ms());
         (traffic.refused_10m, traffic.last_refusal)
+    }
+
+    #[tokio::test]
+    async fn codex_error_responses_keep_status_content_type_and_retry_after() {
+        use crate::provider::Provider;
+
+        let now = OffsetDateTime::now_utc();
+        let mut config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
+        config.accounts[1].disabled = Some(true);
+        let manager = Manager::with_live_refresher(config, None);
+        let responses = [
+            (
+                exhausted_response(&manager, now, 0, false, Provider::Codex, None, None),
+                StatusCode::TOO_MANY_REQUESTS,
+                "no_codex_account",
+                "no_codex_account",
+                None,
+            ),
+            (
+                exhausted_response(&manager, now, 1, false, Provider::Codex, None, None),
+                StatusCode::TOO_MANY_REQUESTS,
+                "pool_unavailable",
+                "pool_unavailable",
+                Some("60"),
+            ),
+            (
+                codex_credential_refused_response(&[(0, Some("alice@example.com/codex".into()))]),
+                StatusCode::FORBIDDEN,
+                "proxy_error",
+                "credential_refused",
+                None,
+            ),
+        ];
+        for (response, status, error_type, code, retry_after) in responses {
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .map(|value| value.to_str().unwrap()),
+                retry_after,
+            );
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["type"], error_type);
+            assert_eq!(body["error"]["code"], code);
+            assert!(body["error"]["message"].as_str().is_some());
+        }
+    }
+
+    #[test]
+    fn gate_descriptions_keep_empty_and_provider_specific_phrases() {
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(describe_gates(&empty), "");
+        assert_eq!(describe_codex_gates(&empty), "");
+        let rejected = std::collections::BTreeMap::from([(GateReason::Rejected, 2)]);
+        assert_eq!(describe_gates(&rejected), ": 2 rejected upstream");
+        assert_eq!(describe_codex_gates(&rejected), ": 2 refused by ChatGPT");
+        let reserved = std::collections::BTreeMap::from([(GateReason::Reserved, 1)]);
+        assert_eq!(describe_gates(&reserved), ": 1 reserved for another group");
+        assert_eq!(
+            describe_codex_gates(&reserved),
+            ": 1 unreachable in a reserved group"
+        );
+        let common = std::collections::BTreeMap::from([(GateReason::Hold, 3)]);
+        assert_eq!(describe_gates(&common), ": 3 on an upstream hold");
+        assert_eq!(describe_codex_gates(&common), ": 3 on an upstream hold");
     }
 
     /// **Every 429 tcr sends a Codex request itself is counted, under its body's type**, so
@@ -22102,7 +22167,7 @@ mod tests {
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some("no_codex_account".to_string()))
+            (1, Some(CodexRefusalKind::NoCodexAccount))
         );
 
         let mut config = fleet();
@@ -22116,7 +22181,7 @@ mod tests {
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some("pool_unavailable".to_string()))
+            (1, Some(CodexRefusalKind::PoolUnavailable))
         );
 
         // A revalidation serve would try the full account once more; off, so the 429 is the
@@ -22141,7 +22206,7 @@ mod tests {
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some("usage_limit_reached".to_string()))
+            (1, Some(CodexRefusalKind::UsageLimitReached))
         );
 
         // An account held by an upstream 403 is out for its short hold, and codex is told to
@@ -22160,7 +22225,7 @@ mod tests {
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some("pool_unavailable".to_string()))
+            (1, Some(CodexRefusalKind::PoolUnavailable))
         );
         assert_eq!(
             codex_echo.request_count(),
@@ -22255,7 +22320,7 @@ mod tests {
             codex_fleet("http://127.0.0.1:9", "http://codex.test"),
             None,
         );
-        manager.note_codex_refusal("pool_unavailable", crate::now_ms());
+        manager.note_codex_refusal(CodexRefusalKind::PoolUnavailable, crate::now_ms());
         let (status, _, body) =
             status_request(manager, Method::GET, Some(loopback_peer()), None).await;
         assert_eq!(status, StatusCode::OK);
@@ -22263,7 +22328,10 @@ mod tests {
             serde_json::from_slice(&body).expect("a status payload");
         let traffic = payload.codex_traffic.expect("the counts are always sent");
         assert_eq!(traffic.refused_10m, 1);
-        assert_eq!(traffic.last_refusal.as_deref(), Some("pool_unavailable"));
+        assert_eq!(
+            traffic.last_refusal,
+            Some(CodexRefusalKind::PoolUnavailable)
+        );
         assert_eq!(payload.codex_upstream.as_deref(), Some("http://codex.test"));
 
         let manager = Manager::with_live_refresher(
@@ -22694,7 +22762,7 @@ mod tests {
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some("pool_unavailable".to_string()))
+            (1, Some(CodexRefusalKind::PoolUnavailable))
         );
     }
 }

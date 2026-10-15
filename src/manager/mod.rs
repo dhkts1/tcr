@@ -3936,20 +3936,19 @@ impl MinuteRing {
 #[derive(Debug, Default)]
 struct CodexRefusals {
     ring: MinuteRing,
-    last: Option<(String, i64)>,
+    last: Option<(tcr_status_wire::CodexRefusalKind, i64)>,
 }
 
 impl Manager {
-    /// Count a 429 this process answered a Codex request with itself, `error_type` being its
-    /// body's `error.type` (`no_codex_account`, `usage_limit_reached` or `pool_unavailable`).
+    /// Count a 429 this process answered a Codex request with itself, under its body's kind.
     /// Fed by `proxy::exhausted_response`'s Codex arms.
-    pub fn note_codex_refusal(&self, error_type: &str, now_ms: i64) {
+    pub fn note_codex_refusal(&self, kind: tcr_status_wire::CodexRefusalKind, now_ms: i64) {
         let mut refused = self
             .codex_refused
             .lock()
             .expect("codex_refused lock poisoned");
         refused.ring.bump(now_ms);
-        refused.last = Some((error_type.to_string(), now_ms));
+        refused.last = Some((kind, now_ms));
     }
 
     /// Count a Codex request relayed on the client's own credential, unpooled, because it named
@@ -3975,7 +3974,7 @@ impl Manager {
                 .lock()
                 .expect("codex_refused lock poisoned");
             let count = refused.ring.count(now_ms);
-            (count, refused.last.clone().filter(|_| count > 0))
+            (count, refused.last.filter(|_| count > 0))
         };
         let unpooled_10m = self
             .codex_unpooled
@@ -16411,13 +16410,16 @@ mod tests {
         // 2026-01-01T00:00:00Z, on a minute boundary.
         let t0: i64 = 1_767_225_600_000;
         let manager = traffic_manager();
-        manager.note_codex_refusal("usage_limit_reached", t0);
-        manager.note_codex_refusal("pool_unavailable", t0 + 300_000);
+        manager.note_codex_refusal(tcr_status_wire::CodexRefusalKind::UsageLimitReached, t0);
+        manager.note_codex_refusal(
+            tcr_status_wire::CodexRefusalKind::PoolUnavailable,
+            t0 + 300_000,
+        );
         assert_eq!(
             manager.codex_traffic(t0 + 599_000),
             tcr_status_wire::CodexTraffic {
                 refused_10m: 2,
-                last_refusal: Some("pool_unavailable".into()),
+                last_refusal: Some(tcr_status_wire::CodexRefusalKind::PoolUnavailable),
                 last_refusal_at_ms: Some(t0 + 300_000),
                 unpooled_10m: 0,
             }

@@ -3912,7 +3912,10 @@ pub(crate) fn codex_traffic_notes(traffic: &tcr_status_wire::CodexTraffic) -> Ve
             "[tcr] note codex-refusals: refused_10m={} last_type={} — tcr answered codex with a \
              429 because no Codex account could serve; see the Codex rows above",
             traffic.refused_10m,
-            traffic.last_refusal.as_deref().unwrap_or("unknown"),
+            traffic
+                .last_refusal
+                .map(|kind| kind.as_str())
+                .unwrap_or("unknown"),
         ));
     }
     if traffic.unpooled_10m > 0 {
@@ -9532,7 +9535,7 @@ mod tests {
     fn status_prints_the_codex_traffic_notes_on_stderr() {
         let traffic = tcr_status_wire::CodexTraffic {
             refused_10m: 12,
-            last_refusal: Some("usage_limit_reached".into()),
+            last_refusal: Some(tcr_status_wire::CodexRefusalKind::UsageLimitReached),
             last_refusal_at_ms: Some(1),
             unpooled_10m: 3,
         };
@@ -9837,7 +9840,7 @@ mod tests {
             },
             tcr_status_wire::CodexTraffic {
                 refused_10m: 12,
-                last_refusal: Some("usage_limit_reached".to_string()),
+                last_refusal: Some(tcr_status_wire::CodexRefusalKind::UsageLimitReached),
                 last_refusal_at_ms: Some(1_767_225_560_000),
                 unpooled_10m: 3,
             },
