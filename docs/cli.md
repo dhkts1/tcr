@@ -970,11 +970,12 @@ and skips the write if the file changed. A symlinked `auth.json` is refused at i
 If a regular imported file is later replaced by a symlink, write-back preserves that symlink and refuses to overwrite it. A failed rename removes the temporary file when possible and erases its token
 contents if the directory prevents removal.
 
-A failed publication is retried while the file still holds the spent source refresh token.
-The running manager retains the latest replacement pair, including subsequent rotations, and
-retries before later requests even while its access token is valid. This retry queue is in
-memory: restarting while the file remains unwritable loses it, although tcr keeps its own
-fresh credentials. Repair the file and allow a retry before restarting, or use a separate login.
+A failed publication retries with exponential backoff while the file still holds the spent
+source refresh token. tcr persists the source token's SHA-256 digest and returned id token
+beside its current credentials, so a restart resumes publication without another refresh POST.
+Text status shows `token_sync=pending`; JSON and TcrBar decode `tokenSyncPending`. Healthy
+requests do not queue behind a publication, and cancellation cannot release its refresh lock.
+Make the imported folder writable again, or use a separate login.
 
 Codex does not take tcr's advisory lock. A Codex write between that final comparison and the
 rename can still be overwritten; these checks cannot make sharing atomic with Codex.

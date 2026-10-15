@@ -617,6 +617,9 @@ pub struct AccountStatusRow {
     /// a login of tcr's own, and for one imported before the key existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<String>,
+    /// Refreshed tokens still need guarded publication to the imported Codex login.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub token_sync_pending: bool,
     /// Whether `tcr run --codex` would pool codex, the same on every Codex row. Filled by
     /// the CLI, never by the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]

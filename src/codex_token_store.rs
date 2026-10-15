@@ -68,17 +68,21 @@ pub(crate) async fn read_async(home: &Path) -> io::Result<ImportedAuth> {
 }
 
 /// Keep the compare, private temporary write, fsyncs and rename on one blocking task.
+/// The source is identified by its SHA-256 digest. `false` preserves a changed source;
+/// a byte conflict retaining the source is retryable. Other fields remain intact.
 pub(crate) async fn write_back_async(
     home: &Path,
-    previous_refresh: &str,
+    expected_digest: &str,
     tokens: &Tokens,
 ) -> io::Result<bool> {
     let home = home.to_path_buf();
-    let previous_refresh = previous_refresh.to_string();
+    let expected_digest = expected_digest.to_string();
     let tokens = tokens.clone();
-    tokio::task::spawn_blocking(move || write_back(&home, &previous_refresh, &tokens))
-        .await
-        .map_err(|_| io::Error::other("Codex login write task failed"))?
+    tokio::task::spawn_blocking(move || {
+        write_back_with_digest(&home, &expected_digest, &tokens, || {})
+    })
+    .await
+    .map_err(|_| io::Error::other("Codex login write task failed"))?
 }
 
 impl ImportedAuth {
@@ -198,16 +202,38 @@ impl Drop for PrivateTokenFile {
     }
 }
 
-/// `false` means the source refresh token changed: no destination bytes were written.
-/// A byte conflict retaining that token is retryable, so the manager keeps its pending pair.
-/// Unknown fields and the original id token are retained unless a replacement was returned.
+/// Compare a source token after restart without storing the spent token itself.
+pub(crate) fn refresh_digest(refresh: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(refresh.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
 pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -> io::Result<bool> {
     write_back_before_commit(home, previous_refresh, tokens, || {})
 }
 
+#[cfg(test)]
 fn write_back_before_commit(
     home: &Path,
     previous_refresh: &str,
+    tokens: &Tokens,
+    before_commit: impl FnOnce(),
+) -> io::Result<bool> {
+    write_back_with_digest(
+        home,
+        &refresh_digest(previous_refresh),
+        tokens,
+        before_commit,
+    )
+}
+
+fn write_back_with_digest(
+    home: &Path,
+    expected_digest: &str,
     tokens: &Tokens,
     before_commit: impl FnOnce(),
 ) -> io::Result<bool> {
@@ -231,7 +257,7 @@ fn write_back_before_commit(
         ));
     }
     let mut auth = read(home)?;
-    if auth.login.refresh_token != previous_refresh {
+    if refresh_digest(&auth.login.refresh_token) != expected_digest {
         return Ok(false);
     }
     let refreshed = tokens
@@ -295,7 +321,7 @@ fn write_back_before_commit(
             .and_then(|document| document.get("tokens"))
             .and_then(|tokens| tokens.get("refresh_token"))
             .and_then(Value::as_str)
-            .is_some_and(|refresh| refresh != previous_refresh);
+            .is_some_and(|refresh| refresh_digest(refresh) != expected_digest);
         if refresh_changed {
             return Ok(false);
         }

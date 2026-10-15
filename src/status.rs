@@ -533,6 +533,9 @@ pub struct AccountStatus {
     /// [`CodexFacts::codex_home`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<String>,
+    /// Refreshed tokens still need guarded publication to the imported Codex login.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub token_sync_pending: bool,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -609,6 +612,7 @@ impl StatusPayload {
                 credits: a.codex.credits.clone(),
                 login_error: a.codex.login_error.clone(),
                 codex_home: a.codex.codex_home.clone(),
+                token_sync_pending: a.codex.token_sync_pending,
             })
             .collect();
         Self {
@@ -714,6 +718,7 @@ impl StatusPayload {
                         credits: a.credits,
                         login_error: a.login_error,
                         codex_home: a.codex_home,
+                        token_sync_pending: a.token_sync_pending,
                     },
                 }
             })
@@ -2697,6 +2702,7 @@ mod tests {
             }),
             login_error: Some("refresh_token_reused".into()),
             codex_home: Some("/Users/example/.codex".into()),
+            token_sync_pending: true,
         };
         let totals = tcr_status_wire::UsageTotals {
             requests: 3,

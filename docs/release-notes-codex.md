@@ -28,8 +28,9 @@ changes ship; that release body is the changelog shown by TcrBar.
 - Claude launches preserve Codex CA settings. Codex launches preserve an explicit CA bundle
   and provide an unmarked proxy URL to their shell tools, without changing Codex's config file.
 - Imported logins can recover a newer refresh token even when its access token has expired.
-  Failed write-backs retry in the running manager while the original source token still matches;
-  restarting loses pending retries. New imports refuse symlinked auth files; a symlink introduced
+  Failed write-backs retry with backoff while the original source token still matches.
+  Pending publication survives restart and appears as `token_sync=pending` in text status,
+  `tokenSyncPending` in JSON, and help on the account's TcrBar state pill. New imports refuse symlinked auth files; a symlink introduced
   after import is preserved. A later `codex login`
   in the shared folder revokes that login and may require tcr to sign in again.
 - The v1 quota endpoint remains Claude-only. Provider-aware status includes Codex, and both

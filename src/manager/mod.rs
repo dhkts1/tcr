@@ -779,7 +779,7 @@ impl AccountRuntime {
             hold_cause: HoldCause::RateLimit,
             login_error: None,
             codex_home: account.codex_home.clone(),
-            pending_codex_writeback: None,
+            pending_codex_writeback: refresh::PendingCodexWriteback::from_config(account),
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
@@ -2407,6 +2407,23 @@ impl Manager {
         // alone calls them one account — a tie that would refuse to persist this
         // rotation, or a pairing that would stamp it onto the other provider's row.
         let probe = crate::identity::probe(provider, name, account_uuid, org_uuid, org_name);
+        let sync_pending = match provider {
+            crate::provider::Provider::Anthropic => None,
+            crate::provider::Provider::Codex => {
+                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                accounts
+                    .iter()
+                    .find(|a| {
+                        a.provider == provider
+                            && a.name == name
+                            && a.account_uuid == probe.account_uuid
+                            && a.org_uuid == probe.org_uuid
+                    })
+                    .and_then(|a| a.pending_codex_writeback.as_ref())
+                    .map(refresh::PendingCodexWriteback::record)
+            }
+        };
+
         // INV1 — the modify and the save must be ONE atomic step against the file.
         // Without that, two concurrent refreshes race: a stale save clobbers the
         // other account's just-rotated refresh token, which then 400s
@@ -2445,6 +2462,19 @@ impl Manager {
                     // `Some(...)` on every reachable refresh success.
                     account.refresh_token = tokens.refresh_token.clone();
                     account.expires_at = Some(tokens.expires_at_ms);
+                    match provider {
+                        crate::provider::Provider::Anthropic => {}
+                        crate::provider::Provider::Codex => match sync_pending {
+                            Some(value) => {
+                                account
+                                    .extra
+                                    .insert(refresh::CODEX_SYNC_PENDING_KEY.to_string(), value);
+                            }
+                            None => {
+                                account.extra.remove(refresh::CODEX_SYNC_PENDING_KEY);
+                            }
+                        },
+                    }
                 }
             }
             (config.clone(), placement)
@@ -3579,6 +3609,7 @@ impl Manager {
                             crate::provider::Provider::Codex => {
                                 row.login_error = None;
                                 row.codex_home = account.codex_home.clone();
+                                row.pending_codex_writeback = None;
                             }
                         }
                         // F6: the submitted type always wins — this route only
@@ -3875,6 +3906,12 @@ impl Manager {
         for_disk.access_token = fresh.access_token.clone();
         for_disk.refresh_token = fresh.refresh_token.clone();
         for_disk.expires_at = fresh.expires_at;
+        match fresh.provider {
+            crate::provider::Provider::Anthropic => {}
+            crate::provider::Provider::Codex => {
+                for_disk.extra.remove(refresh::CODEX_SYNC_PENDING_KEY);
+            }
+        }
 
         let outcome = config::save_account(path, &for_disk);
         // INV3, mirroring `persist_disabled`: touch the in-memory snapshot only
@@ -3894,6 +3931,7 @@ impl Manager {
                         entry.refresh_token = for_disk.refresh_token.clone();
                         entry.expires_at = for_disk.expires_at;
                         entry.codex_home = for_disk.codex_home.clone();
+                        entry.extra.remove(refresh::CODEX_SYNC_PENDING_KEY);
                     }
                 }
                 // No in-memory entry carries this identity either — the disk

@@ -13,6 +13,15 @@ import XCTest
 /// fixture's own clock. Account names are obviously fake: this repository is public.
 final class CodexCardFactsTests: XCTestCase {
 
+    func testPendingTokenSyncIsVisibleWithoutChangingTheStatePill() throws {
+        let ready = try canonical("bob@example.com/codex")
+        let pending = try canonical("bob@example.com/codex", ["tokenSyncPending": true])
+        XCTAssertEqual(FleetTally.Kind(account: pending), FleetTally.Kind(account: ready))
+        XCTAssertNil(CodexCardFacts.stateHelp(ready, now: Date()))
+        XCTAssertTrue(CodexCardFacts.stateHelp(pending, now: Date())?.contains("auth.json") == true)
+        XCTAssertTrue(CodexCardFacts.stateHelp(pending, now: Date())?.contains("retry") == true)
+    }
+
     // MARK: - Which windows draw a row
 
     func testOnlyReportedWindowsAreDrawn() throws {

@@ -1,11 +1,14 @@
 //! `Manager` OAuth token-refresh methods, split verbatim from `mod.rs`.
 
 use super::*;
+use serde_json::Value;
 
 #[derive(Clone)]
 pub(crate) struct PendingCodexWriteback {
     expected_refresh: String,
     tokens: Tokens,
+    retry_after_ms: i64,
+    failures: u8,
 }
 
 impl std::fmt::Debug for PendingCodexWriteback {
@@ -15,6 +18,55 @@ impl std::fmt::Debug for PendingCodexWriteback {
             .field("expected_refresh", &"<redacted>")
             .field("tokens", &"<redacted>")
             .finish()
+    }
+}
+
+pub(crate) const CODEX_SYNC_PENDING_KEY: &str = "codexTokenSyncPending";
+
+impl PendingCodexWriteback {
+    pub(super) fn from_config(account: &config::Account) -> Option<Self> {
+        match account.provider {
+            crate::provider::Provider::Anthropic => return None,
+            crate::provider::Provider::Codex => {}
+        }
+        account.codex_home.as_ref()?;
+        let record = account.extra.get(CODEX_SYNC_PENDING_KEY)?;
+        let expected_refresh = record.get("expectedRefreshSha256")?.as_str()?;
+        if expected_refresh.len() != 64 || !expected_refresh.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(Self {
+            expected_refresh: expected_refresh.to_string(),
+            tokens: Tokens {
+                id_token: record
+                    .get("idToken")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                access_token: account.access_token.clone(),
+                refresh_token: account.refresh_token.clone(),
+                expires_at_ms: account
+                    .expires_at
+                    .map(oauth::normalize_expires_at)
+                    .unwrap_or(0),
+            },
+            retry_after_ms: 0,
+            failures: 0,
+        })
+    }
+
+    pub(super) fn record(&self) -> Value {
+        let mut record = serde_json::json!({"expectedRefreshSha256": self.expected_refresh});
+        if let Some(id) = &self.tokens.id_token {
+            record["idToken"] = id.clone().into();
+        }
+        record
+    }
+
+    fn back_off(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        let seconds = (5_i64 << self.failures.saturating_sub(1).min(6)).min(300);
+        self.retry_after_ms = crate::now_ms().saturating_add(seconds * 1000);
     }
 }
 
@@ -38,21 +90,78 @@ impl Manager {
 
     async fn retry_codex_writeback(&self, idx: usize) {
         let lock = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
-            let Some(account) = accounts.get(idx) else {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
-            if account.pending_codex_writeback.is_none() {
+            if account.removed || account.codex_home.is_none() {
+                account.pending_codex_writeback = None;
+                return;
+            }
+            if !account
+                .pending_codex_writeback
+                .as_ref()
+                .is_some_and(|p| crate::now_ms() >= p.retry_after_ms)
+            {
                 return;
             }
             account.refresh_lock.clone()
         };
-        let _guard = lock.lock().await;
-        let _ = self.flush_codex_writeback_locked(idx).await;
+        // Healthy turns never queue behind a refresh or an already-running publication.
+        let Ok(guard) = lock.try_lock_owned() else {
+            return;
+        };
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        // Move the guard before the first await: a disappearing request cannot release it
+        // while the blocking file writer continues. The task owns persistence as well.
+        let _ = tokio::spawn(async move {
+            let _guard = guard;
+            let due = me
+                .accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .get(idx)
+                .and_then(|a| a.pending_codex_writeback.as_ref())
+                .is_some_and(|p| crate::now_ms() >= p.retry_after_ms);
+            if due && me.flush_codex_writeback_locked(idx).await.is_some() {
+                me.persist_codex_sync_state(idx).await;
+            }
+        })
+        .await;
     }
 
-    /// The per-account refresh lock is held by every caller. Pending state is in memory;
-    /// restarting before publication succeeds loses this retry queue, not tcr's fresh tokens.
+    async fn persist_codex_sync_state(self: &Arc<Self>, idx: usize) {
+        let state = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            accounts.get(idx).filter(|a| !a.removed).map(|a| {
+                (
+                    a.name.clone(),
+                    a.account_uuid.clone(),
+                    a.org_uuid.clone(),
+                    a.org_name.clone(),
+                    a.provider,
+                    Tokens {
+                        id_token: None,
+                        access_token: a.access_token.clone(),
+                        refresh_token: a.refresh_token.clone(),
+                        expires_at_ms: a.expires_at_ms.unwrap_or(0),
+                    },
+                )
+            })
+        };
+        if let Some((name, account, org, org_name, provider, tokens)) = state {
+            let me = self.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                me.persist_tokens(&name, account, org, org_name, provider, &tokens)
+            })
+            .await;
+        }
+    }
+
+    /// Every caller holds the refresh lock. Failed publication is backed off and its source
+    /// digest is persisted with tcr's current tokens, so restart can safely resume the retry.
     async fn flush_codex_writeback_locked(&self, idx: usize) -> Option<std::io::Result<bool>> {
         let (home, pending, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
@@ -79,19 +188,63 @@ impl Manager {
             &pending.tokens,
         )
         .await;
-        match &result {
-            Ok(_) => {
-                if let Some(account) = self
-                    .accounts
-                    .write()
-                    .expect("accounts lock poisoned")
-                    .get_mut(idx)
+        let mut adopted = None;
+        let published = match &result {
+            Ok(true) => true,
+            Ok(false) => {
+                if let Ok(auth) =
+                    crate::codex_token_store::read_async(std::path::Path::new(&home)).await
                 {
-                    account.pending_codex_writeback = None;
+                    if auth.login.refresh_token
+                        == pending.tokens.refresh_token.as_deref().unwrap_or("")
+                        && auth.login.access_token == pending.tokens.access_token
+                    {
+                        true
+                    } else {
+                        let identity = self
+                            .accounts
+                            .read()
+                            .expect("accounts lock poisoned")
+                            .get(idx)
+                            .map(|a| (a.org_uuid.clone(), a.account_uuid.clone()));
+                        if let Some((org, account)) = identity {
+                            adopted = auth
+                                .newer_tokens(
+                                    pending.tokens.refresh_token.as_deref().unwrap_or(""),
+                                    &pending.tokens.access_token,
+                                    org.as_deref(),
+                                    account.as_deref(),
+                                    None,
+                                    false,
+                                )
+                                .filter(|tokens| tokens.expires_at_ms > crate::now_ms());
+                        }
+                        adopted.is_some()
+                    }
+                } else {
+                    false
                 }
             }
-            Err(error) => tracing::warn!(account = %name, error_kind = ?error.kind(),
-                "could not synchronize refreshed tokens with the imported Codex login; will retry while the source token still matches"),
+            Err(_) => false,
+        };
+        if let Some(tokens) = adopted {
+            self.apply_refresh(idx, &tokens, None);
+        }
+        if let Some(account) = self
+            .accounts
+            .write()
+            .expect("accounts lock poisoned")
+            .get_mut(idx)
+        {
+            if published {
+                account.pending_codex_writeback = None;
+            } else if let Some(pending) = &mut account.pending_codex_writeback {
+                pending.back_off();
+            }
+        }
+        if !published {
+            tracing::warn!(account = %name, error_kind = ?result.as_ref().err().map(std::io::Error::kind),
+                "could not synchronize refreshed tokens with the imported Codex login; publication is pending with backoff and survives restart");
         }
         Some(result)
     }
@@ -246,12 +399,25 @@ impl Manager {
             .as_ref()
             .filter(|tokens| tokens.expires_at_ms > crate::now_ms())
         {
+            if let Some(account) = self
+                .accounts
+                .write()
+                .expect("accounts lock poisoned")
+                .get_mut(idx)
+            {
+                account.pending_codex_writeback = None;
+            }
             Ok(tokens.clone())
         } else {
             let mut posted_refresh = preexisting
                 .as_ref()
                 .and_then(|tokens| tokens.refresh_token.clone())
                 .unwrap_or_else(|| refresh_token.clone());
+            let mut posted_from_file = preexisting.is_some()
+                || file_before
+                    .as_ref()
+                    .is_some_and(|auth| auth.login.refresh_token == posted_refresh);
+            let mut needs_publication = true;
             tracing::info!(account = %name, "refreshing OAuth token");
             let mut refreshed = self
                 .refresher
@@ -267,9 +433,11 @@ impl Manager {
                         })
                 {
                     if replacement.expires_at_ms > crate::now_ms() {
+                        needs_publication = false;
                         refreshed = Ok(replacement);
                     } else if let Some(token) = replacement.refresh_token {
                         posted_refresh = token;
+                        posted_from_file = true;
                         refreshed = self
                             .refresher
                             .refresh(provider, posted_refresh.clone())
@@ -279,19 +447,32 @@ impl Manager {
             }
             match refreshed {
                 Ok(mut tokens) => {
-                    if imported_home.is_some() {
+                    if imported_home.is_some() && needs_publication {
                         {
                             let mut accounts =
                                 self.accounts.write().expect("accounts lock poisoned");
                             if let Some(account) = accounts.get_mut(idx) {
-                                let expected_refresh =
-                                    account.pending_codex_writeback.as_ref().map_or_else(
-                                        || posted_refresh.clone(),
+                                let expected_refresh = account
+                                    .pending_codex_writeback
+                                    .as_ref()
+                                    .filter(|pending| {
+                                        !posted_from_file
+                                            && pending.tokens.refresh_token.as_deref()
+                                                == Some(posted_refresh.as_str())
+                                    })
+                                    .map_or_else(
+                                        || {
+                                            crate::codex_token_store::refresh_digest(
+                                                &posted_refresh,
+                                            )
+                                        },
                                         |pending| pending.expected_refresh.clone(),
                                     );
                                 account.pending_codex_writeback = Some(PendingCodexWriteback {
                                     expected_refresh,
                                     tokens: tokens.clone(),
+                                    retry_after_ms: 0,
+                                    failures: 0,
                                 });
                             }
                         }
@@ -304,7 +485,24 @@ impl Manager {
                                 .filter(|candidate| candidate.expires_at_ms > crate::now_ms())
                             {
                                 tokens = newer;
+                                if let Some(account) = self
+                                    .accounts
+                                    .write()
+                                    .expect("accounts lock poisoned")
+                                    .get_mut(idx)
+                                {
+                                    account.pending_codex_writeback = None;
+                                }
                             }
+                        }
+                    } else if !needs_publication {
+                        if let Some(account) = self
+                            .accounts
+                            .write()
+                            .expect("accounts lock poisoned")
+                            .get_mut(idx)
+                        {
+                            account.pending_codex_writeback = None;
                         }
                     }
                     Ok(tokens)
@@ -515,6 +713,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     const ACCOUNT_ID: &str = "11111111-1111-4111-8111-111111111111";
     const USER_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1209,6 +1408,11 @@ mod tests {
                 assert!(manager.ensure_fresh_force(0).await);
             }
             std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            manager.accounts.write().unwrap()[0]
+                .pending_codex_writeback
+                .as_mut()
+                .unwrap()
+                .retry_after_ms = 0;
             manager.ensure_fresh(0).await;
             let stored = read_auth(home.path());
             assert_eq!(
@@ -1223,5 +1427,201 @@ mod tests {
                 "a writeback retry must not spend another refresh token"
             );
         }
+    }
+    #[tokio::test]
+    async fn codex_writeback_failure_backs_off_without_spending_another_refresh() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let original = auth_document("rt-old", 1);
+        write_auth(home.path(), &original);
+        let (manager, calls) = imported_manager(home.path(), None, false);
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(manager.ensure_fresh_force(0).await);
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        manager.ensure_fresh(0).await;
+        assert_eq!(
+            read_auth(home.path()),
+            original,
+            "healthy requests respect write-back backoff"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        manager.ensure_fresh(0).await;
+        assert_eq!(
+            read_auth(home.path())["tokens"]["refresh_token"],
+            "rt-tcr-new"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_codex_writeback_retry_keeps_its_refresh_lock_until_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        let (manager, _) = imported_manager(home.path(), None, false);
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(manager.ensure_fresh_force(0).await);
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let file_lock =
+            std::fs::File::create(crate::paths::codex_auth_lock_file(home.path())).unwrap();
+        file_lock.lock().unwrap();
+        let lock = manager.accounts.read().unwrap()[0].refresh_lock.clone();
+        let serving = manager.clone();
+        let request = tokio::spawn(async move { serving.ensure_fresh(0).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lock.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        let _ = request.await;
+        assert!(
+            lock.try_lock().is_err(),
+            "a disconnected request must not release an unfinished publication's lock"
+        );
+        drop(file_lock);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let _finished = lock.lock().await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            read_auth(home.path())["tokens"]["refresh_token"],
+            "rt-tcr-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_codex_writeback_tracks_the_file_token_actually_posted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        struct RotateFromFile(PathBuf);
+        impl TokenRefresher for RotateFromFile {
+            fn refresh(
+                &self,
+                _: crate::provider::Provider,
+                refresh: String,
+            ) -> oauth::RefreshFuture {
+                let home = self.0.clone();
+                Box::pin(async move {
+                    let generation = match refresh.as_str() {
+                        "rt-old" => 2,
+                        "rt-tcr-2" => {
+                            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                                .unwrap();
+                            let mut document = auth_document("rt-file-new", 3);
+                            document["tokens"]["access_token"] =
+                                json!(access_token(ACCOUNT_ID, 3, 0));
+                            write_auth(&home, &document);
+                            return Err(oauth::OAuthError::AuthRejected {
+                                status: 401,
+                                code: Some("refresh_token_reused"),
+                            });
+                        }
+                        "rt-file-new" => 4,
+                        _ => panic!("unexpected fixture refresh token"),
+                    };
+                    Ok(Tokens {
+                        id_token: None,
+                        access_token: access_token(ACCOUNT_ID, generation, 4_102_444_800),
+                        refresh_token: Some(format!("rt-tcr-{generation}")),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                })
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        let (original, _) = imported_manager(home.path(), None, false);
+        let manager = Manager::new(
+            original.config.lock().unwrap().clone(),
+            Arc::new(RotateFromFile(home.path().to_owned())),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            None,
+        );
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(manager.ensure_fresh_force(0).await);
+        {
+            let mut accounts = manager.accounts.write().unwrap();
+            accounts[0].expires_at_ms = Some(0);
+            accounts[0].refresh_retry_after_ms = None;
+        }
+        assert!(manager.ensure_fresh_force(0).await);
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(read_auth(home.path())["tokens"]["refresh_token"], "rt-tcr-4",
+            "the file token used by the successful POST must be replaced, even with a stale pending entry");
+    }
+
+    #[tokio::test]
+    async fn pending_codex_token_sync_survives_restart_and_is_visible_in_status() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        write_auth(&home, &auth_document("rt-old", 1));
+        let (original, _) = imported_manager(&home, None, false);
+        let config = original.config.lock().unwrap().clone();
+        let path = scratch.path().join("tcr.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = Arc::new(TestRefresh {
+            home: home.clone(),
+            replacement: None,
+            failure_code: None,
+            calls: calls.clone(),
+        });
+        let manager = Manager::new(
+            config,
+            refresher.clone(),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Some(path.clone()),
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(manager.ensure_fresh_force(0).await);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &manager.snapshot(OffsetDateTime::now_utc()),
+            &[0.9],
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_value(payload).unwrap();
+        assert_eq!(
+            wire["accounts"][0]["tokenSyncPending"], true,
+            "a healthy tcr token can still need publication to codex"
+        );
+        let stored = config::load(&path).unwrap();
+        let pending = &stored.accounts[0].extra["codexTokenSyncPending"];
+        assert!(pending["expectedRefreshSha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64));
+        assert!(
+            !pending.to_string().contains("rt-old"),
+            "persist a source digest rather than a spent refresh token"
+        );
+        drop(manager);
+        let restarted = Manager::new(
+            stored,
+            refresher,
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Some(path.clone()),
+        );
+        restarted.ensure_fresh(0).await;
+        assert_eq!(read_auth(&home)["tokens"]["refresh_token"], "rt-tcr-new");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "restart recovery publishes without another refresh POST"
+        );
+        assert!(!config::load(&path).unwrap().accounts[0]
+            .extra
+            .contains_key("codexTokenSyncPending"));
     }
 }

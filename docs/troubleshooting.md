@@ -352,8 +352,10 @@ unreadable and the file timestamp is equal or missing. Known older tokens and a 
 login are rejected. A reused token reaches the sign-in error only when no matching replacement
 can be adopted, for example because the auth file is missing, unreadable or stale. An expired
 access token in a newer file pair is refreshed using that file's refresh token before adoption.
-A failed write-back is retried by the running manager while the file still holds the spent
-source token; fix file access before restarting, because this pending retry is held in memory.
+A failed write-back retries with backoff while the file still holds the spent source token.
+The pending publication survives restart. Text status shows `token_sync=pending`, JSON shows
+`tokenSyncPending`, and TcrBar's state help explains the pending update. Make the imported
+folder writable again to let publication finish, or sign in with tcr for a separate login.
 Import refuses a symlinked auth file; a symlink introduced after import is never replaced. Signing in again with `codex login` in the shared folder
 revokes that login, so tcr may also need sign-in afterward.
 A login can also have expired (`refresh_token_expired`) or been revoked

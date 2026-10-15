@@ -3023,6 +3023,21 @@ fn merge_tokens(
             continue;
         };
         object.extend(fields);
+        match fresh.provider {
+            crate::provider::Provider::Anthropic => {}
+            crate::provider::Provider::Codex => {
+                let key = "codexTokenSyncPending";
+                match fresh.extra.get(key) {
+                    Some(value) => {
+                        object.insert(key.to_string(), value.clone());
+                    }
+                    None => {
+                        object.remove(key);
+                    }
+                }
+            }
+        }
+
         // Stamp the version on every entry this write actually touches, since
         // nothing else in the live path does — see [`CREDENTIAL_VERSION`]'s
         // doc-comment — at the version of the account's own provider: the
@@ -4355,6 +4370,12 @@ fn merge_account(
                             entry.remove("codexHome");
                         }
                     },
+                }
+                match account.provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => {
+                        entry.remove("codexTokenSyncPending");
+                    }
                 }
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
                 if !present(entry, "accountUuid") {

@@ -351,6 +351,8 @@ pub struct CodexFacts {
     pub login_error: Option<String>,
     /// The absolute path of the folder the account's login was imported from.
     pub codex_home: Option<String>,
+    /// Refreshed tokens still need guarded publication to the imported Codex login.
+    pub token_sync_pending: bool,
 }
 
 impl AccountSnapshot {

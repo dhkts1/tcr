@@ -451,6 +451,7 @@ fn codex_snapshot_facts(a: &AccountRuntime) -> crate::stats::CodexFacts {
         credits: a.quota.codex.credits.clone(),
         login_error: a.login_error.clone(),
         codex_home: a.codex_home.clone(),
+        token_sync_pending: a.pending_codex_writeback.is_some(),
     }
 }
 

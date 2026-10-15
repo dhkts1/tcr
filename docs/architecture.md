@@ -442,8 +442,12 @@ file. A matching loaded refresh token permits preparing a `0600` temporary file 
 preserving the other JSON fields and updating a returned id token. tcr compares all original
 bytes immediately before the atomic rename and skips a detected change. File reads, writes,
 fsyncs and lock waits run on blocking workers. Symlinked auth files are not replaced. A failed
-publication retains the latest replacement and original spent source token in memory for retry
-before later requests; a restart loses that pending retry. Failed temporary publications are
+publication retains the latest replacement and a SHA-256 digest of the spent source token.
+The digest and returned id token are saved beside tcr's current credentials so restart can
+resume publication without another refresh POST. Retries use exponential backoff from five
+seconds to five minutes, never queue healthy turns behind the refresh lock, and own that lock
+through a detached task so cancellation cannot race a later rotation. Status exposes only a
+pending boolean, never the private recovery record. Failed temporary publications are
 removed when possible, or their token bytes erased before the private handle closes.
 
 Codex's file writer does not take that lock, so its write can still fall between the final

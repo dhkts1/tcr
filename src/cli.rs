@@ -2660,6 +2660,9 @@ fn codex_tail(a: &AccountSnapshot) -> String {
         Provider::Codex => {}
     }
     let mut tail = String::new();
+    if a.codex.token_sync_pending {
+        tail.push_str(" token_sync=pending");
+    }
     if let Some(code) = &a.codex.login_error {
         tail.push_str(&format!(" login_error={code}"));
     }
@@ -3196,6 +3199,7 @@ fn account_status_rows_at(
                 credits: facts.credits,
                 login_error: facts.login_error,
                 codex_home: facts.codex_home,
+                token_sync_pending: facts.token_sync_pending,
                 // Fleet-wide, repeated on every Codex row like `serverSha`:
                 // whether `tcr run --codex` would pool codex, and what the
                 // server did with Codex requests in the last ten minutes.
@@ -9859,8 +9863,8 @@ mod tests {
     /// A weekly window's length, 10,080 minutes.
     const WEEK_MS: i64 = 7 * DAY_MS;
 
-    /// The ten keys a Codex row may carry and an Anthropic row never does.
-    const CODEX_ROW_KEYS: [&str; 10] = [
+    /// The keys a Codex row may carry and an Anthropic row never does.
+    const CODEX_ROW_KEYS: [&str; 11] = [
         "quotaWindows",
         "fiveHourWindowMinutes",
         "sevenDayWindowMinutes",
@@ -9869,9 +9873,21 @@ mod tests {
         "credits",
         "loginError",
         "codexHome",
+        "tokenSyncPending",
         "codexRoute",
         "codexTraffic",
     ];
+
+    #[test]
+    fn codex_pending_token_sync_has_a_text_status_hint() {
+        let (mut snapshot, _) = status_contract_snapshot();
+        let account = &mut snapshot.accounts[0];
+        account.provider = Provider::Codex;
+        account.codex.token_sync_pending = true;
+        assert!(codex_tail(account).contains("token_sync=pending"));
+        account.provider = Provider::Anthropic;
+        assert!(codex_tail(account).is_empty());
+    }
 
     /// The instant `offset_ms` from the canonical clock.
     fn canonical_at(offset_ms: i64) -> OffsetDateTime {
@@ -10824,6 +10840,7 @@ mod tests {
                 }),
                 login_error: Some("refresh_token_reused".to_string()),
                 codex_home: Some("/Users/example/.codex".to_string()),
+                token_sync_pending: true,
             };
         }
         check("with every Codex fact set", render(&snapshot));

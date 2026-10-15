@@ -1968,6 +1968,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// The folder this account was imported from; `nil` for a login of tcr's
     /// own.
     public let codexHome: String?
+    public let tokenSyncPending: Bool
     /// Whether tcr can pool codex. Computed by the CLI, and the same on every
     /// Codex row; `nil` from a CLI that predates it.
     public let codexRoute: CodexRoute?
@@ -2034,6 +2035,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         credits: CodexCredits? = nil,
         loginError: String? = nil,
         codexHome: String? = nil,
+        tokenSyncPending: Bool = false,
         codexRoute: CodexRoute? = nil,
         codexTraffic: CodexTraffic? = nil
     ) {
@@ -2088,6 +2090,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.credits = credits
         self.loginError = loginError
         self.codexHome = codexHome
+        self.tokenSyncPending = tokenSyncPending
         self.codexRoute = codexRoute
         self.codexTraffic = codexTraffic
     }
@@ -2101,7 +2104,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         case groups, reservedGroups, parkedGroups, controlAllowedGroups, groupColors
         case plan, organizationType, rateLimitTier, seatTier, orgUuid, orgName, gate, freeAtMs
         case provider, quotaWindows, fiveHourWindowMinutes, sevenDayWindowMinutes
-        case limitReachedType, spendControlReached, credits, loginError, codexHome
+        case limitReachedType, spendControlReached, credits, loginError, codexHome, tokenSyncPending
         case codexRoute, codexTraffic
     }
 
@@ -2173,6 +2176,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         credits = try c.decodeIfPresent(CodexCredits.self, forKey: .credits)
         loginError = try c.decodeIfPresent(String.self, forKey: .loginError)
         codexHome = try c.decodeIfPresent(String.self, forKey: .codexHome)
+        tokenSyncPending = try c.decodeIfPresent(Bool.self, forKey: .tokenSyncPending) ?? false
         codexRoute = try c.decodeIfPresent(CodexRoute.self, forKey: .codexRoute)
         codexTraffic = try c.decodeIfPresent(CodexTraffic.self, forKey: .codexTraffic)
     }
