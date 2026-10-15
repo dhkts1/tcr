@@ -4604,20 +4604,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             }
         };
         if status.is_success() {
+            // One parse of the body for all three readings below.
+            let response = parse_non_streamed_response(&bytes);
             // RUNNING NOW, non-streamed twin of the SSE arm above: the body is complete, so
             // any `tool_use` in it starts now. Outside the usage guard for the same reason.
             manager.record_wire_session_tool_uses(
                 wire_session_id.as_deref(),
                 OffsetDateTime::now_utc(),
-                &response_tool_uses_from_json(&bytes),
+                &response.tool_uses,
             );
             // Non-streamed twin of the mint record on the SSE arm above.
-            manager.record_bound_tokens(
-                &response_bound_tokens_from_json(&bytes),
-                idx,
-                crate::now_ms(),
-            );
-            let parsed = usage_from_json(&bytes);
+            manager.record_bound_tokens(&response.bound_tokens, idx, crate::now_ms());
+            let parsed = response.usage;
             if parsed.input_total > 0 || parsed.output > 0 {
                 let record = usage_record(&parsed, request_model.clone(), session_key, || {
                     extended_ttl.get()
@@ -5391,14 +5389,26 @@ fn usage_record(
     )
 }
 
-/// Parse the token breakdown from a non-streamed JSON messages body.
+/// Everything the non-streamed arm reads off a 2xx JSON messages body: the
+/// token breakdown, the `tool_use` blocks and the account-bound tokens.
+#[derive(Debug, Default)]
+struct NonStreamedResponse {
+    usage: ParsedUsage,
+    tool_uses: Vec<crate::session_wire::ToolUseEvent>,
+    bound_tokens: Vec<MintedToken>,
+}
+
+/// Parse a non-streamed JSON messages body ONCE and read all three of its
+/// results off that one tree. Each used to parse the same bytes into its own
+/// [`Value`], three full parses of a body that can be large.
 ///
 /// A body that is not JSON is logged once, at warn: it means this turn's tokens
 /// are missing from the ledger, which is exactly the kind of silent undercount
 /// the usage ledger's own write-failure policy exists to make visible. Only the
 /// serde error and the body LENGTH are logged, never any body content, because a
-/// request body carries the user's prompt and this repository is public.
-fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
+/// request body carries the user's prompt and this repository is public. Such a
+/// body yields no usage, no tool uses and no bound tokens.
+fn parse_non_streamed_response(bytes: &[u8]) -> NonStreamedResponse {
     let value = match serde_json::from_slice::<Value>(bytes) {
         Ok(value) => value,
         Err(err) => {
@@ -5408,9 +5418,44 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
                 "a non-streamed 200 body did not parse as JSON, so this turn's tokens are \
                  NOT in the usage ledger; totals for this window are an undercount"
             );
-            return ParsedUsage::default();
+            return NonStreamedResponse::default();
         }
     };
+    NonStreamedResponse {
+        usage: usage_from_value(&value),
+        tool_uses: response_tool_uses_from_value(&value),
+        bound_tokens: response_bound_tokens_from_value(&value),
+    }
+}
+
+/// The token breakdown of a non-streamed body, parsing it on its own: the tests'
+/// entry point. The proxy reads it through [`parse_non_streamed_response`].
+#[cfg(test)]
+fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
+    parse_non_streamed_response(bytes).usage
+}
+
+/// The `tool_use` events of a non-streamed body, parsing it on its own and
+/// silently: the tests' entry point.
+#[cfg(test)]
+fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUseEvent> {
+    serde_json::from_slice::<Value>(bytes)
+        .map(|value| response_tool_uses_from_value(&value))
+        .unwrap_or_default()
+}
+
+/// The bound tokens of a non-streamed body, parsing it on its own and silently:
+/// the tests' entry point.
+#[cfg(test)]
+fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
+    serde_json::from_slice::<Value>(bytes)
+        .map(|value| response_bound_tokens_from_value(&value))
+        .unwrap_or_default()
+}
+
+/// The token breakdown of a parsed non-streamed messages body. No `usage` key
+/// is ordinary and yields the default.
+fn usage_from_value(value: &Value) -> ParsedUsage {
     let Some(usage) = value.get("usage") else {
         // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
         return ParsedUsage::default();
@@ -5433,16 +5478,10 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
 /// [`parse_sse_usage`]'s block assembly, feeding the same
 /// [`crate::session_wire::tool_use_event_from_block`].
 ///
-/// A second lenient parse of the same bytes [`usage_from_json`] already read, rather than one
-/// pass returning both: `ParsedUsage` is `Copy` on purpose (see its doc) and a `Vec` on it
-/// would end that. The cost lands only on non-streamed 2xx bodies, which are already buffered
-/// and capped by `MAX_BODY_BYTES`; Claude Code itself always streams. A body that is not JSON,
-/// or carries no `content` array, yields no events — [`usage_from_json`] has already logged the
-/// parse failure, so this one stays silent.
-fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUseEvent> {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return Vec::new();
-    };
+/// Reads the tree [`parse_non_streamed_response`] already parsed, and returns its own `Vec`
+/// beside [`ParsedUsage`] rather than on it, because `ParsedUsage` is `Copy` on purpose (see
+/// its doc). A body that carries no `content` array yields no events.
+fn response_tool_uses_from_value(value: &Value) -> Vec<crate::session_wire::ToolUseEvent> {
     let Some(blocks) = value.get("content").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -5469,17 +5508,12 @@ fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUs
 /// [`parse_sse_usage`]'s `bound_tokens`, feeding
 /// [`crate::manager::Manager::record_bound_tokens`].
 ///
-/// A separate pass over the same bytes for the same reason
-/// [`response_tool_uses_from_json`] is one: these bodies are already buffered and capped, and
-/// Claude Code itself always streams, so the cost lands only on the rare non-streamed 2xx.
+/// Reads the tree [`parse_non_streamed_response`] already parsed.
 ///
 /// The body's own `id` is one of them: a later request may name it as `previous_message_id`,
 /// and the thread state behind that id lives on the account that answered — `404 No thread
 /// state was found for the requested previous_message_id` on any other.
-fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return Vec::new();
-    };
+fn response_bound_tokens_from_value(value: &Value) -> Vec<MintedToken> {
     let mut tokens: Vec<MintedToken> = Vec::new();
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         tokens.push((BoundTokenKind::MessageId, id.to_string()));
@@ -7728,6 +7762,156 @@ mod tests {
                 (BoundTokenKind::MessageId, "msg_fake_1".to_string()),
                 (BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string()),
             ]
+        );
+    }
+
+    // The three non-streamed readers as they shipped before the one-parse change, each parsing
+    // the body on its own, kept verbatim as the reference `parse_non_streamed_response` must
+    // agree with.
+    fn reference_usage_from_json(bytes: &[u8]) -> ParsedUsage {
+        let value = match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    body_len = bytes.len(),
+                    "a non-streamed 200 body did not parse as JSON, so this turn's tokens are \
+                     NOT in the usage ledger; totals for this window are an undercount"
+                );
+                return ParsedUsage::default();
+            }
+        };
+        let Some(usage) = value.get("usage") else {
+            // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
+            return ParsedUsage::default();
+        };
+        let output = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let (cache_read, cache_creation, cache_creation_1h) = cache_breakdown(usage);
+        ParsedUsage {
+            input_total: sum_input_tokens(usage),
+            output,
+            cache_read,
+            cache_creation,
+            cache_creation_1h,
+        }
+    }
+
+    fn reference_response_tool_uses_from_json(
+        bytes: &[u8],
+    ) -> Vec<crate::session_wire::ToolUseEvent> {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return Vec::new();
+        };
+        let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|b| {
+                b.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "tool_use")
+            })
+            .take(crate::session_wire::PENDING_TOOL_CAP)
+            .filter_map(|b| {
+                let id = b.get("id").and_then(Value::as_str)?.to_string();
+                Some(crate::session_wire::tool_use_event_from_block(
+                    id,
+                    b.get("name").and_then(Value::as_str).map(str::to_string),
+                    b.get("input"),
+                ))
+            })
+            .collect()
+    }
+
+    fn reference_response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return Vec::new();
+        };
+        let mut tokens: Vec<MintedToken> = Vec::new();
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            tokens.push((BoundTokenKind::MessageId, id.to_string()));
+        }
+        let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+            return tokens;
+        };
+        for block in blocks {
+            let field = |name: &str| block.get(name).and_then(Value::as_str).map(str::to_string);
+            let minted = match block.get("type").and_then(Value::as_str) {
+                Some(SERVER_TOOL_USE_BLOCK_TYPE) => {
+                    field("id").map(|t| (BoundTokenKind::ServerToolUse, t))
+                }
+                Some(THINKING_BLOCK_TYPE) => {
+                    field("signature").map(|t| (BoundTokenKind::ThinkingSignature, t))
+                }
+                Some(REDACTED_THINKING_BLOCK_TYPE) => {
+                    field("data").map(|t| (BoundTokenKind::RedactedThinking, t))
+                }
+                _ => None,
+            };
+            if let Some(minted) = minted {
+                tokens.push(minted);
+            }
+            if tokens.len() >= crate::session_wire::BOUND_TOKEN_SCAN_CAP {
+                break;
+            }
+        }
+        tokens
+    }
+
+    /// One parse of a non-streamed body reads the same usage, tool uses and bound tokens as
+    /// the three separate parses it replaced, on bodies with and without each part.
+    #[test]
+    fn one_parse_of_a_non_streamed_body_matches_the_three_it_replaced() {
+        let fixtures: &[&str] = &[
+            // Text only, full usage with the 5m/1h split.
+            r#"{"id":"msg_fake_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":7,"cache_creation_input_tokens":30,"cache_read_input_tokens":90,"output_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}}}"#,
+            // tool_use blocks, a thinking block, a redacted one, a server tool.
+            r#"{"id":"msg_fake_2","type":"message","content":[{"type":"thinking","thinking":"plan","signature":"sig_fake_2"},{"type":"redacted_thinking","data":"data_fake_2"},{"type":"server_tool_use","id":"srvtoolu_fake_2","name":"web_search","input":{"query":"q"}},{"type":"tool_use","id":"toolu_fake_2","name":"Bash","input":{"command":"ls -la"}},{"type":"tool_use","id":"toolu_fake_3","name":"Read","input":{"file_path":"/tmp/x"}}],"usage":{"input_tokens":5,"output_tokens":2}}"#,
+            // No usage at all, and no id.
+            r#"{"type":"message","content":[{"type":"tool_use","id":"toolu_fake_4","name":"Grep","input":{"pattern":"fn"}}]}"#,
+            // usage present, content missing; content not an array.
+            r#"{"id":"msg_fake_5","usage":{"input_tokens":1,"output_tokens":1}}"#,
+            r#"{"id":"msg_fake_6","content":"text","usage":{"output_tokens":3}}"#,
+            // A tool_use with no id, a thinking block with no signature.
+            r#"{"id":"msg_fake_7","content":[{"type":"tool_use","name":"Grep"},{"type":"thinking","thinking":"x"}],"usage":{"input_tokens":2}}"#,
+            // Not an object, and not JSON.
+            r#"[1,2,3]"#,
+            "not json at all",
+            "",
+        ];
+        for fixture in fixtures {
+            let bytes = fixture.as_bytes();
+            let response = parse_non_streamed_response(bytes);
+            assert_eq!(
+                response.usage,
+                reference_usage_from_json(bytes),
+                "usage differs for {fixture}"
+            );
+            assert_eq!(
+                response.tool_uses,
+                reference_response_tool_uses_from_json(bytes),
+                "tool uses differ for {fixture}"
+            );
+            assert_eq!(
+                response.bound_tokens,
+                reference_response_bound_tokens_from_json(bytes),
+                "bound tokens differ for {fixture}"
+            );
+        }
+        // A positive control: the fixtures do carry every kind of result, so the equality
+        // above is not three empty lists agreeing.
+        let rich = parse_non_streamed_response(fixtures[1].as_bytes());
+        assert_eq!(rich.tool_uses.len(), 2);
+        assert_eq!(rich.bound_tokens.len(), 4);
+        assert_eq!(
+            parse_non_streamed_response(fixtures[0].as_bytes())
+                .usage
+                .cache_creation_1h,
+            Some(20)
         );
     }
 
