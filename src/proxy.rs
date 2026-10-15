@@ -21288,10 +21288,12 @@ mod tests {
         relay_upstream(
             &manager,
             RelayMode::Raw,
+            crate::provider::Provider::Anthropic,
             Method::POST,
             "/v1/oauth/token",
             &HeaderMap::new(),
             Body::from(r#"{"grant_type":"refresh_token"}"#),
+            Instant::now(),
         )
         .await
     }
