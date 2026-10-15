@@ -1021,6 +1021,13 @@ Once imported, the account is refreshed against `auth.openai.com`, probed at
 of `tcr run --codex` and other Codex connections carrying the proxy marker.
 [architecture.md](architecture.md#codex-requests) lists all five pooled model paths.
 
+Model availability can differ between ChatGPT plans. When ChatGPT rejects a model for one
+pooled account, tcr tries another available account without holding the rejected account out
+of other models. If none can serve it, tcr returns `model_unavailable` with the requested
+model and a choice to use another model or make a supporting account available. It does not
+automatically change the requested model.
+
+
 ---
 
 ## `tcr accounts`

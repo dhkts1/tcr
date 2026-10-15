@@ -10,6 +10,8 @@
 # only that turn's own x-codex-* headers can put one there. codex's transport-fallback line is
 # printed for information only; the request count already proves the HTTP path. It spends two
 # real turns of quota. Never prints a token.
+# Both turns use gpt-6-luna, offered on the Team and Free plans checked in review.
+# Override TCR_E2E_CODEX_MODEL only with a model both logins offer.
 #
 # The two CODEX_HOMEs must already be logged in to two DIFFERENT ChatGPT accounts, e.g. ~/.codex and
 # a second home made with `mkdir -p ~/.codex-second && CODEX_HOME=~/.codex-second codex login`. Both
@@ -52,6 +54,7 @@ HOME_B="$(cd "$3" 2>/dev/null && pwd -P)" || refuse "CODEX_HOME_B ($3) is not a 
 [ "$HOME_A" != "$HOME_B" ] || refuse "CODEX_HOME_A and CODEX_HOME_B are one directory; the rotation needs two logins"
 
 # --- the port: never the live proxy's ---------------------------------------
+CODEX_E2E_MODEL="${TCR_E2E_CODEX_MODEL:-gpt-6-luna}"
 LIVE_PORT=3456
 PORT="${TCR_E2E_PORT:-}"
 if [ -z "$PORT" ]; then
@@ -120,6 +123,7 @@ check_expiry() { # $1 = label, $2 = CODEX_HOME
 }
 
 echo "== preflight"
+echo "model: $CODEX_E2E_MODEL (must be available to both logins)"
 check_expiry CODEX_HOME_A "$HOME_A"
 check_expiry CODEX_HOME_B "$HOME_B"
 # `tcr run --codex` launches TCR_CODEX_BIN, else CODEX_BIN, else `codex` on PATH; empty is unset.
@@ -347,7 +351,7 @@ run_turn() { # $1 = the turn's number
   # codex keeps CODEX_HOME_A's own login (tcr swaps the credential on inference only) and runs in
   # an empty directory, its log level pinned so that codex.err never carries debug output.
   (cd "$WORK" && CODEX_HOME="$HOME_A" RUST_LOG=codex_core=info \
-    "$TCR" run --codex --config "$CONFIG" -- exec --skip-git-repo-check "Reply with exactly: ok" \
+    "$TCR" run --codex --config "$CONFIG" -- exec --model "$CODEX_E2E_MODEL" --skip-git-repo-check "Reply with exactly: ok" \
     </dev/null >"$E2E_HOME/turn$n.out" 2>"$E2E_HOME/codex.err") || rc=$?
   if line="$(grep -m 1 -F "$NOT_POOLED" "$E2E_HOME/codex.err")"; then
     fail "turn $n was not pooled: $line"

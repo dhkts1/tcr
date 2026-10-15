@@ -485,3 +485,15 @@ fn wire_rows_parse_with_an_unknown_key() {
         Some("cargo build")
     );
 }
+
+#[test]
+fn model_unavailability_is_a_known_codex_refusal() {
+    let traffic: tcr_status_wire::CodexTraffic = serde_json::from_value(serde_json::json!({
+        "refused10m": 1, "unpooled10m": 0, "lastRefusal": "model_unavailable"
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(traffic).unwrap()["lastRefusal"],
+        "model_unavailable"
+    );
+}

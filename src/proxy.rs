@@ -3554,6 +3554,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // fast-fail response below must name the refused account(s), not just count
     // them.
     let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
+    // Model access can differ between ChatGPT plans. A rejection benches the account
+    // for this request only: it may still serve another model on the very next turn.
+    let mut model_refusals: Vec<(Option<String>, String)> = Vec::new();
     let mut account_access_blocks = 0;
     let mut codex_access_read_failures = 0;
     let mut last_account_access_block: Option<(HeaderMap, Bytes)> = None;
@@ -3756,6 +3759,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // accounts refused, others merely exhausted — fall through
                     // unchanged to the existing exhaustion handling, which can still
                     // recover on the accounts that were not refused.
+                    if !model_refusals.is_empty() {
+                        return codex_model_unavailable_response(
+                            &manager,
+                            request_model.as_deref(),
+                            &model_refusals,
+                            &refused_403,
+                        );
+                    }
                     if codex_access_read_failures > 0
                         && codex_access_read_failures == upstream_responses
                     {
@@ -5426,6 +5437,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 );
             }
         };
+        match provider {
+            Provider::Codex => {
+                if status == StatusCode::BAD_REQUEST {
+                    if let Some(detail) = codex_model_refusal_detail(&bytes) {
+                        log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
+                        model_refusals.push((account_name.clone(), detail));
+                        tried.insert(idx);
+                        continue;
+                    }
+                }
+            }
+            Provider::Anthropic => {}
+        }
         if status.is_success() {
             // One parse of the body for all three readings below.
             let response = parse_non_streamed_response(&bytes, provider);
@@ -5507,6 +5531,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             &up_headers,
             Body::from(bytes),
             ServedBy::PooledAccount,
+        );
+    }
+
+    if !model_refusals.is_empty() {
+        return codex_model_unavailable_response(
+            &manager,
+            request_model.as_deref(),
+            &model_refusals,
+            &refused_403,
         );
     }
 
@@ -5742,6 +5775,67 @@ pub(crate) fn build_codex_upstream_headers(
         }
     }
     out
+}
+
+/// Only the observed ChatGPT model-access rejection is eligible for failover. Other
+/// bad parameters, HTML challenges and malformed bodies keep their original response.
+fn codex_model_refusal_detail(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > RATE_LIMIT_BODY_CAP {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(bytes).ok()?;
+    let message = [
+        "/detail",
+        "/detail/message",
+        "/error/message",
+        "/message",
+        "/error",
+    ]
+    .iter()
+    .find_map(|path| body.pointer(path).and_then(Value::as_str))?;
+    let normalized = message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized
+        .contains("model is not supported when using codex with a chatgpt account")
+        .then(|| message.chars().take(2048).collect())
+}
+
+/// A model-specific refusal is actionable without retrying or replacing a healthy login.
+/// Describe this request's observed rejections, rather than inferring a permanent catalog
+/// from plan names. A supporting account may simply be unavailable right now.
+fn codex_model_unavailable_response(
+    manager: &Manager,
+    model: Option<&str>,
+    refused: &[(Option<String>, String)],
+    credential_refusals: &[(usize, Option<String>)],
+) -> Response {
+    let model: String = model
+        .unwrap_or("the requested model")
+        .chars()
+        .take(256)
+        .collect();
+    let accounts = refused
+        .iter()
+        .map(|(name, _)| name.as_deref().unwrap_or("<unnamed>"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = format!(
+        "tcr could not serve {model} from its available pooled Codex accounts. ChatGPT rejected that model for {accounts}. Choose another model or make an account that supports it available. {}",
+        refused.first().map(|(_, detail)| detail.as_str()).unwrap_or_default(),
+    );
+    if !credential_refusals.is_empty() {
+        message.push(' ');
+        message.push_str(&codex_credential_refused_message(credential_refusals));
+    }
+    manager.note_codex_refusal(CodexRefusalKind::ModelUnavailable, crate::now_ms());
+    codex_error_response(
+        StatusCode::BAD_REQUEST,
+        codex_error_body(CodexRefusalKind::ModelUnavailable, message).to_string(),
+        None,
+    )
 }
 
 /// The common Codex error envelope, with its type and code drawn from one refusal kind.
@@ -23660,6 +23754,170 @@ mod tests {
             r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn codex_model_refusals_try_a_supporting_sibling_without_benching_free() {
+        for shape in ["detail", "error", "message"] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let captured = seen.clone();
+            let origin = Router::new().fallback(move |headers: HeaderMap, body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    let bearer = headers["authorization"].to_str().unwrap().to_owned();
+                    captured.lock().unwrap().push(bearer.clone());
+                    let model: Value = serde_json::from_slice(&body).unwrap();
+                    if bearer == "Bearer at-bob" && model["model"] == "gpt-6.1-sol" {
+                        let detail = "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.";
+                        let error = match shape {
+                            "detail" => serde_json::json!({"detail": detail}),
+                            "error" => serde_json::json!({"error": {"message": detail}}),
+                            _ => serde_json::json!({"message": detail}),
+                        };
+                        Response::builder().status(StatusCode::BAD_REQUEST).header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(error.to_string())).unwrap()
+                    } else { Response::new(Body::from("{}")) }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
+            config.accounts[1].priority = Some(0);
+            config.accounts[2].priority = Some(1);
+            let manager = Manager::with_live_refresher(config, None);
+            for model in ["gpt-6.1-sol", "gpt-6-luna"] {
+                let body = serde_json::json!({"model": model, "input": []}).to_string();
+                let response = drive_full(
+                    manager.clone(),
+                    Method::POST,
+                    crate::provider::CODEX_RESPONSES_PATH,
+                    Some(loopback_peer()),
+                    &[
+                        ("authorization", "Bearer client-own"),
+                        ("content-type", "application/json"),
+                    ],
+                    &body,
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{shape}: a supporting account serves {model}"
+                );
+            }
+            assert_eq!(
+                *seen.lock().unwrap(),
+                ["Bearer at-bob", "Bearer at-carol", "Bearer at-bob"]
+            );
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            assert_eq!(snapshot.accounts[1].gate, GateReason::Ok);
+            assert_eq!(snapshot.accounts[1].codex.login_error, None);
+            assert_eq!(snapshot.accounts[1].rate_limited_until, None);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_model_refusals_explain_an_unavailable_supporting_account() {
+        for blocked in ["disabled", "held", "quota", "credential"] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = requests.clone();
+            let origin = Router::new().fallback(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (status, body) = if headers["authorization"] == "Bearer at-carol" {
+                        (StatusCode::FORBIDDEN, r#"{"error":{"code":"invalid_api_key","type":"authentication_error"}}"#)
+                    } else {
+                        (StatusCode::BAD_REQUEST, r#"{"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}"#)
+                    };
+                    Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(Body::from(body)).unwrap()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
+            config.accounts[1].priority = Some(0);
+            config.accounts[2].priority = Some(1);
+            config.accounts[2].disabled = Some(blocked == "disabled");
+            let manager = Manager::with_live_refresher(config, None);
+            match blocked {
+                "held" => manager.mark_rate_limited(2, 300),
+                "quota" => manager.mark_codex_quota_limited(2, 300),
+                _ => {}
+            }
+            let response = drive_full(
+                manager.clone(),
+                Method::POST,
+                crate::provider::CODEX_RESPONSES_PATH,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own"),
+                    ("content-type", "application/json"),
+                ],
+                r#"{"model":"gpt-6.1-sol","input":[]}"#,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{blocked}");
+            assert!(!response.headers().contains_key("retry-after"));
+            let body = body_json(response).await;
+            assert_eq!(
+                body["error"]["code"], "model_unavailable",
+                "{blocked}: {body}"
+            );
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("gpt-6.1-sol") && message.contains("pooled"));
+            assert!(message.contains("Choose another model"));
+            if blocked == "credential" {
+                assert!(message.contains("tcr login --codex --account carol@example.com"));
+            }
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                if blocked == "credential" { 2 } else { 1 }
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[1].gate,
+                GateReason::Ok
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_other_bad_requests_keep_the_upstream_response() {
+        let body =
+            r#"{"error":{"message":"The temperature parameter is not supported for this model."}}"#;
+        let origin = Router::new().fallback(move || async move {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let manager = Manager::with_live_refresher(
+            codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
+            None,
+        );
+        let response = send_codex_turn(&manager).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        assert!(manager
+            .snapshot(OffsetDateTime::now_utc())
+            .accounts
+            .iter()
+            .all(|row| row.gate == GateReason::Ok));
+        server.abort();
     }
 
     #[tokio::test]

@@ -49,6 +49,18 @@ final class CodexBannerTests: XCTestCase {
         }
     }
 
+    func testModelRefusalNamesTheModelChoiceRemedy() throws {
+        for count in [1, 12] {
+            let fleet = try codexFleet(
+                bobAndDana,
+                traffic: ["refused10m": count, "lastRefusal": "model_unavailable", "unpooled10m": 0])
+            let banner = try XCTUnwrap(call(fleet))
+            XCTAssertTrue(banner.text.contains("Choose another model"))
+            XCTAssertFalse(banner.text.contains("asked codex to retry"))
+            XCTAssertFalse(banner.text.contains("sign in again"))
+        }
+    }
+
     // MARK: - Precedence
 
     /// One line at a time, in the order an operator can act on: a route that is not pooled

@@ -44,3 +44,8 @@ changes ship; that release body is the changelog shown by TcrBar.
 - Token refresh and import workspace checks send tcr's own User-Agent. An expired import
   asks the user to run codex once to refresh its login before trying again, rather than
   immediately replacing that login with another browser sign-in.
+
+- Mixed ChatGPT plans can fail over after a model-access rejection without benching the
+  account for its other models. If no available account can serve the model, the error and
+  TcrBar banner explain the model choice. The manual two-account acceptance script pins
+  `gpt-6-luna`; `TCR_E2E_CODEX_MODEL` can select another model both logins offer.

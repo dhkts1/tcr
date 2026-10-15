@@ -43,6 +43,8 @@ public enum CodexBanner: Equatable, Sendable {
         case noAccount
         /// The login or workspace was refused; waiting cannot repair it.
         case credential
+        /// No available pooled account could serve the requested model.
+        case model
         /// Any other type, or none: codex was asked to retry.
         case other
 
@@ -51,6 +53,7 @@ public enum CodexBanner: Equatable, Sendable {
             case "usage_limit_reached": self = .usageLimit
             case "no_codex_account": self = .noAccount
             case "credential_refused": self = .credential
+            case "model_unavailable": self = .model
             default: self = .other
             }
         }
@@ -95,6 +98,10 @@ public enum CodexBanner: Equatable, Sendable {
 
     private static func refusedSentence(count: Int, last: LastRefusal) -> String {
         switch (count == 1, last) {
+        case (_, .model):
+            let noun = count == 1 ? "request" : "requests"
+            return
+                "tcr refused \(count) Codex \(noun) in the last 10 min: no available pooled account could serve the requested model. Choose another model or enable an account that supports it."
         case (_, .credential):
             let noun = count == 1 ? "request" : "requests"
             return
