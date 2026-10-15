@@ -335,6 +335,32 @@ pub fn minted_ca_path() -> PathBuf {
     MintedPaths::in_dir(&config_dir()).ca
 }
 
+/// Resolve the CA of an existing usable leaf without writing certificate material.
+/// Server startup owns SAN migrations and minting. A client must keep trusting the
+/// persisted chain even when its sidecar is stale or its CA key predates persistence.
+/// Like the server loader, a valid JS leaf takes precedence over a minted chain.
+/// This lookup never changes the process-wide loaded-leaf coverage.
+pub fn existing_ca_path_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    ensure_crypto_provider();
+    let js_cert = dir.join(crate::legacy_names::JS_LEAF_CERT);
+    let js_key = dir.join(crate::legacy_names::JS_LEAF_KEY);
+    if js_cert.is_file() && js_key.is_file() && build_acceptor(&js_cert, &js_key).is_ok() {
+        let ca = dir.join(crate::legacy_names::JS_CA_CERT);
+        if !ca.is_file() {
+            return Ok(None);
+        }
+        load_certs(&ca)?;
+        return Ok(Some(ca));
+    }
+    let minted = MintedPaths::in_dir(dir);
+    if !minted.all_present() {
+        return Ok(None);
+    }
+    build_acceptor(&minted.leaf_cert, &minted.leaf_key)?;
+    load_certs(&minted.ca)?;
+    Ok(Some(minted.ca))
+}
+
 /// Ensure a process-wide rustls crypto provider is installed before building a
 /// `ServerConfig`. Two providers may be compiled (ours + reqwest's), which makes
 /// `ServerConfig::builder()` panic when no default is set; installing one first
@@ -1250,6 +1276,39 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"fresh key material");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_client_ca_keeps_js_leaf_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let minted = load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        let minted_bytes = std::fs::read(&minted).unwrap();
+        let (ca, leaf, key, _) = generate_chain(FALLBACK_LEAF_SANS).unwrap();
+        write_file(
+            &dir.path().join(crate::legacy_names::JS_LEAF_CERT),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        write_file(
+            &dir.path().join(crate::legacy_names::JS_LEAF_KEY),
+            key.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let js_ca = dir.path().join(crate::legacy_names::JS_CA_CERT);
+        write_file(&js_ca, ca.as_bytes(), 0o644).unwrap();
+        assert_eq!(
+            existing_ca_path_in(dir.path()).unwrap(),
+            Some(js_ca.clone())
+        );
+        std::fs::remove_file(&js_ca).unwrap();
+        assert_eq!(
+            existing_ca_path_in(dir.path()).unwrap(),
+            None,
+            "a valid JS leaf without its CA must not advertise the competing minted CA"
+        );
+        assert_eq!(std::fs::read(minted).unwrap(), minted_bytes);
     }
 
     /// A minted chain must be reused on the next load. Re-minting silently

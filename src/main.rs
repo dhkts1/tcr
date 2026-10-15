@@ -6431,7 +6431,7 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // Anything missing from the MITM material lands us in base-URL mode, which
         // always works; there is no half-applied third state.
         let holds_codex = config.holds_codex();
-        match see_through_ca(holds_codex) {
+        match see_through_ca() {
             Some(ca) => apply_see_through_env(&mut cmd, port, &ca, holds_codex),
             None => apply_base_url_env(&mut cmd, port),
         }
@@ -6926,16 +6926,17 @@ fn mark_run_active(cmd: &mut std::process::Command) {
 /// look exactly like a working see-through session while the capabilities it
 /// exists to preserve stay off.
 ///
-/// See-through needs BOTH halves of the MITM contract: the proxy must be able to
-/// present a leaf for `api.anthropic.com` (so `mitm::load_tls` has to succeed)
-/// AND we must be able to name the CA that signed it (so `claude` can be told to
-/// trust it). `load_tls` is the same loader the server ran at boot against the
-/// same dir, so it resolves to the same material rather than a second opinion.
-/// `holds_codex` (the config holds a Codex account) words the hint a fresh CA
-/// prints ([`mitm::ca_export_hint`]).
-fn see_through_ca(holds_codex: bool) -> Option<PathBuf> {
-    match mitm::load_tls(holds_codex) {
-        Ok(assets) => match assets.ca_path {
+/// Read only material already on disk. The server owns certificate creation and
+/// migration at startup; a client must never replace the CA while that server still
+/// presents the leaf it loaded at boot. Missing or unusable material selects base-URL mode.
+fn see_through_ca() -> Option<PathBuf> {
+    let ca = mitm::minted_ca_path();
+    see_through_ca_in(ca.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
+    match mitm::existing_ca_path_in(dir) {
+        Ok(ca_path) => match ca_path {
             Some(ca) if ca.is_file() => Some(ca),
             // A path we cannot read is not a CA we can hand to claude.
             Some(ca) => {
@@ -10448,6 +10449,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn persisted_tls_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[test]
+    fn see_through_ca_keeps_a_running_legacy_proxys_chain_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        std::fs::remove_file(dir.path().join("tcr-ca.key")).unwrap();
+        std::fs::write(
+            dir.path().join("tcr-leaf.sans"),
+            "api.anthropic.com\nplatform.claude.com\nwww.example.org\n",
+        )
+        .unwrap();
+        let before = persisted_tls_files(dir.path());
+
+        assert_eq!(see_through_ca_in(dir.path()), Some(ca));
+
+        assert!(
+            persisted_tls_files(dir.path()) == before,
+            "launching a client must not rotate the running proxy's CA or leaf"
+        );
+        assert!(!dir.path().join("tcr-ca.key").exists());
+    }
+
+    #[test]
+    fn see_through_ca_does_not_create_certificate_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent");
+        assert_eq!(see_through_ca_in(&absent), None);
+        assert!(!absent.exists(), "only server startup may create a chain");
+    }
+
+    #[test]
+    fn see_through_ca_reuses_a_fresh_servers_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        let before = persisted_tls_files(dir.path());
+        assert_eq!(see_through_ca_in(dir.path()), Some(ca));
+        assert_eq!(persisted_tls_files(dir.path()), before);
     }
 
     /// The see-through notice names the CA's second variable once the config holds a Codex
