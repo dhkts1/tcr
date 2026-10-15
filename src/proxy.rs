@@ -6471,12 +6471,20 @@ fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
 /// a CONNECT-phase-only timeout, never a total one, because a `/v1/code/` response
 /// is a long-lived event stream that any total timeout would truncate mid-stream.
 ///
+/// Rebuilt on the first relay after the machine slept, for the reason the
+/// per-account clients are ([`crate::wake`]): its pooled connections died during
+/// the sleep and its idle timer did not move.
+///
 /// `None` only if the TLS backend fails to initialise, which the caller answers with
-/// a 502 — a proxy never panics on a client request.
-fn relay_client() -> Option<&'static reqwest::Client> {
-    static RELAY_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
-    RELAY_CLIENT
-        .get_or_init(|| {
+/// a 502 — a proxy never panics on a client request. The next relay tries the build
+/// again.
+fn relay_client() -> Option<Arc<reqwest::Client>> {
+    RELAY_CLIENT.get()
+}
+
+static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::Client>> =
+    std::sync::LazyLock::new(|| {
+        crate::wake::SleepAwareClient::new("relay", || {
             match reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(10))
@@ -6490,8 +6498,7 @@ fn relay_client() -> Option<&'static reqwest::Client> {
                 }
             }
         })
-        .as_ref()
-}
+    });
 
 /// Forward a request upstream WITHOUT touching account rotation — see the `1c`
 /// block in [`handle`] for which requests land here and why.
@@ -6609,9 +6616,25 @@ async fn relay_request(
                 mode = ?mode,
                 is_connect = err.is_connect(),
                 is_timeout = err.is_timeout(),
-                error = %err,
+                // `?err`, not `%err`: reqwest's Display prints only its top
+                // frame ("error sending request for url (...)"), so the cause
+                // that tells a reset from a refusal would be lost.
+                error = ?err,
                 "relay transport failure"
             );
+            // A failure that never left this box answers the way the main path
+            // does: a dead resolver is the machine being offline, any other
+            // connect-phase failure is safe to retry. Both checks run in this
+            // order because a DNS failure is also `is_connect()`. Past connect,
+            // the request may have reached the upstream, so it keeps the plain
+            // 502 with no `x-should-retry`: telling a client to retry it is a
+            // decision about relayed paths this arm does not make.
+            if is_offline_error(&err) {
+                return offline_unavailable(1);
+            }
+            if err.is_connect() {
+                return bad_gateway(1, false);
+            }
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "proxy_error",
@@ -19923,6 +19946,85 @@ mod tests {
         );
     }
 
+    /// The relay's own client is retired on the first relay after the machine
+    /// slept, like the per-account ones, so a relayed path does not answer the
+    /// client a 502 for a connection the sleep killed. The control half: with
+    /// no sleep, the relay keeps the SAME client and its warm pool.
+    ///
+    /// This is the only test that injects into `RELAY_CLIENT`'s detector, and
+    /// it takes its control pair before injecting; another test relaying in
+    /// between can only consume the wake itself, which still leaves a new client.
+    #[test]
+    fn the_relay_client_is_retired_on_the_first_relay_after_a_sleep() {
+        let first = relay_client().expect("the relay client builds");
+        let second = relay_client().expect("the relay client builds");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "with no sleep between two relays they must share one client"
+        );
+
+        RELAY_CLIENT
+            .detector()
+            .inject_sleep(Duration::from_secs(900));
+        let woken = relay_client().expect("the relay client builds");
+        assert!(
+            !Arc::ptr_eq(&first, &woken),
+            "the first relay after a sleep must get a NEW client, not the pool the \
+             sleep killed"
+        );
+    }
+
+    /// Each recycle logs its own reason. The stream-reset recycle used to log
+    /// its own line AND the serve-budget one, so the log claimed a budget that
+    /// was never spent. The serve-budget half is the positive control: the
+    /// capture can see that wording when it is due.
+    #[test]
+    fn each_client_recycle_logs_only_its_own_reason() {
+        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+
+        let reset_log = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(reset_log.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            manager.recycle_client_after_reset(0);
+        });
+        let reset_log = reset_log.contents();
+        assert!(
+            reset_log.contains("after an HTTP/2 stream reset"),
+            "the reset recycle names the reset: {reset_log}"
+        );
+        assert!(
+            !reset_log.contains("serve budget"),
+            "the reset recycle must not claim a spent serve budget: {reset_log}"
+        );
+
+        let budget_log = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(budget_log.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..10_000 {
+                drop(manager.enter_in_flight(0));
+                if budget_log.contents().contains("serve budget") {
+                    break;
+                }
+            }
+        });
+        let budget_log = budget_log.contents();
+        assert_eq!(
+            budget_log.matches("after its serve budget").count(),
+            1,
+            "spending the serve budget logs the budget line once: {budget_log}"
+        );
+        assert!(
+            !budget_log.contains("stream reset"),
+            "the budget recycle must not claim a stream reset: {budget_log}"
+        );
+    }
+
     /// **The seam the arm actually calls**: `recycle_client_after_reset` swaps
     /// the account's client `Arc` (so the retry that follows genuinely lands on
     /// a fresh connection), and only the StreamReset arm calls it, a
@@ -21176,6 +21278,109 @@ mod tests {
             Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
             "the 503 must tell the client when to come back"
         );
+    }
+
+    /// Relay one raw `POST /v1/oauth/token` to `upstream` and return the answer,
+    /// calling [`relay_upstream`] directly so nothing else in [`handle`] decides
+    /// the status.
+    async fn relay_to(upstream: &str) -> Response {
+        let manager = Manager::with_live_refresher(dummy_config(None, upstream), None);
+        relay_upstream(
+            &manager,
+            RelayMode::Raw,
+            crate::provider::Provider::Anthropic,
+            Method::POST,
+            "/v1/oauth/token",
+            &HeaderMap::new(),
+            Body::from(r#"{"grant_type":"refresh_token"}"#),
+            Instant::now(),
+        )
+        .await
+    }
+
+    fn retry_after(resp: &Response) -> Option<&str> {
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// A relay whose connection is refused never left this box, so it answers
+    /// the main path's safe-to-retry 503, not a 502 that points at the upstream.
+    #[tokio::test]
+    async fn a_relay_refused_at_connect_answers_503_with_retry_after() {
+        let resp = relay_to(&format!("http://127.0.0.1:{}", closed_loopback_port())).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a connect-phase relay failure sent nothing upstream, so it is a 503"
+        );
+        assert_eq!(
+            retry_after(&resp),
+            Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "the connect-phase 503 tells the client when to come back"
+        );
+    }
+
+    /// A relay whose upstream host cannot resolve is the machine being offline,
+    /// and answers the main path's offline 503.
+    #[tokio::test]
+    async fn a_relay_to_an_unresolvable_host_answers_the_offline_503() {
+        let resp = relay_to("http://offline-probe.invalid").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a dead resolver is a local, recoverable condition, not a bad gateway"
+        );
+        assert_eq!(
+            retry_after(&resp),
+            Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "the offline 503 tells the client when to come back"
+        );
+        let body = to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Name resolution failed"),
+            "the offline answer, not the connect-phase one: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// A relay that got PAST connect may have reached the upstream, so it keeps
+    /// today's plain 502 with no `x-should-retry` either way: its outcome is
+    /// unknown, and whether relayed paths should tell clients to retry is not
+    /// decided here.
+    #[tokio::test]
+    async fn a_relay_dropped_after_connect_still_answers_502() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Read the request so it has provably left the client, then
+                // hang up without answering.
+                let mut buf = [0u8; 1024];
+                if sock.read(&mut buf).await.is_err() {
+                    continue;
+                }
+                drop(sock);
+            }
+        });
+
+        let resp = relay_to(&format!("http://{addr}")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "a failure past connect keeps the 502: the request may have arrived"
+        );
+        assert_eq!(
+            resp.headers().get("x-should-retry"),
+            None,
+            "the relay's 502 says nothing about retrying, as before"
+        );
+        assert_eq!(retry_after(&resp), None, "and carries no retry-after");
     }
 
     /// The per-request wait bound must stay inside the loop's total attempt
