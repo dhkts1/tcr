@@ -220,10 +220,7 @@ carry labels, and a labelled set can be *reserved* so only traffic that asks for
 account can be named to serve the identity and control-plane calls a client makes alongside its
 prompts; inference never picks that account, so it stays clean. You can add, enable, disable and
 remove accounts while the proxy runs, which matters because a restart is what costs you warm pins.
-There is a native macOS menu-bar app and a terminal dashboard. `tcr` also drops in for the Node
-[teamclaude](https://github.com/KarpelesLab/teamclaude) proxy, with the same config, certs and port,
-though with that proxy's leaf certificate in place it never pools `codex`
-([why, and the fix](docs/troubleshooting.md#tcr-run---codex-says-it-is-launching-codex-directly-not-pooled)).
+There is a native macOS menu-bar app and a terminal dashboard.
 
 **Codex accounts rotate too.** The pool can also hold ChatGPT logins for OpenAI's `codex` CLI,
 kept apart from the Claude accounts: a Codex request is only ever served by a Codex account, and
@@ -414,15 +411,6 @@ or ChatGPT logins for Codex, signed in with `tcr login --codex` or imported with
 `tcr login --from-codex`. `tcr` does not serve Anthropic API keys, and refuses a Codex login made
 with an API key too ([`docs/cli.md`](docs/cli.md#--from-codex-importing-the-login-codex-already-has)).
 
-### How is this related to teamclaude?
-
-`tcr` is a from-scratch Rust rewrite of the Node proxy
-[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and drops in for it: same
-config file, certificates and port. With the Node proxy's leaf certificate in place, though, `tcr`
-never pools `codex`;
-[`docs/troubleshooting.md`](docs/troubleshooting.md#tcr-run---codex-says-it-is-launching-codex-directly-not-pooled)
-says why, and what to do.
-
 ## Documentation
 
 | Document | What is in it |
@@ -507,9 +495,6 @@ That is a lot of keys for a tool that rotates Claude accounts. The reasoning is 
 and Sparkle's private key does more than protect a build artifact. It decides what every copy
 already installed will run. A key that is not stored here cannot be stolen from here.
 
-## Credits and license
+## License
 
-Licensed under PolyForm Noncommercial 1.0.0; see [`LICENSE`](LICENSE). This is a from-scratch Rust
-rewrite of the Node proxy [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude),
-which is MIT licensed. The original's copyright and license notice are kept in
-[`NOTICE`](NOTICE).
+Licensed under PolyForm Noncommercial 1.0.0; see [`LICENSE`](LICENSE).
