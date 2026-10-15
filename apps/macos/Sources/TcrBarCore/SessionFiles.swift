@@ -299,7 +299,7 @@ public enum CodexRollouts {
 ///
 /// What is remembered is for one codex home; pointed at another, the join starts over. A
 /// session that leaves the list is forgotten.
-public struct CodexRolloutJoin {
+public struct CodexRolloutJoin: Sendable {
     /// How long a miss is remembered before its id is looked up again.
     public static let missRetrySeconds: TimeInterval = 60
 

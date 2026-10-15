@@ -108,9 +108,9 @@ final class FleetViewCodexWiringTests: XCTestCase {
     func testEveryAddAccountButtonTakesTheCodexHelp() throws {
         let source = try source(fleetView)
         XCTAssertEqual(
-            source.components(
+            source.filter { !$0.isWhitespace }.components(
                 separatedBy:
-                    "CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp"
+                    "CodexSignInCopy.addAccountHelp(isPresent:effectivePresence.isPresent)??Self.addAccountHelp"
             ).count - 1, 3,
             "the v4 action row, the empty fleet and the legacy action row each take the Codex help")
         for gone in ["help: Self.addAccountHelp", ".help(Self.addAccountHelp)"] {

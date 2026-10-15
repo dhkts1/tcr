@@ -219,8 +219,9 @@ struct FleetView: View {
 
     /// The Codex sessions' rollout files, remembered across polls — see
     /// ``CodexRolloutJoin``. Merged into ``sessionFiles`` by
-    /// ``readSessionFiles()``.
+    /// ``refreshSessionFiles()``.
     @State private var codexRolloutJoin = CodexRolloutJoin()
+    @State private var sessionFilesReading = false
 
     /// What the box itself is doing, for the Tools tab's machine line. `nil`
     /// until the first reading lands, which is the state the line draws
@@ -447,9 +448,8 @@ struct FleetView: View {
         // `RenderStates.swift`'s sessions-tab fixtures.
         .onAppear {
             if !snapshotMode {
-                sessionFiles = readSessionFiles()
+                refreshSessionFiles()
                 machine = MachineStats.read()
-                refreshRunningProcesses()
                 refreshClaudeCount()
                 claudeRoute = ClaudeRouteRead.current()
                 refreshCodexCount()
@@ -458,9 +458,8 @@ struct FleetView: View {
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
-                sessionFiles = readSessionFiles()
+                refreshSessionFiles()
                 machine = MachineStats.read()
-                refreshRunningProcesses()
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
@@ -1194,7 +1193,8 @@ struct FleetView: View {
                 if !fleetIsEmpty {
                     V4Button(
                         title: "Add account…",
-                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp
+                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent)
+                            ?? Self.addAccountHelp
                     ) { addAccount() }
                 }
                 Spacer(minLength: 0)
@@ -1542,7 +1542,8 @@ struct FleetView: View {
                     )
                     V4Button(
                         title: "Add account…",
-                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp
+                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent)
+                            ?? Self.addAccountHelp
                     ) { addAccount() }
                 }
             } else {
@@ -2556,13 +2557,26 @@ struct FleetView: View {
     /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
     /// A Claude file wins an id clash. Read on appear and on each poll, never
     /// in `snapshotMode`, like the Claude files alone were.
-    private func readSessionFiles() -> [String: SessionFile] {
-        let claude = SessionFiles.read()
-        guard let codexHome = codexPresence.codexHome, case .loaded(let fleet) = poller.state
-        else { return claude }
-        let codexIds = Set(fleet.sessions.filter { $0.provider == .codex }.map(\.sessionId))
-        let rollouts = codexRolloutJoin.files(for: codexIds, codexHome: codexHome, now: Date())
-        return claude.merging(rollouts) { claudeFile, _ in claudeFile }
+    private func refreshSessionFiles() {
+        guard !sessionFilesReading else { return }
+        sessionFilesReading = true
+        let home = codexPresence.codexHome
+        let ids = Set(
+            poller.state.loadedFleet?.sessions.filter { $0.provider == .codex }.map(\.sessionId) ?? [])
+        let join = codexRolloutJoin
+        Task {
+            let reading = await PanelSessionFiles.read(
+                codexHome: home, sessionIds: ids, join: join, now: Date())
+            sessionFilesReading = false
+            // A changed home starts a fresh lookup rather than publishing the old home's join.
+            guard home == codexPresence.codexHome else {
+                refreshSessionFiles()
+                return
+            }
+            codexRolloutJoin = reading.join
+            sessionFiles = reading.files
+            refreshRunningProcesses()
+        }
     }
 
     /// One poll's process reading for every RUNNING Bash call on the tab.
@@ -3894,7 +3908,9 @@ struct FleetView: View {
             // rather than in a Terminal window they have to go and find.
             if !fleetIsEmpty {
                 Button("Add account…") { addAccount() }
-                    .help(CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent) ?? Self.addAccountHelp)
+                    .help(
+                        CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent)
+                            ?? Self.addAccountHelp)
             }
             Spacer(minLength: 0)
         }
@@ -5445,7 +5461,8 @@ struct AccountRow: View {
                 // (``AccountActions/groupItems(for:group:accounts:controlName:)``),
                 // so a Codex row is told why it has no run copy and no mint
                 // rather than being offered two items that can only fail.
-                let items = AccountActions.groupItems(for: account, group: group,
+                let items = AccountActions.groupItems(
+                    for: account, group: group,
                     accounts: allAccounts, controlName: control.current)
                 ForEach(items, id: \.self) { item in
                     groupMenuItem(item, group: group)
