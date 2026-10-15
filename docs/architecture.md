@@ -184,25 +184,29 @@ between. The citations are to `openai/codex@f82e365`, under `codex-rs/`: the fin
 `core/src/tools/spec_plan.rs:1276-1284` and
 `core/src/tools/handlers/unified_exec/exec_command.rs:103-108,126-138`.
 
-**When no Codex account can serve,** the 429 is shaped for `codex` rather than for Claude Code,
+**When no Codex account can serve,** a pool that cannot recover by waiting gets a 400
+`no_codex_account`, with no `retry-after`. This includes an empty pool and one whose remaining
+Codex accounts all need a configuration or login change. The message names `tcr login --codex`
+or the changes needed to enable an existing account. Codex does not retry this configuration
+error. With no Codex account configured, new `chatgpt.com` connections are blind-tunneled;
+an existing intercepted tunnel or a request sent directly to tcr's listener can still receive
+the error. Configured but unusable accounts keep marked connections intercepted, so their
+requests receive the error immediately.
+
+For accounts on temporary gates, the 429 is shaped for `codex` rather than for Claude Code,
 on the principle the Claude 429 follows: a quota is the user's limit, and a hold is not. When
 the Codex account that frees soonest is out on a usage limit, a five-hour or weekly window or a
 refusal from the backend, or none reports when it frees and every one is out on such a limit, it
-is `usage_limit_reached`, which `codex` shows as a usage limit and on which it ends the turn.
+is `usage_limit_reached`, which `codex` ultimately shows as a usage limit and on which it ends the turn.
 Its `resets_in_seconds` is the wait until the soonest Codex account frees, uncapped, beside the
 capped `retry-after` that [When every account is out](#when-every-account-is-out) describes.
 When some Codex account reports when it frees, `resets_at` is the instant that wait ends, in
 Unix seconds, and `codex` names it as the time to try again; when none does, the wait is a flat
 60 seconds that nothing measured, so there is no `resets_at`, and `codex` says to try again
-later. When they are out for anything else, a hold on an upstream `retry-after`, a dead login,
-or an account disabled, parked or reserved, it is `pool_unavailable`: the same
+later. For other temporary gates, such as a hold on an upstream `retry-after`, it is
+`pool_unavailable`: the same
 `resets_in_seconds` and capped `retry-after`, never a `resets_at`, and `codex` retries it after
-that `retry-after`, up to five times, instead of ending the turn. With no Codex account in the
-config at all it is `no_codex_account`, whose message names `tcr login --codex`, and it
-carries no `retry-after`, because waiting changes nothing; tcr intercepts no `chatgpt.com`
-tunnel then, so a `codex` meets it only on a tunnel opened while the pool still held an account,
-or by sending to the listener directly. `codex` shows a 429 of that type only as a generic
-retry-limit error, without the message; tcr's log says that no Codex account is configured. A
+that `retry-after`, up to five times, instead of ending the turn. A
 Claude request never spills onto a Codex account, nor a Codex request onto a Claude one.
 
 ## Account selection
@@ -291,8 +295,9 @@ round trips.
 
 **Counting what tcr refused codex.** The proxy keeps two ten-minute counts for Codex requests,
 each in ten one-minute buckets in memory, and reports them on its status document as
-`codex_traffic`. One is bumped by every 429 tcr sends a Codex request itself (no Codex account,
-a pool out on a usage limit, or one that cannot serve for now), recording the body's error type.
+`codex_traffic`. One is bumped by every 400 or 429 pool refusal tcr sends a Codex request itself
+(no usable Codex account, a pool out on a usage limit, or one that cannot serve for now),
+recording the body's error type.
 The other is bumped by every Codex request relayed on the client's own credential because it
 named a FedRAMP or data-residency routing of its own; a bookkeeping call is relayed for its path
 and is not counted. `tcr status` prints both as notes, and its `--json` rows carry them. A
@@ -301,10 +306,10 @@ restart empties both until the next refusal.
 **A pool with no account for the request's provider.** A Claude request to a pool that holds
 Codex accounts and no Claude account gets the same 429 as before, but its message says
 ``No Claude account is configured in tcr; run `tcr login` to add one.`` rather than
-"All 0 accounts exhausted". A Codex request to a pool with no Codex account gets
-`no_codex_account`, whose message names `tcr login --codex`. An account deleted while the proxy
-runs no longer counts as a Codex account; it still counts toward a Claude request's
-"All N accounts", as it always has.
+"All 0 accounts exhausted". A Codex request to a pool with no usable Codex account gets a 400
+`no_codex_account`, whose message names `tcr login --codex` or the changes needed to enable an
+existing account. An account deleted while the proxy runs counts toward neither provider's
+configured-account count.
 
 **A refused credential.** When every account a request tried was refused by an upstream 403,
 the answer is no 429, since waiting will not help. A Claude client gets a 502 naming the

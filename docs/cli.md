@@ -252,8 +252,8 @@ an account may free while `codex` starts:
 [tcr] no Codex account can serve right now: 1 in the weekly window, 1 needing re-login — the soonest frees at 2026-10-15 14:00:00 UTC
 ```
 
-It counts the pool's Codex accounts by why each is out, in the words tcr's own 429 lists them
-with, but in Codex terms: an account ChatGPT refused reads `refused by ChatGPT`, and so does one
+It counts the pool's Codex accounts by why each is out, in the words tcr's own pool refusal
+lists them with, but in Codex terms: an account ChatGPT refused reads `refused by ChatGPT`, and so does one
 held by an upstream hold or 403 while that refusal stands, since the refusal outlasts the hold;
 one in a reserved group reads `unreachable in a reserved group`, since a Codex request carries no
 group that could reach it; one held by an upstream 403 alone reads `refused upstream (403)`. The
@@ -353,25 +353,27 @@ choosing any account. That answer is what makes `codex` use SSE for the rest of 
 and tcr logs it at debug level only.
 
 **When no account can serve.** A Codex request is served by a Codex account or not at all.
-With none eligible, `codex` gets a 429 shaped for it, in one of three kinds:
+With none eligible, `codex` gets an error shaped for it:
 
 - `usage_limit_reached` when the Codex account that frees soonest is out on a usage limit (a
   five-hour or weekly window, or a refusal from the backend), or when none reports when it frees
-  and every one is out on such a limit. It carries `resets_in_seconds` and, if some Codex
+  and every one is out on such a limit. This 429 carries `resets_in_seconds` and, if some Codex
   account reports when it frees, `resets_at`, the time `codex` tells you to try again, and
   `codex` ends the turn on it.
-- `pool_unavailable` when they are out for anything else: a hold on an upstream `retry-after`,
-  a dead login, or an account disabled, parked or reserved. It carries `resets_in_seconds` but
+- `pool_unavailable`, a 429 for other temporary gates, such as a hold on an upstream `retry-after`.
+  It carries `resets_in_seconds` but
   no `resets_at`, and the same `retry-after` a Claude client gets, and `codex` retries it after
   that wait, up to five times, instead of ending the turn.
-- `no_codex_account`, whose message names `tcr login --codex`, when the pool holds none. An
-  account deleted while the proxy runs no longer counts. tcr does not intercept `chatgpt.com`
-  then, so a `codex` meets this one only on a tunnel opened while the pool still held an account,
-  or by sending to tcr's listener directly. `codex` shows it only as a generic retry-limit error,
-  without its message; tcr's log says that no Codex account is configured, and that
-  `tcr login --codex` adds one.
+- `no_codex_account`, a 400 when the pool holds no Codex account or every remaining account
+  needs a configuration or login change. Its message names `tcr login --codex` or the changes
+  needed to enable an existing account. It has no `retry-after`, and Codex does not retry it:
+  waiting cannot make the pool usable. An account deleted while the proxy runs no longer
+  counts. With none configured, tcr blind-tunnels new `chatgpt.com` connections; an existing
+  intercepted tunnel or a request sent directly to tcr's listener can still receive this
+  error. Configured but unusable accounts keep marked connections intercepted, so their
+  requests receive the error immediately.
 
-Every one of these 429s is tcr's own, and is counted: `tcr status` notes them on stderr, and
+These pool refusals are tcr's own, and are counted: `tcr status` notes them on stderr, and
 `codexTraffic` carries the count on `--json` ([Codex rows on `--json`](#codex-rows-on---json)).
 
 **A Codex login refused upstream.** When ChatGPT answers 403 to a pooled account's credential,
@@ -1257,11 +1259,12 @@ codexVerdict: codex is not pooled: the proxy on :3456 is serving the JS teamclau
 
 **On stderr,** in the text form only, a fleet that holds a Codex account gets a note for each
 thing the running proxy did with `codex` in the last ten minutes, each only while its count is
-above zero: the 429s tcr answered `codex` with itself, with the latest one's type, and the
-requests it relayed on the client's own credential because they named a routing of their own.
+above zero: the 400 or 429 pool refusals tcr answered `codex` with itself, with the latest one's
+type, and the requests it relayed on the client's own credential because they named a routing
+of their own.
 
 ```
-[tcr] note codex-refusals: refused_10m=12 last_type=usage_limit_reached — tcr answered codex with a 429 because no Codex account could serve; see the Codex rows above
+[tcr] note codex-refusals: refused_10m=12 last_type=usage_limit_reached — tcr refused codex because no Codex account could serve; see the Codex rows above
 [tcr] note codex-unpooled: relayed_10m=3 — requests from a FedRAMP or residency-routed ChatGPT login ran on their own credential, unpooled
 ```
 
@@ -1510,13 +1513,16 @@ live read, so `no-proxy` and `status-unreadable` appear only in the text form's
 [`codexVerdict:`](#tcr-status) line. `upstream` is present when the proxy sends Codex requests
 somewhere other than the default `https://chatgpt.com` (`codexUpstream`), pooled or not.
 
-`codexTraffic` counts, over the last ten minutes, the 429s tcr answered a Codex request with
-itself (`refused10m`), whatever their type, and the Codex requests it relayed on the client's
-own credential, unpooled, because they named a FedRAMP or data-residency routing of their own
-(`unpooled10m`). `lastRefusal` is the latest 429's `error.type` (`no_codex_account`,
+`codexTraffic` counts, over the last ten minutes, the 400 or 429 pool refusals tcr answered a
+Codex request with itself (`refused10m`), whatever their type, and the requests it relayed on
+the client's own credential, unpooled, because they named a FedRAMP or data-residency routing of their own
+(`unpooled10m`). `lastRefusal` is the latest pool refusal's `error.type` (`no_codex_account`,
 `usage_limit_reached` or `pool_unavailable`) and `lastRefusalAtMs` when it was sent; both are
 present exactly while `refused10m` is above zero. The counts live in the proxy's memory, so a
 restart empties them until the next refusal.
+
+A client that does not recognize a newer server's refusal kind keeps the counts and timestamp
+and skips that optional label.
 
 On a Codex row, `held` labels each window by that reported length: whole days read `{n}d`, whole
 hours `{n}h`, anything else `{n}m`, so a 30-day weekly window is held as `30d`. Without a length,
@@ -1828,7 +1834,7 @@ The block's keys, in order:
 
 | key | what it reads |
 |---|---|
-| `codexAccounts` | the Codex accounts, counted by why each is out, in the words tcr's own 429 gives `codex`: `in rotation`, `on an upstream hold`, `refused upstream (403)`, `in the 5-hour window`, `in the weekly window`, `needing re-login`, `refused by ChatGPT`, `disabled`, `unreachable in a reserved group`, `in a parked group`, in that order. An account held by an upstream hold or 403 while ChatGPT's refusal stands (its row carries `limitReachedType`) counts as `refused by ChatGPT`, since that refusal outlasts the hold; one that a full window refused keeps that window's phrase (`in the 5-hour window` or `in the weekly window`). The rows are the running proxy's, which leave out an account deleted while it runs; with no proxy answering they are the config's, which carry no gate: `2 (no proxy answered)`. `0` with none |
+| `codexAccounts` | the Codex accounts, counted by why each is out, in the words tcr's own pool refusal gives `codex`: `in rotation`, `on an upstream hold`, `refused upstream (403)`, `in the 5-hour window`, `in the weekly window`, `needing re-login`, `refused by ChatGPT`, `disabled`, `unreachable in a reserved group`, `in a parked group`, in that order. An account held by an upstream hold or 403 while ChatGPT's refusal stands (its row carries `limitReachedType`) counts as `refused by ChatGPT`, since that refusal outlasts the hold; one that a full window refused keeps that window's phrase (`in the 5-hour window` or `in the weekly window`). The rows are the running proxy's, which leave out an account deleted while it runs; with no proxy answering they are the config's, which carry no gate: `2 (no proxy answered)`. `0` with none |
 | `codexIntercept` | whether the proxy can terminate marked Codex connections to `chatgpt.com`: `yes` when `codex` is pooled, and when only tcr's CA file is missing; `no` when the proxy's leaf cannot cover `chatgpt.com`, it runs without MITM, or it holds no Codex account; `unknown` when no proxy answered, its status could not be read, or it is another build, one that predates the report or names a leaf this build does not know |
 | `codexCa` | tcr's CA, `~/.config/tcr-ca.pem`, and whether it is a readable file. It is never loaded |
 | `codexUpstream` | where Codex requests go, `(default)` or `(set by codexUpstream)`: the running proxy's, or the config's when no proxy answered |
@@ -1836,7 +1842,7 @@ The block's keys, in order:
 | `codexEnv` | what this shell would hand a `codex` started here: the proxy variable it reads for `https://` (the first set of `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` and `all_proxy`, any credential in it shown as `…`, marked `(points at tcr)` when it names this proxy), `NO_PROXY` (marked `(exempts chatgpt.com)` when an entry does) and `SSL_CERT_FILE` |
 | `codexLogin` | the login `codex` keeps, `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`, and whether it exists. Existence only: it is never read |
 | `codexRequests10m` | the Codex requests this proxy served in the last ten minutes, summed from the Codex sessions' `reqPerMinute` |
-| `codexRefused10m` | the 429s tcr answered `codex` with itself in the last ten minutes (`codexTraffic`'s `refused10m`) |
+| `codexRefused10m` | the 400 or 429 pool refusals tcr answered `codex` with itself in the last ten minutes (`codexTraffic`'s `refused10m`) |
 | `codexUnpooled10m` | the Codex requests relayed unpooled, on a login's own credential, in the last ten minutes (`unpooled10m`) |
 
 The three counts read `none (no proxy answered)` offline, and the last two
@@ -2221,9 +2227,11 @@ A Codex account whose exit lock names a peer gets a line of its own, after the f
 before the summary: `<account>  exits=<peer short id>`, then why the pin does what it does. A
 Codex request always leaves from this Mac, so a pin that is not strict changes nothing, and
 the line ends ` (inert: Codex accounts always leave from this Mac)`. A strict pin (`--must`)
-is not inert: tcr refuses every request routed to that account until the pin is cleared, so
-the line says so and names the command that clears it, `tcr peer account <name> --exits-from
-local --no-must`. `tcr peer account` no longer writes either pin on a Codex account (see
+is not inert: tcr skips that account during selection until the pin is cleared, while other
+usable Codex accounts can still serve. The line names the command that clears it, `tcr peer
+account <name> --exits-from local --no-must`. If no usable Codex account remains, requests
+fail immediately with a Codex configuration error. `tcr peer account` no longer writes either
+pin on a Codex account (see
 [peers.md](peers.md#exit-lock-keeping-an-account-on-one-ip)); these lines are for one written
 before it refused. The `--json` document is unchanged, and its `lentTo` block never names a
 Codex account, because no lease draws on one.

@@ -287,8 +287,10 @@ each reason and its fix. A session started with `tcr run --codex` said the same 
 launched, on its `[tcr] launching codex directly (not pooled): …` line.
 
 With no such line, the proxy can pool `codex`, so look at the two notes `tcr status` prints on
-stderr. `note codex-refusals` means `codex` did reach the pool and tcr refused it with a 429,
-because no Codex account could serve: the Codex rows say why each is out. `note codex-unpooled`
+stderr. `note codex-refusals` means `codex` did reach the pool and tcr refused it: a 429 while
+accounts are on temporary gates, or an immediate 400 `no_codex_account` when none can become
+usable by waiting. Enable or unpark an account, repair its login or other configuration, or
+add one with `tcr login --codex`; the Codex rows say why each is out. `note codex-unpooled`
 means requests reached tcr from a login that names a FedRAMP or data-residency routing of its
 own, which tcr relays on that login's credential, never pooled. Both count the last ten minutes,
 and a restart of the proxy empties them.

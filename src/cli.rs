@@ -2049,7 +2049,7 @@ fn write_control_account(
 ///
 /// No Mac carries a Codex request in this version, so a pin to another Mac is
 /// one the exit path can never honour: a loose one is ignored, and a strict one
-/// refuses every request routed to the account. Both halves that would make
+/// makes the account ineligible for selection. Both halves that would make
 /// such a pin, `--exits-from <peer>` and `--must`, are therefore refused on a
 /// Codex row before anything is written ([`provider_guard`]). `--exits-from
 /// local` and `--no-must` stay allowed, so a pin written before this refusal
@@ -3906,14 +3906,14 @@ fn codex_wire_facts(
 }
 
 /// The stderr notes `tcr status` prints about what the proxy did with codex in the last ten
-/// minutes, each only when its count is above zero: the 429s tcr answered codex with itself,
+/// minutes, each only when its count is above zero: the pool refusals tcr answered codex with itself,
 /// and the requests it relayed unpooled because they named a routing of their own.
 pub(crate) fn codex_traffic_notes(traffic: &tcr_status_wire::CodexTraffic) -> Vec<String> {
     let mut notes = Vec::new();
     if traffic.refused_10m > 0 {
         notes.push(format!(
-            "[tcr] note codex-refusals: refused_10m={} last_type={} — tcr answered codex with a \
-             429 because no Codex account could serve; see the Codex rows above",
+            "[tcr] note codex-refusals: refused_10m={} last_type={} — tcr refused codex \
+             because no Codex account could serve; see the Codex rows above",
             traffic.refused_10m,
             traffic.last_refusal.map_or("unknown", |kind| kind.as_str()),
         ));
@@ -9550,7 +9550,7 @@ mod tests {
             codex_traffic_notes(&traffic),
             [
                 "[tcr] note codex-refusals: refused_10m=12 last_type=usage_limit_reached — tcr \
-                 answered codex with a 429 because no Codex account could serve; see the Codex \
+                 refused codex because no Codex account could serve; see the Codex \
                  rows above",
                 "[tcr] note codex-unpooled: relayed_10m=3 — requests from a FedRAMP or \
                  residency-routed ChatGPT login ran on their own credential, unpooled",

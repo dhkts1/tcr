@@ -127,7 +127,7 @@ final class CodexBannerTests: XCTestCase {
                     bobAndDana,
                     traffic: ["refused10m": 12, "lastRefusal": "no_codex_account", "unpooled10m": 0])
             )?.text,
-            "tcr refused 12 Codex requests in the last 10 min; the last one found no Codex account in the pool."
+            "tcr refused 12 Codex requests in the last 10 min; the last one found no usable Codex account in the pool."
         )
     }
 
@@ -143,7 +143,7 @@ final class CodexBannerTests: XCTestCase {
             "tcr refused 1 Codex request in the last 10 min and told codex its usage limit is reached.")
         XCTAssertEqual(
             try refusedOnce("no_codex_account"),
-            "tcr refused 1 Codex request in the last 10 min: no Codex account was in the pool.")
+            "tcr refused 1 Codex request in the last 10 min: no usable Codex account was in the pool.")
         XCTAssertEqual(
             try refusedOnce("pool_unavailable"),
             "tcr refused 1 Codex request in the last 10 min and asked codex to retry: no Codex account could serve it."

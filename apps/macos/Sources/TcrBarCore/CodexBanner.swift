@@ -39,7 +39,7 @@ public enum CodexBanner: Equatable, Sendable {
     public enum LastRefusal: Equatable, Sendable {
         /// `usage_limit_reached`: codex was told its usage limit is reached.
         case usageLimit
-        /// `no_codex_account`: the pool held no Codex account at all.
+        /// `no_codex_account`: the pool held no usable Codex account.
         case noAccount
         /// Any other type, or none: codex was asked to retry.
         case other
@@ -95,7 +95,7 @@ public enum CodexBanner: Equatable, Sendable {
         case (true, .usageLimit):
             return "tcr refused 1 Codex request in the last 10 min and told codex its usage limit is reached."
         case (true, .noAccount):
-            return "tcr refused 1 Codex request in the last 10 min: no Codex account was in the pool."
+            return "tcr refused 1 Codex request in the last 10 min: no usable Codex account was in the pool."
         case (true, .other):
             return
                 "tcr refused 1 Codex request in the last 10 min and asked codex to retry: no Codex account could serve it."
@@ -104,7 +104,7 @@ public enum CodexBanner: Equatable, Sendable {
                 "tcr refused \(count) Codex requests in the last 10 min; the last one told codex its usage limit is reached."
         case (false, .noAccount):
             return
-                "tcr refused \(count) Codex requests in the last 10 min; the last one found no Codex account in the pool."
+                "tcr refused \(count) Codex requests in the last 10 min; the last one found no usable Codex account in the pool."
         case (false, .other):
             return
                 "tcr refused \(count) Codex requests in the last 10 min; the last one asked codex to retry: no Codex account could serve it."
