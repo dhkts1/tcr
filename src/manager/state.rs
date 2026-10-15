@@ -185,6 +185,36 @@ impl Manager {
     /// configuration change; quota/refusal holds are timers and still count here.
     /// A bound conversation or hard account lock cannot recover on another row.
     pub(crate) fn codex_account_can_serve_eventually(&self, bound_to: Option<usize>) -> bool {
+        self.codex_candidate_counts(bound_to, None, |_| false).0 > 0
+    }
+
+    /// Whether every otherwise usable Codex account has a live access-refusal hold.
+    /// Inspect the hold directly: a later quota window can hide it in the reported gate.
+    pub(crate) fn codex_pool_is_refused(
+        &self,
+        now: OffsetDateTime,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+    ) -> bool {
+        let now_ms = odt_to_ms(now);
+        let (candidates, refused) = self.codex_candidate_counts(bound_to, group, |account| {
+            account.hold_cause == HoldCause::Refused
+                && account
+                    .rate_limited_until_ms
+                    .is_some_and(|until| until > now_ms)
+        });
+        candidates > 0 && candidates == refused
+    }
+
+    /// Count candidate slots and the subset satisfying `matches`, under one accounts read.
+    /// Config/group snapshots are released before that read, so no request-side guard
+    /// waits on config persistence or nests config and accounts locks.
+    fn codex_candidate_counts(
+        &self,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+        matches: impl Fn(&AccountRuntime) -> bool,
+    ) -> (usize, usize) {
         self.reload_groups_if_changed();
         let unsupported = self.codex_accounts_with_unsupported_exit();
         let parked = self.parked_groups();
@@ -195,18 +225,22 @@ impl Manager {
             .expect("accounts lock poisoned")
             .iter()
             .enumerate()
-            .any(|(idx, account)| match account.provider {
+            .filter(|(idx, account)| match account.provider {
                 crate::provider::Provider::Anthropic => false,
                 crate::provider::Provider::Codex => {
                     !account.removed
-                        && bound_to.is_none_or(|bound| bound == idx)
-                        && locked.is_none_or(|locked_idx| locked_idx == idx)
+                        && bound_to.is_none_or(|bound| bound == *idx)
+                        && locked.is_none_or(|locked_idx| locked_idx == *idx)
+                        && group.is_none_or(|group| account.groups.iter().any(|g| g == group))
                         && !account.disabled
                         && account.status != AccountStatus::Error
                         && !Self::parked_blocks(account, &parked)
-                        && !Self::reserved_blocks(account, None, &reserved)
-                        && !unsupported.contains(&idx)
+                        && !Self::reserved_blocks(account, group, &reserved)
+                        && !unsupported.contains(idx)
                 }
+            })
+            .fold((0, 0), |(total, matching), (_, account)| {
+                (total + 1, matching + usize::from(matches(account)))
             })
     }
 

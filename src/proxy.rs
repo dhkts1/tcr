@@ -2749,15 +2749,16 @@ fn codex_forbidden_is_account_error(headers: &HeaderMap, body: &[u8]) -> bool {
         .flatten()
         .filter_map(Value::as_str)
         .any(|code| {
-            matches!(
-                code,
-                "workspace_deactivated"
-                    | "deactivated_workspace"
-                    | "workspace_disabled"
-                    | "account_deactivated"
-                    | "account_disabled"
-                    | "organization_deactivated"
-            )
+            [
+                "workspace_deactivated",
+                "deactivated_workspace",
+                "workspace_disabled",
+                "account_deactivated",
+                "account_disabled",
+                "organization_deactivated",
+            ]
+            .iter()
+            .any(|known| code.trim().eq_ignore_ascii_case(known))
         });
     account_error
 }
@@ -3770,6 +3771,20 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     if !refused_403.is_empty() && refused_403.len() == upstream_responses {
                         return credential_refused_response(provider, &refused_403);
                     }
+                    // A refused pool is an access problem, not a rate-limit retry. Keep
+                    // that status throughout the short revalidation hold, even near its end.
+                    match provider {
+                        Provider::Codex => {
+                            if manager.codex_pool_is_refused(now, bound_to, strict_group) {
+                                manager.note_codex_refusal(
+                                    CodexRefusalKind::CredentialRefused,
+                                    crate::now_ms(),
+                                );
+                                return codex_refused_pool_response();
+                            }
+                        }
+                        Provider::Anthropic => {}
+                    }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
                     // Rather than telling the client "all exhausted" for a transient
                     // blip, wait out the soonest un-park ONCE and retry select — the
@@ -4613,7 +4628,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             .as_deref()
                             .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
                         {
-                            manager.mark_rate_limited(idx, crate::manager::REFUSED_HOLD_SECONDS);
+                            manager.mark_refused(idx);
                             account_access_blocks += 1;
                             last_account_access_block = body.map(|body| (up_headers, body));
                             tried.insert(idx);
@@ -5070,6 +5085,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // retention this was supposed to remove, still there on the common
             // path of one configuration.
             let extended_ttl_for_usage = extended_ttl.get();
+            let stream_path = path.clone();
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -5083,7 +5099,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     tool_uses: response_tool_uses,
                     bound_tokens,
                     codex_tool_calls,
-                } = parse_sse_usage(byte_stream, provider).await;
+                } = parse_sse_usage(byte_stream, provider, &stream_path).await;
                 // Who minted the account-bound tokens in this turn. Recorded before anything
                 // else the parse learned, because it is the only one of them that changes how a
                 // LATER request is routed: every following turn of this conversation echoes
@@ -6738,9 +6754,14 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 /// `response.completed`, `response.incomplete` or `response.failed`, and a stream that ends
 /// without one, including one severed before its first event, gets the same
 /// [`TRUNCATED_STREAM_ERROR_KIND`] verdict as an Anthropic stream without `message_stop`. It
-/// needs no `message_start` to count as a turn: the one Codex path the pool serves is the
-/// Responses endpoint ([`relay_mode`]), so every Codex stream teed here is a turn.
-async fn parse_sse_usage<S, B, E>(stream: S, provider: crate::provider::Provider) -> SseParse
+/// needs no `message_start` to count as a turn on the Responses endpoint. Auxiliary
+/// image, memory and search streams have their own framing; they never synthesize
+/// a missing Responses terminator, while explicit error events still count.
+async fn parse_sse_usage<S, B, E>(
+    stream: S,
+    provider: crate::provider::Provider,
+    path: &str,
+) -> SseParse
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -7032,14 +7053,21 @@ where
     // that stays silent is events having arrived that affirmatively were not
     // `message_start` — that is the actual proof this was never a Messages
     // turn (see the doc comment above). A Codex stream folds in with its own
-    // terminator, and counts as a turn without any `message_start` (every
-    // Codex stream teed here is one, per the doc comment).
+    // terminator on the Responses path. Auxiliary Codex endpoints do not promise it.
     let saw_turn_end = saw_message_stop || saw_codex_end;
     let confirmed_turn = match provider {
         crate::provider::Provider::Anthropic => saw_message_start,
         crate::provider::Provider::Codex => true,
     };
-    if !saw_turn_end && stream_error.is_none() && (confirmed_turn || !saw_any_event) {
+    let expects_turn_end = match provider {
+        crate::provider::Provider::Anthropic => true,
+        crate::provider::Provider::Codex => path == crate::provider::CODEX_RESPONSES_PATH,
+    };
+    if expects_turn_end
+        && !saw_turn_end
+        && stream_error.is_none()
+        && (confirmed_turn || !saw_any_event)
+    {
         stream_error = Some(TRUNCATED_STREAM_ERROR_KIND.to_string());
     }
     // Blocks still open here never reached `content_block_stop` — the turn was cut off before
@@ -7861,9 +7889,8 @@ fn offline_unavailable(dns_failures: usize) -> Response {
 ///
 /// Either way the refused account is then held for [`crate::manager::REFUSED_HOLD_SECONDS`]
 /// (the 403 branch's `mark_refused`), so this answer reaches a client at most once per hold.
-/// While no other account can take a request, the requests inside the hold get the exhaustion
-/// 429 (for codex, the retryable `pool_unavailable`); one that arrives in the hold's last
-/// [`EXHAUSTION_SOFT_WAIT_MAX_SECS`] seconds waits it out instead.
+/// While every available Codex account remains refused, later requests keep receiving 403
+/// without retry guidance. Anthropic retains its exhaustion 429 and bounded soft wait.
 fn credential_refused_response(
     provider: crate::provider::Provider,
     refused: &[(usize, Option<String>)],
@@ -7891,6 +7918,17 @@ fn credential_refused_response(
              (`tcr login` or the TcrBar UI) — retrying will not help.",
             account_list.join(", ")
         ),
+        None,
+    )
+}
+
+/// While every eligible account remains refused, preserve the access-denied status.
+/// A workspace deactivation is not repaired by refreshing its otherwise valid login.
+fn codex_refused_pool_response() -> Response {
+    codex_error_response(
+        StatusCode::FORBIDDEN,
+        codex_error_body(CodexRefusalKind::CredentialRefused,
+            "ChatGPT refused access for the configured Codex accounts. Check account and workspace access before retrying.").to_string(),
         None,
     )
 }
@@ -8963,6 +9001,7 @@ mod tests {
         } = parse_sse_usage(
             futures::stream::iter(chunks),
             crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
         assert_eq!(
@@ -8999,7 +9038,12 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -9031,7 +9075,12 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error, None,
@@ -9060,7 +9109,12 @@ mod tests {
             usage: parsed,
             stream_error,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error.as_deref(),
@@ -9103,6 +9157,7 @@ mod tests {
         } = parse_sse_usage(
             futures::stream::iter(chunks),
             crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
         assert_eq!(
@@ -9144,7 +9199,12 @@ mod tests {
             stream_error,
             tool_uses,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(stream_error, None);
         assert_eq!(tool_uses.len(), 1, "one completed tool_use block");
         assert_eq!(tool_uses[0].id, "toolu_1");
@@ -9178,7 +9238,12 @@ mod tests {
             stream_error,
             tool_uses,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(
             stream_error.as_deref(),
             Some(TRUNCATED_STREAM_ERROR_KIND),
@@ -9210,8 +9275,12 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let SseParse { tool_uses, .. } =
-            parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        let SseParse { tool_uses, .. } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         let heads: Vec<(&str, Option<&str>)> = tool_uses
             .iter()
             .map(|t| (t.id.as_str(), t.command_head.as_deref()))
@@ -9253,7 +9322,12 @@ mod tests {
             tool_uses,
             bound_tokens,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(
             bound_tokens,
             vec![(BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string())]
@@ -9292,7 +9366,12 @@ mod tests {
             tool_uses,
             bound_tokens,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(
             bound_tokens,
             vec![
@@ -9329,7 +9408,12 @@ mod tests {
             stream_error,
             bound_tokens,
             ..
-        } = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        } = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(stream_error.as_deref(), Some(TRUNCATED_STREAM_ERROR_KIND));
         assert_eq!(
             bound_tokens,
@@ -9408,7 +9492,12 @@ mod tests {
         );
         // The same adapter every Anthropic SSE test above feeds the parser with.
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(stream_text))]);
-        let parsed = parse_sse_usage(stream, crate::provider::Provider::Codex).await;
+        let parsed = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Codex,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert_eq!(parsed.usage.input_total, 1200);
         assert_eq!(parsed.usage.cache_read, 1000);
         assert_eq!(parsed.usage.output, 40);
@@ -9422,7 +9511,12 @@ mod tests {
     /// [`parse_sse_usage`] over one Codex stream, delivered in a single chunk.
     async fn parse_codex_stream(text: impl Into<Bytes>) -> SseParse {
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(text.into())]);
-        parse_sse_usage(stream, crate::provider::Provider::Codex).await
+        parse_sse_usage(
+            stream,
+            crate::provider::Provider::Codex,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await
     }
 
     /// A Codex turn's reasoning tokens are read off the same usage object as the rest, under
@@ -9623,7 +9717,12 @@ mod tests {
             "\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(stream_text))]);
-        let parsed = parse_sse_usage(stream, crate::provider::Provider::Anthropic).await;
+        let parsed = parse_sse_usage(
+            stream,
+            crate::provider::Provider::Anthropic,
+            crate::provider::CODEX_RESPONSES_PATH,
+        )
+        .await;
         assert!(
             parsed.codex_tool_calls.is_empty(),
             "an Anthropic stream carries no Codex call"
@@ -9911,6 +10010,30 @@ mod tests {
         ))
         .await;
         assert_eq!(completed_without_usage.stream_error, None);
+    }
+
+    #[tokio::test]
+    async fn codex_auxiliary_sse_does_not_require_a_responses_terminator() {
+        for path in [
+            "/backend-api/codex/images/generations",
+            "/backend-api/codex/images/edits",
+            "/backend-api/codex/memories/trace_summarize",
+            "/backend-api/codex/alpha/search",
+        ] {
+            for body in ["", "event: done\ndata: {\"type\":\"done\"}\n\n"] {
+                let stream = futures::stream::iter(vec![Ok::<_, Infallible>(body)]);
+                let parsed = parse_sse_usage(stream, crate::provider::Provider::Codex, path).await;
+                assert_eq!(parsed.stream_error, None, "{path}: {body:?}");
+            }
+            let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
+            let stream = futures::stream::iter(vec![Ok::<_, Infallible>(body)]);
+            let parsed = parse_sse_usage(stream, crate::provider::Provider::Codex, path).await;
+            assert_eq!(
+                parsed.stream_error.as_deref(),
+                Some("server_error"),
+                "{path}"
+            );
+        }
     }
 
     /// The non-streamed twin of the token scan, including the body's own message id.
@@ -22563,10 +22686,10 @@ mod tests {
     /// **Every refusal tcr sends a Codex request itself is counted, under its body's type**, so
     /// `tcr status` can say codex was refused while the panel looks healthy: no Codex account
     /// at all, an unusable pool (disabled), a pool held temporarily by an upstream
-    /// 403, and a pool out on a quota. A Claude client's 429 is not codex's and is not counted.
+    /// rate limit, and a pool out on a quota. A Claude client's 429 is not codex's and is not counted.
     ///
     /// Watched red: without the bump in the zero-account branch, the first case reads 0; with a
-    /// 403 hold counted as a quota, the last case reads `usage_limit_reached`.
+    /// transient hold counted as a quota, the last case reads `usage_limit_reached`.
     #[tokio::test]
     async fn every_codex_refusal_tcr_sends_bumps_the_refused_ring() {
         let anthropic_echo = CapturingUpstream::spawn().await;
@@ -22626,10 +22749,9 @@ mod tests {
             (1, Some(CodexRefusalKind::UsageLimitReached))
         );
 
-        // An account held by an upstream 403 is out for its short hold, and codex is told to
-        // retry: the 429 tcr sends meanwhile is counted like any other.
+        // A transient rate limit keeps its retryable pool-unavailable response.
         let manager = Manager::with_live_refresher(fleet(), None);
-        manager.mark_refused(1);
+        manager.mark_rate_limited(1, 120);
         let response = send_codex_turn(&manager).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
@@ -23153,7 +23275,185 @@ mod tests {
         let blocked = codex_index_of(first_bearer.lock().unwrap().as_deref().unwrap());
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(snap.accounts[blocked].codex.login_error, None);
-        assert_eq!(snap.accounts[blocked].gate, GateReason::Hold);
+        assert_eq!(snap.accounts[blocked].gate, GateReason::Refused);
+        server.abort();
+    }
+
+    #[test]
+    fn codex_workspace_refusal_codes_ignore_case_and_whitespace() {
+        for code in [
+            "workspace_deactivated",
+            "deactivated_workspace",
+            "workspace_disabled",
+            "account_deactivated",
+            "account_disabled",
+            "organization_deactivated",
+        ] {
+            let body = serde_json::json!({"error":{"code":format!(" {} ", code.to_uppercase())}});
+            assert!(
+                codex_forbidden_is_account_error(&HeaderMap::new(), body.to_string().as_bytes()),
+                "{code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_workspace_refusals_keep_answering_403_during_the_hold() {
+        let origin = Router::new().fallback(|| async {
+            Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let manager =
+            Manager::with_live_refresher(codex_fleet_with_carol("http://127.0.0.1:9", &url), None);
+        for attempt in 0..2 {
+            let response = send_codex_turn(&manager).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "attempt {attempt}"
+            );
+            assert!(!response.headers().contains_key("retry-after"));
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(!text.contains("pool_unavailable"), "{text}");
+            assert!(!text.contains("tcr login"), "{text}");
+        }
+        for account in manager
+            .snapshot(OffsetDateTime::now_utc())
+            .accounts
+            .iter()
+            .filter(|a| a.provider == crate::provider::Provider::Codex)
+        {
+            assert_eq!(account.gate, GateReason::Refused);
+            assert_eq!(account.codex.login_error, None);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_workspace_refusal_stays_403_when_a_quota_gate_outlasts_its_hold() {
+        for (window, gate) in [
+            ("primary", GateReason::FiveHour),
+            ("secondary", GateReason::SevenDay),
+        ] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = requests.clone();
+            let origin = Router::new().fallback(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"error":{"code":"workspace_deactivated"}}"#))
+                        .unwrap()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
+            config.accounts[2].disabled = Some(true);
+            let manager = Manager::with_live_refresher(config, None);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(
+                    format!("x-codex-{window}-used-percent").as_bytes(),
+                )
+                .unwrap(),
+                HeaderValue::from_static("95"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_bytes(format!("x-codex-{window}-reset-at").as_bytes())
+                    .unwrap(),
+                HeaderValue::from_str(
+                    &(OffsetDateTime::now_utc().unix_timestamp() + 7200).to_string(),
+                )
+                .unwrap(),
+            );
+            manager.update_quota(1, &headers, 200);
+            let hint = manager.exhaustion_hint(
+                OffsetDateTime::now_utc(),
+                false,
+                crate::provider::Provider::Codex,
+                None,
+            );
+            assert_eq!(hint.gated.get(&gate), Some(&1));
+            assert_eq!(
+                send_codex_turn(&manager).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let hint = manager.exhaustion_hint(
+                OffsetDateTime::now_utc(),
+                false,
+                crate::provider::Provider::Codex,
+                None,
+            );
+            assert_eq!(hint.gated.get(&gate), Some(&1));
+            assert!(
+                !hint.gated.contains_key(&GateReason::Refused),
+                "the longer quota gate hides the active refusal hold"
+            );
+            let response = send_codex_turn(&manager).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{window}");
+            assert!(!response.headers().contains_key("retry-after"));
+            assert_eq!(
+                body_json(response).await["error"]["code"],
+                "credential_refused"
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "requests during the refusal hold never reach the origin"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_workspace_refusal_with_a_disabled_sibling_is_still_403() {
+        let origin = Router::new().fallback(|| async {
+            Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
+        config.accounts[2].disabled = Some(true);
+        let manager = Manager::with_live_refresher(config, None);
+        for attempt in 0..2 {
+            let response = send_codex_turn(&manager).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "attempt {attempt}"
+            );
+            assert!(!response.headers().contains_key("retry-after"));
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(!text.contains("pool_unavailable"), "{text}");
+            assert!(!text.contains("tcr login"), "{text}");
+        }
+        for account in manager
+            .snapshot(OffsetDateTime::now_utc())
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.provider == crate::provider::Provider::Codex && a.gate != GateReason::Disabled
+            })
+        {
+            assert_eq!(account.gate, GateReason::Refused);
+            assert_eq!(account.codex.login_error, None);
+        }
         server.abort();
     }
 
@@ -23262,14 +23562,13 @@ mod tests {
         assert_eq!(anthropic_echo.request_count(), 0);
     }
 
-    /// **A refused Codex login is held, and codex's next request meanwhile gets a retryable 429**
-    /// rather than a second refusal: the 403 holds the account for its short hold, so the
-    /// credential refusal reaches codex once, and the request after it never reaches the origin.
-    /// That 429 is counted; the refusal, which is no 429, is not.
+    /// A refused Codex login stays held and subsequent requests preserve access-denied status.
+    /// The next request never reaches the origin and receives no misleading rate-limit retry.
+    /// The locally generated refusal increments the refusal counter.
     ///
     /// Watched red: without the hold, the second request reaches the origin and is served.
     #[tokio::test]
-    async fn a_refused_codex_login_is_held_and_codex_gets_a_retryable_429_meanwhile() {
+    async fn a_refused_codex_login_is_held_and_keeps_its_access_denied_status() {
         let anthropic_echo = CapturingUpstream::spawn().await;
         let (codex_url, refused, served) = spawn_codex_origin_forbidding_the_first().await;
         let manager =
@@ -23284,7 +23583,7 @@ mod tests {
         );
 
         let second = send_codex_turn(&manager).await;
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             second
                 .headers()
@@ -23292,8 +23591,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
-        assert!(second.headers().contains_key("retry-after"));
-        assert_eq!(body_json(second).await["error"]["type"], "pool_unavailable");
+        assert!(!second.headers().contains_key("retry-after"));
+        let second_body = body_json(second).await;
+        assert_eq!(second_body["error"]["type"], "proxy_error");
+        assert_eq!(second_body["error"]["code"], "credential_refused");
 
         assert!(refused.lock().expect("poisoned").is_some(), "one refusal");
         assert!(
@@ -23302,7 +23603,7 @@ mod tests {
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some(CodexRefusalKind::PoolUnavailable))
+            (1, Some(CodexRefusalKind::CredentialRefused))
         );
     }
     #[tokio::test]
