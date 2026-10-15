@@ -180,15 +180,6 @@ final class SessionsCodexCopyTests: XCTestCase {
 
     // MARK: - Tools tab
 
-    func testTheRunningHeadUnit() {
-        XCTAssertEqual(
-            SessionsCodexCopy.runningUnit(count: 3, anyCodex: true),
-            "3 · ring fills toward each call's timeout")
-        XCTAssertEqual(
-            SessionsCodexCopy.runningUnit(count: 3, anyCodex: false),
-            "3 · ring fills toward the 600s timeout")
-    }
-
     func testTheToolsFooter() {
         XCTAssertEqual(
             SessionsCodexCopy.toolsFooter(holdsCodex: true),

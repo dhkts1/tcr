@@ -197,6 +197,23 @@ final class FleetViewCodexWiringTests: XCTestCase {
             "the live panel still passes no codex evidence")
     }
 
+    /// A running call's ring states the timeout it fills toward on its own help, which is
+    /// where that figure lives now that the RUNNING NOW head carries its count alone. A codex
+    /// call's ring fills toward the call's own timeout, so its help names that figure, never
+    /// the Bash tool's 600 s.
+    func testARunningRingsHelpNamesTheTimeoutItFillsToward() throws {
+        let source = try source(fleetView)
+        let item = try slice(
+            source, from: "private func runningToolItem(_ entry: SessionToolEntry) -> some View {",
+            to: "private var noKillLabel: some View {")
+        XCTAssertTrue(
+            item.contains(".help(\"Fills toward the \\(Int(cap))s tool timeout\")"),
+            "the running ring's help no longer names the timeout its own ring fills toward")
+        XCTAssertFalse(
+            item.contains("Int(bashTimeoutSeconds))s tool timeout"),
+            "the running ring's help names the Bash tool's 600 s over a codex call's own timeout")
+    }
+
     // MARK: - Source helpers
 
     private func repoRoot() -> URL {

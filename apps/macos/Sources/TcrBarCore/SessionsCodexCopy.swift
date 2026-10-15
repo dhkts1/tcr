@@ -110,14 +110,6 @@ public enum SessionsCodexCopy {
 
     // MARK: Tools
 
-    /// The RUNNING NOW head's unit. While any running call is codex's, a ring may fill toward
-    /// that call's own timeout rather than the Bash tool's 600 s, so the head stops naming one
-    /// figure for every ring.
-    public static func runningUnit(count: Int, anyCodex: Bool) -> String {
-        if anyCodex { return "\(count) · ring fills toward each call's timeout" }
-        return "\(count) · ring fills toward the \(Int(ToolCall.bashTimeoutSeconds))s timeout"
-    }
-
     /// The Tools tab's footer. tcr reads a Claude call from the request that carries it, and a
     /// codex call from the response that announces it, so with a Codex account the tab is
     /// built from both.

@@ -2398,7 +2398,9 @@ struct FleetView: View {
                         )
                         // The denominator, where the ring is: the section
                         // head used to carry it as a caption over every row.
-                        .help("Fills toward the \(Int(bashTimeoutSeconds))s tool timeout")
+                        // `cap`, as the ring itself: a codex call's own
+                        // timeout, or the Bash tool's 600s.
+                        .help("Fills toward the \(Int(cap))s tool timeout")
                     }
                     // Elapsed and "20s left" are ONE reading, so they are one
                     // Text: a call in the warning band is red AND says how
