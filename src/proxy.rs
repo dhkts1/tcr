@@ -19974,6 +19974,57 @@ mod tests {
         );
     }
 
+    /// Each recycle logs its own reason. The stream-reset recycle used to log
+    /// its own line AND the serve-budget one, so the log claimed a budget that
+    /// was never spent. The serve-budget half is the positive control: the
+    /// capture can see that wording when it is due.
+    #[test]
+    fn each_client_recycle_logs_only_its_own_reason() {
+        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+
+        let reset_log = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(reset_log.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            manager.recycle_client_after_reset(0);
+        });
+        let reset_log = reset_log.contents();
+        assert!(
+            reset_log.contains("after an HTTP/2 stream reset"),
+            "the reset recycle names the reset: {reset_log}"
+        );
+        assert!(
+            !reset_log.contains("serve budget"),
+            "the reset recycle must not claim a spent serve budget: {reset_log}"
+        );
+
+        let budget_log = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(budget_log.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..10_000 {
+                drop(manager.enter_in_flight(0));
+                if budget_log.contents().contains("serve budget") {
+                    break;
+                }
+            }
+        });
+        let budget_log = budget_log.contents();
+        assert_eq!(
+            budget_log.matches("after its serve budget").count(),
+            1,
+            "spending the serve budget logs the budget line once: {budget_log}"
+        );
+        assert!(
+            !budget_log.contains("stream reset"),
+            "the budget recycle must not claim a stream reset: {budget_log}"
+        );
+    }
+
     /// **The seam the arm actually calls**: `recycle_client_after_reset` swaps
     /// the account's client `Arc` (so the retry that follows genuinely lands on
     /// a fresh connection), and only the StreamReset arm calls it, a

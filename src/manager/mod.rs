@@ -579,6 +579,18 @@ pub(crate) fn fail_next_client_build() {
 /// rarer.
 const MAX_SERVES_PER_CONNECTION: u32 = 500;
 
+/// Why [`Manager::recycle_client`] is retiring one account's client, so its
+/// log line names the cause instead of always claiming a spent serve budget.
+/// A sleep retires every account at once and logs its own line
+/// (`Manager::retire_every_client_after_sleep`), so it is not a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecycleReason {
+    /// The client carried [`MAX_SERVES_PER_CONNECTION`] sends.
+    ServeBudget,
+    /// An HTTP/2 stream reset left the pooled connection open and broken.
+    StreamReset,
+}
+
 /// Build one upstream-forwarding HTTP client. Called once per account (see
 /// [`AccountRuntime::http`]) so every account's client is configured
 /// identically and differs from every other account's only in the connection
@@ -2266,7 +2278,7 @@ impl Manager {
             }
         };
         if claimed_recycle {
-            self.recycle_client(idx);
+            self.recycle_client(idx, RecycleReason::ServeBudget);
         }
         InFlightGuard {
             manager: Arc::clone(self),
@@ -2322,17 +2334,11 @@ impl Manager {
     /// broken connection, the live incident this exists to fix: 477
     /// stream-reset failures across every account over 11 minutes, cured only
     /// by a full process restart, because nothing in the ladder ever swapped
-    /// the connection out. This is [`Self::recycle_client`] under its own
-    /// name so the log line can say why, mirroring the call already made by
-    /// the serve-budget path above.
+    /// the connection out. This is [`Self::recycle_client`] with
+    /// [`RecycleReason::StreamReset`], so its one log line names the reset
+    /// rather than a serve budget that was never spent.
     pub fn recycle_client_after_reset(&self, idx: usize) {
-        tracing::info!(
-            account_index = idx,
-            account = self.account_name(idx).as_deref().unwrap_or("?"),
-            "retiring the upstream connection after an HTTP/2 stream reset, \
-             the connection survives the reset, so the retry needs a fresh one"
-        );
-        self.recycle_client(idx);
+        self.recycle_client(idx, RecycleReason::StreamReset);
     }
 
     /// Retire account `idx`'s HTTP client and give it a fresh one, dropping the
@@ -2350,7 +2356,11 @@ impl Manager {
     /// [`Self::add_or_update_account`]'s Added path and for the same reason: a
     /// panic in [`build_serving_client`] (which tests inject) must not poison
     /// `self.accounts`.
-    fn recycle_client(&self, idx: usize) {
+    ///
+    /// `reason` is the caller's, and picks the one log line this writes: the
+    /// line used to claim a spent serve budget for every recycle, including
+    /// the stream-reset one.
+    fn recycle_client(&self, idx: usize, reason: RecycleReason) {
         let fresh = build_serving_client(self.http1_only());
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         let Some(account) = accounts.get_mut(idx) else {
@@ -2359,13 +2369,21 @@ impl Manager {
             return;
         };
         account.http = fresh;
-        tracing::info!(
-            account_index = idx,
-            account = %account.name,
-            serves = MAX_SERVES_PER_CONNECTION,
-            "retiring the upstream connection after its serve budget — \
-             a fresh h2 connection costs a handshake, not a prompt-cache miss"
-        );
+        match reason {
+            RecycleReason::ServeBudget => tracing::info!(
+                account_index = idx,
+                account = %account.name,
+                serves = MAX_SERVES_PER_CONNECTION,
+                "retiring the upstream connection after its serve budget — \
+                 a fresh h2 connection costs a handshake, not a prompt-cache miss"
+            ),
+            RecycleReason::StreamReset => tracing::info!(
+                account_index = idx,
+                account = %account.name,
+                "retiring the upstream connection after an HTTP/2 stream reset, \
+                 the connection survives the reset, so the retry needs a fresh one"
+            ),
+        }
     }
 
     /// Flush the refreshed TOKENS to disk. Token refreshes already persist
