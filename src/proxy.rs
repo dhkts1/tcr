@@ -6471,12 +6471,20 @@ fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
 /// a CONNECT-phase-only timeout, never a total one, because a `/v1/code/` response
 /// is a long-lived event stream that any total timeout would truncate mid-stream.
 ///
+/// Rebuilt on the first relay after the machine slept, for the reason the
+/// per-account clients are ([`crate::wake`]): its pooled connections died during
+/// the sleep and its idle timer did not move.
+///
 /// `None` only if the TLS backend fails to initialise, which the caller answers with
-/// a 502 — a proxy never panics on a client request.
-fn relay_client() -> Option<&'static reqwest::Client> {
-    static RELAY_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
-    RELAY_CLIENT
-        .get_or_init(|| {
+/// a 502 — a proxy never panics on a client request. The next relay tries the build
+/// again.
+fn relay_client() -> Option<Arc<reqwest::Client>> {
+    RELAY_CLIENT.get()
+}
+
+static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::Client>> =
+    std::sync::LazyLock::new(|| {
+        crate::wake::SleepAwareClient::new("relay", || {
             match reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(10))
@@ -6490,8 +6498,7 @@ fn relay_client() -> Option<&'static reqwest::Client> {
                 }
             }
         })
-        .as_ref()
-}
+    });
 
 /// Forward a request upstream WITHOUT touching account rotation — see the `1c`
 /// block in [`handle`] for which requests land here and why.
@@ -19920,6 +19927,34 @@ mod tests {
             classify_transport_failure(&connect),
             TransportFailureReason::ConnectPhase,
             "a CONNECT failure must not be treated as a stream reset: {connect:?}"
+        );
+    }
+
+    /// The relay's own client is retired on the first relay after the machine
+    /// slept, like the per-account ones, so a relayed path does not answer the
+    /// client a 502 for a connection the sleep killed. The control half: with
+    /// no sleep, the relay keeps the SAME client and its warm pool.
+    ///
+    /// This is the only test that injects into `RELAY_CLIENT`'s detector, and
+    /// it takes its control pair before injecting; another test relaying in
+    /// between can only consume the wake itself, which still leaves a new client.
+    #[test]
+    fn the_relay_client_is_retired_on_the_first_relay_after_a_sleep() {
+        let first = relay_client().expect("the relay client builds");
+        let second = relay_client().expect("the relay client builds");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "with no sleep between two relays they must share one client"
+        );
+
+        RELAY_CLIENT
+            .detector()
+            .inject_sleep(Duration::from_secs(900));
+        let woken = relay_client().expect("the relay client builds");
+        assert!(
+            !Arc::ptr_eq(&first, &woken),
+            "the first relay after a sleep must get a NEW client, not the pool the \
+             sleep killed"
         );
     }
 

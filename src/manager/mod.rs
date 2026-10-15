@@ -1151,6 +1151,11 @@ pub struct Manager {
     /// its socket never gets ownership back, and a flag that could be unset is
     /// a flag a future caller can unset by mistake.
     mutation_released: AtomicBool,
+    /// Notices that the machine slept between two upstream sends, so
+    /// [`Self::enter_in_flight`] can retire every account's pooled connection
+    /// before the first post-wake send checks out one the sleep killed. See
+    /// [`crate::wake`] for why the pool's own idle timers cannot.
+    wake: crate::wake::WakeDetector,
     upstream: String,
     /// Where a Codex account's requests go ([`config::Config::codex_upstream`]). Read
     /// through [`Self::upstream_for`]; `upstream` above stays the Anthropic origin.
@@ -1696,6 +1701,7 @@ impl Manager {
             config_write: Arc::new(Mutex::new(())),
             config_path,
             mutation_released: AtomicBool::new(false),
+            wake: crate::wake::WakeDetector::new(),
             upstream,
             codex_upstream,
             proxy_api_key,
@@ -2225,7 +2231,17 @@ impl Manager {
     /// never held across the client build. It used to be a single uncontested
     /// section; that is why the claim resets the counter rather than letting
     /// `recycle_client` re-read it, which would race between the two sections.
+    ///
+    /// It is also where a sleep is noticed, for the same reason: it runs once
+    /// per send and BEFORE the proxy checks the send's client out with
+    /// [`Self::http_client`], so the send that first observes the wake already
+    /// goes out on a fresh pool. [`Self::http_client`] is a read accessor that
+    /// tests call to compare `Arc`s; making it rebuild clients would turn a
+    /// getter into a writer.
     pub fn enter_in_flight(self: &Arc<Self>, idx: usize) -> InFlightGuard {
+        if let Some(slept) = self.wake.observe() {
+            self.retire_every_client_after_sleep(slept);
+        }
         let claimed_recycle = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
@@ -2258,21 +2274,44 @@ impl Manager {
         }
     }
 
-    /// Retire account `idx`'s HTTP client and give it a fresh one, dropping the
-    /// pooled h2 connection that has now carried [`MAX_SERVES_PER_CONNECTION`]
-    /// sends before Anthropic's edge drains it out from under us.
+    /// Give EVERY account a fresh HTTP client after the machine slept for
+    /// `slept`, not just the one about to send: the sleep outlasted every
+    /// pooled connection's idle life on the server side, and none of the pools
+    /// can tell (see [`crate::wake`]). Each account's next send then opens a
+    /// new connection instead of failing once on a dead one and retrying.
     ///
-    /// Requests already in flight are untouched. Each holds its own
-    /// `Arc<reqwest::Client>` clone, taken by [`Self::http_client`] before the
-    /// send, so the OLD client — and the connection carrying their streams —
-    /// stays alive until the last of them finishes and drops the final `Arc`.
-    /// Only sends selected after this point get the new pool. That is the whole
-    /// reason this swaps an `Arc` instead of reaching into the existing client.
+    /// Same rules as [`Self::recycle_client`]: in-flight requests keep their
+    /// own `Arc` of the old client, and the replacements are built with no lock
+    /// held. An account appended between the count and the swap already came
+    /// with a fresh client of its own, so it is left alone. Each swapped
+    /// account's serve-budget counter restarts, since it counts serves on the
+    /// CURRENT client.
     ///
-    /// The replacement is built with NEITHER lock held, matching
-    /// [`Self::add_or_update_account`]'s Added path and for the same reason: a
-    /// panic in [`build_serving_client`] (which tests inject) must not poison
-    /// `self.accounts`.
+    /// The one INFO line per wake is here; nothing logs per request.
+    fn retire_every_client_after_sleep(&self, slept: std::time::Duration) {
+        let count = self.accounts.read().expect("accounts lock poisoned").len();
+        let http1_only = self.http1_only();
+        let fresh: Vec<_> = (0..count)
+            .map(|_| build_serving_client(http1_only))
+            .collect();
+        let retired = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut retired = 0usize;
+            for (account, http) in accounts.iter_mut().zip(fresh) {
+                account.http = http;
+                account.serves_since_client_build = 0;
+                retired += 1;
+            }
+            retired
+        };
+        tracing::info!(
+            slept_secs = slept.as_secs(),
+            clients_retired = retired,
+            "the machine slept; retiring every account's pooled upstream connection, \
+             which the sleep most likely closed while the pool's idle timers stood still"
+        );
+    }
+
     /// Recycle account `idx`'s client after an HTTP/2 stream reset, before the
     /// proxy's same-account retry sends on it again.
     ///
@@ -2296,6 +2335,21 @@ impl Manager {
         self.recycle_client(idx);
     }
 
+    /// Retire account `idx`'s HTTP client and give it a fresh one, dropping the
+    /// pooled h2 connection that has now carried [`MAX_SERVES_PER_CONNECTION`]
+    /// sends before Anthropic's edge drains it out from under us.
+    ///
+    /// Requests already in flight are untouched. Each holds its own
+    /// `Arc<reqwest::Client>` clone, taken by [`Self::http_client`] before the
+    /// send, so the OLD client — and the connection carrying their streams —
+    /// stays alive until the last of them finishes and drops the final `Arc`.
+    /// Only sends selected after this point get the new pool. That is the whole
+    /// reason this swaps an `Arc` instead of reaching into the existing client.
+    ///
+    /// The replacement is built with NEITHER lock held, matching
+    /// [`Self::add_or_update_account`]'s Added path and for the same reason: a
+    /// panic in [`build_serving_client`] (which tests inject) must not poison
+    /// `self.accounts`.
     fn recycle_client(&self, idx: usize) {
         let fresh = build_serving_client(self.http1_only());
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
@@ -9047,6 +9101,57 @@ mod tests {
             0,
             "the recycle resets the age counter, so the next budget starts clean"
         );
+    }
+
+    /// After the machine slept, the first send retires EVERY account's client,
+    /// not only the sending one: every pooled connection outlived the sleep
+    /// with idle timers that stood still (see `crate::wake`).
+    ///
+    /// The control half: sends with no sleep between them keep the SAME `Arc`,
+    /// so this cannot pass against a build that rebuilt on every send; and a
+    /// second send after the same sleep keeps the client the first one built.
+    #[test]
+    fn every_upstream_client_is_retired_on_the_first_send_after_a_sleep() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            pacing_refresher(),
+        );
+        let clients = |m: &Manager| -> Vec<Arc<reqwest::Client>> {
+            (0..3)
+                .map(|i| m.http_client(i).expect("account exists"))
+                .collect()
+        };
+        let original = clients(&manager);
+
+        drop(manager.enter_in_flight(0));
+        let awake = clients(&manager);
+        for (i, (before, after)) in original.iter().zip(&awake).enumerate() {
+            assert!(
+                Arc::ptr_eq(before, after),
+                "account {i}: a send with no sleep before it must keep the warm pool"
+            );
+        }
+
+        manager
+            .wake
+            .inject_sleep(std::time::Duration::from_secs(900));
+        drop(manager.enter_in_flight(0));
+        let woken = clients(&manager);
+        for (i, (before, after)) in original.iter().zip(&woken).enumerate() {
+            assert!(
+                !Arc::ptr_eq(before, after),
+                "account {i}: the first send after a sleep must retire this account's \
+                 client too, not only the sending account's"
+            );
+        }
+
+        drop(manager.enter_in_flight(1));
+        for (i, (before, after)) in woken.iter().zip(&clients(&manager)).enumerate() {
+            assert!(
+                Arc::ptr_eq(before, after),
+                "account {i}: one sleep retires the clients once, not on every later send"
+            );
+        }
     }
 
     /// #6 The SSE fix: once the owned guard is MOVED into a streamed body, the

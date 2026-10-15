@@ -62,6 +62,7 @@ pub mod status;
 pub mod tui;
 pub mod update;
 pub mod usage;
+pub mod wake;
 pub mod warmer;
 pub mod wrap;
 
