@@ -326,8 +326,9 @@ enum RenderStates {
             ("25f-codex-group-add-warning", .loaded(fleet(codexGroupAddWarningJSON)), false, nil),
             // The Sessions tab of a fleet holding both providers: alice's Claude
             // session and bob's Codex one, both in teamclaude-rs, bob's joined by
-            // the first line of his rollout file. It shows the Codex footer, the
-            // `Codex` lead on bob's subtitle and the summary's two clause groups.
+            // the first line of his rollout file. It shows the mixed fleet's
+            // footer, the `Codex` lead on bob's subtitle and the summary's two
+            // clause groups.
             // See ``sessionsTabMixedFleet``.
             ("16b-sessions-tab-mixed", .loaded(sessionsTabMixedFleet), false, nil),
             // A Codex-only fleet with no session and no Codex request in the last

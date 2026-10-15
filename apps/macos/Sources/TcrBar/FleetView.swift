@@ -1156,10 +1156,11 @@ struct FleetView: View {
         if visibleTab == .sessions { return "sparkline: req/min, 30m" }
         guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
         // With a Codex account the Tools footer's provenance sentence says
-        // "from request and response bodies · nothing logged", 299.5 pt, and
-        // beside "server abc1234" it cut to "… · no…": the privacy claim lost
-        // to make room for a build id the other tabs still show. The sentence
-        // outranks the id (`PanelFooter`'s own rule), so here the id goes.
+        // "request and response bodies · nothing logged", 268.8 pt, and beside
+        // "server abc1234" the row leaves it 239.0: the privacy claim would be
+        // cut to make room for a build id the other tabs still show. The
+        // sentence outranks the id (`PanelFooter`'s own rule), so here the id
+        // goes.
         if visibleTab == .tools, fleet.holdsCodex { return nil }
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }

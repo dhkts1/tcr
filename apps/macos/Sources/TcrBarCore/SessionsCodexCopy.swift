@@ -19,10 +19,13 @@ public enum SessionsCodexCopy {
     /// The Sessions tab's footer: where its rows come from. The proxy names every session; the
     /// project beside a Claude session comes from Claude Code's session file, and the project
     /// beside a Codex session from the first line of codex's rollout file.
+    ///
+    /// Each line fits beside the sparkline note at 372 pt, where a longer one truncates. A mixed
+    /// fleet's line names neither program, as the Claude-only one does not: naming both drew
+    /// "proxy + Claude Code and c…", and the plain line is true of both kinds of file.
     public static func sessionsFooter(_ fleet: Fleet) -> String {
         switch pools(fleet) {
-        case .claudeOnly: return "proxy + session files"
-        case .mixed: return "proxy + Claude Code and codex session files"
+        case .claudeOnly, .mixed: return "proxy + session files"
         case .codexOnly: return "proxy + codex session files"
         }
     }
@@ -112,10 +115,10 @@ public enum SessionsCodexCopy {
 
     /// The Tools tab's footer. tcr reads a Claude call from the request that carries it, and a
     /// codex call from the response that announces it, so with a Codex account the tab is
-    /// built from both.
+    /// built from both. The two lines are one sentence, worded alike, with that fact changed.
     public static func toolsFooter(holdsCodex: Bool) -> String {
         holdsCodex
-            ? "from request and response bodies · nothing logged"
+            ? "request and response bodies · nothing logged"
             : "request bodies only · nothing logged"
     }
 

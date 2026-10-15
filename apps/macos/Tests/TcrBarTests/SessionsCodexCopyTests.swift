@@ -68,7 +68,7 @@ final class SessionsCodexCopyTests: XCTestCase {
             "proxy + session files")
         XCTAssertEqual(
             SessionsCodexCopy.sessionsFooter(try fleet([alice, bob], sessions: [s.alice, s.bob])),
-            "proxy + Claude Code and codex session files")
+            "proxy + session files")
         XCTAssertEqual(
             SessionsCodexCopy.sessionsFooter(try fleet([bob], sessions: [s.bob])),
             "proxy + codex session files")
@@ -183,7 +183,7 @@ final class SessionsCodexCopyTests: XCTestCase {
     func testTheToolsFooter() {
         XCTAssertEqual(
             SessionsCodexCopy.toolsFooter(holdsCodex: true),
-            "from request and response bodies · nothing logged")
+            "request and response bodies · nothing logged")
         XCTAssertEqual(
             SessionsCodexCopy.toolsFooter(holdsCodex: false),
             "request bodies only · nothing logged")
