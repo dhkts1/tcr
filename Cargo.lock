@@ -2876,36 +2876,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tcr-fdpass"
-version = "0.1.0"
-dependencies = [
- "core-foundation",
- "libc",
- "nix 0.31.3",
- "security-framework",
-]
-
-[[package]]
-name = "tcr-peer-wire"
-version = "0.1.0"
-dependencies = [
- "data-encoding",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "tcr-status-wire"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
-name = "teamclaude-rs"
+name = "tcr"
 version = "1.1.22"
 dependencies = [
  "anyhow",
@@ -2947,6 +2918,35 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tcr-fdpass"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "libc",
+ "nix 0.31.3",
+ "security-framework",
+]
+
+[[package]]
+name = "tcr-peer-wire"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tcr-status-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "time",
 ]
 
 [[package]]

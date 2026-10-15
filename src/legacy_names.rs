@@ -16,9 +16,10 @@
 //! list of places that still honour an old name. That later change has to
 //! decide how existing installs move their files, and the CA is the hard one.
 //!
-//! The guard test at the bottom fails if one of these names is written as a
-//! literal anywhere else under `src/`, which is what keeps this file the only
-//! one to delete.
+//! The guard test at the bottom fails if the old name is written in code
+//! anywhere else under `src/`, in any case and any shape (a literal, an
+//! identifier, an environment variable), which is what keeps this file the
+//! only one to delete.
 
 /// The config file every install before the rename has:
 /// `~/.config/teamclaude.json`. Used when `~/.config/tcr.json` does not exist
@@ -58,19 +59,11 @@ pub const JS_PROXY_BIN: &str = "teamclaude";
 mod tests {
     use std::path::{Path, PathBuf};
 
-    /// Every name in this file that must not be written as a literal anywhere
-    /// else under `src/`. Matched as substrings of code with comments removed.
-    const NEEDLES: [&str; 4] = [
-        super::CONFIG_FILE,
-        "teamclaude-leaf",
-        "teamclaude-ca",
-        super::LOG_PREFIX,
-    ];
-
-    /// `"teamclaude"` as a whole string literal, quotes included.
-    fn whole_literal() -> String {
-        format!("\"{}\"", super::JS_PROXY_BIN)
-    }
+    /// The old project name. Every name in this file contains it, and after the
+    /// rename nothing else under `src/` may write it in code, in any case: not
+    /// as a literal, an identifier, an environment variable or a crate path.
+    /// Matched as a case-insensitive substring of code with comments removed.
+    const OLD_NAME: &str = "teamclaude";
 
     /// `source` with every comment replaced by spaces (newlines kept, so line
     /// numbers survive) and every string and char literal left as written.
@@ -175,20 +168,14 @@ mod tests {
         out
     }
 
-    /// Every `(line, needle)` in `source` that breaks the rule.
+    /// Every `(line, code)` in `source` that writes [`OLD_NAME`] outside a
+    /// comment, with the offending line trimmed.
     fn violations(source: &str) -> Vec<(usize, String)> {
-        let whole = whole_literal();
         strip_comments(source)
             .lines()
             .enumerate()
-            .flat_map(|(n, line)| {
-                NEEDLES
-                    .iter()
-                    .map(|needle| (*needle).to_string())
-                    .chain(std::iter::once(whole.clone()))
-                    .filter(move |needle| line.contains(needle.as_str()))
-                    .map(move |needle| (n + 1, needle))
-            })
+            .filter(|(_, line)| line.to_ascii_lowercase().contains(OLD_NAME))
+            .map(|(n, line)| (n + 1, line.trim().to_string()))
             .collect()
     }
 
@@ -204,9 +191,9 @@ mod tests {
         }
     }
 
-    /// The rule this file exists for: no old name is written as a literal in
-    /// code anywhere under `src/` except here. Comments may mention them, and
-    /// the crate name `teamclaude_rs` is not an on-disk name.
+    /// The rule this file exists for: the old name is written in code nowhere
+    /// under `src/` except here. Comments may mention it, because they explain
+    /// what an existing install still has on disk.
     #[test]
     fn old_names_are_written_only_in_legacy_names() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -222,9 +209,9 @@ mod tests {
         for file in files.iter().filter(|f| **f != this_file) {
             let source =
                 std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
-            for (line, needle) in violations(&source) {
+            for (line, code) in violations(&source) {
                 found.push(format!(
-                    "{}:{line}: {needle}",
+                    "{}:{line}: {code}",
                     file.strip_prefix(env!("CARGO_MANIFEST_DIR"))
                         .unwrap_or(file)
                         .display()
@@ -233,28 +220,37 @@ mod tests {
         }
         assert!(
             found.is_empty(),
-            "old names belong in src/legacy_names.rs only; use its constants:\n{}",
+            "the old name belongs in src/legacy_names.rs only; use its constants:\n{}",
             found.join("\n")
         );
     }
 
-    /// The positive control: the scanner flags each needle in code and leaves
-    /// it alone in comments, so a green guard is not a scanner that sees nothing.
+    /// The positive control: the scanner flags the old name in every shape code
+    /// can write it and leaves it alone in comments, so a green guard is not a
+    /// scanner that sees nothing.
     #[test]
     fn the_guard_sees_code_and_ignores_comments() {
-        let code = format!(
-            "let a = \"{}\";\nlet b = x == {};\nlet c = r#\"{}.2026\"#;\n",
-            super::CONFIG_FILE,
-            whole_literal(),
-            super::LOG_PREFIX
-        );
+        let code = [
+            format!("let a = \"{}\";", super::CONFIG_FILE),
+            format!("let b = x == \"{}\";", super::JS_PROXY_BIN),
+            format!("let c = r#\"{}.2026\"#;", super::LOG_PREFIX),
+            "let d = \"/opt/nvm/bin/teamclaude\";".to_string(),
+            "use teamclaude_rs::x;".to_string(),
+            "const E: &str = \"TEAMCLAUDE_RS_INSTALL_DIR\";".to_string(),
+            "enum K { Teamclaude }".to_string(),
+        ]
+        .join("\n");
         let lines: Vec<usize> = violations(&code).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(lines, vec![1, 2, 3], "each line holds one violation");
+        assert_eq!(
+            lines,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "each line holds one violation"
+        );
 
         let comments = format!(
-            "// {cfg}\n/// {cfg}\n/* {cfg}\n {whole} */\nlet url = \"https://x\"; // {cfg}\n",
+            "// {cfg}\n/// {cfg}\n/* {cfg}\n \"{bin}\" */\nlet url = \"https://x\"; // {cfg}\n",
             cfg = super::CONFIG_FILE,
-            whole = whole_literal()
+            bin = super::JS_PROXY_BIN
         );
         assert_eq!(violations(&comments), Vec::new(), "comments are allowed");
 
@@ -262,9 +258,8 @@ mod tests {
         // the comment marker after it.
         let tricky = format!("let q = '\"'; // {}\nlet r = 'a';\n", super::CONFIG_FILE);
         assert_eq!(violations(&tricky), Vec::new());
-        // `teamclaude_rs` and a longer literal containing the bin name are fine.
         assert_eq!(
-            violations("use teamclaude_rs::x; let p = \"/path/teamclaude\";\n"),
+            violations("use tcr::x; let p = \"/path/tcr\";\n"),
             Vec::new()
         );
     }

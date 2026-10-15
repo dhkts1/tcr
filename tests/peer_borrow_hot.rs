@@ -30,10 +30,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use teamclaude_rs::config::Config;
-use teamclaude_rs::peer::config as peer_config;
-use teamclaude_rs::server::{serve, IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup};
-use teamclaude_rs::singleton::ProxyHost;
+use tcr::config::Config;
+use tcr::peer::config as peer_config;
+use tcr::server::{serve, IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup};
+use tcr::singleton::ProxyHost;
 
 /// The port `tcr` uses by default. Named so the assertion below says what it is
 /// protecting rather than showing a bare number.
@@ -168,7 +168,7 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
     };
     assert_ne!(handle.addr().port(), LIVE_PROXY_PORT);
     assert!(
-        teamclaude_rs::fallback::configured_provider().is_none(),
+        tcr::fallback::configured_provider().is_none(),
         "a peers file whose only row may not be disclosed to describes nobody to borrow from, \
          so the boot read must install no provider"
     );
@@ -212,8 +212,8 @@ async fn a_disclose_grant_written_after_boot_is_borrowed_on_without_a_restart() 
         "the request after the grant must have dialled the lender, with no restart in between: \
          this is the whole claim"
     );
-    let provider = teamclaude_rs::fallback::configured_provider()
-        .expect("the grant installed a provider after boot");
+    let provider =
+        tcr::fallback::configured_provider().expect("the grant installed a provider after boot");
     assert_eq!(
         provider.name(),
         "peer-lease",

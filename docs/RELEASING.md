@@ -114,7 +114,7 @@ Flags:
 `SUFeedURL` (in `apps/macos/scripts/build-tcrbar.sh`) is now a FIXED location:
 
 ```
-https://raw.githubusercontent.com/dhkts1/teamclaude-rs/gh-pages/appcast.xml
+https://raw.githubusercontent.com/dhkts1/tcr/gh-pages/appcast.xml
 ```
 
 It used to be `.../releases/latest/download/appcast.xml`, and `/releases/latest/`
@@ -341,7 +341,7 @@ fire — it is aimed at a state this pipeline no longer produces. Until that pre
 "no `appcast.xml` asset", either mark the tag prerelease by hand right after pushing it:
 
 ```sh
-gh release edit vX.Y.Z --prerelease --repo dhkts1/teamclaude-rs
+gh release edit vX.Y.Z --prerelease --repo dhkts1/tcr
 ```
 
 — stage 9 clears the flag itself once the assets are up — or push the tag only when you are ready to

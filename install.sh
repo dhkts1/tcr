@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — the one-line installer: `tcr` CLI, then TcrBar on macOS.
 #
-# Step 1 is exactly the cargo-dist shell installer teamclaude-rs-installer.sh
+# Step 1 is exactly the cargo-dist shell installer tcr-installer.sh
 # always was — regenerated every release from dist-workspace.toml, no
 # post-install hook, not something this script edits. Step 2 is new: on
 # macOS, install TcrBar too, so the default install gets both halves of the
@@ -17,11 +17,11 @@
 # look like it failed.
 set -u
 
-DIST_INSTALLER_URL="https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh"
-LATEST_RELEASE_URL="${TCR_LATEST_RELEASE_URL:-https://github.com/dhkts1/teamclaude-rs/releases/latest}"
-LATEST_RELEASE_API_URL="${TCR_LATEST_RELEASE_API_URL:-https://api.github.com/repos/dhkts1/teamclaude-rs/releases/latest}"
-DMG_URL_BASE="${TCR_DMG_URL_BASE:-https://github.com/dhkts1/teamclaude-rs/releases/download}"
-DMG_INSTALL_SCRIPT_URL="${TCR_DMG_INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/dhkts1/teamclaude-rs/main/scripts/install-tcrbar-from-dmg.sh}"
+DIST_INSTALLER_URL="https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh"
+LATEST_RELEASE_URL="${TCR_LATEST_RELEASE_URL:-https://github.com/dhkts1/tcr/releases/latest}"
+LATEST_RELEASE_API_URL="${TCR_LATEST_RELEASE_API_URL:-https://api.github.com/repos/dhkts1/tcr/releases/latest}"
+DMG_URL_BASE="${TCR_DMG_URL_BASE:-https://github.com/dhkts1/tcr/releases/download}"
+DMG_INSTALL_SCRIPT_URL="${TCR_DMG_INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/dhkts1/tcr/main/scripts/install-tcrbar-from-dmg.sh}"
 APP_NAME="TcrBar"
 APPLICATIONS_DIR="${TCR_APPLICATIONS_DIR:-/Applications}"
 
@@ -47,9 +47,9 @@ Env:
   TCR_SKIP_CLI=1  Skip the tcr CLI install step (step 1). Test-only — lets
                   the TcrBar half of this script be exercised without a real
                   network round trip through the cargo-dist installer.
-  TEAMCLAUDE_RS_INSTALL_DIR, TEAMCLAUDE_RS_DOWNLOAD_URL,
-  TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL,
-  TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL, TEAMCLAUDE_RS_GITHUB_TOKEN
+  TCR_INSTALL_DIR, TCR_DOWNLOAD_URL,
+  TCR_INSTALLER_GHE_BASE_URL,
+  TCR_INSTALLER_GITHUB_BASE_URL, TCR_GITHUB_TOKEN
                   Passed through to the cargo-dist shell installer
                   unmodified (see src/update.rs for what each one does).
 USAGE
@@ -69,11 +69,11 @@ if [ "${TCR_SKIP_CLI:-0}" = "1" ]; then
   echo "==> TCR_SKIP_CLI=1 — skipping the tcr CLI install (test-only)."
 else
   echo "==> Installing the tcr CLI…"
-  if ! curl --proto '=https' --tlsv1.2 -LsSf -o "$tmp_dir/teamclaude-rs-installer.sh" "$DIST_INSTALLER_URL"; then
+  if ! curl --proto '=https' --tlsv1.2 -LsSf -o "$tmp_dir/tcr-installer.sh" "$DIST_INSTALLER_URL"; then
     echo "could not download $DIST_INSTALLER_URL" >&2
     exit 1
   fi
-  if ! sh "$tmp_dir/teamclaude-rs-installer.sh"; then
+  if ! sh "$tmp_dir/tcr-installer.sh"; then
     dist_rc=$?
     echo "tcr CLI install failed (exit $dist_rc)" >&2
     exit "$dist_rc"
@@ -98,7 +98,7 @@ fi
 # validate_release_tag, mirrored from src/update.rs so this shell installer
 # and the Rust update path agree on what a safe tag looks like. The tag is
 # interpolated into a URL path below, and an unvalidated one does not stay
-# inside dhkts1/teamclaude-rs: see update.rs's own doc-comment for the
+# inside dhkts1/tcr: see update.rs's own doc-comment for the
 # concrete escape it blocks.
 validate_release_tag() {
   [ -n "$1" ] || return 1

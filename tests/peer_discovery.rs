@@ -8,9 +8,9 @@
 //! Trust, which is why a first pairing is always `Noise_XX` with a six-digit
 //! compare.
 
+use tcr::peer::config::NetworkKey;
+use tcr::peer::discovery::{self, Discovered, FoundList};
 use tcr_peer_wire::{InstanceId, PeerId, INSTANCE_ID_BYTES};
-use teamclaude_rs::peer::config::NetworkKey;
-use teamclaude_rs::peer::discovery::{self, Discovered, FoundList};
 
 /// An instance id distinctive enough that a fragment of it could not appear by
 /// chance in a TXT record.
@@ -143,7 +143,7 @@ fn beacon_txt_carries_only_version_instance_and_name() {
 /// assertion with a `name=studio-mac` pair present.
 #[test]
 fn a_fresh_config_announces_no_name() {
-    let fresh = teamclaude_rs::peer::config::PeerFile::default();
+    let fresh = tcr::peer::config::PeerFile::default();
     assert!(
         !fresh.announce_name,
         "announceName defaults OFF, so a fresh install announces ephemeral \
@@ -161,9 +161,9 @@ fn a_fresh_config_announces_no_name() {
     // The positive control: with the operator having turned it on, the same
     // expression does produce a name. Without this, a `beacon_txt` that had
     // stopped emitting names at all would pass the assertion above.
-    let asked = teamclaude_rs::peer::config::PeerFile {
+    let asked = tcr::peer::config::PeerFile {
         announce_name: true,
-        ..teamclaude_rs::peer::config::PeerFile::default()
+        ..tcr::peer::config::PeerFile::default()
     };
     let name = asked.announce_name.then(|| "studio-mac".to_string());
     let txt = discovery::beacon_txt(&test_instance(), 9600, name.as_deref(), None, 0);
@@ -478,21 +478,21 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 }
 
 /// One pinned row whose only endpoint is `addr`.
-fn pinned_row(node: PeerId, addr: std::net::SocketAddr) -> teamclaude_rs::peer::config::PeerRow {
-    let mut row = teamclaude_rs::peer::config::PeerRow {
+fn pinned_row(node: PeerId, addr: std::net::SocketAddr) -> tcr::peer::config::PeerRow {
+    let mut row = tcr::peer::config::PeerRow {
         node,
         label: "studio-mac".to_string(),
         endpoints: Vec::new(),
         added_at: 1_000,
         rendezvous_secret: None,
         sees_us_at: None,
-        allow: teamclaude_rs::peer::config::Allow::default(),
+        allow: tcr::peer::config::Allow::default(),
         lend: Vec::new(),
     };
-    row.observe_endpoint(teamclaude_rs::peer::config::Endpoint::direct(
+    row.observe_endpoint(tcr::peer::config::Endpoint::direct(
         addr,
         1_000,
-        teamclaude_rs::peer::config::EndpointSource::Paired,
+        tcr::peer::config::EndpointSource::Paired,
     ));
     row
 }
@@ -540,11 +540,11 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
 
     let b = PeerId([0x11; 32]);
     let stranger = PeerId([0x22; 32]);
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![pinned_row(b, dead)],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let b_instance = InstanceId([0xB1; INSTANCE_ID_BYTES]);
     let beacon = Discovered {
@@ -555,14 +555,12 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
     };
 
     // ---- control: before the scan, A cannot reach B at all.
-    let stale = teamclaude_rs::peer::config::read_or_default(&peers)
+    let stale = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
         .peers
         .remove(0);
     assert!(
-        teamclaude_rs::peer::serve::dial_peer(&stale)
-            .await
-            .is_none(),
+        tcr::peer::serve::dial_peer(&stale).await.is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
          must fail before the beacon, otherwise the last assertion proves nothing"
     );
@@ -605,7 +603,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
     .expect("the scan records");
     assert_eq!(moved_rows, 1, "exactly B's row moved");
 
-    let refreshed = teamclaude_rs::peer::config::read_or_default(&peers)
+    let refreshed = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
         .peers
         .remove(0);
@@ -620,7 +618,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         .expect("the announced address is on the row");
     assert_eq!(
         learned.source,
-        teamclaude_rs::peer::config::EndpointSource::Beacon,
+        tcr::peer::config::EndpointSource::Beacon,
         "recorded as what taught it, so a reader can tell an unauthenticated announcement \
          from an address a handshake proved"
     );
@@ -629,9 +627,7 @@ async fn a_pinned_mac_that_moved_is_reached_at_the_address_its_beacon_announced(
         "timed by this node's clock and never by anything in the announcement"
     );
     assert!(
-        teamclaude_rs::peer::serve::dial_peer(&refreshed)
-            .await
-            .is_some(),
+        tcr::peer::serve::dial_peer(&refreshed).await.is_some(),
         "A dials the address B announced and gets a connection: {:?}",
         refreshed.endpoints
     );
@@ -668,7 +664,7 @@ fn brief(node: PeerId, addr: std::net::SocketAddr) -> tcr_peer_wire::NeighborBri
 
 /// One pinned row whose only endpoint is `addr` and which the operator swaps
 /// neighbour lists with, so its briefs are applied.
-fn briefing_row(node: PeerId, addr: std::net::SocketAddr) -> teamclaude_rs::peer::config::PeerRow {
+fn briefing_row(node: PeerId, addr: std::net::SocketAddr) -> tcr::peer::config::PeerRow {
     let mut row = pinned_row(node, addr);
     row.allow.control.briefs = true;
     row
@@ -700,17 +696,17 @@ async fn a_brief_from_a_mutual_friend_refreshes_that_friends_locator() {
     let old_addr: std::net::SocketAddr = "192.0.2.7:9600".parse().expect("a literal address");
     let new_addr: std::net::SocketAddr = "192.0.2.7:9601".parse().expect("a literal address");
 
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![briefing_row(b, old_addr), pinned_row(c, old_addr)],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let briefs = vec![brief(c, new_addr)];
     let moved = discovery::observe_neighbor_briefs(&peers, &b, &briefs, 5_000).expect("records");
     assert_eq!(moved, 1, "exactly C's row moved, from B's brief about it");
 
-    let refreshed = teamclaude_rs::peer::config::read_or_default(&peers)
+    let refreshed = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
         .peers
         .into_iter()
@@ -723,7 +719,7 @@ async fn a_brief_from_a_mutual_friend_refreshes_that_friends_locator() {
         .expect("C's new address, learned through B's brief, is on the row");
     assert_eq!(
         learned.source,
-        teamclaude_rs::peer::config::EndpointSource::Brief,
+        tcr::peer::config::EndpointSource::Brief,
         "recorded as what taught it: a trusted peer's word, not a session A itself completed"
     );
 }
@@ -751,11 +747,11 @@ async fn a_brief_never_introduces_a_key_a_did_not_already_trust() {
     let d_addr: std::net::SocketAddr = "192.0.2.12:9602".parse().expect("a literal address");
 
     // A pins B and C; D was never pinned.
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![briefing_row(b, b_addr), pinned_row(c, c_addr)],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     // B's Hello carries a brief about C (a mutual friend) and one about D (a
     // stranger to A). Both arrive in the same call, so the filter has to tell
@@ -790,7 +786,7 @@ async fn a_brief_never_introduces_a_key_a_did_not_already_trust() {
          nothing about the filter: {raw}"
     );
 
-    let rows = teamclaude_rs::peer::config::read_or_default(&peers)
+    let rows = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
         .peers;
     assert_eq!(
@@ -816,7 +812,7 @@ async fn a_brief_never_introduces_a_key_a_did_not_already_trust() {
 /// 1. every address ran its own locked read-modify-write of the operator's
 ///    peers file, so one frame bought five hundred rewrites of the file every
 ///    `tcr peer` mutation contends for. Counted with
-///    [`teamclaude_rs::peer::config::peers_file_opens`], the counter the
+///    [`tcr::peer::config::peers_file_opens`], the counter the
 ///    accepted-connection test already uses: one read to decide, one inside
 ///    the writer, and nothing per address.
 /// 2. nothing capped a brief's address list, so the eight endpoint slots on
@@ -840,11 +836,11 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
     let b_addr: std::net::SocketAddr = "192.0.2.20:9600".parse().expect("a literal address");
     let c_paired: std::net::SocketAddr = "192.0.2.21:9601".parse().expect("a literal address");
 
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![briefing_row(b, b_addr), pinned_row(c, c_paired)],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let flood = tcr_peer_wire::NeighborBrief {
         node: c,
@@ -860,21 +856,21 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
     // and the endpoint count say nothing about this cap. Measured by hand:
     // with `take(MAX_BRIEF_ADDRS)` deleted, every assertion further down still
     // passes and this one reads 500.
-    let pinned = teamclaude_rs::peer::config::read_or_default(&peers)
+    let pinned = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
         .peers;
     let parsed = discovery::neighbor_brief_endpoints(std::slice::from_ref(&flood), &pinned, 5_000);
     assert_eq!(
         parsed.len(),
-        teamclaude_rs::peer::discovery::MAX_BRIEF_ADDRS,
+        tcr::peer::discovery::MAX_BRIEF_ADDRS,
         "one brief may teach four addresses, and the other 496 are never parsed, held or \
          carried; this batch produced {} endpoints",
         parsed.len()
     );
 
-    let before = teamclaude_rs::peer::config::peers_file_opens(&peers);
+    let before = tcr::peer::config::peers_file_opens(&peers);
     let moved = discovery::observe_neighbor_briefs(&peers, &b, &[flood], 5_000).expect("records");
-    let opened = teamclaude_rs::peer::config::peers_file_opens(&peers) - before;
+    let opened = tcr::peer::config::peers_file_opens(&peers) - before;
 
     assert_eq!(moved, 1, "one node was named, so one row moved");
     assert_eq!(
@@ -884,25 +880,25 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
          per address"
     );
 
-    let row = teamclaude_rs::peer::config::read_or_default(&peers)
+    let row = tcr::peer::config::read_or_default(&peers)
         .expect("the peers file reads")
         .peers
         .into_iter()
         .find(|row| row.node == c)
         .expect("C is still pinned");
     assert!(
-        row.endpoints.len() <= teamclaude_rs::peer::config::MAX_ENDPOINTS_PER_PEER,
+        row.endpoints.len() <= tcr::peer::config::MAX_ENDPOINTS_PER_PEER,
         "the row keeps its cap: {:?}",
         row.endpoints
     );
     let from_brief = row
         .endpoints
         .iter()
-        .filter(|endpoint| endpoint.source == teamclaude_rs::peer::config::EndpointSource::Brief)
+        .filter(|endpoint| endpoint.source == tcr::peer::config::EndpointSource::Brief)
         .count();
     assert_eq!(
         from_brief,
-        teamclaude_rs::peer::discovery::MAX_BRIEF_ENDPOINTS_PER_PEER,
+        tcr::peer::discovery::MAX_BRIEF_ENDPOINTS_PER_PEER,
         "at most two of the eight slots are a peer's word about a third machine, so six \
          stay with the endpoints this node proved: {:?}",
         row.endpoints
@@ -915,14 +911,11 @@ async fn five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_en
         row.endpoints
     );
 
-    let order = teamclaude_rs::peer::probe::order_endpoints(
-        &row,
-        &teamclaude_rs::peer::probe::PathTable::default(),
-    );
+    let order = tcr::peer::probe::order_endpoints(&row, &tcr::peer::probe::PathTable::default());
     assert_eq!(
         order
             .first()
-            .and_then(teamclaude_rs::peer::config::Endpoint::direct_addr),
+            .and_then(tcr::peer::config::Endpoint::direct_addr),
         Some(c_paired),
         "C's paired endpoint is dialled first, ahead of anything a brief added: {order:?}"
     );
@@ -956,11 +949,11 @@ async fn a_sender_without_the_briefs_grant_writes_nothing() {
     let injected: std::net::SocketAddr = "198.51.100.40:9999".parse().expect("a literal address");
 
     // B is pinned and has no grants: `pinned_row` leaves `Allow::default()`.
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![pinned_row(b, b_addr), pinned_row(c, c_paired)],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
     let before = std::fs::read_to_string(&peers).expect("the peers file's bytes");
 
     let briefs = vec![brief(c, injected)];
@@ -1149,7 +1142,7 @@ fn found_ttl_covers_three_browses() {
 /// source` arm to match any held endpoint fails claim 2's.
 #[test]
 fn a_drop_endpoint_never_evicts_a_proven_one() {
-    use teamclaude_rs::peer::config::{Endpoint, EndpointSource, MAX_ENDPOINTS_PER_PEER};
+    use tcr::peer::config::{Endpoint, EndpointSource, MAX_ENDPOINTS_PER_PEER};
 
     let peer = PeerId([0xA1; 32]);
     let proven: std::net::SocketAddr = "192.0.2.50:9601".parse().expect("a literal address");

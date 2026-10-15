@@ -50,7 +50,7 @@
 #
 # Environment:
 #   TCRBAR_OP_ITEM   REQUIRED (by release-local.sh). op://<vault>/<item>.
-#   RELEASE_REPO     owner/name (default dhkts1/teamclaude-rs, as elsewhere).
+#   RELEASE_REPO     owner/name (default dhkts1/tcr, as elsewhere).
 #   SHIP_CHECK_WAIT_MINUTES  how long to wait for checks (default 60).
 set -uo pipefail
 
@@ -58,7 +58,7 @@ die() { printf 'ship-release: error: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 
-repo="${RELEASE_REPO:-dhkts1/teamclaude-rs}"
+repo="${RELEASE_REPO:-dhkts1/tcr}"
 wait_minutes="${SHIP_CHECK_WAIT_MINUTES:-60}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(git -C "$script_dir" rev-parse --show-toplevel)" || die "not inside a git checkout"
@@ -189,9 +189,9 @@ title="chore: appcast entry for $version and bump to $next"
 say "step 5/7  PR: $title"
 git -C "$root" switch -q -c "$branch" || die "could not create $branch"
 V="$version" N="$next" perl -0pi -e 's/^version = "\Q$ENV{V}\E"/version = "$ENV{N}"/m' "$root/Cargo.toml"
-V="$version" N="$next" perl -0pi -e 's/(name = "teamclaude-rs"\nversion = ")\Q$ENV{V}\E"/$1$ENV{N}"/' "$root/Cargo.lock"
+V="$version" N="$next" perl -0pi -e 's/(name = "tcr"\nversion = ")\Q$ENV{V}\E"/$1$ENV{N}"/' "$root/Cargo.lock"
 [ "$(cargo_version)" = "$next" ] || die "Cargo.toml was not moved to $next"
-grep -A1 '^name = "teamclaude-rs"$' "$root/Cargo.lock" | grep -q "^version = \"$next\"$" \
+grep -A1 '^name = "tcr"$' "$root/Cargo.lock" | grep -q "^version = \"$next\"$" \
   || die "Cargo.lock was not moved to $next"
 cargo metadata --manifest-path "$root/Cargo.toml" --format-version 1 --locked --no-deps >/dev/null \
   || die "Cargo.lock does not match Cargo.toml after the bump"

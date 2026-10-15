@@ -31,7 +31,7 @@
 #   publish-appcast-feed.sh [--dry-run] [--branch gh-pages] [--repo owner/name]
 #
 # Environment:
-#   RELEASE_REPO   owner/name (default: dhkts1/teamclaude-rs, same default
+#   RELEASE_REPO   owner/name (default: dhkts1/tcr, same default
 #                  build-tcrbar.sh's feed_url is hardcoded to)
 #
 # Exit status: 0 when the feed already serves these exact bytes (nothing to
@@ -51,7 +51,7 @@ usage() { sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 branch="gh-pages"
 dry_run=0
-repo="${RELEASE_REPO:-dhkts1/teamclaude-rs}"
+repo="${RELEASE_REPO:-dhkts1/tcr}"
 
 while [ $# -gt 0 ]; do
   case "$1" in

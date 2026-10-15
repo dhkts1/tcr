@@ -42,8 +42,8 @@ async fn spawn_upstream_recording(seen: Bodies) -> String {
 
 /// A manager with ONE fake account pointed at `upstream`; `extra` is spliced
 /// into the top-level config object (the unmodelled flags live there).
-fn manager(upstream: &str, extra: &str) -> Arc<teamclaude_rs::manager::Manager> {
-    let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+fn manager(upstream: &str, extra: &str) -> Arc<tcr::manager::Manager> {
+    let config: tcr::config::Config = serde_json::from_str(&format!(
         r#"{{
             "proxy": {{ "port": 0 }},
             "upstream": "{upstream}",
@@ -61,16 +61,16 @@ fn manager(upstream: &str, extra: &str) -> Arc<teamclaude_rs::manager::Manager> 
         }}"#
     ))
     .expect("the inline config parses");
-    teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+    tcr::manager::Manager::with_live_refresher(config, None)
 }
 
-async fn spawn_proxy(manager: Arc<teamclaude_rs::manager::Manager>) -> String {
+async fn spawn_proxy(manager: Arc<tcr::manager::Manager>) -> String {
     let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the proxy");
     let addr = listening.local_addr().expect("proxy addr");
     tokio::spawn(async move {
-        teamclaude_rs::mitm::serve(listening, manager, None).await;
+        tcr::mitm::serve(listening, manager, None).await;
     });
     format!("http://{addr}")
 }

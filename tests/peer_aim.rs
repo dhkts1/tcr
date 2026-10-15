@@ -48,13 +48,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::noise::{self, Handshake};
+use tcr::peer::reach;
+use tcr::peer::serve;
 use tcr_peer_wire::{CollapseHint, Control, PeerId, StreamHeader, StreamKind};
-use teamclaude_rs::peer::config::{self as peer_config, PeerFile, PeerRow};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, SessionContext};
-use teamclaude_rs::peer::noise::{self, Handshake};
-use teamclaude_rs::peer::reach;
-use teamclaude_rs::peer::serve;
 
 /// A carrier's own connection to this node, RFC 5737 TEST-NET-3. Every
 /// exchange below is served from it, so an address learned from the socket

@@ -23,10 +23,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use teamclaude_rs::config::Config;
-use teamclaude_rs::peer::{config as peer_config, serve as peer_serve};
-use teamclaude_rs::server::{serve, IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup};
-use teamclaude_rs::singleton::ProxyHost;
+use tcr::config::Config;
+use tcr::peer::{config as peer_config, serve as peer_serve};
+use tcr::server::{serve, IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup};
+use tcr::singleton::ProxyHost;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// The port `tcr` uses by default. Named so the assertion below says what it is
@@ -168,7 +168,7 @@ async fn a_booted_server_answers_a_knock_and_refuses_the_local_route_on_its_peer
         wire_version: tcr_peer_wire::PROTO_VERSION,
         listen_port: Some(7766),
     };
-    teamclaude_rs::peer::noise::send_knock(&mut stream, &knock, None)
+    tcr::peer::noise::send_knock(&mut stream, &knock, None)
         .await
         .expect("the booted listener takes a knock and answers the one ack byte");
 
@@ -215,7 +215,7 @@ async fn a_booted_server_answers_a_knock_and_refuses_the_local_route_on_its_peer
         .get(format!(
             "http://127.0.0.1:{}{}",
             handle.addr().port(),
-            teamclaude_rs::proxy::STATUS_PATH
+            tcr::proxy::STATUS_PATH
         ))
         .send()
         .await
@@ -311,14 +311,14 @@ async fn a_default_peers_file_opens_no_peer_port() {
 fn the_listener_and_the_beacon_name_one_boot_instance_id() {
     let dir = tempfile::tempdir().expect("a temp profile directory");
     let peers = dir.path().join("tcr-peers.json");
-    let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path()).expect("a node key");
-    let context = teamclaude_rs::peer::listener::SessionContext::new(
+    let key = tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a node key");
+    let context = tcr::peer::listener::SessionContext::new(
         &key,
         &peers,
         &peer_serve::peer_state_path(&peers),
     );
 
-    let boot = teamclaude_rs::peer::id::boot_instance_id();
+    let boot = tcr::peer::id::boot_instance_id();
     assert_eq!(
         context.instance_id(),
         boot,
@@ -327,7 +327,7 @@ fn the_listener_and_the_beacon_name_one_boot_instance_id() {
     // And a second context is the same id: one value per process, so a boot
     // path that builds the listener and the beacon in either order cannot
     // announce one id and answer under another.
-    let second = teamclaude_rs::peer::listener::SessionContext::new(
+    let second = tcr::peer::listener::SessionContext::new(
         &key,
         &peers,
         &peer_serve::peer_state_path(&peers),
@@ -336,7 +336,7 @@ fn the_listener_and_the_beacon_name_one_boot_instance_id() {
 
     // The beacon's side: the TXT record for that id carries it, so the two
     // surfaces really are naming one value and not two that happen to match.
-    let txt = teamclaude_rs::peer::discovery::beacon_txt(&boot, 9_600, None, None, 0);
+    let txt = tcr::peer::discovery::beacon_txt(&boot, 9_600, None, None, 0);
     assert!(
         txt.iter().any(|(_, value)| value == &boot.to_wire()),
         "the beacon TXT names the boot instance id: {txt:?}"
@@ -365,7 +365,7 @@ fn a_profiles_peer_state_file_is_the_one_beside_its_peers_file() {
     // config directory.
     assert_eq!(
         peer_serve::peer_state_path(&peer_config::default_path()),
-        teamclaude_rs::peer::state::default_path()
+        tcr::peer::state::default_path()
     );
 }
 
@@ -672,15 +672,15 @@ mod lender {
     use axum::response::Response;
     use axum::routing::any;
     use axum::Router;
-    use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
-    use teamclaude_rs::fallback::Ask;
-    use teamclaude_rs::peer::config::{
+    use tcr::fallback::Ask;
+    use tcr::peer::config::{
         Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
     };
-    use teamclaude_rs::peer::id::NodeKey;
-    use teamclaude_rs::peer::lease::Ledger;
-    use teamclaude_rs::peer::listener::{self, LeaseServing, SessionContext};
-    use teamclaude_rs::peer::serve;
+    use tcr::peer::id::NodeKey;
+    use tcr::peer::lease::Ledger;
+    use tcr::peer::listener::{self, LeaseServing, SessionContext};
+    use tcr::peer::serve;
+    use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
 
     /// The lease id every test in this file spends.
     const LEASE: u128 = 0x1eaf_0000_0000_0001;
@@ -746,8 +746,8 @@ mod lender {
 
     /// A manager with ONE fake account, pointed at `upstream`. No real email,
     /// no org uuid, no account uuid: this repository is public.
-    fn lending_manager(upstream: &str) -> Arc<teamclaude_rs::manager::Manager> {
-        let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+    fn lending_manager(upstream: &str) -> Arc<tcr::manager::Manager> {
+        let config: tcr::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "{upstream}",
@@ -764,18 +764,18 @@ mod lender {
             }}"#
         ))
         .expect("the inline lender config parses");
-        teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+        tcr::manager::Manager::with_live_refresher(config, None)
     }
 
     /// The lender's own proxy, which is where a relayed request is sent: the
     /// whole of "own picker, own Bearer, own bucket".
-    async fn spawn_proxy(manager: Arc<teamclaude_rs::manager::Manager>) -> String {
+    async fn spawn_proxy(manager: Arc<tcr::manager::Manager>) -> String {
         let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the lender's proxy");
         let addr = listening.local_addr().expect("proxy addr");
         tokio::spawn(async move {
-            teamclaude_rs::mitm::serve(listening, manager, None).await;
+            tcr::mitm::serve(listening, manager, None).await;
         });
         format!("http://{addr}")
     }
@@ -788,7 +788,7 @@ mod lender {
             node: borrower,
             label: "borrower-mac".to_string(),
             endpoints: Vec::new(),
-            added_at: teamclaude_rs::now_ms(),
+            added_at: tcr::now_ms(),
             rendezvous_secret: None,
             sees_us_at: None,
             allow: Allow {
@@ -805,7 +805,7 @@ mod lender {
             node: lender,
             label: "lender-mac".to_string(),
             endpoints: vec![Endpoint::direct(addr, 0, EndpointSource::Paired)],
-            added_at: teamclaude_rs::now_ms(),
+            added_at: tcr::now_ms(),
             rendezvous_secret: None,
             sees_us_at: None,
             allow: Allow {
@@ -818,7 +818,7 @@ mod lender {
     }
 
     fn write_peers(path: &std::path::Path, peers: Vec<PeerRow>) {
-        teamclaude_rs::peer::config::save(
+        tcr::peer::config::save(
             path,
             &PeerFile {
                 peers,
@@ -835,8 +835,8 @@ mod lender {
     /// a fixture whose in-scope account is also the one the picker would have
     /// chosen anyway proves nothing about the restriction. No real email, no
     /// org uuid.
-    fn two_group_manager(upstream: &str) -> Arc<teamclaude_rs::manager::Manager> {
-        let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+    fn two_group_manager(upstream: &str) -> Arc<tcr::manager::Manager> {
+        let config: tcr::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "{upstream}",
@@ -860,7 +860,7 @@ mod lender {
             }}"#
         ))
         .expect("the inline two-account config parses");
-        teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+        tcr::manager::Manager::with_live_refresher(config, None)
     }
 
     /// Borrow once against a lease scoped to group `work`, and return every
@@ -995,7 +995,7 @@ mod lender {
     /// that is what makes two requests one session.
     async fn borrow_once(
         lender_proxy: String,
-        manager: Arc<teamclaude_rs::manager::Manager>,
+        manager: Arc<tcr::manager::Manager>,
         scope: tcr_peer_wire::LendScope,
         body: &'static [u8],
     ) -> Served {
@@ -1013,7 +1013,7 @@ mod lender {
             vec![lender_row_scoped(borrower_id, scope.clone())],
         );
 
-        let now = teamclaude_rs::now_ms();
+        let now = tcr::now_ms();
         let lease = Lease {
             lease_id: LEASE,
             window: Window::SevenDay,
@@ -1113,7 +1113,7 @@ mod lender {
 /// `boot_peer_listener` and the count never moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_booted_server_with_internet_on_starts_the_mapping_keeper() {
-    use teamclaude_rs::peer::reach;
+    use tcr::peer::reach;
 
     let before = reach::mapping_boot_counts();
 
@@ -1164,7 +1164,7 @@ async fn a_booted_server_with_internet_on_starts_the_mapping_keeper() {
 /// the count never moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_booted_server_with_find_on_announces_from_its_own_process() {
-    use teamclaude_rs::peer::discovery;
+    use tcr::peer::discovery;
 
     let before = discovery::announcements();
 

@@ -31,8 +31,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
-use teamclaude_rs::paths;
-use teamclaude_rs::singleton::owner_path_in;
+use tcr::paths;
+use tcr::singleton::owner_path_in;
 
 /// `handle.shutdown()` is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` = 5s
 /// (`src/server.rs`). Give the process comfortably longer than that to exit
@@ -59,7 +59,7 @@ fn stream_stdout(child: &mut Child) -> mpsc::Receiver<String> {
     rx
 }
 
-/// Pulls the bound port out of `tracing::info!("teamclaude-rs listening on
+/// Pulls the bound port out of `tracing::info!("tcr listening on
 /// http://{bound} (headless)")` (`src/main.rs`). Matches the literal marker
 /// text rather than a general "any 5-digit number" regex, so a change to the
 /// log's wording fails this test loudly (wrong port) instead of silently

@@ -35,20 +35,20 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tcr_peer_wire::{
-    Lease, LeaseUnit, LendScope, PeerId, StreamHeader, StreamKind, TunnelTarget, Window,
-};
-use teamclaude_rs::peer::config::{
+use tcr::peer::config::{
     self, Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore,
 };
-use teamclaude_rs::peer::lease::Ledger;
-use teamclaude_rs::peer::listener;
-use teamclaude_rs::peer::noise::{self, Handshake};
-use teamclaude_rs::peer::tunnel::{
+use tcr::peer::lease::Ledger;
+use tcr::peer::listener;
+use tcr::peer::noise::{self, Handshake};
+use tcr::peer::tunnel::{
     self, path_meter, Carry, Forward, NoiseStream, OriginRoute, PathMeter, TunnelBudget,
     BUDGET_WINDOW_MS,
 };
-use teamclaude_rs::peer::{serve, state};
+use tcr::peer::{serve, state};
+use tcr_peer_wire::{
+    Lease, LeaseUnit, LendScope, PeerId, StreamHeader, StreamKind, TunnelTarget, Window,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -187,7 +187,7 @@ fn forwarder_on(
                 route: OriginRoute::Peer(forwarder.target),
                 peer,
                 target: &target,
-                hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+                hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
                 cap_bytes: 1024 * 1024,
                 budget: &forwarder.budget,
                 now_ms: forwarder.now_ms,
@@ -309,10 +309,7 @@ async fn carry_one_request(
 }
 
 /// One path out of a status row, by the endpoint string the panel reads.
-fn path_of(
-    peers: &[teamclaude_rs::status::PathStatus],
-    endpoint: &str,
-) -> teamclaude_rs::status::PathStatus {
+fn path_of(peers: &[tcr::status::PathStatus], endpoint: &str) -> tcr::status::PathStatus {
     peers
         .iter()
         .find(|path| path.endpoint == endpoint)
@@ -346,7 +343,7 @@ fn path_of(
 async fn two_carried_requests_land_on_one_path_and_the_other_stays_at_zero() {
     let (requester, target_peer, me) = (node(), node(), node());
     let elsewhere = node();
-    let now_ms = teamclaude_rs::now_ms();
+    let now_ms = tcr::now_ms();
 
     let target_listener = loopback().await;
     let target_addr = target_listener.local_addr().expect("the target address");
@@ -419,7 +416,7 @@ async fn two_carried_requests_land_on_one_path_and_the_other_stays_at_zero() {
     let state_path = serve::peer_state_path(&peers_path);
     state::save_path_traffic(&state_path, &rows).expect("write the traffic section");
 
-    let peers = teamclaude_rs::status::peers_block(&peers_path, now_ms);
+    let peers = tcr::status::peers_block(&peers_path, now_ms);
     // `id` is the WIRE form on a status row, which is the only spelling
     // `PeerId::parse` reads back; `display` beside it is the short form for a
     // person. This lookup matched on the display form, which stopped being
@@ -539,13 +536,13 @@ fn an_hour_old_window_rolls_off_at_the_meter_and_at_the_reader() {
     )
     .expect("write the traffic section");
 
-    let fresh = teamclaude_rs::status::peers_block(&peers_path, at + BUDGET_WINDOW_MS);
+    let fresh = tcr::status::peers_block(&peers_path, at + BUDGET_WINDOW_MS);
     assert_eq!(
         fresh[0].paths[0].bytes_per_hour,
         Some(4_096),
         "inside the window the written figure stands"
     );
-    let stale = teamclaude_rs::status::peers_block(&peers_path, at + BUDGET_WINDOW_MS + 1);
+    let stale = tcr::status::peers_block(&peers_path, at + BUDGET_WINDOW_MS + 1);
     assert_eq!(
         stale[0].paths[0].bytes_per_hour,
         Some(0),
@@ -580,7 +577,7 @@ fn a_peer_nothing_has_metered_reports_absence_and_not_zero() {
         )],
     );
 
-    let peers = teamclaude_rs::status::peers_block(&peers_path, PINNED_AT_MS);
+    let peers = tcr::status::peers_block(&peers_path, PINNED_AT_MS);
     assert_eq!(
         peers[0].paths[0].bytes_per_hour, None,
         "no traffic section, no measurement, and `None` is how that is said"
@@ -608,7 +605,7 @@ fn a_peer_nothing_has_metered_reports_absence_and_not_zero() {
         }],
     )
     .expect("write the traffic section");
-    let measured = teamclaude_rs::status::peers_block(&peers_path, PINNED_AT_MS);
+    let measured = tcr::status::peers_block(&peers_path, PINNED_AT_MS);
     assert_eq!(
         measured[0].paths[0].bytes_per_hour,
         Some(0),
@@ -634,7 +631,7 @@ fn tokens_are_charged_only_when_the_unit_and_the_path_are_both_known() {
     let path = Locator::Direct {
         addr: "127.0.0.1:9997".parse().expect("a socket address"),
     };
-    let now_ms = teamclaude_rs::now_ms();
+    let now_ms = tcr::now_ms();
     let lease = |id: u128, unit: LeaseUnit| Lease {
         lease_id: id,
         window: Window::SevenDay,
@@ -708,7 +705,7 @@ async fn listener_on(
 ) -> (std::net::SocketAddr, PeerId) {
     let listening = loopback().await;
     let addr = listening.local_addr().expect("the listener address");
-    let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(key_dir).expect("a node key");
+    let key = tcr::peer::id::NodeKey::load_or_mint(key_dir).expect("a node key");
     let id = key.id();
     let store = PeerStore::open(peers_path).expect("open the peers file");
     let context =
@@ -779,7 +776,7 @@ async fn a_carry_is_charged_to_the_path_it_arrived_over() {
     );
     let peers_path = peers_file("gateway-charge-file", vec![requester_row, target_row]);
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let rows_for = |peer: PeerId, now_ms: i64| {
         let mut meter = path_meter().lock().expect("the meter lock");
         meter
@@ -838,7 +835,7 @@ async fn a_carry_is_charged_to_the_path_it_arrived_over() {
     let charged = {
         let mut seen = Vec::new();
         for _ in 0..100 {
-            seen = rows_for(requester.id, teamclaude_rs::now_ms());
+            seen = rows_for(requester.id, tcr::now_ms());
             if seen.iter().any(|row| row.bytes_last_hour > 0) {
                 break;
             }
@@ -884,7 +881,7 @@ async fn a_carry_is_charged_to_the_path_it_arrived_over() {
 #[tokio::test]
 async fn the_written_row_carries_nothing_time_shaped_beyond_updated_at_ms() {
     let (requester, target_peer, me) = (node(), node(), node());
-    let now_ms = teamclaude_rs::now_ms();
+    let now_ms = tcr::now_ms();
 
     let target_listener = loopback().await;
     let target_addr = target_listener.local_addr().expect("the target address");

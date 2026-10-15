@@ -47,11 +47,11 @@ use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
-use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
-use teamclaude_rs::manager::Manager;
-use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use teamclaude_rs::probe::{ProbeError, ProbeFuture, UsageProber};
-use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::manager::Manager;
+use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
+use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 
 // ---------------------------------------------------------------------------
 // Stubs — nothing here ever reaches the network.
@@ -119,13 +119,13 @@ fn fake_org_uuid(i: usize) -> String {
 fn account(i: usize) -> Account {
     Account {
         name: format!("acct{i}"),
-        account_type: teamclaude_rs::config::AccountType::OAuth,
+        account_type: tcr::config::AccountType::OAuth,
         account_uuid: Some(fake_uuid(i)),
         org_uuid: (i > 0).then(|| fake_org_uuid(i)),
         org_name: None,
         access_token: format!("at-fake-{i}"),
         refresh_token: Some(format!("rt-fake-{i}")),
-        expires_at: Some(teamclaude_rs::now_ms() + 3_600_000),
+        expires_at: Some(tcr::now_ms() + 3_600_000),
         // ALL accounts share one priority so they form a single rotation tier.
         //
         // This used to be `Some(i as i64)` — 13 distinct priorities, i.e. 13 tiers
@@ -142,7 +142,7 @@ fn account(i: usize) -> Account {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
-        egress: teamclaude_rs::config::Egress::Local,
+        egress: tcr::config::Egress::Local,
         egress_strict: false,
         extra: serde_json::Map::new(),
     }
@@ -332,7 +332,7 @@ async fn spawn_proxy(manager: Arc<Manager>) -> String {
         .expect("bind proxy");
     let addr = listener.local_addr().expect("proxy addr");
     tokio::spawn(async move {
-        teamclaude_rs::mitm::serve(listener, manager, None).await;
+        tcr::mitm::serve(listener, manager, None).await;
     });
     format!("http://{addr}")
 }

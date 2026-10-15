@@ -129,7 +129,7 @@ SPEC
 
 probe peers_file_mode --test=peer_noise \
   the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise.rs <<'SPEC'
-    teamclaude_rs::peer::config::save(path, &file).expect("the peers file is written");
+    tcr::peer::config::save(path, &file).expect("the peers file is written");
 @@@
     std::fs::write(path, serde_json::to_string(&file).expect("json")).expect("written");
 SPEC

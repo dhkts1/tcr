@@ -2,22 +2,22 @@
 
 <img src="assets/tcrbar-icon.png" alt="" width="116">
 
-# teamclaude-rs (`tcr`)
+# tcr
 
-A local proxy that runs Claude Code across multiple Claude accounts.
+tcr (Team Capacity Router) is a local proxy that runs Claude Code across multiple Claude accounts.
 
 Point Claude Code (or any Anthropic API client) at it. For each request it picks an account by
 looking at what every account has left in every quota window. It keeps a conversation on the
 account whose prompt cache is already warm, and it shows you what the traffic would have cost.
 
-[![Latest release](https://img.shields.io/github/v/release/dhkts1/teamclaude-rs)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/dhkts1/tcr)](https://github.com/dhkts1/tcr/releases/latest)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 ![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
 [Install](#install) · [Usage](#usage) · [Compared with other tools](#compared-with-other-tools) · [FAQ](#faq) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
 
-[![Download TcrBar for macOS](https://img.shields.io/badge/Download-TcrBar%20for%20macOS-blue?style=for-the-badge)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
+[![Download TcrBar for macOS](https://img.shields.io/badge/Download-TcrBar%20for%20macOS-blue?style=for-the-badge)](https://github.com/dhkts1/tcr/releases/latest)
 [![Install the CLI](https://img.shields.io/badge/Install-the%20CLI-lightgrey?style=for-the-badge)](#install)
 
 <sub>TcrBar is a `.dmg` on the release page</sub>
@@ -44,15 +44,15 @@ account whose prompt cache is already warm, and it shows you what the traffic wo
 ## Install
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/teamclaude-rs/main/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/tcr/main/install.sh | sh
 ```
 
 This installs the `tcr` CLI. On macOS it also installs TcrBar from the `.dmg` on the
-[release page](https://github.com/dhkts1/teamclaude-rs/releases/latest); set `TCR_SKIP_UI=1` to skip
+[release page](https://github.com/dhkts1/tcr/releases/latest); set `TCR_SKIP_UI=1` to skip
 that step. To install only the `tcr` CLI, on any platform, use the cargo-dist installer directly:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh | sh
 ```
 
 Or build from source with a Rust toolchain. Put the binary in place with the script and not with
@@ -82,12 +82,12 @@ rather than overwrite a `claude` alias, function or base URL you already have, a
 
 ### Verify a download
 
-Get `tcr` from this repository's [release page](https://github.com/dhkts1/teamclaude-rs/releases)
+Get `tcr` from this repository's [release page](https://github.com/dhkts1/tcr/releases)
 or `install.sh` above, never a copy repackaged elsewhere: it is about to hold your account tokens.
 Each CLI archive has a `.sha256` file beside it:
 
 ```sh
-shasum -a 256 -c teamclaude-rs-aarch64-apple-darwin.tar.xz.sha256
+shasum -a 256 -c tcr-aarch64-apple-darwin.tar.xz.sha256
 ```
 
 TcrBar is signed with a Developer ID certificate and notarized by Apple. The commands that check
@@ -231,7 +231,7 @@ spend figures, and the footer holds a keep-awake switch, Check for updates and Q
 you, keep the Mac awake while it does, and update itself through
 [Sparkle](https://sparkle-project.org).
 
-Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run
+Install it from the [latest release](https://github.com/dhkts1/tcr/releases/latest), or run
 `tcr ui`. To build it from this repo, run `apps/macos/scripts/install.sh`. How releases are made is in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 The panel never shows a blank list. It tells apart four cases, because each needs a different

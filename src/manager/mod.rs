@@ -73,7 +73,7 @@ mod wire_sessions;
 
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
-// the divert-budget design notes §6. Import path: `teamclaude_rs::manager::{divert_verdict, DivertVerdict}`.
+// the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
 pub use select::{divert_verdict, DivertVerdict};
 
 const REQUEST_LOG_CAPACITY: usize = 200;

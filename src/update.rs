@@ -30,7 +30,7 @@
 //! file that documents every other defence makes silence read as "handled":
 //! **TLS and nothing else.** The release publishes no checksum for the
 //! installer script — `sha256.sum` covers the four platform tarballs and
-//! `source.tar.gz` only, there is no `teamclaude-rs-installer.sh.sha256`
+//! `source.tar.gz` only, there is no `tcr-installer.sh.sha256`
 //! asset, and `dist-manifest.json` records `checksum: None` for it — so there
 //! is nothing to verify the script against and this code deliberately does not
 //! pretend otherwise. We fetch over HTTPS (`https_only`, so an https→http
@@ -247,10 +247,10 @@ fn built_binary_path(root: &Path) -> anyhow::Result<PathBuf> {
 
 /// `owner/repo` the releases are published under. Kept as one constant so the
 /// API URL and the asset URL can never drift apart.
-const RELEASE_REPO: &str = "dhkts1/teamclaude-rs";
+const RELEASE_REPO: &str = "dhkts1/tcr";
 
 /// The installer asset name `dist` publishes with every release.
-const INSTALLER_ASSET: &str = "teamclaude-rs-installer.sh";
+const INSTALLER_ASSET: &str = "tcr-installer.sh";
 
 /// The environment variable that makes `dist`'s installer write the binary into
 /// exactly one directory. Without an override the installer picks its own
@@ -266,7 +266,7 @@ const INSTALLER_ASSET: &str = "teamclaude-rs-installer.sh";
 /// layout, `_install_dir="$_force_install_dir"` verbatim, and additionally sets
 /// `NO_MODIFY_PATH=1` and skips the receipt/self-updater — correct for
 /// replacing a binary that is already installed and already on PATH.
-const UNMANAGED_INSTALL_ENV: &str = "TEAMCLAUDE_RS_UNMANAGED_INSTALL";
+const UNMANAGED_INSTALL_ENV: &str = "TCR_UNMANAGED_INSTALL";
 
 /// The file name the installer writes into the install directory.
 const BINARY_NAME: &str = "tcr";
@@ -281,29 +281,29 @@ const BINARY_NAME: &str = "tcr";
 /// shell (or by a direnv `.envrc`) outranks. Measured against the published
 /// installer, sha256 `d79d3de…`:
 ///
-///   * `TEAMCLAUDE_RS_INSTALL_DIR` and `CARGO_DIST_FORCE_INSTALL_DIR` sit ABOVE
+///   * `TCR_INSTALL_DIR` and `CARGO_DIST_FORCE_INSTALL_DIR` sit ABOVE
 ///     `UNMANAGED_INSTALL` in the precedence chain (installer.sh:657-666), and
 ///     the second selects the cargo-home layout that appends `/bin` — so an
 ///     inherited one installs to `<dir>/bin/tcr`: the second-copy failure this
 ///     whole path exists to prevent, while we print a directory nothing was
 ///     written to.
-///   * `TEAMCLAUDE_RS_DOWNLOAD_URL`, `INSTALLER_DOWNLOAD_URL`,
-///     `TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL` and
-///     `TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL` (installer.sh:28-37) replace
+///   * `TCR_DOWNLOAD_URL`, `INSTALLER_DOWNLOAD_URL`,
+///     `TCR_INSTALLER_GHE_BASE_URL` and
+///     `TCR_INSTALLER_GITHUB_BASE_URL` (installer.sh:28-37) replace
 ///     the artifact download URLs wholesale, `http://` included. The binary we
 ///     are about to put on the user's PATH would come from there.
-///   * `TEAMCLAUDE_RS_GITHUB_TOKEN` (installer.sh:66, 1523-1530) is sent as an
+///   * `TCR_GITHUB_TOKEN` (installer.sh:66, 1523-1530) is sent as an
 ///     `Authorization: Bearer` header to whatever those URLs point at. A
 ///     poisoned URL plus an inherited token is token exfiltration. The releases
 ///     are public, so the installer never needs a credential from us.
 const INSTALLER_ENV_OVERRIDES: [&str; 7] = [
-    "TEAMCLAUDE_RS_INSTALL_DIR",
+    "TCR_INSTALL_DIR",
     "CARGO_DIST_FORCE_INSTALL_DIR",
-    "TEAMCLAUDE_RS_DOWNLOAD_URL",
+    "TCR_DOWNLOAD_URL",
     "INSTALLER_DOWNLOAD_URL",
-    "TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL",
-    "TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL",
-    "TEAMCLAUDE_RS_GITHUB_TOKEN",
+    "TCR_INSTALLER_GHE_BASE_URL",
+    "TCR_INSTALLER_GITHUB_BASE_URL",
+    "TCR_GITHUB_TOKEN",
 ];
 
 /// Remove every [`INSTALLER_ENV_OVERRIDES`] entry from a child's environment.
@@ -849,7 +849,7 @@ fn print_manual_app_instructions(bundle: &Path) {
     println!(
         "tcr is running from the copy bundled inside {}, so it can't self-update.\n\
          Rebuild and reinstall the app from the source tree:\n\
-         \n    git -C <teamclaude-rs> pull --ff-only && <teamclaude-rs>/apps/macos/scripts/install.sh\n\
+         \n    git -C <tcr checkout> pull --ff-only && <tcr checkout>/apps/macos/scripts/install.sh\n\
          \nDo NOT `cargo install --path` here: that writes ~/.cargo/bin/tcr, a third copy \
          competing with the bundled one and with anything already on your PATH.",
         bundle.display()
@@ -1716,11 +1716,11 @@ mod tests {
     fn asset_and_api_urls_are_built_from_one_repo_constant() {
         assert_eq!(
             latest_release_api_url(),
-            "https://api.github.com/repos/dhkts1/teamclaude-rs/releases/latest"
+            "https://api.github.com/repos/dhkts1/tcr/releases/latest"
         );
         assert_eq!(
             installer_url_for_tag("v0.1.0").unwrap(),
-            "https://github.com/dhkts1/teamclaude-rs/releases/download/v0.1.0/teamclaude-rs-installer.sh"
+            "https://github.com/dhkts1/tcr/releases/download/v0.1.0/tcr-installer.sh"
         );
         // Tag-pinned, NOT /releases/latest/download/…: a release cut between the
         // API query and the download would otherwise install a version we never
@@ -1737,12 +1737,12 @@ mod tests {
     fn dmg_url_drops_the_v_from_the_filename_not_the_path() {
         assert_eq!(
             dmg_url_for_tag("v0.2.32").unwrap(),
-            "https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.32/TcrBar-0.2.32.dmg"
+            "https://github.com/dhkts1/tcr/releases/download/v0.2.32/TcrBar-0.2.32.dmg"
         );
         // A tag with no leading `v` names a file equal to itself.
         assert_eq!(
             dmg_url_for_tag("0.2.32").unwrap(),
-            "https://github.com/dhkts1/teamclaude-rs/releases/download/0.2.32/TcrBar-0.2.32.dmg"
+            "https://github.com/dhkts1/tcr/releases/download/0.2.32/TcrBar-0.2.32.dmg"
         );
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
             );
             assert!(installer_url_for_tag(tag)
                 .unwrap()
-                .starts_with("https://github.com/dhkts1/teamclaude-rs/releases/download/"));
+                .starts_with("https://github.com/dhkts1/tcr/releases/download/"));
         }
 
         // The same rejection happens at the API ingress, so a poisoned
@@ -1801,20 +1801,21 @@ mod tests {
     }
 
     /// Measured against the published v0.1.0 installer, both directions:
-    /// `TEAMCLAUDE_RS_UNMANAGED_INSTALL=<dir>` installed `<dir>/tcr`, while
+    /// `TCR_UNMANAGED_INSTALL=<dir>` installed `<dir>/tcr`, while
     /// `CARGO_DIST_FORCE_INSTALL_DIR=<dir>` installed `<dir>/bin/tcr`. Pointing
     /// the latter at the running binary's directory would therefore create the
     /// second copy this whole path exists to prevent, so the variable name is
     /// pinned rather than left to look interchangeable.
     #[test]
     fn the_install_dir_override_is_the_flat_layout_variable() {
-        assert_eq!(UNMANAGED_INSTALL_ENV, "TEAMCLAUDE_RS_UNMANAGED_INSTALL");
+        assert_eq!(UNMANAGED_INSTALL_ENV, "TCR_UNMANAGED_INSTALL");
         assert_ne!(UNMANAGED_INSTALL_ENV, "CARGO_DIST_FORCE_INSTALL_DIR");
     }
 
     #[test]
     fn parse_latest_tag_reads_the_tag_name() {
-        let body = r#"{"tag_name":"v0.1.0","name":"v0.1.0","assets":[{"name":"teamclaude-rs-installer.sh"}]}"#;
+        let body =
+            r#"{"tag_name":"v0.1.0","name":"v0.1.0","assets":[{"name":"tcr-installer.sh"}]}"#;
         assert_eq!(parse_latest_tag(body).unwrap(), "v0.1.0");
     }
 
@@ -1915,12 +1916,12 @@ mod tests {
         fs::write(
             &script,
             "#!/bin/sh\n\
-             if [ -n \"${TEAMCLAUDE_RS_INSTALL_DIR:-}\" ]; then\n\
-             \x20 d=\"$TEAMCLAUDE_RS_INSTALL_DIR\"\n\
+             if [ -n \"${TCR_INSTALL_DIR:-}\" ]; then\n\
+             \x20 d=\"$TCR_INSTALL_DIR\"\n\
              elif [ -n \"${CARGO_DIST_FORCE_INSTALL_DIR:-}\" ]; then\n\
              \x20 d=\"$CARGO_DIST_FORCE_INSTALL_DIR/bin\"\n\
-             elif [ -n \"${TEAMCLAUDE_RS_UNMANAGED_INSTALL:-}\" ]; then\n\
-             \x20 d=\"$TEAMCLAUDE_RS_UNMANAGED_INSTALL\"\n\
+             elif [ -n \"${TCR_UNMANAGED_INSTALL:-}\" ]; then\n\
+             \x20 d=\"$TCR_UNMANAGED_INSTALL\"\n\
              else\n\
              \x20 d=\"$HOME/.local/bin\"\n\
              fi\n\
@@ -1958,14 +1959,14 @@ mod tests {
         // The six named in review, spelled out so a rename cannot quietly drop
         // one from the array and still pass the loop above.
         for key in [
-            "TEAMCLAUDE_RS_INSTALL_DIR",
+            "TCR_INSTALL_DIR",
             "CARGO_DIST_FORCE_INSTALL_DIR",
-            "TEAMCLAUDE_RS_DOWNLOAD_URL",
+            "TCR_DOWNLOAD_URL",
             "INSTALLER_DOWNLOAD_URL",
-            "TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL",
-            "TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL",
+            "TCR_INSTALLER_GHE_BASE_URL",
+            "TCR_INSTALLER_GITHUB_BASE_URL",
             // …plus the credential, which is what a poisoned URL would steal.
-            "TEAMCLAUDE_RS_GITHUB_TOKEN",
+            "TCR_GITHUB_TOKEN",
         ] {
             assert!(
                 envs.iter().any(|(k, v)| k == key && v.is_none()),
@@ -1998,7 +1999,7 @@ mod tests {
         // CONTROL: no scrub — the inherited variable wins and the binary lands
         // somewhere we never asked for, while `intended` stays empty.
         let control = Command::new(&script)
-            .env("TEAMCLAUDE_RS_INSTALL_DIR", &attacker)
+            .env("TCR_INSTALL_DIR", &attacker)
             .env(UNMANAGED_INSTALL_ENV, &intended)
             .status()
             .unwrap();
@@ -2016,7 +2017,7 @@ mod tests {
         // PROOF: the same poison var, scrubbed by installer_command — the
         // binary lands in the directory we asked for and nowhere else.
         let mut cmd = Command::new(&script);
-        cmd.env("TEAMCLAUDE_RS_INSTALL_DIR", &attacker);
+        cmd.env("TCR_INSTALL_DIR", &attacker);
         scrub_installer_env(&mut cmd);
         cmd.env(UNMANAGED_INSTALL_ENV, &intended);
         assert!(cmd.status().unwrap().success());

@@ -35,14 +35,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
-use teamclaude_rs::peer::config::{Allow, ControlGrants, PeerRow};
-use teamclaude_rs::peer::listener::{
+use tcr::peer::config::{Allow, ControlGrants, PeerRow};
+use tcr::peer::listener::{
     self, hello_for_peer, peer_stream_gate_hop, peer_stream_gate_rows, NodeFacts, RequestDedup,
     StreamRefusal,
 };
-use teamclaude_rs::peer::noise::{self, Handshake, PinRefusal};
-use teamclaude_rs::peer::pair::{self, PairingWindow};
+use tcr::peer::noise::{self, Handshake, PinRefusal};
+use tcr::peer::pair::{self, PairingWindow};
+use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -355,14 +355,13 @@ fn noise_message_one_lengths_are_what_the_gate_pins() {
 /// next handshake with no restart.
 ///
 /// Watch it fail by deleting the comparison in
-/// [`teamclaude_rs::peer::noise::pin_check`] and watching a forgotten peer
+/// [`tcr::peer::noise::pin_check`] and watching a forgotten peer
 /// complete a handshake and open a stream.
 #[test]
 fn an_unpinned_peer_is_refused_before_message_two() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
-    let store =
-        teamclaude_rs::peer::config::PeerStore::open(&peers).expect("an empty peers file opens");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("an empty peers file opens");
 
     // A static key nobody pinned. Obviously fake, and 32 bytes, so the refusal
     // has to be the pin decision and not a length check.
@@ -1194,7 +1193,7 @@ fn a_pairing_window_opens_and_then_expires_on_its_own() {
 #[test]
 fn opening_the_window_keeps_every_other_key_in_the_state_file() {
     use std::os::unix::fs::PermissionsExt as _;
-    use teamclaude_rs::peer::state;
+    use tcr::peer::state;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let state = dir.path().join("peer-state.json");
@@ -1246,7 +1245,7 @@ fn opening_the_window_keeps_every_other_key_in_the_state_file() {
 #[test]
 fn a_state_file_a_wider_mode_is_quarantined_and_the_saved_one_is_0600() {
     use std::os::unix::fs::PermissionsExt as _;
-    use teamclaude_rs::peer::state;
+    use tcr::peer::state;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("peer-state.json");
@@ -1315,11 +1314,11 @@ fn a_state_file_this_writer_creates_carries_the_format_version() {
         serde_json::from_slice(&std::fs::read(&state).expect("the file reads")).expect("JSON");
     assert_eq!(
         written["version"],
-        serde_json::json!(teamclaude_rs::peer::state::FORMAT_VERSION),
+        serde_json::json!(tcr::peer::state::FORMAT_VERSION),
         "a version-less file is one `state::load` quarantines"
     );
 
-    let loaded = teamclaude_rs::peer::state::load(&state, 5_000)
+    let loaded = tcr::peer::state::load(&state, 5_000)
         .expect("the state loader reads a file the pairing window created");
     assert!(
         loaded.leases.is_empty(),
@@ -1577,7 +1576,7 @@ fn peer_find_off_stores_announce_name_and_exits_zero() {
 /// the reload reads `Closed` and this test fails on the third assertion.
 #[test]
 fn the_pairing_window_survives_a_save_and_a_load() {
-    use teamclaude_rs::peer::state::{self, PairingDeadline};
+    use tcr::peer::state::{self, PairingDeadline};
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("peer-state.json");
@@ -1661,11 +1660,11 @@ fn a_clock_that_moved_closes_the_pairing_window() {
 
 /// A peers file at mode 0600 with a listener address, through the one writer.
 fn peers_file_with_listener(path: &std::path::Path, listen: std::net::SocketAddr) {
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         listen: Some(listen),
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(path, &file).expect("the peers file is written");
+    tcr::peer::config::save(path, &file).expect("the peers file is written");
 }
 
 /// `tcr peer join` used to report success while the registrar recorded
@@ -1686,10 +1685,10 @@ fn peers_file_with_listener(path: &std::path::Path, listen: std::net::SocketAddr
 /// bug, seen from the joiner's side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
+    use tcr::peer::config::{self as peer_config, PeerStore};
+    use tcr::peer::id::NodeKey;
+    use tcr::peer::listener::outstanding_secrets;
     use tcr_peer_wire::Control;
-    use teamclaude_rs::peer::config::{self as peer_config, PeerStore};
-    use teamclaude_rs::peer::id::NodeKey;
-    use teamclaude_rs::peer::listener::outstanding_secrets;
 
     let registrar_dir = tempfile::tempdir().expect("a temp dir");
     let joiner_dir = tempfile::tempdir().expect("a temp dir");
@@ -1700,7 +1699,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     let joiner_key = NodeKey::load_or_mint(joiner_dir.path()).expect("a joiner keypair");
 
     // Bind first, so the token carries the port the kernel actually gave us.
-    let listener = teamclaude_rs::peer::listener::bind("127.0.0.1:0".parse().expect("an addr"))
+    let listener = tcr::peer::listener::bind("127.0.0.1:0".parse().expect("an addr"))
         .await
         .expect("a loopback peer socket");
     let addr = listener.local_addr().expect("the bound address");
@@ -1708,15 +1707,9 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     peers_file_with_listener(&joiner_peers, "127.0.0.1:1".parse().expect("an addr"));
 
     let registrar_store = PeerStore::open(&registrar_peers).expect("the registrar's file opens");
-    let (invite, token) = teamclaude_rs::peer::pair::mint_invite_as(
-        &registrar_store,
-        &registrar_key,
-        "laptop-2",
-        600,
-        1,
-        None,
-    )
-    .expect("an invite is minted");
+    let (invite, token) =
+        tcr::peer::pair::mint_invite_as(&registrar_store, &registrar_key, "laptop-2", 600, 1, None)
+            .expect("an invite is minted");
 
     // The registrar's half: exactly what the listener has to do for an
     // enrolment, and the body the listener's own patch hands over.
@@ -1725,8 +1718,8 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     let registrar_path = registrar_peers.clone();
     let accepting = tokio::spawn(async move {
         let (mut stream, _from) = listener.accept().await.expect("the joiner connects");
-        let file = teamclaude_rs::peer::config::read_or_default(&registrar_path)
-            .expect("the peers file reads");
+        let file =
+            tcr::peer::config::read_or_default(&registrar_path).expect("the peers file reads");
         let psks = outstanding_secrets(&file);
         let message_1 = noise::read_frame(&mut stream).await.expect("message 1");
         let mut scratch = vec![0_u8; tcr_peer_wire::MAX_FRAME_BYTES];
@@ -1772,7 +1765,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
         else {
             panic!("an enrolment session may send exactly one Enroll and nothing else");
         };
-        teamclaude_rs::peer::pair::accept_enrolment(
+        tcr::peer::pair::accept_enrolment(
             &registrar_path,
             session.peer,
             &enroll,
@@ -1785,7 +1778,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
         // The acknowledgement: the ordinary Hello a pinned peer may receive.
         let hello = hello_for_peer(
             &NodeFacts::minimal(registrar_id),
-            &teamclaude_rs::peer::config::ControlGrants::default(),
+            &tcr::peer::config::ControlGrants::default(),
         );
         let bytes = serde_json::to_vec(&Control::Hello(hello)).expect("the Hello serializes");
         noise::send_encrypted(&mut stream, &mut session.transport, &bytes)
@@ -1794,7 +1787,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     });
 
     let joiner_store = PeerStore::open(&joiner_peers).expect("the joiner's file opens");
-    let pinned = teamclaude_rs::peer::pair::join_as(&joiner_store, &joiner_key, &token, "laptop-2")
+    let pinned = tcr::peer::pair::join_as(&joiner_store, &joiner_key, &token, "laptop-2")
         .await
         .expect("the joiner enrols");
     accepting.await.expect("the registrar's half");
@@ -1850,10 +1843,10 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
 /// the operator minted for one machine.
 #[test]
 fn a_one_use_invite_refuses_its_second_joiner() {
+    use tcr::peer::config::{self as peer_config, PeerStore};
+    use tcr::peer::id::NodeKey;
+    use tcr::peer::listener::outstanding_secrets;
     use tcr_peer_wire::Enroll;
-    use teamclaude_rs::peer::config::{self as peer_config, PeerStore};
-    use teamclaude_rs::peer::id::NodeKey;
-    use teamclaude_rs::peer::listener::outstanding_secrets;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
@@ -1861,15 +1854,14 @@ fn a_one_use_invite_refuses_its_second_joiner() {
     let node = NodeKey::load_or_mint(dir.path()).expect("a keypair");
     let store = PeerStore::open(&peers).expect("the file opens");
 
-    let (invite, _token) =
-        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
-            .expect("an invite is minted");
+    let (invite, _token) = tcr::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
+        .expect("an invite is minted");
     let enroll = Enroll {
         invite_id: 0,
         label: "laptop-2".to_string(),
     };
 
-    let first = teamclaude_rs::peer::pair::accept_enrolment(
+    let first = tcr::peer::pair::accept_enrolment(
         &peers,
         PeerId([4_u8; 32]),
         &enroll,
@@ -1880,7 +1872,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
     .expect("the first joiner proves the invite and is pinned");
     assert_eq!(first.node, PeerId([4_u8; 32]));
 
-    let second = teamclaude_rs::peer::pair::accept_enrolment(
+    let second = tcr::peer::pair::accept_enrolment(
         &peers,
         PeerId([5_u8; 32]),
         &enroll,
@@ -1909,21 +1901,20 @@ fn a_one_use_invite_refuses_its_second_joiner() {
 /// to burn an operator's one-use key.
 #[test]
 fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
+    use tcr::peer::config::{self as peer_config, PeerStore};
+    use tcr::peer::id::NodeKey;
     use tcr_peer_wire::Enroll;
-    use teamclaude_rs::peer::config::{self as peer_config, PeerStore};
-    use teamclaude_rs::peer::id::NodeKey;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
     peers_file_with_listener(&peers, "127.0.0.1:9600".parse().expect("an addr"));
     let node = NodeKey::load_or_mint(dir.path()).expect("a keypair");
     let store = PeerStore::open(&peers).expect("the file opens");
-    let (invite, _token) =
-        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
-            .expect("an invite is minted");
+    let (invite, _token) = tcr::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
+        .expect("an invite is minted");
 
     for hostile in ["alice@example.com", "laptop\u{1b}[31m2", "laptop\n2"] {
-        let refusal = teamclaude_rs::peer::pair::accept_enrolment(
+        let refusal = tcr::peer::pair::accept_enrolment(
             &peers,
             PeerId([6_u8; 32]),
             &Enroll {
@@ -1982,8 +1973,8 @@ fn the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused() {
 
     std::fs::set_permissions(&peers, std::fs::Permissions::from_mode(0o644))
         .expect("widen it by hand");
-    let refusal = teamclaude_rs::peer::config::read_or_default(&peers)
-        .expect_err("a widened peers file is refused");
+    let refusal =
+        tcr::peer::config::read_or_default(&peers).expect_err("a widened peers file is refused");
     assert!(
         format!("{refusal:#}").contains("0600"),
         "the refusal names the mode it wanted: {refusal:#}"
@@ -2004,12 +1995,12 @@ fn the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused() {
 fn a_planted_symlink_does_not_capture_the_node_key() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let captured = dir.path().join("captured.key");
-    let key_path = teamclaude_rs::peer::id::private_key_path(dir.path());
+    let key_path = tcr::peer::id::private_key_path(dir.path());
     std::os::unix::fs::symlink(&captured, &key_path).expect("plant the link");
 
     // `NodeKey` has no `Debug` on purpose (it holds the secret), so the
     // refusal is read off the `Err` arm rather than through `expect_err`.
-    let refusal = match teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path()) {
+    let refusal = match tcr::peer::id::NodeKey::load_or_mint(dir.path()) {
         Ok(_) => String::from("load_or_mint returned a key"),
         Err(err) => format!("{err:#}"),
     };
@@ -2120,18 +2111,18 @@ fn forget_takes_the_file_lock() {
         allow: Allow::default(),
         lend: Vec::new(),
     };
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![pinned(doomed, "studio-mac"), pinned(other, "attic-nuc")],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
-    let store = teamclaude_rs::peer::config::PeerStore::open(&peers).expect("open the store");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the store");
 
     // The control first, so the comparison is against a measurement rather
     // than against an assumption about how fast a file write is.
     let started = std::time::Instant::now();
     assert!(
-        teamclaude_rs::peer::pair::forget(&store, &other).expect("the forget writes"),
+        tcr::peer::pair::forget(&store, &other).expect("the forget writes"),
         "the row was there, so this reports a removal"
     );
     let unlocked = started.elapsed();
@@ -2141,30 +2132,28 @@ fn forget_takes_the_file_lock() {
     );
 
     // And now with somebody else's read-modify-write in flight.
-    let held =
-        teamclaude_rs::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
+    let held = tcr::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
     let started = std::time::Instant::now();
-    let removed = teamclaude_rs::peer::pair::forget(&store, &doomed).expect("the forget writes");
+    let removed = tcr::peer::pair::forget(&store, &doomed).expect("the forget writes");
     let waited = started.elapsed();
     drop(held);
 
     assert!(removed, "it still removes the row once it has the lock");
     assert!(
-        waited >= std::time::Duration::from_millis(teamclaude_rs::peer::config::LOCK_STALE_MS),
+        waited >= std::time::Duration::from_millis(tcr::peer::config::LOCK_STALE_MS),
         "a forget must wait for the holder rather than write over its read-modify-write: it \
          took {waited:?}, and the hold is only broken after {}ms",
-        teamclaude_rs::peer::config::LOCK_STALE_MS
+        tcr::peer::config::LOCK_STALE_MS
     );
     assert!(
-        teamclaude_rs::peer::config::read_or_default(&peers)
+        tcr::peer::config::read_or_default(&peers)
             .expect("the file reads")
             .peers
             .is_empty(),
         "and both rows are gone"
     );
     assert!(
-        !teamclaude_rs::peer::pair::forget(&store, &doomed)
-            .expect("a second forget is not an error"),
+        !tcr::peer::pair::forget(&store, &doomed).expect("a second forget is not an error"),
         "a peer that is not pinned reports no removal and writes nothing"
     );
 }
@@ -2188,17 +2177,17 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     // With a listener address, because the enrolment at the end mints an
     // invite and an invite with no address to dial is refused.
     peers_file_with_listener(&peers, "127.0.0.1:9600".parse().expect("an addr"));
-    let store = teamclaude_rs::peer::config::PeerStore::open(&peers).expect("open the store");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the store");
     let peer = PeerId([66_u8; 32]);
 
     let started = std::time::Instant::now();
-    teamclaude_rs::peer::pair::confirm(&store, &peer, "123456", None).expect("the pin writes");
+    tcr::peer::pair::confirm(&store, &peer, "123456", None).expect("the pin writes");
     let unlocked = started.elapsed();
     assert!(
         unlocked < std::time::Duration::from_millis(200),
         "with nobody holding the file a pin is immediate: {unlocked:?}"
     );
-    let written = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let written = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
         written.peers.len(),
         1,
@@ -2206,14 +2195,13 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     );
     assert_eq!(written.peers[0].node, peer);
 
-    let held =
-        teamclaude_rs::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
+    let held = tcr::peer::config::FileLock::acquire(&peers).expect("take the file lock first");
     let started = std::time::Instant::now();
-    teamclaude_rs::peer::pair::confirm(&store, &peer, "654321", None).expect("the re-pin writes");
+    tcr::peer::pair::confirm(&store, &peer, "654321", None).expect("the re-pin writes");
     let waited = started.elapsed();
     drop(held);
     assert!(
-        waited >= std::time::Duration::from_millis(teamclaude_rs::peer::config::LOCK_STALE_MS),
+        waited >= std::time::Duration::from_millis(tcr::peer::config::LOCK_STALE_MS),
         "a pin must wait for the holder rather than write over its read-modify-write: it took \
          {waited:?}"
     );
@@ -2222,12 +2210,12 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     // not go through `pin_row`, so it still completes: the deadlock this
     // could have introduced.
     let joiner = PeerId([67_u8; 32]);
-    let node = teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path())
-        .expect("a node key for the registrar");
+    let node =
+        tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a node key for the registrar");
     let (invite, _token) =
-        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1, None)
+        tcr::peer::pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1, None)
             .expect("an invite is minted");
-    let row = teamclaude_rs::peer::pair::accept_enrolment(
+    let row = tcr::peer::pair::accept_enrolment(
         &peers,
         joiner,
         &tcr_peer_wire::Enroll {
@@ -2389,7 +2377,7 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
 
     for _ in 0..MINTS {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let key_path = teamclaude_rs::peer::id::private_key_path(dir.path());
+        let key_path = tcr::peer::id::private_key_path(dir.path());
         let start = std::sync::Arc::new(std::sync::Barrier::new(2));
         let watcher_start = start.clone();
         let watched = key_path.clone();
@@ -2407,7 +2395,7 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
         });
 
         start.wait();
-        teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
+        tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
         if let Some(first) = watcher.join().expect("the watching thread finishes") {
             sampled += 1;
             if first != 32 {
@@ -2442,7 +2430,7 @@ fn a_node_key_file_is_never_visible_before_its_bytes() {
 #[test]
 fn minting_leaves_only_the_two_key_files() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
+    tcr::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
 
     let mut names: Vec<String> = std::fs::read_dir(dir.path())
         .expect("the config dir reads")

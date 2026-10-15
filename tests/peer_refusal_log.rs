@@ -20,11 +20,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tcr::peer::config::{self, PeerFile};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::noise::{self, Handshake};
 use tcr_peer_wire::PeerId;
-use teamclaude_rs::peer::config::{self, PeerFile};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, SessionContext};
-use teamclaude_rs::peer::noise::{self, Handshake};
 use tokio::net::TcpStream;
 
 /// A scratch directory named after this process and thread, so five lanes

@@ -1,4 +1,4 @@
-# gitleaks configuration for teamclaude-rs.
+# gitleaks configuration for tcr.
 #
 # The pre-commit hook (.githooks/pre-commit) runs `gitleaks git --staged` with
 # this config, so no secret reaches a commit. It extends gitleaks' built-in
@@ -7,7 +7,7 @@
 #
 # Enable the hook in a fresh clone with:
 #   git config core.hooksPath .githooks
-title = "teamclaude-rs"
+title = "tcr"
 
 [extend]
 useDefault = true

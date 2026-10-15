@@ -1,4 +1,4 @@
-# Contributing to teamclaude-rs
+# Contributing to tcr
 
 Thanks for looking at this. `tcr` is a rotating Anthropic API proxy that runs on a developer's own
 machine and holds live OAuth credentials for real accounts, so a few of the rules below are stricter
@@ -39,13 +39,13 @@ mechanics of turning that fork into a pull request are under
 
 ```sh
 # From a fork (most people): press "Fork" on the repository page first.
-git clone https://github.com/<your-username>/teamclaude-rs
-cd teamclaude-rs
-git remote add upstream https://github.com/dhkts1/teamclaude-rs
+git clone https://github.com/<your-username>/tcr
+cd tcr
+git remote add upstream https://github.com/dhkts1/tcr
 
 # With push access: clone this repository directly.
-git clone https://github.com/dhkts1/teamclaude-rs
-cd teamclaude-rs
+git clone https://github.com/dhkts1/tcr
+cd tcr
 ```
 
 Either way, before you touch anything:
@@ -179,9 +179,9 @@ have bypassed the rules.
 ### Opening one from a fork
 
 Push the branch to your own copy — `git push origin fix/whatever`, where `origin` is your fork — and
-open the pull request with the **base** set to `dhkts1/teamclaude-rs` `main` and the **head** set to
+open the pull request with the **base** set to `dhkts1/tcr` `main` and the **head** set to
 your fork's branch. GitHub offers this as a "Compare & pull request" banner in the minutes after you
-push; from a terminal, `gh pr create --repo dhkts1/teamclaude-rs` does the same thing. Read the base
+push; from a terminal, `gh pr create --repo dhkts1/tcr` does the same thing. Read the base
 before you submit. A fresh fork's pull request form can default to your own copy as the base, which
 produces a pull request from you to you — it looks completely normal and no maintainer will ever
 see it.
@@ -253,7 +253,7 @@ specific bug they exist to prevent. Read the doc-comment before "fixing" what it
 
 ## Questions
 
-Open an issue with the [bug report](https://github.com/dhkts1/teamclaude-rs/issues/new?template=bug_report.yml)
-or [feature request](https://github.com/dhkts1/teamclaude-rs/issues/new?template=feature_request.yml)
+Open an issue with the [bug report](https://github.com/dhkts1/tcr/issues/new?template=bug_report.yml)
+or [feature request](https://github.com/dhkts1/tcr/issues/new?template=feature_request.yml)
 form. If you are reporting something involving credentials, quotas or account data, please
 redact before posting; the issue tracker is as public as the repository.

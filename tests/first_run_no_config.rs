@@ -26,13 +26,12 @@ use std::process::Command;
 /// The config path the child will resolve from its own `HOME`
 /// (`config::default_path`) when nothing is there yet: the new name.
 fn config_path_in(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join(teamclaude_rs::paths::CONFIG_FILE)
+    home.join(".config").join(tcr::paths::CONFIG_FILE)
 }
 
 /// The config an install from before the rename has.
 fn legacy_config_path_in(home: &std::path::Path) -> PathBuf {
-    home.join(".config")
-        .join(teamclaude_rs::legacy_names::CONFIG_FILE)
+    home.join(".config").join(tcr::legacy_names::CONFIG_FILE)
 }
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
@@ -114,7 +113,7 @@ fn status_with_no_config_exits_zero_and_creates_the_file() {
         "the empty-fleet hint must be on stderr, got: {stderr}"
     );
     assert!(
-        stderr.contains("created") && stderr.contains(teamclaude_rs::paths::CONFIG_FILE),
+        stderr.contains("created") && stderr.contains(tcr::paths::CONFIG_FILE),
         "creating the config must say so once, got: {stderr}"
     );
     assert!(
