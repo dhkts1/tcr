@@ -6616,9 +6616,25 @@ async fn relay_request(
                 mode = ?mode,
                 is_connect = err.is_connect(),
                 is_timeout = err.is_timeout(),
-                error = %err,
+                // `?err`, not `%err`: reqwest's Display prints only its top
+                // frame ("error sending request for url (...)"), so the cause
+                // that tells a reset from a refusal would be lost.
+                error = ?err,
                 "relay transport failure"
             );
+            // A failure that never left this box answers the way the main path
+            // does: a dead resolver is the machine being offline, any other
+            // connect-phase failure is safe to retry. Both checks run in this
+            // order because a DNS failure is also `is_connect()`. Past connect,
+            // the request may have reached the upstream, so it keeps the plain
+            // 502 with no `x-should-retry`: telling a client to retry it is a
+            // decision about relayed paths this arm does not make.
+            if is_offline_error(&err) {
+                return offline_unavailable(1);
+            }
+            if err.is_connect() {
+                return bad_gateway(1, false);
+            }
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "proxy_error",
@@ -21211,6 +21227,107 @@ mod tests {
             Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
             "the 503 must tell the client when to come back"
         );
+    }
+
+    /// Relay one raw `POST /v1/oauth/token` to `upstream` and return the answer,
+    /// calling [`relay_upstream`] directly so nothing else in [`handle`] decides
+    /// the status.
+    async fn relay_to(upstream: &str) -> Response {
+        let manager = Manager::with_live_refresher(dummy_config(None, upstream), None);
+        relay_upstream(
+            &manager,
+            RelayMode::Raw,
+            Method::POST,
+            "/v1/oauth/token",
+            &HeaderMap::new(),
+            Body::from(r#"{"grant_type":"refresh_token"}"#),
+        )
+        .await
+    }
+
+    fn retry_after(resp: &Response) -> Option<&str> {
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// A relay whose connection is refused never left this box, so it answers
+    /// the main path's safe-to-retry 503, not a 502 that points at the upstream.
+    #[tokio::test]
+    async fn a_relay_refused_at_connect_answers_503_with_retry_after() {
+        let resp = relay_to(&format!("http://127.0.0.1:{}", closed_loopback_port())).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a connect-phase relay failure sent nothing upstream, so it is a 503"
+        );
+        assert_eq!(
+            retry_after(&resp),
+            Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "the connect-phase 503 tells the client when to come back"
+        );
+    }
+
+    /// A relay whose upstream host cannot resolve is the machine being offline,
+    /// and answers the main path's offline 503.
+    #[tokio::test]
+    async fn a_relay_to_an_unresolvable_host_answers_the_offline_503() {
+        let resp = relay_to("http://offline-probe.invalid").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a dead resolver is a local, recoverable condition, not a bad gateway"
+        );
+        assert_eq!(
+            retry_after(&resp),
+            Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "the offline 503 tells the client when to come back"
+        );
+        let body = to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Name resolution failed"),
+            "the offline answer, not the connect-phase one: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// A relay that got PAST connect may have reached the upstream, so it keeps
+    /// today's plain 502 with no `x-should-retry` either way: its outcome is
+    /// unknown, and whether relayed paths should tell clients to retry is not
+    /// decided here.
+    #[tokio::test]
+    async fn a_relay_dropped_after_connect_still_answers_502() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Read the request so it has provably left the client, then
+                // hang up without answering.
+                let mut buf = [0u8; 1024];
+                if sock.read(&mut buf).await.is_err() {
+                    continue;
+                }
+                drop(sock);
+            }
+        });
+
+        let resp = relay_to(&format!("http://{addr}")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "a failure past connect keeps the 502: the request may have arrived"
+        );
+        assert_eq!(
+            resp.headers().get("x-should-retry"),
+            None,
+            "the relay's 502 says nothing about retrying, as before"
+        );
+        assert_eq!(retry_after(&resp), None, "and carries no retry-after");
     }
 
     /// The per-request wait bound must stay inside the loop's total attempt
