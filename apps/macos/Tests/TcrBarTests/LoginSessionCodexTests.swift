@@ -368,8 +368,11 @@ final class LoginSessionCodexTests: XCTestCase {
             }
         }
         let sleeper = try XCTUnwrap(pid, "the fake tcr never started its child")
+        let owned = ProcessTable.snapshot(pid: sleeper)
         addTeardownBlock {
-            if kill(sleeper, 0) == 0 { kill(sleeper, SIGKILL) }
+            signalOwnedCodexTestProcess(owned, current: ProcessTable.snapshot(pid: sleeper)) {
+                _ = kill($0, SIGKILL)
+            }
         }
 
         session.cancel()
@@ -407,6 +410,31 @@ final class LoginSessionCodexTests: XCTestCase {
         XCTAssertTrue(ended(sleeper), "the child the sign-in started outlived its session")
     }
 
+    @MainActor
+    func testTheLoginFactsRetainTheResolvedExecutable() {
+        let path = "/usr/bin/true"
+        let session = LoginSession(
+            request: .codex(account: nil), open: { _ in },
+            resolve: { .success(URL(fileURLWithPath: path)) }, storedCodexExecutable: { nil })
+        session.start()
+        XCTAssertEqual(session.facts.executablePath, path)
+        session.cancel()
+    }
+
+    func testTeardownDoesNotSignalAReusedPid() {
+        let original = ProcessSnapshot(
+            pid: 111, parentPid: 1, processGroup: 111, name: "sleep",
+            startedAt: Date(timeIntervalSince1970: 100), cpuSeconds: 0, residentBytes: 0)
+        let replacement = ProcessSnapshot(
+            pid: 111, parentPid: 1, processGroup: 111, name: "sleep",
+            startedAt: Date(timeIntervalSince1970: 101), cpuSeconds: 0, residentBytes: 0)
+        var signaled: [pid_t] = []
+        signalOwnedCodexTestProcess(original, current: replacement) { signaled.append($0) }
+        XCTAssertEqual(signaled, [])
+        signalOwnedCodexTestProcess(original, current: original) { signaled.append($0) }
+        XCTAssertEqual(signaled, [111])
+    }
+
     // MARK: - Helpers
 
     /// A Codex sign-in running a fake tcr whose own child sleeps, as `codex login` would wait
@@ -441,8 +469,11 @@ final class LoginSessionCodexTests: XCTestCase {
             }
         }
         let sleeper = try XCTUnwrap(pid, "the fake tcr never started its child")
+        let owned = ProcessTable.snapshot(pid: sleeper)
         addTeardownBlock {
-            if kill(sleeper, 0) == 0 { kill(sleeper, SIGKILL) }
+            signalOwnedCodexTestProcess(owned, current: ProcessTable.snapshot(pid: sleeper)) {
+                _ = kill($0, SIGKILL)
+            }
         }
         return (session, sleeper)
     }
@@ -502,4 +533,15 @@ final class LoginSessionCodexTests: XCTestCase {
         shell.waitUntilExit()
         return shell.terminationStatus
     }
+}
+
+/// Recheck the test-owned process identity so a reused-PID regression can run
+/// without signaling a real process. The captured start time is part of the owned identity.
+private func signalOwnedCodexTestProcess(
+    _ expected: ProcessSnapshot?, current: ProcessSnapshot?, send: (pid_t) -> Void
+) {
+    guard let expected, let current, expected.pid == current.pid,
+        expected.startedAt.timeIntervalSince1970 > 0, expected.startedAt == current.startedAt
+    else { return }
+    send(expected.pid)
 }

@@ -93,7 +93,7 @@ final class SessionsCodexCopyTests: XCTestCase {
     func testTheOldServerLineNeedsCodexTrafficAndNoProviderOnAnySession() throws {
         let s = try canonicalSessions()
         let seven =
-            "Codex served 7 requests in the last hour, but this proxy predates Codex sessions — restart it on this build to see them."
+            "Codex served 7 requests in the last hour, but no Codex session was reported. Requests without a session-id are counted without a session row."
         XCTAssertEqual(
             SessionsCodexCopy.oldServerLine(try fleet([alice, bob], sessions: [s.alice])), seven)
         XCTAssertEqual(
@@ -107,7 +107,7 @@ final class SessionsCodexCopyTests: XCTestCase {
         XCTAssertEqual(
             SessionsCodexCopy.oldServerLine(
                 try fleet([alice, bob], sessions: [s.alice], codexLastHourRequests: 1)),
-            "Codex served 1 request in the last hour, but this proxy predates Codex sessions — restart it on this build to see them."
+            "Codex served 1 request in the last hour, but no Codex session was reported. Requests without a session-id are counted without a session row."
         )
     }
 

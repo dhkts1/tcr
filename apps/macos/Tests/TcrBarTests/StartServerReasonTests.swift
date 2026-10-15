@@ -59,6 +59,19 @@ final class StartServerReasonTests: XCTestCase {
         + "only understands up to 1; refusing to load rather than silently reinterpret its "
         + "credential shape"
 
+    func testTheCredentialRefusalNamesTheExecutableThatActuallyRan() {
+        let path = "/opt/example/tcr"
+        XCTAssertTrue(PredatesCodexRefusal.displayed(refusal, executablePath: path).contains(path))
+        XCTAssertTrue(CodexSignInCopy.predatesCodexDetail(executablePath: path).contains(path))
+        XCTAssertTrue(
+            ServerController.State.exited(exitCode: 1, message: refusal)
+                .summary(executablePath: path).contains(path))
+        let state = StatusPoller.classify(
+            TcrTool.Output(exitCode: 1, stdout: Data(), stderr: refusal), executablePath: path)
+        XCTAssertTrue(state.summary.contains(path))
+        XCTAssertFalse(state.summary.contains("Update TcrBar"))
+    }
+
     /// The server's exit, and any other single line carrying that refusal, says what is
     /// wrong in words a person can act on: the tcr inside TcrBar is too old for this
     /// config. Anything else keeps tcr's own words.

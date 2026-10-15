@@ -12,6 +12,13 @@ import Foundation
 /// verbatim, into `.incumbentHoldsPort`'s `message`, so a safe start's own
 /// failed attempt is where this line comes from, not a separate port probe.
 extension ServerController.State {
+    public func summary(executablePath: String?) -> String {
+        if case .exited(_, let message) = self, PredatesCodexRefusal.matches(message) {
+            return PredatesCodexRefusal.displayed(message, executablePath: executablePath)
+        }
+        return summary
+    }
+
     /// The plain sentence for a disabled "Start server" control, or `nil` when
     /// starting again is not futile: every state but a non-proxy holder,
     /// including a `tcr` proxy already on the port (the common, benign case,
@@ -65,9 +72,11 @@ public enum PredatesCodexRefusal {
         return regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
     }
 
-    /// `text` as a single line shows it: the sentence naming the tcr inside TcrBar when
+    /// `text` as a single line shows it: the sentence naming the selected tcr when
     /// `text` carries the refusal, and otherwise `text` unchanged.
-    public static func displayed(_ text: String) -> String {
-        matches(text) ? CodexSignInCopy.predatesCodexSentence : text
+    public static func displayed(_ text: String, executablePath: String? = nil) -> String {
+        guard matches(text) else { return text }
+        return CodexSignInCopy.predatesCodexTitle + ". "
+            + CodexSignInCopy.predatesCodexDetail(executablePath: executablePath)
     }
 }

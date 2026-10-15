@@ -255,7 +255,9 @@ struct LoginSheet: View {
                     + "on the next poll."
             }
         case .failed(let reason):
-            if PredatesCodexRefusal.matches(reason) { return CodexSignInCopy.predatesCodexDetail }
+            if PredatesCodexRefusal.matches(reason) {
+                return CodexSignInCopy.predatesCodexDetail(executablePath: facts.executablePath)
+            }
             // tcr's own words, unparaphrased — the same rule every other
             // failure surface in this panel follows.
             return reason

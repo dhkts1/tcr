@@ -94,7 +94,11 @@ public struct SessionProjectSection: Identifiable, Equatable, Sendable {
     /// count and the spend already say the section is real.
     public var headerSummary: String {
         var parts = ["\(rows.count)"]
-        if let spend { parts.append(QuotaFormat.usd(spend)) }
+        if let label = Session.formatCost(
+            spend, isPartial: rows.contains { $0.session.unpricedRequests > 0 })
+        {
+            parts.append(label)
+        }
         if errors > 0 { parts.append("\(errors) err") }
         return parts.joined(separator: " · ")
     }

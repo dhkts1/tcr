@@ -1557,6 +1557,22 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         return costUsd
     }
 
+    /// A partial session cost is a lower bound; a rounded zero with unpriced
+    /// requests carries no dollar claim.
+    public var costLabel: String? {
+        Self.formatCost(pricedCostUsd, isPartial: unpricedRequests > 0)
+    }
+
+    public static func formatCost(_ cost: Double?, isPartial: Bool) -> String? {
+        guard let cost else { return nil }
+        let label = QuotaFormat.usd(cost)
+        if isPartial {
+            guard cost > 0, label != QuotaFormat.usd(0) else { return nil }
+            return label + "+"
+        }
+        return label
+    }
+
     public var id: String { sessionId }
 
     public init(
@@ -1911,8 +1927,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
 
     /// A Codex row from a server that predates the refusing-window gate,
     /// refused at a full window: the gate reads `rejected`, ChatGPT named no
-    /// limit (``limitReachedType`` is absent, and a newer server always sends
-    /// one with a Codex refusal), and ``held`` still names the window. It is
+    /// limit (``limitReachedType`` is absent), and ``held`` still names the window. It is
     /// timed by that window, as any spent row is.
     public var isOlderServerWindowRefusal: Bool {
         provider == .codex && gate == .rejected && limitReachedType == nil && !held.isEmpty
@@ -1922,15 +1937,15 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// so no Codex request can reach this account, whatever its quota says.
     public var isUnreachable: Bool { provider == .codex && gate == .unknown("reserved") }
 
-    /// A Codex row the server holds because ChatGPT refused it and named the
-    /// limit it reached: a `hold` gate with a ``limitReachedType``.
+    /// A Codex row held by the server: the `hold` gate. A body-only refusal or
+    /// ordinary rate limit may carry no ``limitReachedType`` header.
     ///
     /// A refused Codex row has two causes, and this is one of them: a usage
     /// refusal. The other is ``isForbiddenHold``, ChatGPT answering 403. Both
     /// read as refused, and only the help sentence tells them apart. Neither
     /// is a quota window running out, which is spent.
     public var isRefusedHold: Bool {
-        provider == .codex && gate == .unknown("hold") && limitReachedType != nil
+        provider == .codex && gate == .unknown("hold")
     }
 
     /// A Codex row the server holds for a short while because ChatGPT
@@ -1959,7 +1974,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// The same, for the weekly slot.
     public let sevenDayWindowMinutes: Int?
     /// ChatGPT's reason for refusing this account, verbatim; present exactly
-    /// while the refusal stands.
+    /// while the refusal stands, when its response header or probe named one.
     public let limitReachedType: String?
     /// Whether ChatGPT's spend control is reached; `false` when absent.
     public let spendControlReached: Bool
@@ -2296,7 +2311,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// read "1 of 1 ready · 1 need re-login" in the same frame, the panel
     /// contradicting itself.
     public var isReady: Bool {
-        !disabled && health != .needsRelogin && quotaState == .ok && hasQuotaEvidence
+        if provider == .codex, let gate, gate != .ok { return false }
+        return !disabled && health != .needsRelogin && quotaState == .ok && hasQuotaEvidence
     }
 
     /// Which window a per-window quota state or bar belongs to.
@@ -3241,6 +3257,8 @@ public struct Fleet: Equatable, Sendable {
     /// --json` (`sessions()`, `src/cli.rs`) prints `{"supported", "sessions"}`
     /// and ``StatusPoller`` folds it onto the fleet with ``withSessions(_:)``.
     public let sessions: [Session]
+    /// Session rows that failed to decode, kept separate from account rows.
+    public let unreadableSessions: [UnreadableRow]
 
     /// Where this read's ``sessions`` came from — or, when it has none, the
     /// reason, because the panel draws a different sentence for each. Not a
@@ -3264,25 +3282,29 @@ public struct Fleet: Equatable, Sendable {
         accounts: [Account],
         unreadable: [UnreadableRow] = [],
         sessions: [Session] = [],
-        sessionsSupported: Bool = false
+        sessionsSupported: Bool = false,
+        unreadableSessions: [UnreadableRow] = []
     ) {
         self.init(
             accounts: accounts,
             unreadable: unreadable,
             sessions: sessions,
-            sessionsChannel: sessionsSupported ? .live : .notAttempted)
+            sessionsChannel: sessionsSupported ? .live : .notAttempted,
+            unreadableSessions: unreadableSessions)
     }
 
     public init(
         accounts: [Account],
         unreadable: [UnreadableRow] = [],
         sessions: [Session] = [],
-        sessionsChannel: SessionsChannel
+        sessionsChannel: SessionsChannel,
+        unreadableSessions: [UnreadableRow] = []
     ) {
         self.accounts = accounts
         self.unreadable = unreadable
         self.sessions = sessions
         self.sessionsChannel = sessionsChannel
+        self.unreadableSessions = unreadableSessions
     }
 
     /// What the `tcr sessions --json` half of a poll produced.
@@ -3339,9 +3361,10 @@ public struct Fleet: Equatable, Sendable {
     public func withSessions(_ read: SessionsRead) -> Fleet {
         Fleet(
             accounts: accounts,
-            unreadable: unreadable + read.unreadable,
+            unreadable: unreadable,
             sessions: read.sessions,
-            sessionsChannel: read.channel)
+            sessionsChannel: read.channel,
+            unreadableSessions: read.unreadable)
     }
 
     /// Decode `{"supported": Bool, "sessions": [...]}` — `tcr sessions
@@ -3485,9 +3508,16 @@ public struct Fleet: Equatable, Sendable {
     /// panel: a skipped row must never be indistinguishable from an account that
     /// does not exist.
     public var unreadableNotice: String? {
-        guard unreadableCount > 0 else { return nil }
-        let noun = unreadableCount == 1 ? "account" : "accounts"
-        return "\(unreadableCount) \(noun) unreadable"
+        var parts: [String] = []
+        if unreadableCount > 0 {
+            let noun = unreadableCount == 1 ? "account" : "accounts"
+            parts.append("\(unreadableCount) \(noun)")
+        }
+        if !unreadableSessions.isEmpty {
+            let noun = unreadableSessions.count == 1 ? "session" : "sessions"
+            parts.append("\(unreadableSessions.count) \(noun)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ") + " unreadable"
     }
 
     /// Every row carries the same `source`; take the first and say so.
@@ -3518,6 +3548,10 @@ public struct Fleet: Equatable, Sendable {
     /// nothing.
     public var sessionsLiveCost: Double? {
         sessions.reduce(nil) { UsageTotals.addCost($0, $1.pricedCostUsd) }
+    }
+
+    public var sessionsLiveCostLabel: String? {
+        Session.formatCost(sessionsLiveCost, isPartial: sessions.contains { $0.unpricedRequests > 0 })
     }
 
     /// How many distinct accounts the live sessions are attributed to, over how

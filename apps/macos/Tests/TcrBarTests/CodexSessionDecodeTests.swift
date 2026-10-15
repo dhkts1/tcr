@@ -161,6 +161,10 @@ final class CodexSessionDecodeTests: XCTestCase {
         XCTAssertEqual(
             read.unreadable,
             [Fleet.UnreadableRow(index: 1, message: "provider 'gemini' is newer than this TcrBar")])
+        let fleet = Fleet(accounts: []).withSessions(read)
+        XCTAssertEqual(fleet.unreadableCount, 0, "an unreadable session is not an account")
+        XCTAssertEqual(fleet.unreadableNotice, "1 session unreadable")
+        XCTAssertFalse(PollState.loaded(fleet).summary.contains("no account decoded"))
     }
 
     // MARK: - Helpers

@@ -259,9 +259,7 @@ final class PoolCapacityTests: XCTestCase {
         XCTAssertEqual(FleetTally.Kind(account: kim), .unreachable)
         XCTAssertEqual(FleetTally.Kind.unreachable.token, "unreachable")
         XCTAssertEqual(FleetTally.Kind.unreachable.phrase(for: .codex), "unreachable")
-        XCTAssertTrue(
-            kim.isReady,
-            "today's readiness never reads the state classifier, and a Claude-only fleet keeps it")
+        XCTAssertFalse(kim.isReady, "a Codex row with a blocking gate is not ready")
     }
 
     /// A hold that names the limit ChatGPT reached is ChatGPT's refusal, in ChatGPT's word.
@@ -274,8 +272,11 @@ final class PoolCapacityTests: XCTestCase {
         XCTAssertEqual(hal.freeAtMs, 1_767_228_420_000)
 
         let unnamed = try account(canonicalRow("hal@example.com", ["limitReachedType": NSNull()]))
-        XCTAssertFalse(unnamed.isRefusedHold)
-        XCTAssertEqual(FleetTally.Kind(account: unnamed), .ok)
+        XCTAssertTrue(unnamed.isRefusedHold, "a body-only refusal has no reached-type header")
+        XCTAssertEqual(FleetTally.Kind(account: unnamed), .rejected)
+        XCTAssertFalse(unnamed.isReady)
+        XCTAssertEqual(Fleet(accounts: [unnamed]).readyCount, 0)
+        XCTAssertEqual(PoolCapacity(provider: .codex, accounts: [unnamed], now: Date()).readyCount, 0)
     }
 
     /// A plan that reports no usage window has no figure to carry, so once a probe has run

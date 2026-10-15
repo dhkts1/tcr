@@ -41,15 +41,8 @@ public enum SessionsCodexCopy {
         }
     }
 
-    /// The line for a proxy too old to record Codex sessions, or `nil` when there is nothing
-    /// to explain.
-    ///
-    /// Such a proxy serves Codex and lists no Codex session at all, so the tab would read as
-    /// if codex had been silent. The line shows only when that cannot be true: the fleet holds
-    /// a Codex account, its Codex rows served requests in the last hour, and not one session
-    /// carries the Codex provider. An empty list counts, because the old proxy records none.
-    /// One Codex session on the list proves the proxy records them, and with no Codex traffic
-    /// in the hour an empty list is simply the truth.
+    /// Explain observed Codex traffic without a session row. A current proxy can
+    /// serve requests without a session-id, so this is not evidence of an old build.
     public static func oldServerLine(_ fleet: Fleet) -> String? {
         guard fleet.holdsCodex, !fleet.sessions.contains(where: { $0.provider == .codex })
         else { return nil }
@@ -59,7 +52,7 @@ public enum SessionsCodexCopy {
         guard requests > 0 else { return nil }
         let noun = requests == 1 ? "request" : "requests"
         return "Codex served \(QuotaFormat.count(requests)) \(noun) in the last hour, "
-            + "but this proxy predates Codex sessions — restart it on this build to see them."
+            + "but no Codex session was reported. Requests without a session-id are counted without a session row."
     }
 
     /// What leads a session's subtitle: `"Codex"` for a Codex session in a fleet that holds
@@ -96,7 +89,7 @@ public enum SessionsCodexCopy {
             var group: [String] = []
             if let hourly = claude.burnRateSegment { group.append(hourly) }
             if let today = claude.todayCost { group.append("\(QuotaFormat.usd(today)) today") }
-            if let live = claude.sessionsLiveCost { group.append("\(QuotaFormat.usd(live)) live") }
+            if let live = claude.sessionsLiveCostLabel { group.append("\(live) live") }
             group.append(accountRatio(claude))
             clauses += named("Claude", group)
         }

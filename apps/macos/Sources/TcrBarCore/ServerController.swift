@@ -116,6 +116,9 @@ public final class ServerController: ObservableObject {
     }
 
     @Published public private(set) var state: State = .idle
+    @Published public private(set) var executablePath: String?
+
+    public var summary: String { state.summary(executablePath: executablePath) }
 
     /// The pid of the child this controller currently supervises, or `0`
     /// when there is none. Read from `AbnormalTerminationGuard`'s signal
@@ -369,6 +372,7 @@ public final class ServerController: ObservableObject {
     }
 
     private func spawn(executable: URL, intent: Intent, arguments: [String]) {
+        executablePath = executable.path
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments

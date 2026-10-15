@@ -93,7 +93,7 @@ public struct CodexPresence: Equatable, Sendable {
 
         /// This Mac's file system.
         public static let live = Probe(
-            isExecutableFile: { FileManager.default.isExecutableFile(atPath: $0) },
+            isExecutableFile: { CodexExecutableChoice.isAcceptable(path: $0) },
             isDirectory: { path in
                 var isDirectory: ObjCBool = false
                 return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
@@ -135,7 +135,9 @@ public struct CodexPresence: Equatable, Sendable {
         let home = trimmingTrailingSlashes(home)
         var asked = Set<String>()
         func firstRunnable(_ candidates: [String]) -> String? {
-            candidates.first { asked.insert($0).inserted && probe.isExecutableFile($0) }
+            candidates.first {
+                asked.insert($0).inserted && probe.isExecutableFile($0) && !probe.isDirectory($0)
+            }
         }
 
         let homeURL = URL(fileURLWithPath: home, isDirectory: true)

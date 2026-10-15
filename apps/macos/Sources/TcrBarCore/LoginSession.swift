@@ -222,6 +222,7 @@ public final class LoginSession: ObservableObject {
             return
         }
 
+        facts.executablePath = executable.path
         flow = LoginFlow(requesting: request.account)
         buffer = LineBuffer()
         stderrText = ""
@@ -398,6 +399,8 @@ public struct LoginSheetFacts: Equatable, Sendable {
     public var bundledTcrWithoutCLI: String?
     /// Why the codex a person chose cannot be used, under tcr's reason.
     public var refusedCodexChoice: String?
+    /// The executable captured for this invocation, used only to name a refusal.
+    public var executablePath: String?
 
     public init(
         request: LoginRequest? = nil, notices: [String] = [], savedPlan: String? = nil,
@@ -411,6 +414,7 @@ public struct LoginSheetFacts: Equatable, Sendable {
         self.codexSupported = codexSupported
         self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
         self.refusedCodexChoice = refusedCodexChoice
+        self.executablePath = nil
     }
 }
 

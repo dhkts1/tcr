@@ -75,7 +75,7 @@ final class CodexSignInCopyTests: XCTestCase {
             "Re-import erin@example.com/codex from ~/.codex?")
         XCTAssertEqual(
             CodexSignInCopy.importText,
-            "This shares the codex CLI's login in that folder. tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. Codex account… gives tcr a separate login."
+            "This shares the codex CLI's login in that folder. tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. Signing in again with `codex login` in that folder revokes this shared login; tcr may then need sign-in. Codex account… gives tcr a separate login."
         )
         XCTAssertEqual(CodexSignInCopy.importButton, "Import")
         XCTAssertEqual(
@@ -146,7 +146,7 @@ final class CodexSignInCopyTests: XCTestCase {
         )
         XCTAssertEqual(
             CodexSignInCopy.importLinkHelp,
-            "Shares a codex login through guarded auth.json token updates. A simultaneous codex refresh can still race the update."
+            "Shares a codex login through guarded auth.json token updates. A simultaneous codex refresh can still race the update. Signing in again with `codex login` in that folder revokes this shared login; tcr may then need sign-in."
         )
         XCTAssertEqual(CodexSignInCopy.reloginHint, "Signs in to ChatGPT")
         XCTAssertEqual(
@@ -170,7 +170,7 @@ final class CodexSignInCopyTests: XCTestCase {
         XCTAssertEqual(CodexSignInCopy.reimportItem(shortPath: "~/.codex"), "Re-import from ~/.codex…")
         XCTAssertEqual(
             CodexSignInCopy.reimportHelp(shortPath: "~/.codex"),
-            "Take the login the codex CLI in ~/.codex holds now. Refreshed tokens are shared through guarded auth.json updates; a simultaneous codex refresh can still race the update."
+            "Take the login the codex CLI in ~/.codex holds now. Refreshed tokens are shared through guarded auth.json updates; a simultaneous codex refresh can still race the update. Signing in again with `codex login` in that folder revokes this shared login; tcr may then need sign-in."
         )
     }
 
@@ -179,14 +179,14 @@ final class CodexSignInCopyTests: XCTestCase {
     /// there is.
     func testThePredatesCodexNotice() {
         XCTAssertEqual(
-            CodexSignInCopy.predatesCodexTitle, "The tcr inside TcrBar predates Codex accounts")
+            CodexSignInCopy.predatesCodexTitle, "The selected tcr predates Codex accounts")
         XCTAssertEqual(
             CodexSignInCopy.predatesCodexDetail,
-            "Your config holds a Codex account, which this tcr cannot read. Update TcrBar (Check for Updates…)."
+            "Your config holds a Codex account, which this tcr cannot read. Update the selected tcr, or clear its TCR_BIN or TcrExecutablePath override."
         )
         XCTAssertEqual(
             CodexSignInCopy.predatesCodexSentence,
-            "The tcr inside TcrBar predates Codex accounts. Your config holds a Codex account, which this tcr cannot read. Update TcrBar (Check for Updates…)."
+            "The selected tcr predates Codex accounts. Your config holds a Codex account, which this tcr cannot read. Update the selected tcr, or clear its TCR_BIN or TcrExecutablePath override."
         )
         XCTAssertEqual(
             CodexSignInCopy.predatesCodexSentence,

@@ -134,6 +134,23 @@ final class CodexPresenceTests: XCTestCase {
         }
     }
 
+    func testADirectoryNamedCodexIsNotAnExecutableCandidate() {
+        let directory = "/opt/example/codex"
+        let recorder = CodexProbeRecorder(executables: [directory], directories: [directory])
+        let found = CodexPresence.resolve(
+            environment: ["TCR_CODEX_BIN": directory, "PATH": "/usr/bin"],
+            storedExecutable: nil, home: "/Users/example", probe: recorder.probe)
+        XCTAssertNil(found.codexExecutable)
+    }
+
+    func testTheLiveExecutableProbeRejectsDirectories() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tcrbar-codex-directory-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertFalse(CodexPresence.Probe.live.isExecutableFile(directory.path))
+    }
+
     /// The resolver never runs codex and never opens a file inside the codex home: it asks
     /// whether `auth.json` exists there, and nothing else. A login is a fact of its own,
     /// and the four questions a probe can ask are all of what it can do.

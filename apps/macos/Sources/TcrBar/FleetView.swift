@@ -1059,7 +1059,7 @@ struct FleetView: View {
                 // repeats the state of the button beside it is a line the
                 // mockup's footer does not have and does not need.
                 if !server.state.isOurChild {
-                    Text(server.state.summary)
+                    Text(server.summary)
                         .font(V4.font(V4.footerSize))
                         .foregroundStyle(Tok.mute)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1486,7 +1486,7 @@ struct FleetView: View {
             )
         case .commandFailed(let code, let message):
             if PredatesCodexRefusal.matches(message) {
-                // The bundled tcr cannot read a config holding a Codex account, and
+                // The selected tcr cannot read a config holding a Codex account, and
                 // its refusal names a credential version, not the fix. The banner
                 // names the tcr and the fix; tcr's own words stay in the tooltip.
                 banner(
@@ -1907,10 +1907,10 @@ struct FleetView: View {
                     // clause at all on a server that does not send it: the two
                     // earlier rounds of this bridge left the `$` out entirely
                     // for exactly that reason, and the field existing is what
-                    // changed, not the rule. Read through `pricedCostUsd`, so a
-                    // Codex session nothing was priced for draws no `$0.00`.
-                    if let cost = row.session.pricedCostUsd {
-                        Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
+                    // changed, not the rule. `costLabel` marks partial prices as lower
+                    // bounds and omits a rounded zero while some work remains unpriced.
+                    if let cost = row.session.costLabel {
+                        Text(" · \(cost)").monospacedDigit()
                             .lineLimit(1).layoutPriority(1)
                     }
                     // How long this session's prompt cache stays warm, from the server's
@@ -2909,8 +2909,8 @@ struct FleetView: View {
             if let today = fleet.todayCost {
                 numbers.append(summaryPhrase("\(QuotaFormat.usd(today)) today"))
             }
-            if let live = fleet.sessionsLiveCost {
-                numbers.append(summaryPhrase("\(QuotaFormat.usd(live)) live"))
+            if let live = fleet.sessionsLiveCostLabel {
+                numbers.append(summaryPhrase("\(live) live"))
             }
             if !fleet.accounts.isEmpty {
                 numbers.append(
@@ -3815,7 +3815,7 @@ struct FleetView: View {
                 // runs were two different sizes/roles (`Tok.secondaryFont`
                 // 11pt/dim, `Tok.detailDigitFont` 10pt/faint). Literal per
                 // the tokens-parity fence.
-                Text(server.state.summary)
+                Text(server.summary)
                     .font(Tok.freshnessFont)
                     .foregroundStyle(Tok.inkFaint)
                     .fixedSize(horizontal: false, vertical: true)

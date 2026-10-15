@@ -94,6 +94,18 @@ final class SessionSectionsTests: XCTestCase {
         XCTAssertEqual(sections[0].headerSummary, "2 · $20.0")
     }
 
+    func testPartlyPricedCodexSessionsReportOnlyALowerBound() {
+        for (cost, expected) in [(0.4, "1 · $0.40+"), (0.0, "1"), (0.001, "1")] {
+            let session = Session(
+                sessionId: "11111111-1111-1111-1111-111111111111", firstSeenMs: 0,
+                lastSeenMs: 0, requests: 7, costUsd: cost, provider: .codex,
+                unpricedRequests: 3)
+            let section = SessionProjectSection(
+                key: .unassigned, rows: [JoinedSession(session: session, file: nil)])
+            XCTAssertEqual(section.headerSummary, expected)
+        }
+    }
+
     // MARK: - Codex sessions
 
     /// The canonical sessions: alice's Claude session first, bob's Codex session second.

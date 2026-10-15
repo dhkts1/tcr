@@ -34,7 +34,7 @@ public enum PollState: Equatable {
             // Every row failed to decode. Saying "0 accounts" here would read as
             // "you have none configured", which is a different and much calmer
             // fact than "tcr answered and this build could not read any of it".
-            if n == 0, let unreadable = fleet.unreadableNotice {
+            if n == 0, fleet.unreadableCount > 0, let unreadable = fleet.unreadableNotice {
                 return "no account decoded — \(unreadable)"
             }
             let base =
@@ -469,7 +469,8 @@ public final class StatusPoller: ObservableObject {
     nonisolated static func fetchAccounts(executable: URL) -> PollState {
         do {
             return classify(
-                try TcrTool.run(executable: executable, arguments: ["status", "--json"]))
+                try TcrTool.run(executable: executable, arguments: ["status", "--json"]),
+                executablePath: executable.path)
         } catch {
             return .commandFailed(exitCode: -1, message: error.localizedDescription)
         }
@@ -520,12 +521,15 @@ public final class StatusPoller: ObservableObject {
     }
 
     /// Pure classification of a finished invocation — the part worth testing.
-    public nonisolated static func classify(_ output: TcrTool.Output) -> PollState {
+    public nonisolated static func classify(
+        _ output: TcrTool.Output, executablePath: String? = nil
+    ) -> PollState {
         guard output.exitCode == 0 else {
-            return .commandFailed(
-                exitCode: output.exitCode,
-                message: output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
+            let raw = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message =
+                executablePath == nil
+                ? raw : PredatesCodexRefusal.displayed(raw, executablePath: executablePath)
+            return .commandFailed(exitCode: output.exitCode, message: message)
         }
         do {
             return .loaded(try Fleet.decode(output.stdout))

@@ -135,7 +135,7 @@ struct GeneralSettingsPane: View {
             Section {
                 LabeledContent("Proxy") {
                     HStack(spacing: 8) {
-                        Text(server.state.summary)
+                        Text(server.summary)
                             .foregroundStyle(Tok.inkDim)
                             .lineLimit(2)
                         Spacer(minLength: 8)
@@ -687,7 +687,7 @@ struct UpdatesSettingsPane: View {
 
             Section {
                 LabeledContent("Server on 127.0.0.1:3456") {
-                    Text(server.state.summary).foregroundStyle(Tok.inkDim).lineLimit(2)
+                    Text(server.summary).foregroundStyle(Tok.inkDim).lineLimit(2)
                 }
                 LabeledContent("Command-line tcr") {
                     Text(installedCliPath).font(.caption).foregroundStyle(Tok.inkDim)
