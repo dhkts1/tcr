@@ -149,29 +149,35 @@ struct AccountCard<Actions: View>: View {
             // and preferred readable bars, so it draws the same rows, just at
             // Compact's own tighter density tokens (`V4.quotaLabelWidth`,
             // `V4.quotaMarginTop`, `V4.barHeight`).
-            ForEach(Array(quotaWindows.enumerated()), id: \.element.window) {
-                index, window in
-                QuotaRow(
-                    label: window.label, value: window.value, tint: window.tint,
-                    resetAtMs: window.resetAtMs, now: now,
-                    trailing: trailingText(index, window),
-                    trailingReserved: trailingReserved,
-                    trailingHelp: trailingHelp(index, window),
-                    trailingTint: trailingTint(index))
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(quotaWindows.enumerated()), id: \.element.window) {
+                    index, window in
+                    QuotaRow(
+                        label: window.label, value: window.value, tint: window.tint,
+                        resetAtMs: window.resetAtMs, now: now,
+                        trailing: trailingText(index, window),
+                        trailingReserved: trailingReserved,
+                        trailingHelp: trailingHelp(index, window),
+                        trailingTint: trailingTint(index))
+                }
+                // A Codex plan that reports no usage window draws no row, and this
+                // one line in its place says so, with its credits. `nil` on every
+                // other card, Claude cards included, which draw nothing here.
+                if let line = CodexCardFacts.noWindowsLine(account) {
+                    Text(line.text)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
+                        .padding(.top, V4.quotaMarginTop)
+                        .help(line.help)
+                }
             }
-            // A Codex plan that reports no usage window draws no row, and this
-            // one line in its place says so, with its credits. `nil` on every
-            // other card, Claude cards included, which draw nothing here.
-            if let line = CodexCardFacts.noWindowsLine(account) {
-                Text(line.text)
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
-                    .padding(.top, V4.quotaMarginTop)
-                    .help(line.help)
-            }
+            .frame(
+                minHeight: CGFloat(CodexCardFacts.reservedQuotaRows(account))
+                    * (V4.lineHeight(V4.dimSize) + V4.quotaMarginTop),
+                alignment: .topLeading)
             // A Codex request always leaves from this Mac, so a Codex card draws
             // no lease line, and in place of the exit picker one statement of
             // where its requests leave from (``AccountExit/statement(for:exit:)``).

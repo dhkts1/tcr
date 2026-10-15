@@ -92,6 +92,17 @@ public enum AccountLineFit {
 
     /// The two meters' labels, measured whole.
     public static let labels = ["5h", "7d"]
+    /// The labels reserved by the panel's shared meter columns.
+    public static func panelLabels(_ accounts: [Account]) -> [String] {
+        var result = labels
+        for account in accounts {
+            for label in account.lineSlotLabels.compactMap({ $0 }) where !result.contains(label) {
+                result.append(label)
+            }
+        }
+        return result
+    }
+
     /// The widest a percent draws: a full window.
     public static let widestPercent = "100%"
     /// What a cut name shows where its middle was.

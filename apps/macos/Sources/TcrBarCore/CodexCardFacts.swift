@@ -32,6 +32,11 @@ import Foundation
 /// `apps/macos/Tests/Fixtures/codex-status.json`.
 public enum CodexCardFacts {
 
+    /// The minimum space the card reserves for quota rows; no extra window is drawn.
+    public static func reservedQuotaRows(_ account: Account) -> Int {
+        account.provider == .codex ? 2 : 0
+    }
+
     // MARK: - The state pill's help
 
     /// The sentence behind a Codex row's state pill, or `nil` wherever the row keeps

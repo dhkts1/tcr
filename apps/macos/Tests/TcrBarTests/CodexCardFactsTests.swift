@@ -30,6 +30,18 @@ final class CodexCardFactsTests: XCTestCase {
         XCTAssertEqual(try unmeasuredBob().reportedWindows, [.fiveHour, .sevenDay])
     }
 
+    func testAFirstCodexProbeCannotShrinkTheQuotaArea() throws {
+        let unknown = try unmeasuredBob()
+        let weekly = try canonical("bob@example.com/codex")
+        let none = try canonical("jo@example.com")
+        XCTAssertEqual(CodexCardFacts.reservedQuotaRows(unknown), 2)
+        XCTAssertEqual(CodexCardFacts.reservedQuotaRows(weekly), 2)
+        XCTAssertEqual(CodexCardFacts.reservedQuotaRows(none), 2)
+        // Reserving space must never claim a plan has an absent quota window.
+        XCTAssertEqual(weekly.reportedWindows, [.sevenDay])
+        XCTAssertEqual(none.reportedWindows, [])
+    }
+
     // MARK: - The state pill's word
 
     func testTheStatePillWords() throws {

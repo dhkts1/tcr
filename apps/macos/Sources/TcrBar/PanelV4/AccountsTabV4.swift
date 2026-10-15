@@ -340,15 +340,13 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     /// The signals of the same lines size the column at the right, and what a
     /// short one leaves goes to the names (lead ruling, 2026-10-14).
     ///
-    /// The labels of the same lines size the meters' label column and the bar:
-    /// a Codex window labelled by its length (`30d`) widens the label column for
-    /// every line, and the bar gives it the room, so every bar still starts at
-    /// one x. A panel whose lines draw only `5h` and `7d` gets main's widths.
+    /// Every reported window sizes the meters' label column and bar, including
+    /// spent, collapsed and kept-open rows. Their visibility cannot move the bars.
+    /// A fleet that reports only `5h` and `7d` keeps the established widths.
     private var liveLineFit: LiveLineFit {
         var loose: [String] = []
         var grouped: [String]?
         var signals: [String] = []
-        var labels = AccountLineFit.labels
         for section in lists.flatMap(\.sections) where !isSummarised(section) {
             for row in section.rows where form(row) == .liveLine {
                 let name = AccountName.localPart(row.account.name)
@@ -358,12 +356,9 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     grouped = (grouped ?? []) + [name]
                 }
                 signals.append(row.account.liveSignal(now: now).text)
-                for label in row.account.lineSlotLabels.compactMap({ $0 })
-                where !labels.contains(label) {
-                    labels.append(label)
-                }
             }
         }
+        let labels = AccountLineFit.panelLabels(fleet.accounts)
         let bar = V4.lineBarWidth(labels: labels)
         return LiveLineFit(
             nameColumn: AccountLineFit.nameColumn(
