@@ -814,6 +814,66 @@ fn kill_hard(expected: (u32, u64)) {
     }
 }
 
+/// Every signal is guarded by the exact PID and start time captured while the fixture lives.
+struct TestProcessCleanup {
+    identities: Vec<(u32, u64)>,
+}
+
+impl TestProcessCleanup {
+    fn new(pid: u32) -> Self {
+        let mut cleanup = Self {
+            identities: Vec::new(),
+        };
+        cleanup.remember(pid);
+        cleanup
+    }
+
+    fn remember(&mut self, pid: u32) {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        if let Some(process) = system.process(Pid::from_u32(pid)) {
+            self.identities.push((pid, process.start_time()));
+        }
+    }
+}
+
+#[test]
+fn fixture_cleanup_stops_an_owned_process_even_without_signal_forwarding() {
+    let home = tempfile::tempdir().unwrap();
+    let mut process = Command::new("/bin/sh")
+        .args(["-c", "while :; do /bin/sleep 1; done"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", home.path().join(".codex"))
+        .spawn()
+        .unwrap();
+    let identity;
+    {
+        let cleanup = TestProcessCleanup::new(process.id());
+        identity = cleanup.identities[0];
+    }
+    let cleaned = within(Duration::from_millis(500), || gone(identity));
+    // The red control must clean up as well; assertions never leave a looping fixture.
+    kill_hard(identity);
+    let _ = process.wait();
+    assert!(
+        cleaned,
+        "dropping fixture cleanup must stop its exact owned process"
+    );
+}
+
+impl Drop for TestProcessCleanup {
+    fn drop(&mut self) {
+        for &identity in self.identities.iter().rev() {
+            kill_hard(identity);
+        }
+    }
+}
+
 /// Poll `done` for up to `limit`.
 fn within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + limit;
@@ -956,7 +1016,7 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
     let auth = scratch.path("prepared-auth.json");
     std::fs::write(&auth, bob_auth()).unwrap();
     write_script(&scratch.codex, &format!(
-        "#!/bin/sh\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\necho ready >> '{log}'\nwhile :; do /bin/sleep 1; done\n",
+        "#!/bin/sh\necho pid $$ >> '{log}'\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\necho ready >> '{log}'\nwhile :; do /bin/sleep 1; done\n",
         log = scratch.log.display(), auth = auth.display(),
     ));
     let error_log = scratch.path("cancel.stderr");
@@ -969,12 +1029,19 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
         .stderr(std::fs::File::create(&error_log).unwrap())
         .spawn()
         .unwrap();
+    let mut cleanup = TestProcessCleanup::new(child.id());
     // Allow both freshly built tcr and the fresh shell fixture to finish loader startup.
     let ready = within(Duration::from_secs(20), || {
         std::fs::read_to_string(&scratch.log)
             .unwrap_or_default()
             .contains("ready")
     });
+    for pid in logged(&scratch.log, "pid ")
+        .iter()
+        .filter_map(|pid| pid.parse::<u32>().ok())
+    {
+        cleanup.remember(pid);
+    }
     if !ready {
         let _ = child.kill();
         let _ = child.wait();

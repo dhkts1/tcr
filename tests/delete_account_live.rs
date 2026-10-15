@@ -17,11 +17,16 @@
 //! probe, warm or refresh loop and sends nothing upstream. The `tcr` binary gets
 //! a scratch `HOME`, no `XDG_CACHE_HOME`, and `TCR_CLAUDE_CODE_CREDENTIALS`
 //! pointing at a file that does not exist, so it can read neither the real
-//! config nor the Keychain. Every account is invented.
+//! config nor the Keychain. Every account is invented. Ordinary fixture rows omit refresh
+//! tokens so offline status cannot probe Claude's real usage endpoint. A test-only libc
+//! guard rejects the live proxy and non-loopback connections before any data is sent.
 //!
 //! Every status read asserts `source == "live"`. An offline read builds its rows
 //! from the config file, which the delete has already edited, so it would pass
 //! these tests whether or not the running proxy dropped anything.
+
+#[path = "support/connect_guard.rs"]
+mod connect_guard;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -73,7 +78,7 @@ async fn boot_after(
     let loaded = tcr::config::load(&config).expect("load the scratch config");
     assert_eq!(
         loaded.upstream, "http://127.0.0.1:0",
-        "offline Claude probes must fail closed"
+        "Claude inference stays on the fixture's upstream"
     );
     assert_eq!(
         loaded.codex_upstream, "http://127.0.0.1:0",
@@ -119,7 +124,8 @@ async fn tcr(fleet: &Fleet, args: &[&str]) -> Run {
     let config = fleet.config.clone();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new(env!("CARGO_BIN_EXE_tcr"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        command
             .args(&args)
             .arg("--config")
             .arg(&config)
@@ -129,9 +135,10 @@ async fn tcr(fleet: &Fleet, args: &[&str]) -> Run {
             .env_remove("XDG_CACHE_HOME")
             .env("TCR_CLAUDE_CODE_CREDENTIALS", claude_code_login(&home))
             .env("NO_COLOR", "1")
-            .current_dir(&home)
-            .output()
-            .expect("run tcr");
+            .current_dir(&home);
+        let guard = connect_guard::ConnectGuard::attach(&mut command, &home);
+        let out = command.output().expect("run tcr");
+        guard.assert_no_connections();
         Run {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -179,7 +186,7 @@ fn file_names(path: &Path) -> Vec<String> {
 fn oauth(name: &str, extra: &str) -> String {
     format!(
         r#"{{ "name": "{name}", "type": "oauth", "accessToken": "at-{name}",
-             "refreshToken": "rt-{name}", "expiresAt": 4102444800000 {extra} }}"#
+             "expiresAt": 4102444800000 {extra} }}"#
     )
 }
 
@@ -638,6 +645,15 @@ async fn a_login_after_a_delete_brings_the_account_back_serving() {
     assert_eq!(names(&rows), vec!["alice@example.com", "bob@example.com"]);
     assert_eq!(rows[0]["disabled"], false, "a fresh login serves: {rows:?}");
     assert!(file_names(&fleet.config).contains(&"alice@example.com".to_string()));
+}
+
+#[tokio::test]
+async fn deletion_rows_cannot_probe_a_live_claude_usage_endpoint() {
+    let fleet = boot(&oauth("alice@example.com", ""), "", true).await;
+    assert!(
+        fleet.manager.probeable_indices().is_empty(),
+        "an offline deletion fixture must not probe Claude's fixed real usage endpoint"
+    );
 }
 
 // --- fleet ----------------------------------------------------------------------

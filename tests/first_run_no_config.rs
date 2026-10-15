@@ -20,9 +20,13 @@
 //! [`tempfile::TempDir`] and `XDG_CACHE_HOME` is removed, both set on the
 //! spawned [`Command`] rather than on this test process, so the real
 //! `~/.config/teamclaude.json` — which holds working credentials — and the live
-//! proxy reading it are never touched. Nothing here binds a port or signals a
-//! process: `tcr status` with an explicit fixture port falls back to its offline
-//! snapshot, which is exactly the first-run case under test.
+//! proxy reading it are never touched. A test-only libc guard rejects port 3456 and
+//! non-loopback connections before they leave the child, and records attempts without
+//! account data. Its positive control uses only an owned ephemeral listener. Status
+//! with an explicit fixture port falls back to its offline snapshot.
+#[path = "support/connect_guard.rs"]
+mod connect_guard;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -63,9 +67,11 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
         }
     }
     let bin = env!("CARGO_BIN_EXE_tcr");
-    let out = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .env("HOME", home)
+        .env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         .env("CODEX_HOME", home.join(".codex"))
         .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
         // A scratch HOME does not scratch the login Keychain: the first-run
@@ -79,9 +85,12 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-such-claude-code-credentials.json"),
         )
-        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_CACHE_HOME");
+    let guard = connect_guard::ConnectGuard::attach(&mut command, home);
+    let out = command
         .output()
         .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+    guard.assert_no_connections();
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -156,9 +165,20 @@ fn status_with_an_explicit_missing_config_creates_an_empty_offline_fleet() {
         serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap(),
         serde_json::json!([])
     );
+}
+
+#[test]
+fn a_first_run_text_status_still_explains_claudes_route() {
+    let home = tempfile::tempdir().unwrap();
+    let config = config_path_in(home.path());
+    let (code, stdout, _) = run_tcr(
+        home.path(),
+        &["status", "--config", config.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(0));
     assert!(
-        !stderr.contains("TCR_TEST_PORT_GUARD"),
-        "first-run status performs no live-port probe: {stderr}"
+        stdout.contains("Claude") && stdout.contains("verdict:"),
+        "first-run text status retains the environment-only Claude route verdict"
     );
 }
 

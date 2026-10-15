@@ -3848,12 +3848,8 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         // elsewhere; exit 3, routed here with nothing answering), and only in
         // the text form. `--json` is a bare array a script pipes into jq, and
         // a line above it would corrupt that contract.
-        let claude_verdict = if first_empty_config {
-            None
-        } else {
-            let route = crate::doctor::inspect(proxy_port, served_recently);
-            (route.exit_code() != 0).then(|| route.verdict())
-        };
+        let route = crate::doctor::inspect(proxy_port, served_recently);
+        let claude_verdict = (route.exit_code() != 0).then(|| route.verdict());
         print!(
             "{}",
             render_status_text(&StatusText {

@@ -85,11 +85,20 @@ impl Fixture {
                     .set_write_timeout(Some(Duration::from_millis(100)))
                     .unwrap();
                 let mut head = Vec::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 let mut buffer = [0; 1024];
                 while head.len() < 16_384 && !head.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                     match stream.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(count) => head.extend_from_slice(&buffer[..count]),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) && std::time::Instant::now() < deadline =>
+                        {
+                            continue
+                        }
                         Err(error) => panic!("read fixture status request: {error}"),
                     }
                 }
@@ -153,7 +162,10 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.worker.take().unwrap().join().unwrap();
+        let result = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.expect("status fixture worker");
+        }
     }
 }
 
@@ -164,6 +176,25 @@ fn details(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[test]
+fn the_codex_status_stub_accepts_delayed_request_headers() {
+    let fixture = Fixture::new(true);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    stream
+        .write_all(b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "the stub tolerates scheduling delays"
+    );
 }
 
 #[test]
