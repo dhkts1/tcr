@@ -196,6 +196,20 @@ public enum ClaudeRoutePrompt {
         return status.route == .off && status.conflicts.isEmpty
     }
 
+    /// Is `fleet` one a routed `claude` can use: the `hasFleet` of
+    /// ``shouldShow(hasFleet:reading:answered:)``.
+    ///
+    /// A Claude-only fleet with any account, the rule this prompt shipped with. A fleet
+    /// holding a Codex account also needs an enabled Claude account: a Codex account cannot
+    /// serve claude, so with none the proxy refuses every request a routed claude sends, and
+    /// the prompt would be offering to break the command it names. The Claude no-requests
+    /// banner keeps the same rule (``NoRequestsBanner/totalRequests(_:)``).
+    public static func hasFleet(_ fleet: Fleet) -> Bool {
+        guard !fleet.accounts.isEmpty else { return false }
+        guard fleet.holdsCodex else { return true }
+        return fleet.accounts.contains { $0.provider == .anthropic && !$0.disabled }
+    }
+
     /// The line that takes the buttons' place once answered.
     public static func outcome(for answer: Answer, failure: String?) -> String {
         if let failure { return "Not set up: \(failure)" }
@@ -271,6 +285,12 @@ public final class ClaudeRouteController: ObservableObject {
         promptOutcome = nil
         promptShown = ClaudeRoutePrompt.shouldShow(
             hasFleet: hasFleet, reading: reading, answered: answered)
+    }
+
+    /// ``decideAtOpen(hasFleet:)`` for the fleet the panel opens on, `nil` while none has
+    /// loaded.
+    public func decideAtOpen(fleet: Fleet?) {
+        decideAtOpen(hasFleet: fleet.map(ClaudeRoutePrompt.hasFleet) ?? false)
     }
 
     /// Re-read `tcr setup status --json`. Changes what the NEXT opening

@@ -827,10 +827,12 @@ final class MenuBarShell {
         // Before the show, so the prompt is in the panel's first frame or not
         // at all: nothing may be inserted while the panel is open (Gil,
         // 2026-10-14, no layout shifts). Decided from the status read cached
-        // by launch or the previous open, never one in flight.
-        var hasFleet = false
-        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty { hasFleet = true }
-        claudeRoute.decideAtOpen(hasFleet: hasFleet)
+        // by launch or the previous open, never one in flight. A fleet no
+        // Claude account can serve claude from is never asked
+        // (``ClaudeRoutePrompt/hasFleet(_:)``).
+        var fleet: Fleet?
+        if case .loaded(let loaded) = poller.state { fleet = loaded }
+        claudeRoute.decideAtOpen(fleet: fleet)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
