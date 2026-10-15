@@ -110,7 +110,7 @@ impl Manager {
                 }
             }
         }
-        let (name, account_uuid, org_uuid, org_name, provider) = {
+        let (name, account_uuid, org_uuid, org_name, provider, codex_home) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             match accounts.get(idx) {
                 Some(a) => (
@@ -119,13 +119,71 @@ impl Manager {
                     a.org_uuid.clone(),
                     a.org_name.clone(),
                     a.provider,
+                    a.codex_home.clone(),
                 ),
                 None => return false,
             }
         };
 
-        tracing::info!(account = %name, "refreshing OAuth token");
-        match self.refresher.refresh(provider, refresh_token).await {
+        let imported_home = match provider {
+            crate::provider::Provider::Anthropic => None,
+            crate::provider::Provider::Codex => codex_home.as_deref().map(std::path::Path::new),
+        };
+        let file_before = imported_home.and_then(|home| crate::codex_token_store::read(home).ok());
+        let loaded_refresh_ms = file_before
+            .as_ref()
+            .filter(|auth| auth.login.refresh_token == refresh_token)
+            .and_then(|auth| auth.last_refresh_ms);
+        let newer_in_file = |after_ms| {
+            imported_home
+                .and_then(|home| crate::codex_token_store::read(home).ok())
+                .and_then(|auth| {
+                    auth.newer_tokens(
+                        &refresh_token,
+                        &access_before,
+                        org_uuid.as_deref(),
+                        account_uuid.as_deref(),
+                        after_ms,
+                    )
+                })
+        };
+        // Codex may have refreshed since this row was loaded. Adopt its live pair before
+        // spending the stale single-use refresh token, and check again after an upstream race.
+        let preexisting = newer_in_file(None);
+        let result = if let Some(tokens) = preexisting {
+            Ok(tokens)
+        } else {
+            tracing::info!(account = %name, "refreshing OAuth token");
+            match self
+                .refresher
+                .refresh(provider, refresh_token.clone())
+                .await
+            {
+                Ok(mut tokens) => {
+                    if let Some(home) = imported_home {
+                        match crate::codex_token_store::write_back(home, &refresh_token, &tokens) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Some(newer) = newer_in_file(loaded_refresh_ms) {
+                                    tokens = newer;
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                account = %name,
+                                error_kind = ?error.kind(),
+                                "could not synchronize refreshed tokens with the imported Codex login"
+                            ),
+                        }
+                    }
+                    Ok(tokens)
+                }
+                // A concurrent Codex rotation can change the file during any failed POST,
+                // not only one that names a reused token. A different live pair for the same
+                // account is stronger evidence than this stale token's failure.
+                Err(error) => newer_in_file(loaded_refresh_ms).ok_or(error),
+            }
+        };
+        match result {
             Ok(tokens) => {
                 // A *forced* success re-arms the refresh cooldown, collapsing a herd
                 // of concurrent 401-driven force-refreshes to ONE rotation instead of
@@ -294,5 +352,428 @@ impl Manager {
             };
             account.error_retry_after_ms = Some(crate::now_ms() + account.error_backoff_ms);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const ACCOUNT_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const USER_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn access_token(account_id: &str, issued_at: i64, expires_at: i64) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let payload = serde_json::to_vec(&json!({
+            "iat": issued_at,
+            "exp": expires_at,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": USER_ID,
+            }
+        }))
+        .unwrap();
+        let mut encoded = String::new();
+        for chunk in payload.chunks(3) {
+            let bits = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for shift in [18, 12, 6, 0].into_iter().take(chunk.len() + 1) {
+                encoded.push(ALPHABET[((bits >> shift) & 63) as usize] as char);
+            }
+        }
+        format!("e30.{encoded}.sig")
+    }
+
+    fn auth_document(refresh: &str, issued_at: i64) -> Value {
+        json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "id-token-kept",
+                "access_token": access_token(ACCOUNT_ID, issued_at, 4_102_444_800),
+                "refresh_token": refresh,
+                "account_id": ACCOUNT_ID,
+                "future_token_field": {"keep": true},
+            },
+            "last_refresh": if issued_at == 1 { "2026-10-01T00:00:00Z" } else { "2090-01-01T00:00:00Z" },
+            "future_top_level": ["keep", 1],
+        })
+    }
+
+    fn write_auth(home: &Path, document: &Value) {
+        std::fs::write(home.join("auth.json"), document.to_string()).unwrap();
+    }
+
+    fn read_auth(home: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap()
+    }
+
+    struct TestRefresh {
+        home: PathBuf,
+        replacement: Option<Value>,
+        failure_code: Option<&'static str>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TokenRefresher for TestRefresh {
+        fn refresh(
+            &self,
+            provider: crate::provider::Provider,
+            token: String,
+        ) -> oauth::RefreshFuture {
+            assert_eq!(provider, crate::provider::Provider::Codex);
+            assert_eq!(token, "rt-old");
+            let home = self.home.clone();
+            let replacement = self.replacement.clone();
+            let failure_code = self.failure_code;
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(document) = replacement {
+                    write_auth(&home, &document);
+                }
+                if failure_code == Some("transient") {
+                    Err(oauth::OAuthError::Transient(
+                        "temporary transport failure".to_string(),
+                    ))
+                } else if let Some(code) = failure_code {
+                    Err(oauth::OAuthError::AuthRejected {
+                        status: 401,
+                        code: Some(code),
+                    })
+                } else {
+                    Ok(Tokens {
+                        access_token: "at-tcr-new".to_string(),
+                        refresh_token: Some("rt-tcr-new".to_string()),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                }
+            })
+        }
+    }
+
+    struct NoNetwork;
+    impl UsageProber for NoNetwork {
+        fn probe(&self, _: crate::probe::ProbeCredential) -> crate::probe::ProbeFuture {
+            panic!("refresh tests never probe");
+        }
+    }
+    impl AccountWarmer for NoNetwork {
+        fn warm(&self, _: String, _: String) -> crate::warmer::WarmFuture {
+            panic!("refresh tests never warm");
+        }
+    }
+
+    fn imported_manager(
+        home: &Path,
+        replacement: Option<Value>,
+        reused: bool,
+    ) -> (Arc<Manager>, Arc<AtomicUsize>) {
+        imported_manager_with_failure(home, replacement, reused.then_some("refresh_token_reused"))
+    }
+
+    fn imported_manager_with_failure(
+        home: &Path,
+        replacement: Option<Value>,
+        failure_code: Option<&'static str>,
+    ) -> (Arc<Manager>, Arc<AtomicUsize>) {
+        let config: Config = serde_json::from_value(json!({"accounts": [{
+            "name": "alice@example.com/codex",
+            "provider": "codex",
+            "accountUuid": USER_ID,
+            "orgUuid": ACCOUNT_ID,
+            "accessToken": access_token(ACCOUNT_ID, 1, 4_102_444_800),
+            "refreshToken": "rt-old",
+            "expiresAt": 0,
+            "codexHome": home,
+        }]}))
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = TestRefresh {
+            home: home.to_path_buf(),
+            replacement,
+            failure_code,
+            calls: Arc::clone(&calls),
+        };
+        (
+            Manager::new(
+                config,
+                Arc::new(refresher),
+                Arc::new(NoNetwork),
+                Arc::new(NoNetwork),
+                None,
+            ),
+            calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_imported_codex_refresh_writes_the_rotated_tokens_back() {
+        let home = tempfile::tempdir().unwrap();
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        let (manager, calls) = imported_manager(home.path(), None, false);
+        assert!(manager.ensure_fresh_force(0).await);
+        let document = read_auth(home.path());
+        assert_eq!(document["tokens"]["refresh_token"], "rt-tcr-new");
+        assert_eq!(document["tokens"]["access_token"], "at-tcr-new");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_imported_codex_writeback_preserves_every_other_json_field() {
+        let home = tempfile::tempdir().unwrap();
+        let original = auth_document("rt-old", 1);
+        write_auth(home.path(), &original);
+        let (manager, _) = imported_manager(home.path(), None, false);
+        assert!(manager.ensure_fresh_force(0).await);
+        let mut expected = original;
+        expected["tokens"]["access_token"] = json!("at-tcr-new");
+        expected["tokens"]["refresh_token"] = json!("rt-tcr-new");
+        let document = read_auth(home.path());
+        assert_ne!(document["last_refresh"], expected["last_refresh"]);
+        expected["last_refresh"] = document["last_refresh"].clone();
+        assert_eq!(document, expected);
+    }
+
+    #[tokio::test]
+    async fn an_imported_codex_writeback_is_private_and_replaces_the_file_atomically() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("auth.json");
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before_inode = std::fs::metadata(&path).unwrap().ino();
+        let (manager, _) = imported_manager(home.path(), None, false);
+        assert!(manager.ensure_fresh_force(0).await);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            after.ino(),
+            before_inode,
+            "a same-directory rename publishes a new inode"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_imported_codex_login_is_adopted_before_refreshing() {
+        let home = tempfile::tempdir().unwrap();
+        let newer = auth_document("rt-codex-new", 2);
+        write_auth(home.path(), &newer);
+        let (manager, calls) = imported_manager(home.path(), None, false);
+        assert!(manager.ensure_fresh_force(0).await);
+        assert_eq!(
+            manager.access_token(0).unwrap(),
+            newer["tokens"]["access_token"]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "do not spend the stale refresh token"
+        );
+        assert_eq!(read_auth(home.path()), newer);
+    }
+
+    #[tokio::test]
+    async fn a_reused_imported_codex_refresh_recovers_the_newer_file_login() {
+        let home = tempfile::tempdir().unwrap();
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        let newer = auth_document("rt-codex-new", 2);
+        let (manager, calls) = imported_manager(home.path(), Some(newer.clone()), true);
+        assert!(
+            manager.ensure_fresh_force(0).await,
+            "the newer file login recovers the row"
+        );
+        assert_eq!(
+            manager.access_token(0).unwrap(),
+            newer["tokens"]["access_token"]
+        );
+        assert_eq!(manager.account_status(0), Some(AccountStatus::Active));
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .codex
+                .login_error,
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(read_auth(home.path()), newer);
+    }
+
+    #[tokio::test]
+    async fn an_imported_codex_file_changed_during_refresh_is_not_overwritten() {
+        let home = tempfile::tempdir().unwrap();
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        let newer = auth_document("rt-codex-new", 2);
+        let (manager, _) = imported_manager(home.path(), Some(newer.clone()), false);
+        assert!(manager.ensure_fresh_force(0).await);
+        assert_eq!(
+            read_auth(home.path()),
+            newer,
+            "a changed refresh token guards the file"
+        );
+        assert_eq!(
+            manager.access_token(0).unwrap(),
+            newer["tokens"]["access_token"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_imported_codex_refresh_rejects_foreign_expired_or_older_file_tokens() {
+        let mut foreign = auth_document("rt-other", 2);
+        foreign["tokens"]["account_id"] = json!("33333333-3333-4333-8333-333333333333");
+        foreign["tokens"]["access_token"] = json!(access_token(
+            "33333333-3333-4333-8333-333333333333",
+            2,
+            4_102_444_800,
+        ));
+        let mut expired = auth_document("rt-expired", 2);
+        expired["tokens"]["access_token"] = json!(access_token(ACCOUNT_ID, 2, 1));
+        let mut older = auth_document("rt-older", 2);
+        older["last_refresh"] = json!("2026-09-01T00:00:00Z");
+        for document in [foreign, expired, older, auth_document("rt-old", 2)] {
+            let home = tempfile::tempdir().unwrap();
+            write_auth(home.path(), &auth_document("rt-old", 1));
+            let (manager, _) = imported_manager(home.path(), Some(document.clone()), true);
+            assert!(!manager.ensure_fresh_force(0).await);
+            assert_eq!(manager.account_status(0), Some(AccountStatus::Error));
+            assert_eq!(read_auth(home.path()), document);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_imported_codex_login_is_adopted_after_any_refresh_failure() {
+        let mut failures = Vec::new();
+        for code in [
+            "refresh_token_expired",
+            "refresh_token_invalidated",
+            "transient",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            write_auth(home.path(), &auth_document("rt-old", 1));
+            let newer = auth_document("rt-codex-new", 2);
+            let (manager, _) =
+                imported_manager_with_failure(home.path(), Some(newer.clone()), Some(code));
+            if !manager.ensure_fresh_force(0).await {
+                failures.push(code);
+                continue;
+            }
+            assert_eq!(
+                manager.access_token(0).unwrap(),
+                newer["tokens"]["access_token"]
+            );
+            assert_eq!(manager.account_status(0), Some(AccountStatus::Active));
+            assert_eq!(read_auth(home.path()), newer);
+        }
+        assert!(
+            failures.is_empty(),
+            "newer file login was not adopted after: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_imported_codex_refresh_leaves_a_different_account_file_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        write_auth(home.path(), &auth_document("rt-old", 1));
+        let mut other = auth_document("rt-other", 2);
+        other["tokens"]["account_id"] = json!("33333333-3333-4333-8333-333333333333");
+        let (manager, _) = imported_manager(home.path(), Some(other.clone()), false);
+        assert!(manager.ensure_fresh_force(0).await);
+        assert_eq!(manager.access_token(0).as_deref(), Some("at-tcr-new"));
+        assert_eq!(read_auth(home.path()), other);
+    }
+
+    #[tokio::test]
+    async fn an_imported_codex_refresh_never_overwrites_an_unreadable_auth_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let original = auth_document("rt-old", 1);
+        write_auth(home.path(), &original);
+        let path = home.path().join("auth.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (manager, _) = imported_manager(home.path(), None, false);
+        assert!(manager.ensure_fresh_force(0).await);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(mode, 0o000, "an unreadable login is never replaced");
+        assert_eq!(read_auth(home.path()), original);
+    }
+
+    #[tokio::test]
+    async fn a_failed_imported_codex_writeback_never_rolls_back_live_tokens() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::Mutex;
+
+        struct RotatingRefresh(Arc<Mutex<Vec<String>>>);
+        impl TokenRefresher for RotatingRefresh {
+            fn refresh(&self, _: crate::provider::Provider, token: String) -> oauth::RefreshFuture {
+                let mut calls = self.0.lock().unwrap();
+                calls.push(token);
+                let generation = calls.len();
+                Box::pin(async move {
+                    Ok(Tokens {
+                        access_token: access_token(
+                            ACCOUNT_ID,
+                            generation as i64 + 1,
+                            4_102_444_800,
+                        ),
+                        refresh_token: Some(format!("rt-tcr-{generation}")),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                })
+            }
+        }
+
+        let mut rollbacks = Vec::new();
+        for restart in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let original = auth_document("rt-old", 1);
+            write_auth(home.path(), &original);
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let make_manager = |access: String, refresh: &str| {
+                let config: Config = serde_json::from_value(json!({"accounts": [{
+                    "name": "alice@example.com/codex", "provider": "codex",
+                    "accountUuid": USER_ID, "orgUuid": ACCOUNT_ID,
+                    "accessToken": access, "refreshToken": refresh, "expiresAt": 0,
+                    "codexHome": home.path(),
+                }]}))
+                .unwrap();
+                Manager::new(
+                    config,
+                    Arc::new(RotatingRefresh(Arc::clone(&calls))),
+                    Arc::new(NoNetwork),
+                    Arc::new(NoNetwork),
+                    None,
+                )
+            };
+            let mut manager = make_manager(access_token(ACCOUNT_ID, 1, 4_102_444_800), "rt-old");
+            assert!(manager.ensure_fresh_force(0).await);
+            assert_eq!(
+                read_auth(home.path()),
+                original,
+                "the writeback must have failed"
+            );
+            if restart {
+                manager = make_manager(manager.access_token(0).unwrap(), "rt-tcr-1");
+            } else {
+                let mut accounts = manager.accounts.write().unwrap();
+                accounts[0].refresh_retry_after_ms = None;
+                accounts[0].expires_at_ms = Some(0);
+            }
+            assert!(manager.ensure_fresh_force(0).await);
+            let calls = calls.lock().unwrap();
+            if calls.as_slice() != ["rt-old", "rt-tcr-1"] {
+                rollbacks.push((restart, calls.clone()));
+            }
+            assert_eq!(read_auth(home.path()), original);
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(
+            rollbacks.is_empty(),
+            "stale file login replaced newer runtime tokens: {rollbacks:?}"
+        );
     }
 }

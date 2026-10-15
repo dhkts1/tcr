@@ -366,8 +366,8 @@ fn a_fleet_a_delete_emptied_keeps_the_codex_hint_and_imports_nothing() {
         lines.get(empty_fleet + 1).copied(),
         Some(
             "[tcr] found a codex login at <home>/.codex/auth.json: `tcr login --codex` adds a \
-             Codex account of tcr's own, and `tcr login --from-codex` imports that one (codex \
-             then asks you to log in again, once)"
+             Codex account of tcr's own, and `tcr login --from-codex` imports that one with \
+             guarded token updates shared through auth.json"
         ),
         "{stderr}"
     );

@@ -176,8 +176,8 @@ fn warn_if_no_accounts(config: &Config) {
 /// The codex line fires on evidence only. A machine with no codex login is a Claude-only
 /// first run and reads exactly as it always did; a machine where codex is signed in is one
 /// whose person uses codex, and should hear that tcr can pool it. tcr never imports that login
-/// on its own: an import spends codex's copy of a single-use refresh token, so it is the
-/// person's choice, and the line says what it costs. `claudeCodeImport: false` does not stop
+/// on its own: sharing a login permits guarded token updates to its auth file, so it is the
+/// person's choice. `claudeCodeImport: false` does not stop
 /// the line either, since it stops only the Claude Code import.
 fn no_accounts_lines(config: &Config, codex_login: Option<&Path>) -> Vec<String> {
     if !config.accounts.is_empty() {
@@ -187,8 +187,8 @@ fn no_accounts_lines(config: &Config, codex_login: Option<&Path>) -> Vec<String>
     if let Some(login) = codex_login {
         lines.push(format!(
             "[tcr] found a codex login at {}: `tcr login --codex` adds a Codex account of tcr's \
-             own, and `tcr login --from-codex` imports that one (codex then asks you to log in \
-             again, once)",
+             own, and `tcr login --from-codex` imports that one with guarded token updates \
+             shared through auth.json",
             login.display()
         ));
     }
@@ -4408,7 +4408,9 @@ mod tests {
     /// still succeeds exactly as before this change.
     #[test]
     fn load_for_edit_succeeds_with_no_quarantined_accounts() {
-        let path = write_config("cli-load-no-quarantine", TWO_ACCOUNTS);
+        let mut fixture: serde_json::Value = serde_json::from_str(TWO_ACCOUNTS).unwrap();
+        fixture["proxy"]["port"] = serde_json::json!(9);
+        let path = write_config("cli-load-no-quarantine", &fixture.to_string());
         let config = load_for_edit(&path).expect("a clean config must still load for editing");
         assert_eq!(config.accounts.len(), 2);
         fs::remove_file(&path).ok();
@@ -11316,7 +11318,7 @@ mod tests {
     fn save_after_edit_does_not_revert_a_rotated_credential() {
         let path = write_config(
             "save-after-edit-preserves",
-            r#"{ "accounts": [
+            r#"{ "proxy": { "port": 9 }, "accounts": [
                    { "name": "acct-a", "accessToken": "at-a", "refreshToken": "rt-a", "expiresAt": 1 },
                    { "name": "acct-b", "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1 } ] }"#,
         );
@@ -11744,7 +11746,7 @@ mod tests {
     }
 
     /// An empty fleet on a machine where codex holds a login gets one more line: the two
-    /// ways to pool codex, and what the import costs. The login is named, never read.
+    /// ways to pool codex, and the import's guarded token sharing. The login is named, never read.
     #[test]
     fn the_first_run_with_a_codex_login_prints_the_codex_hint() {
         assert_eq!(
@@ -11756,7 +11758,7 @@ mod tests {
                 "no accounts configured — run `tcr login` to add one".to_string(),
                 "[tcr] found a codex login at /Users/example/.codex/auth.json: `tcr login \
                  --codex` adds a Codex account of tcr's own, and `tcr login --from-codex` \
-                 imports that one (codex then asks you to log in again, once)"
+                 imports that one with guarded token updates shared through auth.json"
                     .to_string(),
             ]
         );

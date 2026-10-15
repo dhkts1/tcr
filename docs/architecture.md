@@ -327,6 +327,7 @@ for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable i
 | `~/.config/teamclaude.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one | `0600` |
 | `~/.config/.teamclaude.json.tcr-*.tmp` | Left behind when a config write is killed halfway. Same contents as the config, and nothing removes them for you | `0600` |
 | `~/.config/tcr-codex-login.*` | Beside the config file, and only while `tcr login --codex` runs: the `CODEX_HOME` it gives `codex login`, holding that sign-in's `auth.json` until tcr has read it. tcr deletes it on every way out it can see; a SIGKILL of tcr can leave one behind, holding a live ChatGPT login | directory `0700` |
+| `<codexHome>/auth.json` | Imported Codex logins only: refreshed tokens are written here with a matching-token guard; other JSON fields and another login are preserved | replacement `0600` |
 | `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem`, and so does `CODEX_CA_CERTIFICATE` for `codex` | `0644`, `0600` |
 | `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts and `chatgpt.com`, its key, and the host list it was made for. tcr decrypts marked `chatgpt.com` connections only while the pool holds a Codex account | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
@@ -418,7 +419,9 @@ Nothing below runs for you; there is no uninstall command for the CLI.
 refreshed an imported login, that login's old refresh token no longer works, and `claude`
 asks you to log in through the browser once.
 
-The same holds for `codex`: tcr never writes the login `codex` keeps, and
-`tcr login --from-codex` only reads it. Once tcr has refreshed an imported login, the copy
-`codex` holds is dead, and `codex login` signs `codex` in again
-([troubleshooting.md](troubleshooting.md#a-codex-account-says-it-needs-sign-in)).
+For Codex accounts imported with `--from-codex`, tcr keeps refreshed tokens in sync with the
+recorded `codexHome/auth.json`. It preserves the rest of the JSON document, writes a `0600`
+temporary file beside it, and atomically renames only if the loaded refresh token still matches
+and the file has not changed. A newer, unexpired token pair for the same ChatGPT account is
+adopted when the file changes or a refresh reports `refresh_token_reused`. A different login is
+left untouched. Uninstalling tcr leaves that auth file in place with its current login.

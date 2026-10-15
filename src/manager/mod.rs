@@ -443,8 +443,8 @@ pub struct AccountRuntime {
     /// ([`Manager::add_or_update_account`]). Always `None` on an Anthropic row. Not persisted:
     /// a restart forgets it, and the next refresh learns it again.
     pub login_error: Option<String>,
-    /// [`config::Account::codex_home`]: the folder a Codex row's login was imported from, for
-    /// the status wire. A re-login replaces it with the submission's.
+    /// [`config::Account::codex_home`]: the imported login's folder, for guarded token sharing
+    /// and the status wire. A re-login replaces it with the submission's.
     pub codex_home: Option<String>,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token

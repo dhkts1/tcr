@@ -517,8 +517,8 @@ tcr runs `codex login` with `CODEX_HOME` set to a throwaway folder, `tcr-codex-l
 the config file (mode `0700`), reads the login `codex` leaves there, deletes the folder, and
 imports the login the way [`--from-codex`](#--from-codex-importing-the-login-codex-already-has) does, workspace check
 included. `codex` does the OAuth in the browser, which it opens itself; the login it keeps for
-its own use is never touched, so the two never share a single-use refresh token, and the import's
-notice about that copy does not print here. A failed `codex login` (a non-zero exit, or no login
+its own use is never touched, and the import's notice about shared token updates does not print
+here. A failed `codex login` (a non-zero exit, or no login
 left behind) writes nothing, and says how it ended; under `--non-interactive`, which passes
 `codex`'s own lines to stderr rather than to the terminal, it quotes the last of them too.
 
@@ -912,13 +912,14 @@ in the same workspace, a Claude account is refused outright, and a name no accou
 the login's email. It is a guard against importing from the wrong `CODEX_HOME`.
 
 **The folder.** The row records the folder it was imported from as `codexHome`
-([configuration.md](configuration.md#accounts)), so TcrBar can offer to import from it again; a
-login of tcr's own records none, and signing a row in with `--codex` removes the one it had.
+([configuration.md](configuration.md#accounts)), so tcr can keep refreshed tokens in sync and
+TcrBar can offer to import from it again. A login of tcr's own records none, and signing a row
+in with `--codex` removes the one it had.
 
 **Importing the same login again** updates its row in place and keeps the name the row is
 saved under, so a `--name` that differs from it is refused. It is refused outright when tcr
-already holds a newer credential for the account than `codex` does, which is the usual state
-once tcr has refreshed it, because the copy `codex` holds is then the dead one:
+already holds a newer credential for the account than the file does, for example when an
+earlier write-back could not complete:
 
 ```
 tcr already holds a newer credential for this account than `codex` does; run `codex login` first if you meant to replace it; nothing was written.
@@ -938,22 +939,26 @@ The proxy's answer is checked as well, and must report the row stored as a Codex
 it does not, the row is already live as a Claude account, and the import fails naming the
 `tcr remove` to run at once, followed by a fresh `codex login`.
 
-**The cost, stated on every import.** Each import prints one line on stderr carrying two
-notices, the first about the copy of the login the `codex` CLI keeps, the second about older
+**Token sharing, stated on every import.** Each import prints one line on stderr carrying two
+notices, the first about guarded token updates to the `codex` login, the second about older
 proxies, then a line on using the account, then the notices of
 [`--codex`](#--codex-a-codex-login-of-tcrs-own) that hold:
 
 ```
-[tcr] imported as 'alice@example.com' (ChatGPT Pro); this copies the login the `codex` CLI itself uses, and Codex refresh tokens are single-use: the first time tcr refreshes it, the copy `codex` holds stops working and `codex` asks you to log in again, once, under `tcr run --codex` too. To avoid that, import a login made for tcr alone: `mkdir -p <dir>`, `CODEX_HOME=<dir> codex login`, then `tcr login --from-codex --codex-home <dir>`. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
+[tcr] imported as 'alice@example.com' (ChatGPT Pro); this shares the login the `codex` CLI itself uses. Codex refresh tokens are single-use: tcr writes refreshed tokens back only while auth.json still holds the refresh token tcr loaded, and adopts newer tokens for the same ChatGPT account. A changed login is left untouched. `tcr login --codex` gives tcr a separate login. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
 [tcr] start a pooled session with `tcr run --codex`
 ```
 
 The plan in parentheses is the label `tcr status` shows, left out when the login names no
-plan. A pooled `tcr run --codex` session does not spare the copy `codex` holds: tcr swaps the
-credential on inference only, every other `/backend-api/` call goes up under the login `codex`
-holds, and `codex` refreshes that copy itself, near its expiry and on a 401. A login made for
-tcr alone, under a `CODEX_HOME` of its own as [above](#--from-codex-importing-the-login-codex-already-has),
-leaves the one you use with `codex` alone, and [`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own) is that, done for you.
+plan. After every successful refresh of an imported account, tcr updates only that recorded
+`codexHome/auth.json`, preserving the document's other fields and token layout. The replacement
+uses a file in the same directory, mode `0600`, followed by an atomic rename. It writes only if
+the file still holds the refresh token tcr loaded and has not changed before the rename.
+
+If the file's token changed, or a refresh reports `refresh_token_reused`, tcr re-reads it and
+adopts newer, unexpired tokens for the same ChatGPT account. A different login, a malformed
+file or an unreadable file is left untouched. If no matching newer credential is available,
+a rejected refresh still needs a new login. `tcr login --codex` gives tcr a separate login.
 
 **Upgrade every `tcr` before the first import.** A Codex row is written at
 `credentialVersion: 2` ([configuration.md](configuration.md#accounts)), which a `tcr` that
@@ -970,8 +975,8 @@ Codex login enters the pool through `--codex` or `--from-codex` and nothing else
 
 Once imported, the account is refreshed against `auth.openai.com`, probed at
 `/backend-api/wham/usage`, never kept warm, and serves the inference requests
-(`/backend-api/codex/responses`) of `tcr run --codex` and of any `codex` routed through the
-proxy; [architecture.md](architecture.md#codex-requests) has the details.
+of `tcr run --codex` and other Codex connections carrying the proxy marker.
+[architecture.md](architecture.md#codex-requests) lists all five pooled model paths.
 
 ---
 
@@ -1216,7 +1221,7 @@ When `codex` has a login of its own on this machine, at `$CODEX_HOME/auth.json`,
 `~/.codex/auth.json`, a second line follows that one:
 
 ```
-[tcr] found a codex login at /Users/example/.codex/auth.json: `tcr login --codex` adds a Codex account of tcr's own, and `tcr login --from-codex` imports that one (codex then asks you to log in again, once)
+[tcr] found a codex login at /Users/example/.codex/auth.json: `tcr login --codex` adds a Codex account of tcr's own, and `tcr login --from-codex` imports that one with guarded token updates shared through auth.json
 ```
 
 It prints on an empty fleet only, and only on that evidence: the file is checked for existence

@@ -1,5 +1,5 @@
-//! Proves a first run works: `tcr status` on a box with no
-//! `~/.config/teamclaude.json` must exit 0 and leave a real config file behind.
+//! Proves first-run file creation through the offline accounts verb, and status
+//! output through an empty config on an isolated port.
 //!
 //! This is an end-to-end test of the BUILT BINARY rather than a unit test of
 //! `config::load_or_init`, because the defect it guards was never in the load
@@ -10,6 +10,9 @@
 //! the dmg showed an error in the menu bar while the proxy behind it was up. A
 //! unit test on the config module would have stayed green through all of that.
 //!
+//! `config::load_or_init` and the CLI loader's unit tests cover absent-file initialization.
+//! The status subprocess uses an explicit empty config so it never probes a developer's live port.
+//!
 //! # Isolation
 //!
 //! Same rules as `tests/headless_sigterm.rs`: `HOME` points at a fresh
@@ -17,7 +20,7 @@
 //! spawned [`Command`] rather than on this test process, so the real
 //! `~/.config/teamclaude.json` — which holds working credentials — and the live
 //! proxy reading it are never touched. Nothing here binds a port or signals a
-//! process: `tcr status` with no server running falls back to its offline
+//! process: `tcr status` with an explicit fixture port falls back to its offline
 //! snapshot, which is exactly the first-run case under test.
 use std::path::PathBuf;
 use std::process::Command;
@@ -30,6 +33,16 @@ fn config_path_in(home: &std::path::Path) -> PathBuf {
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
 fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
+    if args.first() == Some(&"status") {
+        let config: serde_json::Value = std::fs::read(config_path_in(home))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .expect("a status fixture must configure its own port before the child starts");
+        let port = config["proxy"]["port"]
+            .as_u64()
+            .expect("a status fixture must explicitly configure its port");
+        assert_ne!(port, 3456, "never contact the live proxy");
+    }
     let bin = env!("CARGO_BIN_EXE_tcr");
     let out = Command::new(bin)
         .args(args)
@@ -60,55 +73,42 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
 /// the `config i/o error: No such file or directory` text in stderr — observed
 /// on `346ea60` before the fix, not hypothesised.
 #[test]
-fn status_with_no_config_exits_zero_and_creates_the_file() {
+fn status_with_an_empty_config_exits_zero_offline() {
     let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
     let config = config_path_in(home.path());
-    assert!(
-        !config.exists(),
-        "the scratch HOME must start with no config — this test proves the FIRST run"
-    );
+    std::fs::create_dir_all(config.parent().expect("the config's parent"))
+        .expect("create the fixture config directory");
+    let before = b"{\"proxy\":{\"port\":9},\"accounts\":[]}";
+    std::fs::write(&config, before).expect("write the isolated empty config");
 
     let (code, stdout, stderr) = run_tcr(home.path(), &["status", "--json"]);
     assert_eq!(
         code,
         Some(0),
-        "`tcr status --json` on a fresh HOME must exit 0 (TcrBar renders any other \
+        "`tcr status --json` on an empty fleet must exit 0 (TcrBar renders any other \
          exit as a failed poll). stderr={stderr}"
     );
 
-    // The file is on disk afterwards, and it is a config a later run can read —
-    // asserted by parsing it, not by `exists()`, so a zero-byte or half-written
-    // file cannot pass.
+    // A read-only status must retain the explicit fixture port and the config bytes.
     let written = std::fs::read_to_string(&config)
         .unwrap_or_else(|err| panic!("no config at {} after the run: {err}", config.display()));
     let parsed: serde_json::Value =
         serde_json::from_str(&written).unwrap_or_else(|err| panic!("unparseable config: {err}"));
+    assert_eq!(written.as_bytes(), before);
+    assert_eq!(parsed["proxy"]["port"], 9);
     assert_eq!(
         parsed.get("accounts").and_then(|a| a.as_array()),
         Some(&vec![]),
         "a created config must hold an empty accounts array, got {written}"
     );
 
-    // stdout stays a decodable fleet array for TcrBar and for `jq` — never an
-    // error string. Its LENGTH is deliberately not asserted here: `status`
-    // probes the configured port, and a developer box may have a real proxy
-    // answering on it, whose fleet is not this tempdir's. `tcr accounts` below
-    // is the offline verb and carries the empty-fleet assertion instead.
-    // Nothing from that stdout is echoed into a panic message: it can hold real
-    // account names.
+    // The status read is offline and this fixture has no accounts, so the array is empty.
     let fleet: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|_| panic!("`status --json` stdout is not a JSON document"));
-    assert!(
-        fleet.is_array(),
-        "`status --json` must emit a JSON array, not an object or a string"
-    );
+    assert_eq!(fleet, serde_json::json!([]));
     assert!(
         stderr.contains("no accounts configured — run `tcr login` to add one"),
         "the empty-fleet hint must be on stderr, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("created") && stderr.contains("teamclaude.json"),
-        "creating the config must say so once, got: {stderr}"
     );
 }
 
@@ -266,8 +266,8 @@ fn a_codex_login_on_disk_adds_one_hint_line() {
         "[tcr] created <home>/.config/teamclaude.json with no accounts\n\
          no accounts configured — run `tcr login` to add one\n\
          [tcr] found a codex login at <home>/.codex/auth.json: `tcr login --codex` adds a Codex \
-         account of tcr's own, and `tcr login --from-codex` imports that one (codex then asks \
-         you to log in again, once)\n"
+         account of tcr's own, and `tcr login --from-codex` imports that one with guarded \
+         token updates shared through auth.json\n"
     );
 
     let after = std::fs::metadata(&login).expect("the login is still there");

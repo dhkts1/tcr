@@ -355,7 +355,7 @@ pub struct Account {
     )]
     pub egress_strict: bool,
     /// The folder a Codex row's login was imported from (`tcr login --from-codex`, the auth
-    /// file's directory, absolute), so TcrBar can offer to re-import from it. Absent for a login
+    /// file's directory, absolute), for guarded token sharing and TcrBar's re-import. Absent for a login
     /// of tcr's own (`tcr login --codex`), which shares no folder and so leaves nothing to
     /// re-import from, and on every Anthropic row, so an Anthropic-only config re-saves without
     /// the key.

@@ -65,7 +65,7 @@ final class CodexSignInCopyTests: XCTestCase {
             CodexSignInCopy.savedDetail(plan: "ChatGPT Pro", bundledTcrWithoutCLI: nil), withPlan)
     }
 
-    /// The import's confirmation, which states the single-use cost before anything runs,
+    /// The import's confirmation, which explains guarded token sharing before anything runs,
     /// and the folder picker that leads to it.
     func testTheImportConfirmation() {
         XCTAssertEqual(
@@ -75,7 +75,7 @@ final class CodexSignInCopyTests: XCTestCase {
             "Re-import erin@example.com/codex from ~/.codex?")
         XCTAssertEqual(
             CodexSignInCopy.importText,
-            "This shares the codex CLI's login in that folder. Codex refresh tokens are single-use: the first time tcr refreshes this login, codex there must sign in again, once. To leave codex alone, use Codex account… instead: it gives tcr a login of its own."
+            "This shares the codex CLI's login in that folder. tcr writes refreshed tokens back only while auth.json still holds the refresh token it loaded, and adopts newer tokens for the same ChatGPT account. A changed login is left untouched. Codex account… gives tcr a separate login."
         )
         XCTAssertEqual(CodexSignInCopy.importButton, "Import")
         XCTAssertEqual(
@@ -146,7 +146,7 @@ final class CodexSignInCopyTests: XCTestCase {
         )
         XCTAssertEqual(
             CodexSignInCopy.importLinkHelp,
-            "Shares the login a codex CLI already holds in a folder you pick. It costs that codex one sign-in, the first time tcr refreshes it."
+            "Shares a codex login through guarded auth.json token updates. A changed login is left untouched."
         )
         XCTAssertEqual(CodexSignInCopy.reloginHint, "Signs in to ChatGPT")
         XCTAssertEqual(
@@ -170,7 +170,7 @@ final class CodexSignInCopyTests: XCTestCase {
         XCTAssertEqual(CodexSignInCopy.reimportItem(shortPath: "~/.codex"), "Re-import from ~/.codex…")
         XCTAssertEqual(
             CodexSignInCopy.reimportHelp(shortPath: "~/.codex"),
-            "Take the login the codex CLI in ~/.codex holds now. It shares that login: the next time tcr refreshes it, codex there signs in again, once."
+            "Take the login the codex CLI in ~/.codex holds now. Refreshed tokens are shared through guarded auth.json updates; a changed login is left untouched."
         )
     }
 

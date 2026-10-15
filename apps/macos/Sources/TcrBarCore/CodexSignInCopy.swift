@@ -57,9 +57,9 @@ public enum CodexSignInCopy {
         "Re-import \(name) from \(shortPath)?"
     }
 
-    /// What sharing a codex login costs, said before anything runs.
+    /// What sharing a codex login permits, said before anything runs.
     public static let importText =
-        "This shares the codex CLI's login in that folder. Codex refresh tokens are single-use: the first time tcr refreshes this login, codex there must sign in again, once. To leave codex alone, use Codex account… instead: it gives tcr a login of its own."
+        "This shares the codex CLI's login in that folder. tcr writes refreshed tokens back only while auth.json still holds the refresh token it loaded, and adopts newer tokens for the same ChatGPT account. A changed login is left untouched. Codex account… gives tcr a separate login."
     public static let importButton = "Import"
     public static let importPanelMessage = "Choose the codex folder whose login tcr should share"
     /// The prompt of both pickers, the folder for an import and the codex executable.
@@ -116,7 +116,7 @@ public enum CodexSignInCopy {
     public static let codexAccountHelp =
         "Signs in to ChatGPT through codex's own sign-in, run by tcr in a folder of its own: the codex CLI's login is not touched. The account is written only when the browser comes back."
     public static let importLinkHelp =
-        "Shares the login a codex CLI already holds in a folder you pick. It costs that codex one sign-in, the first time tcr refreshes it."
+        "Shares a codex login through guarded auth.json token updates. A changed login is left untouched."
     /// The VoiceOver hint on a Codex row's Re-login button.
     public static let reloginHint = "Signs in to ChatGPT"
     public static let reloginHelp =
@@ -135,7 +135,7 @@ public enum CodexSignInCopy {
     }
 
     public static func reimportHelp(shortPath: String) -> String {
-        "Take the login the codex CLI in \(shortPath) holds now. It shares that login: the next time tcr refreshes it, codex there signs in again, once."
+        "Take the login the codex CLI in \(shortPath) holds now. Refreshed tokens are shared through guarded auth.json updates; a changed login is left untouched."
     }
 
     // MARK: - A bundled tcr that cannot read a Codex config

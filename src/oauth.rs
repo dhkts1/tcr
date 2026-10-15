@@ -2129,27 +2129,15 @@ pub const CLAUDE_CODE_IMPORT_CONSEQUENCE: &str =
      so the next time tcr refreshes it, `claude` will ask you to log in again in the browser, \
      once. Sessions started with `tcr run` are not affected.";
 
-/// What importing the `codex` CLI's own login costs the user, printed on every
-/// `tcr login --from-codex` ([`login_from_codex`]) — the Codex twin of
-/// [`CLAUDE_CODE_IMPORT_CONSEQUENCE`], and the same cost: Codex refresh tokens
-/// rotate and are single-use too (`codex_oauth`'s module doc), so the first
-/// refresh tcr makes leaves the copy `codex` holds dead.
-///
-/// Unlike the Claude twin, `tcr run` does not spare that copy. A pooled
-/// `tcr run --codex` session re-credentials inference only: every other
-/// `/backend-api/` call goes up under the bearer `codex` holds, and `codex`
-/// refreshes that copy itself, near its expiry and on a 401 (openai/codex
-/// f82e365, `codex-rs/login/src/auth/manager.rs`: `should_refresh_proactively`
-/// and `UnauthorizedRecovery`). So once tcr has refreshed, `codex` in that
-/// `CODEX_HOME` logs in again once, pooled or not. The way out is a login made
-/// for tcr alone, imported with `--codex-home`, which the notice names.
-pub const CODEX_IMPORT_CONSEQUENCE: &str = "this copies the login the `codex` CLI itself uses, and \
-    Codex refresh tokens are single-use: the first time tcr refreshes it, the copy `codex` holds \
-    stops working and `codex` asks you to log in again, once, under `tcr run --codex` too. To avoid \
-    that, import a login made for tcr alone: `mkdir -p <dir>`, `CODEX_HOME=<dir> codex login`, \
-    then `tcr login --from-codex --codex-home <dir>`.";
+/// The guarded token sharing an imported Codex login permits, printed on every import.
+/// Codex refresh tokens rotate and are single-use. The manager keeps both holders in sync
+/// through the recorded auth file, preserving another login and adopting newer matching tokens.
+pub const CODEX_IMPORT_CONSEQUENCE: &str = "this shares the login the `codex` CLI itself uses. \
+    Codex refresh tokens are single-use: tcr writes refreshed tokens back only while auth.json \
+    still holds the refresh token tcr loaded, and adopts newer tokens for the same ChatGPT \
+    account. A changed login is left untouched. `tcr login --codex` gives tcr a separate login.";
 
-/// The second cost of a Codex import, printed beside [`CODEX_IMPORT_CONSEQUENCE`] on every one:
+/// The compatibility notice printed beside [`CODEX_IMPORT_CONSEQUENCE`] on every import:
 /// the config now holds a Codex row, and a tcr built before Codex accounts cannot tell it from a
 /// Claude one. What such a build does with the file depends on its age:
 ///
@@ -2261,7 +2249,7 @@ pub async fn login_from_claude_code(
 /// import.
 ///
 /// The row records the folder the login was read from (`codexHome`, the auth file's
-/// directory, made absolute), so TcrBar can offer to re-import from it. `ui` decides how the
+/// directory, made absolute), for guarded token sharing and TcrBar's re-import. `ui` decides how the
 /// import speaks: the terminal gets its lines on stderr, then [`CODEX_IMPORT_RUN_LINE`], then
 /// each notice that holds ([`crate::codex_local::codex_notices`]); [`LoginUi::Machine`] gets the
 /// import's cost as one `notice` event, then those notices as events, then `saved` with the
@@ -2466,9 +2454,9 @@ pub(crate) async fn codex_login_route_check(config_path: &Path, force: bool) -> 
 /// 4. **The row this login already is** ([`existing_codex_row`]), if any. A
 ///    re-import updates that row and renames nothing, so it keeps the row's name
 ///    and refuses a different `--name`. And it is refused outright when tcr holds a
-///    NEWER credential for it than the import: tcr's first refresh rotated the
-///    single-use refresh token, so the `codex` CLI's copy is dead, and writing it
-///    over tcr's live one kills the account at its next refresh.
+///    NEWER credential for it than the import. A stale file can remain when guarded
+///    write-back could not complete; writing it over tcr's live pair would kill the account
+///    at its next refresh.
 /// 5. Otherwise the name [`mint_codex_login_name`] picks.
 /// 6. **The workspace check**, last before the write because it is the one step that
 ///    sends the login's bearer anywhere: `GET {codexUpstream}/backend-api/wham/accounts/check`
@@ -7621,8 +7609,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
     }
 
-    /// tcr's first refresh rotates the single-use refresh token, so after it the
-    /// `codex` CLI's copy is dead. Re-importing that older copy over tcr's newer one
+    /// Re-importing an older credential, such as one left after a skipped write-back, over tcr's newer one
     /// would kill the account at its next refresh: refused, nothing written. A login
     /// NEWER than tcr's (a fresh `codex login`) still replaces it.
     #[tokio::test]

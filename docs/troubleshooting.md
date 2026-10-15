@@ -66,7 +66,7 @@ tcr status --json | jq -r '.[] | "\(.name)\t\(.gate)"'
 | `seven-day` | `7D 2d` | The weekly quota is at or over `switchThreshold`. | Wait for the reset shown. |
 | `fable-weekly` | `FABLE-7D` | The Fable weekly quota is at or over its threshold. It holds the account out for Fable requests only. `tcr status` reports the fleet as a request with no model in mind sees it, so it does not print this value today; read `sevenDayOiState` instead. | Nothing. The account keeps serving other models. |
 | `standard` | `STD` | An API-key account's token or request limit is at or over `switchThreshold`. It never applies to a subscription login, and tcr serves subscription accounts only, so you should not see it. | If you do, the config holds an API-key account. Take it out of the pool with `tcr remove <name>`. |
-| `login` | `LOGIN` | The account's refresh token was rejected, so it cannot get a working access token. tcr retries the refresh on a growing backoff, but only a new login replaces the token. | Log in again: `tcr login --account <name>`. On a Codex account, `tcr login --codex --account <name>`, or `tcr login --from-codex --codex-home <folder> --account <name>` to import it again from the folder it came from (the row's `codexHome` in `tcr status --json`); its `loginError` in `tcr status --json` names why the login died (`refresh_token_reused`: another holder of the login refreshed it first). [A Codex account says it needs sign-in](#a-codex-account-says-it-needs-sign-in) has the rest. |
+| `login` | `LOGIN` | The account's refresh token was rejected, so it cannot get a working access token. tcr retries on a growing backoff and can adopt newer matching tokens from an imported Codex auth file; otherwise a new login is needed. | Log in again: `tcr login --account <name>`. On a Codex account, `tcr login --codex --account <name>`, or `tcr login --from-codex --codex-home <folder> --account <name>` to import it again from the folder it came from (the row's `codexHome` in `tcr status --json`); its `loginError` in `tcr status --json` names why the login died (`refresh_token_reused`: another holder of the login refreshed it first). [A Codex account says it needs sign-in](#a-codex-account-says-it-needs-sign-in) has the rest. |
 | `rejected` | `REJECTED` | Anthropic marked the account `rejected` in its rate-limit headers. There is no reset time to count down to. It clears when the background quota probe sees a quota window start over. | Nothing. It clears on a probe after the window rolls. |
 | `disabled` | `OFF` | Someone ran `tcr disable` on it. | `tcr enable <name>`. |
 | `reserved` | `RESERVED` | The account is in a group marked reserved, so it only takes requests that ask for that group (`tcr run --group <group>`). `tcr status` reports the fleet as a request with no group sees it, so a reserved account reads `reserved` even while it serves its group's sessions. | Nothing, if you meant it. `tcr group unreserve <group>` opens it to all traffic. |
@@ -337,19 +337,24 @@ stderr for it, the dashboard's words with the command:
 [tcr] carol@example.com/codex needs re-login: the codex CLI in ~/.codex refreshed this shared login first — tcr login --codex --account carol@example.com/codex
 ```
 
-**Why it died.** A ChatGPT refresh token works once. A login imported with
-`tcr login --from-codex` is a copy of the one the `codex` CLI keeps, so when `codex`, or another
-copy of the same login, refreshed first, tcr's copy is dead, and its next refresh is refused with
-`refresh_token_reused`. A login can also have expired (`refresh_token_expired`) or been revoked
-(`refresh_token_invalidated`). tcr keeps retrying the refresh on a growing backoff, but only a new
-login brings the account back. Meanwhile the pool serves `codex` from its other Codex accounts,
+**Why it died.** A ChatGPT refresh token works once. For a login imported with
+`tcr login --from-codex`, tcr normally keeps token rotations in sync through the recorded
+`codexHome/auth.json`: it writes refreshed tokens back only while the file still holds the
+refresh token it loaded, and adopts newer, unexpired tokens for the same ChatGPT account if
+the file changes or a refresh reports `refresh_token_reused`. Another login is left untouched.
+
+A reused token reaches the sign-in error only when no matching newer credential can be adopted,
+for example because the auth file is missing, unreadable, stale or contains a different login.
+A login can also have expired (`refresh_token_expired`) or been revoked
+(`refresh_token_invalidated`). Meanwhile the pool serves `codex` from its other Codex accounts,
 if it has any.
 
 **The fix.** `tcr login --codex --account <row>` signs the account in again with a login of tcr's
 own, which nothing else shares, so it cannot die this way again. It writes nothing unless the
 login that comes back is the same ChatGPT user in the same workspace
 ([`cli.md`](cli.md#--codex-a-codex-login-of-tcrs-own)). To keep sharing the `codex` CLI's login
-instead, sign `codex` in again in that login's folder, `CODEX_HOME=<folder> codex login` (plain
+instead, put a fresh login for the same ChatGPT account in that folder; tcr can adopt it on its
+next refresh. You can also sign in and re-import explicitly: `CODEX_HOME=<folder> codex login` (plain
 `codex login` for `~/.codex`), then import it again with
 `tcr login --from-codex --codex-home <folder> --account <row>`. The row's `codexHome` on
 `tcr status --json` names the folder it came from.

@@ -229,10 +229,10 @@ though with that proxy's leaf certificate in place it never pools `codex`
 kept apart from the Claude accounts: a Codex request is only ever served by a Codex account, and
 a Claude request never by one. `tcr login --codex` signs a Codex account in with a login of tcr's
 own, so the `codex` CLI keeps the login it has. `tcr login --from-codex` imports the login `codex`
-already holds instead, at a one-time cost: the first time tcr refreshes it, `codex` asks you to
-log in again. `tcr run --codex -- exec "…"` launches `codex` through the pool, where those
+already holds instead. Refreshed tokens stay in sync through guarded updates to that folder's
+`auth.json`; tcr adopts newer tokens for the same ChatGPT account and leaves another login untouched. `tcr run --codex -- exec "…"` launches `codex` through the pool, where those
 accounts are picked, refreshed and probed the way Claude's are, and `tcr doctor --codex` says
-whether `codex` is pooled and, if it is not, why. The import, and the cost it carries, is in
+whether `codex` is pooled and, if it is not, why. The import and its token-sharing guards are in
 [`docs/cli.md`](docs/cli.md#--from-codex-importing-the-login-codex-already-has); what tcr does
 with a Codex request is in [`docs/architecture.md`](docs/architecture.md#codex-requests).
 

@@ -215,6 +215,12 @@ pub fn jwt_exp_ms(jwt: &str) -> Option<i64> {
     payload.get("exp")?.as_i64()?.checked_mul(1000)
 }
 
+/// `iat` of a JWT, in epoch milliseconds. Issuance order lets imported logins prove that
+/// their token pair is newer than the pair already persisted by tcr, including after restart.
+pub(crate) fn jwt_iat_ms(jwt: &str) -> Option<i64> {
+    jwt_payload(jwt)?.get("iat")?.as_i64()?.checked_mul(1000)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IdClaims {
     pub email: Option<String>,

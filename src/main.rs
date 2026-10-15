@@ -1432,10 +1432,10 @@ struct LoginArgs {
     /// instead) as a Codex account — no value here. The account is named by the
     /// login's email, or `<email>/codex` when another account holds that name.
     /// With `--account`, the login must be that account or nothing is written;
-    /// it takes the row name `tcr accounts` prints, or the login's email. The
-    /// cost, printed on import: Codex refresh tokens are single-use
-    /// too, so the first time tcr refreshes this one, `codex` asks you to log in
-    /// again once. A second account: `mkdir -p <dir>` and
+    /// it takes the row name `tcr accounts` prints, or the login's email.
+    /// Refreshed tokens are written back to auth.json only while its refresh
+    /// token still matches the one tcr loaded. Newer tokens for the same ChatGPT account
+    /// are adopted; a changed login is left untouched. A second account: `mkdir -p <dir>` and
     /// `CODEX_HOME=<dir> codex login`, then this with `--codex-home <dir>`.
     #[arg(long, conflicts_with_all = ["token", "from_claude_code"])]
     from_codex: bool,
@@ -9155,6 +9155,11 @@ mod tests {
                 "`tcr login --help` must say {fact}:\n{login}"
             );
         }
+        let import = help(&["login"], "from_codex");
+        for fact in ["auth.json", "only while", "same ChatGPT account"] {
+            assert!(import.contains(fact), "{import}");
+        }
+        assert!(!import.contains("asks you to log in again"), "{import}");
         let ls = help(&["peer", "ls"], "config");
         assert!(
             ls.contains("Codex exit pins"),

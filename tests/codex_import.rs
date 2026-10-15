@@ -402,8 +402,7 @@ fn from_codex_with_codex_home_reads_the_login_under_that_dir() {
 /// The place most users' login is read from: `$HOME/.codex/auth.json`, with neither
 /// `TCR_CODEX_AUTH` nor `CODEX_HOME` set — read end to end through the binary's own environment
 /// wrappers, which the unit tests deliberately never touch. The success line also tells the user
-/// what the import costs an older proxy, and that `tcr run --codex` does not spare the copy of the
-/// login `codex` holds.
+/// the older-proxy compatibility notice and the guarded token-sharing behavior.
 #[test]
 fn from_codex_reads_the_login_under_the_default_codex_home() {
     let (home, config) = scratch_home("[]");
@@ -428,13 +427,10 @@ fn from_codex_reads_the_login_under_the_default_codex_home() {
         "the import must say what it costs an older proxy: {stderr}"
     );
     assert!(
-        stderr.contains("under `tcr run --codex` too")
-            && stderr.contains(
-                "`CODEX_HOME=<dir> codex login`, then `tcr login --from-codex --codex-home <dir>`"
-            )
-            && !stderr.contains("unaffected"),
-        "the import must say `tcr run --codex` does not spare the copy `codex` holds, and how \
-         to avoid that: {stderr}"
+        stderr.contains("only while auth.json still holds the refresh token tcr loaded")
+            && stderr.contains("newer tokens for the same ChatGPT account")
+            && stderr.contains("changed login is left untouched"),
+        "the import must explain guarded token sharing: {stderr}"
     );
     assert_no_token_in(&out);
 }
