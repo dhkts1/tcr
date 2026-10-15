@@ -1103,9 +1103,11 @@ pub struct Manager {
     config: Mutex<Config>,
     /// Serializes the whole read-modify-write of the CONFIG FILE, and nothing else
     /// (**INV1**). Every writer — [`Self::persist_now`], [`Self::persist_tokens`],
-    /// [`Self::persist_disabled`] — holds this across its whole read, modify,
-    /// `sync_all` and rename, so two persists can never interleave and a stale
-    /// document can never clobber a just-rotated single-use refresh token.
+    /// [`Self::persist_disabled`], and the two plan writers, the profile backfill
+    /// (`backfill_plan_if_unknown`) and a Codex plan change (`record_codex_plan`) —
+    /// holds this across its whole read, modify, `sync_all` and rename, so two
+    /// persists can never interleave and a stale document can never clobber a
+    /// just-rotated single-use refresh token.
     ///
     /// It exists so `self.config` no longer has to do that job (**INV2**). The
     /// config mutex is taken on the PER-CONNECTION path —
@@ -4942,6 +4944,126 @@ mod tests {
             std::fs::read(&path).unwrap(),
             saved,
             "an unchanged plan writes nothing"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Run `probe_account(0)` on its own thread while this one holds `config_write`, and answer
+    /// the config file's bytes as they were while the lock was held, then as they are once it
+    /// was released and the probe finished. The bytes are read before the release, and asserted
+    /// on only after the join, so a writer that ignores the lock fails the test, not hangs it.
+    fn config_while_and_after_the_write_lock(
+        manager: &Manager,
+        path: &std::path::Path,
+    ) -> (String, String) {
+        let writing = manager
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        let held = std::thread::scope(|scope| {
+            let probe = scope.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the probe")
+                    .block_on(manager.probe_account(0));
+            });
+            // Long enough for the probe to reach its write, which must wait.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let held = std::fs::read_to_string(path).unwrap();
+            drop(writing);
+            probe.join().expect("the probe finished");
+            held
+        });
+        (held, std::fs::read_to_string(path).unwrap())
+    }
+
+    /// **The Codex plan write holds the config writers' lock** (INV1). `save_plan` reads the
+    /// whole document, changes one key and writes the document back, so without the lock a
+    /// read taken before another writer's rename and written after it puts back what that
+    /// writer replaced: a refresh token it had just rotated, which is single-use and already
+    /// spent, so that account is dead after its next restart. While another writer holds the
+    /// lock, nothing reaches the file; once it is released, the plan does.
+    ///
+    /// Watched red: without the lock, the new plan is on disk while the lock is still held.
+    #[test]
+    fn a_codex_plan_write_waits_for_the_config_write_lock() {
+        let path = tmp_config_path("codex-plan-lock");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+                  "credentialVersion": 2,
+                  "accountUuid": "22222222-2222-4222-8222-222222222222",
+                  "organizationType": "plus", "priority": 0,
+                  "accessToken": "at-bob", "refreshToken": "rt-bob",
+                  "expiresAt": 4102444800000 }
+            ] }"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let manager = Manager::new(
+            crate::config::load(&path).unwrap(),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(CodexPlanProber { plan: "pro" }),
+            Arc::new(NoWarmer),
+            Some(path.clone()),
+        );
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let (held, after) = config_while_and_after_the_write_lock(&manager, &path);
+        assert_eq!(
+            held, before,
+            "nothing reaches the file while another writer holds the lock"
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after["accounts"][0]["organizationType"], "pro",
+            "once the lock is released, the plan is written"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The plan the profile backfill learns is written under the same lock, for the same
+    /// reason: it is the other writer `save_plan` has.
+    ///
+    /// Watched red: without the lock, the learned plan is on disk while the lock is still held.
+    #[test]
+    fn a_backfilled_plan_write_waits_for_the_config_write_lock() {
+        let path = tmp_config_path("plan-backfill-lock");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "priority": 0 }
+            ] }"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let manager = build_manager_with_path(crate::config::load(&path).unwrap(), path.clone());
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan {
+                organization_type: Some("claude_team".to_string()),
+                rate_limit_tier: None,
+                seat_tier: None,
+            },
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let (held, after) = config_while_and_after_the_write_lock(&manager, &path);
+        assert_eq!(
+            held, before,
+            "nothing reaches the file while another writer holds the lock"
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after["accounts"][0]["organizationType"], "claude_team",
+            "once the lock is released, the plan is written"
         );
         std::fs::remove_file(&path).ok();
     }

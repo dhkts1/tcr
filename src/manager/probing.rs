@@ -413,6 +413,13 @@ impl Manager {
         let Some(path) = self.config_path.as_ref() else {
             return;
         };
+        // INV1: held across save_plan's whole read + modify + sync + rename. Taken after the
+        // accounts lock above is released, never inside it, so the order stays one-way
+        // (`config_write` before `accounts`).
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
         match config::save_plan(
             path,
             &target,
@@ -481,6 +488,13 @@ impl Manager {
         let Some(path) = self.config_path.as_ref() else {
             return;
         };
+        // INV1: held across save_plan's whole read + modify + sync + rename. Taken after the
+        // accounts lock above is released, never inside it, so the order stays one-way
+        // (`config_write` before `accounts`).
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
         match config::save_plan(path, &target, Some(plan_type), None, None) {
             Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
             Ok(outcome) => tracing::warn!(
