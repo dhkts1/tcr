@@ -1371,6 +1371,38 @@ pub struct AccountRename {
 }
 
 impl Config {
+    /// Whether session affinity is on, read from the unmodelled top-level
+    /// `sessionAffinity` (default `true`: ON unless the file says
+    /// `"sessionAffinity": false`). The one reader: the manager's
+    /// [`crate::manager::Manager::session_affinity_enabled`] and `tcr config
+    /// show` both call this, so the panel can never report a value the server
+    /// does not use. Why the default is ON is on the manager's method.
+    pub fn session_affinity_enabled(&self) -> bool {
+        self.extra
+            .get("sessionAffinity")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    /// [`Self::control_reserve`] as the manager applies it: clamped to
+    /// `[0.0, 0.5]`, because a hand-edited file is not bound by the field's
+    /// documented range. Read once at manager construction and by `tcr config
+    /// show`.
+    pub fn effective_control_reserve(&self) -> f64 {
+        self.control_reserve.clamp(0.0, 0.5)
+    }
+
+    /// The Fable weekly threshold the fleet-wide gate applies: the override
+    /// when the file sets one, otherwise [`Self::switch_threshold`]. Resolved
+    /// through the manager's own resolver, so this and the selection path
+    /// cannot disagree.
+    pub fn effective_fable_weekly_threshold(&self) -> f64 {
+        crate::manager::effective_fable_threshold(
+            self.fable_weekly_threshold,
+            self.switch_threshold,
+        )
+    }
+
     /// The set of group labels currently marked `reserved`. Cheap to call —
     /// intended for one-shot use (CLI verbs, [`crate::manager::Manager`]
     /// construction caching its own copy), not a per-request hot path.

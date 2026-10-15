@@ -398,11 +398,13 @@ struct GroupsRotationSettingsPane: View {
 
     @ObservedObject private var poller: StatusPoller
     @ObservedObject private var groupController: GroupController
+    @ObservedObject private var configSettings: ConfigSettingsController
 
     init(dependencies: SettingsDependencies) {
         self.dependencies = dependencies
         self.poller = dependencies.poller
         self.groupController = dependencies.groupController
+        self.configSettings = dependencies.configSettings
     }
 
     /// "Claude accounts only" under the four rotation rows that only Claude
@@ -446,36 +448,30 @@ struct GroupsRotationSettingsPane: View {
                 readOnlyRow(
                     "Switch threshold",
                     "Prefer another account once this share of quota is used.",
-                    value: "95%",
                     key: SettingsRowBadge.switchThreshold, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Control reserve",
                     "The control account is picked below threshold minus reserve.",
-                    value: "5%",
                     key: SettingsRowBadge.controlReserve, sectionTiming: rotationSectionTiming,
                     scope: claudeOnlyScope)
                 readOnlyRow(
                     "Fable weekly threshold", "The separate ceiling for the weekly window.",
-                    value: "80%",
                     key: SettingsRowBadge.fableWeeklyThreshold,
                     sectionTiming: rotationSectionTiming, scope: claudeOnlyScope)
                 readOnlyRow(
                     "Reset urgency tier",
-                    "An account resetting within this long is preferred.",
-                    value: "2 h",
+                    "Weekly resets this close together count as equally soon.",
                     key: SettingsRowBadge.resetUrgencyTier, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Session affinity",
                     "Pin a session to one account so its prompt cache survives.",
-                    value: "On",
                     key: SettingsRowBadge.sessionAffinity, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
-                    "Control account", nil, value: "henry@example.com",
+                    "Control account", nil,
                     key: SettingsRowBadge.controlAccount,
                     sectionTiming: rotationSectionTiming, scope: claudeOnlyScope)
                 readOnlyRow(
                     "Pooled control", "Let the control account serve ordinary traffic too.",
-                    value: "Off",
                     key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming,
                     scope: claudeOnlyScope)
             } header: {
@@ -484,24 +480,22 @@ struct GroupsRotationSettingsPane: View {
 
             Section {
                 readOnlyRow(
-                    "Per-account throttle", nil, value: "8 in flight",
+                    "Per-account throttle", "Requests sent to one organization.",
                     key: SettingsRowBadge.accountThrottle,
                     sectionTiming: limitsSectionTiming)
                 readOnlyRow(
-                    "Fleet throttle", nil, value: "64 in flight",
+                    "Fleet throttle", "Requests sent across all accounts.",
                     key: SettingsRowBadge.fleetThrottle,
                     sectionTiming: limitsSectionTiming)
                 readOnlyRow(
-                    "Pacing", "Spread requests instead of sending them in bursts.",
-                    value: "On",
+                    "Pacing", "Skip an account that is already busy.",
                     key: SettingsRowBadge.pacing, sectionTiming: limitsSectionTiming)
                 readOnlyRow(
-                    "Keep the usage ledger for", nil, value: "30 days",
+                    "Keep the usage ledger for", nil,
                     key: SettingsRowBadge.usageRetentionDays,
                     sectionTiming: limitsSectionTiming)
                 readOnlyRow(
                     "HTTP/1.1 only upstream", "Off means HTTP/2, the faster default.",
-                    value: "Off",
                     key: SettingsRowBadge.http1Only, sectionTiming: limitsSectionTiming)
             } header: {
                 SectionHeader(title: "Limits", timing: limitsSectionTiming, hint: readOnlyHint)
@@ -510,6 +504,11 @@ struct GroupsRotationSettingsPane: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .formContentTopMarginIfAvailable(8)
+        // Each time the pane appears, the same shape as General's claude-route
+        // read: `tcr config show --json` runs off the main thread.
+        .onAppear {
+            Task { await configSettings.refresh() }
+        }
     }
 
     /// `Groups` section's own badge — every row below is checked against
@@ -580,23 +579,23 @@ struct GroupsRotationSettingsPane: View {
         .padding(.vertical, 4)
     }
 
-    /// - Parameter value: what the row shows for the key — the SAME
-    ///   illustrative figures the approved mockup renders
-    ///   (`docs/design/panel-tabs-mockup.html`), since this app has no read
-    ///   path for any of these yet (`CLAUDE.md`: never hand-read the live
-    ///   config). A blank value where a number belongs was worse than a
-    ///   labelled illustrative one — a reader has no way to tell "unmeasured"
-    ///   from "forgot to wire this up".
+    /// The value comes from `tcr config show --json` through
+    /// ``ConfigSettingsFormat/row(for:reading:hint:)``, keyed by `key`: the
+    /// file's effective value, or `—` with the reason in the tooltip while the
+    /// read runs or when it failed. This app never reads the config file
+    /// itself (`CLAUDE.md`: it holds credentials).
     /// - Parameter scope: one more caption under the detail, naming which
     ///   accounts the row applies to, or `nil` for none.
     @ViewBuilder
     private func readOnlyRow(
-        _ title: String, _ detail: String?, value: String, key: String,
+        _ title: String, _ detail: String?, key: String,
         sectionTiming: SettingsRowTiming, scope: String? = nil
     ) -> some View {
+        let shown = ConfigSettingsFormat.row(
+            for: key, reading: configSettings.reading, hint: readOnlyHint)
         LabeledContent {
             HStack(spacing: 6) {
-                Text(value).monospacedDigit()
+                Text(shown.value).monospacedDigit()
                 rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
             }
         } label: {
@@ -616,8 +615,8 @@ struct GroupsRotationSettingsPane: View {
         // each row's height on the value side. The section header now
         // states it once (`SectionHeader(hint:)`); `.help` keeps it
         // reachable per row, the same way the hand-written "Reserved" row
-        // beside this one already carries it.
-        .help(readOnlyHint)
+        // beside this one already carries it. Without a value, it says why.
+        .help(shown.help)
     }
 }
 

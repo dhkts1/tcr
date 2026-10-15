@@ -74,7 +74,7 @@ mod wire_sessions;
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
 // the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
-pub use select::{divert_verdict, DivertVerdict};
+pub use select::{divert_verdict, effective_fable_threshold, DivertVerdict};
 
 const REQUEST_LOG_CAPACITY: usize = 200;
 
@@ -1636,7 +1636,7 @@ impl Manager {
         // Clamp defensively even though `config::default_control_reserve` and
         // the field's own doc already promise `[0.0, 0.5]` — a hand-edited
         // config file is not bound by either.
-        let control_reserve = config.control_reserve.clamp(0.0, 0.5);
+        let control_reserve = config.effective_control_reserve();
         // Read before `config` is moved into the struct below, same reason as
         // `locked_name` above.
         let control_pooled = config.control_pooled;

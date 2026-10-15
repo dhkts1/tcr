@@ -283,7 +283,7 @@ pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: b
 /// this bucket (the account's own `switch_threshold`, or `global_threshold`) —
 /// `config_override.unwrap_or(today)` byte-for-byte reproduces pre-knob
 /// behaviour when the knob is absent. Pure.
-pub(super) fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f64 {
+pub fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f64 {
     config_override.unwrap_or(today)
 }
 

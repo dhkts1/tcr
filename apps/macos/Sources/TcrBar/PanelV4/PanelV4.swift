@@ -5,7 +5,14 @@ import TcrBarCore
 /// `line` border with a brighter top edge, and tabular figures throughout.
 ///
 /// This is the shell every tab draws inside. It owns the chrome and nothing else:
-/// the header, the summary block, the segmented control, and the footer's rule.
+/// the header, the segmented control, the summary block, and the footer's rule.
+///
+/// The tabs come straight after the header, ABOVE the summary (2026-10-16). Each
+/// tab answers a different question in the summary block, so its height differs
+/// per tab: one line on Accounts and Peers, two on Sessions, three on Tools, and
+/// the Tools line wraps by its own numbers. Drawn above the tabs, that block moved
+/// the whole strip by up to 33 pt on every tab switch and on some polls. Under the
+/// tabs it moves only what is below it.
 /// What goes between the strip and the footer is the tab's own business, which is
 /// why `content` is a closure rather than a switch in here — the Accounts tab is
 /// transcribed from the mockup under `PanelV4/`, while Sessions and Tools keep
@@ -49,9 +56,9 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
     private var panelBody: some View {
         VStack(alignment: .leading, spacing: 0) {
             PanelHeader(title: title, freshness: freshness, onSettings: onSettings)
-            summary()
             SegmentedTabs(
                 tabs: tabs, selected: selected, badges: badges, onSelect: onSelect)
+            summary()
             content()
             footer()
         }

@@ -118,6 +118,8 @@ struct SettingsDependencies {
     var groupController: GroupController
     var updater: Updater
     var claudeRoute: ClaudeRouteController
+    /// Groups & Rotation's read of `tcr config show --json`.
+    var configSettings: ConfigSettingsController
     var onWhatsNew: () -> Void = {}
     /// The command-line tcr a shell on this Mac would run, its version, and whether
     /// it predates Codex accounts, for Settings › Updates. Blocking: the pane runs
