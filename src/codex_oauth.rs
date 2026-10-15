@@ -5,11 +5,13 @@
 //! the body encoding is `TokenEncoding::Json`, `login/src/oauth/client.rs:76-110`). The response
 //! carries `id_token`, `access_token` and `refresh_token`, each optional. Refresh tokens ROTATE
 //! and are single-use: a reused one comes back as `refresh_token_reused`, which Codex itself
-//! classifies as exhausted (`manager.rs:1680-1690`). tcr holds such a code permanent only on a
-//! 400 (`PERMANENT_ERROR_CODES`), read from `error` or `error.code`, and any 401 permanent
-//! whatever it says. Codex at f82e365 reads further: a top-level `code` as well, and
-//! `refresh_token_expired`, `refresh_token_reused` or `refresh_token_invalidated` as permanent at
-//! any status (`manager.rs:1659-1667`).
+//! classifies as exhausted (`manager.rs:1683-1693`). Like Codex at f82e365, tcr treats
+//! `refresh_token_expired`, `refresh_token_reused` and `refresh_token_invalidated` as permanent
+//! at any error status, and `invalid_grant` as permanent on a 400 (`manager.rs:1659-1672`).
+//! Codes are read from `error.code`, a string `error`, or top-level `code`, as CodexBar's
+//! `CodexTokenRefresher` does. Every 401 remains permanent even if its body cannot be read;
+//! reading its code is bounded to one second so a stalled body cannot delay rejection until
+//! the refresh timeout.
 //!
 //! The access token is a JWT whose `exp` claim is the expiry (`login/src/token_data.rs:104,145`);
 //! identity claims live under the `https://api.openai.com/auth` key (`token_data.rs`,
@@ -54,20 +56,20 @@ struct RefreshResponse {
 
 /// The error codes `auth.openai.com` uses for a refresh token that will never work again.
 const PERMANENT_ERROR_CODES: &[&str] = &[
-    "invalid_grant",
     "refresh_token_expired",
     "refresh_token_reused",
     "refresh_token_invalidated",
 ];
 
-/// Read the error code out of an OAuth error body, whichever of the two shapes it uses:
-/// `{"error":"invalid_grant"}` or `{"error":{"code":"refresh_token_reused"}}`.
+/// Read the error code from a nested `error.code`, a string `error`, or top-level `code`.
 fn error_code(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let e = v.get("error")?;
-    e.as_str()
-        .map(str::to_string)
-        .or_else(|| e.get("code").and_then(|c| c.as_str()).map(str::to_string))
+    v.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| v.get("error").and_then(serde_json::Value::as_str))
+        .or_else(|| v.get("code").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
 }
 
 /// The error codes RFC 6749 §5.2 gives a token endpoint for a refused grant.
@@ -99,8 +101,9 @@ fn known_error_code(code: &str) -> Option<&'static str> {
 ///
 /// Bounded by `crate::oauth::REFRESH_TIMEOUT`, as that twin is: the manager holds the account's
 /// refresh lock across this call, so a POST that never answered would stall every request on the
-/// account. A 401, or a 400 naming one of `PERMANENT_ERROR_CODES`, is
-/// [`OAuthError::AuthRejected`]; every other failure is [`OAuthError::Transient`].
+/// account. A 401, any error naming one of `PERMANENT_ERROR_CODES`, or a 400 naming
+/// `invalid_grant` is [`OAuthError::AuthRejected`]; every other failure is
+/// [`OAuthError::Transient`].
 pub async fn refresh_access_token_at(
     client: &reqwest::Client,
     refresh_token: &str,
@@ -118,33 +121,43 @@ pub async fn refresh_access_token_at(
         .await
         .map_err(|e| OAuthError::Transient(format!("codex refresh transport: {e}")))?;
     let status = response.status();
-    // A 401 is decided by its status alone, BEFORE the body is read: a 401 whose body stalled or
-    // broke would otherwise surface as a Transient body error after up to the whole timeout, and
-    // a dead refresh token would be retried as a live one.
-    if status.as_u16() == 401 {
+    // Preserve a 401's permanent status even if its body stalls or breaks. When the body is
+    // available, its code distinguishes a reused token so the manager can recover newer tokens.
+    let body = if status.as_u16() == 401 {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), response.bytes()).await {
+            Ok(Ok(body)) => body,
+            _ => {
+                return Err(OAuthError::AuthRejected {
+                    status: 401,
+                    code: None,
+                });
+            }
+        }
+    } else {
+        response
+            .bytes()
+            .await
+            .map_err(|e| OAuthError::Transient(format!("codex refresh body: {e}")))?
+    };
+    let code = error_code(&body);
+    let permanent_code = code.as_deref().is_some_and(|c| {
+        PERMANENT_ERROR_CODES
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(c))
+    });
+    let invalid_grant = status.as_u16() == 400
+        && code
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("invalid_grant"));
+    if !status.is_success() && (status.as_u16() == 401 || permanent_code || invalid_grant) {
+        // tcr's own spelling of the code, never the body's text ([`known_error_code`]), so
+        // it can be shown as why the login is dead (`AccountRuntime::login_error`).
         return Err(OAuthError::AuthRejected {
-            status: 401,
-            code: None,
+            status: status.as_u16(),
+            code: code.as_deref().and_then(known_error_code),
         });
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| OAuthError::Transient(format!("codex refresh body: {e}")))?;
     if status.as_u16() == 400 {
-        let code = error_code(&body);
-        if code.as_deref().is_some_and(|c| {
-            PERMANENT_ERROR_CODES
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(c))
-        }) {
-            // tcr's own spelling of the code, never the body's text ([`known_error_code`]), so
-            // it can be shown as why the login is dead (`AccountRuntime::login_error`).
-            return Err(OAuthError::AuthRejected {
-                status: 400,
-                code: code.as_deref().and_then(known_error_code),
-            });
-        }
         let shown = match code.as_deref() {
             Some(code) => known_error_code(code).unwrap_or("unrecognised error code"),
             None => "no error code",
@@ -447,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn error_code_reads_both_body_shapes() {
+    fn error_code_reads_all_three_body_shapes() {
         assert_eq!(
             error_code(br#"{"error":"invalid_grant"}"#).as_deref(),
             Some("invalid_grant")
@@ -455,6 +468,10 @@ mod tests {
         assert_eq!(
             error_code(br#"{"error":{"code":"refresh_token_reused","message":"x"}}"#).as_deref(),
             Some("refresh_token_reused")
+        );
+        assert_eq!(
+            error_code(br#"{"code":"refresh_token_invalidated"}"#).as_deref(),
+            Some("refresh_token_invalidated")
         );
         assert_eq!(error_code(b"nope"), None);
     }
@@ -569,6 +586,52 @@ mod tests {
             refresh_access_token_at(&client, "rt", &url).await,
             Err(OAuthError::Transient(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dead_refresh_token_codes_are_permanent_at_every_error_status_and_body_shape() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut failures = Vec::new();
+        for status in [400, 401, 403, 500] {
+            for code in [
+                "refresh_token_expired",
+                "refresh_token_reused",
+                "refresh_token_invalidated",
+            ] {
+                for body in [
+                    serde_json::json!({"error": {"code": code}}),
+                    serde_json::json!({"error": code}),
+                    serde_json::json!({"code": code}),
+                ] {
+                    let body = body.to_string();
+                    let (url, _) = stub(status, Box::leak(body.clone().into_boxed_str())).await;
+                    let outcome = refresh_access_token_at(&client, "rt", &url).await;
+                    let permanent = matches!(
+                        &outcome,
+                        Err(OAuthError::AuthRejected { status: actual_status, code: actual_code })
+                            if *actual_status == status
+                                && *actual_code == Some(code)
+                    );
+                    if !permanent {
+                        failures.push(format!("HTTP {status} {body}: {outcome:?}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_without_a_400_or_401_is_transient() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for status in [403, 500] {
+            let (url, _) = stub(status, r#"{"error":"invalid_grant"}"#).await;
+            let outcome = refresh_access_token_at(&client, "rt", &url).await;
+            assert!(
+                matches!(outcome, Err(OAuthError::Transient(_))),
+                "{outcome:?}"
+            );
+        }
     }
 
     /// An empty rotated refresh token is no rotated token: the old one is kept, never stored as
@@ -699,13 +762,13 @@ mod tests {
         );
     }
 
-    /// A 401 is classified from its status, before its body is read. The stub sends the status
-    /// line and a `content-length` at once and the body never: read first, the body stalled the
-    /// refresh until its timeout and a dead refresh token came back Transient, to be retried.
+    /// A 401 is permanent even when its body stalls. The stub sends the status line and a
+    /// `content-length` at once and the body never: reading without a bound delayed rejection
+    /// until the refresh timeout and returned Transient, to be retried.
     ///
     /// Watched red: read the body before the 401 check again and the refresh outlives the wait.
     #[tokio::test]
-    async fn a_401_is_rejected_before_its_body_is_read() {
+    async fn a_401_with_a_stalled_body_is_still_rejected_promptly() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -731,7 +794,7 @@ mod tests {
             refresh_access_token_at(&client, "rt", &url),
         )
         .await
-        .expect("a 401 is classified from its status, not after a body that never arrives");
+        .expect("a 401 is rejected promptly even when its body never arrives");
         assert!(
             matches!(
                 outcome,
