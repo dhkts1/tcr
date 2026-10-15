@@ -644,13 +644,13 @@ fn account_area_height(total_height: u16, n_accounts: u16) -> u16 {
 }
 
 /// The accounts panel title: honest about how many accounts are actually on
-/// screen. `" teamclaude-rs · accounts (7) "` when all fit, or
-/// `" teamclaude-rs · accounts (5/7 ▼) "` when rows are clipped.
+/// screen. `" tcr · accounts (7) "` when all fit, or
+/// `" tcr · accounts (5/7 ▼) "` when rows are clipped.
 fn accounts_title(shown: u16, total: u16) -> String {
     if shown >= total {
-        format!(" teamclaude-rs · accounts ({total}) ")
+        format!(" tcr · accounts ({total}) ")
     } else {
-        format!(" teamclaude-rs · accounts ({shown}/{total} ▼) ")
+        format!(" tcr · accounts ({shown}/{total} ▼) ")
     }
 }
 
@@ -1283,7 +1283,7 @@ fn render_accounts_with(
         let title = if codex.is_empty() {
             accounts_title(shown, total)
         } else {
-            section_title("teamclaude-rs · accounts · codex", shown, total)
+            section_title("tcr · accounts · codex", shown, total)
         };
         let mut block = Block::default().borders(Borders::ALL).title(title);
         if let Some(hint) = hint {
@@ -1335,7 +1335,7 @@ fn render_accounts_with(
         Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .title(section_title(
-                "teamclaude-rs · accounts · claude",
+                "tcr · accounts · claude",
                 claude_shown,
                 claude.len() as u16,
             )),
@@ -2354,12 +2354,12 @@ mod tests {
 
     #[test]
     fn accounts_title_shows_total_when_all_visible() {
-        assert_eq!(accounts_title(7, 7), " teamclaude-rs · accounts (7) ");
+        assert_eq!(accounts_title(7, 7), " tcr · accounts (7) ");
     }
 
     #[test]
     fn accounts_title_flags_clip() {
-        assert_eq!(accounts_title(5, 7), " teamclaude-rs · accounts (5/7 ▼) ");
+        assert_eq!(accounts_title(5, 7), " tcr · accounts (5/7 ▼) ");
     }
 
     #[test]
@@ -3762,7 +3762,7 @@ mod tests {
         ));
         let pane = rows.join("\n");
         assert!(
-            rows[0].starts_with("┌ teamclaude-rs · accounts · claude (2) "),
+            rows[0].starts_with("┌ tcr · accounts · claude (2) "),
             "{pane}"
         );
         let divider = rows[1..]
@@ -3779,7 +3779,7 @@ mod tests {
         ]);
         let rows = buffer_rows(&accounts_buffer(&codex_only, FULL_LAYOUT_MIN_WIDTH, 12, 0));
         assert!(
-            rows[0].starts_with("┌ teamclaude-rs · accounts · codex (2) "),
+            rows[0].starts_with("┌ tcr · accounts · codex (2) "),
             "{}",
             rows.join("\n")
         );
@@ -3790,7 +3790,7 @@ mod tests {
         ]);
         let rows = buffer_rows(&accounts_buffer(&claude_only, FULL_LAYOUT_MIN_WIDTH, 12, 0));
         assert!(
-            rows[0].starts_with("┌ teamclaude-rs · accounts (2) "),
+            rows[0].starts_with("┌ tcr · accounts (2) "),
             "{}",
             rows.join("\n")
         );
@@ -3826,7 +3826,7 @@ mod tests {
         ));
         let pane = rows.join("\n");
         assert!(
-            rows[0].starts_with("┌ teamclaude-rs · accounts · claude (2/3 ▼) "),
+            rows[0].starts_with("┌ tcr · accounts · claude (2/3 ▼) "),
             "{pane}"
         );
         assert!(
@@ -4722,7 +4722,7 @@ mod tests {
             );
             assert!(
                 rows.iter()
-                    .any(|row| row.starts_with("┌ teamclaude-rs · accounts · claude (6) ")),
+                    .any(|row| row.starts_with("┌ tcr · accounts · claude (6) ")),
                 "{frame}"
             );
             assert!(
@@ -5164,7 +5164,9 @@ mod tests {
     /// debug form, which prints every cell's text and every change of style, so a colour or a
     /// modifier that moves fails this as surely as a character does.
     ///
-    /// The golden is never regenerated to fit a change. A Claude-only frame that differs from it
+    /// Its four account titles follow main's project rename to `tcr`; every other cell and
+    /// style remains the original baseline. The golden is never regenerated to fit a change.
+    /// A Claude-only frame that differs from it
     /// is a change a Claude-only user sees, and that is the bug.
     #[test]
     fn claude_only_frames_are_unchanged() {
@@ -5247,8 +5249,7 @@ mod tests {
             buffer[(0, 0)]
         );
         assert!(
-            rows.iter()
-                .any(|row| row.contains(" teamclaude-rs · accounts (0) ")),
+            rows.iter().any(|row| row.contains(" tcr · accounts (0) ")),
             "{screen}"
         );
         assert!(

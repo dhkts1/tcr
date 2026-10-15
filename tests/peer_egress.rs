@@ -33,17 +33,17 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::manager::Manager;
+use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
+use tcr::peer::egress::{self, GatewayCandidate, ViaSetting};
+use tcr::peer::listener;
+use tcr::peer::noise::{self, Handshake};
+use tcr::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
+use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
+use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
-use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
-use teamclaude_rs::manager::Manager;
-use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use teamclaude_rs::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
-use teamclaude_rs::peer::egress::{self, GatewayCandidate, ViaSetting};
-use teamclaude_rs::peer::listener;
-use teamclaude_rs::peer::noise::{self, Handshake};
-use teamclaude_rs::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
-use teamclaude_rs::probe::{ProbeError, ProbeFuture, UsageProber};
-use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tower::ServiceExt as _;
@@ -1528,18 +1528,14 @@ fn capture() -> (Collector, tracing::subscriber::DefaultGuard) {
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(
-        &self,
-        _provider: teamclaude_rs::provider::Provider,
-        _refresh_token: String,
-    ) -> RefreshFuture {
+    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in egress tests".into())) })
     }
 }
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: teamclaude_rs::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -1566,7 +1562,7 @@ impl AccountWarmer for NeverWarms {
 fn fake_account() -> Account {
     Account {
         name: "alice@example.com".to_string(),
-        account_type: teamclaude_rs::config::AccountType::OAuth,
+        account_type: tcr::config::AccountType::OAuth,
         provider: Default::default(),
         account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
         org_uuid: None,
@@ -1581,7 +1577,7 @@ fn fake_account() -> Account {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
-        egress: teamclaude_rs::config::Egress::Local,
+        egress: tcr::config::Egress::Local,
         egress_strict: false,
         codex_home: None,
         extra: serde_json::Map::new(),
@@ -1622,7 +1618,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
         rename_write_error: None,
         proxy: ProxyConfig::default(),
         upstream: upstream.to_string(),
-        codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
+        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.95,
         fable_weekly_threshold: None,
         pacing: PacingConfig {
@@ -1655,7 +1651,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
 
 /// One `/v1/messages` POST through the real router.
 async fn post_messages(manager: Arc<Manager>) -> axum::response::Response {
-    teamclaude_rs::proxy::app(manager)
+    tcr::proxy::app(manager)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1686,7 +1682,7 @@ async fn a_blackholed_upstream_with_no_mesh_answers_todays_503() {
     // An empty peers file: pinned nobody, so there is no Mac to ask. Written
     // rather than absent so this exercises the read path, and never the
     // operator's config directory.
-    teamclaude_rs::peer::config::save(&peers, &PeerFile::default()).expect("write the peers file");
+    tcr::peer::config::save(&peers, &PeerFile::default()).expect("write the peers file");
     assert!(
         egress::install_peers_path(peers),
         "nothing else in this binary installs a peers path, and a lost race here would \
@@ -1771,7 +1767,7 @@ async fn a_gateway_that_does_not_answer_leaves_todays_503() {
         vec!["127.0.0.1:1".to_string()],
         true,
     ));
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let (collector, _guard) = capture();
     // This process may already have had a peers path installed by another test
@@ -2020,13 +2016,13 @@ fn via_round_trips_through_the_peers_file() {
 
     // A file with no `via` key at all is `auto`: the default a fresh install
     // has, and the one every existing file on disk has.
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
-    let read = teamclaude_rs::peer::config::read_or_default(&peers).expect("read it back");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+    let read = tcr::peer::config::read_or_default(&peers).expect("read it back");
     assert_eq!(egress::via_setting(&read), ViaSetting::auto());
 
     file.via = ViaSetting::off();
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write `off`");
-    let read = teamclaude_rs::peer::config::read_or_default(&peers).expect("read `off` back");
+    tcr::peer::config::save(&peers, &file).expect("write `off`");
+    let read = tcr::peer::config::read_or_default(&peers).expect("read `off` back");
     assert!(
         egress::via_setting(&read).is_off(),
         "the stored choice is what the request path reads"
@@ -2041,13 +2037,13 @@ fn via_round_trips_through_the_peers_file() {
     file.via = ViaSetting::pinned(pinned)
         .with_setup_timeout_ms(1_500)
         .expect("1500ms is below the built-in bound");
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write a tuned pin");
+    tcr::peer::config::save(&peers, &file).expect("write a tuned pin");
     let raw = std::fs::read_to_string(&peers).expect("the file text");
     assert!(
         raw.contains("\"setupTimeoutMs\": 1500"),
         "a tuned setting stores the number beside the word: {raw}"
     );
-    let read = teamclaude_rs::peer::config::read_or_default(&peers).expect("read the pin back");
+    let read = tcr::peer::config::read_or_default(&peers).expect("read the pin back");
     let setting = egress::via_setting(&read);
     assert_eq!(setting, file.via);
     assert_eq!(setting.to_spec(), pinned.to_wire());
@@ -2182,11 +2178,11 @@ fn via_writes_the_choice_and_refuses_a_mac_this_one_never_pinned() {
         vec!["127.0.0.1:1".to_string()],
         true,
     ));
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let stored = |peers: &std::path::Path| {
         egress::via_setting(
-            &teamclaude_rs::peer::config::read_or_default(peers).expect("read the peers file"),
+            &tcr::peer::config::read_or_default(peers).expect("read the peers file"),
         )
     };
 
@@ -2269,13 +2265,13 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     let peers = dir.path().join("tcr-peers.json");
     let config = dir.path().join("teamclaude.json");
     let peer = node().id;
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![row(&peer, "attic-nuc", Vec::new(), true)],
         ..Default::default()
     };
     // Through the library's own writer, which is what gives the file the 0600
     // the binary refuses to read a peers file without.
-    teamclaude_rs::peer::config::save(&peers, &file).expect("the peers fixture writes");
+    tcr::peer::config::save(&peers, &file).expect("the peers fixture writes");
     // An obviously fake account: no real email is needed for a query that
     // matches on the name, and this file is written by the binary under test.
     std::fs::write(
@@ -2285,8 +2281,8 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     .expect("the config fixture writes");
 
     let wire = peer.to_wire();
-    let read_pin = |label: &str| -> teamclaude_rs::config::EgressPin {
-        let loaded = teamclaude_rs::config::load(&config)
+    let read_pin = |label: &str| -> tcr::config::EgressPin {
+        let loaded = tcr::config::load(&config)
             .unwrap_or_else(|err| panic!("the config reads back after {label}: {err}"));
         loaded.accounts[0].egress_pin()
     };
@@ -2305,7 +2301,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     assert!(ok, "the pin by id: {out}{err}");
     assert_eq!(
         read_pin("the pin by id").egress,
-        teamclaude_rs::config::Egress::Via(peer),
+        tcr::config::Egress::Via(peer),
         "the account leaves through the Mac the id names: {out}"
     );
     assert!(
@@ -2327,7 +2323,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     assert!(ok, "back to local: {out}{err}");
     assert_eq!(
         read_pin("back to local").egress,
-        teamclaude_rs::config::Egress::Local,
+        tcr::config::Egress::Local,
         "`local` is the word for this Mac's own socket: {out}"
     );
 
@@ -2348,7 +2344,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     );
     assert_eq!(
         read_pin("the pin by name").egress,
-        teamclaude_rs::config::Egress::Via(peer),
+        tcr::config::Egress::Via(peer),
         "and lands the same pin the id did: {out}"
     );
 
@@ -2366,7 +2362,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     let after = read_pin("--must on its own");
     assert_eq!(
         after.egress,
-        teamclaude_rs::config::Egress::Via(peer),
+        tcr::config::Egress::Via(peer),
         "--must changes what an unreachable exit COSTS and never where the exit is: {out}"
     );
     assert!(
@@ -2391,7 +2387,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     );
     assert_eq!(
         read_pin("the refused name").egress,
-        teamclaude_rs::config::Egress::Via(peer),
+        tcr::config::Egress::Via(peer),
         "and the refusal leaves the pin that was there: {out}{err}"
     );
 }
@@ -2474,7 +2470,7 @@ async fn via_off_costs_no_dial_and_no_wait() {
         true,
     ));
     file.via = ViaSetting::off();
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let (collector, _guard) = capture();
     let started = std::time::Instant::now();
@@ -2554,7 +2550,7 @@ async fn the_operators_timeout_is_what_a_silent_gateway_is_given() {
     file.via = ViaSetting::auto()
         .with_setup_timeout_ms(300)
         .expect("300ms is below the built-in bound");
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let (collector, _guard) = capture();
     let started = std::time::Instant::now();
@@ -2620,7 +2616,7 @@ async fn a_lender_that_takes_the_carry_and_never_answers_still_releases_the_requ
     let peers = dir.join("tcr-peers.json");
     // The requester's key has to exist BEFORE the carry runs, because the
     // gateway pins it: `retry_through_peer` mints it in this same directory.
-    let requester = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("mint this node");
+    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("mint this node");
     let gateway = node();
 
     // An origin that accepts and then says nothing at all. The TLS handshake
@@ -2654,7 +2650,7 @@ async fn a_lender_that_takes_the_carry_and_never_answers_still_releases_the_requ
     file.via = ViaSetting::auto()
         .with_setup_timeout_ms(700)
         .expect("700ms is below the built-in bound");
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let (collector, _guard) = capture();
     let started = std::time::Instant::now();
@@ -2818,7 +2814,7 @@ async fn a_carried_request_lands_in_the_ledger() {
             account_idx: 0,
             account: Some("alice@example.com".to_string()),
             session_key: Some(7),
-            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: Some("11111111-1111-1111-1111-111111111111"),
             model: Some("claude-opus-4-6".to_string()),
             method: "POST".to_string(),
@@ -2895,7 +2891,7 @@ async fn a_carried_requests_spend_reaches_the_quota_window() {
             account_idx: 0,
             account: Some("alice@example.com".to_string()),
             session_key: Some(9),
-            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: Some("11111111-1111-1111-1111-111111111111"),
             model: Some("claude-opus-4-6".to_string()),
             method: "POST".to_string(),
@@ -2945,7 +2941,7 @@ async fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
     let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
     assert_ne!(
         manager.account_status(0),
-        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        Some(tcr::manager::AccountStatus::Throttled),
         "before the carry this account is servable: the control for the assertion below"
     );
 
@@ -2966,7 +2962,7 @@ async fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
             account_idx: 0,
             account: Some("alice@example.com".to_string()),
             session_key: None,
-            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: None,
             model: None,
             method: "POST".to_string(),
@@ -2981,12 +2977,12 @@ async fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
 
     assert_eq!(
         manager.account_status(0),
-        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        Some(tcr::manager::AccountStatus::Throttled),
         "a rejection that arrived through a peer holds the account, or the next request \
          is sent straight into it again"
     );
     assert!(
-        !manager.hold_expired(0, teamclaude_rs::now_ms()),
+        !manager.hold_expired(0, tcr::now_ms()),
         "and the hold is still running: it was armed for what the origin asked"
     );
 }
@@ -3011,7 +3007,7 @@ async fn a_carried_success_clears_the_hold_a_carried_rejection_armed() {
     manager.mark_rate_limited(0, 300);
     assert_eq!(
         manager.account_status(0),
-        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        Some(tcr::manager::AccountStatus::Throttled),
         "the fixture starts held, or the assertion below is about nothing"
     );
 
@@ -3021,7 +3017,7 @@ async fn a_carried_success_clears_the_hold_a_carried_rejection_armed() {
             account_idx: 0,
             account: Some("alice@example.com".to_string()),
             session_key: None,
-            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: None,
             model: None,
             method: "POST".to_string(),
@@ -3036,7 +3032,7 @@ async fn a_carried_success_clears_the_hold_a_carried_rejection_armed() {
 
     assert_ne!(
         manager.account_status(0),
-        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        Some(tcr::manager::AccountStatus::Throttled),
         "a carried 200 is live proof the hold no longer binds, exactly as a direct one is"
     );
 }
@@ -3073,7 +3069,7 @@ async fn a_carried_401_on_a_token_only_account_marks_it_error() {
             account_idx: 0,
             account: Some("alice@example.com".to_string()),
             session_key: None,
-            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: None,
             model: None,
             method: "POST".to_string(),
@@ -3088,7 +3084,7 @@ async fn a_carried_401_on_a_token_only_account_marks_it_error() {
 
     assert_eq!(
         manager.account_status(0),
-        Some(teamclaude_rs::manager::AccountStatus::Error),
+        Some(tcr::manager::AccountStatus::Error),
         "a rejected credential with no refresh is dead whichever route the request left by"
     );
 }
@@ -3120,7 +3116,7 @@ async fn a_carried_transient_429_parks_for_what_the_direct_path_parks() {
             account_idx: 0,
             account: Some("alice@example.com".to_string()),
             session_key: None,
-            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            session_kind: tcr::stats::SessionKind::Stable,
             wire_session_id: None,
             model: None,
             method: "POST".to_string(),
@@ -3135,15 +3131,15 @@ async fn a_carried_transient_429_parks_for_what_the_direct_path_parks() {
 
     assert_eq!(
         manager.account_status(0),
-        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        Some(tcr::manager::AccountStatus::Throttled),
         "a 429 still holds the account: this is about how long, not whether"
     );
     assert!(
-        !manager.hold_expired(0, teamclaude_rs::now_ms() + 14_000),
+        !manager.hold_expired(0, tcr::now_ms() + 14_000),
         "and the hold is a real one: still running 14 seconds out"
     );
     assert!(
-        manager.hold_expired(0, teamclaude_rs::now_ms() + 25_000),
+        manager.hold_expired(0, tcr::now_ms() + 25_000),
         "a transient 429 with no guidance parks 15 to 20 seconds, the way the direct \
          path parks it, and not the fabricated minute"
     );
@@ -3179,8 +3175,7 @@ async fn a_carried_transient_429_parks_for_what_the_direct_path_parks() {
 async fn the_real_listener_hands_a_tunnel_to_the_production_handler() {
     let dir = scratch("real-listener-tunnel");
     let requester = node();
-    let gateway_key =
-        teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("the gateway's node key");
+    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("the gateway's node key");
 
     // A pinned requester holding the one carry grant, in a peers file written
     // by the one writer (0600, atomic).
@@ -3188,11 +3183,11 @@ async fn the_real_listener_hands_a_tunnel_to_the_production_handler() {
     let mut file = PeerFile::default();
     file.peers
         .push(row(&requester.id, "requester", Vec::new(), true));
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let listening = loopback().await;
     let gateway_addr = listening.local_addr().expect("the gateway address");
-    let store = teamclaude_rs::peer::config::PeerStore::open(&peers).expect("open the peers file");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the peers file");
     // The state file is inside the scratch dir and does not exist, so this test
     // reads nothing under the operator's cache directory and cannot be
     // perturbed by an operator with a pairing window open while the suite runs.
@@ -3273,18 +3268,17 @@ async fn the_real_listener_hands_a_tunnel_to_the_production_handler() {
 async fn a_tunnel_with_no_target_is_refused_by_the_real_listener() {
     let dir = scratch("real-listener-tunnel-no-target");
     let requester = node();
-    let gateway_key =
-        teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("the gateway's node key");
+    let gateway_key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("the gateway's node key");
 
     let peers = dir.join("tcr-peers.json");
     let mut file = PeerFile::default();
     file.peers
         .push(row(&requester.id, "requester", Vec::new(), true));
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let listening = loopback().await;
     let gateway_addr = listening.local_addr().expect("the gateway address");
-    let store = teamclaude_rs::peer::config::PeerStore::open(&peers).expect("open the peers file");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("open the peers file");
     let context =
         listener::SessionContext::new(&gateway_key, store.path(), &dir.join("peer-state.json"));
     tokio::spawn(async move {
@@ -3343,7 +3337,7 @@ async fn a_tunnel_with_no_target_is_refused_by_the_real_listener() {
 /// skipped it.
 fn pinned_account(peer: &PeerId, strict: bool) -> Account {
     Account {
-        egress: teamclaude_rs::config::Egress::Via(*peer),
+        egress: tcr::config::Egress::Via(*peer),
         egress_strict: strict,
         ..fake_account()
     }
@@ -3428,7 +3422,7 @@ fn attempt<'a>(
         body: bytes::Bytes::from_static(b"{\"model\":\"claude-opus-4-6\",\"messages\":[]}"),
         peers_path: peers,
         session_key: None,
-        session_kind: teamclaude_rs::stats::SessionKind::Fallback,
+        session_kind: tcr::stats::SessionKind::Fallback,
         wire_session_id: None,
         model: None,
         tool_uses: &[],
@@ -3551,7 +3545,7 @@ async fn a_pinned_request_leaves_through_its_peer_on_every_request() {
     // The requester's key is the one `pinned_egress` will mint in this scratch
     // directory, so the gateway has to pin THAT id rather than one the test
     // chose: minting it here first is what makes the two agree.
-    let requester = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir)
+    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
         .expect("mint this node's keypair in the scratch dir");
     let gateway = node();
 
@@ -3582,7 +3576,7 @@ async fn a_pinned_request_leaves_through_its_peer_on_every_request() {
         false,
     ));
     file.peers[0].allow.carry = true;
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let manager = fleet_with(
         &format!("https://{ORIGIN}"),
@@ -3636,7 +3630,7 @@ async fn a_down_peer_refuses_by_name_when_the_account_is_strict() {
         false,
     ));
     file.peers[0].allow.carry = true;
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let manager = fleet_with(
         &format!("https://{ORIGIN}"),
@@ -3701,7 +3695,7 @@ async fn a_down_peer_refuses_by_name_when_the_account_is_strict() {
 async fn a_carry_that_was_taken_and_failed_is_not_sent_again_from_this_mac() {
     let dir = scratch("pinned-delivered");
     let peers = dir.join("tcr-peers.json");
-    let requester = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir)
+    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
         .expect("mint this node's keypair in the scratch dir");
     let gateway = node();
 
@@ -3730,7 +3724,7 @@ async fn a_carry_that_was_taken_and_failed_is_not_sent_again_from_this_mac() {
         false,
     ));
     file.peers[0].allow.carry = true;
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let manager = fleet_with(
         &format!("https://{ORIGIN}"),
@@ -3786,7 +3780,7 @@ async fn a_down_peer_falls_back_to_this_mac_with_one_line_when_it_is_not_strict(
         false,
     ));
     file.peers[0].allow.carry = true;
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let (collector, _guard) = capture();
     let manager = fleet_with(
@@ -3874,10 +3868,7 @@ fn a_pin_that_is_neither_spelling_fails_the_config_load() {
     let peer = node().id;
     let good = serde_json::from_str::<Config>(&account(&format!("via {}", peer.to_wire())))
         .expect("the `via ` spelling is the one that loads");
-    assert_eq!(
-        good.accounts[0].egress,
-        teamclaude_rs::config::Egress::Via(peer)
-    );
+    assert_eq!(good.accounts[0].egress, tcr::config::Egress::Via(peer));
     assert!(
         !good.accounts[0].egress_strict,
         "an absent `egressStrict` is not strict"
@@ -3897,10 +3888,7 @@ fn an_account_round_trips_the_exit_lock_it_was_written_with() {
     let peer = node().id;
 
     let plain = fake_account();
-    assert_eq!(
-        plain.egress_pin(),
-        teamclaude_rs::config::EgressPin::default()
-    );
+    assert_eq!(plain.egress_pin(), tcr::config::EgressPin::default());
     assert!(plain.egress_pin().egress.is_local());
 
     let pinned = pinned_account(&peer, true);
@@ -3959,7 +3947,7 @@ fn an_unpinned_account_writes_no_egress_keys() {
     let back: Account = serde_json::from_str(&plain).expect("the keyless form reads back");
     assert_eq!(
         back.egress_pin(),
-        teamclaude_rs::config::EgressPin::default(),
+        tcr::config::EgressPin::default(),
         "and absent reads as the default it stood for, which is the whole of the round trip"
     );
 }
@@ -4032,7 +4020,7 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
 #[test]
 fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
     assert_eq!(
-        teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+        tcr::peer::egress::PEER_EGRESS_HOSTS,
         &["api.anthropic.com", "platform.claude.com"]
     );
     assert!(egress::host_allowed("api.anthropic.com", 443));
@@ -4058,7 +4046,7 @@ fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
 async fn codex_pinned_account_is_never_carried() {
     let dir = scratch("pinned-codex");
     let peers = dir.join("tcr-peers.json");
-    let requester = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir)
+    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
         .expect("mint this node's keypair in the scratch dir");
     let gateway = node();
 
@@ -4085,19 +4073,19 @@ async fn codex_pinned_account_is_never_carried() {
         false,
     ));
     file.peers[0].allow.carry = true;
-    teamclaude_rs::peer::config::save(&peers, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
 
     let (collector, _guard) = capture();
     for strict in [true, false] {
         let manager = fleet_with(
             &format!("https://{ORIGIN}"),
             vec![Account {
-                provider: teamclaude_rs::provider::Provider::Codex,
+                provider: tcr::provider::Provider::Codex,
                 ..pinned_account(&gateway.id, strict)
             }],
         );
         let answer = egress::pinned_egress(egress::PinnedAttempt {
-            path_and_query: teamclaude_rs::provider::CODEX_RESPONSES_PATH,
+            path_and_query: tcr::provider::CODEX_RESPONSES_PATH,
             ..attempt(&manager, &axum::http::Method::POST, &peers)
         })
         .await;

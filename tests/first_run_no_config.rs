@@ -1,5 +1,6 @@
 //! Proves first-run file creation through the offline accounts verb, and status
-//! output through an empty config on an isolated port.
+//! output through an empty config on an isolated port. Fresh installs use `~/.config/tcr.json`;
+//! an install that already has `~/.config/teamclaude.json` keeps using it.
 //!
 //! This is an end-to-end test of the BUILT BINARY rather than a unit test of
 //! `config::load_or_init`, because the defect it guards was never in the load
@@ -28,7 +29,12 @@ use std::process::Command;
 /// The config path the child will resolve from its own `HOME`
 /// (`config::default_path`).
 fn config_path_in(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join("teamclaude.json")
+    home.join(".config").join(tcr::paths::CONFIG_FILE)
+}
+
+/// The config an install from before the rename has.
+fn legacy_config_path_in(home: &std::path::Path) -> PathBuf {
+    home.join(".config").join(tcr::legacy_names::CONFIG_FILE)
 }
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
@@ -112,6 +118,33 @@ fn status_with_an_empty_config_exits_zero_offline() {
     );
 }
 
+/// An install from before the rename keeps its config where it is: the binary
+/// reads `teamclaude.json`, and creates no `tcr.json` beside it, which would
+/// silently take over on the next run with an empty account list.
+#[test]
+fn an_existing_legacy_config_is_used_in_place() {
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let legacy = legacy_config_path_in(home.path());
+    std::fs::create_dir_all(legacy.parent().expect("a parent")).expect("mkdir .config");
+    let body = r#"{"accounts":[{"name":"alice@example.com","accessToken":"at-fake"}]}"#;
+    std::fs::write(&legacy, body).expect("write the legacy config");
+
+    let (code, stdout, stderr) = run_tcr(home.path(), &["accounts"]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("alice@example.com"),
+        "the account in the legacy config must be listed: {stdout}"
+    );
+    assert!(
+        !stderr.contains("created"),
+        "an existing legacy config is not a first run: {stderr}"
+    );
+    assert!(
+        !config_path_in(home.path()).exists(),
+        "no new-name config may appear beside the legacy one"
+    );
+}
+
 /// `tcr accounts` is the offline half of the same first run: no port probe, so
 /// its empty table and its exit code are this tempdir's alone.
 #[test]
@@ -134,6 +167,14 @@ fn accounts_with_no_config_exits_zero_with_an_empty_table() {
     assert!(
         config_path_in(home.path()).exists(),
         "`tcr accounts` must create the config it could not find"
+    );
+    assert!(
+        stderr.contains("created") && stderr.contains(tcr::paths::CONFIG_FILE),
+        "creating the config must say so once, got: {stderr}"
+    );
+    assert!(
+        !legacy_config_path_in(home.path()).exists(),
+        "a fresh install gets only the new name"
     );
 }
 
@@ -210,7 +251,7 @@ fn normalize_home(text: &str, home: &std::path::Path) -> String {
 /// `CODEX_HOME`, and once with `CODEX_HOME` naming an empty folder.
 #[test]
 fn an_empty_fleet_without_a_codex_login_prints_todays_lines() {
-    const STDERR: &str = "[tcr] created <home>/.config/teamclaude.json with no accounts\n\
+    const STDERR: &str = "[tcr] created <home>/.config/tcr.json with no accounts\n\
                           no accounts configured — run `tcr login` to add one\n";
 
     let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
@@ -263,7 +304,7 @@ fn a_codex_login_on_disk_adds_one_hint_line() {
     assert_eq!(stdout, "no accounts configured\n");
     assert_eq!(
         normalize_home(&stderr, home.path()),
-        "[tcr] created <home>/.config/teamclaude.json with no accounts\n\
+        "[tcr] created <home>/.config/tcr.json with no accounts\n\
          no accounts configured — run `tcr login` to add one\n\
          [tcr] found a codex login at <home>/.codex/auth.json: `tcr login --codex` adds a Codex \
          account of tcr's own, and `tcr login --from-codex` imports that one with guarded \

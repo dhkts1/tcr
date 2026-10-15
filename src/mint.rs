@@ -785,7 +785,7 @@ mod tests {
         // carries the version every Codex row is written at, so the load stamps
         // nothing either.
         let dir = tempfile::tempdir().expect("a temp dir");
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             serde_json::json!({

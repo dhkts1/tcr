@@ -13,11 +13,11 @@
 //! `127.0.0.1:3456`. Every state file is a fresh temp file this test writes
 //! and cleans up itself.
 
+use tcr::peer::ask::{self, Ask};
+use tcr::peer::noise;
+use tcr::peer::pair::{self, JoinToken};
+use tcr::peer::state::{self, PeerState, PendingAsk};
 use tcr_peer_wire::PeerId;
-use teamclaude_rs::peer::ask::{self, Ask};
-use teamclaude_rs::peer::noise;
-use teamclaude_rs::peer::pair::{self, JoinToken};
-use teamclaude_rs::peer::state::{self, PeerState, PendingAsk};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(

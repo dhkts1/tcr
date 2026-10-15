@@ -3,7 +3,7 @@ Buffer {
     area: Rect { x: 0, y: 0, width: 174, height: 40 },
     content: [
         "FLEET 1/8 eligible                                                                                                                                                            ",
-        "┌ teamclaude-rs · accounts (8) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐",
+        "┌ tcr · accounts (8) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐",
         "│Account            Pri Status    Gate            Probe       5h                     7d                          Fable           Reqs   In       Cache   Out      Last   Err │",
         "│▶ alice@example.co 0   active    OK              ok 12m      [####····]  47%  2h39m [##······]  20%     4d      [#####···]  62% 1200   4.2M     93%     310.0k   3m     -   │",
         "│  frank@example.co 0   active    7D 3d           busy 2m     [#·······]  10%  4h10m [########]  96%     3d near [········]   —  2100   0        -       0        —      2   │",
@@ -127,7 +127,7 @@ Buffer {
     area: Rect { x: 0, y: 0, width: 110, height: 40 },
     content: [
         "FLEET 1/8 eligible                                                                                            ",
-        "┌ teamclaude-rs · accounts (8) ──────────────────────────────────────────────────────────────────────────────┐",
+        "┌ tcr · accounts (8) ────────────────────────────────────────────────────────────────────────────────────────┐",
         "│Account            Pri Status    Gate            5h   7d        Fable Reqs   In       Out      Last         │",
         "│▶ alice@example.co 0   active    OK               47%  20%       62%  1200   4.2M     310.0k   3m           │",
         "│  frank@example.co 0   active    7D 3d            10%  96% near —     2100   0        0        —            │",
@@ -237,7 +237,7 @@ Buffer {
     area: Rect { x: 0, y: 0, width: 110, height: 40 },
     content: [
         "FLEET 0/8 eligible · next free alice@example.com in 47m                                                       ",
-        "┌ teamclaude-rs · accounts (8) ──────────────────────────────────────────────────────────────────────────────┐",
+        "┌ tcr · accounts (8) ────────────────────────────────────────────────────────────────────────────────────────┐",
         "│Account            Pri Status    Gate            5h   7d        Fable Reqs   In       Out      Last         │",
         "│▶ alice@example.co 0   active    5H 47m           47%  20%       62%  1200   4.2M     310.0k   3m           │",
         "│  frank@example.co 0   active    7D 3d            10%  96% near —     2100   0        0        —            │",
@@ -347,7 +347,7 @@ Buffer {
     area: Rect { x: 0, y: 0, width: 110, height: 40 },
     content: [
         "FLEET 0/0 eligible · next free unknown                                                                        ",
-        "┌ teamclaude-rs · accounts (0) ──────────────────────────────────────────────────────────────────────────────┐",
+        "┌ tcr · accounts (0) ────────────────────────────────────────────────────────────────────────────────────────┐",
         "│Account            Pri Status    Gate            5h   7d        Fable Reqs   In       Out      Last         │",
         "│                                                                                                            │",
         "└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘",

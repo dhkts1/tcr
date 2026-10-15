@@ -1,4 +1,4 @@
-//! Runtime state: `teamclaude/peer-state.json` in the cache directory.
+//! Runtime state: `peer-state.json` in the cache directory.
 //!
 //! Operator INTENT lives in `tcr-peers.json` in the config directory
 //! ([`crate::peer::config`]); what the process learned lives here. The split is
@@ -30,22 +30,13 @@ use tcr_peer_wire::{InstanceId, Lease, PeerId};
 /// bump it.
 pub const FORMAT_VERSION: u32 = 1;
 
-/// `teamclaude/peer-state.json` in the cache directory, mode 0600.
+/// `peer-state.json` in the cache directory, mode 0600.
 ///
-/// Same base-dir resolution as [`crate::affinity::default_path`]
-/// (`$XDG_CACHE_HOME`, else `$HOME/.cache`), and the same `teamclaude`
-/// directory, a second cache dir would be a second thing to prune.
+/// The same directory as [`crate::affinity::default_path`]
+/// ([`crate::paths::cache_dir`]): a second cache dir would be a second thing
+/// to prune.
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("teamclaude").join("peer-state.json")
+    crate::paths::cache_dir().peer_state_file()
 }
 
 /// What survives a restart.

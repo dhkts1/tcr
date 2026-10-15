@@ -855,20 +855,13 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// `~/.cache/teamclaude/usage/` (or `$XDG_CACHE_HOME/teamclaude/usage/`) — a
-/// cache dir for the same reason the pin file is one: regenerable-ish state
-/// written at high frequency has no business next to live OAuth credentials.
+/// `usage/` in the cache directory ([`crate::paths::cache_dir`]:
+/// `~/.cache/tcr/`, or `~/.cache/teamclaude/` on an install that has only
+/// that one) — a cache dir for the same reason the pin file is one:
+/// regenerable-ish state written at high frequency has no business next to
+/// live OAuth credentials.
 pub fn default_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("teamclaude").join("usage")
+    crate::paths::cache_dir().usage_dir()
 }
 
 /// What a boot-time replay found. Reported so the operator can tell "the ledger

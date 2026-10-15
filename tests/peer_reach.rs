@@ -3,7 +3,7 @@
 //! Every test here runs against loopback or against a pure function. Nothing
 //! reaches a real router, and nothing touches the running proxy: the NAT-PMP
 //! tests stand a fake gateway on `127.0.0.1:0` and point the client at it, which
-//! is the whole reason [`teamclaude_rs::peer::reach::NatPmp::at`] takes an
+//! is the whole reason [`tcr::peer::reach::NatPmp::at`] takes an
 //! address instead of always finding its own.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use teamclaude_rs::peer::noise;
-use teamclaude_rs::peer::reach::{
+use tcr::peer::noise;
+use tcr::peer::reach::{
     self, MapProtocol, NatPmp, ReachError, ResultCode, GATEWAY_PORT, TRIES, VERSION,
 };
 
@@ -715,14 +715,13 @@ fn peer_reach_reports_the_mapping_a_serving_process_holds() {
 
     // Recorded the way a keeper records one, through the library's own writer,
     // so the file gets the 0600 the reader needs and the key the reader reads.
-    let live = teamclaude_rs::peer::state::MappingRecord {
+    let live = tcr::peer::state::MappingRecord {
         external_address: Some("203.0.113.9:41235".to_string()),
         external_port: 41235,
         internal_port: 41235,
-        expires_at_ms: teamclaude_rs::now_ms() + 120_000,
+        expires_at_ms: tcr::now_ms() + 120_000,
     };
-    teamclaude_rs::peer::state::save_mapping(&state, Some(live.clone()))
-        .expect("the record writes");
+    tcr::peer::state::save_mapping(&state, Some(live.clone())).expect("the record writes");
 
     let (out, err, ok) = run_reach(&peers, &["--json"]);
     assert!(ok, "tcr peer reach exited non-zero: {err}");
@@ -745,10 +744,10 @@ fn peer_reach_reports_the_mapping_a_serving_process_holds() {
     );
 
     // The stale case: a keeper that died without deleting its mapping.
-    teamclaude_rs::peer::state::save_mapping(
+    tcr::peer::state::save_mapping(
         &state,
-        Some(teamclaude_rs::peer::state::MappingRecord {
-            expires_at_ms: teamclaude_rs::now_ms() - 1,
+        Some(tcr::peer::state::MappingRecord {
+            expires_at_ms: tcr::now_ms() - 1,
             ..live
         }),
     )
@@ -806,12 +805,12 @@ fn the_address_a_peer_sees_this_mac_at_survives_a_restart() {
 
     // What a completed session does, through its one writer.
     assert!(
-        teamclaude_rs::peer::config::observe_seen_address(&peers, &peer, seen, 1_700_000_000_000)
+        tcr::peer::config::observe_seen_address(&peers, &peer, seen, 1_700_000_000_000)
             .expect("the row takes the address"),
         "the first observation is a write"
     );
     assert!(
-        !teamclaude_rs::peer::config::observe_seen_address(&peers, &peer, seen, 1_700_000_001_000)
+        !tcr::peer::config::observe_seen_address(&peers, &peer, seen, 1_700_000_001_000)
             .expect("the row is read again"),
         "and the same address twice is not a second write, or every session in a boot \
          rewrites this file"
@@ -1154,10 +1153,10 @@ fn internet_off_writes_the_flag_and_leaves_no_mapping() {
 
 use std::path::Path;
 
-use teamclaude_rs::peer::config::{self as peer_config, PeerFile};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, InternetAdmission, SessionContext};
-use teamclaude_rs::peer::noise::Handshake;
+use tcr::peer::config::{self as peer_config, PeerFile};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, InternetAdmission, SessionContext};
+use tcr::peer::noise::Handshake;
 
 /// One Mac's files: a peers file, a state file beside it, a node key.
 struct GateNode {
@@ -1650,7 +1649,7 @@ async fn a_dead_recorded_port_falls_through_to_the_pairs_rendezvous_port() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -1692,7 +1691,7 @@ async fn one_slot_of_skew_still_meets() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -1730,7 +1729,7 @@ async fn with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried(
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 900)
+    let reached = tcr::peer::serve::dial_peer_within(&row, 900)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -1820,8 +1819,7 @@ async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
 
     let deadline_ms: u64 = 10_000;
     let start = Instant::now();
-    let reached =
-        teamclaude_rs::peer::serve::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
+    let reached = tcr::peer::serve::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -1881,7 +1879,7 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
         peer_config::EndpointSource::Paired,
     ));
 
-    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
     assert_eq!(
@@ -1895,7 +1893,7 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
         .expect("the accept task")
         .expect("the listener accepted the dial");
 
-    let order = teamclaude_rs::peer::serve::dial_order(&row);
+    let order = tcr::peer::serve::dial_order(&row);
     let remaining: Vec<SocketAddr> = order
         .iter()
         .filter_map(peer_config::Endpoint::direct_addr)
@@ -1948,7 +1946,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
         peer_config::EndpointSource::Paired,
     ));
 
-    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
     assert!(
@@ -1956,7 +1954,7 @@ async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_u
         "one of the two live listeners must answer the race: {reached:?}"
     );
 
-    let order = teamclaude_rs::peer::serve::dial_order(&row);
+    let order = tcr::peer::serve::dial_order(&row);
     let remaining: Vec<SocketAddr> = order
         .iter()
         .filter_map(peer_config::Endpoint::direct_addr)
@@ -2055,7 +2053,7 @@ fn peer_internet_on_then_off_moves_the_flag_in_the_peers_file() {
 /// without writing: the restore counts 0 and the dial reaches `None`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
-    use teamclaude_rs::peer::config;
+    use tcr::peer::config;
 
     let node = tcr_peer_wire::PeerId([0x44; 32]);
     // Stands in for a completed handshake: the value never leaves this test,
@@ -2131,7 +2129,7 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
 
     let dead = a_closed_loopback_port().await;
     let row = row_at(node, dead);
-    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+    let reached = tcr::peer::serve::dial_peer_within(&row, 3_000)
         .await
         .map(|(addr, _stream)| addr);
 
@@ -2168,7 +2166,7 @@ async fn a_restart_reaches_a_peer_on_the_derived_port_from_the_peers_file() {
 /// the first assertion still reads the secret after the peer is forgotten.
 #[test]
 fn forgetting_a_peer_clears_its_rendezvous_secret() {
-    use teamclaude_rs::peer::config;
+    use tcr::peer::config;
 
     let node = tcr_peer_wire::PeerId([0x66; 32]);
     let secret = reach::port_secret(&[0x1d_u8; 48]);
@@ -2205,7 +2203,7 @@ fn forgetting_a_peer_clears_its_rendezvous_secret() {
 
     let store = config::PeerStore::open(&peers).expect("open the peers file");
     assert!(
-        teamclaude_rs::peer::pair::forget(&store, &node).expect("the forget runs"),
+        tcr::peer::pair::forget(&store, &node).expect("the forget runs"),
         "the row was there to remove"
     );
 
@@ -2235,7 +2233,7 @@ fn forgetting_a_peer_clears_its_rendezvous_secret() {
 /// knows.
 #[test]
 fn a_hello_carries_the_address_this_node_saw_the_peer_from() {
-    use teamclaude_rs::peer::listener::{hello_for_peer, NodeFacts};
+    use tcr::peer::listener::{hello_for_peer, NodeFacts};
 
     let node = tcr_peer_wire::PeerId([0x71; 32]);
     let seen: SocketAddr = "203.0.113.7:51820".parse().expect("a test address parses");
@@ -2255,7 +2253,7 @@ fn a_hello_carries_the_address_this_node_saw_the_peer_from() {
 /// reader has to decide the meaning of.
 #[test]
 fn a_hello_from_a_node_that_saw_no_address_carries_no_field() {
-    use teamclaude_rs::peer::listener::{hello_for_peer, NodeFacts};
+    use tcr::peer::listener::{hello_for_peer, NodeFacts};
 
     let hello = hello_for_peer(
         &NodeFacts::minimal(tcr_peer_wire::PeerId([0x72; 32])),
@@ -2429,10 +2427,10 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
     // have to reach through another Mac) still refuses with the same
     // variant: the new source is the row's own DIRECT locators, not the row
     // itself.
-    let via_only = [teamclaude_rs::peer::config::Endpoint::via(
+    let via_only = [tcr::peer::config::Endpoint::via(
         tcr_peer_wire::PeerId([0x76; 32]),
         1_000,
-        teamclaude_rs::peer::config::EndpointSource::Brief,
+        tcr::peer::config::EndpointSource::Brief,
     )];
     assert_eq!(
         reach::punch_target(&node, &via_only),
@@ -2475,7 +2473,7 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
 /// observation register has nothing.
 ///
 /// The register is never persisted, so it is empty for every peer after any
-/// restart, move or no move ([`teamclaude_rs::peer::reach::observed_peer_for`]'s
+/// restart, move or no move ([`tcr::peer::reach::observed_peer_for`]'s
 /// own doc). The row may already hold that peer's current public address from
 /// a moved link, and only the IP matters here because the port comes from the
 /// pair's own slot derivation.
@@ -2483,10 +2481,10 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
 fn aim_off_the_row() {
     let node = tcr_peer_wire::PeerId([0x77; 32]);
     let moved: std::net::SocketAddr = "198.51.100.7:7755".parse().expect("a test address parses");
-    let endpoints = [teamclaude_rs::peer::config::Endpoint::direct(
+    let endpoints = [tcr::peer::config::Endpoint::direct(
         moved,
         2_000,
-        teamclaude_rs::peer::config::EndpointSource::Moved,
+        tcr::peer::config::EndpointSource::Moved,
     )];
 
     reach::remember_port_secret(node, [0x5d; 32]);
@@ -2642,22 +2640,22 @@ fn a_keeper_whose_internet_flag_goes_off_deletes_its_mapping_and_stops() {
     });
     let dir = tempfile::tempdir().expect("a temp profile directory");
     let peers_path = dir.path().join("tcr-peers.json");
-    let on = teamclaude_rs::peer::config::PeerFile {
+    let on = tcr::peer::config::PeerFile {
         internet: true,
-        ..teamclaude_rs::peer::config::PeerFile::default()
+        ..tcr::peer::config::PeerFile::default()
     };
-    teamclaude_rs::peer::config::save(&peers_path, &on).expect("the peers file writes");
+    tcr::peer::config::save(&peers_path, &on).expect("the peers file writes");
 
     // The switch goes off in another thread, exactly as the CLI does it: a
     // write to the file, and nothing that can reach this loop directly.
     let flipping = peers_path.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
-        let off = teamclaude_rs::peer::config::PeerFile {
+        let off = tcr::peer::config::PeerFile {
             internet: false,
-            ..teamclaude_rs::peer::config::PeerFile::default()
+            ..tcr::peer::config::PeerFile::default()
         };
-        teamclaude_rs::peer::config::save(&flipping, &off).expect("the peers file writes");
+        tcr::peer::config::save(&flipping, &off).expect("the peers file writes");
     });
 
     // The watchdog, so a keeper that ignores the flag ends the test instead of
@@ -2812,7 +2810,7 @@ fn the_internet_switch_decides_start_renew_stop_and_idle() {
 /// it decides here is only that this listener is not on loopback.
 #[tokio::test]
 async fn the_internet_switch_starts_a_keeper_again_on_a_running_server() {
-    use teamclaude_rs::peer::config::{save, PeerFile};
+    use tcr::peer::config::{save, PeerFile};
 
     let dir = tempfile::tempdir().expect("a temp profile directory");
     let peers_path = dir.path().join("tcr-peers.json");
@@ -3011,7 +3009,7 @@ impl CaptureLayer {
 #[test]
 fn a_router_that_refuses_is_asked_once_and_then_left_alone() {
     use std::sync::atomic::AtomicUsize;
-    use teamclaude_rs::peer::config::{save, PeerFile};
+    use tcr::peer::config::{save, PeerFile};
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let dir = tempfile::tempdir().expect("a temp profile directory");
@@ -3400,7 +3398,7 @@ fn the_same_answer_from_one_router_is_said_once() {
 /// parked**, with no router and no friend.
 #[test]
 fn the_reverse_carry_decision_parks_releases_or_does_nothing() {
-    use teamclaude_rs::peer::tunnel::{reverse_step, ReverseNeed, ReverseNotWanted, ReverseStep};
+    use tcr::peer::tunnel::{reverse_step, ReverseNeed, ReverseNotWanted, ReverseStep};
 
     let dialable = ReverseNeed::NotWanted(ReverseNotWanted::HoldsMapping);
     assert_eq!(reverse_step(ReverseNeed::Wanted, false), ReverseStep::Park);
@@ -3427,7 +3425,7 @@ fn the_reverse_carry_decision_parks_releases_or_does_nothing() {
 /// loop instead of on every wake, and the carriers are never released.
 #[tokio::test]
 async fn reverse_carriers_are_released_when_the_router_answers_late() {
-    use teamclaude_rs::peer::tunnel;
+    use tcr::peer::tunnel;
 
     let fake = FakeGateway::start(Behaviour::SlowCooperative {
         external_port: 41_235,

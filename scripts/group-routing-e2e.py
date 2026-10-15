@@ -17,7 +17,7 @@ LOG = os.path.expanduser("~/.cache/teamclaude/logs/teamclaude-rs.log.%s"
                          % time.strftime("%Y-%m-%d"))
 CA = os.path.expanduser("~/.config/tcr-ca.pem")
 PROXY = os.environ.get("HTTPS_PROXY") or "http://127.0.0.1:3456"
-USAGE = re.compile(r'^(\S+)Z\s+INFO teamclaude_rs::proxy: request usage '
+USAGE = re.compile(r'^(\S+)Z\s+INFO (?:tcr|teamclaude_rs)::proxy: request usage '
                    r'account="([^"]+)" session=Some\((\d+)\)')
 
 def known_keys():

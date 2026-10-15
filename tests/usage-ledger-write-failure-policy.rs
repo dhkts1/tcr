@@ -26,8 +26,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
-use teamclaude_rs::pricing::PricingTable;
-use teamclaude_rs::usage::{LedgerAccount, UsageRecord, UsageTracker};
+use tcr::pricing::PricingTable;
+use tcr::usage::{LedgerAccount, UsageRecord, UsageTracker};
 use tracing_subscriber::layer::SubscriberExt;
 
 /// One captured event: its formatted message and every field tracing handed
@@ -141,7 +141,7 @@ fn write_failure_warns_once_per_transition_and_never_touches_the_drop_count() {
 
     {
         let tracker = UsageTracker::new(1, PricingTable::default());
-        let now = teamclaude_rs::now_ms();
+        let now = tcr::now_ms();
         let names = vec![LedgerAccount {
             name: "alice@example.com".to_string(),
             ..LedgerAccount::default()

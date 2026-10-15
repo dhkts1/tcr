@@ -363,7 +363,7 @@ public struct PeerLendGrant: Decodable, Equatable, Identifiable, Sendable {
     /// The wire's own lease id, which is what `--revoke` and `--relend` take.
     ///
     /// **The wire key is `id`, never `leaseId`.**
-    /// [`teamclaude_rs::peer::config::LendGrant::id`] is a `u128` rendered as
+    /// [`tcr::peer::config::LendGrant::id`] is a `u128` rendered as
     /// lower-case hex under the struct's own `camelCase` rename, which leaves
     /// the field NAME `id` untouched (there is no second word to case-convert).
     /// Decoding `leaseId` here silently read every real grant's id as the

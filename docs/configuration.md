@@ -1,7 +1,13 @@
 # Configuration reference
 
-Everything `tcr` reads out of `~/.config/teamclaude.json`, with the real default for each
-key. Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
+Everything `tcr` reads out of its config file, with the real default for each key. The file
+is `~/.config/tcr.json`, or `~/.config/teamclaude.json` on an install that has only that one.
+Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
+
+Cache paths below use `~/.cache/tcr/`. When only the older `~/.cache/teamclaude/` directory
+exists, tcr keeps using it; when both exist, `tcr/` wins. `XDG_CACHE_HOME` replaces `~/.cache`
+when set. The usage ledger, session snapshots, peer state and logs follow the same directory;
+nothing is moved or copied.
 
 Every default here was derived from the Rust source, not from a live config file. If you
 want to check one, start from `src/config.rs`.
@@ -90,7 +96,7 @@ write premium. Each can be set explicitly:
 An override beats the built-in table outright, even when its key is the shorter prefix: a price you
 wrote down is what this proxy should believe.
 
-`usageRetentionDays` bounds the ledger under `~/.cache/teamclaude/usage/`, one `<UTC-date>.jsonl` file
+`usageRetentionDays` bounds the ledger under `~/.cache/tcr/usage/`, one `<UTC-date>.jsonl` file
 per day at roughly 2 MB per 17k requests. Files older than this are deleted once, at boot. Boot reads
 back today's and yesterday's files (that is what makes a restart keep the day's totals), and, when the
 fleet holds a Codex account, the six before them too, which is what keeps a Codex account's weekly
@@ -770,7 +776,7 @@ repo write their own temporary configs with obviously fake values; do the same.
 
 A second file, `tcr-peers.json` in the operator's config directory, mode `0600`, holds everything about the LAN peer
 mesh: who this Mac trusts, what each trusted Mac may do, and the office network key. It is
-never merged into `teamclaude.json` above; a walkthrough of what the mesh does is in
+never merged into the main account config above; a walkthrough of what the mesh does is in
 [peers.md](peers.md), and this section is the file's key reference, read from
 `src/peer/config.rs`.
 
@@ -804,7 +810,7 @@ cache.
 | `deadDrop.store.kind` | `"https"` \| `"gist"` | | boot-time | which surface |
 | `deadDrop.store.url` | string | | boot-time | `https` only: a template containing `{name}`, used for both the write and the read |
 | `deadDrop.store.gistId` | string | | boot-time | `gist` only |
-| `deadDrop.store.token` | string | absent | boot-time | bearer token for the surface. **Held in the clear in this file, mode 0600**, the same as `networkKey` and every `rendezvousSecret`; it goes here and never in `teamclaude.json`, because this is the file whose mode is checked on read |
+| `deadDrop.store.token` | string | absent | boot-time | bearer token for the surface. **Held in the clear in this file, mode 0600**, the same as `networkKey` and every `rendezvousSecret`; it goes here and never in the main account config, because this is the file whose mode is checked on read |
 | `deadDrop.slotSeconds` | int | `3600` | boot-time | how long one drop name is valid. Both Macs must agree: a mismatch means they never meet |
 
 ### One entry in `peers[]`
@@ -878,7 +884,7 @@ replacing the ones already granted:
 
 ### File permissions
 
-Same rule as `teamclaude.json`: mode `0600`, enforced before any bytes are written and
+Same rule as the main account config: mode `0600`, enforced before any bytes are written and
 re-checked afterward. `tcr` refuses to trust a peers file it finds in any other mode rather
 than silently loosening it. Never commit this file for the same reason as the main config:
 `node`, `networkKey` and an outstanding invite's `secret` are all live cryptographic material.

@@ -1,6 +1,6 @@
-//! teamclaude-rs — a lean single-user rotating Anthropic proxy.
+//! tcr (Team Capacity Router) — a lean single-user rotating Anthropic proxy.
 //!
-//! A drop-in replacement for the personal teamclaude proxy: it reads the same
+//! A drop-in replacement for the JS teamclaude proxy: it reads the same
 //! `~/.config/teamclaude.json`, rotates across the configured OAuth accounts as
 //! their quota fills, refreshes tokens on expiry, streams requests to Anthropic
 //! unchanged, and surfaces a live TUI. See `DESIGN.md` for the full contract.
@@ -37,11 +37,13 @@ pub mod fallback;
 #[cfg(unix)]
 pub mod handoff;
 pub mod identity;
+pub mod legacy_names;
 pub mod manager;
 pub mod mint;
 pub mod mitm;
 pub mod model;
 pub mod oauth;
+pub mod paths;
 pub mod peer;
 pub mod pricing;
 pub mod probe;

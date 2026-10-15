@@ -2,10 +2,10 @@
 //! reader that reads it.
 //!
 //! Nothing here reaches a real router and nothing multicasts on a real
-//! interface: [`teamclaude_rs::peer::reach_upnp::Discoverer::at`] takes a
+//! interface: [`tcr::peer::reach_upnp::Discoverer::at`] takes a
 //! destination, so every test here points it at a fake SSDP responder bound
 //! to `127.0.0.1:0`, exactly as `tests/peer_reach.rs` points
-//! [`teamclaude_rs::peer::reach::NatPmp::at`] at a fake NAT-PMP gateway.
+//! [`tcr::peer::reach::NatPmp::at`] at a fake NAT-PMP gateway.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +18,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use proptest::prelude::*;
 
-use teamclaude_rs::peer::reach::MapProtocol;
-use teamclaude_rs::peer::reach_upnp::{
+use tcr::peer::reach::MapProtocol;
+use tcr::peer::reach_upnp::{
     self, DiscoveredGateway, Discoverer, LocationPolicy, UpnpClient, UpnpError, MX_SECONDS,
     SERVICE_TYPES,
 };
@@ -877,7 +877,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 /// Serialize the tests that read or write the process-wide register
-/// [`teamclaude_rs::peer::reach::external_socket`] reports from.
+/// [`tcr::peer::reach::external_socket`] reports from.
 ///
 /// That register is one value per PROCESS, on purpose (its own doc says why:
 /// the keeper thread and `Hello.addrs` are three call sites apart with no
@@ -925,7 +925,7 @@ fn silent_natpmp() -> (SocketAddr, UdpSocket) {
 /// UPnP anything.
 #[test]
 fn natpmp_silence_falls_through_to_upnp_and_maps() {
-    use teamclaude_rs::peer::reach::{MappingKeeper, MappingStep, NatPmp};
+    use tcr::peer::reach::{MappingKeeper, MappingStep, NatPmp};
 
     // `map_over_upnp` publishes to the process-wide register, which a sibling
     // test asserts on.
@@ -993,7 +993,7 @@ fn refusing_natpmp() -> SocketAddr {
 /// asks UPnP anything.
 #[test]
 fn a_refused_natpmp_probe_falls_through_to_upnp_and_maps() {
-    use teamclaude_rs::peer::reach::{MappingKeeper, MappingStep, NatPmp};
+    use tcr::peer::reach::{MappingKeeper, MappingStep, NatPmp};
 
     // `map_over_upnp` publishes to the process-wide register, which a sibling
     // test asserts on.
@@ -1046,7 +1046,7 @@ fn a_refused_natpmp_probe_falls_through_to_upnp_and_maps() {
 /// the keeper reports a mapping that nothing granted.
 #[test]
 fn both_protocols_silent_is_a_named_refusal_and_not_a_mapping() {
-    use teamclaude_rs::peer::reach::{MappingKeeper, NatPmp};
+    use tcr::peer::reach::{MappingKeeper, NatPmp};
 
     let (silent_pmp, _keep_pmp) = silent_natpmp();
     let (silent_upnp, _keep_upnp) = silent_natpmp();
@@ -1063,10 +1063,7 @@ fn both_protocols_silent_is_a_named_refusal_and_not_a_mapping() {
         keeper.steps()
     );
     assert!(
-        matches!(
-            refusal,
-            teamclaude_rs::peer::reach::ReachError::Silent { .. }
-        ),
+        matches!(refusal, tcr::peer::reach::ReachError::Silent { .. }),
         "both protocols silent is a SILENCE and not an unreadable answer: it is the one \
          outcome an operator fixes by looking at the router rather than at this Mac, and \
          `tcr peer reach` reads this variant to print \"router did not answer\": \
@@ -1103,7 +1100,7 @@ fn both_protocols_silent_is_a_named_refusal_and_not_a_mapping() {
 #[test]
 fn a_upnp_mapping_is_published_renewed_and_deleted_over_upnp() {
     use std::sync::atomic::AtomicBool;
-    use teamclaude_rs::peer::reach::{self, MappingStep, NatPmp};
+    use tcr::peer::reach::{self, MappingStep, NatPmp};
 
     // The published address is asserted below, so no sibling test may be
     // publishing to the same register while this one runs.

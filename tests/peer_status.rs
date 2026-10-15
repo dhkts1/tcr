@@ -16,10 +16,10 @@
 
 use std::path::Path;
 
+use tcr::peer::config::{PeerFile, PeerRow, PeerStore};
+use tcr::peer::state::{BorrowedRow, LeaseRow, PeerState};
+use tcr::status::{peer_status_rows, PathKind, PeerStatusRow};
 use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
-use teamclaude_rs::peer::config::{PeerFile, PeerRow, PeerStore};
-use teamclaude_rs::peer::state::{BorrowedRow, LeaseRow, PeerState};
-use teamclaude_rs::status::{peer_status_rows, PathKind, PeerStatusRow};
 
 /// Five minutes of milliseconds, the unit almost every fixture below counts in.
 const FIVE_MINUTES_MS: i64 = 5 * 60 * 1_000;
@@ -36,7 +36,7 @@ fn write_peers(path: &Path, rows: Vec<PeerRow>) -> Vec<PeerRow> {
         peers: rows,
         ..PeerFile::default()
     };
-    teamclaude_rs::peer::config::save(path, &file).expect("the peers file writes");
+    tcr::peer::config::save(path, &file).expect("the peers file writes");
     let store = PeerStore::open(path).expect("the peers file opens");
     store.peers()
 }
@@ -47,7 +47,7 @@ fn write_peers(path: &Path, rows: Vec<PeerRow>) -> Vec<PeerRow> {
 /// each address becomes a `Direct` locator observed at the row's own
 /// `added_at`, with source `Paired`, which is what a pin writes.
 fn row(byte: u8, label: &str, addrs: &[&str]) -> PeerRow {
-    use teamclaude_rs::peer::config::{Endpoint, EndpointSource};
+    use tcr::peer::config::{Endpoint, EndpointSource};
 
     PeerRow {
         node: node(byte),
@@ -152,7 +152,7 @@ fn the_row_speaks_the_panels_vocabulary_and_omits_what_it_cannot_measure() {
     assert_eq!(object.get("serves").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
         object.get("byteCapPerHour").and_then(|v| v.as_u64()),
-        Some(teamclaude_rs::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR),
+        Some(tcr::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR),
         "a row this Mac carries for names the ceiling it is measured against: {wire}"
     );
 
@@ -453,10 +453,10 @@ fn a_row_with_no_lease_names_no_end_and_is_not_ended() {
 #[test]
 fn a_payload_from_a_server_with_no_peers_block_still_parses() {
     let old = serde_json::json!({
-        "kind": teamclaude_rs::status::STATUS_KIND,
+        "kind": tcr::status::STATUS_KIND,
         "accounts": [],
     });
-    let payload: teamclaude_rs::status::StatusPayload =
+    let payload: tcr::status::StatusPayload =
         serde_json::from_value(old).expect("an old server's payload still parses");
     assert!(
         payload.peers.is_empty(),
@@ -464,7 +464,7 @@ fn a_payload_from_a_server_with_no_peers_block_still_parses() {
     );
     assert_eq!(
         payload.kind,
-        teamclaude_rs::status::STATUS_KIND,
+        tcr::status::STATUS_KIND,
         "and the block must NOT have bumped the kind: an old client rejecting \
          the payload would render the structural zeros this endpoint ended"
     );
@@ -485,13 +485,12 @@ fn the_peers_block_round_trips_through_the_status_payload() {
 
     let derived = peer_status_rows(&rows, &state, now_ms);
     let payload = serde_json::json!({
-        "kind": teamclaude_rs::status::STATUS_KIND,
+        "kind": tcr::status::STATUS_KIND,
         "accounts": [],
         "peers": derived,
     });
     let text = serde_json::to_string(&payload).expect("the payload serializes");
-    let back: teamclaude_rs::status::StatusPayload =
-        serde_json::from_str(&text).expect("and parses back");
+    let back: tcr::status::StatusPayload = serde_json::from_str(&text).expect("and parses back");
     assert_eq!(back.peers.len(), 1);
     assert_eq!(
         serde_json::to_value(&back.peers).expect("re-serializes"),
@@ -595,7 +594,7 @@ fn peers_fixture_rows() -> Vec<PeerStatusRow> {
         ended: false,
         lend: Vec::new(),
         paths: vec![
-            teamclaude_rs::status::PathStatus {
+            tcr::status::PathStatus {
                 endpoint: "127.0.0.1:7751".to_string(),
                 kind: PathKind::Direct,
                 rtt_ms: Some(18.5),
@@ -604,7 +603,7 @@ fn peers_fixture_rows() -> Vec<PeerStatusRow> {
                 tokens_per_hour: Some(90_000),
                 last_ok_ms: Some(now_ms - 2_000),
             },
-            teamclaude_rs::status::PathStatus {
+            tcr::status::PathStatus {
                 // The wire id, not `display()`: `PeerStatusRow::id` is the
                 // wire form and the panel resolves a via/reverse endpoint's
                 // name by looking `PathStatus::endpoint` up in that map.
@@ -724,7 +723,7 @@ fn the_committed_peers_fixture_covers_the_absent_and_the_measured_row() {
 // validator that only ever sees a valid document proves nothing about what it
 // would catch, which is the whole defect the peers block existed to fix.
 
-use teamclaude_rs::status::{peer_graph, PeerGraph, PEER_GRAPH_KIND};
+use tcr::status::{peer_graph, PeerGraph, PEER_GRAPH_KIND};
 
 /// What a JSON value is allowed to be, in the schema below.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -995,12 +994,7 @@ fn a_lease_edge_points_from_the_lender_to_the_borrower() {
     let lent: Vec<(&str, &str)> = graph
         .edges
         .iter()
-        .filter(|edge| {
-            matches!(
-                edge.detail,
-                teamclaude_rs::status::GraphEdgeDetail::Lease { .. }
-            )
-        })
+        .filter(|edge| matches!(edge.detail, tcr::status::GraphEdgeDetail::Lease { .. }))
         .map(|edge| (edge.from.as_str(), edge.to.as_str()))
         .collect();
     assert_eq!(
@@ -1037,10 +1031,10 @@ fn an_expired_lease_is_not_an_edge() {
     };
     let graph = peer_graph(&node(1), "this-mac", &rows, &state, now_ms);
     assert!(
-        graph.edges.iter().all(|edge| matches!(
-            edge.detail,
-            teamclaude_rs::status::GraphEdgeDetail::Path { .. }
-        )),
+        graph
+            .edges
+            .iter()
+            .all(|edge| matches!(edge.detail, tcr::status::GraphEdgeDetail::Path { .. })),
         "only the path edge survives an expired lease: {:#?}",
         graph.edges
     );
@@ -1100,14 +1094,14 @@ fn the_serving_process_block_reads_both_files_off_disk() {
     write_peers(&peers_path, vec![row(7, "studio-mac", &["127.0.0.1:7749"])]);
 
     let now_ms = 1_700_000_000_000;
-    let state_path = teamclaude_rs::peer::serve::peer_state_path(&peers_path);
+    let state_path = tcr::peer::serve::peer_state_path(&peers_path);
     let state = PeerState {
         last_seen: vec![(node(7), now_ms - FIVE_MINUTES_MS)],
         ..PeerState::default()
     };
-    teamclaude_rs::peer::state::save(&state_path, &state).expect("the state file writes");
+    tcr::peer::state::save(&state_path, &state).expect("the state file writes");
 
-    let block = teamclaude_rs::status::peers_block(&peers_path, now_ms);
+    let block = tcr::status::peers_block(&peers_path, now_ms);
     assert_eq!(block.len(), 1, "one pinned row in the file, one row out");
     assert_eq!(block[0].name, "studio-mac");
     assert_eq!(
@@ -1129,10 +1123,7 @@ fn the_serving_process_block_reads_both_files_off_disk() {
 #[test]
 fn a_mac_with_no_peers_file_reports_an_empty_block() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let block = teamclaude_rs::status::peers_block(
-        &dir.path().join("never-written.json"),
-        1_700_000_000_000,
-    );
+    let block = tcr::status::peers_block(&dir.path().join("never-written.json"), 1_700_000_000_000);
     assert!(block.is_empty(), "no peers file, no peers: {block:#?}");
 }
 
@@ -1153,8 +1144,7 @@ fn an_unparseable_peers_file_names_its_own_parse_error() {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&peers_path, perms).expect("set mode 0600");
 
-    let (block, error) =
-        teamclaude_rs::status::peers_block_with_error(&peers_path, 1_700_000_000_000);
+    let (block, error) = tcr::status::peers_block_with_error(&peers_path, 1_700_000_000_000);
 
     assert!(block.is_empty(), "a broken file still reports zero peers");
     let error = error.expect("a file that exists but will not parse must name why");
@@ -1222,9 +1212,9 @@ const LIVE_UNTIL_S: u64 = 4_102_444_800;
 /// An end already in the past, for the greyed row. Fixed for the same reason.
 const ENDED_UNTIL_S: u64 = 1_600_000_000;
 
-fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
-    use teamclaude_rs::peer::config::{LendGrant, LendMode};
-    use teamclaude_rs::peer::state::{Ban, BanReason, Knock, Mute};
+fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
+    use tcr::peer::config::{LendGrant, LendMode};
+    use tcr::peer::state::{Ban, BanReason, Knock, Mute};
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let now_ms = 1_700_000_000_000_i64;
@@ -1268,12 +1258,12 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
     let peers_path = dir.path().join("tcr-peers.json");
     let rows = write_peers(&peers_path, vec![pinned, second]);
     let store = PeerStore::open(&peers_path).expect("the peers file opens");
-    let lent_to = teamclaude_rs::peer::lease::lent_to(
+    let lent_to = tcr::peer::lease::lent_to(
         &store,
         &[(
             "alice@example.com".to_string(),
             vec!["work".to_string()],
-            teamclaude_rs::provider::Provider::Anthropic,
+            tcr::provider::Provider::Anthropic,
         )],
     );
 
@@ -1281,19 +1271,19 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
     // so the fixture states them: what is pinned here is the SHAPE the panel
     // decodes, and the derivation has its own tests.
     let peers = vec![
-        teamclaude_rs::status::PeerLsPeer::Trusted(teamclaude_rs::status::PeerLsRow::from_row(
+        tcr::status::PeerLsPeer::Trusted(tcr::status::PeerLsRow::from_row(
             rows[0].clone(),
             Some(LIVE_UNTIL_S),
             false,
         )),
-        teamclaude_rs::status::PeerLsPeer::Trusted(teamclaude_rs::status::PeerLsRow::from_row(
+        tcr::status::PeerLsPeer::Trusted(tcr::status::PeerLsRow::from_row(
             rows[1].clone(),
             Some(ENDED_UNTIL_S),
             true,
         )),
     ];
 
-    teamclaude_rs::status::PeerLsJson {
+    tcr::status::PeerLsJson {
         supported: true,
         peers,
         // `addr` carries the port, because that is what the command renders:
@@ -1324,20 +1314,20 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
         }],
         muted_count: 1,
         limited: 0,
-        caps: teamclaude_rs::status::PeerCapsJson {
-            found_rows: teamclaude_rs::peer::discovery::MAX_FOUND_ROWS,
-            found_per_address: teamclaude_rs::peer::discovery::MAX_FOUND_PER_ADDRESS,
-            pending: teamclaude_rs::peer::state::MAX_PENDING_KNOCKS,
-            knock_interval_ms: teamclaude_rs::peer::listener::KNOCK_INTERVAL_MS,
-            knock_burst: teamclaude_rs::peer::listener::KNOCK_BURST,
-            unauthenticated_sockets: teamclaude_rs::peer::listener::MAX_UNAUTHENTICATED_SOCKETS,
+        caps: tcr::status::PeerCapsJson {
+            found_rows: tcr::peer::discovery::MAX_FOUND_ROWS,
+            found_per_address: tcr::peer::discovery::MAX_FOUND_PER_ADDRESS,
+            pending: tcr::peer::state::MAX_PENDING_KNOCKS,
+            knock_interval_ms: tcr::peer::listener::KNOCK_INTERVAL_MS,
+            knock_burst: tcr::peer::listener::KNOCK_BURST,
+            unauthenticated_sockets: tcr::peer::listener::MAX_UNAUTHENTICATED_SOCKETS,
         },
         lent_to,
         internet: false,
         network: true,
         exits: [(
             "alice".to_string(),
-            teamclaude_rs::status::PeerExitJson {
+            tcr::status::PeerExitJson {
                 // The wire id, matching `Egress`'s own `Display` impl
                 // (`config.rs`: `write!(f, "{}{}", VIA_PREFIX, peer.to_wire())`).
                 // The fixture pinned the display form, which no code path
@@ -1508,7 +1498,7 @@ fn a_lease_edge_names_the_lease_the_way_every_other_surface_does() {
     for id in ids {
         assert_eq!(
             id,
-            teamclaude_rs::peer::config::lease_id_string(0x2a),
+            tcr::peer::config::lease_id_string(0x2a),
             "an edge names its lease in the form the CLI prints and reads back"
         );
         assert_eq!(id.len(), 32, "32 characters, padded: {id}");

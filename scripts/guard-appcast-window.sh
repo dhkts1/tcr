@@ -25,7 +25,7 @@
 set -eu
 
 TAG="${1:?usage: guard-appcast-window.sh vX.Y.Z}"
-REPO=dhkts1/teamclaude-rs
+REPO=dhkts1/tcr
 DEADLINE=$(( $(date +%s) + 1800 ))
 
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do

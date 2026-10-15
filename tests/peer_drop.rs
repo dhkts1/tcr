@@ -25,11 +25,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use tcr_peer_wire::PeerId;
-use teamclaude_rs::peer::drop::{
+use tcr::peer::drop::{
     self, current_slot, seal, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
     RecordRefusal, DROP_SLOT_SECONDS, MAX_RECORD_AGE,
 };
+use tcr_peer_wire::PeerId;
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
 fn peer_id(fill: u8) -> PeerId {
@@ -504,14 +504,14 @@ async fn a_record_from_a_revoked_peer_is_refused() {
     // Pinned, switched on, and holding a rendezvous secret: everything a live
     // fetch needs, so the row being gone is the only reason the fetch below
     // finds nothing.
-    let mut file = teamclaude_rs::peer::config::PeerFile::default();
-    file.peers.push(teamclaude_rs::peer::config::PeerRow {
+    let mut file = tcr::peer::config::PeerFile::default();
+    file.peers.push(tcr::peer::config::PeerRow {
         node: friend,
         label: "revoked".to_string(),
         endpoints: Vec::new(),
         added_at: 0,
-        allow: teamclaude_rs::peer::config::Allow {
-            control: teamclaude_rs::peer::config::ControlGrants {
+        allow: tcr::peer::config::Allow {
+            control: tcr::peer::config::ControlGrants {
                 drop: true,
                 ..Default::default()
             },
@@ -521,12 +521,12 @@ async fn a_record_from_a_revoked_peer_is_refused() {
         rendezvous_secret: Some(counting_secret()),
         sees_us_at: None,
     });
-    teamclaude_rs::peer::config::save(&path, &file).expect("the pinned row writes");
+    tcr::peer::config::save(&path, &file).expect("the pinned row writes");
 
     // `tcr peer forget`'s own effect: the row is gone.
     let mut revoked = file.clone();
     revoked.peers.clear();
-    teamclaude_rs::peer::config::save(&path, &revoked).expect("the revocation writes");
+    tcr::peer::config::save(&path, &revoked).expect("the revocation writes");
 
     let fetched = drop::fetch_for(&store, &path, &friend, 1_758_240_000)
         .await
@@ -563,14 +563,14 @@ fn own_endpoints_publishes_only_ports_this_mac_actually_accepts_on() {
     let ephemeral_observed: SocketAddr = "203.0.113.2:54211"
         .parse()
         .expect("a literal socket address from the documentation range");
-    teamclaude_rs::peer::reach::remember_observed_self(ephemeral_peer, ephemeral_observed);
+    tcr::peer::reach::remember_observed_self(ephemeral_peer, ephemeral_observed);
 
     let listening_peer = peer_id(0x92);
     let listening_observed: SocketAddr = "203.0.113.3:4433".parse().expect(
         "a literal socket address from the documentation range, on this Mac's own listening \
          port",
     );
-    teamclaude_rs::peer::reach::remember_observed_self(listening_peer, listening_observed);
+    tcr::peer::reach::remember_observed_self(listening_peer, listening_observed);
 
     let ephemeral_result = drop::own_endpoints(listen, &ephemeral_peer);
     assert!(

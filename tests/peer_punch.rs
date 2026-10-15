@@ -12,9 +12,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use teamclaude_rs::peer::reach::{
-    self, KernelPunchNet, PunchArrival, PunchFailure, PunchNet, PunchSlot,
-};
+use tcr::peer::reach::{self, KernelPunchNet, PunchArrival, PunchFailure, PunchNet, PunchSlot};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[path = "tools/nat_sim.rs"]

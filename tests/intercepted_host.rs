@@ -1,6 +1,6 @@
 //! Inside a tunnel tcr terminates, the tunnel's own host fixes the upstream; a request that came through `CONNECT chatgpt.com:443` is a request for `chatgpt.com`,
 //! whatever `Host` it declares, and if it declares none. These tests open real tunnels through
-//! the real listener ([`teamclaude_rs::mitm::serve`]), over a leaf minted into a temp dir, to an
+//! the real listener ([`tcr::mitm::serve`]), over a leaf minted into a temp dir, to an
 //! Anthropic and a Codex origin on loopback, and check that:
 //!
 //! - a marked ChatGPT tunnel relays other paths with the client's credential to ChatGPT;
@@ -38,7 +38,7 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 use serde_json::json;
-use teamclaude_rs::manager::Manager;
+use tcr::manager::Manager;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -126,7 +126,7 @@ struct Tcr {
 /// the real host), and serve a fleet of one Anthropic and one Codex account on `127.0.0.1:0`.
 async fn start() -> Tcr {
     let leaf_dir = tempfile::tempdir().expect("a temp dir for the leaf");
-    let assets = teamclaude_rs::mitm::load_tls_in(leaf_dir.path()).expect("mint a leaf");
+    let assets = tcr::mitm::load_tls_in(leaf_dir.path()).expect("mint a leaf");
     for host in ["chatgpt.com", "api.anthropic.com"] {
         assert!(
             assets
@@ -142,7 +142,7 @@ async fn start() -> Tcr {
     let (anthropic, codex) = (Origin::default(), Origin::default());
     let anthropic_url = spawn_origin(anthropic.clone()).await;
     let codex_url = spawn_origin(codex.clone()).await;
-    let in_an_hour = teamclaude_rs::now_ms() + 3_600_000;
+    let in_an_hour = tcr::now_ms() + 3_600_000;
     let config = serde_json::from_value(json!({
         "proxy": { "port": 0 },
         "upstream": anthropic_url,
@@ -167,7 +167,7 @@ async fn start() -> Tcr {
     .expect("the test fleet's config parses");
     let manager = Manager::with_live_refresher(config, None);
     assert!(
-        manager.provider_account_count(teamclaude_rs::provider::Provider::Codex) > 0,
+        manager.provider_account_count(tcr::provider::Provider::Codex) > 0,
         "a fleet with no Codex account blind-tunnels chatgpt.com out of the machine"
     );
 
@@ -175,7 +175,7 @@ async fn start() -> Tcr {
         .await
         .expect("bind tcr's listener");
     let addr = listener.local_addr().expect("tcr's address");
-    tokio::spawn(teamclaude_rs::mitm::serve(
+    tokio::spawn(tcr::mitm::serve(
         listener,
         manager,
         Some(Arc::new(assets.acceptor)),
@@ -257,7 +257,7 @@ async fn through_tunnel(tcr: &Tcr, host: &str, request: &[u8]) -> (u16, String) 
     tcp.write_all(
         format!(
             "CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\nProxy-Authorization: {}\r\n\r\n",
-            teamclaude_rs::mitm::CODEX_PROXY_AUTHORIZATION
+            tcr::mitm::CODEX_PROXY_AUTHORIZATION
         )
         .as_bytes(),
     )

@@ -2381,8 +2381,8 @@ pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> Strin
     let dir = config::default_path()
         .parent()
         .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
-    let js_leaf_on_disk =
-        dir.join("teamclaude-leaf.pem").is_file() && dir.join("teamclaude-leaf.key").is_file();
+    let js_leaf_on_disk = dir.join(crate::legacy_names::JS_LEAF_CERT).is_file()
+        && dir.join(crate::legacy_names::JS_LEAF_KEY).is_file();
     first_codex_account_notice(&live, config.proxy.port, &ca, ca.is_file(), js_leaf_on_disk)
 }
 
@@ -4845,7 +4845,10 @@ mod tests {
         // (as `sysinfo::Process::cmd()` returns it) so a space in an executable's
         // path can never be re-split into the wrong tokens.
         let refuses = |cmd: &[&str]| {
-            let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let argv: Vec<String> = cmd
+                .iter()
+                .map(|s| s.replace("{js}", crate::legacy_names::JS_PROXY_BIN))
+                .collect();
             let server = singleton::classify_proxy_server(&argv)
                 .map(|kind| singleton::Incumbent { pid: 4242, kind });
             assert_eq!(
@@ -4859,12 +4862,12 @@ mod tests {
             )
         };
         assert!(
-            refuses(&["/opt/teamclaude-rs/target/release/tcr", "server"]),
+            refuses(&["/opt/{js}-rs/target/release/tcr", "server"]),
             "a live tcr server must block login"
         );
         assert!(
-            refuses(&["node", "/opt/nvm/bin/teamclaude", "server"]),
-            "a live JS teamclaude server must block login"
+            refuses(&["node", "/opt/nvm/bin/{js}", "server"]),
+            "a live JS proxy server must block login"
         );
         assert!(
             !refuses(&["python3", "-m", "http.server", "3456"]),
@@ -5531,7 +5534,7 @@ mod tests {
             .unwrap()
             .port();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             format!(
@@ -7267,7 +7270,7 @@ mod tests {
         accounts: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             format!(
@@ -8486,9 +8489,12 @@ mod tests {
         );
         assert_eq!(
             first_codex_account_notice(&js, NOTICE_PORT, notice_ca(), true, false),
-            "codex is not pooled: the proxy on :3999 is serving the JS teamclaude leaf, which \
+            format!(
+                "codex is not pooled: the proxy on :3999 is serving the JS {} leaf, which \
              covers api.anthropic.com only and is never re-minted — a restart will not change \
-             this; see docs/troubleshooting.md"
+             this; see docs/troubleshooting.md",
+                crate::legacy_names::JS_PROXY_BIN
+            )
         );
         assert_eq!(
             first_codex_account_notice(

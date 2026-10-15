@@ -815,7 +815,7 @@ fn field(line: &str, key: &str) -> Option<String> {
 /// thirty seconds later saying the field never arrived.
 #[test]
 fn a_coloured_boot_line_still_yields_the_peer_address() {
-    let coloured = "\u{1b}[2m2026-09-19T16:08:55Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mteamclaude_rs::server\u{1b}[0m\u{1b}[2m:\u{1b}[0m peer listener up (a second socket; the local /_tcr/ gate is untouched) \u{1b}[3mpeer_listen\u{1b}[0m\u{1b}[2m=\u{1b}[0m127.0.0.1:34865 \u{1b}[3mnode\u{1b}[0m\u{1b}[2m=\u{1b}[0mtcr-EXAMPLENODE";
+    let coloured = "\u{1b}[2m2026-09-19T16:08:55Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mtcr::server\u{1b}[0m\u{1b}[2m:\u{1b}[0m peer listener up (a second socket; the local /_tcr/ gate is untouched) \u{1b}[3mpeer_listen\u{1b}[0m\u{1b}[2m=\u{1b}[0m127.0.0.1:34865 \u{1b}[3mnode\u{1b}[0m\u{1b}[2m=\u{1b}[0mtcr-EXAMPLENODE";
     assert_eq!(
         field(coloured, "peer_listen").as_deref(),
         Some("127.0.0.1:34865"),
@@ -2304,7 +2304,7 @@ async fn measure_latency_local_vs_borrowed() {
 
 /// Proxy start-to-ready wall clock, ten boots with a `tcr-peers.json` present
 /// and ten without, keyed on the same log line `Mac::boot` waits for
-/// (`"teamclaude-rs listening on http://"`, `src/main.rs:3732`). Prints the
+/// (`"tcr listening on http://"`, `src/main.rs:3732`). Prints the
 /// median of each and the delta.
 #[test]
 #[ignore = "wall-clock measurement; run via scripts/peer-compare-local.sh"]

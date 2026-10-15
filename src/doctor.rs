@@ -304,11 +304,14 @@ pub struct PortHolder {
 /// returns `None` for `tcr run`, which is a tcr by any reading an operator
 /// cares about here.
 pub fn holder_from(pid: u32, name: &str, argv: &[String]) -> PortHolder {
+    let js_bin = crate::legacy_names::JS_PROXY_BIN;
     let is_proxy_program = |token: &str| {
         token == "tcr"
             || token.ends_with("/tcr")
-            || token == "teamclaude"
-            || token.ends_with("/teamclaude")
+            || token == js_bin
+            || token
+                .strip_suffix(js_bin)
+                .is_some_and(|dir| dir.ends_with('/'))
     };
     let is_tcr =
         argv.first().is_some_and(|argv0| is_proxy_program(argv0)) || is_proxy_program(name);
@@ -1763,7 +1766,7 @@ mod tests {
     #[test]
     fn a_codex_config_reports_no_unknown_key() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             r#"{"codexUpstream":"http://127.0.0.1:9100","accounts":[
@@ -2231,7 +2234,10 @@ mod tests {
             !names_tcr(&with_env(
                 not_pooled(
                     "js-leaf",
-                    "the proxy on :3999 is serving the JS teamclaude leaf"
+                    &format!(
+                        "the proxy on :3999 is serving the JS {} leaf",
+                        crate::legacy_names::JS_PROXY_BIN
+                    )
                 ),
                 at_tcr.clone()
             )),

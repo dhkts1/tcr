@@ -1,4 +1,4 @@
-# teamclaude-rs — lean single-user rotating Anthropic proxy (Rust)
+# tcr — lean single-user rotating Anthropic proxy (Rust)
 
 A drop-in replacement for Gil's **personal** teamclaude proxy on `:3456`. It is NOT the
 company multi-tenant pool (that stays a separate multi-tenant service). Single user, his own

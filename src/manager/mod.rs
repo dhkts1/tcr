@@ -73,7 +73,7 @@ mod wire_sessions;
 
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
-// the divert-budget design notes §6. Import path: `teamclaude_rs::manager::{divert_verdict, DivertVerdict}`.
+// the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
 pub use select::{divert_verdict, DivertVerdict};
 
 const REQUEST_LOG_CAPACITY: usize = 200;
@@ -5579,7 +5579,7 @@ mod tests {
     #[tokio::test]
     async fn a_relogin_of_a_deleted_codex_row_revives_it_with_its_folder_and_no_login_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         let alice = account("alice@example.com", 0);
         let bob = Account {
             codex_home: Some("/Users/example/.codex".to_string()),

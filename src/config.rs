@@ -1508,14 +1508,15 @@ impl Config {
     }
 }
 
-/// The default config path: `$HOME/.config/teamclaude.json`.
+/// The default config path: `$HOME/.config/tcr.json`, or
+/// `$HOME/.config/teamclaude.json` on an install that has only that one.
 ///
 /// Deliberately NOT the platform config dir (`directories` would pick
 /// `~/Library/Application Support` on macOS) — the JS proxy hard-codes
-/// `~/.config`, and this binary is a drop-in for it.
+/// `~/.config`, and this binary is a drop-in for it. The choice between the two
+/// names is [`crate::paths::config_file`]'s.
 pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".config").join("teamclaude.json")
+    crate::paths::config_file()
 }
 
 /// Whether an on-disk `accounts[]` entry can yield a usable credential, and if
@@ -4708,7 +4709,7 @@ mod tests {
     #[test]
     fn save_account_writes_a_codex_row_at_credential_version_2() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             r#"{ "accounts": [
@@ -6044,7 +6045,7 @@ mod tests {
     fn load_or_init_creates_the_file_and_its_parent_dir() {
         let dir = tempfile::tempdir().expect("a scratch dir");
         // Two levels down: a fresh box has no `~/.config` at all.
-        let path = dir.path().join("config").join("teamclaude.json");
+        let path = dir.path().join("config").join(crate::paths::CONFIG_FILE);
         assert!(!path.exists(), "the test must start with no file");
 
         let (config, created) = load_or_init(&path).expect("a missing config must be created");
@@ -6126,7 +6127,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))
             .expect("make the parent unwritable");
 
-        let err = load_or_init(&locked.join("teamclaude.json"))
+        let err = load_or_init(&locked.join(crate::paths::CONFIG_FILE))
             .expect_err("an unwritable parent must be an error");
         assert!(
             matches!(err, ConfigError::Io(_)),
@@ -6765,7 +6766,7 @@ mod tests {
     /// only the final rename fails.
     fn unrenamable_target(tag: &str) -> (PathBuf, PathBuf) {
         let dir = tmp_path(tag).with_extension("d");
-        let target = dir.join("teamclaude.json");
+        let target = dir.join(crate::paths::CONFIG_FILE);
         fs::create_dir_all(&target).expect("create the blocking directory");
         (dir, target)
     }
@@ -6827,7 +6828,7 @@ mod tests {
             .to_string();
 
         assert!(
-            name.starts_with(".teamclaude.json.tcr-"),
+            name.starts_with(&format!(".{}.tcr-", crate::paths::CONFIG_FILE)),
             "an orphan must name its owner and its destination, got {name}"
         );
         assert!(
@@ -7947,7 +7948,7 @@ mod tests {
     #[test]
     fn anthropic_only_config_resaves_without_provider_or_codex_upstream() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         let original = r#"{
   "proxy": {
     "port": 3999
@@ -7999,7 +8000,7 @@ mod tests {
     #[test]
     fn an_anthropic_only_config_resaves_without_codex_home() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         let original = r#"{
   "proxy": {
     "port": 3999
@@ -8050,7 +8051,7 @@ mod tests {
     #[test]
     fn codex_home_round_trips_on_codex_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             r#"{ "accounts": [
@@ -8085,7 +8086,7 @@ mod tests {
     #[test]
     fn a_codex_save_without_codex_home_removes_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             r#"{ "accounts": [
@@ -8139,7 +8140,7 @@ mod tests {
     #[test]
     fn a_codex_row_is_saved_with_its_provider_and_never_matches_an_anthropic_row() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(&path, r#"{ "accounts": [
             { "name": "alice@example.com", "accessToken": "at-anthropic", "refreshToken": "rt-anthropic" }
         ] }"#).unwrap();
@@ -8337,7 +8338,7 @@ mod tests {
     #[test]
     fn save_account_update_drops_an_explicit_anthropic_provider_key() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             r#"{ "accounts": [
@@ -8367,7 +8368,7 @@ mod tests {
     #[test]
     fn a_non_default_codex_upstream_survives_save_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             r#"{ "codexUpstream": "https://codex-stub.example.com", "accounts": [] }"#,

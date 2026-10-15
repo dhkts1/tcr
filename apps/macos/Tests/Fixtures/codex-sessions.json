@@ -132,14 +132,14 @@
           },
           {
             "commandClass": null,
-            "commandHead": "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+            "commandHead": "Read /Users/example/git/tcr/src/session_wire.rs",
             "endedMs": 1767225320000,
             "seconds": 0.4,
             "tool": "Read"
           },
           {
             "commandClass": null,
-            "commandHead": "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+            "commandHead": "Read /Users/example/git/tcr/src/proxy.rs",
             "endedMs": 1767225250000,
             "seconds": 0.1,
             "tool": "Read"

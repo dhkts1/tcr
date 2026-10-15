@@ -38,7 +38,7 @@ pub enum KeyKind {
     ReadFromExtra,
     /// Written by teamclaude, the JS proxy this config is shared with. tcr
     /// keeps it and does not read it.
-    Teamclaude,
+    JsProxy,
     /// tcr's own pre-split `throttle` key, which `config::load` migrates to
     /// `accountThrottle` and `fleetThrottle`.
     Legacy,
@@ -85,10 +85,10 @@ const KNOWN_KEYS: &[KnownKey] = &[
     key("throttleExemptNoise", KeyKind::ReadFromExtra),
     key("divertBudget", KeyKind::ReadFromExtra),
     key("claudeCodeImport", KeyKind::ReadFromExtra),
-    key("routes", KeyKind::Teamclaude),
-    key("sx", KeyKind::Teamclaude),
-    key("logDir", KeyKind::Teamclaude),
-    key("autoUpdate", KeyKind::Teamclaude),
+    key("routes", KeyKind::JsProxy),
+    key("sx", KeyKind::JsProxy),
+    key("logDir", KeyKind::JsProxy),
+    key("autoUpdate", KeyKind::JsProxy),
     key("throttle", KeyKind::Legacy),
 ];
 
@@ -237,7 +237,7 @@ mod tests {
     /// teamclaude's keys and the legacy `throttle` are kept on purpose, so a
     /// config written by teamclaude must read as clean.
     #[test]
-    fn teamclaude_and_legacy_keys_are_not_reported() {
+    fn js_proxy_and_legacy_keys_are_not_reported() {
         let document = json!({
             "proxy": {"port": 3456}, "upstream": "https://api.anthropic.com",
             "switchThreshold": 0.9, "accounts": [], "routes": [], "sx": {},

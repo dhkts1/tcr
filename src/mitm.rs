@@ -483,8 +483,8 @@ pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
 /// print: the re-mint line and the fresh-CA hint.
 fn load_tls_in_with(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAssets> {
     ensure_crypto_provider();
-    let leaf_cert = dir.join("teamclaude-leaf.pem");
-    let leaf_key = dir.join("teamclaude-leaf.key");
+    let leaf_cert = dir.join(crate::legacy_names::JS_LEAF_CERT);
+    let leaf_key = dir.join(crate::legacy_names::JS_LEAF_KEY);
 
     if leaf_cert.is_file() && leaf_key.is_file() {
         match build_acceptor(&leaf_cert, &leaf_key) {
@@ -495,7 +495,7 @@ fn load_tls_in_with(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAssets> 
                 // derive the path itself, and reporting `None` here used to strand
                 // it — on the very path Gil is actually on — with the answer
                 // sitting one `join` away. Absent → `None`, same as before.
-                let companion_ca = dir.join("teamclaude-ca.pem");
+                let companion_ca = dir.join(crate::legacy_names::JS_CA_CERT);
                 let ca_path = companion_ca.is_file().then_some(companion_ca);
                 // Conservative: this leaf's real SAN set is unknown, so claim
                 // only the one host we know every such leaf has always carried.
@@ -1240,13 +1240,13 @@ mod tests {
         let (_ca, leaf, key, _ca_key) =
             generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS leaf");
         write_file(
-            &dir.path().join("teamclaude-leaf.pem"),
+            &dir.path().join(crate::legacy_names::JS_LEAF_CERT),
             leaf.as_bytes(),
             0o644,
         )
         .expect("write leaf");
         write_file(
-            &dir.path().join("teamclaude-leaf.key"),
+            &dir.path().join(crate::legacy_names::JS_LEAF_KEY),
             key.as_bytes(),
             0o600,
         )
@@ -1282,8 +1282,18 @@ mod tests {
 
         let (_ca, leaf, key, _ca_key) =
             generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS leaf");
-        write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
-        write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
+        write_file(
+            &dir.join(crate::legacy_names::JS_LEAF_CERT),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .expect("write leaf");
+        write_file(
+            &dir.join(crate::legacy_names::JS_LEAF_KEY),
+            key.as_bytes(),
+            0o600,
+        )
+        .expect("write key");
 
         let assets = load_tls_in(&dir).expect("load");
         assert!(
@@ -1310,14 +1320,29 @@ mod tests {
 
         let (ca, leaf, key, _ca_key) =
             generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS chain");
-        write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
-        write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
-        write_file(&dir.join("teamclaude-ca.pem"), ca.as_bytes(), 0o644).expect("write ca");
+        write_file(
+            &dir.join(crate::legacy_names::JS_LEAF_CERT),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .expect("write leaf");
+        write_file(
+            &dir.join(crate::legacy_names::JS_LEAF_KEY),
+            key.as_bytes(),
+            0o600,
+        )
+        .expect("write key");
+        write_file(
+            &dir.join(crate::legacy_names::JS_CA_CERT),
+            ca.as_bytes(),
+            0o644,
+        )
+        .expect("write ca");
 
         let assets = load_tls_in(&dir).expect("load");
         assert_eq!(
             assets.ca_path.as_deref(),
-            Some(dir.join("teamclaude-ca.pem").as_path()),
+            Some(dir.join(crate::legacy_names::JS_CA_CERT).as_path()),
             "the CA beside the reused leaf must be advertised"
         );
 
@@ -1565,8 +1590,18 @@ mod tests {
         // realistically one that covers only api.anthropic.com.
         let (_ca, leaf, key, _ca_key) =
             generate_chain(&["api.anthropic.com"]).expect("mint a narrow stand-in leaf");
-        write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
-        write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
+        write_file(
+            &dir.join(crate::legacy_names::JS_LEAF_CERT),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .expect("write leaf");
+        write_file(
+            &dir.join(crate::legacy_names::JS_LEAF_KEY),
+            key.as_bytes(),
+            0o600,
+        )
+        .expect("write key");
 
         let assets = load_tls_in(&dir).expect("load");
         assert!(

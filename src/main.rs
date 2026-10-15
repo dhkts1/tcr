@@ -1,7 +1,7 @@
-//! `tcr` — the teamclaude-rs binary.
+//! `tcr` — the command-line binary.
 //!
 //! Boot sequence (DESIGN §main): load the drop-in config → hand it to
-//! [`teamclaude_rs::server::serve`], which builds the [`Manager`], spawns the
+//! [`tcr::server::serve`], which builds the [`Manager`], spawns the
 //! axum proxy task and the background loops, and binds → run the TUI (or block
 //! in `--headless`) → shut the handle down, which flushes on exit.
 //!
@@ -9,19 +9,19 @@
 //! logging subscriber, print operator diagnostics, and turn a stand-down into a
 //! process exit code. Everything reusable lives in the library.
 //!
-//! [`Manager`]: teamclaude_rs::manager::Manager
+//! [`Manager`]: tcr::manager::Manager
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
-use teamclaude_rs::cli::{self, validate_group_label_chars, PriorityArg};
-use teamclaude_rs::config::{self, Config, ConfigError};
-use teamclaude_rs::doctor::{no_proxy_entry_exempts, points_at_tcr};
-use teamclaude_rs::peer;
-use teamclaude_rs::proxy::{self, GROUP_HEADER_NAME};
-use teamclaude_rs::{
+use tcr::cli::{self, validate_group_label_chars, PriorityArg};
+use tcr::config::{self, Config, ConfigError};
+use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
+use tcr::peer;
+use tcr::proxy::{self, GROUP_HEADER_NAME};
+use tcr::{
     affinity, build_info, codex_route, config_keys, demo, mint, mitm, oauth, server, singleton,
     status, tui, update,
 };
@@ -149,8 +149,8 @@ struct SetupTcrRunArgs {
 
 /// Parse `--shell` through the one recogniser `src/setup.rs` uses for
 /// `$SHELL`, so the flag and the variable can never disagree on a name.
-fn parse_shell(value: &str) -> Result<teamclaude_rs::setup::Shell, String> {
-    teamclaude_rs::setup::Shell::from_name(value)
+fn parse_shell(value: &str) -> Result<tcr::setup::Shell, String> {
+    tcr::setup::Shell::from_name(value)
         .ok_or_else(|| format!("{value} is not one of zsh, bash, fish"))
 }
 
@@ -161,7 +161,7 @@ struct SetupShellArgs {
     remove: bool,
     /// The shell to set up: zsh, bash or fish (default: $SHELL).
     #[arg(long, value_parser = parse_shell)]
-    shell: Option<teamclaude_rs::setup::Shell>,
+    shell: Option<tcr::setup::Shell>,
 }
 
 #[derive(clap::Args)]
@@ -172,7 +172,7 @@ struct SetupSettingsArgs {
     /// Replace an ANTHROPIC_BASE_URL that points somewhere else.
     #[arg(long, conflicts_with = "remove")]
     force: bool,
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -184,8 +184,8 @@ struct SetupStatusArgs {
     json: bool,
     /// The shell to check: zsh, bash or fish (default: $SHELL).
     #[arg(long, value_parser = parse_shell)]
-    shell: Option<teamclaude_rs::setup::Shell>,
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    shell: Option<tcr::setup::Shell>,
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -340,8 +340,7 @@ mod peer_cli {
         /// stores, and to say so when no pinned Mac answers to it.
         #[arg(long)]
         pub peers: Option<PathBuf>,
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory). This is the file the pin is written to.
+        /// Path to the main config. This is the file the pin is written to.
         #[arg(long)]
         pub config: Option<PathBuf>,
         /// Which account to change, by the same query every other account verb
@@ -422,8 +421,7 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerStatusArgs {
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory), read for the port and api-key this asks on.
+        /// Path to the main config, read for the port and api-key this asks on.
         #[arg(long)]
         pub config: Option<PathBuf>,
         /// Emit the peers block as JSON instead of greppable text.
@@ -604,7 +602,7 @@ mod peer_cli {
         Off,
     }
 
-    /// The argv spelling of [`teamclaude_rs::peer::config::LendMode`].
+    /// The argv spelling of [`tcr::peer::config::LendMode`].
     ///
     /// A separate enum because clap's derive needs one it owns, and the
     /// conversion is the one place the two spellings meet.
@@ -617,7 +615,7 @@ mod peer_cli {
         Hand,
     }
 
-    impl From<PeerLendMode> for teamclaude_rs::peer::config::LendMode {
+    impl From<PeerLendMode> for tcr::peer::config::LendMode {
         fn from(mode: PeerLendMode) -> Self {
             match mode {
                 PeerLendMode::Serve => Self::Serve,
@@ -701,7 +699,7 @@ mod peer_cli {
         /// neighbours; the panel decodes both.
         #[arg(long)]
         pub json: bool,
-        /// Path to the main config (default: ~/.config/teamclaude.json). The
+        /// Path to the main config. The
         /// `--json` form reads it for the ACCOUNT LABELS the `lentTo` block is
         /// keyed by, each account's exit lock (`exits`) and the expiry a
         /// handed-over key ends at (`handedKeyUntil`); the text form reads it
@@ -745,8 +743,7 @@ mod peer_cli {
         /// shows.
         #[arg(long, default_value = "all")]
         pub scope: String,
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory). Read only when `--scope account:` names accounts, to
+        /// Path to the main config. Read only when `--scope account:` names accounts, to
         /// refuse a label that is a Codex account's; a config that is missing
         /// or unreadable skips that check.
         #[arg(long)]
@@ -826,8 +823,7 @@ mod peer_cli {
         /// disclosure decision than the one the operator took.
         #[arg(long, value_enum)]
         pub mode: Option<PeerLendMode>,
-        /// Path to the main config (default: `teamclaude.json` in the config
-        /// directory). Read by `--mode hand`, to refuse a grant every account
+        /// Path to the main config. Read by `--mode hand`, to refuse a grant every account
         /// in its scope is strictly pinned away from, and when `--scope
         /// account:` names accounts, to refuse a label that is a Codex
         /// account's.
@@ -1059,7 +1055,7 @@ mod peer_cli {
 
 #[derive(clap::Args)]
 struct AccountsArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Refresh each account's live quota before listing (network probe).
@@ -1069,7 +1065,7 @@ struct AccountsArgs {
 
 #[derive(clap::Args)]
 struct RemoveArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1079,7 +1075,7 @@ struct RemoveArgs {
 
 #[derive(clap::Args)]
 struct TokenArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1089,7 +1085,7 @@ struct TokenArgs {
 
 #[derive(clap::Args)]
 struct PriorityArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1108,7 +1104,7 @@ struct PriorityArgs {
 
 #[derive(clap::Args)]
 struct EnableArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1118,7 +1114,7 @@ struct EnableArgs {
 
 #[derive(clap::Args)]
 struct DisableArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Names are
@@ -1128,7 +1124,7 @@ struct DisableArgs {
 
 #[derive(clap::Args)]
 struct ControlArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Account name — exact and case-sensitive, not a substring. Omit with
@@ -1186,7 +1182,7 @@ enum GroupAction {
 
 #[derive(clap::Args)]
 struct GroupLsArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit a machine-readable JSON equivalent instead of greppable text.
@@ -1196,7 +1192,7 @@ struct GroupLsArgs {
 
 #[derive(clap::Args)]
 struct GroupAddArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to add.
@@ -1207,7 +1203,7 @@ struct GroupAddArgs {
 
 #[derive(clap::Args)]
 struct GroupRmArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to remove.
@@ -1226,7 +1222,7 @@ struct GroupRmArgs {
 
 #[derive(clap::Args)]
 struct GroupReserveArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to reserve.
@@ -1238,7 +1234,7 @@ struct GroupReserveArgs {
 
 #[derive(clap::Args)]
 struct GroupUnreserveArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to unreserve.
@@ -1247,7 +1243,7 @@ struct GroupUnreserveArgs {
 
 #[derive(clap::Args)]
 struct GroupParkArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to park.
@@ -1256,7 +1252,7 @@ struct GroupParkArgs {
 
 #[derive(clap::Args)]
 struct GroupUnparkArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to unpark.
@@ -1265,7 +1261,7 @@ struct GroupUnparkArgs {
 
 #[derive(clap::Args)]
 struct GroupAllowControlArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to opt in.
@@ -1274,7 +1270,7 @@ struct GroupAllowControlArgs {
 
 #[derive(clap::Args)]
 struct GroupDisallowControlArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to opt out.
@@ -1283,7 +1279,7 @@ struct GroupDisallowControlArgs {
 
 #[derive(clap::Args)]
 struct GroupColorArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to color.
@@ -1301,7 +1297,7 @@ struct GroupColorArgs {
 
 #[derive(clap::Args)]
 struct StatusArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit the fleet status as a JSON array instead of greppable text.
@@ -1340,7 +1336,7 @@ struct DoctorArgs {
 /// only output there is.
 #[derive(clap::Args)]
 struct ListArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit claude-swap's list schema v1 (required: there is no text form).
@@ -1350,7 +1346,7 @@ struct ListArgs {
 
 #[derive(clap::Args)]
 struct SessionsArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Emit `{"supported": bool, "sessions": [...]}` instead of greppable text.
@@ -1360,8 +1356,8 @@ struct SessionsArgs {
 
 #[derive(clap::Args)]
 struct WrapArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json) —
-    /// consulted only for pricing overrides, never for accounts.
+    /// Path to the config file, consulted only for pricing overrides, never
+    /// for accounts.
     #[arg(long)]
     config: Option<PathBuf>,
     /// How many days back to report, ending today (UTC).
@@ -1381,7 +1377,7 @@ struct UpdateArgs {
 
 #[derive(clap::Args)]
 struct LoginArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Skip the refusal a running proxy would otherwise trigger, and write the
@@ -1478,7 +1474,7 @@ struct LoginArgs {
 
 #[derive(clap::Args)]
 struct MintArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Mint a long-lived token for one existing account — exact name, not a
@@ -1493,7 +1489,7 @@ struct MintArgs {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Serve this session from accounts labelled with this group. Strict by
@@ -1519,7 +1515,7 @@ struct ServerArgs {
     /// Port to bind (overrides `proxy.port` from the config).
     #[arg(long)]
     port: Option<u16>,
-    /// Path to the config file (default: ~/.config/teamclaude.json).
+    /// Path to the config file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Run without the TUI, logging to stdout.
@@ -1569,9 +1565,51 @@ fn effective_argv(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     out
 }
 
+/// The CLI with every `--config` flag's help ending in the one sentence that
+/// says what the default is ([`tcr::paths::config_flag_default_help`]).
+///
+/// Thirty-odd verbs take `--config`, each with its own description of what it
+/// reads the file for. The default used to be hand-copied into every one of
+/// them; appending it here keeps it in one place, so the default cannot be
+/// right on one verb and stale on the next.
+fn cli_command() -> clap::Command {
+    fn with_default(cmd: clap::Command, sentence: &str) -> clap::Command {
+        cmd.mut_args(|arg| {
+            if arg.get_long() != Some("config") {
+                return arg;
+            }
+            let join = |help: &clap::builder::StyledStr| {
+                let help = help.to_string();
+                let help = help.trim_end().trim_end_matches('.');
+                format!("{help}. {sentence}.")
+            };
+            let help = arg.get_help().map_or_else(|| format!("{sentence}."), join);
+            match arg.get_long_help().map(join) {
+                Some(long_help) => arg.help(help).long_help(long_help),
+                None => arg.help(help),
+            }
+        })
+        .mut_subcommands(|sub| with_default(sub, sentence))
+    }
+    with_default(
+        <Cli as clap::CommandFactory>::command(),
+        &tcr::paths::config_flag_default_help(),
+    )
+}
+
+/// `Cli::parse_from`, over [`cli_command`] rather than the bare derived command.
+fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
+    let mut cmd = cli_command();
+    let mut matches = cmd
+        .try_get_matches_from_mut(argv)
+        .unwrap_or_else(|err| err.exit());
+    <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+        .unwrap_or_else(|err| err.format(&mut cmd).exit())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse_from(effective_argv(std::env::args_os().collect()));
+    let cli = parse_cli(effective_argv(std::env::args_os().collect()));
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_harness(args).await,
@@ -1759,11 +1797,11 @@ fn run_peer_account(a: peer_cli::PeerAccountArgs) -> anyhow::Result<()> {
 /// `None` for every serve grant and every ended grant, which is `handoff_for`'s
 /// own first two refusals, in the same order and for the same reasons.
 fn peer_ls_handed_key_until(
-    grant: &teamclaude_rs::peer::config::LendGrant,
+    grant: &tcr::peer::config::LendGrant,
     accounts: &[config::Account],
     now_s: u64,
 ) -> Option<u64> {
-    if grant.mode != teamclaude_rs::peer::config::LendMode::Hand {
+    if grant.mode != tcr::peer::config::LendMode::Hand {
         return None;
     }
     if grant.has_ended(now_s) {
@@ -1802,7 +1840,7 @@ fn peer_ls_handed_key_until(
 /// rows, so nothing is read for `all` or `group:`. A config that is missing or
 /// unreadable skips the check, as `tcr peer ls` treats one, rather than failing
 /// a verb about the peers file. The refusal is
-/// [`teamclaude_rs::provider_guard::provider_guard`]'s, in the words every
+/// [`tcr::provider_guard::provider_guard`]'s, in the words every
 /// Claude-only refusal uses.
 fn refuse_a_lend_scope_naming_codex(
     scope: &tcr_peer_wire::LendScope,
@@ -1819,11 +1857,8 @@ fn refuse_a_lend_scope_naming_codex(
         let named =
             tcr_peer_wire::sanitize_label(&account.name).is_ok_and(|label| labels.contains(&label));
         if named {
-            teamclaude_rs::provider_guard::provider_guard(
-                account,
-                teamclaude_rs::provider_guard::ClaudeOnlyVerb::Lend,
-            )
-            .map_err(anyhow::Error::msg)?;
+            tcr::provider_guard::provider_guard(account, tcr::provider_guard::ClaudeOnlyVerb::Lend)
+                .map_err(anyhow::Error::msg)?;
         }
     }
     Ok(())
@@ -1846,14 +1881,14 @@ fn refuse_a_lend_scope_naming_codex(
 fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
     accounts
         .iter()
-        .filter(|account| account.provider == teamclaude_rs::provider::Provider::Codex)
+        .filter(|account| account.provider == tcr::provider::Provider::Codex)
         .filter_map(|account| {
             let pin = account.egress_pin();
             let peer = pin.egress.peer()?;
             let why = if pin.strict {
-                teamclaude_rs::provider_guard::refused_exit_suffix(&account.name)
+                tcr::provider_guard::refused_exit_suffix(&account.name)
             } else {
-                teamclaude_rs::provider_guard::INERT_EXIT_SUFFIX.to_string()
+                tcr::provider_guard::INERT_EXIT_SUFFIX.to_string()
             };
             Some(format!("{}  exits={}{why}", account.name, peer.display()))
         })
@@ -1862,7 +1897,7 @@ fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
 
 fn peer_ls_exits(
     accounts: &[config::Account],
-    peers: &[teamclaude_rs::peer::config::PeerRow],
+    peers: &[tcr::peer::config::PeerRow],
     last_seen: &[(tcr_peer_wire::PeerId, i64)],
     now_ms: i64,
 ) -> std::collections::BTreeMap<String, status::PeerExitJson> {
@@ -1916,9 +1951,9 @@ fn peer_ls_exits(
 /// its own `until`, and a borrower that is still being served must not be
 /// drawn as ended.
 fn peer_ls_ends(
-    row: &teamclaude_rs::peer::config::PeerRow,
-    leases: &[teamclaude_rs::peer::state::LeaseRow],
-    borrowed: &[teamclaude_rs::peer::state::BorrowedRow],
+    row: &tcr::peer::config::PeerRow,
+    leases: &[tcr::peer::state::LeaseRow],
+    borrowed: &[tcr::peer::state::BorrowedRow],
     now_s: u64,
 ) -> (Option<u64>, bool) {
     // (end, has it passed) for every lease this row is party to.
@@ -1984,7 +2019,7 @@ fn peer_ls_ends(
 /// `src/peer/` tells you what it has to hold while doing it.
 async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
     use peer_cli::PeerAction;
-    use teamclaude_rs::peer;
+    use tcr::peer;
 
     match args.action {
         PeerAction::Id(a) => {
@@ -2120,17 +2155,16 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 // the accounts a `--scope` could name and nothing else. The
                 // provider rides along so `lent_to` can leave a Codex account
                 // out: no lease draws on one.
-                let accounts: Vec<(String, Vec<String>, teamclaude_rs::provider::Provider)> =
-                    config_accounts
-                        .iter()
-                        .map(|account| {
-                            (
-                                account.name.clone(),
-                                account.groups.clone().unwrap_or_default(),
-                                account.provider,
-                            )
-                        })
-                        .collect();
+                let accounts: Vec<(String, Vec<String>, tcr::provider::Provider)> = config_accounts
+                    .iter()
+                    .map(|account| {
+                        (
+                            account.name.clone(),
+                            account.groups.clone().unwrap_or_default(),
+                            account.provider,
+                        )
+                    })
+                    .collect();
                 let lent_to = peer::lease::lent_to(&store, &accounts);
                 let masked: Vec<status::PeerLsRow> = rows
                     .into_iter()
@@ -2462,7 +2496,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Pair(a) => {
-            use teamclaude_rs::peer::pair::PairEvent;
+            use tcr::peer::pair::PairEvent;
 
             /// Print one `--json` line, or nothing at all in prose mode.
             ///
@@ -2480,8 +2514,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let path = a
                 .peers
                 .clone()
-                .unwrap_or_else(teamclaude_rs::peer::config::default_path);
-            let store = teamclaude_rs::peer::config::PeerStore::open(&path)?;
+                .unwrap_or_else(tcr::peer::config::default_path);
+            let store = tcr::peer::config::PeerStore::open(&path)?;
             // A bare host is taken too, and defaulted: see `peer_dial_addr`.
             // `tcr peer pending` prints a bare address for a knock that named
             // no port, and this command has to accept what that row printed.
@@ -2493,10 +2527,10 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // this node's static key with it. Now nothing is disclosed to
             // anyone until an operator at the far Mac has seen a request and
             // pressed Accept.
-            let file = teamclaude_rs::peer::config::read_or_default(&path)?;
+            let file = tcr::peer::config::read_or_default(&path)?;
             let proposed_name = file.display_name();
-            let instance = teamclaude_rs::peer::id::boot_instance_id();
-            if let Err(err) = teamclaude_rs::peer::pair::knock(&store, addr, &proposed_name).await {
+            let instance = tcr::peer::id::boot_instance_id();
+            if let Err(err) = tcr::peer::pair::knock(&store, addr, &proposed_name).await {
                 announce(
                     a.json,
                     &PairEvent::Refused {
@@ -2510,7 +2544,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 &PairEvent::Asking {
                     addr: addr.to_string(),
                     instance: instance.to_string(),
-                    wait_seconds: teamclaude_rs::peer::pair::PAIR_WAIT.as_secs(),
+                    wait_seconds: tcr::peer::pair::PAIR_WAIT.as_secs(),
                 },
             )?;
             if !a.json {
@@ -2527,7 +2561,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // **Phase two: `XX`, once their Accept opens a window for this
             // instance id.** Retried, because approval can come minutes later.
             // See `pair::PAIR_WAIT`.
-            let pending = match teamclaude_rs::peer::pair::pair(&store, addr).await {
+            let pending = match tcr::peer::pair::pair(&store, addr).await {
                 Ok(pending) => pending,
                 Err(err) => {
                     // The ten-minute deadline lands here, and it is the one
@@ -2587,7 +2621,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 )?;
                 anyhow::bail!(message);
             }
-            teamclaude_rs::peer::pair::confirm(&store, &pending.peer, &pending.code, Some(addr))?;
+            tcr::peer::pair::confirm(&store, &pending.peer, &pending.code, Some(addr))?;
             announce(
                 a.json,
                 &PairEvent::Trusted {
@@ -2610,10 +2644,10 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let path = a
                 .peers
                 .clone()
-                .unwrap_or_else(teamclaude_rs::peer::config::default_path);
-            let store = teamclaude_rs::peer::config::PeerStore::open(&path)?;
+                .unwrap_or_else(tcr::peer::config::default_path);
+            let store = tcr::peer::config::PeerStore::open(&path)?;
             if let Some(id) = a.revoke {
-                let removed = teamclaude_rs::peer::pair::revoke_invite(&store, id)?;
+                let removed = tcr::peer::pair::revoke_invite(&store, id)?;
                 println!(
                     "peer invite: {} revoke id={id}",
                     if removed { "ok" } else { "not-found" }
@@ -2621,21 +2655,21 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
             if a.sealed {
-                let (secret, public) = teamclaude_rs::peer::noise::generate_static()?;
-                let now_ms = teamclaude_rs::peer::pair::now_ms();
+                let (secret, public) = tcr::peer::noise::generate_static()?;
+                let now_ms = tcr::peer::pair::now_ms();
                 let until_ms = now_ms.saturating_add(600_000);
-                let id_bytes = teamclaude_rs::peer::noise::random_secret()?;
+                let id_bytes = tcr::peer::noise::random_secret()?;
                 let id = u64::from_be_bytes(id_bytes[..8].try_into().expect("checked length"));
-                teamclaude_rs::peer::state::add_ask(
+                tcr::peer::state::add_ask(
                     &peer_state_path(&path),
-                    teamclaude_rs::peer::state::PendingAsk {
+                    tcr::peer::state::PendingAsk {
                         id,
                         public,
                         private: secret,
                         until_ms,
                     },
                 )?;
-                let ask = teamclaude_rs::peer::ask::Ask { key: public };
+                let ask = tcr::peer::ask::Ask { key: public };
                 println!("{}", ask.to_string_wire());
                 println!(
                     "peer invite: this names no address and grants nothing; whoever holds it \
@@ -2656,16 +2690,16 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     anyhow::bail!(
                         "peer invite: standard input carried no reply (`--reply --stdin` \
                          expects the {}… line on stdin)",
-                        teamclaude_rs::peer::ask::REPLY_PREFIX
+                        tcr::peer::ask::REPLY_PREFIX
                     );
                 }
-                let now_ms = teamclaude_rs::peer::pair::now_ms();
-                let opened = teamclaude_rs::peer::state::open_and_spend_ask(
+                let now_ms = tcr::peer::pair::now_ms();
+                let opened = tcr::peer::state::open_and_spend_ask(
                     &peer_state_path(&path),
                     line.trim(),
                     now_ms,
                 )?;
-                let teamclaude_rs::peer::ask::Opened::Key(token) = opened;
+                let tcr::peer::ask::Opened::Key(token) = opened;
                 // Opening a reply runs the join immediately, the `Enrol`
                 // (`IKpsk1`) path a pasted key already takes: pinned and
                 // trusted on both sides the moment the handshake completes.
@@ -2673,7 +2707,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 // afterwards, because `internet_admission` never answers
                 // either from off the LAN and this reply's whole point is
                 // that the friend may be off it.
-                let joined = teamclaude_rs::peer::pair::join(&store, &token, "this-mac").await?;
+                let joined = tcr::peer::pair::join(&store, &token, "this-mac").await?;
                 println!(
                     "peer invite: ok addr={} file={}",
                     joined.addr,
@@ -2686,11 +2720,9 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // sitting in `reach::external_socket`; it is read off the state
             // file a serving process wrote, the same reader `peer moved mint`
             // uses (`peer::reach::recorded_external_socket`).
-            let now_ms = teamclaude_rs::peer::pair::now_ms();
-            let (external, reason) = teamclaude_rs::peer::reach::recorded_external_socket(
-                &peer_state_path(&path),
-                now_ms,
-            );
+            let now_ms = tcr::peer::pair::now_ms();
+            let (external, reason) =
+                tcr::peer::reach::recorded_external_socket(&peer_state_path(&path), now_ms);
             if let Some(reason) = reason {
                 println!(
                     "peer invite: {reason}, so this key carries what this Mac answers on here \
@@ -2698,7 +2730,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 );
             }
             let (invite, token) =
-                teamclaude_rs::peer::pair::mint_invite(&store, &label, a.ttl, a.uses, external)?;
+                tcr::peer::pair::mint_invite(&store, &label, a.ttl, a.uses, external)?;
             println!(
                 "peer invite: ok id={} label={} ttl_s={} uses={}",
                 invite.id, invite.label, a.ttl, a.uses
@@ -2723,7 +2755,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             if !token
                 .addrs
                 .iter()
-                .any(|entry| entry.kind == teamclaude_rs::peer::pair::DialAddressKind::Internet)
+                .any(|entry| entry.kind == tcr::peer::pair::DialAddressKind::Internet)
             {
                 println!(
                     "peer invite: this key carries no internet address, so a friend who is not \
@@ -2743,14 +2775,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let path = a
                 .peers
                 .clone()
-                .unwrap_or_else(teamclaude_rs::peer::config::default_path);
-            let store = teamclaude_rs::peer::config::PeerStore::open(&path)?;
+                .unwrap_or_else(tcr::peer::config::default_path);
+            let store = tcr::peer::config::PeerStore::open(&path)?;
             // Parsed once into one typed value, so no later line here has to
             // ask "link or key?" with a different test. Nothing below prints
             // any field of it: both halves are live secrets and a terminal
             // keeps scrollback.
             let source = if a.stdin {
-                teamclaude_rs::peer::pair::TokenSource::Stdin
+                tcr::peer::pair::TokenSource::Stdin
             } else {
                 let Some(key) = a.key.as_deref() else {
                     anyhow::bail!(
@@ -2758,16 +2790,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                          pipe it in (which keeps it out of `ps` and the shell history)"
                     );
                 };
-                teamclaude_rs::peer::pair::TokenSource::Argv(key)
+                tcr::peer::pair::TokenSource::Argv(key)
             };
-            let input = teamclaude_rs::peer::pair::read_join_input(source)?;
+            let input = tcr::peer::pair::read_join_input(source)?;
 
-            if let teamclaude_rs::peer::pair::JoinInput::Ask(ask) = &input {
-                let now_ms = teamclaude_rs::peer::pair::now_ms();
-                let (external, reason) = teamclaude_rs::peer::reach::recorded_external_socket(
-                    &peer_state_path(&path),
-                    now_ms,
-                );
+            if let tcr::peer::pair::JoinInput::Ask(ask) = &input {
+                let now_ms = tcr::peer::pair::now_ms();
+                let (external, reason) =
+                    tcr::peer::reach::recorded_external_socket(&peer_state_path(&path), now_ms);
                 if let Some(reason) = reason {
                     println!(
                         "peer join: {reason}, so this reply carries what this Mac answers on \
@@ -2781,14 +2811,9 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 // answers only `Enrol` (a minted key), never a knock, so a
                 // reply that only taught an address could never be dialled by
                 // the friend this mode exists for.
-                let (_invite, token) = teamclaude_rs::peer::pair::mint_invite(
-                    &store,
-                    "sealed-invite-reply",
-                    600,
-                    1,
-                    external,
-                )?;
-                let reply = teamclaude_rs::peer::ask::seal_key(ask, &token)?;
+                let (_invite, token) =
+                    tcr::peer::pair::mint_invite(&store, "sealed-invite-reply", 600, 1, external)?;
+                let reply = tcr::peer::ask::seal_key(ask, &token)?;
                 println!("{}", reply.to_string_wire());
                 println!(
                     "peer join: send this back to whoever sent you the invite; nothing in it \
@@ -2813,8 +2838,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // both keys still pairs on a Mac that keeps its own network key.
             let mut network_key_refusal: Option<String> = None;
             if let Some(network_key) = input.network_key() {
-                let _lock = teamclaude_rs::peer::config::FileLock::acquire(&path)?;
-                let mut file = teamclaude_rs::peer::config::read_or_default(&path)?;
+                let _lock = tcr::peer::config::FileLock::acquire(&path)?;
+                let mut file = tcr::peer::config::read_or_default(&path)?;
                 let replaced = file.network_key.is_some();
                 // The same refusal `tcr peer network-key join` gives, in the
                 // same words. This arm used to overwrite in silence, which made
@@ -2831,7 +2856,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     ));
                 } else {
                     file.network_key = Some(network_key);
-                    teamclaude_rs::peer::config::save(&path, &file)?;
+                    tcr::peer::config::save(&path, &file)?;
                     println!(
                         "peer join: network key {} file={}",
                         if replaced { "replaced" } else { "set" },
@@ -2866,7 +2891,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // The address that ANSWERED, not the first one in the key: a key
             // carries every address that Mac can be reached at, and the one
             // that worked is the only one worth printing back.
-            let joined = teamclaude_rs::peer::pair::join(&store, token, &label).await?;
+            let joined = tcr::peer::pair::join(&store, token, &label).await?;
             println!("peer join: ok addr={} file={}", joined.addr, path.display());
             Ok(())
         }
@@ -2874,11 +2899,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let path = a
                 .peers
                 .clone()
-                .unwrap_or_else(teamclaude_rs::peer::config::default_path);
-            let store = teamclaude_rs::peer::config::PeerStore::open(&path)?;
+                .unwrap_or_else(tcr::peer::config::default_path);
+            let store = tcr::peer::config::PeerStore::open(&path)?;
             let peer = tcr_peer_wire::PeerId::parse(&a.peer)
                 .map_err(|refusal| anyhow::anyhow!("peer forget: {refusal}"))?;
-            if !teamclaude_rs::peer::pair::forget(&store, &peer)? {
+            if !tcr::peer::pair::forget(&store, &peer)? {
                 println!("peer forget: not-found peer={}", a.peer);
                 return Ok(());
             }
@@ -2887,8 +2912,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 "peer forget: its next handshake fails the pin check before message 2, and any \
                  live session with it closes within one frame"
             );
-            let file = teamclaude_rs::peer::config::read_or_default(&path)?;
-            let relays = teamclaude_rs::peer::pair::peers_still_holding_relay(&file);
+            let file = tcr::peer::config::read_or_default(&path)?;
+            let relays = tcr::peer::pair::peers_still_holding_relay(&file);
             if !relays.is_empty() {
                 println!(
                     "peer forget: WARNING this does NOT revoke egress still reachable through \
@@ -2911,11 +2936,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let path = a
                 .peers
                 .clone()
-                .unwrap_or_else(teamclaude_rs::peer::config::default_path);
-            let store = teamclaude_rs::peer::config::PeerStore::open(&path)?;
+                .unwrap_or_else(tcr::peer::config::default_path);
+            let store = tcr::peer::config::PeerStore::open(&path)?;
             let peer = tcr_peer_wire::PeerId::parse(&a.peer)
                 .map_err(|refusal| anyhow::anyhow!("peer hello: {refusal}"))?;
-            match teamclaude_rs::peer::serve::say_hello(&store, &peer).await? {
+            match tcr::peer::serve::say_hello(&store, &peer).await? {
                 Some(_theirs) => println!("peer hello: ok peer={}", a.peer),
                 None => println!(
                     "peer hello: no-answer peer={} (not pinned, or nothing on its row answered)",
@@ -3198,7 +3223,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 .map(|existing| existing.mode);
             let mode = a
                 .mode
-                .map(teamclaude_rs::peer::config::LendMode::from)
+                .map(tcr::peer::config::LendMode::from)
                 .or(replacing)
                 .unwrap_or_default();
 
@@ -3774,7 +3799,7 @@ async fn run_peer_status(args: peer_cli::PeerStatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let config = config::load(&config_path)
         .with_context(|| format!("peer status: could not read {}", config_path.display()))?;
-    let peers = teamclaude_rs::cli::live_peers(&config)
+    let peers = tcr::cli::live_peers(&config)
         .await
         .map_err(|why| anyhow::anyhow!("peer status: {why}"))?;
 
@@ -3806,7 +3831,7 @@ async fn run_peer_status(args: peer_cli::PeerStatusArgs) -> anyhow::Result<()> {
 }
 
 /// `tcr peer graph`: one node per Mac, one edge per way to reach one, one edge
-/// per live lease, as [`teamclaude_rs::status::peer_graph_block`] derives it
+/// per live lease, as [`tcr::status::peer_graph_block`] derives it
 /// off the peers file and the runtime-state file beside it.
 ///
 /// Read-only and local, the same contract `tcr peer reach` already gives:
@@ -3829,8 +3854,7 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
         return serve_peer_graph(peers_path, this, this_label, &args.addr).await;
     }
 
-    let graph =
-        teamclaude_rs::status::peer_graph_block(&peers_path, &this, &this_label, now_unix_ms());
+    let graph = tcr::status::peer_graph_block(&peers_path, &this, &this_label, now_unix_ms());
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&graph)?);
@@ -3848,14 +3872,14 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
             node.id,
             node.name,
             match node.role {
-                teamclaude_rs::status::GraphRole::ThisMac => "self",
-                teamclaude_rs::status::GraphRole::Peer => "peer",
+                tcr::status::GraphRole::ThisMac => "self",
+                tcr::status::GraphRole::Peer => "peer",
             }
         );
     }
     for edge in &graph.edges {
         match &edge.detail {
-            teamclaude_rs::status::GraphEdgeDetail::Path {
+            tcr::status::GraphEdgeDetail::Path {
                 endpoint,
                 path_kind,
                 rtt_ms,
@@ -3870,7 +3894,7 @@ async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
                 rtt_ms.map_or("unmeasured".to_string(), |v| v.to_string()),
                 loss_pct.map_or("unmeasured".to_string(), |v| v.to_string()),
             ),
-            teamclaude_rs::status::GraphEdgeDetail::Lease {
+            tcr::status::GraphEdgeDetail::Lease {
                 lease_id, spent, ..
             } => println!(
                 "peer graph: edge lease from={} to={} lease_id={} spent={:.2}",
@@ -3941,7 +3965,7 @@ async fn serve_peer_graph(
     /// host with no port, which is what `proxy::strip_port` is for and what
     /// the transcription had inlined.
     fn host_is_loopback(host: &str) -> bool {
-        teamclaude_rs::proxy::host_is_loopback(teamclaude_rs::proxy::strip_port(host))
+        tcr::proxy::host_is_loopback(tcr::proxy::strip_port(host))
     }
 
     /// The one check every route on this listener passes before its handler
@@ -3973,7 +3997,7 @@ async fn serve_peer_graph(
     }
 
     async fn graph_json(State(state): State<GraphState>) -> impl IntoResponse {
-        let graph = teamclaude_rs::status::peer_graph_block(
+        let graph = tcr::status::peer_graph_block(
             &state.peers_path,
             &state.this,
             &state.this_label,
@@ -4026,11 +4050,11 @@ const GRAPH_PAGE_HTML: &str = include_str!("peer_graph_page.html");
 /// # What a link can do to this Mac, and what makes that true
 ///
 /// `open --yes` is the only writing path here, and what it writes goes through
-/// [`teamclaude_rs::peer::discovery::admissible_moved_endpoints`] and then
-/// [`teamclaude_rs::peer::config::observe_endpoints`], through nothing else.
+/// [`tcr::peer::discovery::admissible_moved_endpoints`] and then
+/// [`tcr::peer::config::observe_endpoints`], through nothing else.
 /// That pair is what makes the bound true by construction rather than by
 /// review: the second is the peers file's one endpoint writer and answers
-/// [`teamclaude_rs::peer::config::Observed::NoRow`] for a peer it does not
+/// [`tcr::peer::config::Observed::NoRow`] for a peer it does not
 /// already hold, so a link can never pin a Mac, un-forget one, or bring back a
 /// row an operator revoked; the first caps
 /// how much of a row a link may ever own and leaves every stronger endpoint
@@ -4044,7 +4068,7 @@ const GRAPH_PAGE_HTML: &str = include_str!("peer_graph_page.html");
 ///
 /// A line this function wrote itself reads `peer moved: …`, the greppable
 /// shape every other verb uses. A refusal that came out of
-/// [`teamclaude_rs::peer::moved`] is printed in the module's own words, which
+/// [`tcr::peer::moved`] is printed in the module's own words, which
 /// start `moved link:`, rather than re-spelled here: one sentence with two
 /// spellings is two sentences that drift, and the prefix says which layer
 /// refused.
@@ -4064,7 +4088,7 @@ fn run_peer_moved(args: peer_cli::PeerMovedArgs) -> anyhow::Result<()> {
 /// # Where the addresses come from, and the ones that are left out
 ///
 /// The same ranked set an invite key carries,
-/// [`teamclaude_rs::peer::pair::dial_addresses`], plus the router mapping a
+/// [`tcr::peer::pair::dial_addresses`], plus the router mapping a
 /// serving process holds. The rank is the order a dial should try, and each
 /// band is there because a different friend is on the other end: the tailnet
 /// address, the mapped external socket, then the addresses a real interface
@@ -4072,7 +4096,7 @@ fn run_peer_moved(args: peer_cli::PeerMovedArgs) -> anyhow::Result<()> {
 ///
 /// The mapping is read off the runtime-state file the way [`run_peer_reach`]
 /// reads it, and for the reason that function states: the register
-/// [`teamclaude_rs::peer::reach::external_socket`] answers from is filled by a
+/// [`tcr::peer::reach::external_socket`] answers from is filled by a
 /// keeper thread, a CLI process has run none, so asking it here would silently
 /// ship the LAN socket alone on a Mac whose mapping is live. A record past its
 /// deadline reads as no mapping. It is offered to the ranking AND added
@@ -4138,7 +4162,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     // live half of `dial_addresses` reads the external socket off a register a
     // keeper thread fills and this process has run none, so the walk is done
     // here and the mapping above is handed in explicitly.
-    let host: Vec<peer::pair::HostAddress> = teamclaude_rs::status::network_fact::interfaces()
+    let host: Vec<peer::pair::HostAddress> = tcr::status::network_fact::interfaces()
         .into_iter()
         .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
         .collect();
@@ -4207,7 +4231,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 /// not depend on the rows it walked: a link forwarded into the wrong group chat
 /// must teach its reader nothing about whose Mac it was for or whether this Mac
 /// came close. Every key that did not open it answers
-/// [`teamclaude_rs::peer::moved::MovedRefusal::NotForThisMac`], which is one
+/// [`tcr::peer::moved::MovedRefusal::NotForThisMac`], which is one
 /// sentence naming nothing, and the only refusals that can outrank it are the
 /// ones decided after a key DID open the bytes.
 fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> anyhow::Result<()> {
@@ -4379,13 +4403,13 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
 /// is the IPv4 answer, and a refusal is the ORDINARY outcome -- most routers
 /// ship with port mapping off -- so every failure here prints and the verb
 /// still exits 0. The third is the time-derived port
-/// ([`teamclaude_rs::peer::reach::derived_port`]), which needs the secret both
+/// ([`tcr::peer::reach::derived_port`]), which needs the secret both
 /// ends share, and that secret is the pair's Noise handshake hash: **it is not
 /// persisted anywhere today**, so the per-peer rows print the slot and say the
 /// port is unavailable rather than inventing a number from public key material,
 /// which a scanner could compute too.
 fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
-    use teamclaude_rs::peer::reach;
+    use tcr::peer::reach;
 
     /// How long a probe asks a mapping to be held for. Two minutes: long
     /// enough for the operator to test a dial, short enough that a forgotten
@@ -4689,7 +4713,7 @@ fn peer_state_path(peers_path: &Path) -> PathBuf {
 /// is a verb with its own sub-verbs, and folding four more arms into an
 /// already-long match makes the one that matters harder to find.
 fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow::Result<()> {
-    use teamclaude_rs::peer;
+    use tcr::peer;
 
     let peers_path = args
         .peers
@@ -4827,7 +4851,7 @@ fn peer_lend_grant(
     fraction: f64,
     ttl_s: u32,
     max_inflight: u8,
-) -> anyhow::Result<teamclaude_rs::peer::config::LendGrant> {
+) -> anyhow::Result<tcr::peer::config::LendGrant> {
     // REFUSED, not clamped, and this is the only fraction that is. `NaN`
     // compares false against both of `clamp`'s bounds, so it passed through the
     // clamp below unchanged and printed nothing; `serde_json` then writes a
@@ -4839,14 +4863,14 @@ fn peer_lend_grant(
              of the window between 0 and {MAX_LEND_FRACTION}"
         );
     }
-    let clamped = teamclaude_rs::peer::config::lend_fraction(fraction);
+    let clamped = tcr::peer::config::lend_fraction(fraction);
     if (clamped - fraction).abs() > f64::EPSILON {
         println!(
             "peer lend: clamped fraction {fraction} to {clamped} (the ceiling on one lease is \
              {MAX_LEND_FRACTION}, the same clamp the main config applies to its own reserve)"
         );
     }
-    Ok(teamclaude_rs::peer::config::LendGrant::new(
+    Ok(tcr::peer::config::LendGrant::new(
         window,
         clamped,
         ttl_s,
@@ -4858,12 +4882,12 @@ fn peer_lend_grant(
 /// flag that accepts a fraction and the reader that parses one off disk answer
 /// to one number, or a hand-edited file carries what this flag would have
 /// refused.
-const MAX_LEND_FRACTION: f64 = teamclaude_rs::peer::config::MAX_LEND_FRACTION;
+const MAX_LEND_FRACTION: f64 = tcr::peer::config::MAX_LEND_FRACTION;
 
 #[cfg(test)]
 mod peer_lend_fraction_tests {
     use super::{peer_lend_grant, MAX_LEND_FRACTION};
-    use teamclaude_rs::peer::config::LendGrant;
+    use tcr::peer::config::LendGrant;
 
     /// **A fraction that is not a number is refused at the flag**, and the
     /// ordinary over-large one is still clamped and still written.
@@ -5016,7 +5040,7 @@ mod peer_dial_addr_tests {
         let addr = peer_dial_addr("192.0.2.10").expect("a bare host parses");
         assert_eq!(
             addr.port(),
-            teamclaude_rs::peer::config::default_listen().port(),
+            tcr::peer::config::default_listen().port(),
             "a knock that named no port is answered where the default listener is"
         );
     }
@@ -5030,10 +5054,7 @@ mod peer_dial_addr_tests {
     #[test]
     fn a_bare_ipv6_host_takes_the_default_listen_port() {
         let addr = peer_dial_addr("2001:db8::1").expect("a bare v6 host parses");
-        assert_eq!(
-            addr.port(),
-            teamclaude_rs::peer::config::default_listen().port()
-        );
+        assert_eq!(addr.port(), tcr::peer::config::default_listen().port());
     }
 
     #[test]
@@ -5623,7 +5644,7 @@ mod peer_grant_tests {
     /// peers fixtures give: a field added to `Config` later must not turn this
     /// into a compile error.
     fn config_with_account(dir: &Path, egress: &str) -> PathBuf {
-        let path = dir.join("teamclaude.json");
+        let path = dir.join(tcr::paths::CONFIG_FILE);
         std::fs::write(
             &path,
             format!(
@@ -5977,7 +5998,7 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
 /// `tcr setup shell|claude-settings|status`. A refusal is an error, so the
 /// exit code is non-zero and the conflict lines are on stderr.
 fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
-    use teamclaude_rs::setup;
+    use tcr::setup;
     let homes = setup::Homes::from_env()?;
     match args.action {
         SetupAction::Shell(args) => {
@@ -6005,7 +6026,7 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
                 setup::install_settings(&homes, port, args.force)?
             };
             let path = change.path.display();
-            let var = teamclaude_rs::doctor::BASE_URL_VAR;
+            let var = tcr::doctor::BASE_URL_VAR;
             println!(
                 "{}",
                 match change.change {
@@ -6159,7 +6180,7 @@ fn run_ui() -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "TcrBar is not installed. Run `tcr ui` in a terminal to install it, or \
-             download the dmg from https://github.com/dhkts1/teamclaude-rs/releases/latest"
+             download the dmg from https://github.com/dhkts1/tcr/releases/latest"
         );
     }
 
@@ -6293,8 +6314,8 @@ fn claude_command() -> std::process::Command {
 /// `PATH` as it is: every command the agent runs inherits that `PATH`, so tcr must not reorder
 /// it.
 fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
-    let codex = teamclaude_rs::codex_local::find_codex()
-        .map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
+    let codex =
+        tcr::codex_local::find_codex().map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
     Ok((std::process::Command::new(&codex.path), codex.path))
 }
 
@@ -6572,11 +6593,11 @@ fn codex_pool_preflight(
     payload: &status::StatusPayload,
     now: time::OffsetDateTime,
 ) -> Option<String> {
-    use teamclaude_rs::stats::GateReason;
+    use tcr::stats::GateReason;
     let codex: Vec<&status::AccountStatus> = payload
         .accounts
         .iter()
-        .filter(|row| row.provider == teamclaude_rs::provider::Provider::Codex)
+        .filter(|row| row.provider == tcr::provider::Provider::Codex)
         .collect();
     if codex.is_empty() || codex.iter().any(|row| row.gate == GateReason::Ok) {
         return None;
@@ -6615,8 +6636,7 @@ fn codex_pool_preflight(
 /// `tcr run` ask the running proxy whether it holds a Claude account.
 fn holds_only_codex(config: &Config) -> bool {
     let holds = |provider| config.accounts.iter().any(|a| a.provider == provider);
-    holds(teamclaude_rs::provider::Provider::Codex)
-        && !holds(teamclaude_rs::provider::Provider::Anthropic)
+    holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)
 }
 
 /// The warning `tcr run` prints for a claude session when the running proxy on `port` holds
@@ -6624,14 +6644,14 @@ fn holds_only_codex(config: &Config) -> bool {
 /// `None` when the proxy lists any Claude account, or no account at all.
 fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Option<String> {
     let holds = |provider| payload.accounts.iter().any(|row| row.provider == provider);
-    (holds(teamclaude_rs::provider::Provider::Codex)
-        && !holds(teamclaude_rs::provider::Provider::Anthropic))
-    .then(|| {
-        format!(
-            "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
+    (holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)).then(
+        || {
+            format!(
+                "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
              every request from this session — add one with `tcr login`"
-        )
-    })
+            )
+        },
+    )
 }
 
 /// Carry out [`codex_launch`]'s decision on `cmd`, and print its notices.
@@ -6733,7 +6753,7 @@ fn no_proxy_rewrites(
 const MIN_CLAUDE_VERSION_FOR_GROUP: (u64, u64, u64) = (2, 1, 227);
 const MIN_CLAUDE_VERSION_FOR_GROUP_STR: &str = "2.1.227";
 
-// `validate_group_label_chars` moved to `teamclaude_rs::cli` (imported below) so
+// `validate_group_label_chars` moved to `tcr::cli` (imported below) so
 // `tcr group add`'s surgical write can reuse the same Phase 1 validator instead
 // of a second one drifting out of sync with this one.
 
@@ -6771,14 +6791,10 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         // would route it nowhere. Only a fleet holding a Codex account can have
         // such a group, since a label exists only while some account carries it.
         let has_claude = config.accounts.iter().any(|account| {
-            account.provider == teamclaude_rs::provider::Provider::Anthropic
-                && account.in_group(group)
+            account.provider == tcr::provider::Provider::Anthropic && account.in_group(group)
         });
         if !has_claude {
-            anyhow::bail!(
-                "{}",
-                teamclaude_rs::provider_guard::group_has_no_claude(group)
-            );
+            anyhow::bail!("{}", tcr::provider_guard::group_has_no_claude(group));
         }
         return Ok(());
     }
@@ -7033,7 +7049,7 @@ fn see_through_ca_notice(ca: &Path, holds_codex: bool) -> String {
 fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
     let proxy = format!(
         "http://{}@127.0.0.1:{port}",
-        teamclaude_rs::mitm::CODEX_PROXY_USERNAME
+        tcr::mitm::CODEX_PROXY_USERNAME
     );
     cmd.env("HTTPS_PROXY", &proxy);
     cmd.env("https_proxy", &proxy);
@@ -7068,7 +7084,7 @@ fn apply_nested_claude_ca(cmd: &mut std::process::Command, ca: &Path, caller_exp
 /// The host the MITM leaf must cover for `tcr run --codex` to route `codex`
 /// through the pool.
 fn mitm_codex_host() -> &'static str {
-    teamclaude_rs::provider::CODEX_HOST
+    tcr::provider::CODEX_HOST
 }
 
 /// BASE-URL mode — the fallback, used when see-through material is unavailable.
@@ -7167,7 +7183,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         return finish_login(result, args.non_interactive);
     }
     if args.codex {
-        let result = teamclaude_rs::codex_cli_login::login(
+        let result = tcr::codex_cli_login::login(
             &config_path,
             args.force,
             args.account.as_deref(),
@@ -7288,7 +7304,7 @@ fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDown
 
 /// `tcr server` — the clap→[`server::ServeOptions`] adapter.
 ///
-/// Everything that actually boots the proxy lives in [`teamclaude_rs::server`],
+/// Everything that actually boots the proxy lives in [`tcr::server`],
 /// which is usable from a test or any other embedder. What stays here is what
 /// only a *binary* may do: choose the logging subscriber, print the operator's
 /// stand-down diagnosis, turn that stand-down into a process exit code, and pick
@@ -7375,14 +7391,14 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         affinity_path: Some(affinity::default_path()),
         // The Sessions/Tools panel cache, a binary-only side effect exactly like the
         // pin cache above and for the same reason: one shared file, one writer.
-        wire_sessions_path: Some(teamclaude_rs::session_wire_persist::default_path()),
+        wire_sessions_path: Some(tcr::session_wire_persist::default_path()),
         // The shared usage ledger, a binary-only side effect exactly like the
         // pin cache above and for the same reason: one directory, one writer.
-        usage_dir: Some(teamclaude_rs::usage::default_dir()),
+        usage_dir: Some(tcr::usage::default_dir()),
         tls: server::TlsSetup::Load,
         // This is a standalone `tcr` process, stated rather than sniffed from
         // `argv[0]`: the owner file is what makes a proxy identifiable when its
-        // process name is NOT `tcr` (see `teamclaude_rs::singleton`), so the value
+        // process name is NOT `tcr` (see `tcr::singleton`), so the value
         // has to come from the caller that knows.
         host: singleton::ProxyHost::Cli,
         // Claim the port for the next `tcr` (and for `tcr login`) to read. A
@@ -7437,7 +7453,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         if sigterm.is_none() {
             tracing::warn!("could not install SIGTERM handler; a supervised stop will kill this process without draining");
         }
-        tracing::info!("teamclaude-rs listening on http://{bound} (headless)");
+        tracing::info!("tcr listening on http://{bound} (headless)");
         // Block until Ctrl-C, SIGTERM, or the server task exits.
         let trigger = tokio::select! {
             _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
@@ -7666,42 +7682,33 @@ fn default_config() -> Config {
     serde_json::from_str("{}").expect("an empty JSON object is always a valid default config")
 }
 
-/// Base cache directory: `$XDG_CACHE_HOME/teamclaude`, else `$HOME/.cache/teamclaude`.
-///
-/// Deliberately independent of [`affinity::default_path`] (same env-var
-/// resolution order, duplicated rather than shared) so that a bug or a test
-/// touching the log path can never brush the live session-affinity pin file's
-/// neighbourhood by construction — the two are computed by different code, not
-/// just used at different leaf paths under a shared helper.
-fn cache_base_dir() -> std::path::PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("teamclaude")
-}
-
 /// The one shared, well-known, non-private directory both modes log into:
-/// `~/.cache/teamclaude/logs/` (or `$XDG_CACHE_HOME/teamclaude/logs/`).
+/// `logs/` in the cache directory, `~/.cache/tcr/logs/` on a fresh install and
+/// `~/.cache/teamclaude/logs/` on one that has only the old directory
+/// (`tcr::paths::cache_dir`), with the log file prefix that goes
+/// with that directory.
 ///
 /// The path is fixed for **human discoverability** — so `rg 'server started'
-/// ~/.cache/teamclaude/logs/*` always finds the right directory — not because
-/// any code depends on the literal string. Nothing in this codebase opens this
-/// path programmatically outside this module; see `open_log_appender` below and
-/// the doc-comment on `the_log_directory_is_the_shared_cache_location` for the
+/// ~/.cache/tcr/logs/*` always finds the right directory — not because any code
+/// depends on the literal string. Nothing in this codebase opens this path
+/// programmatically outside this module; see `open_log_appender` below and the
+/// doc-comment on `the_log_directory_is_the_shared_cache_location` for the
 /// census that established that.
-fn log_dir_path() -> std::path::PathBuf {
-    cache_base_dir().join("logs")
+///
+/// This used to compute the cache base separately from
+/// `affinity::default_path`, so a log-path bug could not brush the pin file.
+/// It now shares `paths::cache_dir` with it on purpose: two resolutions of
+/// "old directory or new" could disagree, and an install would split its cache
+/// across two folders.
+fn log_location() -> (std::path::PathBuf, &'static str) {
+    let cache = tcr::paths::cache_dir();
+    (cache.log_dir(), cache.log_prefix())
 }
 
 /// Open the durable, rotating log directory, injectable for tests so they never
-/// touch the real `~/.cache/teamclaude/logs/` — pass a unique temp dir instead
-/// of routing through [`log_dir_path`].
+/// touch the real cache directory's `logs/` — pass a unique temp dir instead
+/// of routing through [`log_location`]. `prefix` is the file name prefix
+/// rotation and pruning key on, and has to match the directory's own.
 ///
 /// `tracing_appender::rolling` has no per-file `.mode()` hook (checked against
 /// its 0.2.5 source: `create_writer` in its `rolling.rs` opens with
@@ -7761,6 +7768,7 @@ fn log_dir_path() -> std::path::PathBuf {
 /// means the daily boundary lands at 03:00 in Asia/Jerusalem, not midnight.
 fn open_log_appender(
     log_dir: &std::path::Path,
+    prefix: &str,
 ) -> std::io::Result<tracing_appender::rolling::RollingFileAppender> {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -7789,7 +7797,7 @@ fn open_log_appender(
 
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("teamclaude-rs.log")
+        .filename_prefix(prefix)
         .max_log_files(5)
         .build(log_dir)
         .map_err(std::io::Error::other)
@@ -7857,8 +7865,8 @@ fn init_tracing(headless: bool) {
     use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let log_dir = log_dir_path();
-    let file = match open_log_appender(&log_dir) {
+    let (log_dir, log_prefix) = log_location();
+    let file = match open_log_appender(&log_dir, log_prefix) {
         Ok(file) => Some(file),
         Err(err) => {
             eprintln!(
@@ -7894,7 +7902,7 @@ mod tests {
     use super::*;
     use build_info::StandDownBuild;
     use std::os::unix::fs::PermissionsExt as _;
-    use teamclaude_rs::codex_route::no_codex_account_reason;
+    use tcr::codex_route::no_codex_account_reason;
 
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
@@ -8254,6 +8262,60 @@ mod tests {
         assert!(
             !codes[1..].contains(&2),
             "2 is clap's usage error, which TcrBar maps to the unknown-argument hint"
+        );
+    }
+
+    /// Every `--config` flag, on every verb, says the default once and the same
+    /// way: the new file, and that an existing old one is still used.
+    #[test]
+    fn every_config_flag_states_both_default_files() {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, String)>) {
+            for arg in cmd.get_arguments() {
+                if arg.get_long() == Some("config") {
+                    out.push((
+                        path.to_string(),
+                        arg.get_help().map(ToString::to_string).unwrap_or_default(),
+                        arg.get_long_help()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut flags = Vec::new();
+        walk(&cli_command(), "tcr", &mut flags);
+        // 31 doc comments carried the default before; a few verbs share one
+        // args struct, so the walk sees at least that many flags.
+        assert!(
+            flags.len() >= 31,
+            "found only {} --config flags",
+            flags.len()
+        );
+        let sentence = tcr::paths::config_flag_default_help();
+        for (verb, help, long_help) in &flags {
+            assert!(
+                help.ends_with(&format!("{sentence}.")),
+                "`{verb} --config` help must end with the default: {help:?}"
+            );
+            assert_eq!(help.matches("Default:").count(), 1, "`{verb}`: {help:?}");
+            assert!(
+                long_help.is_empty() || long_help.ends_with(&format!("{sentence}.")),
+                "`{verb} --config` long help must end with the default: {long_help:?}"
+            );
+        }
+        // And what a user sees on screen.
+        let rendered = cli_command()
+            .find_subcommand_mut("accounts")
+            .expect("an accounts verb")
+            .render_help()
+            .to_string();
+        assert!(
+            rendered.contains(&format!("~/.config/{}", tcr::paths::CONFIG_FILE))
+                && rendered.contains(tcr::legacy_names::CONFIG_FILE),
+            "{rendered}"
         );
     }
 
@@ -8733,11 +8795,12 @@ mod tests {
                     "leaf": "js",
                 }))),
                 true,
-                direct(
-                    "the proxy on :3999 is serving the JS teamclaude leaf, which covers \
+                direct(&format!(
+                    "the proxy on :3999 is serving the JS {} leaf, which covers \
                      api.anthropic.com only and is never re-minted — a restart will not change \
                      this; see docs/troubleshooting.md",
-                ),
+                    tcr::legacy_names::JS_PROXY_BIN
+                )),
             ),
             (
                 "MITM off",
@@ -8777,7 +8840,7 @@ mod tests {
                 pooling().map(|mut payload| {
                     payload
                         .accounts
-                        .retain(|row| row.provider != teamclaude_rs::provider::Provider::Codex);
+                        .retain(|row| row.provider != tcr::provider::Provider::Codex);
                     payload
                 }),
                 true,
@@ -9083,10 +9146,7 @@ mod tests {
             no_codex_account_reason(3999, "chatgpt.com"),
             oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
             oauth::no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
-            teamclaude_rs::codex_cli_login::codex_login_saved_line(
-                "bob@example.com",
-                Some("ChatGPT Pro"),
-            ),
+            tcr::codex_cli_login::codex_login_saved_line("bob@example.com", Some("ChatGPT Pro")),
             oauth::CODEX_IMPORT_RUN_LINE.to_string(),
             oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
         ];
@@ -9225,7 +9285,7 @@ mod tests {
     #[test]
     fn the_pooled_codex_verdict_names_a_command_that_parses() {
         for requests in [1, 2] {
-            let verdict = teamclaude_rs::doctor::CodexReport {
+            let verdict = tcr::doctor::CodexReport {
                 port: 3999,
                 rows: Vec::new(),
                 route: tcr_status_wire::CodexRoute {
@@ -9239,7 +9299,7 @@ mod tests {
                 upstream: "https://chatgpt.com".to_string(),
                 upstream_is_default: true,
                 bin: Ok((PathBuf::from("/opt/homebrew/bin/codex"), "PATH".to_string())),
-                env: teamclaude_rs::doctor::CodexEnv::default(),
+                env: tcr::doctor::CodexEnv::default(),
                 login: PathBuf::from("/Users/example/.codex/auth.json"),
                 login_exists: true,
                 requests_10m: Some(requests),
@@ -9281,7 +9341,7 @@ mod tests {
             "--codex-home",
         ] {
             assert!(
-                teamclaude_rs::codex_local::help_has_whole_token(&help, token),
+                tcr::codex_local::help_has_whole_token(&help, token),
                 "`tcr login --help` must carry {token} as a whole token:\n{help}"
             );
         }
@@ -9331,7 +9391,7 @@ mod tests {
     /// the restart hint above once went wrong.
     #[test]
     fn every_command_a_codex_refusal_names_parses() {
-        use teamclaude_rs::provider_guard;
+        use tcr::provider_guard;
         let sentences = [
             provider_guard::reserve_strands_codex(
                 "orchard",
@@ -9435,7 +9495,7 @@ mod tests {
     /// and is being written by a running process).
     fn unique_log_dir(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "teamclaude-rs-test-{tag}-{}-{:?}",
+            "tcr-test-{tag}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -9460,7 +9520,7 @@ mod tests {
         // Goes through the production opener: re-implementing the mode here
         // would assert 0o700 == 0o700 and pass however `open_log_appender`
         // drifts.
-        let _appender = open_log_appender(&dir).expect("open temp log dir");
+        let _appender = open_log_appender(&dir, tcr::paths::LOG_PREFIX).expect("open temp log dir");
         let dir_mode = std::fs::metadata(&dir)
             .expect("stat temp log dir")
             .permissions()
@@ -9495,7 +9555,8 @@ mod tests {
             "test setup sanity: the pre-created dir must actually be 0755"
         );
 
-        let _appender = open_log_appender(&dir).expect("open pre-existing log dir");
+        let _appender =
+            open_log_appender(&dir, tcr::paths::LOG_PREFIX).expect("open pre-existing log dir");
         let dir_mode = std::fs::metadata(&dir)
             .expect("stat temp log dir")
             .permissions()
@@ -9545,15 +9606,14 @@ mod tests {
     /// This is the "it writes", not merely "it initialised", proof: a dropped
     /// `WorkerGuard` (see `headless_subscriber`'s doc-comment) would make
     /// `init_tracing`-style construction succeed while nothing ever lands here.
-    fn read_the_one_log_file(dir: &std::path::Path) -> String {
+    ///
+    /// `prefix` is the one the appender was opened with: the resolved cache
+    /// directory's own, never a fixed name.
+    fn read_the_one_log_file(dir: &std::path::Path, prefix: &str) -> String {
         let mut matches: Vec<_> = std::fs::read_dir(dir)
             .expect("read temp log dir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("teamclaude-rs.log")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
             .collect();
         assert_eq!(
             matches.len(),
@@ -9572,7 +9632,8 @@ mod tests {
     #[test]
     fn headless_logging_reaches_both_the_file_and_stdout() {
         let dir = unique_log_dir("headless-test");
-        let appender = open_log_appender(&dir).expect("open temp log dir");
+        let prefix = tcr::paths::LOG_PREFIX;
+        let appender = open_log_appender(&dir, prefix).expect("open temp log dir");
         let stdout = SharedBuf::default();
         let marker = format!("headless-sink-probe-{}", std::process::id());
 
@@ -9586,7 +9647,7 @@ mod tests {
             tracing::info!("{marker}");
         });
 
-        let on_disk = read_the_one_log_file(&dir);
+        let on_disk = read_the_one_log_file(&dir, prefix);
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             on_disk.contains(&marker),
@@ -9688,14 +9749,23 @@ mod tests {
     /// version of this test justified itself with "this is what `tcr status`
     /// and every diagnostic already read", which was false and is not
     /// repeated here).
+    ///
+    /// Reads this process's real `HOME` to resolve the path, and writes nothing.
     #[test]
     fn the_log_directory_is_the_shared_cache_location() {
-        assert_eq!(log_dir_path(), cache_base_dir().join("logs"));
-        assert!(
-            log_dir_path().ends_with(std::path::Path::new("teamclaude").join("logs")),
-            "log directory must live under the shared teamclaude cache dir: {:?}",
-            log_dir_path()
+        let cache = tcr::paths::cache_dir();
+        let (dir, prefix) = log_location();
+        assert_eq!(dir, cache.root().join("logs"));
+        assert_eq!(
+            Some(cache.root()),
+            tcr::affinity::default_path().parent(),
+            "logs and the pin file share one cache directory"
         );
+        let expected = match cache.generation() {
+            tcr::paths::Generation::Current => tcr::paths::LOG_PREFIX,
+            tcr::paths::Generation::Legacy => tcr::legacy_names::LOG_PREFIX,
+        };
+        assert_eq!(prefix, expected, "the prefix follows the directory");
     }
 
     /// `max_log_files` pruning is real, not merely configured, AND it is the
@@ -9726,7 +9796,18 @@ mod tests {
     /// skipped.
     #[test]
     fn old_log_files_are_pruned_at_max_log_files() {
-        let dir = unique_log_dir("pruning");
+        assert_old_log_files_are_pruned(tcr::paths::LOG_PREFIX, "pruning");
+    }
+
+    /// The same pruning in an install that kept the old cache directory, whose
+    /// logs carry the old prefix: a new prefix there would never prune them.
+    #[test]
+    fn old_log_files_are_pruned_under_the_legacy_prefix() {
+        assert_old_log_files_are_pruned(tcr::legacy_names::LOG_PREFIX, "pruning-legacy");
+    }
+
+    fn assert_old_log_files_are_pruned(prefix: &str, tag: &str) {
+        let dir = unique_log_dir(tag);
         std::fs::create_dir_all(&dir).expect("create temp log dir");
 
         // Five pre-existing dated files, oldest first, each with a distinct
@@ -9734,7 +9815,7 @@ mod tests {
         let oldest = "2020-02-01";
         let survivors = ["2020-02-02", "2020-02-03", "2020-02-04", "2020-02-05"];
         for date in std::iter::once(&oldest).chain(survivors.iter()) {
-            std::fs::write(dir.join(format!("teamclaude-rs.log.{date}")), b"old\n")
+            std::fs::write(dir.join(format!("{prefix}.{date}")), b"old\n")
                 .expect("write stale log file");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -9742,7 +9823,7 @@ mod tests {
         // Production max_log_files(5): prune keeps (5 - 1) = 4 of the 5
         // existing files, then the appender creates one new file for today —
         // 5 total, with only the single oldest pre-existing file removed.
-        let _appender = open_log_appender(&dir).expect("open temp log dir");
+        let _appender = open_log_appender(&dir, prefix).expect("open temp log dir");
 
         let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
             .expect("read temp log dir")
@@ -9756,12 +9837,12 @@ mod tests {
             "at least 2 files must survive pruning: {remaining:?}"
         );
         assert!(
-            !remaining.contains(&format!("teamclaude-rs.log.{oldest}")),
+            !remaining.contains(&format!("{prefix}.{oldest}")),
             "the single oldest file must have been pruned: {remaining:?}"
         );
         for date in survivors {
             assert!(
-                remaining.contains(&format!("teamclaude-rs.log.{date}")),
+                remaining.contains(&format!("{prefix}.{date}")),
                 "pre-existing file {date} must survive pruning: {remaining:?}"
             );
         }
@@ -10040,7 +10121,7 @@ mod tests {
         config.accounts = vec![
             account_with_groups("alice", Some(&["review"])),
             config::Account {
-                provider: teamclaude_rs::provider::Provider::Codex,
+                provider: tcr::provider::Provider::Codex,
                 ..account_with_groups("bob-codex", Some(&["lab", "review"]))
             },
         ];
@@ -10063,7 +10144,7 @@ mod tests {
         config.accounts = vec![
             account_with_groups("alice", Some(&["review"])),
             config::Account {
-                provider: teamclaude_rs::provider::Provider::Codex,
+                provider: tcr::provider::Provider::Codex,
                 ..account_with_groups("bob-codex", Some(&["lab"]))
             },
         ];
@@ -10079,7 +10160,7 @@ mod tests {
             .expect_err("spilling does not give lab a Claude account");
         assert_eq!(
             err.to_string(),
-            teamclaude_rs::provider_guard::group_has_no_claude("lab")
+            tcr::provider_guard::group_has_no_claude("lab")
         );
     }
 
@@ -10090,7 +10171,7 @@ mod tests {
     /// local, get no line.
     #[test]
     fn peer_ls_marks_a_codex_exit_pin_inert() {
-        use teamclaude_rs::provider::Provider;
+        use tcr::provider::Provider;
         let peer = tcr_peer_wire::PeerId([7_u8; 32]);
         let pinned = |name: &str, provider: Provider, strict: bool| config::Account {
             provider,
@@ -10353,7 +10434,7 @@ mod tests {
             let help = sub(path).render_long_help().to_string();
             for token in tokens {
                 assert!(
-                    teamclaude_rs::codex_local::help_has_whole_token(&help, token),
+                    tcr::codex_local::help_has_whole_token(&help, token),
                     "`tcr {} --help` must carry {token} as a whole token:\n{help}",
                     path.join(" ")
                 );

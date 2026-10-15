@@ -319,25 +319,31 @@ one that arrives in the hold's last 20 seconds waits it out instead.
 
 `tcr` keeps two directories. The config directory is always `$HOME/.config`: it does not
 follow `XDG_CONFIG_HOME`, because the Node teamclaude proxy uses that path and `tcr` drops in
-for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable is set, and
-`~/.cache/teamclaude` otherwise.
+for it. The cache directory is `$XDG_CACHE_HOME/tcr` when that variable is set, and
+`~/.cache/tcr` otherwise.
+
+The project used to be called teamclaude, and an install from then keeps its old names: the
+config `~/.config/teamclaude.json` and the cache directory `teamclaude/`, whose logs are
+`teamclaude-rs.log.<date>`. `tcr` uses the new name when it exists, else the old one when that
+exists, else the new one, and it never moves, copies or links an old file. The rule and every
+old name are in `src/paths.rs` and `src/legacy_names.rs`.
 
 | Path | What it holds | Mode |
 |---|---|---|
-| `~/.config/teamclaude.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one | `0600` |
-| `~/.config/.teamclaude.json.tcr-*.tmp` | Left behind when a config write is killed halfway. Same contents as the config, and nothing removes them for you | `0600` |
+| `~/.config/tcr.json` | Every account, with its **working** OAuth access and refresh tokens or API key, and the proxy's own API key if you set one; the older `teamclaude.json` is used when only it exists | `0600` |
+| `~/.config/.tcr.json.tcr-*.tmp` | Left behind when a config write is killed halfway (`.teamclaude.json.tcr-*.tmp` with the older config name). Same contents as the config, and nothing removes them for you | `0600` |
 | `~/.config/tcr-codex-login.*` | Beside the config file, and only while `tcr login --codex` runs: the `CODEX_HOME` it gives `codex login`, holding that sign-in's `auth.json` until tcr has read it. tcr deletes it on every way out it can see; a SIGKILL of tcr can leave one behind, holding a live ChatGPT login | directory `0700` |
 | `<codexHome>/auth.json` | Imported Codex logins only: refreshed tokens are written here with a matching-token guard; other JSON fields and another login are preserved | replacement `0600` |
 | `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem`, and so does `CODEX_CA_CERTIFICATE` for `codex` | `0644`, `0600` |
 | `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts and `chatgpt.com`, its key, and the host list it was made for. tcr decrypts marked `chatgpt.com` connections only while the pool holds a Codex account | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
 | `~/.config/tcr-node.key`, `tcr-node.pub` | Peers only: this Mac's peer identity key pair | `0600`, `0644` |
-| `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater | |
+| `~/.config/tcr/tcr-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater. An install made before the rename has `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` instead | |
 | `<cache>/session-affinity.json` | Which session is pinned to which account | `0600` |
 | `<cache>/session-wire.json` | The Sessions and Tools lists, including up to 120 characters of each slow or running tool call's command | `0600` |
 | `<cache>/peer-state.json` | Peers only: what the proxy has learned about other Macs | `0600` |
 | `<cache>/usage/<UTC-date>.jsonl` | The usage ledger behind `tcr wrap` and the spend figures, one line per request, 90 days by default | directory `0700`, files `0600` |
-| `<cache>/logs/teamclaude-rs.log.<date>` | The server log, which names accounts by email. Five daily files are kept | directory `0700` |
+| `<cache>/logs/tcr.log.<date>` | The server log, which names accounts by email. Five daily files are kept | directory `0700` |
 | `$TMPDIR/teamclaude-rs.log` | The single log file older builds wrote. Newer builds leave it where it was | |
 
 If you also run the Node teamclaude proxy, its `teamclaude-leaf.pem`, `teamclaude-leaf.key` and
@@ -355,7 +361,7 @@ login. The proxy it runs uses the same config and cache files as the CLI.
 ## Verifying a download
 
 Get `tcr` from this repository only: its
-[release page](https://github.com/dhkts1/teamclaude-rs/releases) or `install.sh` from `main`,
+[release page](https://github.com/dhkts1/tcr/releases) or `install.sh` from `main`,
 which downloads from that page. A copy repackaged anywhere else has not been checked by
 anyone here, and it is a program you are about to hand your account tokens to.
 
@@ -363,8 +369,8 @@ anyone here, and it is a program you are about to hand your account tokens to.
 `sha256.sum` lists them all. With both files in one directory:
 
 ```sh
-shasum -a 256 -c teamclaude-rs-aarch64-apple-darwin.tar.xz.sha256
-# expect: teamclaude-rs-aarch64-apple-darwin.tar.xz: OK
+shasum -a 256 -c tcr-aarch64-apple-darwin.tar.xz.sha256
+# expect: tcr-aarch64-apple-darwin.tar.xz: OK
 ```
 
 The file ends in a blank line, so `shasum` also warns that one line is improperly formatted;
@@ -403,11 +409,13 @@ Nothing below runs for you; there is no uninstall command for the CLI.
    `apps/macos/scripts/uninstall.sh` quits TcrBar, which also stops any proxy it was running,
    unregisters the login item and deletes `/Applications/TcrBar.app`. It keeps TcrBar's
    preferences; `defaults delete io.github.dhkts1.tcrbar` clears them.
-4. **Delete the config.** `~/.config/teamclaude.json` holds working credentials for every
-   account in the pool, and they stay valid after `tcr` is gone. Delete it, any
-   `.teamclaude.json.tcr-*.tmp` and `tcr-codex-login.*` folder beside it, and the other
+4. **Delete the config.** `~/.config/tcr.json` and, on an older install,
+   `~/.config/teamclaude.json` hold working credentials for every account in the pool, and
+   they stay valid after `tcr` is gone. Delete both, any `.tcr.json.tcr-*.tmp` or
+   `.teamclaude.json.tcr-*.tmp` and `tcr-codex-login.*` folder beside them, and the other
    `~/.config` files in the table above.
-5. **Delete the cache:** `~/.cache/teamclaude/` (or `$XDG_CACHE_HOME/teamclaude/`). Its logs
+5. **Delete the cache:** `~/.cache/tcr/` and `~/.cache/teamclaude/` (or the same two under
+   `$XDG_CACHE_HOME`). Their logs
    name your accounts, and `session-wire.json` holds fragments of commands your sessions ran.
 6. **Undo what points at the proxy:** any `ANTHROPIC_BASE_URL`, `HTTPS_PROXY`,
    `NODE_EXTRA_CA_CERTS` or `CODEX_CA_CERTIFICATE` you exported, in your shell or in the `env`

@@ -4,8 +4,12 @@
 
 # ── Secrets: real account tokens & config (NEVER commit) ──────
 # The live config holds OAuth access/refresh tokens for real accounts.
-# Default path is ~/.config/teamclaude.json (outside the repo); these
-# patterns fail closed against any copy placed inside it.
+# Default path is ~/.config/tcr.json, or ~/.config/teamclaude.json on an
+# install from before the rename (both outside the repo); these patterns fail
+# closed against any copy placed inside it.
+tcr.json
+tcr*.json
+.tcr.json
 teamclaude.json
 teamclaude*.json
 .teamclaude.json
@@ -32,13 +36,15 @@ ca.*
 # ── Logs & runtime captures ──────────────────────────────────
 *.log
 # `*.log` alone does not match tracing-appender's rotated shape, which
-# suffixes rather than extends the name: `teamclaude-rs.log.2026-08-08` ends
-# in the date, not `.log`, and account emails + request paths live in it. The
-# trailing dot below is deliberate: `teamclaude-rs.log.*` matches only names
-# that continue PAST `.log` (the rotated date suffixes) and leaves the bare
-# `teamclaude-rs.log` to the pre-existing `*.log` rule above — a bare `*`
-# here would also swallow an unrelated future source file like
-# `teamclaude-rs.logic.rs`, which must never be silently ignored.
+# suffixes rather than extends the name: `tcr.log.2026-08-08` ends in the
+# date, not `.log`, and account emails + request paths live in it. The
+# trailing dot below is deliberate: `tcr.log.*` matches only names that
+# continue PAST `.log` (the rotated date suffixes) and leaves the bare
+# `tcr.log` to the pre-existing `*.log` rule above — a bare `*` here would
+# also swallow an unrelated future source file like `tcr.logic.rs`, which
+# must never be silently ignored. `teamclaude-rs.log.*` is the same rule for
+# the name installs from before the rename keep writing.
+tcr.log.*
 teamclaude-rs.log.*
 *.jsonl
 tcr-capture*

@@ -146,9 +146,10 @@ fn decide(
         MitmStatus::LEAF_JS => (
             JS_LEAF,
             format!(
-                "the proxy on :{port} is serving the JS teamclaude leaf, which covers \
+                "the proxy on :{port} is serving the JS {} leaf, which covers \
                  api.anthropic.com only and is never re-minted — a restart will not change \
-                 this; see docs/troubleshooting.md"
+                 this; see docs/troubleshooting.md",
+                crate::legacy_names::JS_PROXY_BIN
             ),
         ),
         MitmStatus::LEAF_NONE => (
@@ -286,6 +287,12 @@ mod tests {
     /// Mismatches are collected, so a regression names every row it breaks.
     #[test]
     fn every_code_carries_the_launchers_reason_verbatim() {
+        let js_leaf_reason = format!(
+            "the proxy on :3999 is serving the JS {} leaf, which covers \
+             api.anthropic.com only and is never re-minted — a restart will not change \
+             this; see docs/troubleshooting.md",
+            crate::legacy_names::JS_PROXY_BIN
+        );
         let no_server = LiveStatusError::NoServer;
         let no_answer = LiveStatusError::NoAnswer("the server did not answer within 5s".into());
         let predates = payload(None, 1, None);
@@ -345,15 +352,7 @@ mod tests {
                 "the proxy on :3999 (build abc1234) predates Codex interception — restart it on \
                  this build at a quiet moment",
             ),
-            (
-                Ok(&js),
-                true,
-                1,
-                JS_LEAF,
-                "the proxy on :3999 is serving the JS teamclaude leaf, which covers \
-                 api.anthropic.com only and is never re-minted — a restart will not change \
-                 this; see docs/troubleshooting.md",
-            ),
+            (Ok(&js), true, 1, JS_LEAF, &js_leaf_reason),
             (
                 Ok(&off),
                 true,

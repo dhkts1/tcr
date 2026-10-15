@@ -35,14 +35,14 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use tcr_peer_wire::{Control, Lease, LeaseUnit, Window};
-use teamclaude_rs::fallback::Ask;
-use teamclaude_rs::peer::config::LendMode;
-use teamclaude_rs::peer::lease::{
+use tcr::fallback::Ask;
+use tcr::peer::config::LendMode;
+use tcr::peer::lease::{
     bearer_fingerprint, handed_tokens, handoff_for, handoff_push_is_due, handoff_renewal_due,
     lease_has_ended, serve_on_handed_bearer, usage_hint, HandedBearer, HandedTokens, Ledger,
     HANDOFF_RENEW_LEAD_MS,
 };
+use tcr_peer_wire::{Control, Lease, LeaseUnit, Window};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
@@ -365,7 +365,7 @@ fn a_handoff_is_built_only_for_a_live_hand_grant() {
     let now_ms = 1_000_000;
     let live = lease(9, now_ms + 60_000, None);
     let bearer = || {
-        Some(teamclaude_rs::manager::HandedCredential {
+        Some(tcr::manager::HandedCredential {
             access_token: OWNER_FAKE_BEARER.to_string(),
             expires_at_ms: now_ms + 60_000,
             utilization: 0.4,
@@ -478,8 +478,8 @@ fn a_formatted_handoff_never_carries_the_bearer() {
 /// `src/peer/listener.rs`: the enrolment assertion below fails by name.
 #[test]
 fn a_bearer_goes_out_on_a_return_visit_and_on_no_other_handshake() {
-    use teamclaude_rs::peer::listener::handoff_is_permitted;
-    use teamclaude_rs::peer::noise::Handshake;
+    use tcr::peer::listener::handoff_is_permitted;
+    use tcr::peer::noise::Handshake;
 
     assert!(
         handoff_is_permitted(Handshake::Return),
@@ -523,7 +523,7 @@ fn a_bearer_goes_out_on_a_return_visit_and_on_no_other_handshake() {
 #[test]
 fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
     let manager_with = |accounts: &str| {
-        let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+        let config: tcr::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "http://127.0.0.1:1",
@@ -533,7 +533,7 @@ fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
             }}"#
         ))
         .expect("the inline config parses");
-        teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+        tcr::manager::Manager::with_live_refresher(config, None)
     };
     let two = r#"{
             "name": "first@example.com",
@@ -631,7 +631,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
         }"#;
 
     let manager_with = |accounts: String| {
-        let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+        let config: tcr::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "http://127.0.0.1:1",
@@ -641,7 +641,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
             }}"#
         ))
         .expect("the inline config parses");
-        teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+        tcr::manager::Manager::with_live_refresher(config, None)
     };
 
     // The pinned account is FIRST, so a handoff that ignored the pin would
@@ -694,7 +694,7 @@ fn a_strictly_pinned_account_is_never_handed_over() {
 #[test]
 fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
     let manager_with = |accounts: &str| {
-        let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+        let config: tcr::config::Config = serde_json::from_str(&format!(
             r#"{{
                 "proxy": {{ "port": 0 }},
                 "upstream": "http://127.0.0.1:1",
@@ -704,7 +704,7 @@ fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
             }}"#
         ))
         .expect("the inline config parses");
-        teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+        tcr::manager::Manager::with_live_refresher(config, None)
     };
     let two = r#"{
             "name": "held@example.com",
@@ -799,7 +799,7 @@ fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
         std::fs::set_permissions(&peers, std::fs::Permissions::from_mode(0o600))
             .expect("0600 on the peers file");
     }
-    let store = teamclaude_rs::peer::config::PeerStore::open(&peers).expect("the peers file reads");
+    let store = tcr::peer::config::PeerStore::open(&peers).expect("the peers file reads");
     let ask = tcr_peer_wire::LeaseRequest {
         window: Window::FiveHour,
         unit: LeaseUnit::Fraction(0.20),
@@ -952,7 +952,7 @@ fn an_expired_bearer_is_not_handed_over() {
         handoff_for(
             LendMode::Hand,
             &live,
-            Some(teamclaude_rs::manager::HandedCredential {
+            Some(tcr::manager::HandedCredential {
                 access_token: OWNER_FAKE_BEARER.to_string(),
                 expires_at_ms: now_ms,
                 utilization: 0.4,
@@ -966,7 +966,7 @@ fn an_expired_bearer_is_not_handed_over() {
         handoff_for(
             LendMode::Hand,
             &live,
-            Some(teamclaude_rs::manager::HandedCredential {
+            Some(tcr::manager::HandedCredential {
                 access_token: OWNER_FAKE_BEARER.to_string(),
                 expires_at_ms: now_ms - 1,
                 utilization: 0.4,
@@ -980,7 +980,7 @@ fn an_expired_bearer_is_not_handed_over() {
         handoff_for(
             LendMode::Hand,
             &live,
-            Some(teamclaude_rs::manager::HandedCredential {
+            Some(tcr::manager::HandedCredential {
                 access_token: OWNER_FAKE_BEARER.to_string(),
                 expires_at_ms: now_ms + 1,
                 utilization: 0.4,
@@ -1159,9 +1159,9 @@ async fn owner_lending_expiring(
     lend: &str,
     expires_at_ms: i64,
 ) -> Owner {
-    use teamclaude_rs::peer::config::PeerStore;
-    use teamclaude_rs::peer::id::NodeKey;
-    use teamclaude_rs::peer::listener::{self, LeaseServing, SessionContext};
+    use tcr::peer::config::PeerStore;
+    use tcr::peer::id::NodeKey;
+    use tcr::peer::listener::{self, LeaseServing, SessionContext};
 
     let home = tempfile::tempdir().expect("a temp home");
     let peers = home.path().join("tcr-peers.json");
@@ -1190,7 +1190,7 @@ async fn owner_lending_expiring(
             .expect("0600 on the peers file");
     }
 
-    let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+    let config: tcr::config::Config = serde_json::from_str(&format!(
         r#"{{
             "proxy": {{ "port": 0 }},
             "upstream": "http://127.0.0.1:1",
@@ -1208,7 +1208,7 @@ async fn owner_lending_expiring(
         }}"#
     ))
     .expect("the inline owner config parses");
-    let manager = teamclaude_rs::manager::Manager::with_live_refresher(config, None);
+    let manager = tcr::manager::Manager::with_live_refresher(config, None);
     // THE OWNER'S OWN WINDOW, measured, because a `hand` grant hands a bearer
     // over only for an account whose window this Mac has read: the borrower
     // reports its spend as a rise above that figure, and there is no honest
@@ -1240,7 +1240,7 @@ async fn owner_lending_expiring(
         LeaseServing {
             ledger: ledger.clone(),
             upstream: "http://127.0.0.1:1".to_string(),
-            utilization: Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+            utilization: Arc::new(tcr::peer::serve::NoFleetUtilization),
             manager,
         },
     ));
@@ -1270,10 +1270,10 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
     let mut stream = tokio::net::TcpStream::connect(owner.addr)
         .await
         .expect("connect to the owner");
-    let mut session = teamclaude_rs::peer::noise::dial_handshake(
+    let mut session = tcr::peer::noise::dial_handshake(
         &mut stream,
         secret,
-        teamclaude_rs::peer::noise::Handshake::Return,
+        tcr::peer::noise::Handshake::Return,
         Some(&owner.public),
         None,
     )
@@ -1285,9 +1285,9 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: teamclaude_rs::peer::lease::random_id().expect("a request id"),
+        request_id: tcr::peer::lease::random_id().expect("a request id"),
     };
-    teamclaude_rs::peer::serve::send_control(&mut stream, &mut session, &header)
+    tcr::peer::serve::send_control(&mut stream, &mut session, &header)
         .await
         .expect("the header goes");
     let ask = tcr_peer_wire::LeaseRequest {
@@ -1296,15 +1296,11 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
         ttl_s: 300,
         max_inflight: 2,
     };
-    teamclaude_rs::peer::serve::send_control(
-        &mut stream,
-        &mut session,
-        &Control::LeaseRequest(ask),
-    )
-    .await
-    .expect("the ask goes");
+    tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
+        .await
+        .expect("the ask goes");
 
-    let granted: Control = teamclaude_rs::peer::serve::recv_control(&mut stream, &mut session)
+    let granted: Control = tcr::peer::serve::recv_control(&mut stream, &mut session)
         .await
         .expect("the owner answers the ask");
     let Control::LeaseGrant(grant) = granted else {
@@ -1318,7 +1314,7 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
     // close.
     let next = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        teamclaude_rs::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+        tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
     )
     .await;
     let next = match next {
@@ -1343,7 +1339,7 @@ async fn ask_for_a_lease(owner: &Owner, secret: &[u8; 32]) -> (Lease, Option<Con
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ended_hand_grant_beside_a_live_serve_grant_hands_nothing_over() {
     let (borrower_secret, borrower_public) =
-        teamclaude_rs::peer::noise::generate_static().expect("a borrower keypair");
+        tcr::peer::noise::generate_static().expect("a borrower keypair");
     let borrower = tcr_peer_wire::PeerId(borrower_public);
     // `until` is unix SECONDS and this one is in 1970, so `LendGrant::has_ended`
     // is true for it on any clock this test can run on.
@@ -1403,7 +1399,7 @@ async fn an_ended_hand_grant_beside_a_live_serve_grant_hands_nothing_over() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_poisoned_lease_ledger_hands_nothing_over() {
     let (borrower_secret, borrower_public) =
-        teamclaude_rs::peer::noise::generate_static().expect("a borrower keypair");
+        tcr::peer::noise::generate_static().expect("a borrower keypair");
     let borrower = tcr_peer_wire::PeerId(borrower_public);
     let owner = owner_serving(borrower, "hand").await;
 
@@ -1428,10 +1424,10 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
     let mut stream = tokio::net::TcpStream::connect(owner.addr)
         .await
         .expect("connect to the owner");
-    let mut session = teamclaude_rs::peer::noise::dial_handshake(
+    let mut session = tcr::peer::noise::dial_handshake(
         &mut stream,
         &borrower_secret,
-        teamclaude_rs::peer::noise::Handshake::Return,
+        tcr::peer::noise::Handshake::Return,
         Some(&owner.public),
         None,
     )
@@ -1442,9 +1438,9 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: teamclaude_rs::peer::lease::random_id().expect("a request id"),
+        request_id: tcr::peer::lease::random_id().expect("a request id"),
     };
-    teamclaude_rs::peer::serve::send_control(&mut stream, &mut session, &header)
+    tcr::peer::serve::send_control(&mut stream, &mut session, &header)
         .await
         .expect("the header goes");
     let ask = tcr_peer_wire::LeaseRequest {
@@ -1453,13 +1449,9 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
         ttl_s: 300,
         max_inflight: 2,
     };
-    teamclaude_rs::peer::serve::send_control(
-        &mut stream,
-        &mut session,
-        &Control::LeaseRequest(ask),
-    )
-    .await
-    .expect("the ask goes");
+    tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
+        .await
+        .expect("the ask goes");
 
     // Every frame this session can still read, and there must be none: the
     // refusal closes the stream. Two reads, because the defect answered with a
@@ -1468,7 +1460,7 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
     for _ in 0..2 {
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            teamclaude_rs::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+            tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
         )
         .await;
         match next {
@@ -1517,7 +1509,7 @@ async fn a_poisoned_lease_ledger_hands_nothing_over() {
 async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
     for (mode, expect_handoff) in [("hand", true), ("serve", false)] {
         let (borrower_secret, borrower_public) =
-            teamclaude_rs::peer::noise::generate_static().expect("a borrower keypair");
+            tcr::peer::noise::generate_static().expect("a borrower keypair");
         let borrower = tcr_peer_wire::PeerId(borrower_public);
         // The same fixture with the one word changed, which is the only
         // difference the two legs rest on.
@@ -1526,10 +1518,10 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
         let mut stream = tokio::net::TcpStream::connect(owner.addr)
             .await
             .expect("connect to the owner");
-        let mut session = teamclaude_rs::peer::noise::dial_handshake(
+        let mut session = tcr::peer::noise::dial_handshake(
             &mut stream,
             &borrower_secret,
-            teamclaude_rs::peer::noise::Handshake::Return,
+            tcr::peer::noise::Handshake::Return,
             Some(&owner.public),
             None,
         )
@@ -1541,9 +1533,9 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
             target: None,
             via: Vec::new(),
             hops_remaining: 1,
-            request_id: teamclaude_rs::peer::lease::random_id().expect("a request id"),
+            request_id: tcr::peer::lease::random_id().expect("a request id"),
         };
-        teamclaude_rs::peer::serve::send_control(&mut stream, &mut session, &header)
+        tcr::peer::serve::send_control(&mut stream, &mut session, &header)
             .await
             .expect("the header goes");
         let ask = tcr_peer_wire::LeaseRequest {
@@ -1552,15 +1544,11 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
             ttl_s: 300,
             max_inflight: 2,
         };
-        teamclaude_rs::peer::serve::send_control(
-            &mut stream,
-            &mut session,
-            &Control::LeaseRequest(ask),
-        )
-        .await
-        .expect("the ask goes");
+        tcr::peer::serve::send_control(&mut stream, &mut session, &Control::LeaseRequest(ask))
+            .await
+            .expect("the ask goes");
 
-        let granted: Control = teamclaude_rs::peer::serve::recv_control(&mut stream, &mut session)
+        let granted: Control = tcr::peer::serve::recv_control(&mut stream, &mut session)
             .await
             .expect("the owner answers the ask");
         let Control::LeaseGrant(grant) = granted else {
@@ -1574,7 +1562,7 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
         // in serve mode nothing comes at all and the read waits for the close.
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            teamclaude_rs::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+            tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
         )
         .await;
 
@@ -1660,7 +1648,7 @@ async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
         let borrower_peers = borrower_home.path().join("tcr-peers.json");
         // `request_lease` mints the borrower's key beside its peers file, so
         // the id the owner has to pin is read from there and not invented.
-        let borrower = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+        let borrower = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
             .expect("the borrower's node key")
             .id();
         let owner = owner_serving(borrower, mode).await;
@@ -1699,7 +1687,7 @@ async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
             std::fs::set_permissions(&borrower_peers, std::fs::Permissions::from_mode(0o600))
                 .expect("0600 on the peers file");
         }
-        let store = teamclaude_rs::peer::config::PeerStore::open(&borrower_peers)
+        let store = tcr::peer::config::PeerStore::open(&borrower_peers)
             .expect("the borrower's peers file reads");
 
         let ask = tcr_peer_wire::LeaseRequest {
@@ -1708,14 +1696,11 @@ async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
             ttl_s: 300,
             max_inflight: 2,
         };
-        let lease = teamclaude_rs::peer::lease::request_lease(
-            &store,
-            &tcr_peer_wire::PeerId(owner.public),
-            &ask,
-        )
-        .await
-        .expect("the ask reaches the owner")
-        .expect("the owner grants a lease in both modes");
+        let lease =
+            tcr::peer::lease::request_lease(&store, &tcr_peer_wire::PeerId(owner.public), &ask)
+                .await
+                .expect("the ask reaches the owner")
+                .expect("the owner grants a lease in both modes");
 
         let bearer_of = |lease_id: u128| {
             handed_tokens()
@@ -1782,7 +1767,7 @@ async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
 async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let borrower = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's node key")
         .id();
     let owner = owner_serving(borrower, "hand").await;
@@ -1819,10 +1804,10 @@ async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
         std::fs::set_permissions(&borrower_peers, std::fs::Permissions::from_mode(0o600))
             .expect("0600 on the peers file");
     }
-    let store = teamclaude_rs::peer::config::PeerStore::open(&borrower_peers)
+    let store = tcr::peer::config::PeerStore::open(&borrower_peers)
         .expect("the borrower's peers file reads");
 
-    let lease = teamclaude_rs::peer::lease::request_lease(
+    let lease = tcr::peer::lease::request_lease(
         &store,
         &tcr_peer_wire::PeerId(owner.public),
         &tcr_peer_wire::LeaseRequest {
@@ -1923,7 +1908,7 @@ async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     let (borrower_secret, borrower_public) =
-        teamclaude_rs::peer::noise::generate_static().expect("a borrower keypair");
+        tcr::peer::noise::generate_static().expect("a borrower keypair");
     let borrower = tcr_peer_wire::PeerId(borrower_public);
     // Inside the renewal lead, so every poll finds one due.
     let expires_at_ms = crate_now_ms() + HANDOFF_RENEW_LEAD_MS / 2;
@@ -1944,10 +1929,10 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     let mut stream = tokio::net::TcpStream::connect(owner.addr)
         .await
         .expect("connect to the owner");
-    let mut session = teamclaude_rs::peer::noise::dial_handshake(
+    let mut session = tcr::peer::noise::dial_handshake(
         &mut stream,
         &borrower_secret,
-        teamclaude_rs::peer::noise::Handshake::Return,
+        tcr::peer::noise::Handshake::Return,
         Some(&owner.public),
         None,
     )
@@ -1959,12 +1944,12 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
         target: None,
         via: Vec::new(),
         hops_remaining: 1,
-        request_id: teamclaude_rs::peer::lease::random_id().expect("a request id"),
+        request_id: tcr::peer::lease::random_id().expect("a request id"),
     };
-    teamclaude_rs::peer::serve::send_control(&mut stream, &mut session, &header)
+    tcr::peer::serve::send_control(&mut stream, &mut session, &header)
         .await
         .expect("the header goes");
-    teamclaude_rs::peer::serve::send_control(
+    tcr::peer::serve::send_control(
         &mut stream,
         &mut session,
         &Control::LeaseRequest(tcr_peer_wire::LeaseRequest {
@@ -1977,7 +1962,7 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     .await
     .expect("the ask goes");
 
-    let granted: Control = teamclaude_rs::peer::serve::recv_control(&mut stream, &mut session)
+    let granted: Control = tcr::peer::serve::recv_control(&mut stream, &mut session)
         .await
         .expect("the owner answers the ask");
     let Control::LeaseGrant(grant) = granted else {
@@ -2001,7 +1986,7 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     for _ in 0..2 {
         let read = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            teamclaude_rs::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+            tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
         )
         .await;
         let Ok(Ok(Control::Handoff {
@@ -2035,7 +2020,7 @@ async fn the_owner_hands_a_bearer_once_and_stops_at_revoke() {
     std::fs::write(&peers, stripped).expect("rewrite the peers file");
     let after = tokio::time::timeout(
         std::time::Duration::from_secs(4),
-        teamclaude_rs::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
+        tcr::peer::serve::recv_control::<_, Control>(&mut stream, &mut session),
     )
     .await;
     assert!(
@@ -2224,7 +2209,7 @@ fn a_strict_local_pin_refuses_a_hand_grant_at_lend_time() {
 /// `EgressPin::may_be_handed` and the unresolvable index reads as lendable.
 #[test]
 fn an_account_index_the_exit_locks_do_not_cover_is_refused() {
-    use teamclaude_rs::config::{Egress, EgressPin};
+    use tcr::config::{Egress, EgressPin};
 
     let free = EgressPin {
         egress: Egress::Local,

@@ -54,12 +54,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
-use teamclaude_rs::manager::{InFlightGuard, Manager};
-use teamclaude_rs::model::is_fable_model;
-use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use teamclaude_rs::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
-use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::manager::{InFlightGuard, Manager};
+use tcr::model::is_fable_model;
+use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
+use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 use time::{Duration, OffsetDateTime};
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ fn to_ms(at: OffsetDateTime) -> i64 {
 fn account(name: &str, priority: i64) -> Account {
     Account {
         name: name.to_string(),
-        account_type: teamclaude_rs::config::AccountType::OAuth,
+        account_type: tcr::config::AccountType::OAuth,
         provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
@@ -118,7 +118,7 @@ fn account(name: &str, priority: i64) -> Account {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
-        egress: teamclaude_rs::config::Egress::Local,
+        egress: tcr::config::Egress::Local,
         egress_strict: false,
         codex_home: None,
         extra: serde_json::Map::new(),
@@ -139,11 +139,7 @@ fn pacing(cap: u32) -> PacingConfig {
 /// takes them.
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(
-        &self,
-        _provider: teamclaude_rs::provider::Provider,
-        _refresh_token: String,
-    ) -> RefreshFuture {
+    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
         Box::pin(async {
             Err(OAuthError::Transient(
                 "no refresher in workload tests".into(),
@@ -154,7 +150,7 @@ impl TokenRefresher for NeverRefreshes {
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _credential: teamclaude_rs::probe::ProbeCredential) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -226,7 +222,7 @@ impl Fleet {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
-            codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
+            codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: SWITCH_THRESHOLD,
             fable_weekly_threshold: None,
             pacing,

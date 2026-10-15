@@ -119,7 +119,7 @@ fn scratch_home_answering(
     answer: &'static str,
 ) -> (tempfile::TempDir, PathBuf, Arc<AtomicUsize>) {
     let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
-    let config = home.path().join(".config").join("teamclaude.json");
+    let config = home.path().join(".config").join(tcr::paths::CONFIG_FILE);
     std::fs::create_dir_all(config.parent().expect("the config has a parent"))
         .expect("creating the scratch .config dir");
     let (upstream, answered) = spawn_codex_upstream(answer);
@@ -682,8 +682,8 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
     );
     let consequence = format!(
         "{} {}",
-        teamclaude_rs::oauth::CODEX_IMPORT_CONSEQUENCE,
-        teamclaude_rs::oauth::CODEX_IMPORT_OLDER_PROXY
+        tcr::oauth::CODEX_IMPORT_CONSEQUENCE,
+        tcr::oauth::CODEX_IMPORT_OLDER_PROXY
     );
     assert_eq!(
         events(&out),
@@ -691,7 +691,7 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
             serde_json::json!({"event": "notice", "text": consequence}),
             serde_json::json!({
                 "event": "notice",
-                "text": teamclaude_rs::oauth::CODEX_FIRST_ACCOUNT_NOTICE
+                "text": tcr::oauth::CODEX_FIRST_ACCOUNT_NOTICE
             }),
             serde_json::json!({
                 "account": "alice@example.com",

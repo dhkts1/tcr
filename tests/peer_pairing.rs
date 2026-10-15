@@ -29,13 +29,13 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tcr::peer::config::{self, NetworkKey, PeerFile};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::noise::{self, Handshake};
+use tcr::peer::pair;
+use tcr::peer::state::{self, BanReason, PeerState};
 use tcr_peer_wire::{InstanceId, Knock, PeerId, INSTANCE_ID_BYTES};
-use teamclaude_rs::peer::config::{self, NetworkKey, PeerFile};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, SessionContext};
-use teamclaude_rs::peer::noise::{self, Handshake};
-use teamclaude_rs::peer::pair;
-use teamclaude_rs::peer::state::{self, BanReason, PeerState};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -2197,7 +2197,7 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
     );
     assert_eq!(
         parsed["caps"]["foundRows"].as_u64(),
-        Some(teamclaude_rs::peer::discovery::MAX_FOUND_ROWS as u64)
+        Some(tcr::peer::discovery::MAX_FOUND_ROWS as u64)
     );
 
     // `accept` by instance id opens a window for that one Mac.
@@ -3018,15 +3018,13 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
         .find(|row| row.node == b.key.id())
         .expect("A has a row for B");
     assert!(
-        teamclaude_rs::peer::serve::dial_peer(&stale_row)
-            .await
-            .is_none(),
+        tcr::peer::serve::dial_peer(&stale_row).await.is_none(),
         "the control: A's only endpoint for B is a port nobody listens on, so the dial \
          must fail before the Hello, otherwise the last assertion proves nothing"
     );
 
     // ---- B says hello to A, over the endpoint B has for A.
-    let answered = teamclaude_rs::peer::serve::say_hello(&b_store, &a.key.id())
+    let answered = tcr::peer::serve::say_hello(&b_store, &a.key.id())
         .await
         .expect("the hello round trip completes")
         .expect("A is pinned and answered");
@@ -3057,9 +3055,7 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
          survived"
     );
     assert!(
-        teamclaude_rs::peer::serve::dial_peer(&refreshed)
-            .await
-            .is_some(),
+        tcr::peer::serve::dial_peer(&refreshed).await.is_some(),
         "A dials the port B announced and B answers: {:?}",
         refreshed.endpoints
     );
@@ -3084,7 +3080,7 @@ async fn a_peer_that_moved_announces_its_new_port_and_is_reached_there() {
 /// constructor and the second assertion reads `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_completed_return_visit_registers_the_pairs_rendezvous_secret() {
-    use teamclaude_rs::peer::reach;
+    use tcr::peer::reach;
 
     let node = Node::new("rendezvous-secret");
     let (peer_secret, peer_public) = noise::generate_static().expect("a peer keypair");
@@ -3233,7 +3229,7 @@ async fn a_hello_carries_a_brief_for_a_mutual_friend_and_the_far_side_records_it
          about an address B always had"
     );
 
-    let answered = teamclaude_rs::peer::serve::say_hello(&b_store, &a.key.id())
+    let answered = tcr::peer::serve::say_hello(&b_store, &a.key.id())
         .await
         .expect("the hello round trip completes")
         .expect("A is pinned and answered");
@@ -3467,7 +3463,7 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
 /// reads `serve` and `until` reads null.
 #[test]
 fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
-    use teamclaude_rs::peer::config::{LendGrant, LendMode};
+    use tcr::peer::config::{LendGrant, LendMode};
 
     let mac = Node::new("share-preserves-mode");
     let mut file = mac.file();
@@ -3550,9 +3546,9 @@ fn share_on_keeps_the_mode_and_the_window_of_the_grant_it_replaces() {
 fn pinned_row(
     node: PeerId,
     label: &str,
-    grant: teamclaude_rs::peer::config::LendGrant,
-) -> teamclaude_rs::peer::config::PeerRow {
-    teamclaude_rs::peer::config::PeerRow {
+    grant: tcr::peer::config::LendGrant,
+) -> tcr::peer::config::PeerRow {
+    tcr::peer::config::PeerRow {
         node,
         label: label.to_string(),
         endpoints: Vec::new(),
@@ -3670,26 +3666,22 @@ fn a_reservation_placeholder_is_never_selected() {
 fn a_learned_key_survives_the_window_it_was_learned_in() {
     let mut state = PeerState::default();
     let learned = PeerId([0x44; 32]);
-    state
-        .accepted
-        .push(teamclaude_rs::peer::state::AcceptedInstance {
-            instance_id: InstanceId([0x01; INSTANCE_ID_BYTES]),
-            addr: "192.0.2.30".to_string(),
-            until_ms: 2_000,
-            opened_at_ms: 1_000,
-            learned_key: Some(learned),
-        });
+    state.accepted.push(tcr::peer::state::AcceptedInstance {
+        instance_id: InstanceId([0x01; INSTANCE_ID_BYTES]),
+        addr: "192.0.2.30".to_string(),
+        until_ms: 2_000,
+        opened_at_ms: 1_000,
+        learned_key: Some(learned),
+    });
     // A window with no key at all: it goes, which is what keeps the kept rows
     // from being "expire stopped working".
-    state
-        .accepted
-        .push(teamclaude_rs::peer::state::AcceptedInstance {
-            instance_id: InstanceId([0x02; INSTANCE_ID_BYTES]),
-            addr: "192.0.2.31".to_string(),
-            until_ms: 2_000,
-            opened_at_ms: 1_000,
-            learned_key: None,
-        });
+    state.accepted.push(tcr::peer::state::AcceptedInstance {
+        instance_id: InstanceId([0x02; INSTANCE_ID_BYTES]),
+        addr: "192.0.2.31".to_string(),
+        until_ms: 2_000,
+        opened_at_ms: 1_000,
+        learned_key: None,
+    });
 
     let after_the_window = 900_000;
     state.expire(after_the_window);
@@ -4158,7 +4150,7 @@ fn the_announced_wait_is_the_deadline_the_command_keeps() {
     let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
         .expect("main.rs reads");
     assert!(
-        main.contains("wait_seconds: teamclaude_rs::peer::pair::PAIR_WAIT.as_secs()"),
+        main.contains("wait_seconds: tcr::peer::pair::PAIR_WAIT.as_secs()"),
         "the asking line no longer takes its wait from PAIR_WAIT, so the panel's deadline and \
          the command's can drift apart"
     );
@@ -4628,7 +4620,7 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
     );
     let ask_line = mint_out
         .lines()
-        .find(|line| line.starts_with(teamclaude_rs::peer::ask::ASK_PREFIX))
+        .find(|line| line.starts_with(tcr::peer::ask::ASK_PREFIX))
         .unwrap_or_else(|| panic!("no ask line on stdout: {mint_out}"))
         .to_string();
     assert!(
@@ -4660,7 +4652,7 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
     );
     let reply_line = answer_stdout
         .lines()
-        .find(|line| line.starts_with(teamclaude_rs::peer::ask::REPLY_PREFIX))
+        .find(|line| line.starts_with(tcr::peer::ask::REPLY_PREFIX))
         .unwrap_or_else(|| panic!("no reply line on stdout: {answer_stdout}"))
         .to_string();
     assert!(

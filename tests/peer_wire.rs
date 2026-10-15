@@ -11,10 +11,10 @@
 //! last gate un-ignores and stays green: `cargo test -- --ignored --list`
 //! prints nothing from this file.
 
+use tcr::peer::listener::{peer_stream_gate_rows, StreamRefusal};
 use tcr_peer_wire::{
     Control, LabelRefusal, LeaseUnit, PeerId, StreamHeader, StreamKind, Window, MAX_LABEL_BYTES,
 };
-use teamclaude_rs::peer::listener::{peer_stream_gate_rows, StreamRefusal};
 
 /// The invariant the whole design rests on: **no credential field on the peer
 /// wire, ever.**

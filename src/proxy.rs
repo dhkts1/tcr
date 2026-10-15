@@ -22528,7 +22528,7 @@ mod tests {
     #[tokio::test]
     async fn a_live_delete_of_the_last_codex_account_reads_as_no_codex_account() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         let config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
         let write = |accounts: &[Account]| {
             std::fs::write(
@@ -22611,7 +22611,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_the_last_claude_account_returns_the_no_account_message() {
         let dir = tempfile::tempdir().expect("temporary config");
-        let path = dir.path().join("teamclaude.json");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
         let config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
         let write = |accounts: &[Account]| {
             std::fs::write(

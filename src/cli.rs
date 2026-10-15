@@ -9386,9 +9386,14 @@ mod tests {
                                   https://gateway.example.com";
 
     /// The JS-leaf route's reason, as `tcr run --codex` words it for a proxy on :3999.
-    const JS_LEAF_REASON: &str = "the proxy on :3999 is serving the JS teamclaude leaf, which \
-                                  covers api.anthropic.com only and is never re-minted — a \
-                                  restart will not change this; see docs/troubleshooting.md";
+    fn js_leaf_reason() -> String {
+        format!(
+            "the proxy on :3999 is serving the JS {} leaf, which covers api.anthropic.com \
+             only and is never re-minted — a restart will not change this; see \
+             docs/troubleshooting.md",
+            crate::legacy_names::JS_PROXY_BIN
+        )
+    }
 
     /// The status read of a proxy on :3999, as `fetch_live_status` hands it over: parsed from
     /// the wire, with `mitm` as given, `codex_rows` Codex accounts and `traffic` as its counts.
@@ -9477,7 +9482,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            format!("codexVerdict: codex is not pooled: {JS_LEAF_REASON}")
+            format!("codexVerdict: codex is not pooled: {}", js_leaf_reason())
         );
         assert!(lines[1].starts_with("status source="), "{text}");
 
@@ -9486,7 +9491,7 @@ mod tests {
         assert_eq!(lines[0], CLAUDE_VERDICT, "Claude's verdict stays first");
         assert_eq!(
             lines[1],
-            format!("codexVerdict: codex is not pooled: {JS_LEAF_REASON}")
+            format!("codexVerdict: codex is not pooled: {}", js_leaf_reason())
         );
         assert!(lines[2].starts_with("status source="), "{text}");
 
@@ -9512,7 +9517,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            format!("verdict: codex is not pooled: {JS_LEAF_REASON}")
+            format!("verdict: codex is not pooled: {}", js_leaf_reason())
         );
         assert!(lines[1].starts_with("status source="), "{text}");
         assert!(
@@ -10409,14 +10414,14 @@ mod tests {
                     slow(
                         "Read",
                         0.4,
-                        "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+                        "Read /Users/example/git/tcr/src/session_wire.rs",
                         None,
                         ms(-280 * SECOND_MS),
                     ),
                     slow(
                         "Read",
                         0.1,
-                        "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+                        "Read /Users/example/git/tcr/src/proxy.rs",
                         None,
                         ms(-350 * SECOND_MS),
                     ),

@@ -1959,7 +1959,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let mut background: Vec<JoinHandle<()>> = Vec::new();
 
     // Session-affinity pins survive a restart via their own cache file (NOT the
-    // credential config — see `teamclaude_rs::affinity`). Restore before the
+    // credential config — see `tcr::affinity`). Restore before the
     // listener binds, so the first request after a bounce already routes on its
     // old pin instead of cold-starting the account's prompt cache.
     //
@@ -2028,7 +2028,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         })));
     }
 
-    // The account-bound-token map (see `teamclaude_rs::bound_tokens`) survives a restart the
+    // The account-bound-token map (see `tcr::bound_tokens`) survives a restart the
     // same way pins do, and for a sharper reason: a restart is exactly when live conversations
     // get re-keyed onto other accounts, and a conversation carrying an advisor result, a
     // thinking signature or server-side thread state is rejected outright on every remaining
@@ -3195,7 +3195,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn booting_beside_a_sharing_peers_file_wires_the_peer_lease_fallback() {
         let home = tempfile::tempdir().expect("a temp home");
-        let config_path = home.path().join("teamclaude.json");
+        let config_path = home.path().join(crate::paths::CONFIG_FILE);
         std::fs::write(&config_path, br#"{"accounts": []}"#).expect("the temp config writes");
 
         // The lender: a socket that accepts one connection, records it, and
@@ -3302,10 +3302,9 @@ mod tests {
     fn the_peers_file_is_the_one_beside_the_config_and_nothing_without_one() {
         assert_eq!(peers_file_beside_config(None), None);
 
-        let resolved = peers_file_beside_config(Some(std::path::Path::new(
-            "/tmp/tcr-unit-profile/teamclaude.json",
-        )))
-        .expect("a config path resolves a peers path");
+        let config = PathBuf::from("/tmp/tcr-unit-profile").join(crate::paths::CONFIG_FILE);
+        let resolved =
+            peers_file_beside_config(Some(&config)).expect("a config path resolves a peers path");
         assert_eq!(
             resolved,
             PathBuf::from("/tmp/tcr-unit-profile/tcr-peers.json"),

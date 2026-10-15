@@ -189,7 +189,7 @@ impl Scratch {
         let home = tempfile::tempdir().expect("a scratch HOME");
         let config_dir = home.path().join(".config");
         std::fs::create_dir_all(&config_dir).expect("the scratch .config");
-        let config = config_dir.join("teamclaude.json");
+        let config = config_dir.join(tcr::paths::CONFIG_FILE);
         let log = home.path().join("codex.log");
         let watched = log.clone();
         let (upstream, answered) = spawn_upstream(BOB_CLEARED, move || seen(&watched));
@@ -531,7 +531,7 @@ fn fake_tcr(dir: &Path, version: &str) {
 /// the de-duplication removed, the one on both is warned about twice.
 #[test]
 fn login_codex_prints_its_notices_only_when_they_hold() {
-    let n1 = teamclaude_rs::oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string();
+    let n1 = tcr::oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string();
 
     // (a) The first account, no codex login, two older tcrs on PATH.
     let scratch = Scratch::new("[]");
@@ -1126,8 +1126,8 @@ fn proxy_without_providers() -> u16 {
                 stream,
                 "HTTP/1.1 400 Bad Request\r\n{}: {}\r\ncontent-type: application/json\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{refusal}",
-                teamclaude_rs::proxy::ENDPOINT_HEADER,
-                teamclaude_rs::proxy::ADD_ACCOUNT_ENDPOINT,
+                tcr::proxy::ENDPOINT_HEADER,
+                tcr::proxy::ADD_ACCOUNT_ENDPOINT,
                 refusal.len()
             );
         }

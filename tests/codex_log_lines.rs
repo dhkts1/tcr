@@ -36,9 +36,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
-use teamclaude_rs::config::Config;
-use teamclaude_rs::manager::Manager;
-use teamclaude_rs::proxy::ClientAddr;
+use tcr::config::Config;
+use tcr::manager::Manager;
+use tcr::proxy::ClientAddr;
 use tower::ServiceExt as _;
 
 /// The line the peer-carry seam writes first, once per offer, for an origin the mesh does not
@@ -142,7 +142,7 @@ fn anthropic(name: &str) -> Value {
         "name": name,
         "accessToken": "at-fake-anthropic",
         "refreshToken": "rt-fake-anthropic",
-        "expiresAt": teamclaude_rs::now_ms() + 3_600_000,
+        "expiresAt": tcr::now_ms() + 3_600_000,
         "priority": 0,
     })
 }
@@ -155,7 +155,7 @@ fn codex() -> Value {
         "accountUuid": "11111111-1111-4111-8111-111111111111",
         "accessToken": "at-fake-codex",
         "refreshToken": "rt-fake-codex",
-        "expiresAt": teamclaude_rs::now_ms() + 3_600_000,
+        "expiresAt": tcr::now_ms() + 3_600_000,
         "priority": 0,
     })
 }
@@ -188,7 +188,7 @@ async fn send(
     request
         .extensions_mut()
         .insert(ClientAddr(SocketAddr::from(([127, 0, 0, 1], 50_000))));
-    teamclaude_rs::proxy::app(manager)
+    tcr::proxy::app(manager)
         .oneshot(request)
         .await
         .expect("the router always answers")
@@ -209,7 +209,7 @@ async fn codex_upgrade_426_is_logged_at_debug_not_warn() {
     let (status, log) = captured(send(
         manager,
         "GET",
-        teamclaude_rs::provider::CODEX_RESPONSES_PATH,
+        tcr::provider::CODEX_RESPONSES_PATH,
         &[("upgrade", "websocket"), ("connection", "Upgrade")],
         "",
     ))
@@ -243,7 +243,7 @@ async fn codex_request_is_never_offered_to_a_peer_carry() {
     let (status, log) = captured(send(
         codex_only,
         "POST",
-        teamclaude_rs::provider::CODEX_RESPONSES_PATH,
+        tcr::provider::CODEX_RESPONSES_PATH,
         &[("content-type", "application/json")],
         "{}",
     ))

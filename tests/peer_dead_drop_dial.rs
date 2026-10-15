@@ -43,12 +43,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use tcr_peer_wire::PeerId;
-use teamclaude_rs::peer::config as peer_config;
-use teamclaude_rs::peer::drop::{
+use tcr::peer::config as peer_config;
+use tcr::peer::drop::{
     self, seal, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
 };
-use teamclaude_rs::peer::serve;
+use tcr::peer::serve;
+use tcr_peer_wire::PeerId;
 
 fn peer_id(fill: u8) -> PeerId {
     PeerId([fill; 32])

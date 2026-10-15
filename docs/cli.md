@@ -13,7 +13,13 @@ and each one was derived from the source, so start from `src/main.rs` to check a
 ## Conventions
 
 `--config <path>` appears on every subcommand except `update`, `demo` and `ui`. Unset, it
-resolves to `~/.config/teamclaude.json`.
+resolves to `~/.config/tcr.json`, or to `~/.config/teamclaude.json` on an install that has only
+that file. The tables below write the default as `~/.config/tcr.json` and mean this rule.
+
+Cache paths below use `~/.cache/tcr/` for a fresh install. If only the older
+`~/.cache/teamclaude/` exists, tcr keeps using it; when both exist, `tcr/` wins. Usage,
+session snapshots, peer state and logs all follow that one directory. `XDG_CACHE_HOME`
+replaces `~/.cache` when set. Existing files are never moved or copied.
 
 **A config file that does not exist yet is created, not an error.** The first command you run
 on a new machine writes the defaults to that path (`0600`, an empty `accounts` array), prints
@@ -37,7 +43,7 @@ can name it in a script or a launch agent.
 | flag | type | default | effect |
 |---|---|---|---|
 | `--port <u16>` | number | config's `proxy.port` | bind port, overriding the config |
-| `--config <path>` | path | `~/.config/teamclaude.json` | which config to load |
+| `--config <path>` | path | `~/.config/tcr.json` | which config to load |
 | `--headless` | bool | `false` | run without the TUI |
 | `--replace` | bool | `false` | kill a proxy already on the port and take it |
 | `--no-replace` | bool | `false` | **deprecated no-op** |
@@ -73,7 +79,8 @@ invocation that used to "work" now fails loudly.
 ### Where the logs actually go
 
 `--headless` logs to stdout **and** to a daily-rotating file under
-`~/.cache/teamclaude/logs/` (`Rotation::DAILY`). The file sink is not a headless-only
+`~/.cache/tcr/logs/` (`Rotation::DAILY`), or the older cache directory under the rule above.
+The file sink is not a headless-only
 feature: with the TUI running, tracing goes to the file *only*, because writing events to
 stdout would corrupt the alternate screen.
 
@@ -135,7 +142,7 @@ routed through the pool's Codex accounts.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | which config to read the port from |
+| `--config <path>` | path | `~/.config/tcr.json` | which config to read the port from |
 | `--codex` | bool | `false` | launch `codex` instead of `claude` — see [below](#--codex-launching-codex-through-the-pool) |
 | `-- <args>` | strings | empty | passed verbatim to `claude`, or to `codex` with `--codex` |
 
@@ -495,7 +502,7 @@ it imports the login the `codex` CLI already holds.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
+| `--config <path>` | path | `~/.config/tcr.json` | config to write into |
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it. A Codex account is refused, before anything runs, without `--codex` or `--from-codex` |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
@@ -533,7 +540,7 @@ login; [architecture.md](architecture.md#files-on-disk) lists it.
 $ tcr login --codex
 [tcr] signing in a Codex account: `codex login` runs in a folder of tcr's own, so the codex CLI keeps the login it has
 …  codex login's own output, passed through unchanged  …
-Saved account 'bob@example.com' to /Users/example/.config/teamclaude.json
+Saved account 'bob@example.com' to /Users/example/.config/tcr.json
 [tcr] 'bob@example.com' is a Codex account (ChatGPT Pro): Codex sessions started with `tcr run --codex` can use it
 [tcr] tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`, or set HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port> and CODEX_CA_CERTIFICATE to tcr's CA; unmarked connections keep their own login
 [tcr] codex needs a login of its own to start, even when pooled, and none is at /Users/example/.codex/auth.json: unless codex keeps its login in the keyring, run `codex login` once
@@ -992,7 +999,7 @@ empty-fleet lines on stderr, the codex-login line among them, and the same exit 
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to list |
+| `--config <path>` | path | `~/.config/tcr.json` | config to list |
 | `--probe` | bool | `false` | refresh each account's live quota first, a real network call per account |
 
 ---
@@ -1173,7 +1180,7 @@ file is read and never written, so this command exports a token and keeps nothin
 |---|---|---|---|
 | `--account <name>` | string | none | mint for one account, by its exact name (see "Account resolution" above) |
 | `--group <label>` | string | none | mint for every account carrying this group label, one at a time |
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
+| `--config <path>` | path | `~/.config/tcr.json` | config to read |
 
 Exactly one of `--account` and `--group` is required; a group no account carries is an error.
 For each account, `tcr mint` prints an authorize URL on stderr; you sign in as that account
@@ -1202,7 +1209,7 @@ Probes every account's live quota and prints the fleet.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | config to read |
+| `--config <path>` | path | `~/.config/tcr.json` | config to read |
 | `--json` | bool | `false` (text) | emit a JSON array instead of greppable text |
 | `--check` | bool | `false` | exit **4** when an enabled account's last probe failed; output unchanged |
 
@@ -1596,7 +1603,7 @@ was built before this field existed — which is the ordinary state here, since 
 rebuilt on merge while the live process keeps serving until someone restarts it. `source` on the same
 row says which.
 
-Totals survive a restart: each served request is appended to `~/.cache/teamclaude/usage/`, and boot
+Totals survive a restart: each served request is appended to `~/.cache/tcr/usage/`, and boot
 replays the day back in, and the last seven days when the fleet holds a Codex account, so the weekly
 window survives a restart too. Fleet-wide totals are not a field — sum the rows.
 
@@ -1897,7 +1904,7 @@ channel TcrBar's panel reads for its Sessions and Tools tabs: the rows live only
 out here the way it does for every other fact.
 
 Live only, with no offline fallback. A session is the running proxy's own state: the copy it keeps
-on disk, `~/.cache/teamclaude/session-wire.json`, is a cache it reads back at boot, not a record of
+on disk, `~/.cache/tcr/session-wire.json`, is a cache it reads back at boot, not a record of
 what is live, so an offline rendering could only be a stale list dressed up as a measurement. With
 nothing listening the command exits non-zero and says so on stderr.
 
@@ -1995,7 +2002,7 @@ are labelled "claude-swap" until CodexBar learns about tcr as a source of its ow
 ## `tcr wrap`
 
 `tcr wrap [--days N] [--json]` — a usage report for the last `N` days (default 7, ending
-today UTC), read straight off the usage ledger in `~/.cache/teamclaude/usage/`. Unlike `tcr
+today UTC), read straight off the usage ledger in `~/.cache/tcr/usage/`. Unlike `tcr
 status`, this needs no running proxy: the ledger is a durable, append-only record on disk, and
 `tcr wrap` just reads it.
 
@@ -2003,7 +2010,7 @@ It reports, in order: totals (requests; uncached input, output, cache-write and 
 tokens; cost; and the cache-hit ratio, the share of all prompt tokens read from cache), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
 per-day breakdown with the busiest day marked, the count of distinct sessions plus the three
 longest-running ones by request count, and a comparison against the previous `N`-day period
-(`+12%` / `-3%`). `--config` (default `~/.config/teamclaude.json`) is consulted only for
+(`+12%` / `-3%`). `--config` (default `~/.config/tcr.json`) is consulted only for
 pricing overrides — never for accounts, so a removed account's traffic still shows up under
 the name it was recorded under. `--json` emits the same numbers as one object instead of the
 plain-text layout.
@@ -2029,7 +2036,7 @@ Every number is reproducible straight from the files, without running `tcr` at a
 example, total requests and cost for one day:
 
 ```
-$ jq -s '{requests: length, inputTokens: (map(.i) | add)}' ~/.cache/teamclaude/usage/2026-09-10.jsonl
+$ jq -s '{requests: length, inputTokens: (map(.i) | add)}' ~/.cache/tcr/usage/2026-09-10.jsonl
 {
   "requests": 5,
   "inputTokens": 812000
@@ -2225,7 +2232,7 @@ Codex account, because no lease draws on one.
 |---|---|---|---|
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
 | `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, and no `node` at all, because a found row carries no key to pin |
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read: `--json` reads it for the account labels the `lentTo` block is keyed by, each account's exit lock (`exits`) and the expiry a handed-over key ends at (`handedKeyUntil`), and the text form for the Codex exit pins it lists. A config that is missing or unreadable reads as one with no accounts, so `lentTo` and `exits` are empty and no pins are listed, instead of failing the listing |
+| `--config <path>` | path | `~/.config/tcr.json` | main config to read: `--json` reads it for the account labels the `lentTo` block is keyed by, each account's exit lock (`exits`) and the expiry a handed-over key ends at (`handedKeyUntil`), and the text form for the Codex exit pins it lists. A config that is missing or unreadable reads as one with no accounts, so `lentTo` and `exits` are empty and no pins are listed, instead of failing the listing |
 
 ### `tcr peer find <on\|off>`
 
@@ -2274,7 +2281,7 @@ Turns account sharing on or off for every currently trusted peer, at a default l
 | `--ttl <secs>` | int | `600` | how long a granted lease lives before it needs renewing |
 | `--max-inflight <n>` | int | `2` | how many borrowed requests may be in flight at once against one lease. `0` mints leases that refuse every request, which is what writing `0` asks for |
 | `--scope <scope>` | string | `all` | what the DEFAULT lease draws from: `all`, `group:<name>`, or `account:<label>[,<label>]`. Written onto every pinned Mac and recorded as `defaultLend`, which the Sharing defaults sheet shows |
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config, read only when `--scope account:` names accounts, to refuse a label that is a Codex account's. A config that is missing or unreadable skips that check |
+| `--config <path>` | path | `~/.config/tcr.json` | main config, read only when `--scope account:` names accounts, to refuse a label that is a Codex account's. A config that is missing or unreadable skips that check |
 
 `tcr peer share on` with no flags mints exactly one grant per trusted peer: 10% of the weekly
 window (`7d`), a 600-second lease, at most 2 requests in flight, drawn from every account.
@@ -2438,7 +2445,7 @@ this is the per-Mac sheet's **Lend from** list.
 | `--days <mon,tue,...>` | string | every day | only open the lease on these days of the week, read against the day the window starts |
 | `--mode <serve\|hand>` | enum | keeps the replaced grant's mode, or `serve` for a new one | `serve` sends the borrower's requests over this Mac and out on this Mac's IP; this Mac reads them. `hand` gives the borrower a short-lived access token instead, over the paired session, so the borrower sends the request on its own IP and this Mac never reads it. Omitted on a replace keeps the mode already in force, so editing a hand grant's fraction cannot quietly turn it back into `serve` |
 | `--list` | bool | `false` | list this peer's leases instead of changing them, one greppable line each, with the lease id `--revoke` and `--relend` take |
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config, read by `--mode hand` to check the scope's exit locks, and when `--scope account:` names accounts, to refuse a label that is a Codex account's. A config that is missing or unreadable skips the second check |
+| `--config <path>` | path | `~/.config/tcr.json` | main config, read by `--mode hand` to check the scope's exit locks, and when `--scope account:` names accounts, to refuse a label that is a Codex account's. A config that is missing or unreadable skips the second check |
 | `--revoke <lease-id>` | string | none | take one lease away, by the id `--list` printed. The other leases this Mac holds are untouched |
 | `--relend <lease-id>` | string | none | put an ended lease back to work, with a new `--for`/`--until` or with no end at all |
 
@@ -2473,7 +2480,7 @@ row appears only while a server is up.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read the port and api-key from |
+| `--config <path>` | path | `~/.config/tcr.json` | main config to read the port and api-key from |
 | `--json` | bool | `false` | emit the peers block as JSON instead of greppable text |
 
 Each row carries the pinned key twice: **`id`** is the full wire form, the only spelling

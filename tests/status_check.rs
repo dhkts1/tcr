@@ -22,15 +22,13 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use teamclaude_rs::cli::snapshot_offline;
-use teamclaude_rs::oauth::NoRefresh;
-use teamclaude_rs::probe::{
-    ProbeCredential, ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber,
-};
-use teamclaude_rs::status::StatusPayload;
+use tcr::cli::snapshot_offline;
+use tcr::oauth::NoRefresh;
+use tcr::probe::{ProbeCredential, ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
+use tcr::status::StatusPayload;
 
 /// The exit code `--check` reports a failed probe with
-/// (`teamclaude_rs::cli::StatusCheck::exit_code`). Written out as a literal on
+/// (`tcr::cli::StatusCheck::exit_code`). Written out as a literal on
 /// purpose: it is a contract scripts read, so changing it must fail here.
 const PROBE_FAILED_EXIT: i32 = 4;
 
@@ -81,7 +79,7 @@ const FLEET: &str = r#"{
 async fn payload_from(dir: &Path, prober: Arc<dyn UsageProber>) -> String {
     let path = dir.join("fleet.json");
     std::fs::write(&path, FLEET).expect("write the fleet config");
-    let config = teamclaude_rs::config::load(&path).expect("load the fleet config");
+    let config = tcr::config::load(&path).expect("load the fleet config");
     let snapshot = snapshot_offline(config, Arc::new(NoRefresh), prober, true).await;
     let thresholds = vec![1.0; snapshot.accounts.len()];
     let payload = StatusPayload::from_snapshot(

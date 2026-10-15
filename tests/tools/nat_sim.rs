@@ -38,8 +38,8 @@
 //! documentation and is routed nowhere), and the bytes move over in-process
 //! duplex pipes. Everything above the socket is the shipped code: the slot
 //! waiting, the retry cadence, the race between the two halves and the
-//! outcome names are all [`teamclaude_rs::peer::reach::punch`] itself, running
-//! against [`teamclaude_rs::peer::reach::PunchNet`] exactly as it runs against
+//! outcome names are all [`tcr::peer::reach::punch`] itself, running
+//! against [`tcr::peer::reach::PunchNet`] exactly as it runs against
 //! the kernel.
 
 #![allow(dead_code)]
@@ -50,8 +50,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use teamclaude_rs::peer::reach::PunchNet;
-use teamclaude_rs::peer::serve::PeerStream;
+use tcr::peer::reach::PunchNet;
+use tcr::peer::serve::PeerStream;
 use tokio::sync::mpsc;
 
 /// How many bytes one direction of a simulated connection buffers.
@@ -60,7 +60,7 @@ const PIPE_BYTES: usize = 64 * 1024;
 /// The first external port the address-dependent mode hands out.
 ///
 /// Deliberately far from the derived-port window
-/// (`teamclaude_rs::peer::reach::PORT_FLOOR`), so a symmetric mapping can
+/// (`tcr::peer::reach::PORT_FLOOR`), so a symmetric mapping can
 /// never coincide with the port the pair derived and accidentally let a punch
 /// through.
 const SYMMETRIC_FIRST_PORT: u16 = 61_001;

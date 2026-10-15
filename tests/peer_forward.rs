@@ -36,13 +36,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore};
+use tcr::peer::listener;
+use tcr::peer::noise::{self, Handshake};
+use tcr::peer::tunnel::{self, Carry, Forward, NoiseStream, OriginRoute, TunnelBudget};
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
-use teamclaude_rs::peer::config::{
-    self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore,
-};
-use teamclaude_rs::peer::listener;
-use teamclaude_rs::peer::noise::{self, Handshake};
-use teamclaude_rs::peer::tunnel::{self, Carry, Forward, NoiseStream, OriginRoute, TunnelBudget};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -172,7 +170,7 @@ fn decide(case: &Case) -> anyhow::Result<tunnel::ForwardPlan> {
             route: case.route,
             peer: case.requester,
             target: &case.target,
-            hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+            hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
             cap_bytes: 1024 * 1024,
             budget: &budget,
             now_ms: NOW_MS,
@@ -251,7 +249,7 @@ fn a_requester_without_the_relay_grant_is_refused() {
         ..forward_header(1, Vec::new())
     };
     let bare = row(&a.id, "requester", Vec::new(), false);
-    let refusal = teamclaude_rs::peer::listener::peer_stream_gate_rows(&header, Some(&bare))
+    let refusal = tcr::peer::listener::peer_stream_gate_rows(&header, Some(&bare))
         .expect_err("the gate refuses a relay target under a bare pin");
     assert!(
         format!("{refusal:?}").contains("NotGranted"),
@@ -493,7 +491,7 @@ async fn forward_one(stream: TcpStream, forwarder: &Forwarder) -> anyhow::Result
             route: OriginRoute::Peer(forwarder.target),
             peer,
             target: &target,
-            hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+            hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
             cap_bytes: forwarder.cap_bytes,
             budget: &forwarder.budget,
             now_ms: NOW_MS,
@@ -1271,7 +1269,7 @@ fn store_in(dir: &std::path::Path, max_hops: u8, rows: Vec<PeerRow>) -> PeerStor
 }
 
 /// A pinned row this node may ASK to carry for it: `allow.carry`, the
-/// direction [`teamclaude_rs::peer::config::Allow::carry`]'s own doc separates
+/// direction [`tcr::peer::config::Allow::carry`]'s own doc separates
 /// from `gateway`.
 fn carry_row(peer: &PeerId, label: &str, addrs: Vec<String>) -> PeerRow {
     let mut row = row(peer, label, addrs, false);
@@ -1351,11 +1349,7 @@ async fn forwarder_and_target(
 /// The handshake is against B's pinned key over whatever the dial returned,
 /// which is the claim being made: a forwarded stream is not a second kind of
 /// stream to its caller.
-async fn speak_to_target(
-    stream: teamclaude_rs::peer::serve::PeerStream,
-    secret: &[u8; 32],
-    target: &PeerId,
-) {
+async fn speak_to_target(stream: tcr::peer::serve::PeerStream, secret: &[u8; 32], target: &PeerId) {
     let mut stream = stream;
     let mut nested = noise::dial_handshake(
         &mut stream,
@@ -1387,7 +1381,7 @@ async fn speak_to_target(
 async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
     let (b, c) = (node(), node());
     let dir = scratch("client-via");
-    let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
+    let key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
         // One carried stream: no Mac here holds `allow.carry`, so the address
         // exchange inside the punch step has no carrier to ask and spends
@@ -1414,13 +1408,13 @@ async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
         ],
     );
     assert!(
-        teamclaude_rs::peer::serve::forwarders_for(&b.id, &a_store).is_empty(),
+        tcr::peer::serve::forwarders_for(&b.id, &a_store).is_empty(),
         "no Mac here holds `allow.carry`, so the carry-grantee fallback has nothing to \
          offer and the `Via` endpoint is the only way this dial can succeed"
     );
     let b_row = a_store.row(&b.id).expect("A pinned B");
 
-    let stream = teamclaude_rs::peer::serve::dial_peer_reaching(&b_row, &a_store)
+    let stream = tcr::peer::serve::dial_peer_reaching(&b_row, &a_store)
         .await
         .expect("the `Via` endpoint is followed through C");
     speak_to_target(stream, key.secret_bytes(), &b.id).await;
@@ -1466,7 +1460,7 @@ async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
 #[tokio::test]
 async fn the_same_via_row_is_unreachable_to_a_dial_with_no_peers_file() {
     let (b, c) = (node(), node());
-    let dialled = teamclaude_rs::peer::serve::dial_peer(&via_row(&b.id, "target", c.id)).await;
+    let dialled = tcr::peer::serve::dial_peer(&via_row(&b.id, "target", c.id)).await;
     assert!(
         dialled.is_none(),
         "`dial_peer` holds no peers file, so it cannot read the forwarder's row or this \
@@ -1485,7 +1479,7 @@ async fn the_same_via_row_is_unreachable_to_a_dial_with_no_peers_file() {
 async fn a_row_with_no_endpoints_is_reached_through_a_carry_grantee() {
     let (b, c) = (node(), node());
     let dir = scratch("client-carry");
-    let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
+    let key = tcr::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
         // ONE carried stream, and it is the borrow's own. This row holds
         // nothing at all, which is the state the punch step names
@@ -1512,12 +1506,12 @@ async fn a_row_with_no_endpoints_is_reached_through_a_carry_grantee() {
         "the whole point of this case is a row with nowhere to dial"
     );
     assert!(
-        teamclaude_rs::peer::serve::has_a_way_back(&b_row, &a_store),
+        tcr::peer::serve::has_a_way_back(&b_row, &a_store),
         "a row with no endpoint and a reachable carry grantee still has a way back, and a \
          borrow that filtered on `has_endpoint` would skip exactly this lender"
     );
 
-    let stream = teamclaude_rs::peer::serve::dial_peer_reaching(&b_row, &a_store)
+    let stream = tcr::peer::serve::dial_peer_reaching(&b_row, &a_store)
         .await
         .expect("the carry grantee is asked once the row itself answers nothing");
     speak_to_target(stream, key.secret_bytes(), &b.id).await;
@@ -1563,7 +1557,7 @@ fn only_a_reachable_carry_grantee_that_is_not_the_target_is_asked() {
         ],
     );
     assert_eq!(
-        teamclaude_rs::peer::serve::forwarders_for(&b.id, &a_store),
+        tcr::peer::serve::forwarders_for(&b.id, &a_store),
         vec![c.id],
         "a carrier needs `allow.carry` (not `relay`, which is the other direction), a \
          direct address of its own, and must not be the Mac being reached"
@@ -1576,7 +1570,7 @@ fn only_a_reachable_carry_grantee_that_is_not_the_target_is_asked() {
         vec![row(&b.id, "target", Vec::new(), false)],
     );
     assert!(
-        !teamclaude_rs::peer::serve::has_a_way_back(&bare.row(&b.id).expect("pinned"), &bare),
+        !tcr::peer::serve::has_a_way_back(&bare.row(&b.id).expect("pinned"), &bare),
         "no endpoint and no carry grantee is no way back"
     );
 }
@@ -1629,7 +1623,7 @@ fn a_lender_with_no_address_still_installs_the_provider_through_a_carrier() {
     };
 
     assert!(
-        teamclaude_rs::fallback::peer_lease_provider(&store(
+        tcr::fallback::peer_lease_provider(&store(
             "carrier-installs",
             2,
             vec![
@@ -1643,7 +1637,7 @@ fn a_lender_with_no_address_still_installs_the_provider_through_a_carrier() {
     );
 
     assert!(
-        teamclaude_rs::fallback::peer_lease_provider(&store(
+        tcr::fallback::peer_lease_provider(&store(
             "carrier-no-grant",
             2,
             vec![
@@ -1657,7 +1651,7 @@ fn a_lender_with_no_address_still_installs_the_provider_through_a_carrier() {
     );
 
     assert!(
-        teamclaude_rs::fallback::peer_lease_provider(&store(
+        tcr::fallback::peer_lease_provider(&store(
             "carrier-no-address",
             2,
             vec![lender_row(true), carrier_row(true, Vec::new())],
@@ -1684,7 +1678,7 @@ fn undialable_row(peer: &PeerId, label: &str) -> PeerRow {
 /// This is the shape of the real thing rather than a stand-in: the carrier a
 /// Mac parks IS a socket it opened outwards, so a client socket to the Mac
 /// playing the target is the same object in the same direction.
-async fn carrier_to(addr: std::net::SocketAddr) -> teamclaude_rs::peer::serve::PeerStream {
+async fn carrier_to(addr: std::net::SocketAddr) -> tcr::peer::serve::PeerStream {
     Box::new(
         TcpStream::connect(addr)
             .await
@@ -1880,8 +1874,8 @@ fn a_carrier_from_an_unpinned_mac_is_refused() {
 /// anyway would be spending a third Mac's bytes on a path it does not need.
 #[test]
 fn a_reachable_node_wants_no_carrier_and_an_unreachable_one_does() {
-    use teamclaude_rs::peer::reach::{MapProtocol, Mapping};
-    use teamclaude_rs::peer::tunnel::{ReverseNeed, ReverseNotWanted};
+    use tcr::peer::reach::{MapProtocol, Mapping};
+    use tcr::peer::tunnel::{ReverseNeed, ReverseNotWanted};
 
     let mapping = Mapping {
         protocol: MapProtocol::Tcp,
@@ -2024,7 +2018,7 @@ fn a_dialable_lender_is_asked_before_one_that_needs_carrying() {
         ],
     );
 
-    let asked: Vec<PeerId> = teamclaude_rs::peer::lease::lenders_in_ask_order(&store)
+    let asked: Vec<PeerId> = tcr::peer::lease::lenders_in_ask_order(&store)
         .into_iter()
         .map(|row| row.node)
         .collect();

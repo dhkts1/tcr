@@ -114,7 +114,7 @@ Flags:
 `SUFeedURL` (in `apps/macos/scripts/build-tcrbar.sh`) is now a FIXED location:
 
 ```
-https://raw.githubusercontent.com/dhkts1/teamclaude-rs/gh-pages/appcast.xml
+https://raw.githubusercontent.com/dhkts1/tcr/gh-pages/appcast.xml
 ```
 
 It used to be `.../releases/latest/download/appcast.xml`, and `/releases/latest/`
@@ -201,12 +201,35 @@ upgrade notice. Copy them into the first release that ships Codex pooling.
    on a machine with no network; without it Gatekeeper has to ask Apple at open time.
 7. **Sparkle signature** — `sign_update` produces the EdDSA signature and byte length.
 8. **Appcast** — a new `<item>` is inserted at the marker comment in `apps/macos/appcast.xml`.
-9. **Publish** — `gh release upload` puts the DMG and `appcast.xml` on the release for the tag.
+9. **Publish** — `gh release upload` puts the DMG and `appcast.xml` on the release for the tag,
+   then `attach-compat-installer.sh` adds `teamclaude-rs-installer.sh` (next section), all while
+   the release is marked prerelease. Only then is it marked latest.
 10. **Publish the feed** — outside `release-tcrbar.sh` (which makes no git writes): once that
     `<item>` is committed to main, `apps/macos/scripts/publish-appcast-feed.sh` pushes it to
     `gh-pages`. `ship-release.sh` runs it; a hand release has to. This is the step
     `SUFeedURL` actually reads; step 9's upload now exists only to keep pre-migration installs
     working. See "The update feed" above.
+
+## The teamclaude-rs-installer.sh compat asset
+
+Every release from 1.2.0 on carries `teamclaude-rs-installer.sh` beside `tcr-installer.sh`. A CLI
+on v1.1.21 or older updates by fetching that old name from the latest release and running it with
+`TEAMCLAUDE_RS_UNMANAGED_INSTALL` set to its own directory. From 1.2.0 the package is `tcr`, so
+cargo-dist publishes only `tcr-installer.sh`, which reads only `TCR_*` names. Without the old name
+the update is a 404. With the plain new installer under it, the old variable is ignored and the
+binary lands in the installer's default directory (`~/.cargo/bin` when measured) as a second copy.
+
+The file is this release's own `tcr-installer.sh` with a short header that maps
+`TEAMCLAUDE_RS_UNMANAGED_INSTALL` and `TEAMCLAUDE_RS_INSTALL_DIR` to their `TCR_` names, never the
+URL or token ones, and clears any `TCR_` override the caller's shell left behind.
+`apps/macos/scripts/build-compat-installer.sh` builds it, and its header has the full reasoning.
+`attach-compat-installer.sh <tag>` uploads it and reads it back, and stage 9 calls it, so nothing
+needs remembering. A release that skips stage 9 (a CLI-only release) needs it run by hand. It can
+go once no v1.1.21-or-older CLI is expected to update.
+
+Both scripts have fixtures that need no network, run by hand: `compat-installer-fixture-test.sh`
+(optionally given a real `target/distrib/tcr-installer.sh` from `dist build --artifacts=global`)
+and `attach-compat-installer-fixture-test.sh`.
 
 ## Why there are no signing secrets in GitHub
 
@@ -338,13 +361,16 @@ poll — returns **404**, and they cannot check for updates.
 Observed on 0.2.26: confirmed 404 against the live URL, cleared by marking the tag prerelease so
 `latest` fell back to 0.2.25.
 
-`quarantine_if_assetless` in `release-tcrbar.sh` exists to close exactly this window, but it tests
-for a release with **no assets at all**. A cargo-dist release has thirteen, so the guard does not
-fire — it is aimed at a state this pipeline no longer produces. Until that predicate is widened to
-"no `appcast.xml` asset", either mark the tag prerelease by hand right after pushing it:
+`quarantine_if_assetless` in `release-tcrbar.sh` exists to close exactly this window. It tests for
+a release with no `appcast.xml`, but `dist-workspace.toml` now attaches the committed `appcast.xml`
+when cargo-dist creates the release, so the guard never fires.
+
+The same window holds for `teamclaude-rs-installer.sh`, which only stage 9 attaches: a v1.1.21-or-
+older CLI that runs `tcr update` in it gets a 404 and changes nothing, and a re-run after the
+release finishes works. Either mark the tag prerelease by hand right after pushing it:
 
 ```sh
-gh release edit vX.Y.Z --prerelease --repo dhkts1/teamclaude-rs
+gh release edit vX.Y.Z --prerelease --repo dhkts1/tcr
 ```
 
 — stage 9 clears the flag itself once the assets are up — or push the tag only when you are ready to

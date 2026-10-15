@@ -474,8 +474,7 @@ fn claude_only_doctor_is_unchanged() {
 /// `body`, as [`fake_status_endpoint`] does. `body` must parse as the payload the CLI reads, so
 /// a misspelled key fails here, loudly, rather than as a status the CLI could not read.
 fn serve_status(body: serde_json::Value) -> u16 {
-    if let Err(error) = serde_json::from_value::<teamclaude_rs::status::StatusPayload>(body.clone())
-    {
+    if let Err(error) = serde_json::from_value::<tcr::status::StatusPayload>(body.clone()) {
         panic!("the fake status payload does not parse ({error}): {body}");
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");

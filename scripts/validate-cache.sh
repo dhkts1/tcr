@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# validate-cache.sh — live prompt-cache warmth validator for tcr (teamclaude-rs)
+# validate-cache.sh — live prompt-cache warmth validator for tcr
 # =============================================================================
 #
 # WHAT THIS PROVES

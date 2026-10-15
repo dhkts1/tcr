@@ -19,15 +19,13 @@
 
 use std::net::SocketAddr;
 
-use tcr_peer_wire::{decode_bytes, PeerId};
-use teamclaude_rs::peer::config::{
-    Allow, Endpoint, EndpointSource, PeerRow, MAX_ENDPOINTS_PER_PEER,
-};
-use teamclaude_rs::peer::discovery::{admissible_moved_endpoints, MAX_MOVED_ENDPOINTS_PER_PEER};
-use teamclaude_rs::peer::moved::{
+use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerRow, MAX_ENDPOINTS_PER_PEER};
+use tcr::peer::discovery::{admissible_moved_endpoints, MAX_MOVED_ENDPOINTS_PER_PEER};
+use tcr::peer::moved::{
     open_link, open_link_field, seal_link, seal_link_field, MintRefusal, MovedKeys, MovedRecord,
     MovedRefusal, MAX_MOVED_AGE, MOVED_VERSION,
 };
+use tcr_peer_wire::{decode_bytes, PeerId};
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
 fn peer_id(fill: u8) -> PeerId {
@@ -600,7 +598,7 @@ fn a_moved_endpoint_never_evicts_one_a_handshake_proved() {
 /// giving it a band of its own (`4`) swaps it with the drop's.
 #[test]
 fn a_moved_endpoint_sorts_behind_a_brief_and_beside_a_drop() {
-    use teamclaude_rs::peer::probe::{self, PathTable};
+    use tcr::peer::probe::{self, PathTable};
 
     let port_of = |source: EndpointSource| -> u16 {
         match source {
@@ -776,7 +774,7 @@ fn receiver_peers(dir: &std::path::Path, sender: &PeerId) -> std::path::PathBuf 
 /// The id `mint` minted for the Mac that moved, read off the public half it
 /// wrote beside the peers file.
 fn sender_id(dir: &std::path::Path) -> PeerId {
-    let raw = std::fs::read(teamclaude_rs::peer::id::public_key_path(dir))
+    let raw = std::fs::read(tcr::peer::id::public_key_path(dir))
         .expect("mint wrote this Mac's public key beside the peers file");
     let bytes: [u8; 32] = raw
         .try_into()
@@ -1070,13 +1068,13 @@ fn the_mint_verb_reads_the_held_mapping_off_the_state_file() {
 
     let sender_dir = scratch("mapping-sender");
     let sender = sender_peers(&sender_dir, None);
-    let live = teamclaude_rs::peer::state::MappingRecord {
+    let live = tcr::peer::state::MappingRecord {
         external_address: Some(mapped.to_string()),
         external_port: 7_755,
         internal_port: 41_234,
-        expires_at_ms: teamclaude_rs::now_ms() + 120_000,
+        expires_at_ms: tcr::now_ms() + 120_000,
     };
-    teamclaude_rs::peer::state::save_mapping(&sender_dir.join("peer-state.json"), Some(live))
+    tcr::peer::state::save_mapping(&sender_dir.join("peer-state.json"), Some(live))
         .expect("the record writes the way a keeper writes one");
 
     let (out, err, ok) = run_moved(&sender, &["mint", &peer_id(0x22).to_wire()], None);
@@ -1094,13 +1092,13 @@ fn the_mint_verb_reads_the_held_mapping_off_the_state_file() {
     );
 
     // The control: the same mapping, one number past its deadline.
-    teamclaude_rs::peer::state::save_mapping(
+    tcr::peer::state::save_mapping(
         &sender_dir.join("peer-state.json"),
-        Some(teamclaude_rs::peer::state::MappingRecord {
+        Some(tcr::peer::state::MappingRecord {
             external_address: Some(mapped.to_string()),
             external_port: 7_755,
             internal_port: 41_234,
-            expires_at_ms: teamclaude_rs::now_ms() - 1,
+            expires_at_ms: tcr::now_ms() - 1,
         }),
     )
     .expect("the stale record writes");
@@ -1285,7 +1283,7 @@ fn minting_on_a_listener_with_no_port_refuses_and_names_the_remedy() {
 #[test]
 fn a_link_carrying_only_undialable_addresses_says_so_and_not_that_the_row_is_gone() {
     let sender = peer_id(0x44);
-    let link = teamclaude_rs::peer::moved::mint_link(
+    let link = tcr::peer::moved::mint_link(
         &keys_for(&counting_secret()),
         &sender,
         &MovedRecord {

@@ -132,10 +132,10 @@ final class CodexSessionDecodeTests: XCTestCase {
                         endedMs: 1_767_225_475_000, seconds: 1.5),
                     ToolCall(
                         tool: "Read",
-                        commandHead: "Read /Users/example/git/teamclaude-rs/src/session_wire.rs",
+                        commandHead: "Read /Users/example/git/tcr/src/session_wire.rs",
                         endedMs: 1_767_225_320_000, seconds: 0.4),
                     ToolCall(
-                        tool: "Read", commandHead: "Read /Users/example/git/teamclaude-rs/src/proxy.rs",
+                        tool: "Read", commandHead: "Read /Users/example/git/tcr/src/proxy.rs",
                         endedMs: 1_767_225_250_000, seconds: 0.1),
                 ],
                 overOneMinute: 0,

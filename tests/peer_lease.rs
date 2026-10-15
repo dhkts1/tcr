@@ -35,14 +35,14 @@ use std::path::{Path, PathBuf};
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
-use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, PeerId, Window};
-use teamclaude_rs::fallback::{self, Ask, FallbackProvider};
-use teamclaude_rs::peer::config::{
+use tcr::fallback::{self, Ask, FallbackProvider};
+use tcr::peer::config::{
     Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,
 };
-use teamclaude_rs::peer::lease::{self, Ledger, PeerLeaseProvider, RelayRefusal};
-use teamclaude_rs::peer::serve;
-use teamclaude_rs::provider::Provider;
+use tcr::peer::lease::{self, Ledger, PeerLeaseProvider, RelayRefusal};
+use tcr::peer::serve;
+use tcr::provider::Provider;
+use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, PeerId, Window};
 
 /// **The scrub.** A SERVE frame carries neither `authorization` nor
 /// `x-api-key`, because the borrower removes both before the frame is written.
@@ -495,21 +495,18 @@ fn the_ledger_does_not_grow_without_bound_on_peer_driven_input() {
     // peer that asks once a second for five minutes leaves behind.
     for nth in 0..300_u128 {
         let mut expired = lease_with(LEASE + 1 + nth, 0.500, 0.0);
-        expired.expires_at_ms = teamclaude_rs::now_ms() - 1;
+        expired.expires_at_ms = tcr::now_ms() - 1;
         ledger.record_scoped(expired, grantee, tcr_peer_wire::LendScope::All);
     }
     // One live lease last, so the vector is not empty for a reason unrelated to
     // the prune.
     let mut live = lease_with(LEASE, 0.500, 0.0);
-    live.expires_at_ms = teamclaude_rs::now_ms() + 300_000;
+    live.expires_at_ms = tcr::now_ms() + 300_000;
     ledger.record_scoped(live, grantee, tcr_peer_wire::LendScope::All);
-    assert!(
-        ledger.live(teamclaude_rs::now_ms()).len() == 1,
-        "one live lease"
-    );
+    assert!(ledger.live(tcr::now_ms()).len() == 1, "one live lease");
 
     // In flight, then out: the key goes with it.
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     assert_eq!(ledger.enter_relay(LEASE, &grantee, REQUEST, now), Ok(()));
     assert_eq!(ledger.inflight(LEASE), 1);
     ledger.leave_relay(LEASE);
@@ -1082,7 +1079,7 @@ fn a_grant_reads_the_peers_file_and_records_what_it_minted() {
     assert_eq!(lease.unit, LeaseUnit::Fraction(0.20));
     assert_eq!(lease.max_inflight, 2);
     assert_eq!(
-        ledger.live(teamclaude_rs::now_ms()).len(),
+        ledger.live(tcr::now_ms()).len(),
         1,
         "a minted lease is in the ledger, or the lender cannot honour it"
     );
@@ -1129,7 +1126,7 @@ fn the_provider_is_configured_by_a_disclose_grant_and_an_address() {
         ..PeerFile::default()
     };
     let store_of = |file: &PeerFile| {
-        teamclaude_rs::peer::config::save(&peers_path, file).expect("write the peers file");
+        tcr::peer::config::save(&peers_path, file).expect("write the peers file");
         PeerStore::open(&peers_path).expect("open the peers file")
     };
     assert!(
@@ -1242,7 +1239,7 @@ fn the_ledger_is_persisted_and_restored_with_its_grantee_and_scope() {
     let grantee = PeerId([46_u8; 32]);
     let scope = tcr_peer_wire::LendScope::Group("work".to_string());
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let mut live = lease_with(LEASE, 0.500, 0.0);
     live.granted_at_ms = now;
     live.expires_at_ms = now + 300_000;
@@ -1332,7 +1329,7 @@ fn a_lease_with_no_grantee_is_neither_persisted_nor_restored() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let state = dir.path().join("peer-state.json");
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let mut live = lease_with(LEASE, 0.500, 0.0);
     live.granted_at_ms = now;
     live.expires_at_ms = now + 300_000;
@@ -1357,7 +1354,7 @@ fn a_lease_with_no_grantee_is_neither_persisted_nor_restored() {
         ledger.record_scoped(second, PeerId([48_u8; 32]), tcr_peer_wire::LendScope::All);
     }
 
-    let on_disk = teamclaude_rs::peer::state::load(&state, now).expect("the state file reads");
+    let on_disk = tcr::peer::state::load(&state, now).expect("the state file reads");
     assert_eq!(
         on_disk.leases.len(),
         1,
@@ -1369,12 +1366,12 @@ fn a_lease_with_no_grantee_is_neither_persisted_nor_restored() {
 
     // The reader, against a file an older build could have left behind.
     let mut planted = on_disk.clone();
-    planted.leases.push(teamclaude_rs::peer::state::LeaseRow {
+    planted.leases.push(tcr::peer::state::LeaseRow {
         lease: live,
         peer: PeerId([0_u8; 32]),
         scope: tcr_peer_wire::LendScope::All,
     });
-    teamclaude_rs::peer::state::save(&state, &planted).expect("plant the zero-grantee row");
+    tcr::peer::state::save(&state, &planted).expect("plant the zero-grantee row");
 
     let restored = Ledger::restored_from(&state);
     let ids: Vec<u128> = restored
@@ -1416,7 +1413,7 @@ fn a_charge_is_written_by_the_flush_and_not_by_the_relay() {
     let state = dir.path().join("peer-state.json");
     let grantee = PeerId([49_u8; 32]);
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let mut live = lease_with(LEASE, 0.500, 0.0);
     live.granted_at_ms = now;
     live.expires_at_ms = now + 300_000;
@@ -1428,7 +1425,7 @@ fn a_charge_is_written_by_the_flush_and_not_by_the_relay() {
         !ledger.is_dirty(),
         "the grant itself wrote, so nothing is pending"
     );
-    let granted = teamclaude_rs::peer::state::load(&state, now).expect("the state file reads");
+    let granted = tcr::peer::state::load(&state, now).expect("the state file reads");
     assert_eq!(
         granted.leases.len(),
         1,
@@ -1440,7 +1437,7 @@ fn a_charge_is_written_by_the_flush_and_not_by_the_relay() {
     ledger.leave_relay(LEASE);
     assert!(ledger.debit(LEASE, REQUEST, 0.031) > 0.0);
 
-    let after_charge = teamclaude_rs::peer::state::load(&state, now).expect("the state reads");
+    let after_charge = tcr::peer::state::load(&state, now).expect("the state reads");
     assert!(
         (after_charge.leases[0].lease.spent - 0.0).abs() < 1e-9,
         "the charge must not have gone to disk on the relay path: {}",
@@ -1449,7 +1446,7 @@ fn a_charge_is_written_by_the_flush_and_not_by_the_relay() {
     assert!(ledger.is_dirty(), "it is pending instead");
 
     assert!(ledger.flush(), "the flush has something to write");
-    let after_flush = teamclaude_rs::peer::state::load(&state, now).expect("the state reads");
+    let after_flush = tcr::peer::state::load(&state, now).expect("the state reads");
     assert!(
         (after_flush.leases[0].lease.spent - 0.031).abs() < 1e-9,
         "and the flush writes it, so a restart still sees the ceiling: {}",
@@ -1479,7 +1476,7 @@ fn a_charge_returns_while_the_state_file_lock_is_held() {
     let state = dir.path().join("peer-state.json");
     let grantee = PeerId([50_u8; 32]);
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let mut live = lease_with(LEASE, 0.500, 0.0);
     live.granted_at_ms = now;
     live.expires_at_ms = now + 300_000;
@@ -1491,8 +1488,7 @@ fn a_charge_returns_while_the_state_file_lock_is_held() {
     ledger.leave_relay(LEASE);
 
     // Somebody else's read-modify-write of the same file, mid-flight.
-    let held =
-        teamclaude_rs::peer::config::FileLock::acquire(&state).expect("take the file lock first");
+    let held = tcr::peer::config::FileLock::acquire(&state).expect("take the file lock first");
 
     let started = std::time::Instant::now();
     let charge = ledger.debit(LEASE, REQUEST, 0.031);
@@ -1504,7 +1500,7 @@ fn a_charge_returns_while_the_state_file_lock_is_held() {
         elapsed < std::time::Duration::from_millis(200),
         "a relay must not wait on another process's lock: the charge took {elapsed:?}, and \
          the lock it used to queue behind is only broken after {}ms",
-        teamclaude_rs::peer::config::LOCK_STALE_MS
+        tcr::peer::config::LOCK_STALE_MS
     );
     assert!(
         ledger.is_dirty(),
@@ -1538,25 +1534,25 @@ fn writing_lease_rows_over_a_quarantined_state_file_is_refused() {
 
     // An operator's own decisions, written by the one writer that creates this
     // file at 0600.
-    let mut value = teamclaude_rs::peer::state::PeerState::default();
-    value.banned.push(teamclaude_rs::peer::state::Ban {
+    let mut value = tcr::peer::state::PeerState::default();
+    value.banned.push(tcr::peer::state::Ban {
         addr: "192.0.2.61".to_string(),
         key: None,
         since_ms: NOW,
-        reason: teamclaude_rs::peer::state::BanReason::Blocked,
+        reason: tcr::peer::state::BanReason::Blocked,
     });
-    teamclaude_rs::peer::state::save(&path, &value).expect("the state file writes");
+    tcr::peer::state::save(&path, &value).expect("the state file writes");
 
     // Something widened it, so `load` will not trust it.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
         .expect("widen it by hand");
 
-    let row = teamclaude_rs::peer::state::LeaseRow {
+    let row = tcr::peer::state::LeaseRow {
         lease: lease_with(LEASE, 0.500, 0.0),
         peer: PeerId([51_u8; 32]),
         scope: tcr_peer_wire::LendScope::All,
     };
-    let refusal = teamclaude_rs::peer::state::save_leases(&path, std::slice::from_ref(&row))
+    let refusal = tcr::peer::state::save_leases(&path, std::slice::from_ref(&row))
         .expect_err("a quarantined read must refuse the write");
     let refusal = format!("{refusal:#}");
     assert!(
@@ -1574,22 +1570,22 @@ fn writing_lease_rows_over_a_quarantined_state_file_is_refused() {
 
     // And the ordinary cases still write. A MISSING file is not this case:
     // there is nothing to lose and a first grant has to create it.
-    teamclaude_rs::peer::state::save_leases(&path, std::slice::from_ref(&row))
+    tcr::peer::state::save_leases(&path, std::slice::from_ref(&row))
         .expect("a missing state file is created by the first write of a lease row");
-    let created = teamclaude_rs::peer::state::load(&path, NOW).expect("it reads back");
+    let created = tcr::peer::state::load(&path, NOW).expect("it reads back");
     assert_eq!(created.leases.len(), 1);
 
     // A TRUSTED file keeps every other key through the same write.
     let mut trusted = created;
-    trusted.banned.push(teamclaude_rs::peer::state::Ban {
+    trusted.banned.push(tcr::peer::state::Ban {
         addr: "192.0.2.62".to_string(),
         key: None,
         since_ms: NOW,
-        reason: teamclaude_rs::peer::state::BanReason::Blocked,
+        reason: tcr::peer::state::BanReason::Blocked,
     });
-    teamclaude_rs::peer::state::save(&path, &trusted).expect("write the ban");
-    teamclaude_rs::peer::state::save_leases(&path, &[]).expect("clearing the lease rows writes");
-    let after = teamclaude_rs::peer::state::load(&path, NOW).expect("it reads back");
+    tcr::peer::state::save(&path, &trusted).expect("write the ban");
+    tcr::peer::state::save_leases(&path, &[]).expect("clearing the lease rows writes");
+    let after = tcr::peer::state::load(&path, NOW).expect("it reads back");
     assert!(
         after.leases.is_empty(),
         "the lease rows are the ones replaced"
@@ -1774,7 +1770,7 @@ fn write_peers(path: &Path, peers: Vec<PeerRow>) {
         peers,
         ..PeerFile::default()
     };
-    teamclaude_rs::peer::config::save(path, &file).expect("the peers file writes");
+    tcr::peer::config::save(path, &file).expect("the peers file writes");
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,11 +1788,11 @@ mod fleet {
     use axum::response::Response;
     use axum::routing::any;
     use axum::Router;
-    use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
-    use teamclaude_rs::manager::Manager;
-    use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-    use teamclaude_rs::probe::{ProbeError, ProbeFuture, UsageProber};
-    use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
+    use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+    use tcr::manager::Manager;
+    use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+    use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
+    use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 
     /// The canned body the fake upstream answers with. A relayed request that
     /// reached a real account comes back as exactly these bytes.
@@ -1811,7 +1807,7 @@ mod fleet {
     impl TokenRefresher for NeverRefreshes {
         fn refresh(
             &self,
-            _provider: teamclaude_rs::provider::Provider,
+            _provider: tcr::provider::Provider,
             _refresh_token: String,
         ) -> RefreshFuture {
             Box::pin(async { Err(OAuthError::Transient("no refresher in lease tests".into())) })
@@ -1819,7 +1815,7 @@ mod fleet {
     }
     struct NeverProbes;
     impl UsageProber for NeverProbes {
-        fn probe(&self, _credential: teamclaude_rs::probe::ProbeCredential) -> ProbeFuture {
+        fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(ProbeError {
                     status: None,
@@ -1844,7 +1840,7 @@ mod fleet {
     fn account() -> Account {
         Account {
             name: "lender-fake".to_string(),
-            account_type: teamclaude_rs::config::AccountType::OAuth,
+            account_type: tcr::config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             // One org, so every borrowed request lands in ONE per-org GCRA
@@ -1853,7 +1849,7 @@ mod fleet {
             org_name: None,
             access_token: LENDER_TOKEN.to_string(),
             refresh_token: Some("rt-fake-lender".to_string()),
-            expires_at: Some(teamclaude_rs::now_ms() + 3_600_000),
+            expires_at: Some(tcr::now_ms() + 3_600_000),
             priority: Some(0),
             switch_threshold: None,
             disabled: None,
@@ -1861,7 +1857,7 @@ mod fleet {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
-            egress: teamclaude_rs::config::Egress::Local,
+            egress: tcr::config::Egress::Local,
             egress_strict: false,
             codex_home: None,
             extra: serde_json::Map::new(),
@@ -1880,7 +1876,7 @@ mod fleet {
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),
-            codex_upstream: teamclaude_rs::provider::CODEX_UPSTREAM.to_string(),
+            codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: 0.98,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -1920,7 +1916,7 @@ mod fleet {
         let mut config = config(
             upstream,
             vec![Account {
-                provider: teamclaude_rs::provider::Provider::Codex,
+                provider: tcr::provider::Provider::Codex,
                 ..account()
             }],
             ThrottleConfig::default(),
@@ -2182,7 +2178,7 @@ mod fleet {
             .expect("bind the proxy");
         let addr = listener.local_addr().expect("proxy addr");
         tokio::spawn(async move {
-            teamclaude_rs::mitm::serve(listener, manager, None).await;
+            tcr::mitm::serve(listener, manager, None).await;
         });
         format!("http://{addr}")
     }
@@ -2217,14 +2213,14 @@ mod mesh {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    use tcr::manager::Manager;
+    use tcr::peer::config::PeerStore;
+    use tcr::peer::id::NodeKey;
+    use tcr::peer::lease::Ledger;
+    use tcr::peer::listener::{self, LeaseServing, SessionContext};
+    use tcr::peer::noise;
+    use tcr::peer::serve::{self, WindowUtilization};
     use tcr_peer_wire::{Control, Lease, LeaseGrant, LeaseUnit, StreamHeader, StreamKind, Window};
-    use teamclaude_rs::manager::Manager;
-    use teamclaude_rs::peer::config::PeerStore;
-    use teamclaude_rs::peer::id::NodeKey;
-    use teamclaude_rs::peer::lease::Ledger;
-    use teamclaude_rs::peer::listener::{self, LeaseServing, SessionContext};
-    use teamclaude_rs::peer::noise;
-    use teamclaude_rs::peer::serve::{self, WindowUtilization};
     use tokio::net::TcpListener;
 
     use super::fleet;
@@ -2587,7 +2583,7 @@ mod mesh {
                             );
                             asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(answer_delay).await;
-                            let now_ms = teamclaude_rs::now_ms();
+                            let now_ms = tcr::now_ms();
                             let grant = LeaseGrant {
                                 lease: Some(Lease {
                                     lease_id: 0xc0_ffee,
@@ -2941,7 +2937,7 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
         .post(format!("{proxy}/v1/messages"))
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
-        .header(teamclaude_rs::proxy::RELAYED_HEADER_NAME, "1")
+        .header(tcr::proxy::RELAYED_HEADER_NAME, "1")
         .body(r#"{"model":"claude-sonnet-4-5","messages":[]}"#)
         .send()
         .await
@@ -3019,10 +3015,10 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -3034,7 +3030,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -3065,7 +3061,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
         // unmeasurable and `Ledger::debit` charges MIN_DEBIT, which is what
         // assertion 3 reads: see `a_served_request_debits_the_measured_rise`
         // for the other half.
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -3127,7 +3123,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
     {
         let held = ledger.lock().expect("ledger lock");
         let after = held
-            .live(teamclaude_rs::now_ms())
+            .live(tcr::now_ms())
             .first()
             .copied()
             .expect("the lease is still live");
@@ -3156,7 +3152,7 @@ async fn a_borrowed_request_is_served_on_the_lenders_account() {
     // the scrub's effect is visible.
     let capture_home = tempfile::tempdir().expect("the capturing lender's temp home");
     let capture_peers = capture_home.path().join("tcr-peers.json");
-    let capture_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(capture_home.path())
+    let capture_id = tcr::peer::id::NodeKey::load_or_mint(capture_home.path())
         .expect("the capturing lender's key")
         .id();
     write_peers(
@@ -3291,7 +3287,7 @@ async fn a_lender_forwards_only_the_allowlisted_headers() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -3430,7 +3426,7 @@ async fn a_non_post_relayed_request_is_refused() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -3488,10 +3484,10 @@ async fn a_relayed_frame_the_lender_receives_holds_no_credential() {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -3529,7 +3525,7 @@ async fn a_relayed_frame_the_lender_receives_holds_no_credential() {
     // go missing.
     let headers = borrower_credentials();
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -3606,10 +3602,10 @@ async fn a_served_request_debits_the_measured_utilization_rise() {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -3621,7 +3617,7 @@ async fn a_served_request_debits_the_measured_utilization_rise() {
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -3687,7 +3683,7 @@ async fn a_served_request_debits_the_measured_utilization_rise() {
 
     let held = ledger.lock().expect("ledger lock");
     let after = held
-        .live(teamclaude_rs::now_ms())
+        .live(tcr::now_ms())
         .first()
         .copied()
         .expect("the lease is still live");
@@ -3767,10 +3763,10 @@ async fn an_answer_larger_than_one_frame_is_carried_and_charged() {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -3782,7 +3778,7 @@ async fn an_answer_larger_than_one_frame_is_carried_and_charged() {
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -3854,7 +3850,7 @@ async fn an_answer_larger_than_one_frame_is_carried_and_charged() {
 
     let held = ledger.lock().expect("ledger lock");
     let spent = held
-        .live(teamclaude_rs::now_ms())
+        .live(tcr::now_ms())
         .first()
         .map(|lease| lease.spent)
         .expect("the lease is still live");
@@ -3876,8 +3872,8 @@ async fn an_answer_larger_than_one_frame_is_carried_and_charged() {
 /// The temp dirs are carried in the struct because they must outlive the
 /// listener: dropping one deletes the lender's node key under a live socket.
 struct HostilePair {
-    lender_key: teamclaude_rs::peer::id::NodeKey,
-    borrower_key: teamclaude_rs::peer::id::NodeKey,
+    lender_key: tcr::peer::id::NodeKey,
+    borrower_key: tcr::peer::id::NodeKey,
     key_dir: PathBuf,
     peers_path: PathBuf,
     ledger: std::sync::Arc<std::sync::Mutex<Ledger>>,
@@ -3888,10 +3884,10 @@ fn hostile_pair() -> HostilePair {
     let lender_home = tempfile::tempdir().expect("the lender's temp home");
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let peers_path = lender_home.path().join("tcr-peers.json");
-    let lender_key = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
-        .expect("the lender's key");
-    let borrower_key = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
-        .expect("the borrower's key");
+    let lender_key =
+        tcr::peer::id::NodeKey::load_or_mint(lender_home.path()).expect("the lender's key");
+    let borrower_key =
+        tcr::peer::id::NodeKey::load_or_mint(borrower_home.path()).expect("the borrower's key");
 
     write_peers(
         &peers_path,
@@ -3901,7 +3897,7 @@ fn hostile_pair() -> HostilePair {
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::new()));
     {
         let mut held = ledger.lock().expect("ledger lock");
@@ -3943,17 +3939,17 @@ fn hostile_pair() -> HostilePair {
 /// whose frame should not have existed.
 async fn hostile_serve(
     peer_addr: std::net::SocketAddr,
-    lender: &teamclaude_rs::peer::id::NodeKey,
-    borrower: &teamclaude_rs::peer::id::NodeKey,
+    lender: &tcr::peer::id::NodeKey,
+    borrower: &tcr::peer::id::NodeKey,
     request: serve::ServeRequest,
 ) -> anyhow::Result<serve::ServeReply> {
     let mut stream = tokio::net::TcpStream::connect(peer_addr)
         .await
         .expect("the lender's listener answers");
-    let mut session = teamclaude_rs::peer::noise::dial_handshake(
+    let mut session = tcr::peer::noise::dial_handshake(
         &mut stream,
         borrower.secret_bytes(),
-        teamclaude_rs::peer::noise::Handshake::Return,
+        tcr::peer::noise::Handshake::Return,
         Some(&lender.id().0),
         None,
     )
@@ -3984,10 +3980,10 @@ async fn hostile_serve(
 
     // The body, and then the empty frame that ends it: a body is a run of
     // frames now, and a lender waits for the terminator before it serves.
-    teamclaude_rs::peer::noise::send_encrypted(&mut stream, &mut session.transport, b"{}")
+    tcr::peer::noise::send_encrypted(&mut stream, &mut session.transport, b"{}")
         .await
         .expect("the body is written");
-    teamclaude_rs::peer::noise::send_encrypted(&mut stream, &mut session.transport, b"")
+    tcr::peer::noise::send_encrypted(&mut stream, &mut session.transport, b"")
         .await
         .expect("the body terminator is written");
 
@@ -4029,7 +4025,7 @@ async fn borrowed_requests_are_paced_by_the_lenders_own_bucket() {
 /// Three concurrent borrowed requests against one lender, and how long the last
 /// one took. The lender's fleet is one account in one organization, so every
 /// one of the three lands in the same per-org bucket.
-async fn borrowed_burst(throttle: teamclaude_rs::config::ThrottleConfig) -> std::time::Duration {
+async fn borrowed_burst(throttle: tcr::config::ThrottleConfig) -> std::time::Duration {
     let (upstream, _hits, _served) = fleet::spawn_upstream().await;
     let lender_proxy = fleet::spawn_proxy(fleet::lending_manager(&upstream, throttle)).await;
 
@@ -4037,10 +4033,10 @@ async fn borrowed_burst(throttle: teamclaude_rs::config::ThrottleConfig) -> std:
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -4052,7 +4048,7 @@ async fn borrowed_burst(throttle: teamclaude_rs::config::ThrottleConfig) -> std:
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -4079,7 +4075,7 @@ async fn borrowed_burst(throttle: teamclaude_rs::config::ThrottleConfig) -> std:
         lender_peers.clone(),
         ledger,
         lender_proxy,
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4152,7 +4148,7 @@ async fn a_lender_refuses_a_local_control_path_in_a_frame() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4218,7 +4214,7 @@ async fn a_borrower_on_the_older_serve_flow_is_refused_and_nothing_is_served() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4309,7 +4305,7 @@ async fn an_answer_that_cannot_be_carried_back_is_never_retryable() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         format!("http://{truncating}"),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -4970,8 +4966,8 @@ fn an_old_single_grant_object_reads_as_a_one_element_list() {
         ),
     );
 
-    let file = teamclaude_rs::peer::config::read_or_default(&peers)
-        .expect("the pre-decision-12 shape still reads");
+    let file =
+        tcr::peer::config::read_or_default(&peers).expect("the pre-decision-12 shape still reads");
     let row = &file.peers[0];
     assert_eq!(row.lend.len(), 1, "one grant object is one lease: {row:?}");
     let grant = &row.lend[0];
@@ -5007,7 +5003,7 @@ fn an_old_single_grant_object_reads_as_a_one_element_list() {
         }}"#
         ),
     );
-    let file = teamclaude_rs::peer::config::read_or_default(&modern).expect("the list shape reads");
+    let file = tcr::peer::config::read_or_default(&modern).expect("the list shape reads");
     assert_eq!(file.peers[0].lend.len(), 2);
 }
 
@@ -5057,7 +5053,7 @@ fn an_ended_flag_in_the_file_is_ignored_and_the_clock_decides() {
         ),
     );
 
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     let lend = &file.peers[0].lend;
     assert!(
         lend[0].ended,
@@ -5076,7 +5072,7 @@ fn an_ended_flag_in_the_file_is_ignored_and_the_clock_decides() {
     assert!(!row.lend[1].ended);
     // The one reader the picker uses skips the ended grant and finds the live
     // one on its own window.
-    let now_s = u64::try_from(teamclaude_rs::now_ms() / 1_000).expect("a positive clock");
+    let now_s = u64::try_from(tcr::now_ms() / 1_000).expect("a positive clock");
     // Every scope in this fixture is `All`, which every fleet can hold, so the
     // enforceability predicate answers `true` and the ENDED grant is the only
     // thing being skipped here.
@@ -5111,7 +5107,7 @@ fn a_grant_with_an_end_puts_it_on_the_lease_and_a_passed_end_mints_nothing() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
     let borrower = PeerId([21_u8; 32]);
-    let now_s = u64::try_from(teamclaude_rs::now_ms() / 1_000).expect("a positive clock");
+    let now_s = u64::try_from(tcr::now_ms() / 1_000).expect("a positive clock");
 
     let mut ahead = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
     ahead.until = Some(now_s + 7_200);
@@ -5186,7 +5182,7 @@ fn a_grant_with_an_end_puts_it_on_the_lease_and_a_passed_end_mints_nothing() {
 /// catch: the field was stored, printed, and enforced nowhere.
 #[test]
 fn a_grant_outside_its_window_is_refused_and_inside_it_mints() {
-    use teamclaude_rs::peer::schedule::Between;
+    use tcr::peer::schedule::Between;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
@@ -5268,7 +5264,7 @@ fn a_grant_outside_its_window_is_refused_and_inside_it_mints() {
 /// schedule is concerned.
 #[test]
 fn a_lease_minted_before_its_window_closes_stops_serving_at_the_close() {
-    use teamclaude_rs::peer::schedule::Between;
+    use tcr::peer::schedule::Between;
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
@@ -5308,7 +5304,7 @@ fn a_lease_minted_before_its_window_closes_stops_serving_at_the_close() {
         .lease
         .expect("the window is open right now, so this mints");
 
-    let mint_ms = teamclaude_rs::now_ms();
+    let mint_ms = tcr::now_ms();
     assert!(
         minted.expires_at_ms - mint_ms <= 2 * 60_000 + 5_000,
         "expires_at_ms must be clamped to the window's close, not the ask's one-hour ttl: \
@@ -5402,7 +5398,7 @@ fn a_lease_scope_stays_on_the_lender_and_never_reaches_the_wire() {
 fn lent_to_carries_the_real_scope_the_real_end_and_whether_it_has_passed() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
-    let now_s = u64::try_from(teamclaude_rs::now_ms() / 1_000).expect("a positive clock");
+    let now_s = u64::try_from(tcr::now_ms() / 1_000).expect("a positive clock");
 
     let mut live = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
     live.scope = tcr_peer_wire::LendScope::Group("work".to_string());
@@ -5645,7 +5641,7 @@ fn lend_with_a_scope_adds_a_second_lease_on_the_same_window() {
     assert!(out.contains("scope=group:work"), "{out}");
     assert!(out.contains("leases=2"), "{out}");
 
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     let lend = &file.peers[0].lend;
     assert_eq!(lend.len(), 2, "one lease per scope: {lend:?}");
     assert_eq!(lend[0].scope, tcr_peer_wire::LendScope::All);
@@ -5660,7 +5656,7 @@ fn lend_with_a_scope_adds_a_second_lease_on_the_same_window() {
     let (_, err, ok) = run_tcr_peer(&peers, &["lend", &node, "--scope", "7"]);
     assert!(!ok, "a bare number is not a scope");
     assert!(err.contains("scope"), "{err}");
-    let after = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let after = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(after.peers[0].lend.len(), 2, "a refused lend wrote nothing");
 }
 
@@ -5703,8 +5699,8 @@ fn lend_list_prints_ids_and_revoke_removes_exactly_one_lease() {
     assert!(lines[1].contains("scope=group:work"), "{out}");
     assert!(lines[1].contains("until=none"), "{out}");
 
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
-    let doomed = teamclaude_rs::peer::config::lease_id_string(file.peers[0].lend[0].id);
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
+    let doomed = tcr::peer::config::lease_id_string(file.peers[0].lend[0].id);
     let kept = file.peers[0].lend[1].id;
     assert!(
         out.contains(&doomed),
@@ -5714,7 +5710,7 @@ fn lend_list_prints_ids_and_revoke_removes_exactly_one_lease() {
     let (out, err, ok) = run_tcr_peer(&peers, &["lend", &node, "--revoke", &doomed]);
     assert!(ok, "revoke: {out}{err}");
     assert!(out.contains("leases_left=1"), "{out}");
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(file.peers[0].lend.len(), 1);
     assert_eq!(
         file.peers[0].lend[0].id, kept,
@@ -5745,7 +5741,7 @@ fn lend_list_prints_ids_and_revoke_removes_exactly_one_lease() {
 fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (peers, node) = cli_peers_file(dir.path());
-    let before = u64::try_from(teamclaude_rs::now_ms() / 1_000).expect("a positive clock");
+    let before = u64::try_from(tcr::now_ms() / 1_000).expect("a positive clock");
 
     let (out, err, ok) = run_tcr_peer(
         &peers,
@@ -5761,7 +5757,7 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
         ],
     );
     assert!(ok, "lend --for: {out}{err}");
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     let grant = &file.peers[0].lend[0];
     let until = grant.until.expect("`--for 2h` wrote an end");
     assert!(
@@ -5769,7 +5765,7 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
         "two hours ahead of now, in absolute unix seconds: {until} vs {before}"
     );
     assert!(!grant.ended, "two hours ahead has not passed");
-    let id = teamclaude_rs::peer::config::lease_id_string(grant.id);
+    let id = tcr::peer::config::lease_id_string(grant.id);
 
     // A clock that has gone is REFUSED through the same CLI, and the end the
     // grant already had is left alone. It used to roll to tomorrow, which is
@@ -5791,7 +5787,7 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
         err.contains("already passed today"),
         "and the refusal says why, naming what it resolved to: {out}{err}"
     );
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(
         file.peers[0].lend[0].until,
         Some(until),
@@ -5808,10 +5804,10 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
     let (out, err, ok) = run_tcr_peer(&peers, &["lend", &node, "--relend", &id]);
     assert!(ok, "relend with no end: {out}{err}");
     assert!(out.contains("until=none"), "{out}");
-    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    let file = tcr::peer::config::read_or_default(&peers).expect("the file reads");
     assert_eq!(file.peers[0].lend[0].until, None);
     assert_eq!(
-        teamclaude_rs::peer::config::lease_id_string(file.peers[0].lend[0].id),
+        tcr::peer::config::lease_id_string(file.peers[0].lend[0].id),
         id,
         "re-lending keeps the id, because deleting and re-creating would strand every \
          surface holding the old one"
@@ -6277,7 +6273,7 @@ fn a_malformed_grant_inside_a_list_is_refused_with_its_line() {
         ),
     );
 
-    let refusal = teamclaude_rs::peer::config::read_or_default(&peers)
+    let refusal = tcr::peer::config::read_or_default(&peers)
         .expect_err("a grant whose fraction is a string is not a readable peers file")
         .to_string();
 
@@ -6316,7 +6312,7 @@ fn a_malformed_grant_inside_a_list_is_refused_with_its_line() {
 }}"#
         ),
     );
-    let file = teamclaude_rs::peer::config::read_or_default(&good).expect("the list shape reads");
+    let file = tcr::peer::config::read_or_default(&good).expect("the list shape reads");
     assert_eq!(file.peers[0].lend.len(), 2);
 }
 
@@ -6444,7 +6440,7 @@ fn ls_json_row(peers_path: &Path, config_path: &Path) -> serde_json::Value {
 
 /// The wall clock in unix SECONDS: the unit `until` is in.
 fn unix_seconds() -> u64 {
-    u64::try_from(teamclaude_rs::now_ms().max(0) / 1_000).unwrap_or(0)
+    u64::try_from(tcr::now_ms().max(0) / 1_000).unwrap_or(0)
 }
 
 /// **An accepted connection opens the peers file ONCE**: the review's L2.
@@ -6477,10 +6473,10 @@ async fn an_accepted_connection_opens_the_peers_file_once() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -6492,7 +6488,7 @@ async fn an_accepted_connection_opens_the_peers_file_once() {
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -6515,7 +6511,7 @@ async fn an_accepted_connection_opens_the_peers_file_once() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -6532,12 +6528,12 @@ async fn an_accepted_connection_opens_the_peers_file_once() {
 
     // AFTER the listener is up: standing one up reads the file once, and that
     // read is not per connection.
-    let before = teamclaude_rs::peer::config::peers_file_opens(&lender_peers);
+    let before = tcr::peer::config::peers_file_opens(&lender_peers);
     // A positive control for the counter itself, on a path that is not the
     // lender's: an empty result here would otherwise read as "one open" no
     // matter what the listener did.
     assert_eq!(
-        teamclaude_rs::peer::config::peers_file_opens(&borrower_peers),
+        tcr::peer::config::peers_file_opens(&borrower_peers),
         1,
         "the borrower's own store opened its own file once, so this counter \
          counts opens rather than always answering zero"
@@ -6550,7 +6546,7 @@ async fn an_accepted_connection_opens_the_peers_file_once() {
         .served()
         .expect("the lender served it");
 
-    let opened = teamclaude_rs::peer::config::peers_file_opens(&lender_peers) - before;
+    let opened = tcr::peer::config::peers_file_opens(&lender_peers) - before;
     assert_eq!(
         opened, 1,
         "one accepted connection opens the lender's peers file {opened} times; \
@@ -6584,10 +6580,10 @@ async fn a_borrowed_lease_is_written_and_a_fresh_ls_reads_its_until() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -6611,7 +6607,7 @@ async fn a_borrowed_lease_is_written_and_a_fresh_ls_reads_its_until() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -6642,7 +6638,7 @@ async fn a_borrowed_lease_is_written_and_a_fresh_ls_reads_its_until() {
     );
 
     let state_path = borrower_home.path().join("peer-state.json");
-    let state = teamclaude_rs::peer::state::load(&state_path, teamclaude_rs::now_ms())
+    let state = tcr::peer::state::load(&state_path, tcr::now_ms())
         .expect("the borrower's state file reads back");
     assert_eq!(
         state.borrowed.len(),
@@ -6708,10 +6704,10 @@ async fn a_borrow_through_the_provider_carries_the_headers_the_api_requires() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -6733,7 +6729,7 @@ async fn a_borrow_through_the_provider_carries_the_headers_the_api_requires() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -6814,9 +6810,9 @@ fn a_borrowed_lease_whose_end_has_passed_reads_ended() {
     );
 
     let ended_at = unix_seconds() - 60;
-    let now_ms = teamclaude_rs::now_ms();
-    let state = teamclaude_rs::peer::state::PeerState {
-        borrowed: vec![teamclaude_rs::peer::state::BorrowedRow {
+    let now_ms = tcr::now_ms();
+    let state = tcr::peer::state::PeerState {
+        borrowed: vec![tcr::peer::state::BorrowedRow {
             lease: Lease {
                 lease_id: 0x5ea5e,
                 window: Window::SevenDay,
@@ -6832,9 +6828,9 @@ fn a_borrowed_lease_whose_end_has_passed_reads_ended() {
             },
             lender,
         }],
-        ..teamclaude_rs::peer::state::PeerState::default()
+        ..tcr::peer::state::PeerState::default()
     };
-    teamclaude_rs::peer::state::save(&home.path().join("peer-state.json"), &state)
+    tcr::peer::state::save(&home.path().join("peer-state.json"), &state)
         .expect("the borrower's state file writes");
 
     let row = ls_json_row(&peers_path, &config_path);
@@ -6865,9 +6861,9 @@ fn a_live_borrowed_lease_is_restored_at_boot_and_an_expired_one_is_not() {
     let peers_path = home.path().join("tcr-peers.json");
     let live_lender = PeerId([3_u8; 32]);
     let dead_lender = PeerId([4_u8; 32]);
-    let now_ms = teamclaude_rs::now_ms();
+    let now_ms = tcr::now_ms();
 
-    let row_for = |lender: PeerId, expires_at_ms: i64| teamclaude_rs::peer::state::BorrowedRow {
+    let row_for = |lender: PeerId, expires_at_ms: i64| tcr::peer::state::BorrowedRow {
         lease: Lease {
             lease_id: 0x11,
             window: Window::SevenDay,
@@ -6880,14 +6876,14 @@ fn a_live_borrowed_lease_is_restored_at_boot_and_an_expired_one_is_not() {
         },
         lender,
     };
-    let state = teamclaude_rs::peer::state::PeerState {
+    let state = tcr::peer::state::PeerState {
         borrowed: vec![
             row_for(live_lender, now_ms + 300_000),
             row_for(dead_lender, now_ms - 1_000),
         ],
-        ..teamclaude_rs::peer::state::PeerState::default()
+        ..tcr::peer::state::PeerState::default()
     };
-    teamclaude_rs::peer::state::save(&home.path().join("peer-state.json"), &state)
+    tcr::peer::state::save(&home.path().join("peer-state.json"), &state)
         .expect("the borrower's state file writes");
 
     let restored = PeerLeaseProvider::new(peers_path).borrowed();
@@ -7010,7 +7006,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
 
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -7021,7 +7017,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
     for _ in 0..2 {
         let home = tempfile::tempdir().expect("a lender's temp home");
         let peers = home.path().join("tcr-peers.json");
-        let id = teamclaude_rs::peer::id::NodeKey::load_or_mint(home.path())
+        let id = tcr::peer::id::NodeKey::load_or_mint(home.path())
             .expect("the lender's key")
             .id();
         write_peers(
@@ -7041,7 +7037,7 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
             peers,
             ledger,
             lender_proxy.clone(),
-            std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+            std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
             fleet::dry_manager(),
         )
         .await;
@@ -7052,13 +7048,12 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
     // The deadline is the borrower's own file, which is the production path:
     // shorter than the origin's delay, so the first lender runs out of time
     // with the body already gone.
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: rows,
         borrow_timeout_ms: 300,
-        ..teamclaude_rs::peer::config::PeerFile::default()
+        ..tcr::peer::config::PeerFile::default()
     };
-    teamclaude_rs::peer::config::save(&borrower_peers, &file)
-        .expect("the borrower's peers file writes");
+    tcr::peer::config::save(&borrower_peers, &file).expect("the borrower's peers file writes");
 
     let provider = PeerLeaseProvider::new(borrower_peers.clone());
     let ask = ask_for("/v1/messages");
@@ -7210,10 +7205,10 @@ async fn a_lender_that_never_acknowledges_has_taken_nothing() {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -7280,7 +7275,7 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
 
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -7291,7 +7286,7 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
     for inspect in [false, true] {
         let home = tempfile::tempdir().expect("a lender's temp home");
         let peers = home.path().join("tcr-peers.json");
-        let id = teamclaude_rs::peer::id::NodeKey::load_or_mint(home.path())
+        let id = tcr::peer::id::NodeKey::load_or_mint(home.path())
             .expect("the lender's key")
             .id();
         let mut row = lender_row_for(
@@ -7314,7 +7309,7 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
             peers,
             ledger,
             lender_proxy.clone(),
-            std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+            std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
             fleet::dry_manager(),
         )
         .await;
@@ -7322,13 +7317,12 @@ async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serve
         homes.push(home);
     }
 
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: rows,
         borrow_timeout_ms: 3_000,
-        ..teamclaude_rs::peer::config::PeerFile::default()
+        ..tcr::peer::config::PeerFile::default()
     };
-    teamclaude_rs::peer::config::save(&borrower_peers, &file)
-        .expect("the borrower's peers file writes");
+    tcr::peer::config::save(&borrower_peers, &file).expect("the borrower's peers file writes");
 
     let provider = PeerLeaseProvider::new(borrower_peers.clone());
     let ask = ask_for("/v1/messages");
@@ -7383,13 +7377,12 @@ async fn borrow_timeout_ms_on_the_peers_file_is_the_deadline_open_serve_uses() {
         }
     });
 
-    let file = teamclaude_rs::peer::config::PeerFile {
+    let file = tcr::peer::config::PeerFile {
         peers: vec![borrower_row_for(lender_id, true, vec![addr.to_string()])],
         borrow_timeout_ms: 50,
-        ..teamclaude_rs::peer::config::PeerFile::default()
+        ..tcr::peer::config::PeerFile::default()
     };
-    teamclaude_rs::peer::config::save(&borrower_peers, &file)
-        .expect("the borrower's peers file writes");
+    tcr::peer::config::save(&borrower_peers, &file).expect("the borrower's peers file writes");
 
     let store = PeerStore::open(&borrower_peers).expect("the borrower's peers file");
     let lease = lease_with(LEASE, 0.20, 0.0);
@@ -7471,7 +7464,7 @@ fn a_second_ask_is_cut_out_of_what_is_left_not_out_of_the_whole() {
         (ledger.committed_fraction(
             &tcr_peer_wire::LendScope::All,
             Window::SevenDay,
-            teamclaude_rs::now_ms()
+            tcr::now_ms()
         ) - 0.20)
             .abs()
             < 1e-9,
@@ -7515,7 +7508,7 @@ fn a_second_ask_is_cut_out_of_what_is_left_not_out_of_the_whole() {
 /// ledger says nothing is promised while two leases are live.
 #[test]
 fn a_lease_on_an_overlapping_scope_is_already_promised_room() {
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let borrower = PeerId([7_u8; 32]);
     let work = tcr_peer_wire::LendScope::Group("work".to_string());
     let all = tcr_peer_wire::LendScope::All;
@@ -7598,7 +7591,7 @@ fn a_busy_lease_cannot_evict_another_leases_replay_defence() {
     let quiet = 0x9111_u128;
     let busy = 0x9222_u128;
     let peer = PeerId([7_u8; 32]);
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
 
     let mut ledger = Ledger::new();
     for lease_id in [quiet, busy] {
@@ -7735,7 +7728,7 @@ fn a_ninth_live_lease_for_one_peer_is_refused_and_the_eight_stand() {
          backs off from a live one for the wrong reason"
     );
 
-    let now_ms = teamclaude_rs::now_ms();
+    let now_ms = tcr::now_ms();
     assert_eq!(
         ledger.live_for(&borrower, now_ms),
         8,
@@ -7792,10 +7785,10 @@ async fn five_concurrent_first_asks_mint_one_lease() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -7856,7 +7849,7 @@ async fn five_concurrent_first_asks_mint_one_lease() {
     );
 
     let state_path = borrower_home.path().join("peer-state.json");
-    let state = teamclaude_rs::peer::state::load(&state_path, teamclaude_rs::now_ms())
+    let state = tcr::peer::state::load(&state_path, tcr::now_ms())
         .expect("the borrower's state file reads back");
     assert_eq!(
         state.borrowed.len(),
@@ -7956,15 +7949,15 @@ fn a_row_is_dialled_newest_first_and_through_a_peer_last() {
 fn a_leases_tokens_are_charged_to_the_path_it_was_noted_on() {
     let borrower = PeerId([0xb0_u8; 32]);
     let arrived_over: std::net::SocketAddr = "127.0.0.1:9901".parse().expect("a literal address");
-    let path = teamclaude_rs::peer::config::Locator::Direct { addr: arrived_over };
-    let now = teamclaude_rs::now_ms();
+    let path = tcr::peer::config::Locator::Direct { addr: arrived_over };
+    let now = tcr::now_ms();
 
     let rows_for = |peer: PeerId| {
-        let mut meter = teamclaude_rs::peer::tunnel::path_meter()
+        let mut meter = tcr::peer::tunnel::path_meter()
             .lock()
             .expect("the meter lock");
         meter
-            .rows(teamclaude_rs::now_ms())
+            .rows(tcr::now_ms())
             .into_iter()
             .filter(|row| row.peer == peer)
             .collect::<Vec<_>>()
@@ -8049,10 +8042,10 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -8061,7 +8054,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
         vec![lender_row_for(
             borrower_id,
             vec![LendGrant {
-                mode: teamclaude_rs::peer::config::LendMode::Hand,
+                mode: tcr::peer::config::LendMode::Hand,
                 ..LendGrant::new(Window::SevenDay, 0.20, 300, 2)
             }],
         )],
@@ -8077,7 +8070,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
         lender_peers.clone(),
         ledger.clone(),
         owner_proxy.clone(),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         manager.clone(),
     )
     .await;
@@ -8107,8 +8100,8 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
     // The lease the provider is holding, read off the borrower's own state
     // file, which is where it writes the borrowed rows. Its id is what the
     // bearer is keyed by and what this test forgets on the way out.
-    let borrower_state = teamclaude_rs::peer::serve::peer_state_path(&borrower_peers);
-    let handed = teamclaude_rs::peer::state::load(&borrower_state, teamclaude_rs::now_ms())
+    let borrower_state = tcr::peer::serve::peer_state_path(&borrower_peers);
+    let handed = tcr::peer::state::load(&borrower_state, tcr::now_ms())
         .expect("the borrower's state file reads")
         .borrowed
         .first()
@@ -8122,7 +8115,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
         arrived = store
             .lock()
             .expect("the handed-token store")
-            .bearer(handed, teamclaude_rs::now_ms())
+            .bearer(handed, tcr::now_ms())
             .is_some();
         if arrived {
             break;
@@ -8265,7 +8258,7 @@ fn a_lent_to_row_carries_the_wire_id_of_the_mac_it_names() {
 #[test]
 fn a_pair_the_serve_cache_forgot_is_charged_when_it_is_served_again() {
     let peer = PeerId([9_u8; 32]);
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let mut ledger = Ledger::new();
     ledger.record_scoped(
         Lease {
@@ -8358,10 +8351,10 @@ async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -8373,7 +8366,7 @@ async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
         )],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -8396,7 +8389,7 @@ async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -8449,7 +8442,7 @@ async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
     // A lease id of this test's own, because the handed-token store is one
     // process-wide map and every test in this binary shares it.
     let lease_id = 0xc0ff_ee00_u128;
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     lease::handed_tokens()
         .lock()
         .expect("the handed-token store")
@@ -8508,10 +8501,10 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
     let lender_peers = lender_home.path().join("tcr-peers.json");
     let borrower_peers = borrower_home.path().join("tcr-peers.json");
 
-    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+    let lender_id = tcr::peer::id::NodeKey::load_or_mint(lender_home.path())
         .expect("the lender's key")
         .id();
-    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+    let borrower_id = tcr::peer::id::NodeKey::load_or_mint(borrower_home.path())
         .expect("the borrower's key")
         .id();
 
@@ -8538,7 +8531,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
     .collect();
     let mut closed_now = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
     closed_now.days = Some(
-        teamclaude_rs::peer::schedule::Days::try_from(every_other_day.join(","))
+        tcr::peer::schedule::Days::try_from(every_other_day.join(","))
             .expect("a day list this test built"),
     );
 
@@ -8547,7 +8540,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
         vec![lender_row_for(borrower_id, vec![closed_now])],
     );
 
-    let now = teamclaude_rs::now_ms();
+    let now = tcr::now_ms();
     let lease = Lease {
         lease_id: LEASE,
         window: Window::SevenDay,
@@ -8572,7 +8565,7 @@ async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
         lender_peers.clone(),
         ledger.clone(),
         lender_proxy.clone(),
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -8647,7 +8640,7 @@ async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
         .header(
-            teamclaude_rs::proxy::ACCOUNTS_HEADER_NAME,
+            tcr::proxy::ACCOUNTS_HEADER_NAME,
             "no-such-account-on-this-mac",
         )
         .body(r#"{"model":"claude-sonnet-4-5","messages":[]}"#)
@@ -8723,7 +8716,7 @@ async fn codex_path_in_a_frame_is_refused_by_the_lender() {
         pair.peers_path.clone(),
         pair.ledger.clone(),
         lender_proxy,
-        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
         fleet::dry_manager(),
     )
     .await;
@@ -8736,7 +8729,7 @@ async fn codex_path_in_a_frame_is_refused_by_the_lender() {
             lease_id: LEASE,
             request_id: 1,
             method: "POST".to_string(),
-            path: teamclaude_rs::provider::CODEX_RESPONSES_PATH.to_string(),
+            path: tcr::provider::CODEX_RESPONSES_PATH.to_string(),
             query: None,
             headers: Vec::new(),
             body_bytes: 2,
