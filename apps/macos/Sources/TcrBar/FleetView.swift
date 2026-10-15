@@ -110,6 +110,7 @@ struct FleetView: View {
     /// up: one piece of state rather than a session plus a separate
     /// `isPresented` flag that can disagree with it.
     @State private var loginSession: LoginSession?
+    @State private var checkingLoginCapability = false
 
     /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -3981,6 +3982,13 @@ struct FleetView: View {
     /// is picked. The chooser's Codex help depends on whether this tcr has
     /// `tcr login --codex`, which is asked once and remembered.
     private func addAccount() {
+        Task { await addAccountAfterProbe() }
+    }
+
+    private func addAccountAfterProbe() async {
+        guard !checkingLoginCapability else { return }
+        checkingLoginCapability = true
+        defer { checkingLoginCapability = false }
         guard effectivePresence.isPresent else {
             beginLogin(.claude(account: nil))
             return
@@ -3994,7 +4002,7 @@ struct FleetView: View {
             let codex = effectivePresence.codexExecutable
             loginSession = LoginSession(
                 request: nil, phase: .choosing,
-                codexSupported: LoginCapability.probeCodex(executable: tcr),
+                codexSupported: await LoginCapability.probeCodex(executable: tcr),
                 resolvedCodexExecutable: { codex })
         }
     }
@@ -4038,6 +4046,13 @@ struct FleetView: View {
     /// A sheet already up, the chooser or the import's confirmation, runs the
     /// request itself; otherwise a new one is presented.
     private func beginLogin(_ request: LoginRequest) {
+        Task { await beginLoginAfterProbe(request) }
+    }
+
+    private func beginLoginAfterProbe(_ request: LoginRequest) async {
+        guard !checkingLoginCapability else { return }
+        checkingLoginCapability = true
+        defer { checkingLoginCapability = false }
         loginError = nil
         guard !snapshotMode else { return }
 
@@ -4048,7 +4063,7 @@ struct FleetView: View {
         case .success(let executable):
             switch request {
             case .claude(let name):
-                guard LoginCapability.probe(executable: executable) else {
+                guard await LoginCapability.probe(executable: executable) else {
                     closeSheetForTerminal()
                     if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
                         loginError = Self.loginFailureMessage(why)
@@ -4056,7 +4071,7 @@ struct FleetView: View {
                     return
                 }
             case .codex, .codexImport:
-                switch LoginCapability.readCodexPath(executable: executable) {
+                switch await LoginCapability.readCodexPath(executable: executable) {
                 case .inSheet:
                     break
                 case .terminal:

@@ -884,7 +884,7 @@ final class MenuBarShell {
             if codexPresence.presence.isPresent || fleetHoldsCodex,
                 case .success(let tcr) = TcrTool.resolve()
             {
-                _ = LoginCapability.probeCodex(executable: tcr)
+                _ = await LoginCapability.probeCodex(executable: tcr)
             }
         }
     }

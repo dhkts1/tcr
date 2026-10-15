@@ -30,6 +30,21 @@ final class LoginCapabilityTests: XCTestCase {
           -h, --help               Print help
         """#
 
+    @MainActor
+    func testAllHelpProbesRunOffTheMainThread() async {
+        let executable = URL(fileURLWithPath: "/opt/example/tcr-help-thread-test")
+        let read: @Sendable (URL) throws -> String = { _ in
+            XCTAssertFalse(Thread.isMainThread)
+            return "--codex --non-interactive"
+        }
+        let nonInteractive = await LoginCapability.probe(executable: executable, readHelp: read)
+        let codex = await LoginCapability.probeCodex(executable: executable, readHelp: read)
+        let path = await LoginCapability.readCodexPath(executable: executable, readHelp: read)
+        XCTAssertTrue(nonInteractive)
+        XCTAssertTrue(codex)
+        XCTAssertEqual(path, .inSheet)
+    }
+
     /// `--codex` as a whole token is the in-app sign-in, wherever it sits on its line.
     func testTheWholeTokenCodexPasses() {
         XCTAssertTrue(

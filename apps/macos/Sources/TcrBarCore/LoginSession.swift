@@ -664,14 +664,15 @@ public enum LoginCapability {
     /// every `tcr` ever shipped, so an unreadable answer must fall back to it
     /// rather than onto a flag that may not exist.
     @MainActor
-    public static func probe(executable: URL) -> Bool {
+    public static func probe(
+        executable: URL,
+        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) }
+    ) async -> Bool {
         if let known = cached[executable.path] { return known }
         let answer: Bool
         do {
-            let output = try TcrTool.run(
-                executable: executable, arguments: ["login", "--help"])
-            let help = (String(data: output.stdout, encoding: .utf8) ?? "") + output.stderr
-            answer = output.exitCode == 0 && supportsNonInteractive(help: help)
+            let help = try await Task.detached(priority: .utility) { try readHelp(executable) }.value
+            answer = supportsNonInteractive(help: help)
         } catch {
             answer = false
         }
@@ -702,9 +703,14 @@ public enum LoginCapability {
     /// `false`, which sends a Codex sign-in to the Terminal script, the path every
     /// `tcr` that can import a codex login takes.
     @MainActor
-    public static func probeCodex(executable: URL) -> Bool {
+    public static func probeCodex(
+        executable: URL,
+        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) }
+    ) async -> Bool {
         if let known = codexCached[executable.path] { return known }
-        let answer = (try? loginHelp(executable: executable)).map(supportsCodex(help:)) ?? false
+        let answer =
+            (try? await Task.detached(priority: .utility) { try readHelp(executable) }.value).map(
+                supportsCodex(help:)) ?? false
         codexCached[executable.path] = answer
         return answer
     }
@@ -745,8 +751,12 @@ public enum LoginCapability {
     /// failed run answers `.terminal`, as a `false` from ``probeCodex(executable:)``
     /// does.
     @MainActor
-    public static func readCodexPath(executable: URL) -> CodexLoginPath {
-        guard let help = try? loginHelp(executable: executable) else {
+    public static func readCodexPath(
+        executable: URL,
+        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) }
+    ) async -> CodexLoginPath {
+        let help = try? await Task.detached(priority: .utility) { try readHelp(executable) }.value
+        guard let help else {
             codexCached[executable.path] = false
             return .terminal
         }
@@ -756,7 +766,7 @@ public enum LoginCapability {
     }
 
     /// `tcr login --help`'s text, both streams; a non-zero exit is a failed run.
-    private static func loginHelp(executable: URL) throws -> String {
+    public nonisolated static func readLoginHelp(_ executable: URL) throws -> String {
         let output = try TcrTool.run(executable: executable, arguments: ["login", "--help"])
         guard output.exitCode == 0 else { throw HelpFailed() }
         return (String(data: output.stdout, encoding: .utf8) ?? "") + output.stderr
