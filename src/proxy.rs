@@ -3555,6 +3555,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // them.
     let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
     let mut account_access_blocks = 0;
+    let mut codex_access_read_failures = 0;
     let mut last_account_access_block: Option<(HeaderMap, Bytes)> = None;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
@@ -3755,10 +3756,42 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // accounts refused, others merely exhausted — fall through
                     // unchanged to the existing exhaustion handling, which can still
                     // recover on the accounts that were not refused.
+                    if codex_access_read_failures > 0
+                        && codex_access_read_failures == upstream_responses
+                    {
+                        return error_response(StatusCode::BAD_GATEWAY, "proxy_error",
+                            "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.", None);
+                    }
                     if account_access_blocks > 0
                         && account_access_blocks + refused_403.len() == upstream_responses
                     {
                         if let Some((headers, body)) = last_account_access_block.take() {
+                            if !refused_403.is_empty() {
+                                let mut combined: Value = serde_json::from_slice(&body)
+                                    .unwrap_or_else(|_| {
+                                        codex_error_body(
+                                            CodexRefusalKind::CredentialRefused,
+                                            "ChatGPT refused workspace access.",
+                                        )
+                                    });
+                                let message = combined
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("ChatGPT refused workspace access.");
+                                let message = format!(
+                                    "{message} {}",
+                                    codex_credential_refused_message(&refused_403)
+                                );
+                                if !combined.get("error").is_some_and(Value::is_object) {
+                                    combined["error"] = serde_json::json!({});
+                                }
+                                combined["error"]["message"] = message.into();
+                                return codex_error_response(
+                                    StatusCode::FORBIDDEN,
+                                    combined.to_string(),
+                                    None,
+                                );
+                            }
                             return build_response(
                                 StatusCode::FORBIDDEN,
                                 &headers,
@@ -4619,6 +4652,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             };
             match provider {
                 Provider::Codex => {
+                    if body.is_none() {
+                        let hold = NO_GUIDANCE_HOLD_SECS
+                            + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                        manager.mark_rate_limited(idx, hold);
+                        codex_access_read_failures += 1;
+                        tried.insert(idx);
+                        continue;
+                    }
                     let auth_error = body
                         .as_deref()
                         .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
@@ -8048,21 +8089,19 @@ fn codex_credential_refused_response(refused: &[(usize, Option<String>)]) -> Res
         "returning 403 to a Codex client — every account tried was refused with a 403; sign \
          each in again"
     );
-    let message = names
-        .iter()
-        .map(|name| {
-            format!(
-                "ChatGPT refused {name}'s login — sign it in again with `tcr login --codex \
-                 --account {name}` or TcrBar's Re-login\u{2026}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let message = codex_credential_refused_message(refused);
     codex_error_response(
         StatusCode::FORBIDDEN,
         codex_error_body(CodexRefusalKind::CredentialRefused, message).to_string(),
         None,
     )
+}
+
+fn codex_credential_refused_message(refused: &[(usize, Option<String>)]) -> String {
+    refused.iter().map(|(_, name)| {
+        let name = name.as_deref().unwrap_or("<unnamed>");
+        format!("ChatGPT refused {name}'s login — sign it in again with `tcr login --codex --account {name}` or TcrBar's Re-login…")
+    }).collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -23443,6 +23482,103 @@ mod tests {
             r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_codex_403_is_held_briefly_and_rotates_without_relogin() {
+        for stalled in [false, true] {
+            let first = Arc::new(std::sync::Mutex::new(None::<String>));
+            let observed = first.clone();
+            let origin = Router::new().fallback(move |headers: HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    let bearer = headers["authorization"].to_str().unwrap().to_owned();
+                    let original = observed
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(bearer.clone())
+                        .clone();
+                    if bearer != original {
+                        return Response::new(Body::from("{}"));
+                    }
+                    let stream = futures::stream::unfold(0, move |step| async move {
+                        match step {
+                            0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(b"{")), 1)),
+                            1 => {
+                                if stalled {
+                                    std::future::pending::<()>().await;
+                                }
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                                Some((Err(std::io::Error::other("fixture body disconnected")), 2))
+                            }
+                            _ => None,
+                        }
+                    });
+                    Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let manager = Manager::with_live_refresher(
+                codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
+                None,
+            );
+            let response = tokio::time::timeout(Duration::from_secs(8), send_codex_turn(&manager))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "stalled={stalled}: a healthy sibling serves this turn"
+            );
+            let failed = codex_index_of(first.lock().unwrap().as_deref().unwrap());
+            let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+            let row = &snapshot.accounts[failed];
+            assert!(
+                row.rate_limited_until.is_some(),
+                "an unreadable access response must not repeat immediately"
+            );
+            assert_ne!(row.gate, GateReason::Refused);
+            assert_eq!(row.codex.login_error, None);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_codex_workspace_and_credential_refusals_keep_both_remedies() {
+        let origin = Router::new().fallback(|headers: HeaderMap| async move {
+            let body = if headers["authorization"] == "Bearer at-bob" {
+                r#"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"Login rejected"}}"#
+            } else {
+                r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#
+            };
+            Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body)).unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let manager = Manager::with_live_refresher(
+            codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
+            None,
+        );
+        let response = send_codex_turn(&manager).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key("retry-after"));
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "workspace_deactivated");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Workspace deactivated"));
+        assert!(
+            message.contains("tcr login --codex --account bob@example.com"),
+            "{message}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
