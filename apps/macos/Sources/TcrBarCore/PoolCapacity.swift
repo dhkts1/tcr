@@ -10,9 +10,9 @@ import Foundation
 // bar, the strip and the tooltip say which client can work.
 //
 // A pool counts an account as ready when its state (`FleetTally.Kind`) is `.ok`. That is
-// stricter than `Account.isReady`, which never reads the server's gate: a refused,
-// unreachable, group-parked or signed-out account is not capacity, and a fleet holding
-// Codex accounts is where those states are common.
+// stricter than Claude's `Account.isReady`, which does not read the server's gate.
+// Codex readiness does read its gate: refused, unreachable, group-parked and signed-out
+// Codex accounts cannot serve.
 //
 // A fleet with no Codex account is not counted here at all. `Fleet.providerPools(now:)` is
 // `nil` for it, the empty fleet included, and every caller keeps today's path on that

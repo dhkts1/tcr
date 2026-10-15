@@ -120,12 +120,9 @@ final class ToolCallLabelTests: XCTestCase {
 
     // MARK: - SLOWEST TODAY's timeout
 
-    /// SLOWEST TODAY judges a Claude call by the Bash tool's 600 s, as it always has, and a
-    /// codex call by its own timeout. codex's default `exec_command` names none and has none,
-    /// so a codex call that ran ten minutes or more under it keeps its duration: "timed out",
-    /// spoken "killed at the 600 second timeout", would be false. A one-shot call that ran
-    /// into its own timeout says so.
-    func testACodexCallIsJudgedByItsOwnTimeout() {
+    /// Finished Codex rows have no timeout on the wire; the label keeps their duration.
+    /// Claude keeps its established Bash-timeout policy.
+    func testFinishedCodexCallsDoNotInferATimeout() {
         let interactive = SessionToolEntry(
             sessionId: "s", call: ToolCall(tool: "exec_command", seconds: 900), provider: .codex)
         XCTAssertNil(ToolCallLabel.judgedTimeout(for: interactive, bashTimeout: 600))
@@ -133,17 +130,6 @@ final class ToolCallLabelTests: XCTestCase {
         XCTAssertEqual(ToolCallLabel.pill(seconds: 900, timeout: none), "15m 0s")
         XCTAssertFalse(ToolCallLabel.timedOut(seconds: 900, timeout: none))
         XCTAssertNil(ToolCallLabel.spoken(seconds: 900, timeout: none))
-
-        let oneShot = SessionToolEntry(
-            sessionId: "s", call: ToolCall(tool: "exec_command", seconds: 120, timeoutSeconds: 120),
-            provider: .codex)
-        let own = ToolCallLabel.judgedTimeout(for: oneShot, bashTimeout: 600)
-        XCTAssertEqual(own, 120)
-        XCTAssertEqual(ToolCallLabel.pill(seconds: 120, timeout: own), "timed out")
-        XCTAssertEqual(
-            ToolCallLabel.spoken(seconds: 120, timeout: own),
-            "ran 2m 0s, killed at the 120 second timeout")
-        XCTAssertEqual(ToolCallLabel.pill(seconds: 700, timeout: own), "timed out")
 
         for tool in ["Bash", "Agent", "Read"] {
             let claude = SessionToolEntry(sessionId: "s", call: ToolCall(tool: tool, seconds: 600))

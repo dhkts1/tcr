@@ -301,43 +301,12 @@ final class PoolCapacityTests: XCTestCase {
         XCTAssertEqual(FleetTally.Kind(account: unknown), .unmeasured)
     }
 
-    /// A server older than the refusing-window gate sent a Codex quota refusal as
-    /// `rejected`, with its full window still held. That row is out until the window rolls,
-    /// which is spent; a refusal with nothing held, or with a named limit, stays one.
-    func testAnOlderServersWindowRefusalIsSpent() throws {
-        let carol = try account(canonicalRow("carol@example.com", olderServerRefusal))
-        XCTAssertTrue(carol.isOlderServerWindowRefusal)
-        XCTAssertFalse(carol.isRejected)
-        XCTAssertEqual(FleetTally.Kind(account: carol), .spent)
-        XCTAssertNil(carol.stateHelp)
-
-        var nothingHeld = olderServerRefusal
-        nothingHeld["held"] = [Any]()
-        XCTAssertEqual(
-            FleetTally.Kind(account: try account(canonicalRow("carol@example.com", nothingHeld))),
-            .rejected)
-        var named = olderServerRefusal
-        named["limitReachedType"] = "rate_limit_reached"
-        XCTAssertEqual(
-            FleetTally.Kind(account: try account(canonicalRow("carol@example.com", named))),
-            .rejected)
-
-        let alice = try account(
-            canonicalRow(
-                "alice@example.com",
-                [
-                    "gate": "rejected",
-                    "held": [
-                        ["window": "5h", "minutesUntilReset": 159, "resetAtMs": 1_767_235_140_000]
-                    ],
-                ]))
-        XCTAssertFalse(alice.isOlderServerWindowRefusal)
-        XCTAssertTrue(alice.isRejected)
-        XCTAssertEqual(FleetTally.Kind(account: alice), .rejected)
-
-        // Timed by its held week, as a spent row is.
-        let pool = PoolCapacity(provider: .codex, accounts: [carol], now: fixtureNow)
-        XCTAssertEqual(pool.nextIn, "next in 3d 4h")
+    /// A real rejected gate stays a refusal even when a quota window is full too.
+    func testARejectedCodexLoginIsNotReclassifiedAsASpentWindow() throws {
+        let row = try account(canonicalRow("carol@example.com", rejectedFullWindow))
+        XCTAssertTrue(row.isRejected)
+        XCTAssertEqual(FleetTally.Kind(account: row), .rejected)
+        XCTAssertNotNil(row.stateHelp)
     }
 
     /// The short hold the server arms after ChatGPT answered 403 is a refusal on a Codex
@@ -755,7 +724,7 @@ final class PoolCapacityTests: XCTestCase {
 
     /// The keys an older server's Codex window refusal carries over canonical carol: gate
     /// `rejected`, nothing that a newer server adds, and her held week left in place.
-    private let olderServerRefusal: [String: Any] = [
+    private let rejectedFullWindow: [String: Any] = [
         "gate": "rejected", "freeAtMs": NSNull(), "secondsUntilFree": NSNull(),
         "limitReachedType": NSNull(), "credits": NSNull(), "quotaWindows": NSNull(),
         "sevenDayWindowMinutes": NSNull(),

@@ -58,16 +58,12 @@ public enum ToolCallLabel {
     /// The timeout SLOWEST TODAY judges a finished call against, or `nil` for a
     /// call that had none this build knows of, which no duration makes "timed out".
     ///
-    /// A Claude call keeps `bashTimeout`, the Bash tool's 600 s, which this list
-    /// has always judged every Claude call by. A codex call is judged by its own
-    /// cap (``ToolCall/timeoutCap(bashTimeout:)``, the figure its ring filled
-    /// toward while it ran): a one-shot `exec_command` names a timeout, and codex's
-    /// default `exec_command` has none at all, so a codex call that ran ten minutes
-    /// under it was not killed at anything.
+    /// Claude keeps the Bash timeout this list has always used. A completed Codex
+    /// row does not carry its timeout on the wire, so no duration proves it timed out.
     public static func judgedTimeout(for entry: SessionToolEntry, bashTimeout: Double) -> Double? {
         switch entry.provider {
         case .anthropic: return bashTimeout
-        case .codex: return entry.call.timeoutCap(bashTimeout: bashTimeout)
+        case .codex: return nil
         }
     }
 

@@ -1912,26 +1912,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// claiming anything when this is absent.
     public let gate: GateReason?
 
-    /// Whether Anthropic itself has rejected this account, so the router will
-    /// never select it however healthy its quota looks. The one gate the panel
-    /// had no way to see, and the reason ``gate`` is decoded at all.
-    ///
-    /// Not every `rejected` gate is a refusal. A server built before the
-    /// refusing-window gate existed sent a Codex quota refusal as `rejected`
-    /// too, with the full window still listed in ``held``. That row is out
-    /// until its window rolls, which is spent, so it is not rejected here
-    /// (``isOlderServerWindowRefusal``). With that, the state classifier, the
-    /// pill's help, the pool-membership pill, the spoken card and the legacy
-    /// panel all read it as spent. The exclusion never holds on a Claude row.
-    public var isRejected: Bool { gate == .rejected && !isOlderServerWindowRefusal }
-
-    /// A Codex row from a server that predates the refusing-window gate,
-    /// refused at a full window: the gate reads `rejected`, ChatGPT named no
-    /// limit (``limitReachedType`` is absent), and ``held`` still names the window. It is
-    /// timed by that window, as any spent row is.
-    public var isOlderServerWindowRefusal: Bool {
-        provider == .codex && gate == .rejected && limitReachedType == nil && !held.isEmpty
-    }
+    /// The server refused this login, independently of any full quota window.
+    public var isRejected: Bool { gate == .rejected }
 
     /// A Codex row in a reserved group. A Codex session cannot ask for a group,
     /// so no Codex request can reach this account, whatever its quota says.
@@ -3167,21 +3149,17 @@ public struct FleetTally: Equatable, Sendable {
         ///  3. `health == .needsRelogin` — a dead credential.
         ///  4. ``Account/isUnreachable`` — a Codex row in a reserved group,
         ///     which no Codex request can reach.
-        ///  5. ``Account/isOlderServerWindowRefusal`` — a Codex row a server
-        ///     older than the refusing-window gate called rejected while its
-        ///     full window was still held. It is out until that window rolls,
-        ///     which is spent, exactly as the row a newer server sends for it.
-        ///  6. ``Account/isRejected`` — Anthropic's own verdict — or a refused
+        ///  5. ``Account/isRejected`` — Anthropic's own verdict — or a refused
         ///     Codex row, for either of its two causes: a usage refusal that
         ///     names its limit (``Account/isRefusedHold``) or a 403
         ///     (``Account/isForbiddenHold``).
-        ///  7. the quota state, or `.unmeasured` when nothing was ever probed.
+        ///  6. the quota state, or `.unmeasured` when nothing was ever probed.
         ///
-        /// 3 to 6 sit ahead of `hasQuotaEvidence` deliberately: a broken,
+        /// 3 to 5 sit ahead of `hasQuotaEvidence` deliberately: a broken,
         /// unreachable or refused account may have no quota reading either, and
         /// checking evidence first would land every one of them back in
         /// `.unmeasured` — telling the operator to wait for a sweep that will
-        /// never fix any of those causes. 4 and 5, and the Codex half of 6,
+        /// never fix any of those causes. 4 and the Codex half of 5
         /// start with the row's provider, so no Claude row moves.
         ///
         /// Public because the v4 account card (`PanelV4/AccountCard.swift`, a
@@ -3196,8 +3174,7 @@ public struct FleetTally: Equatable, Sendable {
                 self = .needsRelogin
             } else if account.isUnreachable {
                 self = .unreachable
-            } else if account.isOlderServerWindowRefusal {
-                self = .spent
+
             } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
                 self = .rejected
             } else {
