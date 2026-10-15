@@ -82,7 +82,7 @@ pub struct Quota {
     pub seven_day_oi: Option<QuotaWindow>,
     /// Last reported unified status: `allowed` | `allowed_warning` | `rejected`.
     /// A Codex account has no such header: its value comes from the response's HTTP
-    /// status instead (see [`Quota::update_from_codex_headers`]).
+    /// status instead (see [`Quota::update_from_codex_refusal`]).
     pub status: Option<String>,
     // Standard API-key rate limits (present on non-OAuth accounts).
     pub tokens_limit: Option<i64>,
@@ -99,7 +99,7 @@ pub struct Quota {
     pub extra_usage_usd: Option<f64>,
     /// When a quota reading was last taken, from EITHER source: a successful
     /// usage probe ([`Self::apply_usage`]) or a response that carried rate-limit
-    /// headers ([`Self::update_from_headers`], or [`Self::update_from_codex_headers`]
+    /// headers ([`Self::update_from_headers`], or [`Self::update_from_codex_refusal`]
     /// for a Codex account). `None` means nothing has been read since this process
     /// started.
     ///
@@ -113,7 +113,7 @@ pub struct Quota {
     /// What a Codex account's readings said beyond its windows' utilization: which windows
     /// its plan has and how long they are, the refusal's kind, its spend control and its
     /// credits. See [`CodexQuotaFacts`]. Only the Codex readers write it
-    /// ([`Self::update_from_codex_headers`], and [`Self::apply_usage`] with a Codex probe's
+    /// ([`Self::update_from_codex_refusal`], and [`Self::apply_usage`] with a Codex probe's
     /// reading), so on an Anthropic account it stays the default.
     pub codex: CodexQuotaFacts,
 }
@@ -471,7 +471,7 @@ impl Quota {
     ///
     /// Without this, a rejection outlives its cause and benches the account until
     /// the process restarts. [`Quota::update_from_headers`] is the only writer of
-    /// `status` (with, for a Codex account, [`Quota::update_from_codex_headers`]), and
+    /// `status` (with, for a Codex account, [`Quota::update_from_codex_refusal`]), and
     /// it reads a SERVED response's `anthropic-ratelimit-unified-status` (the Codex one,
     /// the response's HTTP status). But
     /// [`crate::manager::Manager::account_terminal_gate`] skips an account carrying
@@ -482,7 +482,7 @@ impl Quota {
     /// ended a rejection. A refused Codex account is not kept from traffic that way: once
     /// the hold its refusal armed lapses, the pool pick, which never reads `status`, may send
     /// it a request, and upstream is the oracle, since a 2xx that carries a window reads it
-    /// allowed and another refusal marks it again ([`Quota::update_from_codex_headers`]). A
+    /// allowed and another refusal marks it again ([`Quota::update_from_codex_refusal`]). A
     /// probe that reads the account allowed ends the refusal too, the backend's own word
     /// ([`Self::lift_a_codex_refusal_the_probe_reads_allowed`], which runs after this).
     ///
@@ -504,7 +504,7 @@ impl Quota {
     ///
     /// Clearing wrongly is cheap and self-correcting. EVERY upstream response
     /// including a 429 is folded through [`Quota::update_from_headers`], or a Codex
-    /// account's through [`Quota::update_from_codex_headers`]
+    /// account's through [`Quota::update_from_codex_refusal`]
     /// (`proxy.rs`, immediately after the "upstream response" log line), so an
     /// account that really is still rejected is marked again on its very next
     /// attempt, at a cost of one request. Clearing too late is the old behaviour: a
@@ -809,7 +809,7 @@ pub const CODEX_FIVE_HOUR_CUTOFF_MINUTES: i64 = 600;
 /// `rate-limit-reached-type`, and the three credits headers: whether the account has credits,
 /// whether they are unlimited, and their balance), then the one the Codex client reads and tcr
 /// does not, a promotional message (`codex-api/src/rate_limits.rs`). The credits are read
-/// BEFORE the strip, in [`Quota::update_from_codex_headers`], which the proxy calls with the
+/// BEFORE the strip, in [`Quota::update_from_codex_refusal`], which the proxy calls with the
 /// upstream headers ahead of building the pooled answer. All eleven describe the SERVING
 /// account, so `proxy::build_response` strips exactly these from a pooled Codex response
 /// (`proxy::is_account_scoped`), as it strips `anthropic-ratelimit-*`: a pooled client would
@@ -981,20 +981,9 @@ impl Quota {
     /// each pooled response describes whichever account served it and the client would show
     /// a usage picture that changes per request. A relayed (client-credential) response keeps
     /// them: they describe the client's own account.
-    #[must_use]
-    pub fn update_from_codex_headers(
-        &mut self,
-        headers: &impl HeaderView,
-        http_status: u16,
-    ) -> bool {
-        let refusal = (http_status == 429)
-            .then(|| CodexQuotaRefusal::parse(headers, &[], OffsetDateTime::now_utc()))
-            .flatten();
-        self.update_from_codex_refusal(headers, http_status, refusal.as_ref())
-    }
-
     /// Fold headers and the refusal already parsed by the proxy together. A body-only
     /// refusal is the same rejection as a header refusal; its reset takes precedence.
+    #[must_use]
     pub(crate) fn update_from_codex_refusal(
         &mut self,
         headers: &impl HeaderView,
@@ -1131,7 +1120,7 @@ fn codex_credits_from_headers(headers: &impl HeaderView) -> Option<tcr_status_wi
 /// length in minutes): the length of the window whose utilization the bucket keeps, which is the
 /// fuller one, and the longer of the two on equal utilization.
 ///
-/// One rule for both readers, the headers ([`Quota::update_from_codex_headers`]) and the probe
+/// One rule for both readers, the headers ([`Quota::update_from_codex_refusal`]) and the probe
 /// ([`crate::codex_probe::usage_from_payload`]), so they report one account's lengths alike. A
 /// utilization the reading did not carry is passed as `f64::NEG_INFINITY`, so the window that
 /// did carry one is the one kept, as the bucket keeps its utilization.
@@ -1961,8 +1950,11 @@ mod tests {
     fn codex_headers_fill_the_five_hour_and_weekly_windows_as_fractions() {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let mut q = Quota::default();
-        let read =
-            q.update_from_codex_headers(&codex_headers("25", "3.5", now + 3600, now + 86400), 200);
+        let read = q.update_from_codex_refusal(
+            &codex_headers("25", "3.5", now + 3600, now + 86400),
+            200,
+            None,
+        );
         assert!(read, "a primary window was read");
         let fh = q.five_hour.expect("five_hour");
         assert!(
@@ -1994,7 +1986,7 @@ mod tests {
     /// response with no Codex header, a 0% placeholder slot with no length or
     /// reset, and a 429 that is not the quota read nothing.
     ///
-    /// Watched red: without the stamp in `update_from_codex_headers`, the
+    /// Watched red: without the stamp in `update_from_codex_refusal`, the
     /// weekly-only reading leaves `updated_at` at `None`.
     #[test]
     fn a_codex_reading_stamps_updated_at_and_silence_does_not() {
@@ -2002,7 +1994,7 @@ mod tests {
         let stale = OffsetDateTime::from_unix_timestamp(now - 40 * 60).unwrap();
         let mut q = Quota::default();
 
-        assert!(!q.update_from_codex_headers(&TestHeaders::new(&[]), 200));
+        assert!(!q.update_from_codex_refusal(&TestHeaders::new(&[]), 200, None));
         assert_eq!(q.updated_at, None, "no Codex header is no reading");
 
         let weekly_only = TestHeaders::new(&[
@@ -2012,7 +2004,7 @@ mod tests {
         ]);
         let before = OffsetDateTime::now_utc();
         assert!(
-            !q.update_from_codex_headers(&weekly_only, 200),
+            !q.update_from_codex_refusal(&weekly_only, 200, None),
             "control: a weekly-only reading returns false"
         );
         let stamped = q
@@ -2034,14 +2026,25 @@ mod tests {
             ),
         ] {
             q.updated_at = Some(stale);
-            let _ = q.update_from_codex_headers(&silence, status);
+            let _ = q.update_from_codex_refusal(
+                &silence,
+                status,
+                (status == 429)
+                    .then(|| CodexQuotaRefusal::parse(&silence, &[], OffsetDateTime::now_utc()))
+                    .flatten()
+                    .as_ref(),
+            );
             assert_eq!(q.updated_at, Some(stale), "{label} must not move it");
         }
 
         q.updated_at = Some(stale);
         let before = OffsetDateTime::now_utc();
         let refusal = TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]);
-        let _ = q.update_from_codex_headers(&refusal, 429);
+        let _ = q.update_from_codex_refusal(
+            &refusal,
+            429,
+            CodexQuotaRefusal::parse(&refusal, &[], OffsetDateTime::now_utc()).as_ref(),
+        );
         assert_eq!(
             q.status.as_deref(),
             Some("rejected"),
@@ -2070,7 +2073,7 @@ mod tests {
         ]);
         let mut q = Quota::default();
         assert!(
-            q.update_from_codex_headers(&swapped, 200),
+            q.update_from_codex_refusal(&swapped, 200, None),
             "the five-hour window was read, from the secondary slot"
         );
         assert!((q.five_hour.unwrap().utilization - 0.10).abs() < 1e-9);
@@ -2091,7 +2094,7 @@ mod tests {
         let mut q = Quota::default();
         let before = OffsetDateTime::now_utc();
         assert!(
-            q.update_from_codex_headers(&only_pct, 200),
+            q.update_from_codex_refusal(&only_pct, 200, None),
             "by position the primary slot is the five-hour window"
         );
         let after = OffsetDateTime::now_utc();
@@ -2143,7 +2146,7 @@ mod tests {
             }
             let mut q = Quota::default();
             assert!(
-                !q.update_from_codex_headers(&h, 200),
+                !q.update_from_codex_refusal(&h, 200, None),
                 "no five-hour window was read (window-minutes {placeholder_minutes:?})"
             );
             assert!(
@@ -2167,7 +2170,7 @@ mod tests {
         ]);
         let mut q = Quota::default();
         assert!(
-            !q.update_from_codex_headers(&primary_placeholder, 200),
+            !q.update_from_codex_refusal(&primary_placeholder, 200, None),
             "no five-hour window was read from a primary slot that carries no data"
         );
         assert!(
@@ -2210,7 +2213,7 @@ mod tests {
                 ("x-codex-secondary-reset-at", &second.2.to_string()),
             ]);
             let mut q = Quota::default();
-            assert!(!q.update_from_codex_headers(&h, 200));
+            assert!(!q.update_from_codex_refusal(&h, 200, None));
             let weekly = q.seven_day.expect("the weekly bucket");
             assert!(
                 (weekly.utilization - 0.90).abs() < 1e-9,
@@ -2231,7 +2234,7 @@ mod tests {
             ("x-codex-secondary-reset-at", &early.to_string()),
         ]);
         let mut q = Quota::default();
-        assert!(!q.update_from_codex_headers(&h, 200));
+        assert!(!q.update_from_codex_refusal(&h, 200, None));
         let weekly = q.seven_day.expect("the weekly bucket");
         assert!(
             (weekly.utilization - 0.97).abs() < 1e-9,
@@ -2252,16 +2255,24 @@ mod tests {
         let secs = OffsetDateTime::now_utc().unix_timestamp();
         let h = codex_headers("30", "100", secs + 600, secs + 50_000);
         let mut q = Quota::default();
-        let _ = q.update_from_codex_headers(&h, 200);
+        let _ = q.update_from_codex_refusal(&h, 200, None);
         assert_eq!(q.status.as_deref(), Some("allowed"), "precondition");
-        let _ = q.update_from_codex_headers(&h, 429);
+        let _ = q.update_from_codex_refusal(
+            &h,
+            429,
+            CodexQuotaRefusal::parse(&h, &[], OffsetDateTime::now_utc()).as_ref(),
+        );
         assert_eq!(
             q.status.as_deref(),
             Some("allowed"),
             "a 429 that is not a quota refusal leaves the status as it was"
         );
         let mut fresh = Quota::default();
-        let _ = fresh.update_from_codex_headers(&h, 429);
+        let _ = fresh.update_from_codex_refusal(
+            &h,
+            429,
+            CodexQuotaRefusal::parse(&h, &[], OffsetDateTime::now_utc()).as_ref(),
+        );
         assert_eq!(fresh.status, None, "and sets none on a fresh account");
     }
 
@@ -2297,7 +2308,11 @@ mod tests {
         h.push("x-codex-rate-limit-reached-type", "primary");
         let mut q = Quota::default();
         assert!(
-            q.update_from_codex_headers(&h, 429),
+            q.update_from_codex_refusal(
+                &h,
+                429,
+                CodexQuotaRefusal::parse(&h, &[], OffsetDateTime::now_utc()).as_ref()
+            ),
             "a 429's windows are folded exactly like a 200's"
         );
         assert_eq!(q.status.as_deref(), Some("rejected"));
@@ -2362,7 +2377,7 @@ mod tests {
     fn anthropic_headers_do_not_feed_the_codex_parser_and_vice_versa() {
         let anthropic = TestHeaders::new(&[("anthropic-ratelimit-unified-5h-utilization", "0.5")]);
         let mut q = Quota::default();
-        assert!(!q.update_from_codex_headers(&anthropic, 200));
+        assert!(!q.update_from_codex_refusal(&anthropic, 200, None));
         assert!(q.five_hour.is_none());
         assert!(
             q.status.is_none(),
@@ -2391,7 +2406,7 @@ mod tests {
         ]);
         let mut q = Quota::default();
         assert!(
-            !q.update_from_codex_headers(&weekly_only, 200),
+            !q.update_from_codex_refusal(&weekly_only, 200, None),
             "no five-hour window was read"
         );
         assert!(
@@ -2429,7 +2444,7 @@ mod tests {
         let nan_first = codex_headers("nan", "100", secs + 600, secs + 50_000);
         let mut q = Quota::default();
         assert!(
-            !q.update_from_codex_headers(&nan_first, 200),
+            !q.update_from_codex_refusal(&nan_first, 200, None),
             "a NaN five-hour window is not a read"
         );
         assert!(q.five_hour.is_none(), "and it creates no window");
@@ -2478,17 +2493,21 @@ mod tests {
     fn codex_headers_record_which_windows_carried_a_value() {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let mut two = Quota::default();
-        let _ =
-            two.update_from_codex_headers(&codex_headers("25", "3", now + 3600, now + 86_400), 200);
+        let _ = two.update_from_codex_refusal(
+            &codex_headers("25", "3", now + 3600, now + 86_400),
+            200,
+            None,
+        );
         assert_eq!(carried(&two), names(&["fiveHour", "sevenDay"]));
 
         let mut pro = Quota::default();
-        let _ = pro.update_from_codex_headers(&pro_codex_headers(now + 86_400), 200);
+        let _ = pro.update_from_codex_refusal(&pro_codex_headers(now + 86_400), 200, None);
         assert_eq!(carried(&pro), names(&["sevenDay"]));
 
-        let _ = pro.update_from_codex_headers(
+        let _ = pro.update_from_codex_refusal(
             &TestHeaders::new(&[("content-type", "text/event-stream")]),
             200,
+            None,
         );
         assert_eq!(
             carried(&pro),
@@ -2520,7 +2539,7 @@ mod tests {
             let mut h = pro_codex_headers(now + 86_400);
             h.push("x-codex-secondary-used-percent", placeholder);
             let mut q = Quota::default();
-            let _ = q.update_from_codex_headers(&h, 200);
+            let _ = q.update_from_codex_refusal(&h, 200, None);
             assert_eq!(carried(&q), names(&["sevenDay"]), "{label}");
             assert!(q.five_hour.is_none(), "{label}: {:?}", q.five_hour);
 
@@ -2531,7 +2550,7 @@ mod tests {
             ]);
             h.push("x-codex-primary-used-percent", placeholder);
             let mut q = Quota::default();
-            let _ = q.update_from_codex_headers(&h, 200);
+            let _ = q.update_from_codex_refusal(&h, 200, None);
             assert_eq!(
                 carried(&q),
                 names(&["sevenDay"]),
@@ -2555,7 +2574,7 @@ mod tests {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let read = |h: &TestHeaders| {
             let mut q = Quota::default();
-            let _ = q.update_from_codex_headers(h, 200);
+            let _ = q.update_from_codex_refusal(h, 200, None);
             q.codex.windows().expect("the reading carried a window")
         };
         let window = |minutes: Option<u32>| Some(CodexWindow { minutes });
@@ -2621,7 +2640,11 @@ mod tests {
         refusal.push("x-codex-credits-unlimited", "false");
         refusal.push("x-codex-credits-balance", "12.50");
         let mut q = Quota::default();
-        let _ = q.update_from_codex_headers(&refusal, 429);
+        let _ = q.update_from_codex_refusal(
+            &refusal,
+            429,
+            CodexQuotaRefusal::parse(&refusal, &[], OffsetDateTime::now_utc()).as_ref(),
+        );
         assert_eq!(q.status.as_deref(), Some("rejected"));
         assert_eq!(q.codex_limit_reached_type(), Some("rate_limit_reached"));
         let credits = Some(CodexCredits {
@@ -2631,8 +2654,11 @@ mod tests {
         });
         assert_eq!(q.codex.credits, credits);
 
-        let _ =
-            q.update_from_codex_headers(&codex_headers("10", "5", now + 1800, now + 86_400), 200);
+        let _ = q.update_from_codex_refusal(
+            &codex_headers("10", "5", now + 1800, now + 86_400),
+            200,
+            None,
+        );
         assert_eq!(q.status.as_deref(), Some("allowed"));
         assert_eq!(
             q.codex_limit_reached_type(),
@@ -2644,9 +2670,10 @@ mod tests {
             "a response without the credits headers leaves the last reading alone"
         );
 
-        let _ = q.update_from_codex_headers(
+        let _ = q.update_from_codex_refusal(
             &TestHeaders::new(&[("x-codex-credits-has-credits", "FALSE")]),
             200,
+            None,
         );
         assert_eq!(
             q.codex.credits,
@@ -2658,9 +2685,10 @@ mod tests {
             "the flag is read in any case, unlimited is false when absent, and no balance is none"
         );
 
-        let _ = q.update_from_codex_headers(
+        let _ = q.update_from_codex_refusal(
             &TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]),
             200,
+            None,
         );
         assert_eq!(
             q.codex_limit_reached_type(),

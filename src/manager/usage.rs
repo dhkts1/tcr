@@ -11,7 +11,7 @@ impl Manager {
     ///
     /// The account's PROVIDER picks the parser, never the headers: Anthropic's
     /// [`crate::quota::Quota::update_from_headers`] or Codex's
-    /// [`crate::quota::Quota::update_from_codex_headers`]. A `match`, so a third provider
+    /// [`crate::quota::Quota::update_from_codex_refusal`]. A `match`, so a third provider
     /// decides here instead of inheriting either. `status` is the response's HTTP status,
     /// which the Codex parser reads in place of Anthropic's `unified-status` header (a 2xx
     /// is `allowed`, a refusal 429 `rejected`); the Anthropic parser ignores it.

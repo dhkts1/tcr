@@ -1786,8 +1786,7 @@ async fn status_handler(
     // Named only when it is not the default, so a reader is told only of an upstream they did
     // not expect.
     let codex_upstream = manager.upstream_for(crate::provider::Provider::Codex);
-    payload.codex_upstream = (!crate::config::is_default_codex_upstream(codex_upstream))
-        .then(|| codex_upstream.to_string());
+    payload.codex_upstream = crate::config::non_default_codex_upstream(codex_upstream);
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.

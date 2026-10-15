@@ -471,7 +471,7 @@ fn assert_each_reached_its_own_origin(ledger: &Ledger) {
 /// to `upstream` in `Manager::upstream_for` and step 1 reaches the Anthropic origin; drop the
 /// provider check in `manager::select::eligible` and step 1 is served on carol; skip the
 /// `session-id` tier of `proxy::stable_session_key` and step 2 lands on bob; read the header's
-/// percent as the fraction in `Quota::update_from_codex_headers` (`used` for `used / 100.0`) and
+/// percent as the fraction in `Quota::update_from_codex_refusal` (`used` for `used / 100.0`) and
 /// step 3 reads 12.0; skip the local 426 in `proxy::handle` and step 4 gets the origin's 200;
 /// skip the relay for Codex paths in `proxy::handle` and step 5 is served on bob's pooled bearer;
 /// drop the Codex arm of `proxy::relay_mode` and step 6, which carries no bearer, is pooled.

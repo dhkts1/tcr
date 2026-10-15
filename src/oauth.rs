@@ -7380,12 +7380,6 @@ mod tests {
         }
     }
 
-    /// A port nothing listens on: bound to learn the number, then released.
-    async fn released_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    }
-
     /// A stub of the account-add route on 127.0.0.1:0, recording every request
     /// body it receives. Every answer is stamped with the route's
     /// `ENDPOINT_HEADER`, as every tcr with the route stamps them; `advertise`
@@ -7590,7 +7584,7 @@ mod tests {
     /// since the write would rename nothing.
     #[tokio::test]
     async fn a_re_import_keeps_the_name_its_row_is_saved_under() {
-        let port = released_port().await;
+        let port = 0;
         let (_dir, path) = import_config(
             port,
             &unconstrained_upstream().await,
@@ -7646,7 +7640,7 @@ mod tests {
     /// NEWER than tcr's (a fresh `codex login`) still replaces it.
     #[tokio::test]
     async fn a_re_import_of_an_older_credential_is_refused_and_writes_nothing() {
-        let port = released_port().await;
+        let port = 0;
         let (_dir, path) = import_config(
             port,
             &unconstrained_upstream().await,
@@ -7739,8 +7733,7 @@ mod tests {
     /// Watched red: with the guard refusing the account it should accept, nothing is written.
     #[tokio::test]
     async fn an_import_for_its_own_account_is_written() {
-        let (_dir, path) =
-            import_config(released_port().await, &unconstrained_upstream().await, "[]");
+        let (_dir, path) = import_config(0, &unconstrained_upstream().await, "[]");
 
         let saved = import_codex_login(
             &path,
@@ -7897,7 +7890,7 @@ mod tests {
         ] {
             let (upstream, checks) =
                 accounts_check_stub(200, &workspace_answer(origin, routing)).await;
-            let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+            let (_dir, path) = import_config(0, &upstream, "[]");
             let before = std::fs::read(&path).unwrap();
 
             let err = import_codex_login(
@@ -7980,7 +7973,7 @@ mod tests {
     /// Watched red: without the check, every one of these imports writes the row.
     #[tokio::test]
     async fn a_workspace_check_that_cannot_complete_refuses_the_import() {
-        let dead = format!("http://127.0.0.1:{}", released_port().await);
+        let dead = "http://127.0.0.1:0".to_string();
         let mut upstreams = vec![(dead, "could not connect".to_string())];
         for (status, body, why) in [
             (500, "{}", "answered HTTP 500"),
@@ -7996,7 +7989,7 @@ mod tests {
             upstreams.push((upstream, why.to_string()));
         }
         for (upstream, why) in upstreams {
-            let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+            let (_dir, path) = import_config(0, &upstream, "[]");
             let before = std::fs::read(&path).unwrap();
 
             let err = import_codex_login(
@@ -8074,7 +8067,7 @@ mod tests {
         let (elsewhere, redirected) =
             accounts_check_stub(200, &workspace_answer("NO_CONSTRAINT", "NO_CONSTRAINT")).await;
         let (upstream, checks) = redirecting_stub(&format!("{elsewhere}/elsewhere")).await;
-        let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+        let (_dir, path) = import_config(0, &upstream, "[]");
         let before = std::fs::read(&path).unwrap();
 
         let err = import_codex_login(
@@ -8116,7 +8109,7 @@ mod tests {
             &workspace_answer("https://chatgpt.com", "NO_CONSTRAINT"),
         )
         .await;
-        let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+        let (_dir, path) = import_config(0, &upstream, "[]");
 
         let saved = import_codex_login(
             &path,
@@ -8206,8 +8199,7 @@ mod tests {
             None => panic!("no coded refusal in: {err:#}"),
         };
 
-        let (_dir, path) =
-            import_config(released_port().await, &unconstrained_upstream().await, "[]");
+        let (_dir, path) = import_config(0, &unconstrained_upstream().await, "[]");
         let mut login = alice_codex_login(1_800_000_000_000, "at-codex", "rt-codex");
         login.is_fedramp = true;
         let err = import_codex_login(&path, false, None, None, login, None)
@@ -8221,7 +8213,7 @@ mod tests {
             &workspace_answer("https://gov.chatgpt.com", "NO_CONSTRAINT"),
         )
         .await;
-        let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+        let (_dir, path) = import_config(0, &upstream, "[]");
         let err = import_codex_login(
             &path,
             false,
@@ -8240,7 +8232,7 @@ mod tests {
         );
 
         let (upstream, _) = accounts_check_stub(500, "{}").await;
-        let (_dir, path) = import_config(released_port().await, &upstream, "[]");
+        let (_dir, path) = import_config(0, &upstream, "[]");
         let err = import_codex_login(
             &path,
             false,
@@ -8265,7 +8257,7 @@ mod tests {
     #[tokio::test]
     async fn from_codex_account_accepts_the_row_name() {
         let (_dir, path) = import_config(
-            released_port().await,
+            0,
             &unconstrained_upstream().await,
             &format!(
                 r#"[{{ "name": "alice@example.com/codex", "provider": "codex",

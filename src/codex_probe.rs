@@ -142,7 +142,7 @@ pub async fn fetch_usage(
 /// reset cannot wrap into the past (and a past reset cannot wrap into the future).
 ///
 /// A window is trusted only as far as it carries data, by the same three rules the header parser
-/// applies (`Quota::update_from_codex_headers`), so the probe and the headers read one account
+/// applies (`Quota::update_from_codex_refusal`), so the probe and the headers read one account
 /// alike:
 ///
 /// - a `limit_window_seconds` of zero or less is no length at all, and the slot decides;
@@ -916,7 +916,7 @@ mod tests {
         let weekly_only = Some(vec!["sevenDay".to_string()]);
 
         let mut control = Quota::default();
-        let _ = control.update_from_codex_headers(&headers, 200);
+        let _ = control.update_from_codex_refusal(&headers, 200, None);
         assert_eq!(
             names(&control),
             both,
@@ -924,7 +924,7 @@ mod tests {
         );
 
         let mut headers_first = Quota::default();
-        let _ = headers_first.update_from_codex_headers(&headers, 200);
+        let _ = headers_first.update_from_codex_refusal(&headers, 200, None);
         headers_first.apply_usage(&usage_from_payload(&pro_payload));
         assert_eq!(
             names(&headers_first),
@@ -947,7 +947,7 @@ mod tests {
 
         let mut probe_first = Quota::default();
         probe_first.apply_usage(&usage_from_payload(&pro_payload));
-        let _ = probe_first.update_from_codex_headers(&headers, 200);
+        let _ = probe_first.update_from_codex_refusal(&headers, 200, None);
         assert_eq!(names(&probe_first), weekly_only, "the probe, then headers");
     }
 

@@ -40,6 +40,10 @@ pub(crate) fn default_codex_upstream() -> String {
 pub(crate) fn is_default_codex_upstream(value: &str) -> bool {
     value == crate::provider::CODEX_UPSTREAM
 }
+/// Name an upstream override consistently on every provider-aware status surface.
+pub(crate) fn non_default_codex_upstream(value: &str) -> Option<String> {
+    (!is_default_codex_upstream(value)).then(|| value.to_owned())
+}
 fn default_switch_threshold() -> f64 {
     0.95
 }
