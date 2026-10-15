@@ -1988,6 +1988,24 @@ pub fn running_tool_is_lost(tool: &str, started_ms: i64, now_ms: i64) -> bool {
     age_ms > limit
 }
 
+/// [`running_tool_is_lost`] for one `running` entry. A call that named its own timeout (a Codex
+/// call's `timeout_ms`, [`RunningTool::timeout_seconds`]) is lost once that timeout and the same
+/// 60 s grace [`RUNNING_BASH_LOST_MS`] gives `Bash` have passed: codex ended the command at its
+/// timeout, so a call still here is one whose closing request never reached this process. Every
+/// other call keeps its tool's line, which is every Claude call, since none carries a timeout.
+pub fn running_call_is_lost(call: &RunningTool, now_ms: i64) -> bool {
+    match call.timeout_seconds {
+        Some(seconds) => {
+            let limit_ms = i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_add(60)
+                .saturating_mul(1_000);
+            now_ms.saturating_sub(call.started_ms) > limit_ms
+        }
+        None => running_tool_is_lost(&call.tool, call.started_ms, now_ms),
+    }
+}
+
 /// The bounded, in-memory table `tcr status --json`'s `sessions` array is read from. No I/O; a
 /// caller (`Manager`) is responsible for locking.
 #[derive(Debug, Default)]

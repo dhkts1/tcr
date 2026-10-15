@@ -260,27 +260,17 @@ impl Manager {
                             .values()
                             .filter(|r| {
                                 (r.tool == "Agent" || r.tool == "Task")
-                                    && !crate::session_wire::running_tool_is_lost(
-                                        &r.tool,
-                                        r.started_ms,
-                                        now_ms,
-                                    )
+                                    && !crate::session_wire::running_call_is_lost(r, now_ms)
                             })
                             .count() as u64,
                         // Belt and braces beside `WireSessionTracker::restore`'s own drop: an
                         // entry too old to still be running is a LOST result, whatever put it
-                        // there — see `crate::session_wire::running_tool_is_lost`.
+                        // there — see `crate::session_wire::running_call_is_lost`.
                         running: s
                             .tools
                             .running
                             .into_values()
-                            .filter(|r| {
-                                !crate::session_wire::running_tool_is_lost(
-                                    &r.tool,
-                                    r.started_ms,
-                                    now_ms,
-                                )
-                            })
+                            .filter(|r| !crate::session_wire::running_call_is_lost(r, now_ms))
                             .map(|r| tcr_status_wire::RunningToolRow {
                                 tool: r.tool,
                                 started_ms: r.started_ms,
@@ -621,6 +611,58 @@ mod tests {
         assert_eq!(
             row.tools.subagents_running, 1,
             "the count and the list agree about what is running"
+        );
+    }
+
+    /// A Codex call that named its own timeout is lost once that timeout, and the same minute
+    /// of grace a Claude `Bash` call gets, has passed: codex ended the command by then, so a
+    /// call still running is one whose closing request never reached this process. A Codex
+    /// call with no timeout keeps the six-hour line every tool with no deadline gets.
+    ///
+    /// Watched red: with every Codex call held to the six-hour line, the timed call is still
+    /// projected as running past its timeout.
+    #[test]
+    fn a_codex_call_past_its_own_timeout_is_not_projected_as_running() {
+        use crate::session_wire::CodexToolCall;
+        let started = OffsetDateTime::now_utc();
+        let call = |id: &str, timeout_seconds: Option<u64>| CodexToolCall {
+            event: ToolUseEvent {
+                id: id.to_string(),
+                name: Some("exec_command".to_string()),
+                command_head: Some("cargo test".to_string()),
+                command_class: None,
+            },
+            timeout_seconds,
+        };
+        let manager = Manager::from_runtimes(vec![]);
+        manager.record_codex_wire_session(Some("sess-codex"), None, started);
+        manager.record_codex_wire_session_calls(
+            Some("sess-codex"),
+            started,
+            &[call("call_timed", Some(30)), call("call_open", None)],
+        );
+        let running = |after_ms: i64| -> Vec<Option<u64>> {
+            let mut timeouts: Vec<Option<u64>> = manager
+                .snapshot(started + Duration::milliseconds(after_ms))
+                .wire_sessions[0]
+                .tools
+                .running
+                .iter()
+                .map(|r| r.timeout_seconds)
+                .collect();
+            timeouts.sort();
+            timeouts
+        };
+
+        assert_eq!(
+            running((30 + 60) * 1_000),
+            [None, Some(30)],
+            "at the line both are still running"
+        );
+        assert_eq!(
+            running((30 + 60) * 1_000 + 1),
+            [None],
+            "the timed call is lost, the call with no timeout stays"
         );
     }
 
