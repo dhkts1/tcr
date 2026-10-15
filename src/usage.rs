@@ -2707,10 +2707,21 @@ mod tests {
 
     /// Record one line under `account`'s own identity, as the manager does.
     fn record_as(tracker: &UsageTracker, idx: usize, account: &LedgerAccount, input: u64) {
-        let now = crate::now_ms();
+        record_as_at(tracker, idx, account, input, crate::now_ms());
+    }
+
+    /// [`record_as`], stamped `ts_ms`: a test that replays and reads its lines at one instant
+    /// stamps them with that instant, so no midnight can fall between the stamp and the read.
+    fn record_as_at(
+        tracker: &UsageTracker,
+        idx: usize,
+        account: &LedgerAccount,
+        input: u64,
+        ts_ms: i64,
+    ) {
         tracker.record(
             idx,
-            &record(now, "claude-opus-5", input),
+            &record(ts_ms, "claude-opus-5", input),
             &account.name,
             account.uuid.as_deref(),
             account.org.as_deref(),
@@ -2763,8 +2774,11 @@ mod tests {
             let dir = scratch(tag);
             let writer = tracker();
             writer.attach_ledger(dir.clone(), 90, &seats, now);
-            record_as(&writer, 0, &seats[0], 3);
-            record_as(&writer, 1, &seats[1], 5);
+            // Stamped `now`, the instant the replay and the reads below use: a fresh clock
+            // read here can land past a UTC midnight (the line goes to a file the replay never
+            // reads) or a local one (the day `today` reads is empty).
+            record_as_at(&writer, 0, &seats[0], 3, now);
+            record_as_at(&writer, 1, &seats[1], 5, now);
             assert!(writer.flush_ledger());
 
             let replayed = tracker();
