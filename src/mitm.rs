@@ -278,12 +278,20 @@ fn host_intercepted(host: &str, codex_accounts: usize, codex_connection: bool) -
 }
 
 /// [`host_intercepted`] against `manager`'s Codex accounts, counted on every call and never
-/// cached: [`handle_connect`] asks it once per CONNECT.
+/// cached. Only a marked ChatGPT CONNECT needs the count: other tunnels never wait
+/// behind the config write lock. Configured but unusable pools remain explicitly pooled;
+/// their HTTP requests get an immediate configuration error instead of a retryable hold.
 fn intercepts_now(manager: &Manager, host: &str, codex_connection: bool) -> bool {
+    if !host.eq_ignore_ascii_case(crate::provider::CODEX_HOST) {
+        return host_allowed(host);
+    }
+    if !codex_connection {
+        return false;
+    }
     host_intercepted(
         host,
         manager.provider_account_count(crate::provider::Provider::Codex),
-        codex_connection,
+        true,
     )
 }
 
@@ -1529,10 +1537,40 @@ mod tests {
             codex_home: None,
             extra: serde_json::Map::new(),
         });
-        assert!(
-            intercepts_now(&m, "chatgpt.com", true),
-            "an import takes effect on the next CONNECT"
-        );
+        assert!(intercepts_now(&m, "chatgpt.com", true), "an imported account enables interception; a disabled pool gets an immediate configuration error");
+    }
+
+    #[test]
+    fn unrelated_connects_never_wait_for_a_config_write() {
+        for (host, marked, expected) in [
+            ("example.com", false, false),
+            ("api.anthropic.com", false, true),
+            ("chatgpt.com", false, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, b"{}").unwrap();
+            let manager = dummy_manager_at(Some(path));
+            let held = manager.clone();
+            let (ready, acquired) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                held.with_config_write_for_test(|| {
+                    ready.send(()).unwrap();
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(2));
+                })
+            });
+            acquired.recv().unwrap();
+            let start = std::time::Instant::now();
+            assert_eq!(intercepts_now(&manager, host, marked), expected);
+            let elapsed = start.elapsed();
+            let _ = release.send(());
+            holder.join().unwrap();
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "{host} waited {elapsed:?}"
+            );
+        }
     }
 
     /// [`FALLBACK_LEAF_SANS`] is "the policy allowlist + the JS test host", so
@@ -1863,6 +1901,10 @@ mod tests {
     /// call and no auth gate — the cheapest real route through `serve_http`'s
     /// router to observe which HTTP version `serve_connection` negotiated.
     fn dummy_manager() -> Arc<Manager> {
+        dummy_manager_at(None)
+    }
+
+    fn dummy_manager_at(config_path: Option<std::path::PathBuf>) -> Arc<Manager> {
         let config = crate::config::Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
@@ -1919,7 +1961,7 @@ mod tests {
             Arc::new(crate::oauth::NoRefresh),
             Arc::new(crate::probe::LiveUsageProber::new()),
             Arc::new(crate::warmer::LiveWarmer::new()),
-            None,
+            config_path,
         )
     }
 

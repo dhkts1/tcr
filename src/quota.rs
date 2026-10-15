@@ -463,6 +463,7 @@ impl Quota {
         {
             self.status = None;
             self.codex.limit_reached_type = None;
+            self.codex.refusal_reset = None;
         }
     }
 
@@ -516,8 +517,9 @@ impl Quota {
             || window_rolled(self.seven_day, usage.seven_day)
         {
             self.status = None;
-            // A Codex refusal's kind lives exactly as long as the refusal.
+            // A Codex refusal's facts live exactly as long as the refusal.
             self.codex.limit_reached_type = None;
+            self.codex.refusal_reset = None;
         }
     }
 }
@@ -847,17 +849,49 @@ pub const CODEX_REACHED_TYPE_HEADER: &str = "x-codex-rate-limit-reached-type";
 /// Is this Codex 429 a quota refusal? Codex recognizes these body types and codes in
 /// `codex-api/src/api_bridge.rs`; the reached-type header is an independent signal.
 pub fn is_codex_quota_refusal(headers: &impl HeaderView, body: &[u8]) -> bool {
-    headers.get_str(CODEX_REACHED_TYPE_HEADER).is_some() || codex_quota_error(body).is_some()
+    CodexQuotaRefusal::parse(headers, body, OffsetDateTime::now_utc()).is_some()
 }
 
-fn codex_quota_error(body: &[u8]) -> Option<serde_json::Value> {
-    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let error = doc.get("error")?;
-    let quota_type = matches!(
+/// A quota refusal parsed once for both the quota snapshot and the selection hold.
+/// Only a future body deadline or a full window is evidence for a long hold.
+#[derive(Debug, Clone)]
+pub struct CodexQuotaRefusal {
+    pub reset: Option<OffsetDateTime>,
+    pub limit_reached_type: Option<String>,
+}
+
+impl CodexQuotaRefusal {
+    pub fn parse(headers: &impl HeaderView, body: &[u8], now: OffsetDateTime) -> Option<Self> {
+        let document = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let error = document.as_ref().and_then(|doc| doc.get("error"));
+        let limit_reached_type = headers
+            .get_str(CODEX_REACHED_TYPE_HEADER)
+            .map(str::to_owned);
+        if limit_reached_type.is_none() && !error.is_some_and(codex_quota_error) {
+            return None;
+        }
+        let reset = error
+            .and_then(|error| codex_error_reset(error, now))
+            .or_else(|| {
+                codex_hold_seconds(headers, now).and_then(|seconds| {
+                    OffsetDateTime::from_unix_timestamp(
+                        now.unix_timestamp().saturating_add(seconds),
+                    )
+                    .ok()
+                })
+            });
+        Some(Self {
+            reset,
+            limit_reached_type,
+        })
+    }
+}
+
+fn codex_quota_error(error: &serde_json::Value) -> bool {
+    matches!(
         error.get("type").and_then(serde_json::Value::as_str),
         Some("usage_limit_reached" | "usage_not_included" | "insufficient_quota")
-    );
-    let quota_code = matches!(
+    ) || matches!(
         error.get("code").and_then(serde_json::Value::as_str),
         Some(
             "insufficient_quota"
@@ -866,25 +900,28 @@ fn codex_quota_error(body: &[u8]) -> Option<serde_json::Value> {
                 | "project_spend_limit_exceeded"
                 | "organization_usage_limit_exceeded"
         )
-    );
-    (quota_type || quota_code).then(|| error.clone())
+    )
 }
 
 /// `resets_at` is Unix seconds, as Codex's `DateTime::from_timestamp(seconds, 0)` reads it.
-/// Codex does not read `resets_in_seconds`; accept it as a relative-seconds fallback when
-/// the absolute reset is absent or malformed, then let the caller try header windows.
+/// Ignore elapsed deadlines, including clock-skewed ones, before trying relative seconds
+/// and then header windows. Codex does not itself read `resets_in_seconds`.
 pub fn codex_body_reset(body: &[u8], now: OffsetDateTime) -> Option<OffsetDateTime> {
     let document: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let error = document.get("error")?;
+    codex_error_reset(document.get("error")?, now)
+}
+
+fn codex_error_reset(error: &serde_json::Value, now: OffsetDateTime) -> Option<OffsetDateTime> {
     error
         .get("resets_at")
         .and_then(serde_json::Value::as_i64)
         .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .filter(|reset| *reset > now)
         .or_else(|| {
             error
                 .get("resets_in_seconds")
                 .and_then(serde_json::Value::as_i64)
-                .filter(|seconds| *seconds >= 0)
+                .filter(|seconds| *seconds > 0)
                 .and_then(|seconds| now.checked_add(time::Duration::seconds(seconds)))
         })
 }
@@ -958,6 +995,18 @@ impl Quota {
         http_status: u16,
         body: &[u8],
     ) -> bool {
+        let refusal = (http_status == 429)
+            .then(|| CodexQuotaRefusal::parse(headers, body, OffsetDateTime::now_utc()))
+            .flatten();
+        self.update_from_codex_refusal(headers, http_status, refusal.as_ref())
+    }
+
+    pub(crate) fn update_from_codex_refusal(
+        &mut self,
+        headers: &impl HeaderView,
+        http_status: u16,
+        refusal: Option<&CodexQuotaRefusal>,
+    ) -> bool {
         let now = OffsetDateTime::now_utc();
         // This response's reading of each bucket, (utilization, reported reset, length in
         // minutes), merged across slots before anything is written: see the doc for why a
@@ -1028,15 +1077,13 @@ impl Quota {
             );
             self.five_hour = Some(QuotaWindow { utilization, reset });
         }
-        let refused = http_status == 429 && is_codex_quota_refusal(headers, body);
+        let refused = refusal.is_some();
         // The refusal's kind is set in the statement that marks the refusal and cleared in the
         // one that ends it, so it is present exactly while the refusal stands.
-        if refused {
-            self.codex.refusal_reset = codex_body_reset(body, now);
+        if let Some(refusal) = refusal {
+            self.codex.refusal_reset = refusal.reset;
             self.status = Some("rejected".to_string());
-            self.codex.limit_reached_type = headers
-                .get_str(CODEX_REACHED_TYPE_HEADER)
-                .map(str::to_string);
+            self.codex.limit_reached_type = refusal.limit_reached_type.clone();
         } else if read_a_window && (200..300).contains(&http_status) {
             self.status = Some("allowed".to_string());
             self.codex.limit_reached_type = None;
@@ -1107,39 +1154,22 @@ pub(crate) fn codex_kept_length(
     }
 }
 
-/// How long a Codex QUOTA refusal should hold the account, in seconds from `now`: until the
-/// LATEST reset among the windows that are full (`used-percent >= 100`), since an account
-/// whose windows are both spent serves again only when both have rolled; else the reset of
-/// the fullest window; else `None`. Never negative: a reset already past is `0`.
-///
-/// Asked only for a 429 that IS a quota refusal ([`is_codex_quota_refusal`]); the proxy
-/// holds any other 429 on `retry-after` or its default short hold alone, so a non-quota 429
-/// that still carries window headers cannot bench its account for up to an hour. `None`
-/// sends a refusal to that same fallback.
-///
-/// A `used-percent` that is not a finite number counts as `0`, the guard every f64 read in
-/// this module takes (`get_parsed`). NaN compares false both ways, so a NaN in the first
-/// slot would otherwise keep that slot against a real 100% in the second.
+/// Seconds until the latest future reset of a FULL Codex window. A partly used
+/// window cannot explain a refusal (for example a spend cap), and an elapsed reset
+/// cannot justify a zero hold. Without evidence, callers use a capped retry delay.
 pub fn codex_hold_seconds(headers: &impl HeaderView, now: OffsetDateTime) -> Option<i64> {
-    let mut latest_full: Option<i64> = None;
-    let mut fullest: Option<(f64, i64)> = None;
-    for prefix in ["x-codex-primary", "x-codex-secondary"] {
-        let used = get_parsed::<f64>(headers, &format!("{prefix}-used-percent"))
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.0);
-        let Some(reset) = get_parsed::<i64>(headers, &format!("{prefix}-reset-at")) else {
-            continue;
-        };
-        if used >= 100.0 {
-            latest_full = Some(latest_full.map_or(reset, |other| other.max(reset)));
-        }
-        if fullest.is_none_or(|(u, _)| used > u) {
-            fullest = Some((used, reset));
-        }
-    }
-    latest_full
-        .or(fullest.map(|(_, reset)| reset))
-        .map(|reset| reset.saturating_sub(now.unix_timestamp()).max(0))
+    ["x-codex-primary", "x-codex-secondary"]
+        .into_iter()
+        .filter_map(|prefix| {
+            let used = get_parsed::<f64>(headers, &format!("{prefix}-used-percent"))?;
+            if !used.is_finite() || used < 100.0 {
+                return None;
+            }
+            let reset = get_parsed::<i64>(headers, &format!("{prefix}-reset-at"))?;
+            let at = OffsetDateTime::from_unix_timestamp(reset).ok()?;
+            (at > now).then(|| reset.saturating_sub(now.unix_timestamp()))
+        })
+        .max()
 }
 
 #[cfg(test)]
@@ -2269,6 +2299,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_refusal_does_not_wait_for_a_partly_used_window() {
+        let now = OffsetDateTime::now_utc();
+        let headers = codex_headers(
+            "10",
+            "35",
+            now.unix_timestamp() + 600,
+            now.unix_timestamp() + 6 * 86400,
+        );
+        assert_eq!(codex_hold_seconds(&headers, now), None);
+    }
+
+    #[test]
+    fn codex_refusal_discards_past_body_resets() {
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({"error": {"type": "usage_limit_reached", "resets_at": now.unix_timestamp() - 5}});
+        assert_eq!(codex_body_reset(body.to_string().as_bytes(), now), None);
+        let relative = serde_json::json!({"error": {"resets_at": now.unix_timestamp() - 5, "resets_in_seconds": 30}});
+        assert_eq!(
+            codex_body_reset(relative.to_string().as_bytes(), now),
+            Some(now + Duration::seconds(30))
+        );
+    }
+
     /// Each parser reads only its own provider's family, so a response folded
     /// through the wrong one fabricates nothing: an Anthropic header is silence to
     /// the Codex parser (no window, and so no `allowed` either), and a Codex block
@@ -2360,8 +2414,8 @@ mod tests {
         ]);
         assert_eq!(
             codex_hold_seconds(&unreachable, now),
-            Some(0),
-            "a reset before any clock is already past: no hold, and no overflow"
+            None,
+            "a reset before any clock is ignored without overflow"
         );
     }
 

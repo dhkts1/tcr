@@ -54,6 +54,21 @@ impl Manager {
         status: u16,
         body: &[u8],
     ) -> bool {
+        let refusal = (status == 429)
+            .then(|| {
+                crate::quota::CodexQuotaRefusal::parse(headers, body, OffsetDateTime::now_utc())
+            })
+            .flatten();
+        self.update_quota_with_codex_refusal(idx, headers, status, refusal.as_ref())
+    }
+
+    pub(crate) fn update_quota_with_codex_refusal(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+    ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
@@ -64,7 +79,7 @@ impl Manager {
                         }
                         crate::provider::Provider::Codex => account
                             .quota
-                            .update_from_codex_response(headers, status, body),
+                            .update_from_codex_refusal(headers, status, refusal),
                     };
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
@@ -326,7 +341,22 @@ impl Manager {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
+                    let was_codex_refused = match account.provider {
+                        crate::provider::Provider::Anthropic => false,
+                        crate::provider::Provider::Codex => {
+                            account.quota.status.as_deref() == Some("rejected")
+                        }
+                    };
                     account.quota.apply_usage(usage);
+                    if was_codex_refused
+                        && account.quota.status.as_deref() != Some("rejected")
+                        && account.hold_cause == HoldCause::RateLimit
+                    {
+                        account.rate_limited_until_ms = None;
+                        if account.status == AccountStatus::Throttled {
+                            account.status = AccountStatus::Active;
+                        }
+                    }
                     let flipped = !account.quota_known;
                     account.quota_known = true;
                     flipped
@@ -407,14 +437,23 @@ impl Manager {
         }
     }
 
-    /// A Codex quota reset is a measured deadline, which may be days away. Preserve it
-    /// rather than applying the short generic rate-limit hold ceiling.
+    /// A measured future quota deadline may be days away. Without one, cap the
+    /// retry delay so a spend cap cannot bench an account until an unrelated reset.
+    /// A successful probe also releases the hold when it reads the refusal as over.
     pub fn mark_codex_quota_limited(&self, idx: usize, seconds: i64) {
-        let until = crate::now_ms().saturating_add(seconds.max(0).saturating_mul(1000));
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         if let Some(account) = accounts.get_mut(idx) {
+            let now = OffsetDateTime::now_utc();
+            let hold = account
+                .quota
+                .codex
+                .refusal_reset
+                .filter(|reset| *reset > now)
+                .map(|reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()))
+                .unwrap_or_else(|| seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS));
             account.status = AccountStatus::Throttled;
-            account.rate_limited_until_ms = Some(until);
+            account.rate_limited_until_ms =
+                Some(crate::now_ms().saturating_add(hold.saturating_mul(1000)));
             account.hold_cause = HoldCause::RateLimit;
         }
     }

@@ -179,6 +179,42 @@ impl Manager {
             .count()
     }
 
+    /// Whether waiting could leave a Codex account usable. Operator-disabled, parked,
+    /// removed, reserved, dead-login and unsupported strict peer-exit rows need a
+    /// configuration change; quota/refusal holds are timers and still count here.
+    /// A bound conversation or hard account lock cannot recover on another row.
+    pub(crate) fn codex_account_can_serve_eventually(&self, bound_to: Option<usize>) -> bool {
+        self.reload_groups_if_changed();
+        let unsupported = self.codex_accounts_with_unsupported_exit();
+        let parked = self.parked_groups();
+        let reserved = self.reserved_groups();
+        let locked = self.locked_account_name();
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .enumerate()
+            .any(|(idx, account)| match account.provider {
+                crate::provider::Provider::Anthropic => false,
+                crate::provider::Provider::Codex => {
+                    !account.removed
+                        && bound_to.is_none_or(|bound| bound == idx)
+                        && locked.as_ref().is_none_or(|name| name == &account.name)
+                        && !account.disabled
+                        && account.status != AccountStatus::Error
+                        && !Self::parked_blocks(account, &parked)
+                        && !Self::reserved_blocks(account, None, &reserved)
+                        && !unsupported.contains(&idx)
+                }
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_config_write_for_test(&self, f: impl FnOnce()) {
+        let _guard = self.config_write.lock().expect("config write poisoned");
+        f();
+    }
+
     /// Account `idx`'s `last_selected_seq`, the tick a selection stamps on the account it
     /// picks (`0` = never picked). Test-only: it is how a test proves a request was answered
     /// without any account being SELECTED, which `requests` (a count of SERVED requests)

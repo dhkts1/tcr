@@ -2727,6 +2727,41 @@ fn codex_forbidden_is_auth_error(headers: &HeaderMap, body: &[u8]) -> bool {
             })
 }
 
+/// Explicit account/workspace access failures can be avoided by trying another login.
+/// Unknown JSON, HTML, region and Cloudflare blocks are request/network failures: rotating
+/// or benching credentials cannot fix them. Keep their original response for the client.
+fn codex_forbidden_is_account_error(headers: &HeaderMap, body: &[u8]) -> bool {
+    if headers
+        .get("cf-mitigated")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("challenge"))
+    {
+        return false;
+    }
+    let Ok(document) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = document.get("error") else {
+        return false;
+    };
+    let account_error = [error.get("code"), error.get("type")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|code| {
+            matches!(
+                code,
+                "workspace_deactivated"
+                    | "deactivated_workspace"
+                    | "workspace_disabled"
+                    | "account_deactivated"
+                    | "account_disabled"
+                    | "organization_deactivated"
+            )
+        });
+    account_error
+}
+
 /// The catch-all proxy handler.
 async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
@@ -3515,6 +3550,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // fast-fail response below must name the refused account(s), not just count
     // them.
     let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
+    let mut account_access_blocks = 0;
+    let mut last_account_access_block: Option<(HeaderMap, Bytes)> = None;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
     // The account the NEXT iteration must use, bypassing select(). Three producers:
@@ -3714,6 +3751,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // accounts refused, others merely exhausted — fall through
                     // unchanged to the existing exhaustion handling, which can still
                     // recover on the accounts that were not refused.
+                    if account_access_blocks > 0
+                        && account_access_blocks + refused_403.len() == upstream_responses
+                    {
+                        if let Some((headers, body)) = last_account_access_block.take() {
+                            return build_response(
+                                StatusCode::FORBIDDEN,
+                                &headers,
+                                Body::from(body),
+                                ServedBy::PooledAccount,
+                            );
+                        }
+                    }
                     if !refused_403.is_empty() && refused_403.len() == upstream_responses {
                         return credential_refused_response(provider, &refused_403);
                     }
@@ -4411,7 +4460,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         );
         let up_headers = resp.headers().clone();
         let rejections = quota_rejections(&up_headers);
-        manager.update_quota(idx, &up_headers, status.as_u16());
+        match provider {
+            Provider::Codex if status == StatusCode::TOO_MANY_REQUESTS => {}
+            Provider::Codex | Provider::Anthropic => {
+                manager.update_quota(idx, &up_headers, status.as_u16());
+            }
+        }
         // Any non-429 is live proof a rate-limit hold no longer binds.
         if status.as_u16() != 429 {
             manager.clear_rate_limited(idx);
@@ -4479,8 +4533,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // Claude Code reads a 403 as "your own session is dead" and drops the
         // user's login over an account problem that is not theirs. Rotate away, as
         // the 401 branch above does — this account may simply be disabled while its
-        // siblings are fine. Codex challenges, region/policy blocks and
-        // other non-auth 403s keep their upstream response and receive a short generic hold.
+        // siblings are fine. Codex account access failures rotate without asking for a
+        // re-login. Challenges, region blocks and unknown errors pass through without
+        // holding healthy accounts: another credential cannot fix a shared IP block.
         //
         // Deliberately does NOT set the terminal `Error` account status, for the
         // same reason the 401 branch above does not: `Error` is permanent, skipped
@@ -4529,12 +4584,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         .as_deref()
                         .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
                     if !auth_error {
-                        manager.mark_rate_limited(idx, crate::manager::REFUSED_HOLD_SECONDS);
-                        tracing::warn!(
-                            account = account_name.as_deref().unwrap_or("?"),
-                            account_index = idx,
-                            "upstream Codex access block — holding account without rejecting its login"
-                        );
+                        if body
+                            .as_deref()
+                            .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
+                        {
+                            manager.mark_rate_limited(idx, crate::manager::REFUSED_HOLD_SECONDS);
+                            account_access_blocks += 1;
+                            last_account_access_block = body.map(|body| (up_headers, body));
+                            tried.insert(idx);
+                            continue;
+                        }
+                        tracing::warn!(account_index = idx, "upstream Codex request blocked without an account failure; forwarding unchanged");
                         return match body {
                             Some(body) => build_response(
                                 status,
@@ -4657,24 +4717,27 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // their retry-after even when a response also carries window readings.
                     match provider {
                         crate::provider::Provider::Codex => {
-                            manager.update_quota_with_body(idx, &up_headers, 429, &refusal_body);
-                            let quota_refusal =
-                                crate::quota::is_codex_quota_refusal(&up_headers, &refusal_body);
                             let clock = OffsetDateTime::now_utc();
-                            let hold = quota_refusal
-                                .then(|| {
-                                    crate::quota::codex_body_reset(&refusal_body, clock)
-                                        .map(|reset| {
-                                            reset
-                                                .unix_timestamp()
-                                                .saturating_sub(clock.unix_timestamp())
-                                                .max(0)
-                                        })
-                                        .or_else(|| {
-                                            crate::quota::codex_hold_seconds(&up_headers, clock)
-                                        })
+                            let refusal = crate::quota::CodexQuotaRefusal::parse(
+                                &up_headers,
+                                &refusal_body,
+                                clock,
+                            );
+                            manager.update_quota_with_codex_refusal(
+                                idx,
+                                &up_headers,
+                                429,
+                                refusal.as_ref(),
+                            );
+                            let quota_refusal = refusal.is_some();
+                            let hold = refusal
+                                .as_ref()
+                                .and_then(|refusal| refusal.reset)
+                                .map(|reset| {
+                                    reset
+                                        .unix_timestamp()
+                                        .saturating_sub(clock.unix_timestamp())
                                 })
-                                .flatten()
                                 .unwrap_or(retry_after);
                             if quota_refusal {
                                 manager.mark_codex_quota_limited(idx, hold);
@@ -5700,14 +5763,8 @@ pub(crate) fn codex_pool_unavailable_body(wait_secs: u64, wait_measured: bool) -
     body.to_string()
 }
 
-/// The 429 body a Codex client gets when the fleet has NO Codex account at all, which
-/// [`codex_pool_unavailable_body`] would answer as a pool that frees in 60 seconds
-/// (`pool_unavailable`, `retry-after: 60`), a wait no account will end. The same status and
-/// `{"error": {...}}` envelope, but a `type`/`code` other than `usage_limit_reached` (the type
-/// codex's `map_api_error` reads as a usage limit with a reset), and no reset fields. codex's
-/// `map_api_error` turns a 429 of any other type into its generic retry-limit error and does
-/// not print this message. The message, which names the fix, is for a person reading the raw
-/// body; the operator learns the cause from the warn line in [`exhausted_response`].
+/// The error body for a missing Codex pool. It is sent as a 400, because Codex retries
+/// every 429 regardless of its retry-after header, and waiting cannot create a login.
 pub(crate) fn codex_no_account_body() -> String {
     codex_error_body(
         CodexRefusalKind::NoCodexAccount,
@@ -7258,12 +7315,10 @@ async fn exhausted_or_fallback(
 /// `provider_account_count` is how many accounts the request's provider has
 /// ([`Manager::provider_account_count`]), the only accounts that could have
 /// served it, so the Anthropic message's "All N accounts" never counts a Codex
-/// account. At zero, a Codex client gets [`codex_no_account_body`], whose message
-/// says no Codex account is configured and how to add one, instead of a
-/// `pool_unavailable` 429 telling it to retry in 60 seconds, which codex obeys up
-/// to five times though no wait adds an account; that answer carries no
-/// `retry-after`, because waiting changes nothing. codex shows that 429 only as
-/// its generic retry-limit error, so the warn line below is what names the cause.
+/// account. A Codex pool with no account that can become usable by waiting gets a
+/// non-retryable 400 and a configuration/login hint. A missing pool uses
+/// [`codex_no_account_body`]; disabled, parked and dead rows get a repair hint.
+/// Neither answer carries `retry-after`, because waiting changes nothing.
 fn exhausted_response(
     manager: &Manager,
     now: OffsetDateTime,
@@ -7275,16 +7330,22 @@ fn exhausted_response(
 ) -> Response {
     let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
     match provider {
-        crate::provider::Provider::Codex if provider_account_count == 0 => {
+        crate::provider::Provider::Codex
+            if !manager.codex_account_can_serve_eventually(bound_to) =>
+        {
             tracing::warn!(
                 provider = provider.as_str(),
-                "returning 429 to a Codex client: no Codex account is configured; add one with \
-             `tcr login --codex`"
+                "no Codex account can serve by waiting; enable, unpark or repair a login, or add one with `tcr login --codex`"
             );
             manager.note_codex_refusal(CodexRefusalKind::NoCodexAccount, now_ms);
             return codex_error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                codex_no_account_body(),
+                StatusCode::BAD_REQUEST,
+                if provider_account_count == 0 {
+                    codex_no_account_body()
+                } else {
+                    codex_error_body(CodexRefusalKind::NoCodexAccount,
+                        "No usable Codex account is configured in tcr. Enable, unpark or unreserve an account, clear an account lock or unsupported strict peer exit, or repair its login with `tcr login --codex`.").to_string()
+                },
                 None,
             );
         }
@@ -9617,7 +9678,9 @@ mod tests {
     #[tokio::test]
     async fn a_codex_request_tcr_answers_itself_closes_no_call() {
         let anthropic_echo = CapturingUpstream::spawn().await;
-        let (codex_origin, attempts) = spawn_counted_upstream(vec![Some(raw_403())]).await;
+        let auth_body = r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#;
+        let auth_response = format!("HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", auth_body.len(), auth_body);
+        let (codex_origin, attempts) = spawn_counted_upstream(vec![Some(auth_response)]).await;
         let manager = Manager::with_live_refresher(
             codex_fleet(&anthropic_echo.url, &format!("http://{codex_origin}")),
             None,
@@ -22095,29 +22158,25 @@ mod tests {
             "the message does not print the 60 as if it were measured: {message}"
         );
 
-        // A disabled account is no quota: the plain shape, with the Anthropic arm's
-        // `retry-after`, and still no time.
+        // Disabled accounts require an operator action, not a timed retry.
         let mut config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
         config.accounts[1].disabled = Some(true);
         let manager = Manager::with_live_refresher(config, None);
-        let now = OffsetDateTime::now_utc();
-        let response = exhausted_response(&manager, now, 1, false, Provider::Codex, None, None);
-        assert_eq!(
-            response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok()),
-            Some("60")
+        let response = exhausted_response(
+            &manager,
+            OffsetDateTime::now_utc(),
+            1,
+            false,
+            Provider::Codex,
+            None,
+            None,
         );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("retry-after"));
         let body = body_of(response).await;
-        assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
-        assert_eq!(body["error"]["resets_in_seconds"], 60, "{body}");
-        assert!(body["error"].get("resets_at").is_none(), "{body}");
-        let message = body["error"]["message"].as_str().expect("a message");
-        assert!(
-            message.contains("none reports when it frees"),
-            "the message does not print the 60 as if it were measured: {message}"
-        );
+        assert_eq!(body["error"]["type"], "no_codex_account");
+        assert!(body["error"].get("resets_in_seconds").is_none());
+        assert!(body["error"].get("resets_at").is_none());
     }
 
     /// **A fleet with no Codex account answers a Codex request by saying so**,
@@ -22149,7 +22208,7 @@ mod tests {
             "{}",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let retry_after = resp.headers().get("retry-after").cloned();
         let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
             .await
@@ -22262,13 +22321,17 @@ mod tests {
         let responses = [
             (
                 exhausted_response(&manager, now, 0, false, Provider::Codex, None, None),
-                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::BAD_REQUEST,
                 "no_codex_account",
                 "no_codex_account",
                 None,
             ),
             (
-                exhausted_response(&manager, now, 1, false, Provider::Codex, None, None),
+                codex_error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    codex_pool_unavailable_body(60, true),
+                    Some(60),
+                ),
                 StatusCode::TOO_MANY_REQUESTS,
                 "pool_unavailable",
                 "pool_unavailable",
@@ -22318,15 +22381,15 @@ mod tests {
         assert_eq!(describe_codex_gates(&common), ": 3 on an upstream hold");
     }
 
-    /// **Every 429 tcr sends a Codex request itself is counted, under its body's type**, so
+    /// **Every refusal tcr sends a Codex request itself is counted, under its body's type**, so
     /// `tcr status` can say codex was refused while the panel looks healthy: no Codex account
-    /// at all, a pool that cannot serve for now (a disabled account, or one held by an upstream
-    /// 403), and a pool out on a quota. A Claude client's 429 is not codex's and is not counted.
+    /// at all, an unusable pool (disabled), a pool held temporarily by an upstream
+    /// 403, and a pool out on a quota. A Claude client's 429 is not codex's and is not counted.
     ///
     /// Watched red: without the bump in the zero-account branch, the first case reads 0; with a
     /// 403 hold counted as a quota, the last case reads `usage_limit_reached`.
     #[tokio::test]
-    async fn every_codex_429_tcr_sends_bumps_the_refused_ring() {
+    async fn every_codex_refusal_tcr_sends_bumps_the_refused_ring() {
         let anthropic_echo = CapturingUpstream::spawn().await;
         let codex_echo = CapturingUpstream::spawn().await;
         let fleet = || codex_fleet(&anthropic_echo.url, &codex_echo.url);
@@ -22335,7 +22398,7 @@ mod tests {
         config.accounts.remove(1);
         let manager = Manager::with_live_refresher(config, None);
         let response = send_codex_turn(&manager).await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             body_json(response).await["error"]["type"],
             "no_codex_account"
@@ -22349,14 +22412,14 @@ mod tests {
         config.accounts[1].disabled = Some(true);
         let manager = Manager::with_live_refresher(config, None);
         let response = send_codex_turn(&manager).await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             body_json(response).await["error"]["type"],
-            "pool_unavailable"
+            "no_codex_account"
         );
         assert_eq!(
             refusals(&manager),
-            (1, Some(CodexRefusalKind::PoolUnavailable))
+            (1, Some(CodexRefusalKind::NoCodexAccount))
         );
 
         // A revalidation serve would try the full account once more; off, so the 429 is the
@@ -22607,7 +22670,7 @@ mod tests {
         );
 
         let response = send_codex_turn(&manager).await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             body_json(response).await["error"]["type"],
             "no_codex_account"
@@ -22842,14 +22905,17 @@ mod tests {
         let account = &snapshot.accounts[1];
         assert_eq!(
             account.gate,
-            GateReason::Hold,
+            GateReason::Ok,
             "a block is not a login refusal"
         );
         assert_eq!(account.codex.login_error, None);
-        let held_until = account.rate_limited_until.expect("the account is held");
-        let remaining = held_until - OffsetDateTime::now_utc();
-        assert!(remaining.whole_seconds() > 0);
-        assert!(remaining.whole_seconds() <= crate::manager::REFUSED_HOLD_SECONDS);
+        assert_eq!(account.rate_limited_until, None);
+        let again = send_codex_turn(&manager).await;
+        assert_eq!(
+            again.status(),
+            StatusCode::FORBIDDEN,
+            "a shared IP block must not exhaust the account pool"
+        );
         assert_eq!(snapshot.accounts[0].gate, GateReason::Ok);
         assert_eq!(anthropic_echo.request_count(), 0);
     }
@@ -22882,6 +22948,34 @@ mod tests {
             r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn codex_account_access_403_rotates_without_requesting_relogin() {
+        let first_bearer = Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured = first_bearer.clone();
+        let origin = Router::new().fallback(move |req: Request| {
+            let captured = captured.clone();
+            async move {
+                let bearer = req.headers()["authorization"].to_str().unwrap().to_owned();
+                let first = captured.lock().unwrap().get_or_insert(bearer.clone()).clone();
+                if first == bearer {
+                    Response::builder().status(StatusCode::FORBIDDEN).header("content-type", "application/json")
+                        .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
+                } else { Response::new(Body::from("{}")) }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let manager =
+            Manager::with_live_refresher(codex_fleet_with_carol("http://127.0.0.1:9", &url), None);
+        assert_eq!(send_codex_turn(&manager).await.status(), StatusCode::OK);
+        let blocked = codex_index_of(first_bearer.lock().unwrap().as_deref().unwrap());
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(snap.accounts[blocked].codex.login_error, None);
+        assert_eq!(snap.accounts[blocked].gate, GateReason::Hold);
+        server.abort();
     }
 
     /// A Codex origin that refuses EVERY request with a 403, recording each bearer in order.
@@ -23032,6 +23126,125 @@ mod tests {
             (1, Some(CodexRefusalKind::PoolUnavailable))
         );
     }
+    #[tokio::test]
+    async fn codex_refusal_probe_releases_the_account_hold() {
+        let manager = Manager::with_live_refresher(
+            codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9"),
+            None,
+        );
+        manager.update_quota_with_body(
+            1,
+            &HeaderMap::new(),
+            429,
+            br#"{"error":{"type":"insufficient_quota"}}"#,
+        );
+        manager.mark_codex_quota_limited(1, 6 * 86400);
+        manager.apply_usage(
+            1,
+            &crate::probe::Usage {
+                codex: Some(crate::codex_probe::CodexProbeFacts {
+                    allowed: Some(true),
+                    limit_reached: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(snapshot.accounts[1].rate_limited_until, None);
+        assert_eq!(snapshot.accounts[1].gate, GateReason::Ok);
+    }
+
+    #[tokio::test]
+    async fn codex_refusal_without_a_full_window_caps_the_retry_hold() {
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 6 * 86400;
+        let origin = Router::new().fallback(move || async move {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .header("retry-after", "999999")
+                .header("x-codex-primary-used-percent", "35")
+                .header("x-codex-primary-window-minutes", "10080")
+                .header("x-codex-primary-reset-at", reset.to_string())
+                .body(Body::from(r#"{"error":{"type":"insufficient_quota"}}"#))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let manager = Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &url), None);
+        assert_eq!(
+            send_codex_turn(&manager).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let remaining = manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+            .rate_limited_until
+            .unwrap()
+            - OffsetDateTime::now_utc();
+        assert!(
+            (1..=3600).contains(&remaining.whole_seconds()),
+            "hold is {remaining}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_accounts_that_cannot_recover_by_waiting_fail_immediately() {
+        for state in ["disabled", "parked", "login", "reserved"] {
+            let mut config = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
+            if state == "disabled" {
+                config.accounts[1].disabled = Some(true);
+            }
+            if state == "parked" {
+                config.accounts[1].groups = Some(vec!["test-group".into()]);
+                config.group_settings.insert(
+                    "test-group".into(),
+                    crate::config::GroupSettings {
+                        parked: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            if state == "reserved" {
+                config.accounts[1].groups = Some(vec!["test-group".into()]);
+                config.group_settings.insert(
+                    "test-group".into(),
+                    crate::config::GroupSettings {
+                        reserved: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            let manager = Manager::with_live_refresher(config, None);
+            if state == "login" {
+                manager.mark_error(1);
+            }
+            let response = send_codex_turn(&manager).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{state} must not trigger Codex's 429 retry loop"
+            );
+            assert!(!response.headers().contains_key("retry-after"));
+            assert_eq!(
+                body_json(response).await["error"]["code"],
+                "no_codex_account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_locked_unsupported_exit_cannot_wait_for_an_unreachable_sibling() {
+        let mut config = codex_fleet_with_carol("http://127.0.0.1:9", "http://127.0.0.1:9");
+        config.lock_account = Some(config.accounts[1].name.clone());
+        config.accounts[1].egress = crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32]));
+        config.accounts[1].egress_strict = true;
+        let manager = Manager::with_live_refresher(config, None);
+        let response = send_codex_turn(&manager).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("retry-after"));
+    }
+
     async fn check_codex_quota_body_case(
         body: String,
         reached_header: bool,
@@ -23047,7 +23260,10 @@ mod tests {
                     .status(StatusCode::TOO_MANY_REQUESTS)
                     .header(CONTENT_TYPE, "application/json")
                     .header("retry-after", "30")
-                    .header("x-codex-primary-used-percent", "10")
+                    .header(
+                        "x-codex-primary-used-percent",
+                        if quota && !body_reset { "100" } else { "10" },
+                    )
                     .header("x-codex-primary-reset-at", (reset + 3600).to_string());
                 if reached_header {
                     response = response.header(crate::quota::CODEX_REACHED_TYPE_HEADER, "primary");
