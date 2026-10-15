@@ -21,3 +21,17 @@ changes ship; that release body is the changelog shown by TcrBar.
   `tcr login --codex` login avoids sharing. After a rejected refresh, tcr can recover a changed,
   unexpired pair for the same ChatGPT account even when token timestamps are ambiguous;
   known older tokens and different accounts remain rejected.
+
+- A Codex quota or rate-limit error inside a successful SSE stream holds its serving account
+  so the next pinned turn can rotate. Disabled and otherwise unusable rows cannot hide a spent
+  pool's real reset. Other stream errors remain observational.
+- Claude launches preserve Codex CA settings. Codex launches preserve an explicit CA bundle
+  and provide an unmarked proxy URL to their shell tools, without changing Codex's config file.
+- Imported logins can recover a newer refresh token even when its access token has expired.
+  Failed write-backs retry in the running manager while the original source token still matches;
+  restarting loses pending retries. Symlinked auth files are preserved. A later `codex login`
+  in the shared folder revokes that login and may require tcr to sign in again.
+- The v1 quota endpoint remains Claude-only. Provider-aware status includes Codex, and both
+  status and doctor recognize a configured Codex fleet behind an older proxy.
+- TcrBar correctly shows body-only refusals, partially priced totals and unreadable sessions;
+  sign-in messages identify the selected tcr executable when available.

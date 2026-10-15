@@ -57,7 +57,7 @@ tcr routes `codex`, OpenAI's coding CLI on a ChatGPT login, in forward-proxy mod
 has no base-URL route for `codex` yet. `codex` keeps its own backend URL, the real
 `https://chatgpt.com` for every login tcr pools, sends `CONNECT` through `HTTPS_PROXY`, and
 trusts tcr's leaf through `CODEX_CA_CERTIFICATE`; `tcr run --codex` sets the proxy URL to
-`http://tcr-codex@127.0.0.1:<port>` and sets the CA
+`http://tcr-codex@127.0.0.1:<port>` and sets the CA unless explicitly supplied
 ([`cli.md`](cli.md#--codex-launching-codex-through-the-pool)). A request's provider is
 decided by its path in base-URL mode: everything under `/backend-api/` is Codex, everything else
 is Anthropic, and a request tcr pools is served only by an account of its own provider.
@@ -68,7 +68,10 @@ that declares another host, including loopback, or an unreadable Host, is answer
 
 tcr terminates `chatgpt.com` only when CONNECT carries the `tcr-codex` proxy marker and the
 pool holds a Codex account, counted on every CONNECT. Codex's HTTP and WebSocket transports
-both send proxy URL userinfo as `Proxy-Authorization`. Unmarked connections, including a
+both send proxy URL userinfo as `Proxy-Authorization`. The launch supplies unmarked proxy
+values to Codex's shell environment policy for ordinary child tools; explicit child environments
+can still override that choice. The marker is routing opt-in, not process authentication.
+Unmarked connections, including a
 manually set `HTTPS_PROXY=http://127.0.0.1:<port>`, are blind-tunneled and use the client's
 own login. A login whose ChatGPT workspace is FedRAMP, routed to a data residency or to a
 backend of its own is neither pooled nor importable: another backend is tunneled untouched,
@@ -438,12 +441,18 @@ the recorded `codexHome/auth.json`. Its writers take a private advisory lock bef
 file. A matching loaded refresh token permits preparing a `0600` temporary file beside it,
 preserving the other JSON fields and updating a returned id token. tcr compares all original
 bytes immediately before the atomic rename and skips a detected change. File reads, writes,
-fsyncs and lock waits run on blocking workers.
+fsyncs and lock waits run on blocking workers. Symlinked auth files are not replaced. A failed
+publication retains the latest replacement and original spent source token in memory for retry
+before later requests; a restart loses that pending retry. Failed temporary publications are
+removed when possible, or their token bytes erased before the private handle closes.
 
 Codex's file writer does not take that lock, so its write can still fall between the final
 comparison and rename. This is best-effort sharing, not an atomic compare-and-swap with Codex.
 `tcr login --codex` avoids sharing the file. tcr adopts a changed, unexpired pair for the same
 ChatGPT account when freshness is established; after a permanent refresh rejection it can also
 recover when issuance is equal or unreadable and the file timestamp is equal or missing.
-Known older tokens and different accounts remain rejected. Uninstalling tcr leaves that auth
+An expired access token in a newer file pair is refreshed with that file's refresh token before
+application. Known older tokens and different accounts remain rejected. Signing in again with
+`codex login` in the shared folder revokes that login and can require tcr to sign in again.
+Uninstalling tcr leaves that auth
 file in place with its current login.

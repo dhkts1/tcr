@@ -320,18 +320,12 @@ never pooled. `tcr login --from-codex` refuses to import such a login, saying wh
 
 `codex` takes one extra CA bundle: `CODEX_CA_CERTIFICATE` when it is set, and `SSL_CERT_FILE`
 only when it is not (`openai/codex@f82e365`, `codex-rs/http-client/src/custom_ca.rs:393-411`).
-A pooled `tcr run --codex` sets `CODEX_CA_CERTIFICATE` to tcr's CA, and so does a plain
-`tcr run` in see-through mode, so a `codex` that a Claude Code tool or plugin runs inside that
-session inherits it. Either way it replaces any value you exported, so a corporate CA that
-reached `codex` through `SSL_CERT_FILE` no longer does. For `chatgpt.com`, while tcr decrypts
-it, `codex` only ever sees tcr's leaf. The hosts tcr tunnels untouched still present whatever
-certificate your network presents, `auth.openai.com` among them, where `codex` refreshes its
-own login, and unmarked `chatgpt.com` connections (or any with no Codex account), so behind a
-TLS-inspecting proxy whose CA reaches `codex` only through `SSL_CERT_FILE` those connections
-fail. This is a known limitation of `tcr run --codex`, and of a `codex` started inside a
-`tcr run` session, and no tcr setting changes it. `codex` itself accepts a PEM file holding
-several certificates, so a `codex` you route through tcr by hand can be pointed at one bundle
-holding both CAs.
+A Claude `tcr run` leaves `CODEX_CA_CERTIFICATE` unchanged, so a nested unmarked Codex
+connection retains its original CA choice. A pooled `tcr run --codex` preserves an explicit
+`CODEX_CA_CERTIFICATE`; otherwise it sets tcr's CA. If your network also needs a corporate CA,
+point that variable at a PEM bundle containing both certificates before launching. This matters
+for tunneled hosts such as `auth.openai.com` as well as marked ChatGPT connections. Codex reads
+`SSL_CERT_FILE` only when `CODEX_CA_CERTIFICATE` is unset.
 
 ## A Codex account says it needs sign-in
 
@@ -352,11 +346,16 @@ compares the complete file immediately before replacing it. Codex does not take 
 so a simultaneous Codex write can still race that final check and replacement. Use
 `tcr login --codex` for a separate login without this shared-file race.
 
-If the current token is permanently rejected, tcr re-reads the file and can adopt a changed,
-unexpired token pair for the same ChatGPT account even when issuance times are equal or
+If the current token is permanently rejected, tcr re-reads the file and can recover a changed
+token pair for the same ChatGPT account even when issuance times are equal or
 unreadable and the file timestamp is equal or missing. Known older tokens and a different
 login are rejected. A reused token reaches the sign-in error only when no matching replacement
-can be adopted, for example because the auth file is missing, unreadable or stale.
+can be adopted, for example because the auth file is missing, unreadable or stale. An expired
+access token in a newer file pair is refreshed using that file's refresh token before adoption.
+A failed write-back is retried by the running manager while the file still holds the spent
+source token; fix file access before restarting, because this pending retry is held in memory.
+A symlinked auth file is not replaced. Signing in again with `codex login` in the shared folder
+revokes that login, so tcr may also need sign-in afterward.
 A login can also have expired (`refresh_token_expired`) or been revoked
 (`refresh_token_invalidated`). Meanwhile the pool serves `codex` from its other Codex accounts,
 if it has any.

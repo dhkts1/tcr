@@ -132,7 +132,6 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:3456   # base-URL mode
 # or
 export HTTPS_PROXY=http://127.0.0.1:3456          # forward-proxy mode
 export NODE_EXTRA_CA_CERTS=<the CA path tcr logs at boot>
-export CODEX_CA_CERTIFICATE=<the same CA path>    # for an explicitly routed codex session
 ```
 
 Forward-proxy mode decrypts TLS with a locally generated certificate, so the client has to trust
@@ -145,10 +144,13 @@ including the one inherited from a Claude `tcr run` session, tunnels `chatgpt.co
 and leaves the client on its own login. Marked connections relay paths outside `/backend-api/`
 with the client's credential. `codex` takes no CA from `NODE_EXTRA_CA_CERTS`:
 `CODEX_CA_CERTIFICATE` is its variable for one, `SSL_CERT_FILE` serves while that is unset,
-and a CA already in the system trust store works too. `tcr run` sets both CA variables when
-it launches Claude Code in forward-proxy mode; `tcr run --codex` sets
-`CODEX_CA_CERTIFICATE`, and `NODE_EXTRA_CA_CERTS` for a `claude`
-that session starts. The config lives at `~/.config/tcr.json` (an install that has only
+and a CA already in the system trust store works too. Claude launches set only
+`NODE_EXTRA_CA_CERTS`, preserving a nested Codex client's own CA choice. A pooled Codex launch
+sets `CODEX_CA_CERTIFICATE` only when you have not supplied it, and preserves an explicit
+`NODE_EXTRA_CA_CERTS` too. Its shell tools receive an unmarked proxy URL, so their ChatGPT
+requests keep their own TLS and login; explicitly configured child environments can override
+that default. Keep the marker scoped to `tcr run --codex` rather than exporting it to a shell.
+The config lives at `~/.config/tcr.json` (an install that has only
 `~/.config/teamclaude.json` keeps using that), and `name` and
 `accessToken` are the only required keys. Every other key, its default and the file's permissions
 are in [`docs/configuration.md`](docs/configuration.md).

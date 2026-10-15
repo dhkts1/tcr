@@ -182,23 +182,14 @@ A config that holds a Claude account makes no such read and prints nothing new, 
 cannot be read prints nothing. So a proxy started from another config, or whose accounts changed
 since, can miss the warning.
 
-In see-through mode the routing environment also carries `CODEX_CA_CERTIFICATE`, naming the
-same CA as `NODE_EXTRA_CA_CERTS`. Claude Code ignores it. A `codex` started by a Claude tool
-inherits an unmarked proxy URL and stays on its own login: tcr tunnels that `chatgpt.com`
-connection without terminating TLS. Start it with `tcr run --codex` to opt into pooling.
-tcr's `CODEX_CA_CERTIFICATE` replaces any you exported, and `codex` reads `SSL_CERT_FILE`
-only while that variable is unset; see
-[troubleshooting.md](troubleshooting.md#a-corporate-ssl_cert_file-is-ignored-under-tcr-run-and-tcr-run---codex).
-
-The launch names that CA on stderr. Once the config holds a Codex account, in any state, the line
-names both variables:
+A Claude launch leaves `CODEX_CA_CERTIFICATE` unchanged. A `codex` started by a Claude tool
+inherits an unmarked proxy URL, keeps its CA choice and stays on its own login: tcr tunnels
+that `chatgpt.com` connection without terminating TLS. Start it with `tcr run --codex` to opt
+into pooling. The Claude launch names only its own CA variable on stderr:
 
 ```
-[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem
+[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem
 ```
-
-With no Codex account it names `NODE_EXTRA_CA_CERTS` alone, as it always has, though the
-session carries both variables either way.
 
 Every child also gets `TCR_RUN_ACTIVE=1`, on every path, the proxy-down passthrough and
 `--codex` included. It means one thing: **a `tcr run` is already above you in this chain.**
@@ -229,7 +220,8 @@ Codex account to serve the session; add one with
 launch leaves `codex` on its own backend URL, which is the real `https://chatgpt.com` for every
 login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to
 `http://tcr-codex@127.0.0.1:<port>`, and sets
-`CODEX_CA_CERTIFICATE` to tcr's CA, `~/.config/tcr-ca.pem`: that variable is where `codex`
+`CODEX_CA_CERTIFICATE` to tcr's CA, `~/.config/tcr-ca.pem`, unless you supplied that variable.
+An explicit bundle is preserved and must include tcr's CA. That variable is where `codex`
 takes an extra CA from, and it takes none from `NODE_EXTRA_CA_CERTS`. Of Claude's variables only
 `NODE_EXTRA_CA_CERTS` is set, to the same CA, for a `claude` started inside the session, and not
 when you exported one, which the session then inherits untouched. A login whose ChatGPT
@@ -243,6 +235,15 @@ launch says so on stderr:
 [tcr] see-through mode: codex keeps its own backend URL, tunnelling via http://tcr-codex@127.0.0.1:3456; a FedRAMP or residency-routed login runs on its own credential, unpooled
 [tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem
 ```
+
+The launch also supplies `shell_environment_policy.set.HTTPS_PROXY` and
+`shell_environment_policy.set.https_proxy` overrides with the unmarked loopback URL. Ordinary
+Codex shell tools such as curl, Python and git then tunnel `chatgpt.com` on their own TLS and
+credentials. These two launch overrides replace any proxy values in the config file's shell
+policy while preserving other keys and filters; later explicit `-c` arguments can override
+them. No Codex config file is written. MCP tools do not inherit proxy variables by default,
+but explicit MCP environments and other child helpers can still inherit the marker. For such
+a child, explicitly set an unmarked proxy URL; do not export the marker to your whole shell.
 
 **When no Codex account can serve right now.** A pooled launch whose running proxy reports no
 Codex account able to serve says so first, from the same read, and then launches as usual, since
@@ -544,7 +545,7 @@ $ tcr login --codex
 …  codex login's own output, passed through unchanged  …
 Saved account 'bob@example.com' to /Users/example/.config/tcr.json
 [tcr] 'bob@example.com' is a Codex account (ChatGPT Pro): Codex sessions started with `tcr run --codex` can use it
-[tcr] tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`, or set HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port> and CODEX_CA_CERTIFICATE to tcr's CA; unmarked connections keep their own login
+[tcr] tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep the marker scoped to that launch, since unmarked connections keep their own login
 [tcr] codex needs a login of its own to start, even when pooled, and none is at /Users/example/.codex/auth.json: unless codex keeps its login in the keyring, run `codex login` once
 [tcr] warning: the tcr at /usr/local/bin/tcr (0.2.44) predates Codex accounts: update it before it next starts — it would read this login as a Claude account and send its token to Anthropic
 Logged in as 'bob@example.com'.
@@ -923,7 +924,8 @@ the login's email. It is a guard against importing from the wrong `CODEX_HOME`.
 **The folder.** The row records the folder it was imported from as `codexHome`
 ([configuration.md](configuration.md#accounts)), so tcr can keep refreshed tokens in sync and
 TcrBar can offer to import from it again. A login of tcr's own records none, and signing a row
-in with `--codex` removes the one it had.
+in with `--codex` removes the one it had. A `TCR_CODEX_AUTH` override whose filename is not
+`auth.json` records no `codexHome`: its standalone file is not automatically synchronized.
 
 **Importing the same login again** updates its row in place and keeps the name the row is
 saved under, so a `--name` that differs from it is refused. It is refused outright when tcr
@@ -954,7 +956,7 @@ proxies, then a line on using the account, then the notices of
 [`--codex`](#--codex-a-codex-login-of-tcrs-own) that hold:
 
 ```
-[tcr] imported as 'alice@example.com' (ChatGPT Pro); this shares the login the `codex` CLI itself uses. Codex refresh tokens are single-use: tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. `tcr login --codex` gives tcr a separate login. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
+[tcr] imported as 'alice@example.com' (ChatGPT Pro); this shares the login the `codex` CLI itself uses. Codex refresh tokens are single-use: tcr checks auth.json before writing refreshed tokens and can adopt replacement tokens for the same ChatGPT account. A simultaneous codex refresh can still race this update. Signing in again with `codex login` in that folder revokes this shared login; tcr may then need sign-in. `tcr login --codex` gives tcr a separate login. Update every tcr that may start on this config, TcrBar's bundled one included, before it next starts: an older one refuses to start, or reads this login as a Claude account.
 [tcr] start a pooled session with `tcr run --codex`
 ```
 
@@ -964,14 +966,23 @@ plan. After a successful refresh of an imported account, tcr tries to update onl
 refreshed id token when one is returned. tcr serializes its writers with a private advisory
 lock, checks the loaded refresh token, then prepares a `0600` temporary file in the same
 directory. It compares the complete original file again immediately before the atomic rename
-and skips the write if the file changed.
+and skips the write if the file changed. A symlinked `auth.json` is preserved and write-back
+is refused. A failed rename removes the temporary file when possible and erases its token
+contents if the directory prevents removal.
+
+A failed publication is retried while the file still holds the spent source refresh token.
+The running manager retains the latest replacement pair, including subsequent rotations, and
+retries before later requests even while its access token is valid. This retry queue is in
+memory: restarting while the file remains unwritable loses it, although tcr keeps its own
+fresh credentials. Repair the file and allow a retry before restarting, or use a separate login.
 
 Codex does not take tcr's advisory lock. A Codex write between that final comparison and the
 rename can still be overwritten; these checks cannot make sharing atomic with Codex.
 `tcr login --codex` gives tcr a separate login and avoids this shared-file race.
 
-When the file holds a changed, unexpired token pair for the same ChatGPT account, tcr can adopt
-it instead. Before refreshing, tcr requires evidence that the file's tokens are newer. After
+When the file holds a changed token pair for the same ChatGPT account, tcr can recover it
+instead. A live access token can be adopted directly; an expired access token must first be
+refreshed using that file's newer refresh token. Before refreshing, tcr requires evidence that the file's tokens are newer. After
 the current refresh token is permanently rejected, it can also recover a matching changed pair
 whose issuance time is equal or unreadable and whose file timestamp is equal or missing. Known
 older tokens, a different login, a malformed file or an unreadable file are rejected. If no
@@ -1691,14 +1702,13 @@ verb but `GET` is a local 405.
    "sevenDay":0.2,"sevenDayResetMs":1767830400000}]}
 ```
 
-One row per account in the server's order. `gate` is the same token `tcr status --json` reports
+One row per Claude account in the server's order. `gate` is the same token `tcr status --json` reports
 (`ok`, `hold`, `five-hour`, `seven-day`, ...); utilizations are fractions and resets are Unix
 milliseconds, `null` when the window has no reading yet. Check `kind` before trusting a body: a tcr
 too old to have the route answers it with a local 404.
 
-A Codex account's row carries `"provider": "codex"`, spelled as on `tcr status --json`, and an
-Anthropic row carries no `provider` key, so a status line that wants its Claude picture keeps only
-the rows without one.
+The v1 route stays Claude-only, so existing status lines cannot count ChatGPT quota as Claude
+capacity. Use `/_tcr/status` or `tcr status --json` for provider-aware Claude and Codex rows.
 
 ---
 
@@ -1860,8 +1870,7 @@ counts Claude sessions only, and `codexRequests10m` Codex sessions only.
 A `codexProblem:` line follows for each problem, in this order:
 
 - an unmarked proxy URL points at tcr: `chatgpt.com` is tunneled untouched, so start with
-  `tcr run --codex` or set `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>` and
-  `CODEX_CA_CERTIFICATE` to tcr's CA to join the pool;
+  `tcr run --codex` to join the pool for that launch instead of marking the whole shell;
 - a marked proxy URL points at tcr, `NO_PROXY` does not exempt `chatgpt.com`, and the CA
   `codex` reads first (`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`) is not tcr's, so its
   TLS handshake would fail. Left out while `codexIntercept` is `no`;
@@ -2030,7 +2039,7 @@ the name it was recorded under. `--json` emits the same numbers as one object in
 plain-text layout.
 
 When the period holds a Codex ledger line, the report also prints a second totals line, which counts
-the Codex requests no price covers, and a `by provider` block (`claude`, `codex`) before the
+the Codex requests no price covers, and a `by provider` block (`anthropic`, `codex`) before the
 per-model breakdown. No OpenAI model has a built-in price, so Codex traffic is unpriced until
 `pricing` names its model ([configuration.md](configuration.md#pricing-and-usageretentiondays)).
 Beside every cost that a bucket's unpriced requests leave out, the report says so:
@@ -2112,7 +2121,7 @@ totals requests=2200 input=14100000 output=1200000 cacheWrite=3000000 cacheRead=
 totals unpriced=400 (Codex requests with no price; the cost above covers priced requests only)
 
 by provider:
-  claude                       requests=1800     cost=$105.06
+  anthropic                    requests=1800     cost=$105.06
   codex                        requests=400      cost=n/a (400 unpriced)
 
 by model (sorted by cost):
