@@ -76,13 +76,19 @@ On a Codex row, ChatGPT's usage-limit refusal reads `rejected` only when nothing
 it. It reads as the window that refused it, `five-hour` or `seven-day`, with that window's reset.
 Past the reset the row keeps that window, with no time, until a quota probe reads the new window
 or a request it serves is answered with one. A refusal no full window explains, for credits or a spend cap, reads `hold` while
-the hold tcr set for it lasts, or `refused` if an upstream 403 holds the account. A quota probe
-ends the refusal when it sees a window roll or reads the account allowed again. The details are
-in [`cli.md`](cli.md#codex-rows-on---json). When an upstream 403 refuses a Codex account and no
+the capped retry hold lasts, or `refused` if a JSON authentication 403 holds the account.
+Only a future body reset or a full window justifies a longer quota hold. A quota probe
+ends both the refusal and its account hold when it sees a window roll or reads the account allowed again. The details are
+in [`cli.md`](cli.md#codex-rows-on---json). When a JSON authentication 403 refuses a Codex account and no
 other Codex account can take the request, `codex` gets tcr's answer for a refused login, which
 names the account and `tcr login --codex --account <name>`
 ([`cli.md`](cli.md#--codex-launching-codex-through-the-pool)), and its requests during the
 120-second hold get a 429 it retries.
+
+Cloudflare challenges, HTML pages, region blocks and unrecognized 403s pass through unchanged
+without holding the account: rotating credentials cannot fix a shared IP block. Explicit account
+or workspace access failures rotate to another account without requesting a re-login; if none
+can serve, the upstream access error is returned.
 
 In the dashboard a Codex row's chip uses ChatGPT's terms: `rejected` reads `REFUSED`, `hold`
 reads `REFUSED` and the time left while ChatGPT's refusal stands, `reserved` reads `UNREACHABLE`,
