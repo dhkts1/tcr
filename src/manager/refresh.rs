@@ -137,7 +137,7 @@ impl Manager {
             .as_ref()
             .filter(|auth| auth.login.refresh_token == refresh_token)
             .and_then(|auth| auth.last_refresh_ms);
-        let newer_in_file = |after_ms| {
+        let newer_in_file = |after_ms, previous_rejected| {
             let home = imported_home.clone();
             let refresh_token = refresh_token.clone();
             let access_before = access_before.clone();
@@ -155,13 +155,14 @@ impl Manager {
                             org_uuid.as_deref(),
                             account_uuid.as_deref(),
                             after_ms,
+                            previous_rejected,
                         )
                     })
             }
         };
         // Codex may have refreshed since this row was loaded. Adopt its live pair before
         // spending the stale single-use refresh token, and check again after an upstream race.
-        let preexisting = newer_in_file(None).await;
+        let preexisting = newer_in_file(None, false).await;
         let result = if let Some(tokens) = preexisting {
             Ok(tokens)
         } else {
@@ -182,7 +183,7 @@ impl Manager {
                         {
                             Ok(true) => {}
                             Ok(false) => {
-                                if let Some(newer) = newer_in_file(loaded_refresh_ms).await {
+                                if let Some(newer) = newer_in_file(loaded_refresh_ms, false).await {
                                     tokens = newer;
                                 }
                             }
@@ -198,7 +199,12 @@ impl Manager {
                 // A concurrent Codex rotation can change the file during any failed POST,
                 // not only one that names a reused token. A different live pair for the same
                 // account is stronger evidence than this stale token's failure.
-                Err(error) => newer_in_file(loaded_refresh_ms).await.ok_or(error),
+                Err(error) => {
+                    let rejected = matches!(&error, oauth::OAuthError::AuthRejected { .. });
+                    newer_in_file(loaded_refresh_ms, rejected)
+                        .await
+                        .ok_or(error)
+                }
             }
         };
         match result {
@@ -409,6 +415,10 @@ mod tests {
     const USER_ID: &str = "22222222-2222-4222-8222-222222222222";
 
     fn access_token(account_id: &str, issued_at: i64, expires_at: i64) -> String {
+        access_token_with_issuance(account_id, json!(issued_at), expires_at)
+    }
+
+    fn access_token_with_issuance(account_id: &str, issued_at: Value, expires_at: i64) -> String {
         const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let payload = serde_json::to_vec(&json!({
             "iat": issued_at,
@@ -715,6 +725,89 @@ mod tests {
             failures.is_empty(),
             "newer file login was not adopted after: {failures:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_stale_codex_refresh_recovers_equal_or_unreadable_file_issuance() {
+        for changed_during_post in [false, true] {
+            for same_timestamp in [false, true] {
+                for issuance in [json!(1), json!("unreadable"), Value::Null] {
+                    for code in [
+                        "refresh_token_reused",
+                        "refresh_token_expired",
+                        "refresh_token_invalidated",
+                    ] {
+                        let home = tempfile::tempdir().unwrap();
+                        let original = auth_document("rt-old", 1);
+                        let mut replacement = auth_document("rt-codex-new", 2);
+                        replacement["tokens"]["access_token"] = json!(access_token_with_issuance(
+                            ACCOUNT_ID,
+                            issuance.clone(),
+                            4_102_444_801,
+                        ));
+                        if same_timestamp {
+                            replacement["last_refresh"] = original["last_refresh"].clone();
+                        } else {
+                            replacement.as_object_mut().unwrap().remove("last_refresh");
+                        }
+                        write_auth(
+                            home.path(),
+                            if changed_during_post {
+                                &original
+                            } else {
+                                &replacement
+                            },
+                        );
+                        let (manager, calls) = imported_manager_with_failure(
+                            home.path(),
+                            changed_during_post.then(|| replacement.clone()),
+                            Some(code),
+                        );
+
+                        assert!(manager.ensure_fresh_force(0).await, "a rejected stale refresh must recover the changed live file pair (during_post={changed_during_post}, same_timestamp={same_timestamp}, {issuance:?}, {code})");
+                        assert_eq!(
+                            calls.load(Ordering::SeqCst),
+                            1,
+                            "ambiguous issuance must not replace tokens before an auth rejection"
+                        );
+                        assert_eq!(manager.account_status(0), Some(AccountStatus::Active));
+                        assert_eq!(
+                            manager.access_token(0).unwrap(),
+                            replacement["tokens"]["access_token"]
+                        );
+                        assert_eq!(
+                            manager.accounts.read().unwrap()[0].refresh_token.as_deref(),
+                            Some("rt-codex-new")
+                        );
+                        assert_eq!(read_auth(home.path()), replacement);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_codex_file_pair_still_requires_freshness_without_auth_rejection() {
+        for (issuance, code) in [
+            (Value::Null, "transient"),
+            (json!(0), "refresh_token_reused"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let mut replacement = auth_document("rt-codex-new", 2);
+            replacement["tokens"]["access_token"] = json!(access_token_with_issuance(
+                ACCOUNT_ID,
+                issuance,
+                4_102_444_801,
+            ));
+            write_auth(home.path(), &replacement);
+            let (manager, calls) = imported_manager_with_failure(home.path(), None, Some(code));
+            let original_access = manager.access_token(0).unwrap();
+
+            assert!(!manager.ensure_fresh_force(0).await);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(manager.access_token(0).unwrap(), original_access);
+            assert_eq!(read_auth(home.path()), replacement);
+        }
     }
 
     #[tokio::test]

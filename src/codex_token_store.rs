@@ -6,13 +6,16 @@
 //! (`openai/codex` `login/src/auth/storage.rs` and `login/src/token_data.rs`). Updating the JSON
 //! value preserves every other field, including token fields a later Codex version adds.
 //!
-//! A write uses a private temporary file in the same directory and compares the original file
-//! again immediately before renaming. That final check is why this cannot use the unconditional
-//! config writer: Codex may have rotated its single-use token during our upstream refresh.
+//! A write holds a private advisory lock shared by tcr writers, writes a private temporary file
+//! in the same directory, and compares the complete original immediately before renaming.
+//! Codex's current FileAuthStorage writes without this lock, so the comparison and rename are
+//! not an atomic compare-and-swap against Codex: a Codex write in that final gap can still race.
+//! The lock serializes cooperative tcr writers; the final comparison detects completed external
+//! changes. No cross-process lock protocol is currently shared with Codex.
 
 use std::fs;
 use std::io::{self, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -83,6 +86,8 @@ impl ImportedAuth {
     /// JWT issuance must advance, or an unchanged/missing issuance time needs an advancing
     /// file timestamp whose baseline belonged to the current refresh token. A different live
     /// pair alone proves no freshness: a failed writeback can leave an older pair on disk.
+    /// After the authority rejects the current refresh token, an equal or unreadable issuance
+    /// can recover from the changed live file pair; a known older issuance is still rejected.
     pub(crate) fn newer_tokens(
         &self,
         previous_refresh: &str,
@@ -90,6 +95,7 @@ impl ImportedAuth {
         account_id: Option<&str>,
         user_id: Option<&str>,
         after_ms: Option<i64>,
+        previous_rejected: bool,
     ) -> Option<Tokens> {
         let expected_account = account_id.filter(|id| !id.is_empty())?;
         if self.login.refresh_token == previous_refresh
@@ -99,8 +105,10 @@ impl ImportedAuth {
             || user_id
                 .zip(self.login.user_id.as_deref())
                 .is_some_and(|(old, new)| old != new)
-            || after_ms
-                .is_some_and(|previous| self.last_refresh_ms.is_none_or(|now| now <= previous))
+            || after_ms.is_some_and(|previous| match self.last_refresh_ms {
+                Some(current) => current < previous || (current == previous && !previous_rejected),
+                None => !previous_rejected,
+            })
         {
             return None;
         }
@@ -111,8 +119,9 @@ impl ImportedAuth {
             (Some(previous), Some(candidate)) if candidate < previous => return None,
             (Some(previous), Some(candidate)) if candidate > previous => {}
             // An equal or unreadable issuance time can only use a timestamp baseline read
-            // from a file that still held the current refresh token before this POST.
-            _ if after_ms.is_some() => {}
+            // from a file that still held the current refresh token before this POST, unless
+            // the authority has now rejected that current token and the file offers recovery.
+            _ if after_ms.is_some() || previous_rejected => {}
             _ => return None,
         }
         // account_id in the file must not conceal a different workspace in either JWT.
@@ -153,6 +162,27 @@ impl ImportedAuth {
 /// `false` means the file changed: no destination bytes were written. Unknown fields and the
 /// original id token are retained unless the refresh endpoint returned a replacement.
 pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -> io::Result<bool> {
+    write_back_before_commit(home, previous_refresh, tokens, || {})
+}
+
+fn write_back_before_commit(
+    home: &Path,
+    previous_refresh: &str,
+    tokens: &Tokens,
+    before_commit: impl FnOnce(),
+) -> io::Result<bool> {
+    let writer_lock_path = crate::paths::codex_auth_lock_file(home);
+    let writer_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(writer_lock_path)?;
+    writer_lock.lock()?;
+    // Keep this handle alive through the final comparison and rename. Codex does not take
+    // this advisory lock; it protects cooperating tcr writers, not uncooperative processes.
+    let _writer_lock = writer_lock;
     let mut auth = read(home)?;
     if auth.login.refresh_token != previous_refresh {
         return Ok(false);
@@ -197,7 +227,9 @@ pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
     // Compare all bytes so an unrelated field edited while the temp was prepared is preserved
-    // too. In particular, a newly rotated refresh token can never be overwritten by this write.
+    // too. A Codex write completed before this read is preserved. Codex ignores our lock,
+    // so a later external write can still race the rename; this is not an atomic CAS.
+    before_commit();
     if fs::read(&auth.path)? != auth.original {
         return Ok(false);
     }
@@ -209,4 +241,98 @@ pub(crate) fn write_back(home: &Path, previous_refresh: &str, tokens: &Tokens) -
     }
     let _ = fs::File::open(home).and_then(|directory| directory.sync_all());
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn auth(refresh: &str) -> Value {
+        serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": format!("at-{refresh}"),
+                "refresh_token": refresh,
+                "account_id": "11111111-1111-4111-8111-111111111111",
+            },
+            "last_refresh": "2026-10-01T00:00:00Z",
+            "other": {"preserve": true},
+        })
+    }
+
+    fn tokens(refresh: &str) -> Tokens {
+        Tokens {
+            id_token: None,
+            access_token: format!("at-{refresh}"),
+            refresh_token: Some(refresh.to_string()),
+            expires_at_ms: crate::now_ms() + 3_600_000,
+        }
+    }
+
+    #[test]
+    fn a_codex_rotation_while_the_temporary_file_is_prepared_is_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::paths::codex_auth_file(home.path());
+        fs::write(&path, auth("rt-old").to_string()).unwrap();
+        let rotated = auth("rt-codex-new").to_string();
+
+        let written =
+            write_back_before_commit(home.path(), "rt-old", &tokens("rt-tcr-new"), || {
+                // Codex's current file backend writes in place without our advisory lock.
+                fs::write(&path, &rotated).unwrap();
+            })
+            .unwrap();
+
+        assert!(
+            !written,
+            "a file changed during temporary preparation must not be replaced"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), rotated);
+    }
+
+    #[test]
+    fn two_tcr_writers_serialize_and_recheck_the_imported_refresh_token() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::paths::codex_auth_file(home.path());
+        fs::write(&path, auth("rt-old").to_string()).unwrap();
+        let first_home = home.path().to_path_buf();
+        let (prepared, ready) = mpsc::channel();
+        let (release, commit) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            write_back_before_commit(&first_home, "rt-old", &tokens("rt-first"), || {
+                prepared.send(()).unwrap();
+                commit.recv().unwrap();
+            })
+            .unwrap()
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_home = home.path().to_path_buf();
+        let (finished, done) = mpsc::channel();
+        let (started, running) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let written = write_back(&second_home, "rt-old", &tokens("rt-second")).unwrap();
+            finished.send(written).unwrap();
+            written
+        });
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        let held = matches!(
+            done.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        release.send(()).unwrap();
+        let first_written = first.join().unwrap();
+        let second_written = second.join().unwrap();
+
+        assert!(held, "a second tcr writer bypassed the first writer's lock");
+        assert!(first_written);
+        assert!(
+            !second_written,
+            "the follower must re-read the newly rotated token"
+        );
+        let stored: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["tokens"]["refresh_token"], "rt-first");
+    }
 }
