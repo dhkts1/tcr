@@ -25,6 +25,7 @@ impl Manager {
     /// The account indices eligible for a keep-warm request. Starts from the same
     /// base as [`Self::probeable_indices`] (an OAuth account with a refresh token
     /// that is neither disabled nor errored) and additionally skips:
+    ///  - a Codex account — a warm is an Anthropic inference request;
     ///  - a `Throttled` account — warming it would just 429;
     ///  - an account whose 5h window is **live** (a future reset) — already warm,
     ///    so warming again only burns quota for nothing;
@@ -99,6 +100,14 @@ impl Manager {
         accounts
             .iter()
             .enumerate()
+            // A warm is an Anthropic inference request (`warm_account` POSTs `/v1/messages`
+            // to the Anthropic `upstream` with the row's bearer), so a Codex row is never a
+            // target: warming it would hand its bearer to the wrong provider. A `match`, so a
+            // third provider decides here instead of inheriting an answer.
+            .filter(|(_, a)| match a.provider {
+                crate::provider::Provider::Anthropic => true,
+                crate::provider::Provider::Codex => false,
+            })
             .filter(|(_, a)| {
                 a.account_type.is_oauth()
                     && a.refresh_token.is_some()
@@ -155,7 +164,8 @@ impl Manager {
             Ok(headers) => {
                 // Fold the now-live 5h window into the account's quota so the next
                 // sweep sees it as already warm (REQUIRED — suppresses re-warm).
-                if self.update_quota(idx, &headers) {
+                // The warmer yields headers only for a 2xx (`warmer.rs`).
+                if self.update_quota(idx, &headers, reqwest::StatusCode::OK.as_u16()) {
                     tracing::info!(account = %name, index = idx, "keep-warm: started 5h window");
                 } else {
                     let gave_up = self.record_warm_without_evidence(idx);

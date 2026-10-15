@@ -59,7 +59,7 @@ use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
         Box::pin(async {
             Err(OAuthError::Transient(
                 "no refresher in throttle tests".into(),
@@ -70,7 +70,7 @@ impl TokenRefresher for NeverRefreshes {
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _access_token: String) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -120,6 +120,7 @@ fn account(i: usize) -> Account {
     Account {
         name: format!("acct{i}"),
         account_type: tcr::config::AccountType::OAuth,
+        provider: Default::default(),
         account_uuid: Some(fake_uuid(i)),
         org_uuid: (i > 0).then(|| fake_org_uuid(i)),
         org_name: None,
@@ -144,6 +145,7 @@ fn account(i: usize) -> Account {
         seat_tier: None,
         egress: tcr::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }
@@ -172,6 +174,7 @@ fn config(
             extra: serde_json::Map::new(),
         },
         upstream: upstream.to_string(),
+        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.98,
         fable_weekly_threshold: None,
         pacing: PacingConfig::default(),

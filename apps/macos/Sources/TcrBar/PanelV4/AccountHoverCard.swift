@@ -151,12 +151,16 @@ struct AccountHoverCardContent<Actions: View, Menu: View>: View {
     let snapshotMode: Bool
     /// A kept-open card whose strip segment the pointer is on.
     var lit: Bool = false
+    /// The fleet also holds Codex accounts, so a kept-open Claude card's spoken
+    /// label says which provider it serves (``AccountCard/namesProvider``).
+    var namesProvider: Bool = false
     @ViewBuilder var actions: () -> Actions
     @ViewBuilder var menu: () -> Menu
 
     var body: some View {
         AccountCard(
             account: row.account, shape: shape, now: now, isControl: row.isControl,
+            namesProvider: namesProvider,
             snapshotMode: snapshotMode, lit: lit
         ) {
             actions()

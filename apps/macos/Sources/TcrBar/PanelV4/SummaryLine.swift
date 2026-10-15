@@ -30,14 +30,19 @@ struct SummaryLine: View {
     /// reads as one long number (the design's own `.sum` row).
     let lines: [[Run]]
     var accessibilityText: String?
+    /// A tooltip per line, by index. A line with no entry, or a `nil` one,
+    /// takes no `.help` at all.
+    var lineHelp: [String?] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(lines.enumerated()), id: \.offset) { _, runs in
-                text(for: runs)
-                    .lineSpacing(V4.lineSpacing(V4.summarySize))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(minHeight: V4.lineHeight(V4.summarySize), alignment: .leading)
+            ForEach(Array(lines.enumerated()), id: \.offset) { index, runs in
+                helped(
+                    text(for: runs)
+                        .lineSpacing(V4.lineSpacing(V4.summarySize))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(minHeight: V4.lineHeight(V4.summarySize), alignment: .leading),
+                    index < lineHelp.count ? lineHelp[index] : nil)
             }
         }
         .padding(.horizontal, V4.summaryPaddingSide)
@@ -47,6 +52,15 @@ struct SummaryLine: View {
         .accessibilityLabel(
             accessibilityText
                 ?? lines.map { $0.map(\.spoken).joined(separator: ", ") }.joined(separator: ". "))
+    }
+
+    @ViewBuilder
+    private func helped<Line: View>(_ line: Line, _ help: String?) -> some View {
+        if let help {
+            line.help(help)
+        } else {
+            line
+        }
     }
 
     private func text(for runs: [Run]) -> Text {
@@ -73,7 +87,19 @@ extension SummaryLine {
     /// (option H, unit H3): the strip at the top of the tab counts the fleet
     /// now ("5 of 13 can take work now"), and two counts of one fleet in two
     /// wordings, one over the other, is one too many.
+    ///
+    /// A fleet holding Codex accounts reads every figure per provider
+    /// (``AccountsSummary/lines(_:)``): the fleet-wide figures below would
+    /// fold Codex's tokens into Claude's cache ratio and its requests into
+    /// Claude's unpriced count. The Codex clause joins the same line, and the
+    /// line's tooltip says what the Codex figure is.
     static func accounts(_ fleet: Fleet) -> SummaryLine? {
+        if fleet.holdsCodex {
+            guard let lines = AccountsSummary.lines(fleet) else { return nil }
+            return SummaryLine(
+                lines: lines.map { $0.map { Run($0) } },
+                lineHelp: [AccountsSummary.usageHelp(fleet)])
+        }
         var second: [Run] = []
         if fleet.hasUsage {
             // `dim` at 400: the mockup's money clause is `.nw`, which sets
@@ -91,5 +117,20 @@ extension SummaryLine {
             }
         }
         return second.isEmpty ? nil : SummaryLine(lines: [second])
+    }
+}
+
+extension SummaryLine.Run {
+    /// A summary clause in the palette token its role names. Ready is the one
+    /// clause drawn at 600, as on every other summary.
+    init(_ clause: SummaryRun) {
+        switch clause.role {
+        case .lead: self.init(text: clause.text, tint: Tok.ink)
+        case .ok: self.init(text: clause.text, tint: Tok.ok, emphasised: true)
+        case .near: self.init(text: clause.text, tint: Tok.near)
+        case .bad: self.init(text: clause.text, tint: Tok.spent)
+        case .dim: self.init(text: clause.text, tint: Tok.dim)
+        case .mute: self.init(text: clause.text, tint: Tok.mute)
+        }
     }
 }

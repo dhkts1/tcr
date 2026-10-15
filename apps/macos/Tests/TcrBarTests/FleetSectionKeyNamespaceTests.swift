@@ -90,6 +90,103 @@ final class FleetSectionKeyNamespaceTests: XCTestCase {
         XCTAssertEqual(keys.count, 12)
         XCTAssertEqual(Set(keys).count, keys.count, "two list children share a measured-height key")
     }
+
+    // MARK: - The key an open group is stored under
+
+    /// A Codex box stores its open state under a key of its own, so opening one orchard does
+    /// not open the other, and its identity cannot meet a Claude box's in one list.
+    func testTheCodexBoxKeyIsNamespaced() throws {
+        let lists = try XCTUnwrap(try canonicalFleet().accountsTabSectionsByProvider(expandedGroups: []))
+        let codex = try XCTUnwrap(lists.first { $0.provider == .codex }).sections
+        let orchard = try XCTUnwrap(codex.first { $0.group == .named("orchard") })
+        let research = try XCTUnwrap(codex.first { $0.group == .named("research") })
+
+        XCTAssertEqual(orchard.expansionKey, "codex:g:orchard")
+        XCTAssertEqual(research.expansionKey, "codex:g:research")
+        XCTAssertFalse(codex.isEmpty, "positive control: the fixture has Codex sections")
+        for section in codex {
+            XCTAssertTrue(
+                section.id.hasPrefix("codex\u{1F}"),
+                "Codex section id \(section.id) is not in the Codex namespace")
+        }
+    }
+
+    /// A Claude box keeps the key and the identity it always had, so a group an operator left
+    /// open is still open once the fleet holds a Codex account.
+    func testTheClaudeBoxKeepsTodaysKey() throws {
+        let lists = try XCTUnwrap(try canonicalFleet().accountsTabSectionsByProvider(expandedGroups: []))
+        let claude = try XCTUnwrap(lists.first { $0.provider == .anthropic }).sections
+        let orchard = try XCTUnwrap(claude.first { $0.group == .named("orchard") })
+
+        XCTAssertEqual(orchard.expansionKey, "g:orchard")
+        XCTAssertEqual(orchard.id, "0\u{1F}g:orchard")
+    }
+
+    /// The two places the tab reads an open group, pinned by what they do: whether a group is
+    /// closed to one line, and whether a wholly-parked one shows past its cap. Each opens a
+    /// Codex box under the Codex key only.
+    func testACodexBoxOpensOnlyUnderItsOwnKey() throws {
+        let big = try decodeFleet(
+            [try canonicalRow("alice@example.com")]
+                + ["bob@example.com/codex", "dana@example.com", "ivy@example.com", "jo@example.com"]
+                .map { try canonicalRow($0, ["groups": ["big"]]) })
+        func codexBig(_ expanded: Set<String>) throws -> FleetSection {
+            let lists = try XCTUnwrap(big.accountsTabSectionsByProvider(expandedGroups: expanded))
+            return try XCTUnwrap(lists.last?.sections.first { $0.group == .named("big") })
+        }
+        XCTAssertTrue(try codexBig([]).isSummarised(expandedGroups: []))
+        XCTAssertTrue(
+            try codexBig(["g:big"]).isSummarised(expandedGroups: ["g:big"]),
+            "the Claude key opened a Codex box")
+        XCTAssertFalse(try codexBig(["codex:g:big"]).isSummarised(expandedGroups: ["codex:g:big"]))
+
+        let night = try decodeFleet(
+            ["bob@example.com/codex", "dana@example.com", "jo@example.com"].map {
+                try canonicalRow($0, ["disabled": true, "groups": ["night"]])
+            })
+        func drawn(_ expanded: Set<String>) throws -> [String] {
+            try XCTUnwrap(night.accountsTabSectionsByProvider(expandedGroups: expanded))
+                .flatMap(\.sections)
+                .rowsInDrawOrder(expandedGroups: expanded, parkedCap: 2) {
+                    $0.account.name == "bob@example.com/codex"
+                }
+                .map(\.account.name)
+        }
+        let capped = ["dana@example.com", "bob@example.com/codex", "jo@example.com"]
+        XCTAssertEqual(try drawn([]), capped)
+        XCTAssertEqual(try drawn(["g:night"]), capped, "the Claude key lifted a Codex group's cap")
+        XCTAssertEqual(
+            try drawn(["codex:g:night"]),
+            ["dana@example.com", "jo@example.com", "bob@example.com/codex"])
+    }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// All ten canonical rows: alice (Claude, in orchard) and nine Codex rows.
+private func canonicalFleet() throws -> Fleet {
+    try decodeFleet(
+        [
+            "alice@example.com", "bob@example.com/codex", "carol@example.com", "dana@example.com",
+            "erin@example.com/codex", "gil@example.com", "hal@example.com", "ivy@example.com",
+            "jo@example.com", "kim@example.com",
+        ].map { try canonicalRow($0) })
 }
 
 /// Same fixture shape as `FleetSectionsTests`, so the two files cannot drift.

@@ -59,6 +59,17 @@ final class MenuBarShell {
     /// to apply" notice must survive the panel closing and reopening, not
     /// reset the moment the operator dismisses it.
     let removeController: RemoveAccountController
+    /// This Mac's codex evidence for Add account… and the sign-in sheet, resolved
+    /// off the main thread each time the panel opens. Owned here so the panel is
+    /// rebuilt around the same answer, and so nothing renders it: the render
+    /// harness passes no evidence at all.
+    let codexPresence: CodexPresenceController
+    /// What the panel keeps under a Codex account's line for this app run: a
+    /// refused re-login and a group add's warning. Owned here for the same reason
+    /// as `groupController`: a note that reset every time the panel opened would
+    /// be gone by the time anyone looked.
+    let codexNotes: CodexNoteStore
+    let codexBannerSnapshot: CodexBannerSnapshot
     /// The claude route: the Accounts tab's one-time prompt and the Settings
     /// row. Owned here because the prompt's show-or-not is decided in
     /// ``openPanel()``, before the popover's first frame.
@@ -79,6 +90,11 @@ final class MenuBarShell {
     /// the Settings window happens to be open.
     let runningToolsPreference: ShowRunningToolsPreference
     let defaultTabPreference: DefaultTabPreference
+    /// "Cup shows" (Settings window, Menu Bar pane): which pool the cup follows
+    /// in a fleet holding both Claude and Codex accounts. Owned here for the
+    /// same reason as `countsPreference`: the mark it steers is composed on
+    /// every poll tick, not just while the Settings window is open.
+    let cupPoolPreference: MenuBarCupPoolPreference
     /// "Panel density" (Settings window, Menu Bar pane). Owned here, same
     /// shape as `defaultTabPreference`, even though `V4.compact` never reads
     /// this instance — the picker binding in `SettingsPanes` needs a live
@@ -93,6 +109,7 @@ final class MenuBarShell {
             poller: poller, server: server, loginItem: loginItem, awake: awake,
             preference: preference, countsPreference: countsPreference,
             runningToolsPreference: runningToolsPreference,
+            cupPoolPreference: cupPoolPreference,
             defaultTabPreference: defaultTabPreference,
             panelDensityPreference: panelDensityPreference,
             groupController: groupController, updater: updater,
@@ -107,6 +124,7 @@ final class MenuBarShell {
     let popover: NSPopover
 
     private var marks: Set<AnyCancellable> = []
+    private var openingWhenPresenceResolves = false
 
     /// `nil` means "the real one". A default argument is evaluated in a
     /// *nonisolated* context, and every controller here is `@MainActor`, so
@@ -125,12 +143,14 @@ final class MenuBarShell {
         updater: Updater? = nil,
         groupController: GroupController? = nil,
         removeController: RemoveAccountController? = nil,
+        codexPresence: CodexPresenceController? = nil,
         claudeRoute: ClaudeRouteController? = nil,
         whatsNew: WhatsNewController? = nil,
         runningToolsPreference: ShowRunningToolsPreference? = nil,
         defaultTabPreference: DefaultTabPreference? = nil,
         panelDensityPreference: PanelDensityPreference? = nil,
-        knocks: KnockReader? = nil
+        knocks: KnockReader? = nil,
+        cupPoolPreference: MenuBarCupPoolPreference? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -146,6 +166,9 @@ final class MenuBarShell {
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
         self.removeController = removeController ?? RemoveAccountController()
+        self.codexPresence = codexPresence ?? CodexPresenceController()
+        self.codexNotes = CodexNoteStore()
+        self.codexBannerSnapshot = CodexBannerSnapshot()
         self.claudeRoute = claudeRoute ?? ClaudeRouteController()
         // The controller's `init` is inert; nothing fetches until `AppDelegate`
         // calls `checkAfterLaunch()`, which the shell probe never does.
@@ -160,6 +183,7 @@ final class MenuBarShell {
         self.runningToolsPreference = runningToolsPreference ?? ShowRunningToolsPreference()
         self.defaultTabPreference = defaultTabPreference ?? DefaultTabPreference()
         self.panelDensityPreference = panelDensityPreference ?? PanelDensityPreference()
+        self.cupPoolPreference = cupPoolPreference ?? MenuBarCupPoolPreference()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -197,9 +221,12 @@ final class MenuBarShell {
                 accounts: self.accounts, control: self.control, awake: self.awake,
                 preference: self.preference, updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
+                codexPresence: self.codexPresence, codexNotes: self.codexNotes,
+                codexBannerSnapshot: self.codexBannerSnapshot,
                 routeController: self.claudeRoute,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
+                runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
                 onFindingTurnedOn: { [weak self] in
                     self?.knockNotifier?.requestAuthorizationOnce()
                 },
@@ -233,17 +260,20 @@ final class MenuBarShell {
         // The knock count is combined in here for the same reason the other
         // three are: the mark is recomposed whenever ANY of them changes, and
         // a knock arriving between two polls must move the bar without
-        // waiting for an account figure to change.
+        // waiting for an account figure to change. "Cup shows" joins them for
+        // the same reason: picking a pool must move the cup at once.
         self.poller.$state
             .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
             .combineLatest(self.runningToolsPreference.$showRunningToolCount)
             .combineLatest(self.knocks.$knocks)
-            .sink { [weak self] outer, pending in
+            .combineLatest(self.cupPoolPreference.$pool)
+            .sink { [weak self] withKnocks, cupPool in
+                let (outer, pending) = withKnocks
                 let (combined, showRunningTools) = outer
                 let (state, isOn, showCounts) = combined
                 self?.updateMark(
                     state: state, awake: isOn, showCounts: showCounts,
-                    showRunningTools: showRunningTools, knocks: pending.count)
+                    showRunningTools: showRunningTools, knocks: pending.count, cupPool: cupPool)
             }
             .store(in: &marks)
 
@@ -351,12 +381,15 @@ final class MenuBarShell {
 
     // MARK: - The mark
 
-    /// Which colour the one coffee-cup glyph wears. `PollState.capacityTintKind(awake:)`
+    /// Which colour the one coffee-cup glyph wears. `PollState.capacityTintKind(awake:cupPool:)`
     /// (`TcrBarCore/StatusPoller.swift`) is the whole decision — testable there,
     /// against no `NSColor` at all — and this is the one place `Tok`'s actual
-    /// colours attach to it.
-    static func cupTint(for state: PollState, awake: Bool) -> MenuBarMark.Tint {
-        switch state.capacityTintKind(awake: awake) {
+    /// colours attach to it. `cupPool` is "Cup shows": in a fleet holding Codex
+    /// accounts the colour follows the same pool the fill does.
+    static func cupTint(
+        for state: PollState, awake: Bool, cupPool: MenuBarCupPool
+    ) -> MenuBarMark.Tint {
+        switch state.capacityTintKind(awake: awake, cupPool: cupPool) {
         case .failed: return .failed(Tok.spentNSColor)
         case .near: return .near(Tok.nearNSColor)
         case .awake: return .awake(Tok.awakeNSColor)
@@ -364,11 +397,13 @@ final class MenuBarShell {
         }
     }
 
-    /// One line for the tooltip. The menu bar has room for a glyph and nothing
-    /// else, so this is where the poll's own summary is reachable by a human who
-    /// has not opened the panel. ``PollState/tooltipSentence`` is the fuller
-    /// capacity sentence when a healthy read has one to give, and
-    /// ``PollState/summary`` unchanged for every other case.
+    /// The tooltip. The menu bar has room for a glyph and nothing else, so this
+    /// is where the poll's own summary is reachable by a human who has not
+    /// opened the panel. ``PollState/menuBarToolTip(awake:showRunningTools:knocks:cupPool:now:)``
+    /// composes it in the library, where it is tested:
+    /// ``PollState/tooltipSentence`` is the fuller capacity sentence when a
+    /// healthy read has one to give, and ``PollState/summary`` unchanged for
+    /// every other case.
     ///
     /// The running-tools clause, when the segment is shown, sits between that
     /// sentence and the keep-awake clause — matching the mockup's own ordering
@@ -379,20 +414,14 @@ final class MenuBarShell {
     /// A Mac waiting on an answer is PREPENDED, in its own sentence, ahead of
     /// every capacity clause: it is the one thing on this item that is waiting
     /// on a person, and the pointer route is where the amber glyph beside the
-    /// cup says what it means in words.
+    /// cup says what it means in words. A fleet holding both Claude and Codex
+    /// accounts gives each pool its own line, and says which one the cup shows.
     static func toolTip(
-        state: PollState, awake: Bool, showRunningTools: Bool, knocks: Int = 0
+        state: PollState, awake: Bool, showRunningTools: Bool, knocks: Int = 0,
+        cupPool: MenuBarCupPool
     ) -> String {
-        var sentence = state.tooltipSentence
-        if let running = state.runningToolsCount(showRunningTools: showRunningTools) {
-            let noun = running == 1 ? "tool" : "tools"
-            sentence += " · \(running) \(noun) running"
-        }
-        if awake {
-            sentence = "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
-        }
-        guard let asking = PeerAdmission.knockBarSentence(count: knocks) else { return sentence }
-        return "\(asking) \(sentence)"
+        state.menuBarToolTip(
+            awake: awake, showRunningTools: showRunningTools, knocks: knocks, cupPool: cupPool)
     }
 
     /// The knock segment: `person.fill.questionmark` in amber, plus the count
@@ -441,11 +470,14 @@ final class MenuBarShell {
     ///
     /// This label is opt-in (the counts preference, default off): the cup
     /// itself already carries capacity by default, as its fill level and its
-    /// own colour (``MenuBarShell/cupTint(for:awake:)``) — this is a second,
-    /// numeric rendering of the identical fact for an operator who wants it
-    /// spelled out. `amber` matches whatever tint the cup drew for the same
-    /// poll, so the two can never disagree about which state they describe.
-    /// The separator dot is drawn `Tok.mute` so it reads as
+    /// own colour (``MenuBarShell/cupTint(for:awake:cupPool:)``) — this is a
+    /// second, numeric rendering of the identical fact for an operator who
+    /// wants it spelled out. A fleet with one provider has one part, amber
+    /// exactly when the cup is, so the two can never disagree about which
+    /// state they describe. A fleet holding both providers has one part per
+    /// pool (`3/4 · 0/2`, Claude first), each amber when its own pool is near
+    /// (`nearHalves`, in order), so the amber says which pool is short.
+    /// The separator dots are drawn `Tok.mute` so they read as
     /// punctuation rather than a second urgency signal, and the running count
     /// itself is `labelColor` — amber marks capacity, not tool activity.
     /// Internal, not `private`: `RenderMark` composes the identical title this
@@ -453,13 +485,26 @@ final class MenuBarShell {
     /// the render fixtures and the live mark can never draw the label two
     /// different ways.
     static func countsAttributedTitle(
-        _ label: String, amber: Bool, runningTools: Int?
+        _ label: String, nearHalves: [Bool], runningTools: Int?
     ) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(
             ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
-        let result = NSMutableAttributedString(
-            string: label,
-            attributes: [.font: font, .foregroundColor: amber ? Tok.nearNSColor : .labelColor])
+        let result = NSMutableAttributedString()
+        for (index, half) in label.components(separatedBy: " \u{00b7} ").enumerated() {
+            if index > 0 {
+                result.append(
+                    NSAttributedString(
+                        string: " \u{00b7} ",
+                        attributes: [.font: font, .foregroundColor: NSColor(Tok.mute)]))
+            }
+            let near = index < nearHalves.count && nearHalves[index]
+            result.append(
+                NSAttributedString(
+                    string: half,
+                    attributes: [
+                        .font: font, .foregroundColor: near ? Tok.nearNSColor : .labelColor,
+                    ]))
+        }
         guard let runningTools else { return result }
 
         result.append(
@@ -512,19 +557,20 @@ final class MenuBarShell {
         }
         title.append(
             Self.countsAttributedTitle(
-                label, amber: state.countIsNearCapacity,
+                label, nearHalves: state.countsNearHalves,
                 runningTools: state.runningToolsCount(showRunningTools: showRunningTools)))
         return title
     }
 
     private func updateMark(
         state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool,
-        knocks: Int
+        knocks: Int, cupPool: MenuBarCupPool
     ) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
-            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn),
-            knocks: knocks)
+            fraction: state.capacityFraction(cupPool: cupPool),
+            tint: Self.cupTint(for: state, awake: isOn, cupPool: cupPool),
+            knocks: knocks, fleet: state.loadedFleet)
         {
             button.image = mark
             button.attributedTitle = Self.markTitle(
@@ -538,7 +584,8 @@ final class MenuBarShell {
             button.title = "tcr"
         }
         button.toolTip = Self.toolTip(
-            state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks)
+            state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks,
+            cupPool: cupPool)
     }
 
     // MARK: - The panel's size, predicted against what it really is
@@ -696,6 +743,19 @@ final class MenuBarShell {
         settingsWindow.show()
     }
 
+    /// Runs a picker for the sign-in sheet and keeps the panel up while it runs.
+    /// The popover is transient, so a picker taking focus would close it and the
+    /// sheet's next step would be drawn into a panel nobody can see.
+    func runOpenPanel(_ panel: NSOpenPanel) -> URL? {
+        let behavior = popover.behavior
+        popover.behavior = .applicationDefined
+        defer {
+            popover.behavior = behavior
+            if !popover.isShown { openPanel() }
+        }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
     /// `DefaultTabPreference` stores a plain string (see that type's own
     /// doc-comment on why it cannot hold `PanelTab` directly); this is the
     /// one place that turns it back into the real enum, at the one call site
@@ -728,9 +788,12 @@ final class MenuBarShell {
                 accounts: accounts, control: control, awake: awake,
                 preference: preference, updater: updater,
                 groupController: groupController, removeController: removeController,
+                codexPresence: codexPresence, codexNotes: codexNotes,
+                codexBannerSnapshot: codexBannerSnapshot,
                 routeController: claudeRoute,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
+                runOpenPanel: { [weak self] panel in self?.runOpenPanel(panel) },
                 onFindingTurnedOn: { [weak self] in
                     self?.knockNotifier?.requestAuthorizationOnce()
                 },
@@ -740,6 +803,18 @@ final class MenuBarShell {
 
     func openPanel() {
         guard let button = statusItem.button else { return }
+        // The first frame and an immediate Add account click need resolved absence,
+        // not the controller's initial placeholder. This stat-only read is off main.
+        guard codexPresence.isResolved else {
+            guard !openingWhenPresenceResolves else { return }
+            openingWhenPresenceResolves = true
+            Task {
+                await codexPresence.refresh(fleetHoldsCodex: poller.state.loadedFleet?.holdsCodex == true)
+                openingWhenPresenceResolves = false
+                openPanel()
+            }
+            return
+        }
         // Without activation the panel opens without key focus, and
         // `.textSelection(.enabled)` on the account name (`FleetView.swift:537`)
         // stops working.
@@ -770,10 +845,13 @@ final class MenuBarShell {
         // Before the show, so the prompt is in the panel's first frame or not
         // at all: nothing may be inserted while the panel is open (Gil,
         // 2026-10-14, no layout shifts). Decided from the status read cached
-        // by launch or the previous open, never one in flight.
-        var hasFleet = false
-        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty { hasFleet = true }
-        claudeRoute.decideAtOpen(hasFleet: hasFleet)
+        // by launch or the previous open, never one in flight. A fleet no
+        // Claude account can serve claude from is never asked
+        // (``ClaudeRoutePrompt/hasFleet(_:)``).
+        var fleet: Fleet?
+        if case .loaded(let loaded) = poller.state { fleet = loaded }
+        claudeRoute.decideAtOpen(fleet: fleet)
+        codexBannerSnapshot.decideAtOpen()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
@@ -813,6 +891,21 @@ final class MenuBarShell {
         // own rather than waiting for the timer, and the panel it is drawing
         // meanwhile is the same panel it always drew.
         Task { await poller.pollOnce() }
+        // This Mac's codex evidence, for Add account… and the sign-in sheet,
+        // resolved off the main thread once per open: it only checks where codex
+        // lives, and never runs it or opens a file of its. With evidence, or a
+        // Codex row in the fleet, this tcr is asked once whether it has
+        // `tcr login --codex`, so the chooser and a Codex row's Re-login can word
+        // their help without starting a process on a click.
+        Task {
+            let fleetHoldsCodex = poller.state.loadedFleet?.holdsCodex == true
+            await codexPresence.refresh(fleetHoldsCodex: fleetHoldsCodex)
+            if codexPresence.presence.isPresent || fleetHoldsCodex,
+                case .success(let tcr) = TcrTool.resolve()
+            {
+                _ = await LoginCapability.probeCodex(executable: tcr)
+            }
+        }
     }
 
     func closePanel() {
@@ -838,9 +931,14 @@ struct FleetPanel: View {
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
     @ObservedObject var removeController: RemoveAccountController
+    @ObservedObject var codexPresence: CodexPresenceController
+    @ObservedObject var codexNotes: CodexNoteStore
+    @ObservedObject var codexBannerSnapshot: CodexBannerSnapshot
     @ObservedObject var routeController: ClaudeRouteController
     var onWhatsNew: () -> Void = {}
     var onSettings: () -> Void = {}
+    /// The shell's picker runner, which keeps the panel up while a picker runs.
+    var runOpenPanel: (NSOpenPanel) -> URL? = { _ in nil }
     /// Run when **Find Macs on this network** is switched ON.
     ///
     /// The one moment a knock becomes possible at all, and therefore the
@@ -864,8 +962,17 @@ struct FleetPanel: View {
             removeController: removeController,
             routeController: routeController,
             startServerAtLaunch: $preference.startServerAtLaunch,
+            codexPresence: codexPresence.presence,
+            resolveCodexPresenceForLogin: {
+                await codexPresence.resolvedForLogin(
+                    fleetHoldsCodex: poller.state.loadedFleet?.holdsCodex == true)
+            },
+            codexNotes: codexNotes,
+            codexBannerSnapshot: codexBannerSnapshot,
+            bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,
             onWhatsNew: onWhatsNew,
             onSettings: onSettings,
+            runOpenPanel: runOpenPanel,
             onFindingTurnedOn: onFindingTurnedOn,
             initialTab: initialTab
         )

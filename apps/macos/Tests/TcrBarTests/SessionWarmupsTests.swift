@@ -111,4 +111,74 @@ final class SessionWarmupsTests: XCTestCase {
     func testFoldLabelDropsSpendWhenNothingWasPriced() {
         XCTAssertEqual(SessionWarmup.foldLabel(count: 3, cost: nil), "3 warm-ups")
     }
+
+    // MARK: - Codex sessions
+
+    /// One session decoded from the wire's JSON, last seen `idleMinutes` before ``now``, with
+    /// `fields` (JSON members) beside the keys every row carries.
+    private func decoded(_ fields: String, idleMinutes: Double = 10) throws -> Session {
+        let lastSeenMs = Int64((now.timeIntervalSince1970 - idleMinutes * 60) * 1000)
+        let payload = """
+            {"supported": true, "sessions": [
+              {"firstSeenMs": \(lastSeenMs), "lastSeenMs": \(lastSeenMs), \(fields)}]}
+            """
+        let read = try Fleet.decodeSessions(Data(payload.utf8))
+        XCTAssertEqual(read.unreadable, [])
+        return try XCTUnwrap(read.sessions.first)
+    }
+
+    /// A Codex session's `costUsd` is 0.0 on the wire when nothing it sent could be priced,
+    /// which is not a measurement: such a session has no priced cost at all. A partly priced
+    /// Codex session keeps the dollars that were priced, and a Claude session's cost means
+    /// exactly what it always did, a measured zero included.
+    func testPricedCostIsTheSessionsCostExceptAnAllUnpricedCodexSession() throws {
+        let unpriced = try decoded(
+            #""sessionId": "c1", "provider": "codex", "requests": 7, "unpricedRequests": 7, "costUsd": 0.0"#
+        )
+        XCTAssertNil(unpriced.pricedCostUsd)
+
+        let partlyPriced = try decoded(
+            #""sessionId": "c2", "provider": "codex", "requests": 7, "unpricedRequests": 3, "costUsd": 0.4"#
+        )
+        XCTAssertEqual(partlyPriced.pricedCostUsd, 0.4)
+
+        let claude = try decoded(#""sessionId": "a1", "requests": 9, "costUsd": 1.2"#)
+        XCTAssertEqual(claude.pricedCostUsd, 1.2)
+
+        let claudeAtZero = try decoded(#""sessionId": "a2", "requests": 2, "costUsd": 0.0"#)
+        XCTAssertEqual(claudeAtZero.pricedCostUsd, 0.0)
+
+        // The live total reads the same figure: the unpriced session adds nothing to it.
+        XCTAssertEqual(
+            Fleet(accounts: [], sessions: [unpriced, claude], sessionsSupported: true)
+                .sessionsLiveCost, 1.2)
+        XCTAssertNil(
+            Fleet(accounts: [], sessions: [unpriced], sessionsSupported: true).sessionsLiveCost)
+    }
+
+    /// The warm-up rule was measured on Claude Code's cache-warming stubs. A one-shot
+    /// `codex exec` has the same shape, one request and no tool call, and must stay a row.
+    func testACodexSessionIsNeverAWarmup() throws {
+        let claude = try decoded(#""sessionId": "a1", "requests": 1"#)
+        XCTAssertTrue(SessionWarmup.isWarmup(joined(claude), now: now))
+
+        let codex = try decoded(#""sessionId": "c1", "provider": "codex", "requests": 1"#)
+        XCTAssertFalse(SessionWarmup.isWarmup(joined(codex), now: now))
+    }
+
+    /// The fold takes the two Claude stubs and sums only their priced spend; the Codex session
+    /// of the same shape stays a row.
+    func testTheFoldSumsPricedSpendOnly() throws {
+        let sessions = [
+            try decoded(#""sessionId": "a1", "requests": 1, "costUsd": 0.5"#),
+            try decoded(#""sessionId": "a2", "requests": 1, "costUsd": 0.25"#),
+            try decoded(
+                #""sessionId": "c1", "provider": "codex", "requests": 1, "unpricedRequests": 1, "costUsd": 0.0"#
+            ),
+        ]
+        let fold = SessionsFold(sessions.map(joined), now: now)
+        XCTAssertEqual(fold.warmups.map(\.id), ["a1", "a2"])
+        XCTAssertEqual(fold.foldLabel, "2 warm-ups · " + QuotaFormat.usd(0.75))
+        XCTAssertEqual(fold.visible.map(\.id), ["c1"])
+    }
 }

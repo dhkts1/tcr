@@ -18,18 +18,19 @@ use clap::{Parser, Subcommand};
 
 use tcr::cli::{self, validate_group_label_chars, PriorityArg};
 use tcr::config::{self, Config, ConfigError};
+use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use tcr::peer;
-use tcr::proxy::GROUP_HEADER_NAME;
+use tcr::proxy::{self, GROUP_HEADER_NAME};
 use tcr::{
-    affinity, build_info, config_keys, demo, mint, mitm, oauth, server, singleton, status, tui,
-    update,
+    affinity, build_info, codex_route, config_keys, demo, mint, mitm, oauth, server, singleton,
+    status, tui, update,
 };
 
 #[derive(Parser)]
 #[command(
     name = "tcr",
     version,
-    about = "Lean single-user rotating Anthropic proxy with a live TUI",
+    about = "Lean single-user rotating proxy for Claude and Codex (ChatGPT) accounts, with a live TUI",
     // Let `tcr [flags]` (no subcommand) behave as the default server run, while
     // `tcr server [flags]` is the explicit form. The two cannot be mixed.
     args_conflicts_with_subcommands = true
@@ -45,13 +46,15 @@ struct Cli {
 enum Command {
     /// Run the proxy server (the default when no subcommand is given).
     Server(ServerArgs),
-    /// Run Claude Code through the proxy (launches it directly if we're not up).
+    /// Run Claude Code, or `codex` with `--codex`, through the proxy (launches it
+    /// directly if we're not up).
     Run(RunArgs),
-    /// Authenticate a Claude account via the browser and add it to the config.
+    /// Add an account: Claude through the browser, or Codex (ChatGPT) with
+    /// --codex or --from-codex.
     Login(LoginArgs),
-    /// Mint a long-lived (365-day) token for an existing account, or every
-    /// account in a group, and put the result on the clipboard. Nothing is
-    /// stored — export only.
+    /// Mint a long-lived (365-day) token for an existing Claude account, or
+    /// every Claude account in a group, and put the result on the clipboard.
+    /// Nothing is stored — export only (Claude accounts only).
     Mint(MintArgs),
     /// List the configured accounts (offline; `--probe` refreshes live quota).
     Accounts(AccountsArgs),
@@ -66,7 +69,8 @@ enum Command {
     Enable(EnableArgs),
     /// Disable an account (holds it out of rotation).
     Disable(DisableArgs),
-    /// Set, clear, or show the identity-bound control account.
+    /// Set, clear, or show the identity-bound control account (Claude accounts
+    /// only).
     Control(ControlArgs),
     /// Manage account group membership (`ls` / `add` / `rm`).
     Group(GroupArgs),
@@ -82,7 +86,7 @@ enum Command {
     /// one-liners in the docs). Sessions get their own object-shaped verb
     /// rather than a flag that changes `status`'s top-level type.
     Sessions(SessionsArgs),
-    /// Print every account as claude-swap's `list --json` document, for
+    /// Print every Claude account as claude-swap's `list --json` document, for
     /// CodexBar. JSON only: `tcr status` is the view for a person.
     ///
     /// Its own verb for the same reason as `sessions`: the document is an
@@ -99,8 +103,9 @@ enum Command {
     /// Open TcrBar, the macOS menu-bar app (macOS only).
     Ui,
     /// Say whether Claude Code is actually reaching this proxy, and which file
-    /// decides that. Exits 0 when it is, 2 when another base URL owns the
-    /// route, 3 when the route points here and no proxy answers.
+    /// decides that; and whether codex is pooled, when the fleet holds a Codex
+    /// account or with --codex. Exits 0 when it is, 2 when another base URL
+    /// owns the route, 3 when the route points here and no proxy answers.
     Doctor(DoctorArgs),
     /// Send the `claude` command through tcr: from your shell (`setup shell`),
     /// or on every launch (`setup claude-settings`). Each refuses rather than
@@ -231,6 +236,7 @@ mod peer_cli {
         Name(PeerNameArgs),
         /// Let trusted Macs serve requests with this Mac's accounts, which
         /// means they read those requests, prompts included.
+        /// Codex requests always leave from this Mac: no Mac lends, serves or carries them in this version.
         Share(PeerSwitchArgs),
         /// Trust a Mac interactively: both screens show six digits, you
         /// compare them, you confirm on both.
@@ -253,8 +259,10 @@ mod peer_cli {
         /// Grant or revoke one thing for one peer.
         Allow(PeerAllowArgs),
         /// Set what one peer may borrow on one window, or take it away.
+        /// Codex requests always leave from this Mac: no Mac lends, serves or carries them in this version.
         Lend(PeerLendArgs),
         /// Choose how this Mac reaches the internet.
+        /// Codex requests always leave from this Mac: no Mac lends, serves or carries them in this version.
         Via(PeerViaArgs),
         /// Turn this Mac's dead drop on or off: leaving a friend that has also
         /// moved this Mac's current address on an HTTPS surface you own, and
@@ -295,6 +303,7 @@ mod peer_cli {
         Internet(PeerInternetArgs),
         /// Set where one account's requests leave from, and what an exit
         /// this Mac cannot reach costs.
+        /// Codex accounts always leave from this Mac.
         Account(PeerAccountArgs),
         /// Ask the RUNNING proxy what it holds for each pinned Mac.
         Status(PeerStatusArgs),
@@ -690,11 +699,14 @@ mod peer_cli {
         /// neighbours; the panel decodes both.
         #[arg(long)]
         pub json: bool,
-        /// Path to the main config, read
-        /// for the ACCOUNT LABELS the `lentTo` block is keyed by. Nothing else
-        /// is taken from it, and a config that is missing or unreadable leaves
-        /// `lentTo` empty rather than failing the listing: the peers half of
-        /// this output does not depend on it.
+        /// Path to the main config. The
+        /// `--json` form reads it for the ACCOUNT LABELS the `lentTo` block is
+        /// keyed by, each account's exit lock (`exits`) and the expiry a
+        /// handed-over key ends at (`handedKeyUntil`); the text form reads it
+        /// for the Codex exit pins it lists. A config that is missing or
+        /// unreadable reads as one with no accounts, so `lentTo` and `exits`
+        /// are empty and no pins are listed, rather than failing the listing:
+        /// the peers half of this output does not depend on it.
         #[arg(long)]
         pub config: Option<PathBuf>,
     }
@@ -731,6 +743,11 @@ mod peer_cli {
         /// shows.
         #[arg(long, default_value = "all")]
         pub scope: String,
+        /// Path to the main config. Read only when `--scope account:` names accounts, to
+        /// refuse a label that is a Codex account's; a config that is missing
+        /// or unreadable skips that check.
+        #[arg(long)]
+        pub config: Option<PathBuf>,
     }
 
     /// The wire's three windows, as an operator types them.
@@ -806,8 +823,10 @@ mod peer_cli {
         /// disclosure decision than the one the operator took.
         #[arg(long, value_enum)]
         pub mode: Option<PeerLendMode>,
-        /// Path to the main config. Read only by `--mode hand`, to refuse a grant every
-        /// account in its scope is strictly pinned away from.
+        /// Path to the main config. Read by `--mode hand`, to refuse a grant every account
+        /// in its scope is strictly pinned away from, and when `--scope
+        /// account:` names accounts, to refuse a label that is a Codex
+        /// account's.
         #[arg(long)]
         pub config: Option<PathBuf>,
         /// Lend for a duration (`2h`, `90m`, `3d`), after which this Mac stops
@@ -1208,6 +1227,9 @@ struct GroupReserveArgs {
     config: Option<PathBuf>,
     /// The group label to reserve.
     group: String,
+    /// Reserve the group even though it holds Codex accounts, which then serve nothing while it stays reserved.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args)]
@@ -1293,9 +1315,10 @@ struct StatusArgs {
     check: bool,
 }
 
-/// `tcr doctor [--json]`: the route check. Same two options every read-only
-/// verb here takes, and no third: the question it answers is about THIS
-/// machine's configuration, so there is nothing to select.
+/// `tcr doctor [--json] [--codex]`: the route check. The same two options every
+/// read-only verb here takes, plus `--codex`, which narrows the question to
+/// codex's route: the question it answers is about THIS machine's
+/// configuration, so there is nothing to select.
 #[derive(clap::Args)]
 struct DoctorArgs {
     /// Path to the config file.
@@ -1304,6 +1327,9 @@ struct DoctorArgs {
     /// Emit one JSON object instead of greppable `key: value` lines.
     #[arg(long)]
     json: bool,
+    /// Report only whether codex is pooled, and exit with that verdict's code.
+    #[arg(long)]
+    codex: bool,
 }
 
 /// `tcr list --json`: the same two options as `status`, and `--json` is the
@@ -1397,13 +1423,41 @@ struct LoginArgs {
     /// the explicit redo (after `tcr remove`, or onto a second config).
     #[arg(long, conflicts_with = "token")]
     from_claude_code: bool,
+    /// Import the login the `codex` CLI already holds (`$CODEX_HOME/auth.json`,
+    /// default `~/.codex/auth.json`; `TCR_CODEX_AUTH` names a file to read
+    /// instead) as a Codex account — no value here. The account is named by the
+    /// login's email, or `<email>/codex` when another account holds that name.
+    /// With `--account`, the login must be that account or nothing is written;
+    /// it takes the row name `tcr accounts` prints, or the login's email.
+    /// Refreshed tokens are written back to auth.json only while its refresh
+    /// token still matches the one tcr loaded. Newer tokens for the same ChatGPT account
+    /// are adopted; a changed login is left untouched. A second account: `mkdir -p <dir>` and
+    /// `CODEX_HOME=<dir> codex login`, then this with `--codex-home <dir>`.
+    #[arg(long, conflicts_with_all = ["token", "from_claude_code"])]
+    from_codex: bool,
+    /// Sign in a Codex (ChatGPT) account with a login of tcr's own: tcr runs `codex login` in a
+    /// throwaway folder, imports it, and deletes the folder, so the codex CLI's own login is not
+    /// touched. With --account, the login must be that row's user and workspace, or nothing is
+    /// written.
+    #[arg(long, conflicts_with_all = ["token", "from_claude_code", "from_codex"])]
+    codex: bool,
+    /// Read `<DIR>/auth.json` instead of `$CODEX_HOME` / `~/.codex` (for a second login made
+    /// with `mkdir -p <DIR>` and `CODEX_HOME=<DIR> codex login`).
+    #[arg(long, requires = "from_codex", value_name = "DIR")]
+    codex_home: Option<PathBuf>,
     /// Drive the login from another program instead of a terminal: stdin is
-    /// never read, the browser is never opened here, and progress goes to
-    /// stdout as one JSON object per line — `{"event":"browser","url":…}`,
-    /// `{"event":"waiting"}`, `{"event":"saved","account":…}`,
-    /// `{"event":"error","reason":…}`. The caller opens the URL; the loopback
-    /// callback is then the only way the login can complete, and the same
-    /// 2-minute timeout exits non-zero with the reason on one stderr line.
+    /// never read, and progress goes to stdout as one JSON object per line —
+    /// `{"event":"browser","url":…}`, `{"event":"waiting"}`,
+    /// `{"event":"notice","text":…}`, `{"event":"saved","account":…}`,
+    /// `{"event":"error","reason":…}`; a Codex account's `saved` adds
+    /// `provider` and, when known, `plan`, and a refusal a caller can name adds
+    /// `code`. tcr's own browser flow never opens the browser here: the caller
+    /// opens the URL, the loopback callback is then the only way the login can
+    /// complete, and the same 2-minute timeout exits non-zero with the reason
+    /// on one stderr line. Under `--codex`, `codex login` opens the browser
+    /// itself, so its `browser` line carries `"opened":true` and the caller
+    /// opens nothing; `--codex` has no timeout, and waits until the sign-in
+    /// ends or the caller sends SIGTERM, which also stops `codex login`.
     /// Refuses to combine with `--token`, which reads the credential from
     /// stdin: that is the one input this mode has no way to supply.
     #[arg(long, conflicts_with = "token")]
@@ -1444,9 +1498,14 @@ struct RunArgs {
     /// session is already pinned to. Set `groupSettings.<group>.spillToPool:
     /// true` in the config to let it fall back to the whole pool instead (a
     /// reserved group stays strict either way).
+    /// Claude sessions only; a Codex session cannot ask for a group.
     #[arg(long)]
     group: Option<String>,
-    /// Args passed verbatim to `claude` (e.g. `tcr run -- -p "hi"`).
+    /// Launch `codex` instead of `claude`, routed through the proxy's Codex accounts.
+    #[arg(long)]
+    codex: bool,
+    /// Args passed verbatim to `claude`, or to `codex` with `--codex` (e.g. `tcr run -- -p "hi"`,
+    /// or `tcr run --codex -- exec "hi"`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -1553,7 +1612,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli(effective_argv(std::env::args_os().collect()));
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,
-        Some(Command::Run(args)) => run_claude(args),
+        Some(Command::Run(args)) => run_harness(args).await,
         Some(Command::Login(args)) => run_login(args).await,
         Some(Command::Mint(args)) => run_mint(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
@@ -1770,6 +1829,72 @@ fn peer_ls_handed_key_until(
 /// with `local`, for the reason the `lentTo` map gives: the panel hides the
 /// line when there is nothing to say, and a map of every account saying
 /// "local" is a list the reader has to filter before it means anything.
+/// `tcr peer lend` and `tcr peer share on`: refuse a scope that names a Codex
+/// account, before anything is written.
+///
+/// Codex accounts stay on this Mac: no lease draws on one
+/// (`Manager::lend_candidates` skips them), so a grant scoped to one would
+/// advertise a capability that is not there. A row is named when a scope label
+/// equals `sanitize_label` of its name, the match the serve path's
+/// `scope_restriction` makes for an `account:` scope. Only such a scope names
+/// rows, so nothing is read for `all` or `group:`. A config that is missing or
+/// unreadable skips the check, as `tcr peer ls` treats one, rather than failing
+/// a verb about the peers file. The refusal is
+/// [`tcr::provider_guard::provider_guard`]'s, in the words every
+/// Claude-only refusal uses.
+fn refuse_a_lend_scope_naming_codex(
+    scope: &tcr_peer_wire::LendScope,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let tcr_peer_wire::LendScope::Accounts(labels) = scope else {
+        return Ok(());
+    };
+    let path = config_path.map_or_else(config::default_path, Path::to_path_buf);
+    let Ok(main) = config::load(&path) else {
+        return Ok(());
+    };
+    for account in &main.accounts {
+        let named =
+            tcr_peer_wire::sanitize_label(&account.name).is_ok_and(|label| labels.contains(&label));
+        if named {
+            tcr::provider_guard::provider_guard(account, tcr::provider_guard::ClaudeOnlyVerb::Lend)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(())
+}
+
+/// The text form of `tcr peer ls`: one line per Codex account whose exit lock
+/// names a peer, saying what that pin really does.
+///
+/// A Codex request always leaves from this Mac, because no Mac carries one in
+/// this version, and `tcr peer account` no longer writes such a pin. One written
+/// before it refused can still be on the row, though, and it does one of two
+/// things. A pin that is not strict is inert: the exit path warns and sends the
+/// request from here. A strict one is not inert at all: the exit path refuses
+/// every request routed to the account (`src/peer/egress.rs`, its Codex arm),
+/// so its line says so and names the command that clears it.
+///
+/// A Claude account's pin is a real one and is not listed here, and nothing is
+/// listed for a Codex account left on `local`. `--json` is unchanged: its
+/// `exits` map already carries every pin.
+fn peer_ls_inert_exit_lines(accounts: &[config::Account]) -> Vec<String> {
+    accounts
+        .iter()
+        .filter(|account| account.provider == tcr::provider::Provider::Codex)
+        .filter_map(|account| {
+            let pin = account.egress_pin();
+            let peer = pin.egress.peer()?;
+            let why = if pin.strict {
+                tcr::provider_guard::refused_exit_suffix(&account.name)
+            } else {
+                tcr::provider_guard::INERT_EXIT_SUFFIX.to_string()
+            };
+            Some(format!("{}  exits={}{why}", account.name, peer.display()))
+        })
+        .collect()
+}
+
 fn peer_ls_exits(
     accounts: &[config::Account],
     peers: &[tcr::peer::config::PeerRow],
@@ -1963,6 +2088,27 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             let state_path = peer_state_path(&peers_path);
             let state = peer::state::load(&state_path, peer::pair::now_ms())?;
 
+            // The main config, read once for both forms: the JSON form keys its
+            // `lentTo` block by account label and reads each account's exit
+            // lock, and the text form lists the Codex exit pins.
+            //
+            // A missing or unreadable config is an EMPTY list and not a
+            // failure: `tcr peer ls` is about the peers file, and an operator
+            // running it on a Mac with no accounts configured still wants the
+            // pinned rows.
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_accounts: Vec<config::Account> = match config::load(&config_path) {
+                Ok(config) => config.accounts,
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        path = %config_path.display(),
+                        "peer ls: no account labels to key `lentTo` by"
+                    );
+                    Vec::new()
+                }
+            };
+
             if a.json {
                 // The clock the two derived keys are answered against, taken
                 // ONCE for the whole listing: two rows read a second apart
@@ -2006,30 +2152,16 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 // is what the panel matches its account card against; `lent_to`
                 // keys the map on it and sanitizes it itself for the scope
                 // match, so an `account:<label>` scope still reaches exactly
-                // the accounts a `--scope` could name and nothing else.
-                //
-                // A missing or unreadable config is an EMPTY map and not a
-                // failure: `tcr peer ls` is about the peers file, and an
-                // operator running it on a Mac with no accounts configured
-                // still wants the pinned rows.
-                let config_path = a.config.unwrap_or_else(config::default_path);
-                let config_accounts: Vec<config::Account> = match config::load(&config_path) {
-                    Ok(config) => config.accounts,
-                    Err(err) => {
-                        tracing::debug!(
-                            error = %err,
-                            path = %config_path.display(),
-                            "peer ls: no account labels to key `lentTo` by"
-                        );
-                        Vec::new()
-                    }
-                };
-                let accounts: Vec<(String, Vec<String>)> = config_accounts
+                // the accounts a `--scope` could name and nothing else. The
+                // provider rides along so `lent_to` can leave a Codex account
+                // out: no lease draws on one.
+                let accounts: Vec<(String, Vec<String>, tcr::provider::Provider)> = config_accounts
                     .iter()
                     .map(|account| {
                         (
                             account.name.clone(),
                             account.groups.clone().unwrap_or_default(),
+                            account.provider,
                         )
                     })
                     .collect();
@@ -2122,6 +2254,12 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         found.address, name
                     );
                 }
+                // A Codex account's exit pin, after the rows and before the
+                // summary. Only a fleet holding a Codex account with a pin that
+                // names a peer prints one, so every other listing is unchanged.
+                for line in peer_ls_inert_exit_lines(&config_accounts) {
+                    println!("{line}");
+                }
                 // Greppable, `key: value`-shaped, and printed even at zero:
                 // "pending=0" is a fact an operator can act on and a missing
                 // line is one they have to go and check. `found=` and
@@ -2212,6 +2350,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         );
                         return Ok(());
                     }
+                    // A scope that names a Codex account is refused here, before
+                    // anything is written, as `peer lend` refuses it. The zero
+                    // fraction above stays allowed, so an old grant that names
+                    // one can still be removed.
+                    refuse_a_lend_scope_naming_codex(&scope, a.config.as_deref())?;
                     // AN END THAT HAS ALREADY PASSED IS REFUSED, BEFORE
                     // ANYTHING IS WRITTEN. This verb keeps the end, the mode
                     // and the schedule an operator set per peer, which is
@@ -3011,6 +3154,15 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     until.map_or("none".to_string(), |at| at.to_string())
                 );
                 return Ok(());
+            }
+
+            // A SCOPE THAT NAMES A CODEX ACCOUNT IS REFUSED, before anything is
+            // written: no lease draws on one (`refuse_a_lend_scope_naming_codex`).
+            // A zero fraction is a removal and stays allowed, as --list,
+            // --revoke and --relend above do, so an old lease that names one can
+            // still be cleared.
+            if a.fraction > 0.0 {
+                refuse_a_lend_scope_naming_codex(&scope, a.config.as_deref())?;
             }
 
             // A HAND grant is refused when every account it could draw on is
@@ -5268,6 +5420,7 @@ mod peer_grant_tests {
                 ttl: 600,
                 max_inflight: 2,
                 scope: "all".to_string(),
+                config: None,
             }),
         })
         .await
@@ -5295,6 +5448,7 @@ mod peer_grant_tests {
                 ttl: 600,
                 max_inflight: 2,
                 scope: "all".to_string(),
+                config: None,
             }),
         })
         .await
@@ -5354,6 +5508,7 @@ mod peer_grant_tests {
                 ttl: 600,
                 max_inflight: 2,
                 scope: "all".to_string(),
+                config: None,
             }),
         };
         let refusal = run_peer(share_on(peers_path.clone()))
@@ -5785,7 +5940,7 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         }
         GroupAction::Reserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::reserve_group(&config_path, &a.group)
+            cli::reserve_group_with(&config_path, &a.group, a.force)
         }
         GroupAction::Unreserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
@@ -5830,7 +5985,9 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tcr doctor [--json]`: whether Claude Code is routed to this proxy.
+/// `tcr doctor [--json] [--codex]`: whether Claude Code is routed to this
+/// proxy, and whether codex is pooled when the fleet holds a Codex account or
+/// `--codex` asks.
 ///
 /// The exit code is the point of the verb (a script asks `tcr doctor >/dev/null
 /// || …`), so it is carried out of [`cli::doctor`] and spent here rather than
@@ -5925,7 +6082,7 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
 
 async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    let code = cli::doctor(&config_path, args.json).await?;
+    let code = cli::doctor(&config_path, args.json, args.codex).await?;
     if code != 0 {
         std::process::exit(code);
     }
@@ -6106,12 +6263,12 @@ const TCR_CLAUDE_BIN_ENV: &str = "TCR_CLAUDE_BIN";
 /// See [`TCR_CLAUDE_BIN_ENV`].
 const CLAUDE_BIN_ENV: &str = "CLAUDE_BIN";
 
-/// Resolves which `claude` binary to launch, through the ordered pair of env
-/// keys documented at [`TCR_CLAUDE_BIN_ENV`]. Named generally — "harness",
-/// not "claude" — because a second external harness binary will need this
-/// exact resolution order later; that second binary is not built here, but
-/// the helper already takes its own key names and default so adding it is a
-/// new pair of constants and a one-line call, not a rewrite of this function.
+/// Resolves which harness binary to launch, through an ordered pair of env
+/// keys: the pair documented at [`TCR_CLAUDE_BIN_ENV`] for `claude`. Named
+/// generally — "harness", not "claude" — because it was written for any
+/// harness; today it serves `claude` only. `codex` is found by
+/// `codex_local::find_codex`, the one rule `tcr run --codex`, `tcr login
+/// --codex` and the doctor share, which also searches past `PATH`.
 fn resolve_harness_bin(specific_key: &str, legacy_key: &str, default: &str) -> String {
     resolve_harness_bin_from(
         std::env::var(specific_key).ok(),
@@ -6149,15 +6306,63 @@ fn claude_command() -> std::process::Command {
     std::process::Command::new(claude_bin())
 }
 
-/// `tcr run [-- args…]` — launch Claude Code already pointed at this proxy.
+/// A fresh [`std::process::Command`] for the `codex` binary `tcr run --codex` launches:
+/// [`claude_command`]'s twin, resolved by `codex_local::find_codex`, the rule `tcr login
+/// --codex` and the doctor use too. `TCR_CODEX_BIN`, then `CODEX_BIN`, always decide when set;
+/// otherwise `PATH`, TcrBar's directories and npm's global prefix. A miss is the search's own
+/// sentence, so nothing has been printed or read yet when it bails. The child keeps the shell's
+/// `PATH` as it is: every command the agent runs inherits that `PATH`, so tcr must not reorder
+/// it.
+fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
+    let codex =
+        tcr::codex_local::find_codex().map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
+    Ok((std::process::Command::new(&codex.path), codex.path))
+}
+
+/// `tcr run [--codex] [-- args…]` — launch Claude Code, or `codex` with
+/// `--codex`, already pointed at this proxy.
 ///
 /// Mirrors the JS `teamclaude run` passthrough contract: if the proxy is not
 /// listening we launch `claude` untouched, so a stopped proxy never breaks the
 /// shell alias.
-fn run_claude(args: RunArgs) -> anyhow::Result<()> {
+///
+/// `codex` is routed in see-through mode or not at all: tcr has no base-URL
+/// route for `codex` yet, so a launch this function does not route through the
+/// pool is announced on stderr with the reason, never a silent bypass. Which of
+/// the two it gets is the RUNNING proxy's answer — see [`codex_launch`].
+async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let (config, _) = load_config(&config_path)?;
     let port = config.proxy.port;
+
+    // Ahead of everything below that can spawn a process, `claude --version` included.
+    refuse_group_with_codex(&args)?;
+    if args.codex {
+        let (mut cmd, codex) = codex_command()?;
+        mark_run_active(&mut cmd);
+        // ONE read of the running proxy answers both "is it listening" and "does
+        // it intercept chatgpt.com", so the two cannot disagree. The CA is named,
+        // never loaded: loading it here could re-mint a leaf the proxy never reads.
+        let live = cli::fetch_live_status(&config).await;
+        let ca = mitm::minted_ca_path();
+        let launch = codex_launch(&args, port, &live, &ca, ca.is_file(), &|var| {
+            std::env::var(var).ok()
+        })?;
+        // Pooled, but the pool may have no account free: say so before the banner, from the
+        // same read, so a session that will be refused is not a surprise.
+        if let (CodexLaunch::SeeThrough { .. }, Ok(payload)) = (&launch, &live) {
+            if let Some(line) = codex_pool_preflight(payload, time::OffsetDateTime::now_utc()) {
+                eprintln!("{line}");
+            }
+        }
+        apply_codex_launch(&mut cmd, port, &launch);
+        // Generated shell-tool defaults precede explicit caller overrides.
+        cmd.args(&args.args);
+        let status = cmd
+            .status()
+            .with_context(|| format!("failed to launch `{}`", codex.display()))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     // `--group`: validate the name and the claude version BEFORE spawning
     // anything, in this order — a. name, b. version — so a typo or too-old
@@ -6206,6 +6411,16 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
     }
 
     if cli::proxy_is_up(port) {
+        // A config that holds Codex accounts and no Claude one may be a proxy that refuses this
+        // whole session: read its accounts, once, only then. A Claude-only or mixed config pays
+        // no read and prints nothing new.
+        if holds_only_codex(&config) {
+            if let Ok(payload) = cli::fetch_live_status(&config).await {
+                if let Some(warning) = no_claude_account_warning(port, &payload) {
+                    eprintln!("{warning}");
+                }
+            }
+        }
         if let Some(notice) = withheld_api_key_notice(
             config.proxy.api_key.is_some(),
             std::env::var_os("ANTHROPIC_API_KEY").is_some(),
@@ -6228,6 +6443,329 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `--group` is a Claude Code mechanism (`ANTHROPIC_CUSTOM_HEADERS`); Codex has no custom-header
+/// env, so until the `[model_providers]` route lands this is refused rather than silently
+/// routing the session to the whole Codex pool.
+fn refuse_group_with_codex(args: &RunArgs) -> anyhow::Result<()> {
+    if args.codex && args.group.is_some() {
+        anyhow::bail!("--group is not supported with --codex yet; run without --group");
+    }
+    Ok(())
+}
+
+/// How `tcr run --codex` launches `codex`: [`codex_launch`]'s decision, which
+/// [`apply_codex_launch`] carries out.
+#[derive(Debug, PartialEq, Eq)]
+enum CodexLaunch {
+    /// Pooled: see-through via this tcr, trusting `ca` for the leaf it presents.
+    SeeThrough {
+        ca: PathBuf,
+        /// The inherited `NO_PROXY` spellings that exempt `chatgpt.com`, and
+        /// what codex gets instead ([`no_proxy_rewrites`]).
+        no_proxy: Vec<NoProxyRewrite>,
+    },
+    /// Not pooled: `codex` goes direct, and the notice says why.
+    Direct {
+        /// The reason, as the notice words it.
+        reason: String,
+        /// Inherited proxy variables that point at this tcr, removed from
+        /// codex's environment ([`proxy_vars_at`]).
+        unset: Vec<&'static str>,
+    },
+}
+
+impl CodexLaunch {
+    /// The `[tcr]` lines this launch prints, besides the see-through banner
+    /// [`apply_codex_see_through_env`] prints itself.
+    fn notices(&self, port: u16) -> Vec<String> {
+        match self {
+            Self::SeeThrough { no_proxy, .. } => no_proxy
+                .iter()
+                .map(|rewrite| {
+                    format!(
+                        "[tcr] dropped {} from {} for codex: {} {} from the proxy, and the \
+                         session would bypass tcr",
+                        rewrite.dropped.join(", "),
+                        rewrite.var,
+                        if rewrite.dropped.len() == 1 {
+                            "it exempts"
+                        } else {
+                            "they exempt"
+                        },
+                        mitm_codex_host(),
+                    )
+                })
+                .collect(),
+            Self::Direct { reason, unset } => {
+                let mut lines = vec![format!(
+                    "[tcr] launching codex directly (not pooled): {reason}"
+                )];
+                if !unset.is_empty() {
+                    lines.push(format!(
+                        "[tcr] removed {} from codex's environment: {} at tcr on :{port}, which \
+                         this launch bypasses",
+                        unset.join(", "),
+                        if unset.len() == 1 {
+                            "it points"
+                        } else {
+                            "they point"
+                        },
+                    ));
+                }
+                lines
+            }
+        }
+    }
+}
+
+/// Decide how `tcr run --codex` launches `codex`. Read-only: caller CA bundles are
+/// checked for tcr's certificate, and nothing here mints or writes a certificate.
+///
+/// # The running proxy decides
+///
+/// The proxy loads its MITM leaf once, at boot, and nothing reloads it. This
+/// used to be decided by a load in THIS process instead (`mitm::load_tls`),
+/// which re-mints a stale leaf on disk and reports coverage the running proxy
+/// does not have. So with an older proxy running, or a current one whose TLS
+/// load failed at boot, it printed the see-through banner over a session
+/// whose `chatgpt.com` traffic the proxy blind-tunnelled: silently un-pooled.
+/// The inputs are now the running proxy's own account (`status`, one read of
+/// its status endpoint), whether tcr's CA is on disk at `ca`, and the
+/// inherited environment (`inherited`).
+///
+/// # Rows
+///
+/// * `--group` is refused before anything launches (`refuse_group_with_codex`).
+/// * Pooled exactly when [`codex_route::codex_route`] says so: the proxy
+///   reports a tcr-minted leaf that intercepts `chatgpt.com`, lists a Codex
+///   account (in any state, as the proxy counts them), and its CA is on disk.
+///   `tcr status` words the same decision, so the two never disagree.
+/// * Direct otherwise, with the route's reason. Only a proxy that predates the
+///   status key is told to restart: a JS leaf, or MITM off, survives any
+///   restart.
+///
+/// Every direct launch also drops the inherited proxy variables that point at
+/// this tcr ([`proxy_vars_at`]), so a tcr that is down, or not intercepting,
+/// cannot capture the launch that goes around it. A dead tcr behind an
+/// exported `HTTPS_PROXY` refuses the connection instead.
+fn codex_launch(
+    args: &RunArgs,
+    port: u16,
+    status: &Result<status::StatusPayload, cli::LiveStatusError>,
+    ca: &Path,
+    ca_is_file: bool,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<CodexLaunch> {
+    refuse_group_with_codex(args)?;
+    let route = codex_route::codex_route(
+        status.as_ref(),
+        port,
+        ca,
+        ca_is_file,
+        status
+            .as_ref()
+            .map_or(0, codex_route::listed_codex_accounts),
+    );
+    if route.pooled {
+        let trusted_ca = match codex_route::codex_ca_for_launch(ca, inherited) {
+            Ok(bundle) => bundle,
+            Err(reason) => {
+                return Ok(CodexLaunch::Direct {
+                    reason,
+                    unset: proxy_vars_at(port, inherited),
+                })
+            }
+        };
+        return Ok(CodexLaunch::SeeThrough {
+            ca: trusted_ca,
+            no_proxy: no_proxy_rewrites(mitm_codex_host(), inherited),
+        });
+    }
+    Ok(CodexLaunch::Direct {
+        reason: route.reason.unwrap_or_default(),
+        unset: proxy_vars_at(port, inherited),
+    })
+}
+
+/// The line `tcr run --codex` prints before its banner when the running proxy pools codex but
+/// no Codex account in its pool can serve right now: why each is out, worded as tcr's own 429
+/// lists its gates but in Codex words ([`proxy::describe_codex_gates`]), and when the first one
+/// frees ([`proxy::at_utc`]), or that none reports when. `None` when a Codex account is in
+/// rotation, or when the pool holds none (the launch already said so).
+///
+/// A row held by an upstream hold or 403 that carries ChatGPT's own refusal
+/// (`limitReachedType`) is counted as refused by ChatGPT: the refusal outlasts the hold, and is
+/// why the account stays out.
+fn codex_pool_preflight(
+    payload: &status::StatusPayload,
+    now: time::OffsetDateTime,
+) -> Option<String> {
+    use tcr::stats::GateReason;
+    let codex: Vec<&status::AccountStatus> = payload
+        .accounts
+        .iter()
+        .filter(|row| row.provider == tcr::provider::Provider::Codex)
+        .collect();
+    if codex.is_empty() || codex.iter().any(|row| row.gate == GateReason::Ok) {
+        return None;
+    }
+    let mut tally: std::collections::BTreeMap<GateReason, usize> =
+        std::collections::BTreeMap::new();
+    for row in &codex {
+        let gate = match row.gate {
+            GateReason::Hold | GateReason::Refused if row.limit_reached_type.is_some() => {
+                GateReason::Rejected
+            }
+            gate => gate,
+        };
+        *tally.entry(gate).or_default() += 1;
+    }
+    let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+    let soonest = codex
+        .iter()
+        .filter_map(|row| row.free_at_ms)
+        .filter(|&at_ms| at_ms > now_ms)
+        .min()
+        .and_then(|at_ms| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000).ok()
+        });
+    let tail = match soonest {
+        Some(at) => format!("the soonest frees at {}", proxy::at_utc(at, now)),
+        None => "none reports when it frees".to_string(),
+    };
+    Some(format!(
+        "[tcr] no Codex account can serve right now{} — {tail}",
+        proxy::describe_codex_gates(&tally)
+    ))
+}
+
+/// Does `config` hold a Codex account and no Claude account, in any state? Only then does
+/// `tcr run` ask the running proxy whether it holds a Claude account.
+fn holds_only_codex(config: &Config) -> bool {
+    let holds = |provider| config.accounts.iter().any(|a| a.provider == provider);
+    holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)
+}
+
+/// The warning `tcr run` prints for a claude session when the running proxy on `port` holds
+/// Codex accounts and no Claude account: every request this session sends will be refused.
+/// `None` when the proxy lists any Claude account, or no account at all.
+fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Option<String> {
+    let holds = |provider| payload.accounts.iter().any(|row| row.provider == provider);
+    (holds(tcr::provider::Provider::Codex) && !holds(tcr::provider::Provider::Anthropic)).then(
+        || {
+            format!(
+                "[tcr] warning: the proxy on :{port} holds no Claude account, so it will refuse \
+             every request from this session — add one with `tcr login`"
+            )
+        },
+    )
+}
+
+/// Carry out [`codex_launch`]'s decision on `cmd`, and print its notices.
+fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &CodexLaunch) {
+    match launch {
+        CodexLaunch::SeeThrough { ca, no_proxy } => {
+            apply_codex_see_through_env(
+                cmd,
+                port,
+                ca,
+                std::env::var_os("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
+            );
+            apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
+            // This affects shell-like tools, not Codex's own HTTP/WebSocket clients.
+            // Scalar overrides preserve the caller's other policy entries and filters.
+            for var in ["HTTPS_PROXY", "https_proxy"] {
+                cmd.arg("-c").arg(format!(
+                    "shell_environment_policy.set.{var}=\"http://127.0.0.1:{port}\""
+                ));
+            }
+            eprintln!("[tcr] shell tools use an unmarked proxy and keep their own ChatGPT login. Other helpers can inherit Codex's marker; use unmarked HTTPS_PROXY and https_proxy for those commands.");
+            for rewrite in no_proxy {
+                cmd.env(rewrite.var, &rewrite.kept);
+            }
+        }
+        CodexLaunch::Direct { unset, .. } => {
+            for var in unset {
+                cmd.env_remove(var);
+            }
+        }
+    }
+    for line in launch.notices(port) {
+        eprintln!("{line}");
+    }
+}
+
+/// Every spelling of a proxy variable `codex`'s HTTP stack reads for an
+/// `https://` request: `HTTPS_PROXY` first, then `ALL_PROXY`, either case. The
+/// `HTTP_PROXY` pair is not consulted for `https://`, but a codex child process
+/// may read it, and it is just as stale when it names this tcr.
+const CODEX_PROXY_VARS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// The inherited [`CODEX_PROXY_VARS`] that point at THIS tcr ([`points_at_tcr`]),
+/// and so must not reach a `codex` launched around it.
+///
+/// Only those, never all six: a corporate egress proxy, or a loopback px or
+/// cntlm on another port, may be how this machine reaches the internet at all.
+/// Removing it would turn an un-pooled launch that works into one that fails.
+fn proxy_vars_at(port: u16, inherited: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    CODEX_PROXY_VARS
+        .into_iter()
+        .filter(|var| inherited(var).is_some_and(|value| points_at_tcr(&value, port)))
+        .collect()
+}
+
+/// One inherited `NO_PROXY` spelling, rewritten for a see-through launch.
+#[derive(Debug, PartialEq, Eq)]
+struct NoProxyRewrite {
+    var: &'static str,
+    /// What codex gets: the inherited entries minus [`Self::dropped`], in
+    /// their order. Empty when nothing else was listed; see
+    /// [`no_proxy_rewrites`] for why the variable stays set then.
+    kept: String,
+    /// The entries that exempted the host, trimmed.
+    dropped: Vec<String>,
+}
+
+/// Each inherited `NO_PROXY`/`no_proxy`, without the entries that exempt
+/// `host`, for the ones that had any.
+///
+/// Such an entry (`chatgpt.com`, `.com`, `*`) sends codex around the proxy,
+/// so the session is un-pooled while the see-through banner says otherwise.
+/// The user asked for a pooled session, so those entries are dropped, and
+/// said so, rather than the launch going direct; every other entry keeps
+/// exempting what it did. A variable left empty stays SET, as `""`: codex
+/// reads the first of the two spellings that is set, so unsetting one would
+/// hand that choice to the other.
+fn no_proxy_rewrites(
+    host: &str,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> Vec<NoProxyRewrite> {
+    ["NO_PROXY", "no_proxy"]
+        .into_iter()
+        .filter_map(|var| {
+            let value = inherited(var)?;
+            let (dropped, kept): (Vec<&str>, Vec<&str>) = value
+                .split(',')
+                .partition(|entry| no_proxy_entry_exempts(entry, host));
+            (!dropped.is_empty()).then(|| NoProxyRewrite {
+                var,
+                kept: kept.join(","),
+                dropped: dropped
+                    .iter()
+                    .map(|entry| entry.trim().to_string())
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// The oldest Claude Code that forwards `ANTHROPIC_CUSTOM_HEADERS` as a real
@@ -6270,6 +6808,16 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
     configured.dedup();
 
     if configured.contains(&group) {
+        // The session this launches is a Claude session, and only a Claude
+        // account can serve one: a group whose every member is a Codex account
+        // would route it nowhere. Only a fleet holding a Codex account can have
+        // such a group, since a label exists only while some account carries it.
+        let has_claude = config.accounts.iter().any(|account| {
+            account.provider == tcr::provider::Provider::Anthropic && account.in_group(group)
+        });
+        if !has_claude {
+            anyhow::bail!("{}", tcr::provider_guard::group_has_no_claude(group));
+        }
         return Ok(());
     }
     if configured.is_empty() {
@@ -6400,14 +6948,17 @@ fn mark_run_active(cmd: &mut std::process::Command) {
 /// look exactly like a working see-through session while the capabilities it
 /// exists to preserve stay off.
 ///
-/// See-through needs BOTH halves of the MITM contract: the proxy must be able to
-/// present a leaf for `api.anthropic.com` (so `mitm::load_tls` has to succeed)
-/// AND we must be able to name the CA that signed it (so `claude` can be told to
-/// trust it). `load_tls` is the same loader the server ran at boot against the
-/// same dir, so it resolves to the same material rather than a second opinion.
+/// Read only material already on disk. The server owns certificate creation and
+/// migration at startup; a client must never replace the CA while that server still
+/// presents the leaf it loaded at boot. Missing or unusable material selects base-URL mode.
 fn see_through_ca() -> Option<PathBuf> {
-    match mitm::load_tls() {
-        Ok(assets) => match assets.ca_path {
+    let ca = mitm::minted_ca_path();
+    see_through_ca_in(ca.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn see_through_ca_in(dir: &Path) -> Option<PathBuf> {
+    match mitm::existing_ca_path_in(dir) {
+        Ok(ca_path) => match ca_path {
             Some(ca) if ca.is_file() => Some(ca),
             // A path we cannot read is not a CA we can hand to claude.
             Some(ca) => {
@@ -6466,6 +7017,9 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
 /// The proxy vars are set in BOTH cases deliberately: clients disagree about
 /// which spelling they read, and one that reads only the one we skipped would go
 /// direct — bypassing rotation entirely, silently.
+///
+/// A nested codex inherits an unmarked proxy and keeps its own login, so it
+/// never needs tcr's CA. Preserve its inherited CA settings unchanged.
 fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
     let proxy = format!("http://127.0.0.1:{port}");
     cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
@@ -6478,10 +7032,79 @@ fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) 
     eprintln!(
         "[tcr] see-through mode: claude keeps https://api.anthropic.com, tunnelling via {proxy}"
     );
-    eprintln!(
+    eprintln!("{}", see_through_ca_notice(ca));
+}
+
+/// The CA a see-through Claude session trusts; Codex's trust settings are untouched.
+fn see_through_ca_notice(ca: &Path) -> String {
+    format!(
         "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
         ca.display()
+    )
+}
+
+/// SEE-THROUGH mode for `codex`, the only mode tcr routes it in. `codex` keeps
+/// its own backend URL, the real `https://chatgpt.com` for a login served there,
+/// and reaches it through us as a CONNECT proxy; while the pool holds a Codex
+/// account the proxy URL's `tcr-codex` marker opts its CONNECT into interception, and
+/// `CODEX_CA_CERTIFICATE` is what makes `codex` trust that leaf. A login whose
+/// workspace is routed elsewhere (FedRAMP, data residency) is never pooled: tcr
+/// blind-tunnels another origin, and relays a request that names its routing on
+/// the client's own credential. Both proxy spellings for the reason
+/// [`apply_see_through_env`] gives. Nothing of Claude's is set here: no
+/// `ANTHROPIC_BASE_URL`, no `NODE_EXTRA_CA_CERTS`, no capability defaults. A
+/// pooled launch adds `NODE_EXTRA_CA_CERTS` on its own, for a `claude` the
+/// session starts ([`apply_nested_claude_ca`]).
+fn apply_codex_see_through_env(
+    cmd: &mut std::process::Command,
+    port: u16,
+    ca: &Path,
+    caller_ca_exported: bool,
+) {
+    let proxy = format!(
+        "http://{}@127.0.0.1:{port}",
+        tcr::mitm::CODEX_PROXY_USERNAME
     );
+    cmd.env("HTTPS_PROXY", &proxy);
+    cmd.env("https_proxy", &proxy);
+    // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
+    // NODE_EXTRA_CA_CERTS means nothing to it.
+    if !caller_ca_exported {
+        cmd.env("CODEX_CA_CERTIFICATE", ca);
+    }
+    eprintln!(
+        "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {proxy}; a \
+         FedRAMP or residency-routed login runs on its own credential, unpooled"
+    );
+    if caller_ca_exported {
+        eprintln!("[tcr] keeping the caller's CODEX_CA_CERTIFICATE; its CA bundle must include tcr's CA for pooled TLS");
+    } else {
+        eprintln!(
+            "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
+            ca.display()
+        );
+    }
+}
+
+/// Let a `claude` started inside a pooled codex session trust tcr's leaf: set
+/// `NODE_EXTRA_CA_CERTS` to tcr's CA on the codex child, unless the caller
+/// exported one (`caller_exported`), which the child then inherits untouched.
+///
+/// The codex child carries `HTTPS_PROXY` aimed at tcr, and so does everything it
+/// starts. A `claude` among them meets tcr's leaf for `api.anthropic.com`, and
+/// node trusts that leaf only through this variable; without it the nested
+/// session fails TLS. codex itself reads only `CODEX_CA_CERTIFICATE`, so this
+/// changes nothing for codex. Silent, as the rest of the launch's defaults are.
+fn apply_nested_claude_ca(cmd: &mut std::process::Command, ca: &Path, caller_exported: bool) {
+    if !caller_exported {
+        cmd.env("NODE_EXTRA_CA_CERTS", ca);
+    }
+}
+
+/// The host the MITM leaf must cover for `tcr run --codex` to route `codex`
+/// through the pool.
+fn mitm_codex_host() -> &'static str {
+    tcr::provider::CODEX_HOST
 }
 
 /// BASE-URL mode — the fallback, used when see-through material is unavailable.
@@ -6549,17 +7172,47 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 /// config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let ui = if args.non_interactive {
+        oauth::LoginUi::Machine
+    } else {
+        oauth::LoginUi::Terminal
+    };
     if args.from_claude_code {
-        let name = oauth::login_from_claude_code(
+        let result = oauth::login_from_claude_code(
             &config_path,
             args.force,
             args.name.as_deref(),
             args.account.as_deref(),
+            ui,
         )
         .await
-        .context("importing the Claude Code login failed")?;
-        println!("Logged in as '{name}'.");
-        return Ok(());
+        .context("importing the Claude Code login failed");
+        return finish_login(result, args.non_interactive);
+    }
+    if args.from_codex {
+        let result = oauth::login_from_codex(
+            &config_path,
+            args.force,
+            args.name.as_deref(),
+            args.account.as_deref(),
+            args.codex_home.as_deref(),
+            ui,
+        )
+        .await
+        .context("importing the Codex login failed");
+        return finish_login(result, args.non_interactive);
+    }
+    if args.codex {
+        let result = tcr::codex_cli_login::login(
+            &config_path,
+            args.force,
+            args.account.as_deref(),
+            args.name.as_deref(),
+            ui,
+        )
+        .await
+        .context("the Codex sign-in failed");
+        return finish_login(result, args.non_interactive);
     }
     if args.token {
         let name = oauth::login_with_token(
@@ -6573,11 +7226,6 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         println!("Logged in as '{name}'.");
         return Ok(());
     }
-    let ui = if args.non_interactive {
-        oauth::LoginUi::Machine
-    } else {
-        oauth::LoginUi::Terminal
-    };
     let result = oauth::login(
         &config_path,
         args.force,
@@ -6587,27 +7235,34 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     )
     .await
     .context("OAuth login failed");
-    let name = match result {
-        Ok(name) => name,
-        // A machine caller gets the failure the same way it got every other
-        // step — one JSON line on stdout — and the human-readable half on one
-        // stderr line rather than as anyhow's indented multi-line chain,
-        // which a GUI would have to render as a wall of text. Exits here
-        // rather than returning the error, because `main`'s reporter would
-        // print that chain on top of what was just said.
-        Err(error) if args.non_interactive => {
-            let reason = oauth::one_line_reason(&error);
-            println!("{}", oauth::LoginEvent::Error { reason: &reason }.line());
+    finish_login(result, args.non_interactive)
+}
+
+/// How every login ends: `Logged in as` in the terminal, nothing more in the machine form
+/// (whose stream already said it as `{"event":"saved",…}`).
+///
+/// A machine caller gets a failure the same way it got every other step — one JSON line on
+/// stdout, coded when it is a refusal a GUI titles by its code (`oauth::machine_error_line`) —
+/// and the human-readable half on one stderr line rather than as anyhow's indented multi-line
+/// chain, which a GUI would have to render as a wall of text. It exits here rather than
+/// returning the error, because `main`'s reporter would print that chain on top of what was
+/// just said.
+fn finish_login(result: anyhow::Result<String>, non_interactive: bool) -> anyhow::Result<()> {
+    match result {
+        Ok(name) => {
+            if !non_interactive {
+                println!("Logged in as '{name}'.");
+            }
+            Ok(())
+        }
+        Err(error) if non_interactive => {
+            let (line, reason) = oauth::machine_error_line(&error);
+            println!("{line}");
             eprintln!("{reason}");
             std::process::exit(1);
         }
-        Err(error) => return Err(error),
-    };
-    // The machine stream already said this, as `{"event":"saved",…}`.
-    if !args.non_interactive {
-        println!("Logged in as '{name}'.");
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 /// `tcr mint --account <name> | --group <name>` — mint a long-lived token for
@@ -7268,6 +7923,7 @@ mod tests {
     use super::*;
     use build_info::StandDownBuild;
     use std::os::unix::fs::PermissionsExt as _;
+    use tcr::codex_route::no_codex_account_reason;
 
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
@@ -7348,6 +8004,33 @@ mod tests {
         );
     }
 
+    /// A nested Codex keeps its own login through the unmarked proxy, and keeps
+    /// whichever CA bundle it inherited rather than replacing it with tcr's.
+    #[test]
+    fn claude_see_through_env_preserves_a_nested_codex_ca_choice() {
+        let mut cmd = std::process::Command::new("true");
+        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"));
+        let set = |name: &str| {
+            cmd.get_envs()
+                .find_map(|(k, v)| (k == name).then(|| v.map(|v| v.to_string_lossy().into_owned())))
+        };
+        assert_eq!(
+            set("CODEX_CA_CERTIFICATE"),
+            None,
+            "an unmarked nested codex never meets our leaf and keeps its own CA choice"
+        );
+        assert_eq!(
+            set("NODE_EXTRA_CA_CERTS"),
+            Some(Some("/tmp/ca.pem".to_string())),
+            "the same CA claude trusts"
+        );
+        assert_eq!(
+            set("HTTPS_PROXY"),
+            Some(Some("http://127.0.0.1:3999".to_string())),
+            "the proxy a nested codex inherits"
+        );
+    }
+
     /// Neither routing mode may hand `claude` an `ANTHROPIC_API_KEY`.
     #[test]
     fn no_routing_mode_gives_claude_an_api_key() {
@@ -7372,6 +8055,55 @@ mod tests {
                  login and disables every claude.ai connector"
             );
         }
+    }
+
+    /// `codex`'s see-through env: both proxy spellings, because a client that reads only the
+    /// one we skipped would go direct and bypass the pool in silence, and the CA in the one
+    /// variable Codex reads it from. Nothing of Claude's: `NODE_EXTRA_CA_CERTS` means nothing to
+    /// `codex`, and `ANTHROPIC_BASE_URL` has no business in its environment.
+    #[test]
+    fn codex_see_through_env_sets_proxy_and_ca_and_nothing_anthropic() {
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_see_through_env(&mut cmd, 3999, std::path::Path::new("/tmp/ca.pem"), false);
+        let env: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://tcr-codex@127.0.0.1:3999")
+        );
+        assert_eq!(
+            env.get("https_proxy").map(String::as_str),
+            Some("http://tcr-codex@127.0.0.1:3999")
+        );
+        assert_eq!(
+            env.get("CODEX_CA_CERTIFICATE").map(String::as_str),
+            Some("/tmp/ca.pem")
+        );
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!env.contains_key("NODE_EXTRA_CA_CERTS"));
+    }
+
+    #[test]
+    fn codex_see_through_env_respects_the_callers_ca() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("CODEX_CA_CERTIFICATE", "/tmp/corporate-ca.pem");
+        apply_codex_see_through_env(&mut cmd, 3999, Path::new("/tmp/tcr-ca.pem"), true);
+        assert_eq!(
+            cmd.get_envs().find_map(|(key, value)| {
+                (key == "CODEX_CA_CERTIFICATE").then_some(value.unwrap())
+            }),
+            Some(std::ffi::OsStr::new("/tmp/corporate-ca.pem")),
+            "an explicit caller CA must not be replaced"
+        );
     }
 
     /// The re-entry marker must reach the child, and must not be named such that
@@ -7693,6 +8425,779 @@ mod tests {
         }
     }
 
+    /// `--from-codex` is a third credential from a third place; asking for it
+    /// with either of the other two is a contradiction clap must reject by name,
+    /// exactly as it rejects `--token` with `--from-claude-code`.
+    #[test]
+    fn from_codex_with_token_or_from_claude_code_is_a_usage_error() {
+        for other in ["--token", "--from-claude-code"] {
+            let Err(err) = Cli::try_parse_from(["tcr", "login", "--from-codex", other]) else {
+                panic!("--from-codex with {other} must not parse");
+            };
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "it must fail as a conflict, not as some other parse error: {err}"
+            );
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("--from-codex") && rendered.contains(other),
+                "the message must name BOTH flags so the operator knows what to remove: {rendered}"
+            );
+        }
+    }
+
+    /// `--codex-home` means something only to the Codex import. Accepted alone,
+    /// every other login would ignore it in silence, so clap refuses it.
+    #[test]
+    fn codex_home_without_from_codex_is_a_usage_error() {
+        let Err(err) = Cli::try_parse_from(["tcr", "login", "--codex-home", "/tmp/x"]) else {
+            panic!("--codex-home without --from-codex must not parse");
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "it must fail as the missing --from-codex: {err}"
+        );
+    }
+
+    #[test]
+    fn from_codex_parses_alone_and_with_codex_home_name_and_account() {
+        for args in [
+            vec!["tcr", "login", "--from-codex"],
+            vec![
+                "tcr",
+                "login",
+                "--from-codex",
+                "--codex-home",
+                "/tmp/x",
+                "--name",
+                "alice",
+            ],
+            vec![
+                "tcr",
+                "login",
+                "--from-codex",
+                "--account",
+                "alice@example.com",
+            ],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+        }
+    }
+
+    /// The [`RunArgs`] of a parsed `tcr run …`. `let … else` rather than a match arm that
+    /// formats the other variant: neither `Cli` nor `Command` implements Debug.
+    fn run_args_of(cli: Cli) -> RunArgs {
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected the parsed command to be `tcr run`");
+        };
+        args
+    }
+
+    /// `--group` works by setting `ANTHROPIC_CUSTOM_HEADERS`, which Claude Code turns into a
+    /// request header and `codex` ignores, so with `--codex` the session would quietly route to
+    /// the whole Codex pool. clap accepts the pair; the launcher has to refuse it before
+    /// anything is spawned.
+    #[test]
+    fn run_codex_with_group_is_a_usage_error() {
+        let err =
+            Cli::try_parse_from(["tcr", "run", "--codex", "--group", "g", "--", "exec", "hi"]);
+        // Parsing succeeds (clap cannot know), but run_harness must refuse before launching:
+        let args = match err {
+            Ok(cli) => cli,
+            Err(e) => panic!("{e}"),
+        };
+        assert!(refuse_group_with_codex(&run_args_of(args)).is_err());
+    }
+
+    /// `tcr run --codex -- exec hi`, as the launch-decision tests run it.
+    const CODEX_RUN: &[&str] = &["tcr", "run", "--codex", "--", "exec", "hi"];
+
+    /// A parsed `tcr run …`'s [`RunArgs`].
+    fn run_args(argv: &[&str]) -> RunArgs {
+        run_args_of(
+            Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}")),
+        )
+    }
+
+    /// The running proxy's status as `cli::fetch_live_status` hands it over:
+    /// parsed from the wire, so the tri-state `mitm` key is read the way a real
+    /// answer is. `None` leaves the key out, as a server older than it does.
+    /// Its pool holds one Codex account, without which the proxy intercepts no
+    /// `chatgpt.com` tunnel at all.
+    fn live_status(
+        mitm: Option<serde_json::Value>,
+    ) -> Result<status::StatusPayload, cli::LiveStatusError> {
+        let mut wire = serde_json::json!({
+            "kind": status::STATUS_KIND,
+            "accounts": [{
+                "name": "bob@example.com/codex", "provider": "codex", "priority": 0,
+                "status": "active", "disabled": false, "requests": 0, "inputTokens": 0,
+                "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+                "probeStatus": "ok", "quotaState": "normal", "gate": "ok", "threshold": 0.9,
+            }],
+            "build": {"sha": "abc1234"},
+        });
+        if let Some(mitm) = mitm {
+            wire["mitm"] = mitm;
+        }
+        Ok(serde_json::from_value(wire).expect("a status payload"))
+    }
+
+    /// An inherited environment holding exactly `vars`.
+    fn inherited(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    /// What `cmd` will set (`Some`) or remove (`None`) in the child's environment.
+    fn env_changes(
+        cmd: &std::process::Command,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// One row of [`status_with_rows`]: a provider, a name, a gate, and optionally a `freeAtMs`
+    /// and a `limitReachedType`.
+    type WireRow<'a> = (&'a str, &'a str, &'a str, Option<i64>, Option<&'a str>);
+
+    /// A running proxy's status, parsed from the wire, holding `rows`.
+    fn status_with_rows(rows: &[WireRow]) -> status::StatusPayload {
+        let accounts: Vec<serde_json::Value> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (provider, name, gate, free_at_ms, limit_reached))| {
+                let mut row = serde_json::json!({
+                    "name": name, "priority": i, "status": "active",
+                    "disabled": *gate == "disabled", "requests": 0, "inputTokens": 0,
+                    "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+                    "probeStatus": "ok", "quotaState": "normal", "gate": gate, "threshold": 0.9,
+                });
+                if *provider == "codex" {
+                    row["provider"] = serde_json::json!("codex");
+                }
+                if let Some(at) = free_at_ms {
+                    row["freeAtMs"] = serde_json::json!(at);
+                }
+                if let Some(kind) = limit_reached {
+                    row["limitReachedType"] = serde_json::json!(kind);
+                }
+                row
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "kind": status::STATUS_KIND,
+            "accounts": accounts,
+            "build": {"sha": "abc1234"},
+        }))
+        .expect("a status payload")
+    }
+
+    /// 2026-10-14T00:00:00Z.
+    fn preflight_now() -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(1_791_936_000).expect("a valid instant")
+    }
+
+    /// **`tcr run --codex` says, before its banner, when no Codex account can serve**: why each
+    /// is out, as tcr's own 429 lists its gates but in Codex words, and when the first frees.
+    /// One Codex account in rotation, or none in the pool at all, says nothing.
+    #[test]
+    fn the_run_codex_preflight_names_the_gates_and_the_soonest_return() {
+        let payload = status_with_rows(&[
+            ("anthropic", "alice@example.com", "ok", None, None),
+            (
+                "codex",
+                "carol@example.com/codex",
+                "seven-day",
+                Some(1_792_072_800_000),
+                None,
+            ),
+            ("codex", "erin@example.com/codex", "login", None, None),
+        ]);
+        assert_eq!(
+            codex_pool_preflight(&payload, preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 in the weekly window, 1 needing \
+                 re-login — the soonest frees at 2026-10-15 14:00:00 UTC"
+            )
+        );
+
+        // An account held by an upstream 403 is out for a short hold, which is then the
+        // soonest return, under a day away, so the clock alone.
+        let payload = status_with_rows(&[
+            (
+                "codex",
+                "carol@example.com/codex",
+                "seven-day",
+                Some(1_792_072_800_000),
+                None,
+            ),
+            ("codex", "erin@example.com/codex", "login", None, None),
+            (
+                "codex",
+                "frank@example.com/codex",
+                "refused",
+                Some(1_791_936_090_000),
+                None,
+            ),
+        ]);
+        assert_eq!(
+            codex_pool_preflight(&payload, preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 refused upstream (403), 1 in the \
+                 weekly window, 1 needing re-login — the soonest frees at 00:01:30 UTC"
+            )
+        );
+
+        let serving = status_with_rows(&[
+            (
+                "codex",
+                "carol@example.com/codex",
+                "seven-day",
+                Some(1_792_072_800_000),
+                None,
+            ),
+            ("codex", "dana@example.com/codex", "ok", None, None),
+        ]);
+        assert_eq!(codex_pool_preflight(&serving, preflight_now()), None);
+        let claude_only =
+            status_with_rows(&[("anthropic", "alice@example.com", "login", None, None)]);
+        assert_eq!(codex_pool_preflight(&claude_only, preflight_now()), None);
+    }
+
+    /// When no Codex account reports when it frees, the line says so rather than naming a time.
+    /// An account whose hold sits over ChatGPT's own refusal is counted as refused by ChatGPT:
+    /// the refusal outlasts the hold, and is why it stays out.
+    ///
+    /// Watched red: with a disabled row counted as able to serve, this pool says nothing.
+    #[test]
+    fn the_run_codex_preflight_says_none_reports_when_it_frees() {
+        let mut rows = vec![
+            ("codex", "erin@example.com/codex", "login", None, None),
+            ("codex", "gil@example.com/codex", "disabled", None, None),
+        ];
+        assert_eq!(
+            codex_pool_preflight(&status_with_rows(&rows), preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 needing re-login, 1 disabled — \
+                 none reports when it frees"
+            )
+        );
+        rows.push((
+            "codex",
+            "hal@example.com/codex",
+            "hold",
+            None,
+            Some("rate_limit_reached"),
+        ));
+        assert_eq!(
+            codex_pool_preflight(&status_with_rows(&rows), preflight_now()).as_deref(),
+            Some(
+                "[tcr] no Codex account can serve right now: 1 needing re-login, 1 refused by \
+                 ChatGPT, 1 disabled — none reports when it frees"
+            )
+        );
+    }
+
+    /// **`tcr run` warns a Claude session that the running proxy holds no Claude account**, and
+    /// so will refuse every request it sends. Any Claude account, or an empty pool, says
+    /// nothing.
+    #[test]
+    fn run_warns_when_the_proxy_holds_no_claude_account() {
+        let codex_only = status_with_rows(&[
+            ("codex", "bob@example.com/codex", "ok", None, None),
+            ("codex", "dana@example.com/codex", "disabled", None, None),
+        ]);
+        assert_eq!(
+            no_claude_account_warning(3999, &codex_only).as_deref(),
+            Some(
+                "[tcr] warning: the proxy on :3999 holds no Claude account, so it will refuse \
+                 every request from this session — add one with `tcr login`"
+            )
+        );
+        let mixed = status_with_rows(&[
+            ("anthropic", "alice@example.com", "disabled", None, None),
+            ("codex", "bob@example.com/codex", "ok", None, None),
+        ]);
+        assert_eq!(no_claude_account_warning(3999, &mixed), None);
+        assert_eq!(
+            no_claude_account_warning(3999, &status_with_rows(&[])),
+            None
+        );
+    }
+
+    /// Every row of `tcr run --codex`'s launch decision ([`codex_launch`]): the
+    /// launch it picks, and the exact notice it prints. Each row inherits an
+    /// `HTTPS_PROXY` aimed at this tcr, so every direct row must drop it, the
+    /// "not listening" one included: a dead tcr behind that variable refuses the
+    /// connection rather than launching anything.
+    ///
+    /// Only the "key absent" row may tell the user to restart. A JS leaf and MITM
+    /// off both survive any restart, and saying otherwise sends the user to pay a
+    /// cold prompt cache for nothing.
+    ///
+    /// Mismatches are collected rather than asserted one at a time, so a
+    /// regression names every row it breaks.
+    #[test]
+    fn codex_launch_follows_what_the_running_proxy_reports() {
+        const PORT: u16 = 3999;
+        const AT_TCR: &[(&str, &str)] = &[("HTTPS_PROXY", "http://127.0.0.1:3999")];
+        let ca = Path::new("/tmp/tcr-run-test/tcr-ca.pem");
+        let pooling = || {
+            live_status(Some(serde_json::json!({
+                "interceptedHosts": ["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+                "leaf": "minted",
+            })))
+        };
+        let direct = |reason: &str| {
+            Ok((
+                CodexLaunch::Direct {
+                    reason: reason.to_string(),
+                    unset: vec!["HTTPS_PROXY"],
+                },
+                vec![
+                    format!("[tcr] launching codex directly (not pooled): {reason}"),
+                    "[tcr] removed HTTPS_PROXY from codex's environment: it points at tcr on \
+                     :3999, which this launch bypasses"
+                        .to_string(),
+                ],
+            ))
+        };
+        // (label, argv, the status read, whether the CA is on disk, the launch and
+        // notices wanted — or the refusal's text).
+        type Live = Result<status::StatusPayload, cli::LiveStatusError>;
+        type Want = Result<(CodexLaunch, Vec<String>), &'static str>;
+        let rows: Vec<(&str, &[&str], Live, bool, Want)> = vec![
+            (
+                "--group is refused before anything launches",
+                &["tcr", "run", "--codex", "--group", "g", "--", "exec", "hi"],
+                pooling(),
+                true,
+                Err("--group is not supported with --codex"),
+            ),
+            (
+                "not listening",
+                CODEX_RUN,
+                Err(cli::LiveStatusError::NoServer),
+                true,
+                direct("no proxy answered on 127.0.0.1:3999"),
+            ),
+            (
+                "no answer",
+                CODEX_RUN,
+                Err(cli::LiveStatusError::NoAnswer(
+                    "the server did not answer within 5s".to_string(),
+                )),
+                true,
+                direct(
+                    "could not read the running proxy's status (the server did not answer \
+                     within 5s)",
+                ),
+            ),
+            (
+                "an answer that is not a usable status",
+                CODEX_RUN,
+                Err(cli::LiveStatusError::Unusable(
+                    "HTTP 401 Unauthorized — the proxy api-key in the config was rejected"
+                        .to_string(),
+                )),
+                true,
+                direct(
+                    "could not read the running proxy's status (HTTP 401 Unauthorized — the \
+                     proxy api-key in the config was rejected)",
+                ),
+            ),
+            (
+                "key absent: a proxy older than the key",
+                CODEX_RUN,
+                live_status(None),
+                true,
+                direct(
+                    "the proxy on :3999 (build abc1234) predates Codex interception — restart \
+                     it on this build at a quiet moment",
+                ),
+            ),
+            (
+                "the JS leaf",
+                CODEX_RUN,
+                live_status(Some(serde_json::json!({
+                    "interceptedHosts": ["api.anthropic.com"],
+                    "leaf": "js",
+                }))),
+                true,
+                direct(&format!(
+                    "the proxy on :3999 is serving the JS {} leaf, which covers \
+                     api.anthropic.com only and is never re-minted — a restart will not change \
+                     this; see docs/troubleshooting.md",
+                    tcr::legacy_names::JS_PROXY_BIN
+                )),
+            ),
+            (
+                "MITM off",
+                CODEX_RUN,
+                live_status(Some(
+                    serde_json::json!({"interceptedHosts": [], "leaf": "none"}),
+                )),
+                true,
+                direct(
+                    "the proxy on :3999 is running without MITM: its TLS material failed to \
+                     load at boot — see its log",
+                ),
+            ),
+            (
+                "pooled",
+                CODEX_RUN,
+                pooling(),
+                true,
+                Ok((
+                    CodexLaunch::SeeThrough {
+                        ca: ca.to_path_buf(),
+                        no_proxy: Vec::new(),
+                    },
+                    Vec::new(),
+                )),
+            ),
+            (
+                "chatgpt.com intercepted, but no CA on disk",
+                CODEX_RUN,
+                pooling(),
+                false,
+                direct("no readable CA at /tmp/tcr-run-test/tcr-ca.pem"),
+            ),
+            (
+                "a leaf that covers chatgpt.com, but no Codex account in the pool",
+                CODEX_RUN,
+                pooling().map(|mut payload| {
+                    payload
+                        .accounts
+                        .retain(|row| row.provider != tcr::provider::Provider::Codex);
+                    payload
+                }),
+                true,
+                direct(
+                    "the proxy on :3999 holds no Codex account, so it blind-tunnels chatgpt.com \
+                     and codex keeps its own login — add one with `tcr login --codex`",
+                ),
+            ),
+            (
+                "a minted leaf that does not cover chatgpt.com",
+                CODEX_RUN,
+                live_status(Some(serde_json::json!({
+                    "interceptedHosts": ["api.anthropic.com", "platform.claude.com"],
+                    "leaf": "minted",
+                }))),
+                true,
+                direct(
+                    "the proxy on :3999 serves a leaf it minted but does not intercept \
+                     chatgpt.com (it intercepts [api.anthropic.com, platform.claude.com])",
+                ),
+            ),
+            (
+                "a leaf this build does not know, whose CA it cannot name",
+                CODEX_RUN,
+                live_status(Some(serde_json::json!({
+                    "interceptedHosts": ["chatgpt.com"],
+                    "leaf": "future",
+                }))),
+                true,
+                direct(
+                    "the proxy on :3999 (build abc1234) reports a leaf this build does not know \
+                     (\"future\") — run tcr run --codex from the same build as the proxy",
+                ),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, argv, live, ca_is_file, want) in rows {
+            let got = codex_launch(
+                &run_args(argv),
+                PORT,
+                &live,
+                ca,
+                ca_is_file,
+                &inherited(AT_TCR),
+            )
+            .map(|launch| {
+                let notices = launch.notices(PORT);
+                (launch, notices)
+            })
+            .map_err(|err| err.to_string());
+            let right = match (&got, &want) {
+                (Ok(got), Ok(want)) => got == want,
+                (Err(got), Err(want)) => got.contains(want),
+                _ => false,
+            };
+            if !right {
+                wrong.push(format!("{label}:\n  got  {got:?}\n  want {want:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} row(s) wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_codex_launch_keeps_a_corporate_ca_and_runs_direct_when_tcr_is_absent() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ca = scratch.path().join("tcr.pem");
+        let corporate = scratch.path().join("corporate.pem");
+        std::fs::write(&ca, "tcr certificate fixture").unwrap();
+        std::fs::write(&corporate, "different corporate certificate fixture").unwrap();
+        let live = live_status(Some(
+            serde_json::json!({"interceptedHosts": ["chatgpt.com"], "leaf": "minted"}),
+        ));
+        for variable in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
+            let corporate = corporate.to_str().unwrap();
+            let launch = codex_launch(
+                &run_args(CODEX_RUN),
+                3999,
+                &live,
+                &ca,
+                true,
+                &inherited(&[
+                    ("HTTPS_PROXY", "http://127.0.0.1:3999"),
+                    (variable, corporate),
+                ]),
+            )
+            .unwrap();
+            let CodexLaunch::Direct { reason, unset } = launch else {
+                panic!(
+                    "pooling without trust in both CAs must not break a working corporate setup"
+                );
+            };
+            assert!(reason.contains(variable));
+            assert_eq!(unset, ["HTTPS_PROXY"]);
+        }
+    }
+
+    #[test]
+    fn a_pooled_codex_launch_uses_the_callers_complete_ssl_bundle() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ca = scratch.path().join("tcr.pem");
+        let bundle = scratch.path().join("bundle.pem");
+        let generated = rcgen::generate_simple_self_signed(vec!["example.test".into()]).unwrap();
+        let pem = generated.cert.pem();
+        std::fs::write(&ca, &pem).unwrap();
+        std::fs::write(&bundle, format!("# caller bundle\n{pem}")).unwrap();
+        let live = live_status(Some(
+            serde_json::json!({"interceptedHosts": ["chatgpt.com"], "leaf": "minted"}),
+        ));
+        let launch = codex_launch(
+            &run_args(CODEX_RUN),
+            3999,
+            &live,
+            &ca,
+            true,
+            &inherited(&[("SSL_CERT_FILE", bundle.to_str().unwrap())]),
+        )
+        .unwrap();
+        assert!(
+            matches!(launch, CodexLaunch::SeeThrough {ca, ..} if ca == bundle),
+            "setting CODEX_CA_CERTIFICATE must retain the caller's complete bundle"
+        );
+    }
+
+    /// A direct launch drops only the proxy variables that point at THIS tcr
+    /// (loopback host, the configured port, scheme optional) and keeps every
+    /// other proxy: one on another port (a local px or cntlm) or on another host
+    /// (a corporate egress) may be how this machine reaches the internet at all,
+    /// and removing it would break a launch that only had to go un-pooled.
+    #[test]
+    fn a_direct_codex_launch_drops_only_the_proxy_variables_aimed_at_this_tcr() {
+        let env = inherited(&[
+            ("HTTPS_PROXY", "http://127.0.0.1:3999"),
+            ("https_proxy", "localhost:3999"),
+            ("HTTP_PROXY", "http://[::1]:3999/"),
+            ("http_proxy", "http://127.0.0.1:8080"),
+            ("ALL_PROXY", "http://proxy.corp.example:3999"),
+            ("all_proxy", "socks5://127.0.0.1:1080"),
+        ]);
+        let launch = codex_launch(
+            &run_args(CODEX_RUN),
+            3999,
+            &Err(cli::LiveStatusError::NoServer),
+            Path::new("/tmp/ca.pem"),
+            false,
+            &env,
+        )
+        .expect("a direct launch");
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(&mut cmd, 3999, &launch);
+        assert_eq!(
+            env_changes(&cmd),
+            [
+                ("HTTPS_PROXY".to_string(), None),
+                ("HTTP_PROXY".to_string(), None),
+                ("https_proxy".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+            "exactly the three aimed at tcr are removed, and nothing is set"
+        );
+        assert_eq!(
+            launch.notices(3999).get(1).map(String::as_str),
+            Some(
+                "[tcr] removed HTTPS_PROXY, https_proxy, HTTP_PROXY from codex's environment: \
+                 they point at tcr on :3999, which this launch bypasses"
+            )
+        );
+
+        for (value, aimed_at_tcr) in [
+            ("http://127.0.0.1:3999", true),
+            ("HTTP://LOCALHOST:3999/", true),
+            ("https://[::1]:3999", true),
+            ("127.0.0.1:3999", true),
+            (" http://127.0.0.1:3999 ", true),
+            ("socks5h://localhost:3999", true),
+            ("http://127.0.0.1", false),
+            ("http://127.0.0.1:39990", false),
+            ("http://127.0.0.2:3999", false),
+            ("http://proxy.corp.example:3999", false),
+            ("", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(points_at_tcr(value, 3999), aimed_at_tcr, "{value:?}");
+        }
+    }
+
+    /// A pooled launch drops only the `NO_PROXY` entries that would exempt chatgpt.com,
+    /// keeps the rest in order, keeps an emptied variable SET (codex reads the first
+    /// spelling that is set), and says what it dropped, so the banner it prints is true.
+    #[test]
+    fn a_pooled_codex_launch_drops_only_the_no_proxy_entries_that_exempt_chatgpt_com() {
+        let env = inherited(&[
+            ("NO_PROXY", "localhost,.chatgpt.com, 10.0.0.0/8"),
+            ("no_proxy", "*"),
+        ]);
+        let live = live_status(Some(serde_json::json!({
+            "interceptedHosts": ["chatgpt.com"],
+            "leaf": "minted",
+        })));
+        let launch = codex_launch(
+            &run_args(CODEX_RUN),
+            3999,
+            &live,
+            Path::new("/tmp/ca.pem"),
+            true,
+            &env,
+        )
+        .expect("a pooled launch");
+        assert_eq!(
+            launch,
+            CodexLaunch::SeeThrough {
+                ca: PathBuf::from("/tmp/ca.pem"),
+                no_proxy: vec![
+                    NoProxyRewrite {
+                        var: "NO_PROXY",
+                        kept: "localhost, 10.0.0.0/8".to_string(),
+                        dropped: vec![".chatgpt.com".to_string()],
+                    },
+                    NoProxyRewrite {
+                        var: "no_proxy",
+                        kept: String::new(),
+                        dropped: vec!["*".to_string()],
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            launch.notices(3999),
+            [
+                "[tcr] dropped .chatgpt.com from NO_PROXY for codex: it exempts chatgpt.com from \
+                 the proxy, and the session would bypass tcr",
+                "[tcr] dropped * from no_proxy for codex: it exempts chatgpt.com from the proxy, \
+                 and the session would bypass tcr",
+            ]
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(&mut cmd, 3999, &launch);
+        let env = env_changes(&cmd);
+        assert_eq!(
+            env.get("NO_PROXY"),
+            Some(&Some("localhost, 10.0.0.0/8".to_string()))
+        );
+        assert_eq!(
+            env.get("no_proxy"),
+            Some(&Some(String::new())),
+            "emptied, and still set"
+        );
+        assert_eq!(
+            env.get("HTTPS_PROXY"),
+            Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string()))
+        );
+        assert_eq!(
+            env.get("CODEX_CA_CERTIFICATE"),
+            Some(&Some("/tmp/ca.pem".to_string()))
+        );
+    }
+
+    /// [`no_proxy_entry_exempts`] against the matcher codex's HTTP stack runs:
+    /// hyper-util's, which reqwest builds its environment proxy from (reqwest
+    /// enables hyper-util's `client-proxy` feature for it; this tree and
+    /// `openai/codex` both lock hyper-util 0.1.20). An entry exempts chatgpt.com
+    /// exactly when that matcher sends `https://chatgpt.com/…` direct. The
+    /// expected column documents the rules; the matcher is the authority.
+    #[test]
+    fn no_proxy_matching_agrees_with_the_matcher_codex_uses() {
+        use hyper_util::client::proxy::matcher::Matcher;
+        let target: hyper::Uri = "https://chatgpt.com/backend-api/codex/responses"
+            .parse()
+            .expect("a uri");
+        let proxied = |no_proxy: &str| {
+            Matcher::builder()
+                .https("http://127.0.0.1:3999")
+                .no(no_proxy)
+                .build()
+                .intercept(&target)
+                .is_some()
+        };
+        assert!(
+            proxied(""),
+            "control: with no NO_PROXY the request is proxied"
+        );
+        for (entry, exempts) in [
+            ("chatgpt.com", true),
+            ("CHATGPT.COM", true),
+            (".chatgpt.com", true),
+            (" chatgpt.com ", true),
+            ("com", true),
+            (".com", true),
+            ("*", true),
+            ("api.chatgpt.com", false),
+            ("gpt.com", false),
+            ("chatgpt.com.example", false),
+            ("openai.com", false),
+            ("*.chatgpt.com", false),
+            (".", false),
+            ("", false),
+            ("10.0.0.0/8", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+        ] {
+            assert_eq!(
+                no_proxy_entry_exempts(entry, "chatgpt.com"),
+                exempts,
+                "{entry:?}"
+            );
+            assert_eq!(!proxied(entry), exempts, "the matcher on {entry:?}");
+        }
+    }
+
     /// Every `tcr` command the "proxy too old" warnings tell the user to run
     /// must be one this binary accepts. All four named a `restart` subcommand,
     /// which clap rejected with exit 2: the remedy in the warning was itself an
@@ -7715,6 +9220,360 @@ mod tests {
             if let Err(e) = Cli::try_parse_from(&argv) {
                 panic!("the warning tells the user to run `{command}`, which does not parse: {e}");
             }
+        }
+    }
+
+    /// Every `tcr` command a Codex login or launch tells someone to run parses: each production
+    /// string that names one in backticks is split on its backticks, and each span starting
+    /// `tcr ` goes through the real CLI parser, as does each command a refusal over a running
+    /// proxy echoes. A remedy naming a flag clap refuses sends its reader into a usage error.
+    ///
+    /// Watched red: one flag misspelled in one production string panics naming that span.
+    #[test]
+    fn codex_remedies_name_only_commands_that_parse() {
+        let workspace = oauth::codex_relogin_workspace_refusal(
+            Some("erin@example.com"),
+            "99999999-9999-4999-8999-999999999999",
+            Some("business"),
+            "work",
+            "88888888-8888-4888-8888-888888888888",
+            Some("pro"),
+        );
+        let strings = [
+            oauth::codex_account_login_refusal("bob@example.com/codex"),
+            oauth::claude_account_codex_login_refusal("alice@example.com"),
+            oauth::claude_account_codex_import_refusal("alice@example.com"),
+            oauth::codex_identity_refusal("carol@example.com", "erin@example.com/codex").reason,
+            workspace.reason,
+            no_codex_account_reason(3999, "chatgpt.com"),
+            oauth::NO_REFRESH_CODEX_MESSAGE.to_string(),
+            oauth::no_codex_login_message(Path::new("/Users/example/.codex/auth.json")),
+            tcr::codex_cli_login::codex_login_saved_line("bob@example.com", Some("ChatGPT Pro")),
+            oauth::CODEX_IMPORT_RUN_LINE.to_string(),
+            oauth::CODEX_FIRST_ACCOUNT_NOTICE.to_string(),
+        ];
+        let mut commands: Vec<String> = Vec::new();
+        for text in &strings {
+            let spans: Vec<&str> = text
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("tcr "))
+                .collect();
+            assert!(!spans.is_empty(), "names no tcr command: {text}");
+            commands.extend(spans.iter().map(|span| span.to_string()));
+        }
+        commands.extend(
+            [
+                oauth::LOGIN_COMMAND,
+                oauth::LOGIN_FROM_CODEX_COMMAND,
+                oauth::LOGIN_FROM_CLAUDE_CODE_COMMAND,
+                oauth::LOGIN_CODEX_COMMAND,
+            ]
+            .map(str::to_string),
+        );
+        for command in commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!(
+                    "a Codex remedy tells the user to run `{command}`, which does not parse: {e}"
+                );
+            }
+        }
+    }
+
+    /// The help says what `--non-interactive` does under `--codex`, where `codex login` opens
+    /// the browser itself and nothing times the sign-in out: the `browser` line's
+    /// `"opened":true` tells the caller to open nothing, and SIGTERM is how it ends an abandoned
+    /// sign-in. And `tcr peer ls --help` names the Codex exit pins its text form reads from the
+    /// config.
+    ///
+    /// Watched red: the old help says the caller opens the URL and the same 2-minute timeout
+    /// applies, and `peer ls` takes nothing from the config but the account labels.
+    #[test]
+    fn the_help_tells_the_truth_about_codex_logins_and_pins() {
+        use clap::CommandFactory as _;
+        let cli = Cli::command();
+        let help = |path: &[&str], id: &str| -> String {
+            let mut command = &cli;
+            for name in path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no {name} subcommand"));
+            }
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("no {id} argument"));
+            arg.get_long_help()
+                .or_else(|| arg.get_help())
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        let login = help(&["login"], "non_interactive");
+        for fact in [r#""opened":true"#, "`--codex` has no timeout", "SIGTERM"] {
+            assert!(
+                login.contains(fact),
+                "`tcr login --help` must say {fact}:\n{login}"
+            );
+        }
+        let import = help(&["login"], "from_codex");
+        for fact in ["auth.json", "only while", "same ChatGPT account"] {
+            assert!(import.contains(fact), "{import}");
+        }
+        assert!(!import.contains("asks you to log in again"), "{import}");
+        let ls = help(&["peer", "ls"], "config");
+        assert!(
+            ls.contains("Codex exit pins"),
+            "`tcr peer ls --help` must name the Codex exit pins it reads:\n{ls}"
+        );
+        assert!(!ls.contains("Nothing else is taken from it"), "{ls}");
+    }
+
+    /// Every command the `login` row of docs/troubleshooting.md's gate table tells a user to run
+    /// parses, and its `--from-codex` re-import names the folder to read: without
+    /// `--codex-home`, `--from-codex` reads `$CODEX_HOME` or `~/.codex`, never the folder the
+    /// row records, so an account imported from another folder would be refused.
+    ///
+    /// Watched red: the row said `tcr login --from-codex --account <name>` imports the login
+    /// again "from the folder it came from".
+    #[test]
+    fn the_troubleshooting_login_remedies_parse_and_name_the_folder() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/troubleshooting.md");
+        let doc =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+        let row = doc
+            .lines()
+            .find(|line| line.starts_with("| `login` |"))
+            .expect("docs/troubleshooting.md has a `login` row");
+        let commands: Vec<String> = row
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tcr "))
+            .map(|span| {
+                span.replace("<name>", "bob@example.com/codex")
+                    .replace("<folder>", "/Users/example/.codex-second")
+            })
+            .collect();
+        assert!(
+            commands.iter().any(|command| command.contains("--codex ")),
+            "positive control, the row's `--codex` remedy: {commands:?}"
+        );
+        for command in &commands {
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!(
+                    "the login row tells the user to run `{command}`, which does not parse: {e}"
+                );
+            }
+            if command.contains("--from-codex") {
+                assert!(
+                    command.contains("--codex-home "),
+                    "`{command}` reads `$CODEX_HOME` or ~/.codex, not the folder the row records"
+                );
+            }
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("--from-codex")),
+            "the row names no `--from-codex` re-import: {commands:?}"
+        );
+    }
+
+    /// The command `tcr doctor`'s pooled Codex verdict names parses, in the sentence for one
+    /// request and in the one for several.
+    #[test]
+    fn the_pooled_codex_verdict_names_a_command_that_parses() {
+        for requests in [1, 2] {
+            let verdict = tcr::doctor::CodexReport {
+                port: 3999,
+                rows: Vec::new(),
+                route: tcr_status_wire::CodexRoute {
+                    pooled: true,
+                    code: None,
+                    reason: None,
+                    upstream: None,
+                },
+                ca: PathBuf::from("/Users/example/.config/tcr-ca.pem"),
+                ca_readable: true,
+                upstream: "https://chatgpt.com".to_string(),
+                upstream_is_default: true,
+                bin: Ok((PathBuf::from("/opt/homebrew/bin/codex"), "PATH".to_string())),
+                env: tcr::doctor::CodexEnv::default(),
+                login: PathBuf::from("/Users/example/.codex/auth.json"),
+                login_exists: true,
+                requests_10m: Some(requests),
+                traffic: None,
+            }
+            .verdict();
+            let commands: Vec<&str> = verdict
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("tcr "))
+                .collect();
+            assert!(!commands.is_empty(), "names no tcr command: {verdict}");
+            for command in commands {
+                let argv: Vec<&str> = command.split_whitespace().collect();
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    panic!("the verdict names `{command}`, which does not parse: {e}");
+                }
+            }
+        }
+    }
+
+    /// `tcr login --help` carries `--codex` as a whole token, beside the tokens TcrBar already
+    /// probes for: `LoginCapability` decides between the in-app Codex sign-in and Terminal by
+    /// finding it, so a help that renamed it would silently send every Codex sign-in to
+    /// Terminal.
+    #[test]
+    fn login_help_lists_codex_as_a_whole_token() {
+        use clap::CommandFactory as _;
+        let mut cli = Cli::command();
+        let login = cli
+            .find_subcommand_mut("login")
+            .expect("tcr has a login subcommand");
+        let help = login.render_long_help().to_string();
+        for token in [
+            "--codex",
+            "--non-interactive",
+            "--from-codex",
+            "--codex-home",
+        ] {
+            assert!(
+                tcr::codex_local::help_has_whole_token(&help, token),
+                "`tcr login --help` must carry {token} as a whole token:\n{help}"
+            );
+        }
+    }
+
+    /// The `tcr group` argv TcrBar sends still parses, unchanged: the panel shells
+    /// out to these shapes and never passes `--force`, which is additive. A
+    /// reserve without it is not forced; with it, it is.
+    #[test]
+    fn the_group_argv_tcrbar_sends_is_unchanged() {
+        for argv in [
+            &["tcr", "group", "add", "orchard", "alice@example.com"][..],
+            &["tcr", "group", "rm", "orchard", "alice@example.com"],
+            &["tcr", "group", "rm", "orchard", "--all"],
+            &["tcr", "group", "park", "orchard"],
+            &["tcr", "group", "unpark", "orchard"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(argv) {
+                panic!("TcrBar sends {argv:?}, which no longer parses: {e}");
+            }
+        }
+
+        let reserve = |argv: &[&str]| -> GroupReserveArgs {
+            match Cli::try_parse_from(argv) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Group(GroupArgs {
+                            action: GroupAction::Reserve(args),
+                        })),
+                    ..
+                }) => args,
+                Ok(_) => panic!("{argv:?} parsed to something other than a reserve"),
+                Err(e) => panic!("{argv:?} does not parse: {e}"),
+            }
+        };
+        let plain = reserve(&["tcr", "group", "reserve", "orchard"]);
+        assert_eq!(plain.group, "orchard");
+        assert!(!plain.force, "TcrBar's reserve is never forced");
+        let forced = reserve(&["tcr", "group", "reserve", "orchard", "--force"]);
+        assert_eq!(forced.group, "orchard");
+        assert!(forced.force);
+    }
+
+    /// Every `tcr` command the Codex refusals and notes tell an operator to run
+    /// is one this binary accepts, read out of the sentences themselves as they
+    /// are printed: a remedy that clap rejects is itself an error, which is how
+    /// the restart hint above once went wrong.
+    #[test]
+    fn every_command_a_codex_refusal_names_parses() {
+        use tcr::provider_guard;
+        let sentences = [
+            provider_guard::reserve_strands_codex(
+                "orchard",
+                &["bob@example.com/codex", "dana@example.com/codex"],
+            ),
+            provider_guard::reserve_force_warning("orchard", &["bob@example.com/codex"]),
+            provider_guard::refused_exit_suffix("bob@example.com/codex"),
+        ];
+        let mut named: Vec<Vec<String>> = Vec::new();
+        for sentence in &sentences {
+            let commands: Vec<&str> = sentence
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|span| span.starts_with("tcr "))
+                .collect();
+            assert_eq!(
+                commands.len(),
+                1,
+                "each sentence names one command to run: {sentence}"
+            );
+            for command in commands {
+                let argv: Vec<&str> = command.split_whitespace().collect();
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    panic!(
+                        "`{sentence}` tells the user to run `{command}`, which does not parse: {e}"
+                    );
+                }
+                named.push(argv.iter().map(|word| word.to_string()).collect());
+            }
+        }
+
+        // Both reserve sentences name the remove that takes the first Codex
+        // member out of the group, and it parses as exactly that.
+        for argv in &named[..2] {
+            assert_eq!(
+                argv,
+                &["tcr", "group", "rm", "orchard", "bob@example.com/codex"]
+            );
+            match Cli::try_parse_from(argv) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Group(GroupArgs {
+                            action: GroupAction::Rm(rm),
+                        })),
+                    ..
+                }) => {
+                    assert_eq!(rm.group, "orchard");
+                    assert_eq!(rm.account.as_deref(), Some("bob@example.com/codex"));
+                    assert!(!rm.all);
+                }
+                _ => panic!("{argv:?} is not a group rm"),
+            }
+        }
+        // The strict exit pin's remedy clears it: back to local, and not strict.
+        assert_eq!(
+            named[2],
+            [
+                "tcr",
+                "peer",
+                "account",
+                "bob@example.com/codex",
+                "--exits-from",
+                "local",
+                "--no-must"
+            ]
+        );
+        match Cli::try_parse_from(&named[2]) {
+            Ok(Cli {
+                command:
+                    Some(Command::Peer(peer_cli::PeerArgs {
+                        action: peer_cli::PeerAction::Account(account),
+                    })),
+                ..
+            }) => {
+                assert_eq!(account.account, "bob@example.com/codex");
+                assert_eq!(account.exits_from.as_deref(), Some("local"));
+                assert!(account.no_must && !account.must);
+            }
+            _ => panic!("{:?} is not a peer account", named[2]),
         }
     }
 
@@ -8221,6 +10080,7 @@ mod tests {
         config::Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -8236,6 +10096,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -8349,6 +10210,98 @@ mod tests {
         assert!(
             err.to_string().contains("control character"),
             "the error must name the character class at fault: {err}"
+        );
+    }
+
+    /// `tcr run --group` launches a CLAUDE session, and no Codex account can
+    /// serve one: a group whose every member is a Codex account is refused before
+    /// anything launches, while a group that also holds a Claude account launches
+    /// as before.
+    #[test]
+    fn run_group_with_no_claude_member_is_refused() {
+        let mut config = default_config();
+        config.accounts = vec![
+            account_with_groups("alice", Some(&["review"])),
+            config::Account {
+                provider: tcr::provider::Provider::Codex,
+                ..account_with_groups("bob-codex", Some(&["lab", "review"]))
+            },
+        ];
+        let err = validate_group(&config, "lab").expect_err("lab holds no Claude account");
+        assert_eq!(
+            err.to_string(),
+            "group 'lab' has no Claude account (its members are Codex accounts, which a Claude session cannot use) — nothing launched."
+        );
+        assert!(validate_group(&config, "review").is_ok());
+    }
+
+    /// `spillToPool` does not lift that refusal. With it, every request of such a
+    /// session would fall back to the whole pool, so the session would run and
+    /// never once be served by the group it asked for. The launch-time check
+    /// already treats a label no account carries the same way, spill or not, and
+    /// a group with no Claude account is that, to a Claude session.
+    #[test]
+    fn run_group_refuses_a_codex_only_group_even_when_it_spills_to_the_pool() {
+        let mut config = default_config();
+        config.accounts = vec![
+            account_with_groups("alice", Some(&["review"])),
+            config::Account {
+                provider: tcr::provider::Provider::Codex,
+                ..account_with_groups("bob-codex", Some(&["lab"]))
+            },
+        ];
+        config.group_settings.insert(
+            "lab".to_string(),
+            config::GroupSettings {
+                spill_to_pool: true,
+                ..Default::default()
+            },
+        );
+        assert!(config.group_allows_spill("lab") && !config.is_group_reserved("lab"));
+        let err = validate_group(&config, "lab")
+            .expect_err("spilling does not give lab a Claude account");
+        assert_eq!(
+            err.to_string(),
+            tcr::provider_guard::group_has_no_claude("lab")
+        );
+    }
+
+    /// `tcr peer ls` lists a Codex account's exit pin with what it really does:
+    /// a loose pin is inert, because a Codex request always leaves from this Mac,
+    /// and a strict one skips the account during selection, so its line
+    /// names the command that clears it. A Claude pin, and a Codex account left
+    /// local, get no line.
+    #[test]
+    fn peer_ls_marks_a_codex_exit_pin_inert() {
+        use tcr::provider::Provider;
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let pinned = |name: &str, provider: Provider, strict: bool| config::Account {
+            provider,
+            egress: config::Egress::Via(peer),
+            egress_strict: strict,
+            ..account_with_groups(name, None)
+        };
+        let accounts = vec![
+            pinned("bob@example.com/codex", Provider::Codex, false),
+            pinned("carol@example.com/codex", Provider::Codex, true),
+            pinned("alice@example.com", Provider::Anthropic, false),
+            config::Account {
+                provider: Provider::Codex,
+                ..account_with_groups("dana@example.com/codex", None)
+            },
+        ];
+        assert_eq!(
+            peer_ls_inert_exit_lines(&accounts),
+            vec![
+                format!(
+                    "bob@example.com/codex  exits={} (inert: Codex accounts always leave from this Mac)",
+                    peer.display()
+                ),
+                format!(
+                    "carol@example.com/codex  exits={} (refused: a Codex account cannot exit from another Mac, so tcr skips this account; clear it with `tcr peer account carol@example.com/codex --exits-from local --no-must`)",
+                    peer.display()
+                ),
+            ]
         );
     }
 
@@ -8482,5 +10435,225 @@ mod tests {
             "tests/headless_sigterm.rs matches this exact text; changing it here \
              without changing it there turns that test red for no real reason"
         );
+    }
+
+    /// The help renders no fleet, so every fleet reads the same help: it names both providers,
+    /// and says which verbs, flags and peer features are Claude's alone. clap drops a
+    /// doc-comment's closing period from the text it shows. The tokens TcrBar probes the help
+    /// for stay whole tokens.
+    #[test]
+    fn help_names_both_providers() {
+        use clap::CommandFactory as _;
+        let cli = Cli::command();
+        let text = |styled: Option<&clap::builder::StyledStr>| {
+            styled.map(ToString::to_string).unwrap_or_default()
+        };
+        let sub = |path: &[&str]| -> clap::Command {
+            let mut command = cli.clone();
+            for name in path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("tcr has no {path:?} subcommand"))
+                    .clone();
+            }
+            command
+        };
+        let arg_help = |command: &clap::Command, id: &str| {
+            text(
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_id() == id)
+                    .unwrap_or_else(|| panic!("no {id} argument"))
+                    .get_help(),
+            )
+        };
+
+        assert_eq!(
+            text(cli.get_about()),
+            "Lean single-user rotating proxy for Claude and Codex (ChatGPT) accounts, with a \
+             live TUI"
+        );
+        assert_eq!(
+            text(sub(&["login"]).get_about()),
+            "Add an account: Claude through the browser, or Codex (ChatGPT) with --codex or \
+             --from-codex"
+        );
+        assert_eq!(
+            text(sub(&["mint"]).get_about()),
+            "Mint a long-lived (365-day) token for an existing Claude account, or every Claude \
+             account in a group, and put the result on the clipboard. Nothing is stored — \
+             export only (Claude accounts only)"
+        );
+        assert_eq!(
+            text(sub(&["control"]).get_about()),
+            "Set, clear, or show the identity-bound control account (Claude accounts only)"
+        );
+        assert_eq!(
+            text(sub(&["doctor"]).get_about()),
+            "Say whether Claude Code is actually reaching this proxy, and which file decides \
+             that; and whether codex is pooled, when the fleet holds a Codex account or with \
+             --codex. Exits 0 when it is, 2 when another base URL owns the route, 3 when the \
+             route points here and no proxy answers"
+        );
+        assert_eq!(
+            arg_help(&sub(&["doctor"]), "codex"),
+            "Report only whether codex is pooled, and exit with that verdict's code"
+        );
+        assert!(
+            text(sub(&["list"]).get_about()).starts_with(
+                "Print every Claude account as claude-swap's `list --json` document, for \
+                 CodexBar."
+            ),
+            "{}",
+            text(sub(&["list"]).get_about())
+        );
+        let account = text(sub(&["peer", "account"]).get_about());
+        assert!(
+            account.ends_with(". Codex accounts always leave from this Mac"),
+            "{account}"
+        );
+        for verb in ["share", "via", "lend"] {
+            let about = text(sub(&["peer", verb]).get_about());
+            assert!(
+                about.ends_with(
+                    ". Codex requests always leave from this Mac: no Mac lends, serves or \
+                     carries them in this version"
+                ),
+                "peer {verb}: {about}"
+            );
+        }
+        let group = arg_help(&sub(&["run"]), "group");
+        assert!(
+            group.ends_with(". Claude sessions only; a Codex session cannot ask for a group"),
+            "{group}"
+        );
+
+        for (path, tokens) in [
+            (&["login"][..], &["--non-interactive", "--codex"][..]),
+            (&["server"], &["--replace", "--no-replace"]),
+            (&["doctor"], &["--codex"]),
+        ] {
+            let help = sub(path).render_long_help().to_string();
+            for token in tokens {
+                assert!(
+                    tcr::codex_local::help_has_whole_token(&help, token),
+                    "`tcr {} --help` must carry {token} as a whole token:\n{help}",
+                    path.join(" ")
+                );
+            }
+        }
+    }
+
+    fn persisted_tls_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[test]
+    fn see_through_ca_keeps_a_running_legacy_proxys_chain_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        std::fs::remove_file(dir.path().join("tcr-ca.key")).unwrap();
+        std::fs::write(
+            dir.path().join("tcr-leaf.sans"),
+            "api.anthropic.com\nplatform.claude.com\nwww.example.org\n",
+        )
+        .unwrap();
+        let before = persisted_tls_files(dir.path());
+
+        assert_eq!(see_through_ca_in(dir.path()), Some(ca));
+
+        assert!(
+            persisted_tls_files(dir.path()) == before,
+            "launching a client must not rotate the running proxy's CA or leaf"
+        );
+        assert!(!dir.path().join("tcr-ca.key").exists());
+    }
+
+    #[test]
+    fn see_through_ca_does_not_create_certificate_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent");
+        assert_eq!(see_through_ca_in(&absent), None);
+        assert!(!absent.exists(), "only server startup may create a chain");
+    }
+
+    #[test]
+    fn see_through_ca_reuses_a_fresh_servers_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        let before = persisted_tls_files(dir.path());
+        assert_eq!(see_through_ca_in(dir.path()), Some(ca));
+        assert_eq!(persisted_tls_files(dir.path()), before);
+    }
+
+    /// Claude's trust notice names only the setting its own connection needs.
+    #[test]
+    fn the_claude_see_through_notice_names_only_its_ca() {
+        let ca = Path::new("/Users/example/.config/tcr-ca.pem");
+        assert_eq!(
+            see_through_ca_notice(ca),
+            "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem"
+        );
+    }
+
+    /// A pooled codex session carries `HTTPS_PROXY` aimed at tcr, so a `claude` that codex
+    /// starts meets tcr's leaf for `api.anthropic.com`, and node trusts it only through
+    /// `NODE_EXTRA_CA_CERTS`. A pooled launch sets it to tcr's CA, unless the caller exported one,
+    /// which the child then inherits untouched. A direct launch meets no leaf and sets nothing.
+    #[test]
+    fn a_claude_inside_a_pooled_codex_gets_node_extra_ca_certs() {
+        let ca = Path::new("/tmp/ca.pem");
+        let mut cmd = std::process::Command::new("true");
+        apply_nested_claude_ca(&mut cmd, ca, false);
+        assert_eq!(
+            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"),
+            Some(&Some("/tmp/ca.pem".to_string()))
+        );
+        let mut cmd = std::process::Command::new("true");
+        apply_nested_claude_ca(&mut cmd, ca, true);
+        assert_eq!(
+            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"),
+            None,
+            "the caller's own value is inherited, not replaced"
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(
+            &mut cmd,
+            3999,
+            &CodexLaunch::SeeThrough {
+                ca: ca.to_path_buf(),
+                no_proxy: Vec::new(),
+            },
+        );
+        let expected = match std::env::var_os("NODE_EXTRA_CA_CERTS") {
+            None => Some(Some("/tmp/ca.pem".to_string())),
+            Some(_) => None,
+        };
+        assert_eq!(
+            env_changes(&cmd).get("NODE_EXTRA_CA_CERTS").cloned(),
+            expected,
+            "a pooled launch sets the CA for a nested claude unless this process exported one"
+        );
+
+        let mut cmd = std::process::Command::new("true");
+        apply_codex_launch(
+            &mut cmd,
+            3999,
+            &CodexLaunch::Direct {
+                reason: "no proxy answered on 127.0.0.1:3999".to_string(),
+                unset: Vec::new(),
+            },
+        );
+        assert_eq!(env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"), None);
     }
 }

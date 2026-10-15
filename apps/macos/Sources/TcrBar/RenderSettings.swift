@@ -48,7 +48,10 @@ import TcrBarCore
 ///     TcrBar.app/Contents/MacOS/TcrBar --render-settings <output-directory>
 ///
 /// Writes one PNG per pane per appearance and exits without ever showing a
-/// menu-bar item, polling `tcr`, or touching a server.
+/// menu-bar item, polling `tcr`, or touching a server. The panes a fleet
+/// holding both Claude and Codex accounts draws differently (``mixedTabs``)
+/// are rendered once more over such a fleet, as `<tab>-mixed-<appearance>.png`,
+/// and so are the Peers sheets, as `<sheet>-mixed-<appearance>.png`.
 enum RenderSettings {
     static let flag = "--render-settings"
 
@@ -109,10 +112,13 @@ enum RenderSettings {
 
         var written = 0
         var attempted = 0
+        let fleet = Fleet(accounts: fixtureAccounts())
         for tab in SettingsTab.allCases {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(tab, appearance: appearance, into: directory) { written += 1 }
+                if render(tab, appearance: appearance, fleet: fleet, into: directory) {
+                    written += 1
+                }
             }
         }
         // The two sheet scenes, after the panes: same window, same appearance
@@ -120,7 +126,36 @@ enum RenderSettings {
         for scene in SheetScene.allCases {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(.peers, appearance: appearance, sheet: scene, into: directory) {
+                if render(.peers, appearance: appearance, sheet: scene, fleet: fleet, into: directory)
+                {
+                    written += 1
+                }
+            }
+        }
+        // The mixed pass, last, so every capture above keeps its name and its
+        // place in the run.
+        let mixed = mixedFleet()
+        for tab in mixedTabs {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if render(
+                    tab, appearance: appearance,
+                    fleet: tab == .groupsRotation ? mixedFleetWithOrchard() : mixed,
+                    nameSuffix: "-mixed", into: directory)
+                {
+                    written += 1
+                }
+            }
+        }
+        // The Peers sheets over the same fleet, which name Claude in their
+        // promises and say the Codex accounts stay on this Mac.
+        for scene in SheetScene.allCases {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if render(
+                    .peers, appearance: appearance, sheet: scene, fleet: mixed,
+                    nameSuffix: "-mixed", into: directory)
+                {
                     written += 1
                 }
             }
@@ -142,6 +177,35 @@ enum RenderSettings {
                 "carol@example.com", groups: ["henry-team"], parkedGroups: ["henry-team"],
                 groupColors: ["henry-team": "#32d74b"]),
         ]
+    }
+
+    /// The panes that draw something of their own over a fleet holding both
+    /// Claude and Codex accounts: Menu Bar's "Cup shows" row and its counts
+    /// caption, and Peers, whose promises name Claude and whose Sharing head says
+    /// that Codex requests always leave from this Mac; General's Codex row under
+    /// Server, Updates' flag on a command-line tcr that predates Codex accounts, and
+    /// Groups & Rotation's Claude-only rotation rows and per-provider Members line.
+    static let mixedTabs: [SettingsTab] = [.menuBar, .peers, .general, .updates, .groupsRotation]
+
+    /// ``fixtureAccounts()`` plus canonical bob, a ready Codex account: a fleet
+    /// holding both providers.
+    private static func mixedFleet() -> Fleet {
+        let row = RenderStates.codexRow(.bob, now: Date())
+        guard let bob = try? Fleet.decode(Data("[\(row)]".utf8)).accounts.first else {
+            preconditionFailure("canonical bob does not decode")
+        }
+        return Fleet(accounts: fixtureAccounts() + [bob])
+    }
+
+    /// ``mixedFleet()`` plus canonical ivy, a Codex account in ORCHARD, for the Groups
+    /// pane: the fixture's own groups hold only Claude accounts, so without her no group
+    /// would have a Codex member to count.
+    private static func mixedFleetWithOrchard() -> Fleet {
+        let row = RenderStates.codexRow(.ivy, now: Date())
+        guard let ivy = try? Fleet.decode(Data("[\(row)]".utf8)).accounts.first else {
+            preconditionFailure("canonical ivy does not decode")
+        }
+        return Fleet(accounts: mixedFleet().accounts + [ivy])
     }
 
     /// 660×581, the reviewed window as a FRAME
@@ -231,10 +295,13 @@ enum RenderSettings {
     /// anything. Two models of one pane, and either one alone is a claim: the
     /// arithmetic is what the tests can gate, the drawn figure is what the
     /// operator gets.
-    private static func paneEstimate(for tab: SettingsTab) -> CGFloat {
+    ///
+    /// `fleet` is the capture's: one holding a Codex account draws one more line
+    /// under the Sharing head, and the estimate charges it.
+    private static func paneEstimate(for tab: SettingsTab, fleet: Fleet) -> CGFloat {
         guard tab == .peers else { return 0 }
         return PeersSettingsPane.estimatedHeight(
-            trustedMacs: 2, pendingKnocks: 1, advancedOpen: false)
+            trustedMacs: 2, pendingKnocks: 1, advancedOpen: false, holdsCodex: fleet.holdsCodex)
     }
 
     /// The pane's own scroll view: the WIDEST one in the window, which is the
@@ -253,10 +320,12 @@ enum RenderSettings {
         return found.max { $0.bounds.width < $1.bounds.width }
     }
 
+    /// `fleet` is what the pinned poller reads, and `nameSuffix` follows the
+    /// pane's name in the file's: `-mixed` for the mixed pass, empty otherwise.
     @MainActor
     private static func render(
-        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil,
-        into directory: URL
+        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil, fleet: Fleet,
+        nameSuffix: String = "", into directory: URL
     ) -> Bool {
         // Two appearances, two mechanisms: `NSApp.appearance` is what the window
         // and its title bar adopt, and the DRAWING appearance is what every
@@ -273,11 +342,12 @@ enum RenderSettings {
 
         return withDrawingAppearance(appearance.nsAppearance) {
             renderUnderCurrentAppearance(
-                tab, appearance: appearance, sheet: sheet, into: directory)
+                tab, appearance: appearance, sheet: sheet, fleet: fleet, nameSuffix: nameSuffix,
+                into: directory)
         }
     }
 
-    /// The body of ``render(_:appearance:into:)``, run with the drawing
+    /// The body of ``render(_:appearance:sheet:fleet:nameSuffix:into:)``, run with the drawing
     /// appearance already installed.
     ///
     /// A separate function only because the macOS 12 replacement for assigning
@@ -286,9 +356,9 @@ enum RenderSettings {
     /// to change nothing.
     @MainActor
     private static func renderUnderCurrentAppearance(
-        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, into directory: URL
+        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, fleet: Fleet,
+        nameSuffix: String, into directory: URL
     ) -> Bool {
-        let fleet = Fleet(accounts: fixtureAccounts())
         let dependencies = SettingsDependencies(
             poller: StatusPoller(pinnedState: .loaded(fleet), lastPollAt: Date()),
             server: ServerController(),
@@ -297,12 +367,19 @@ enum RenderSettings {
             preference: LaunchPreference(),
             countsPreference: MenuBarCountsPreference(),
             runningToolsPreference: ShowRunningToolsPreference(),
+            // A scratch suite, so a render never reads the operator's own
+            // choice of pool.
+            cupPoolPreference: MenuBarCupPoolPreference(
+                defaults: UserDefaults(suiteName: "tcrbar.render-settings")!),
             defaultTabPreference: DefaultTabPreference(),
             panelDensityPreference: PanelDensityPreference(),
             groupController: GroupController(),
             updater: Updater(startingUpdater: false),
             claudeRoute: ClaudeRouteController(pinned: .status(ClaudeRouteStatus(route: .shell))),
-            onWhatsNew: {})
+            onWhatsNew: {},
+            // A fixed answer, never this Mac's tcr: a command-line tcr that predates
+            // Codex accounts. Read only over a fleet holding a Codex account.
+            pathTcr: { TcrTool.PathTcr(path: "/usr/local/bin/tcr", version: "0.2.44", predatesCodex: true) })
 
         // A fresh navigation object per capture, not `.shared` — so setting
         // `selectedTab` here can never race or persist against a later call
@@ -400,14 +477,14 @@ enum RenderSettings {
                 "  \(tab.rawValue): scrolled to \(Int(offset)) pt to show the last "
                     + "\(Int(rowHeight)) pt of the pane (document \(Int(documentHeight)) pt, "
                     + "viewport \(Int(viewportHeight)) pt, resting \(Int(restingY)) pt, "
-                    + "pane estimate \(Int(paneEstimate(for: tab))) pt)")
+                    + "pane estimate \(Int(paneEstimate(for: tab, fleet: fleet))) pt)")
             for _ in 0..<3 {
                 RunLoop.current.run(until: Date().addingTimeInterval(0.05))
             }
         }
 
         // A sheet scene is named for the SHEET, not for the pane behind it.
-        let name = "\(sheet?.rawValue ?? tab.rawValue)-\(appearance.rawValue).png"
+        let name = "\(sheet?.rawValue ?? tab.rawValue)\(nameSuffix)-\(appearance.rawValue).png"
         // `NSView.cacheDisplay`/`ImageRenderer` both draw OFFSCREEN, bypassing
         // the window server entirely — measured across every attempt in this
         // file's own doc-comment, neither one reliably reproduces what

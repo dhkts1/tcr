@@ -2221,20 +2221,36 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // Load the MITM TLS material (reuse the existing leaf, else mint one). A
     // failure here is non-fatal: base-URL mode still serves; only CONNECT
     // (forward-proxy) mode is unavailable until the cert issue is fixed.
+    //
+    // What the listener's policy and loaded leaf let it intercept is recorded
+    // HERE, from the material it actually got, because nothing reloads it after
+    // this point: the status endpoint reports it (`StatusPayload::mitm`), and
+    // `tcr run --codex` pools a session only on that answer and the account
+    // rows (`chatgpt.com` is terminated only while the pool holds a Codex
+    // account), never on the leaf a client finds on disk.
+    //
+    // Whether the pool holds a Codex account only words the CA notices: once one does, they
+    // name `CODEX_CA_CERTIFICATE` too, the variable codex trusts a CA from.
+    let holds_codex = manager.provider_account_count(crate::provider::Provider::Codex) > 0;
     let tls = match tls {
-        TlsSetup::Load => match mitm::load_tls() {
+        TlsSetup::Load => match mitm::load_tls(holds_codex) {
             Ok(assets) => {
                 if let Some(ca) = &assets.ca_path {
-                    tracing::info!(ca = %ca.display(), "MITM: advertise this CA via NODE_EXTRA_CA_CERTS");
+                    tracing::info!(ca = %ca.display(), "{}", mitm::advertise_note(holds_codex));
                 }
+                manager.record_mitm_status(crate::status::MitmStatus::of(Some(&assets)));
                 Some(Arc::new(assets.acceptor))
             }
             Err(err) => {
                 tracing::warn!(error = %err, "MITM disabled: could not load/generate TLS material (base-URL mode still works)");
+                manager.record_mitm_status(crate::status::MitmStatus::of(None));
                 None
             }
         },
-        TlsSetup::Disabled => None,
+        TlsSetup::Disabled => {
+            manager.record_mitm_status(crate::status::MitmStatus::of(None));
+            None
+        }
     };
 
     // Hybrid proxy server task: base-URL mode and HTTPS_PROXY/CONNECT mode on the

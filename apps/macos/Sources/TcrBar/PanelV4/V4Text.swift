@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import TcrBarCore
 
 /// The panel's four text roles.
 ///
@@ -123,5 +125,55 @@ struct MonoText: View {
             .textSelection(.enabled)
             .help(text)
             .accessibilityValue(text)
+    }
+}
+
+/// A sentence that names commands between backticks (``CommandProse``), in the font and
+/// colour its call site sets: each command in the mono face at the sentence's size,
+/// without its backticks and never broken inside one of its words, and a menu that copies
+/// each one as written, `Copy “tcr run --codex”`. A path in the prose, such as the one tcr's
+/// not-pooled reason names, is never broken either. A sentence that names no command is
+/// one `Text`, with no menu.
+///
+/// Not selectable, unlike ``MonoText``. The drawn text carries word joiners, and a
+/// drag-select would copy them: the pasted command would name a file that does not exist,
+/// with nothing on screen to say why, which is the rule `FleetView`'s email break hint
+/// keeps for the same reason. The menu copies the sentence's own commands instead, and
+/// VoiceOver reads the sentence as written, without its backticks.
+struct CommandProseText: View {
+    let text: String
+    /// The sentence's point size, at which its commands are drawn in the mono face.
+    let size: CGFloat
+
+    var body: some View {
+        let commands = CommandProse.commands(in: text)
+        if commands.isEmpty {
+            Text(verbatim: CommandProse.keepingPathsWhole(text))
+                .accessibilityLabel(text)
+        } else {
+            drawn
+                .contextMenu {
+                    ForEach(commands, id: \.self) { command in
+                        Button("Copy “\(command)”") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(command, forType: .string)
+                        }
+                    }
+                }
+                .accessibilityLabel(CommandProse.spoken(text))
+        }
+    }
+
+    /// The sentence as ``CommandProse/drawnRuns(_:)`` draws it: the prose with its paths
+    /// kept whole, and each command, in the mono face, with no break inside its words.
+    private var drawn: Text {
+        CommandProse.drawnRuns(text).reduce(Text(verbatim: "")) { sentence, run in
+            switch run {
+            case .prose(let prose):
+                return sentence + Text(verbatim: prose)
+            case .command(let command):
+                return sentence + Text(verbatim: command).font(V4.mono(size))
+            }
+        }
     }
 }

@@ -184,6 +184,28 @@ final class GroupCommandTests: XCTestCase {
         XCTAssertNotEqual(removeEntry.title, addEntry.title)
         XCTAssertNotEqual(removeEntry.copiedText, addEntry.copiedText)
     }
+
+    /// Adding a Codex account to a group succeeds with a warning on stderr: the group
+    /// labels it and can park it, but no Codex request can ask for a group. The warning is
+    /// what the row keeps, without its prefix; a success that warned of nothing keeps none,
+    /// and a refusal is still a refusal.
+    func testGroupAddReturnsItsStderrWarningOnSuccess() {
+        let warning =
+            "'ivy@example.com' is a Codex account. A Codex session cannot ask for a group, so "
+            + "'orchard' labels it and can park it, but never routes to it; while 'orchard' is "
+            + "reserved, it serves nothing."
+        let notice = "warning: " + warning
+        XCTAssertEqual(
+            GroupCommand.classify(exitCode: 0, stderr: notice + "\n"), .spoke(notice: notice))
+        XCTAssertEqual(GroupCommand.warning(inNotice: notice), warning)
+        XCTAssertEqual(
+            GroupCommand.warning(inNotice: "Added 'ivy@example.com' to group 'orchard'.\n" + notice),
+            warning)
+        XCTAssertNil(GroupCommand.warning(inNotice: "Added 'ivy@example.com' to group 'orchard'."))
+        guard case .failed = GroupCommand.classify(exitCode: 1, stderr: notice + "\n") else {
+            return XCTFail("a non-zero exit is a refusal, whatever it printed")
+        }
+    }
 }
 
 /// Whether a typed name can be used to create a brand new group (bridge

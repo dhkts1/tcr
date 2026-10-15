@@ -205,7 +205,7 @@ final class PanelV4ControlsTests: XCTestCase {
         let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
         XCTAssertTrue(
             squashed.contains(
-                "if!server.state.isOurChild{Text(server.state.summary)"
+                "if!server.state.isOurChild{Text(server.summary)"
                     + ".font(V4.font(V4.footerSize)).foregroundStyle(Tok.mute)"
                     + ".fixedSize(horizontal:false,vertical:true)}v4FooterAwakeQuit"),
             "v4FooterAwakeQuit is no longer the last, unconditional row in v4Footer")

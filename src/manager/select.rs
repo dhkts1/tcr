@@ -64,9 +64,10 @@ fn pin_counts_as_load(is_self: bool, touched_ms: i64, now_ms: i64) -> bool {
 /// from a session/affinity key — see [`classify_request`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestClass {
-    /// `/v1/messages`, `/v1/messages/count_tokens` — pool only. **Never** the
-    /// control account, even when `controlAccount` names an ENABLED (pooled)
-    /// account — see [`Manager::select`]'s pool-pick exclusion.
+    /// `/v1/messages`, `/v1/messages/count_tokens` and Codex's
+    /// `/backend-api/codex/responses` — pool only. **Never** the control
+    /// account, even when `controlAccount` names an ENABLED (pooled) account —
+    /// see [`Manager::select`]'s pool-pick exclusion.
     ///
     /// Two opt-ins lift that, both off by default, and both leave
     /// [`Manager::pool_pick_respects_control_reserve`]'s floor in force:
@@ -121,6 +122,12 @@ pub(super) enum GroupMiss {
     /// not allowed to select. Serves nothing until `allowControlAccount` is set
     /// on the group or `controlPooled` is set fleet-wide.
     OnlyControl,
+    /// Accounts carry the label, but none of them belongs to this request's
+    /// provider: a Claude request to a group of Codex accounts, or the reverse.
+    /// No retry fixes it, because Claude and Codex accounts never serve each
+    /// other's requests; only an account of the request's provider joining the
+    /// group does.
+    OtherProviderOnly,
     /// Members exist and are selectable in principle, but every one is held out
     /// right now by a hard gate: disabled, errored, rate-limited, over its
     /// switch threshold, model-blocked, or reserved away from this caller.
@@ -137,6 +144,7 @@ impl GroupMiss {
         match self {
             Self::Unknown => "no-such-group",
             Self::OnlyControl => "control-account-only",
+            Self::OtherProviderOnly => "other-provider-only",
             Self::AllGated => "all-members-unavailable",
             Self::Paced => "all-members-paced",
         }
@@ -150,19 +158,26 @@ impl GroupMiss {
             Self::OnlyControl => {
                 "the requested group's only member is the control account, which inference never selects — no request will ever route to this group until another account joins it, the control account is cleared, or the group opts in with `tcr group allow-control <g>`"
             }
+            Self::OtherProviderOnly => {
+                "the requested group has no account of this request's provider: Claude and Codex accounts never serve each other's requests"
+            }
             Self::AllGated => "every account in the requested group is currently unavailable",
             Self::Paced => "every account in the requested group is paced out",
         }
     }
 }
 
-/// Classify an unpinned request's path into the three-way split. Exact match
-/// for the two inference paths (mirrors `stable_session_key`'s
-/// `/v1/messages/count_tokens must NOT prefix-match /v1/messages` guard);
-/// prefix match for the two noise paths, matching the bridge's own examples
+/// Classify an unpinned request's path into the three-way split. Inference is
+/// whatever the path's own provider calls inference
+/// ([`crate::provider::Provider::is_inference_path`]): exact matches only,
+/// which keeps `stable_session_key`'s `/v1/messages/count_tokens must NOT
+/// prefix-match /v1/messages` guard, read from the one list in
+/// `crate::provider` rather than a copy here that could drift from it. Prefix
+/// match for the two noise paths, matching the bridge's own examples
 /// (`/api/event_logging/v2/batch`, and any `/mcp-registry...` route).
 pub(super) fn classify_request(path: &str) -> RequestClass {
-    if path == "/v1/messages" || path == "/v1/messages/count_tokens" {
+    let provider = crate::provider::Provider::of_path(path);
+    if provider.is_inference_path(path) {
         RequestClass::Inference
     } else if path.starts_with("/api/event_logging") || path.starts_with("/mcp-registry") {
         RequestClass::Noise
@@ -393,6 +408,42 @@ impl Manager {
         self.select_with_group(tried, now, model, affinity, path, conn_key, None)
     }
 
+    /// Unsupported strict Codex exits at their exact runtime slots. The manager's
+    /// cached config and runtime vectors are append-only and stay index-aligned;
+    /// deleting a file row marks its runtime slot removed rather than shifting it.
+    pub(crate) fn codex_accounts_with_unsupported_exit(&self) -> HashSet<usize> {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| account.has_unsupported_strict_peer_exit())
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn exclude_unsupported_codex_exits<'a>(
+        &self,
+        tried: &'a HashSet<usize>,
+        provider: crate::provider::Provider,
+    ) -> std::borrow::Cow<'a, HashSet<usize>> {
+        let unsupported = match provider {
+            crate::provider::Provider::Anthropic => return std::borrow::Cow::Borrowed(tried),
+            crate::provider::Provider::Codex => self.codex_accounts_with_unsupported_exit(),
+        };
+        if unsupported.is_empty() {
+            return std::borrow::Cow::Borrowed(tried);
+        }
+        self.affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .retain(|_, (idx, _)| !unsupported.contains(idx));
+        let mut excluded = tried.clone();
+        excluded.extend(unsupported);
+        std::borrow::Cow::Owned(excluded)
+    }
+
     /// Whether `group` has opted in to `spillToPool`, a PREFERENCE, whose own
     /// traffic may be served by a non-member when no member has capacity.
     ///
@@ -491,8 +542,21 @@ impl Manager {
         // carve-outs; this is the identical expression, hoisted.
         let strict_group =
             group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
+        // THE PROVIDER THIS REQUEST BELONGS TO, decided by its path (see
+        // `crate::provider`'s module doc for why path and not host). Computed
+        // here, above the hard lock, for the same reason `strict_group` is: the
+        // lock returns before `eligible` is ever asked, so it has to ask this
+        // itself. Every account this call returns is of this provider:
+        // `eligible` refuses any other first, and each door below that does
+        // not go through `eligible` checks it on its own.
+        let provider = crate::provider::Provider::of_path(path);
 
-        // Hard account lock: pin ALL traffic to the configured account, bypassing
+        // A strict Codex peer exit is a configuration block, not an upstream failure.
+        // Exclude it before locks, affinity and pool picks can select that account.
+        let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
+        let tried = filtered_tried.as_ref();
+
+        // Hard account lock: pin its provider's traffic to the configured account, bypassing
         // rotation/affinity/migration. `tried` still ends the rotation loop, once the
         // locked account has failed this request, return None (no failover to the pool).
         //
@@ -515,18 +579,14 @@ impl Manager {
         // and nowhere else", so when they disagree there is no account that
         // satisfies both, and the honest answer is the one a strict ask is
         // always owed. The caller's next rung is the 429 it already has.
-        // A locked account deleted from the config is no lock at all: the next
-        // boot resolves `lockAccount` to nothing and rotates normally, so this
-        // process does the same now rather than serve a deleted account.
-        let locked = self.locked_idx.filter(|&li| {
-            !self
-                .accounts
-                .read()
-                .expect("accounts lock poisoned")
-                .get(li)
-                .is_some_and(|a| a.removed)
-        });
-        if let Some(li) = locked {
+        //
+        // # A LOCK ONLY BINDS ITS OWN PROVIDER
+        //
+        // The other upstream keeps its own independent pool; it must never be
+        // disabled by this lock or receive the locked account's credential.
+        //
+        // A deleted lock no longer restricts either provider.
+        if let Some(li) = self.locked_account_for(provider) {
             if let Some(g) = strict_group {
                 let in_group = {
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
@@ -543,7 +603,11 @@ impl Manager {
 
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
-        let is_fable = model.is_some_and(crate::model::is_fable_model);
+        // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
+        let is_fable = match provider {
+            crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
+            crate::provider::Provider::Codex => false,
+        };
         // Compute the control-account three-way split ONCE (part 2). Consulted
         // twice below: the routing overlay (control-preferred / noise) after the
         // affinity fast-path, and the pool-pick exclusion (inference must never
@@ -599,6 +663,26 @@ impl Manager {
                 (pinned, counts)
             };
             if let Some((idx, pin_touched_ms)) = pinned {
+                // A PIN NEVER CROSSES PROVIDERS.
+                //
+                // `eligible` refuses an account of the other provider, but this
+                // fast path does not end at `eligible`: the over-threshold
+                // pin-honor serve and the `tried` divert below both ask
+                // `Self::account_hard_ok`, which judges the ACCOUNT and knows
+                // nothing about the request, so a pin on the other provider's
+                // account would be served a request its upstream cannot answer.
+                // No request path pins a session there on purpose (it takes two
+                // providers' session keys colliding); this makes it harmless if
+                // one ever does.
+                //
+                // A DIVERT and not a re-key, the same family as the strict-group
+                // divert below: the mismatch is a fact about THIS request, so it
+                // is served by its own provider's pool and the pin stays where
+                // the session it belongs to is warm.
+                let other_provider = {
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    accounts.get(idx).is_some_and(|a| a.provider != provider)
+                };
                 // A STRICT GROUP ASK OUTRANKS AN EXISTING PIN, and once it
                 // did not.
                 //
@@ -631,7 +715,15 @@ impl Manager {
                         .get(idx)
                         .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
                 });
-                if out_of_strict_group {
+                if other_provider {
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    keep_pin = Some(idx);
+                    divert_reason = Some("other-provider");
+                    divert_until_ms = accounts
+                        .get(idx)
+                        .and_then(|a| a.rate_limited_until_ms)
+                        .unwrap_or(0);
+                } else if out_of_strict_group {
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
                     keep_pin = Some(idx);
                     divert_reason = Some("group-strict");
@@ -701,6 +793,7 @@ impl Manager {
                                 now,
                                 now_ms,
                                 is_fable,
+                                provider,
                                 None,  // no group PREFERENCE — honouring an existing pin
                                 group, // but reservation is not a preference — real ask
                                 &reserved_groups,
@@ -855,6 +948,7 @@ impl Manager {
                                                 now,
                                                 now_ms,
                                                 is_fable,
+                                                provider,
                                                 None,
                                                 group,
                                                 &reserved_groups,
@@ -945,6 +1039,7 @@ impl Manager {
                                         now,
                                         now_ms,
                                         is_fable,
+                                        provider,
                                         // `strict_group`, not `None`: the fourth door out of a
                                         // strict group, and the one that returns from inside the
                                         // affinity fast path. A migration target is a NEW pin, not
@@ -1085,6 +1180,7 @@ impl Manager {
                                             now,
                                             now_ms,
                                             is_fable,
+                                            provider,
                                             // `strict_group`, not `None`: a GROUP-scoped lease
                                             // carries no `tried` seeding the way an account-set
                                             // scope does, so for it `strict_group` is the whole
@@ -1135,7 +1231,14 @@ impl Manager {
                                     // GROUP-scoped lease carries no `tried` seeding, so this is
                                     // the whole enforcement for it, same reasoning as the
                                     // connection-affinity overlay just above.
-                                    Self::control_eligible(a, now_ms)
+                                    //
+                                    // Nor is it a substitute for the provider, asked first:
+                                    // the control account is an Anthropic identity
+                                    // (`assemble` ignores a Codex one), and every
+                                    // `/backend-api/` path but the inference one classifies
+                                    // as control-preferred.
+                                    a.provider == provider
+                                        && Self::control_eligible(a, now_ms)
                                         && strict_group.is_none_or(|g| {
                                             a.groups.iter().any(|carried| carried == g)
                                         })
@@ -1199,6 +1302,7 @@ impl Manager {
                             now,
                             now_ms,
                             is_fable,
+                            provider,
                             // `strict_group`, not `None`: the second door out
                             // of a strict group, and the one the fast-path fix
                             // above would otherwise leave open. Stickiness
@@ -1303,8 +1407,9 @@ impl Manager {
             // inside the min-spacing window) AND, when `--group` was requested,
             // prefer that group. With pacing OFF and no group this is byte-identical
             // to the pre-pacing pick.
-            let mut best =
-                self.pick_eligible(&accounts, pool_tried, now, now_ms, is_fable, true, group);
+            let mut best = self.pick_eligible(
+                &accounts, pool_tried, now, now_ms, is_fable, provider, true, group,
+            );
 
             // An explicit `--group` ask is STRICT BY DEFAULT (2026-09-13), and
             // strictness is checked BEFORE the soft fallback below can widen the
@@ -1366,6 +1471,7 @@ impl Manager {
                         now,
                         now_ms,
                         is_fable,
+                        provider,
                         g,
                         &reserved_groups,
                         &parked_groups,
@@ -1376,8 +1482,8 @@ impl Manager {
                         "group: strict — refusing to fall back to the whole pool, returning no account — {}",
                         miss.explain(),
                     );
-                } else if let Some(idx) =
-                    self.pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable, None)
+                } else if let Some(idx) = self
+                    .pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable, provider, None)
                 {
                     if let Some(account) = accounts.get(idx) {
                         // This fallback fires whenever the first (group- and
@@ -1399,6 +1505,7 @@ impl Manager {
                                     now,
                                     now_ms,
                                     is_fable,
+                                    provider,
                                     g,
                                     &reserved_groups,
                                     &parked_groups,
@@ -1436,7 +1543,9 @@ impl Manager {
             // path costs nothing (identical to today) and on a mispredicted one it
             // spends one real request to convert the guess into a fact.
             if best.is_none() && is_fable && strict_group.is_none() {
-                if let Some(idx) = self.pick_fable_last_resort(&accounts, pool_tried, now, now_ms) {
+                if let Some(idx) =
+                    self.pick_fable_last_resort(&accounts, pool_tried, now, now_ms, provider)
+                {
                     if let Some(account) = accounts.get(idx) {
                         let seven_day_oi =
                             account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
@@ -1606,12 +1715,19 @@ impl Manager {
     ///
     /// The winner's `last_selected_seq` is stamped and ONE `tracing::info!` names the
     /// path (pin-honor vs fallback), the account, and its utilization.
+    ///
+    /// `path` is the request's query-stripped path, the argument [`Self::select`]
+    /// takes, and for the same reason: its provider decides which accounts this
+    /// serve may land on, ahead of every other gate. A mixed fleet whose Anthropic
+    /// half reads over the threshold has its idle accounts on the OTHER provider,
+    /// and the least-utilized pick below would otherwise reach for exactly those.
     pub fn select_revalidation(
         &self,
         tried: &HashSet<usize>,
         now: OffsetDateTime,
         model: Option<&str>,
         affinity: Option<u64>,
+        path: &str,
     ) -> Option<usize> {
         // Live-reload group membership/settings — same call `select_with_group`
         // makes, so a session revalidated through THIS path also sees a just-
@@ -1627,10 +1743,20 @@ impl Manager {
         let reserved_groups = self.reserved_groups();
         let parked_groups = self.parked_groups();
         let now_ms = odt_to_ms(now);
-        let is_fable = model.is_some_and(crate::model::is_fable_model);
+        // Derived exactly as `select_with_group` derives them.
+        let provider = crate::provider::Provider::of_path(path);
+        let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
+        let tried = filtered_tried.as_ref();
+        // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
+        let is_fable = match provider {
+            crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
+            crate::provider::Provider::Codex => false,
+        };
 
         // HARD-gate predicate shared by both paths: the blocks that even a
         // revalidation serve must honor (soft utilization/pacing deliberately absent).
+        // The request's provider is asked first, as `eligible` asks it: an account of
+        // the other provider is not an over-threshold candidate, it is no candidate.
         //
         // `group: None` — this path (unlike `select_with_group`) carries no
         // `--group` context at all, so it cannot tell a grouped session's real
@@ -1640,18 +1766,19 @@ impl Manager {
         // account is never leaked to traffic this path cannot identify.
         let warm = self.warm_window(affinity);
         let hard_ok = |account: &AccountRuntime| -> bool {
-            Self::hard_ok(
-                account,
-                self.global_threshold,
-                self.fable_weekly_threshold,
-                now,
-                now_ms,
-                is_fable,
-                None,
-                &reserved_groups,
-                &parked_groups,
-                warm,
-            )
+            account.provider == provider
+                && Self::hard_ok(
+                    account,
+                    self.global_threshold,
+                    self.fable_weekly_threshold,
+                    now,
+                    now_ms,
+                    is_fable,
+                    None,
+                    &reserved_groups,
+                    &parked_groups,
+                    warm,
+                )
         };
 
         // Mirrors `select()`'s `keep_pin`: set to the OLD pin index when the pin
@@ -1789,12 +1916,15 @@ impl Manager {
 
             // A servable candidate exists — spend the anti-storm window now (after
             // selection, so a fleet with nothing to serve never burns the valve).
-            let next_at = self.next_revalidation_at_ms.load(Ordering::Relaxed);
+            let valve = match provider {
+                crate::provider::Provider::Anthropic => &self.next_revalidation_at_ms,
+                crate::provider::Provider::Codex => &self.next_codex_revalidation_at_ms,
+            };
+            let next_at = valve.load(Ordering::Relaxed);
             if now_ms < next_at {
                 return None;
             }
-            self.next_revalidation_at_ms
-                .store(now_ms + REVALIDATION_MIN_SPACING_MS, Ordering::Relaxed);
+            valve.store(now_ms + REVALIDATION_MIN_SPACING_MS, Ordering::Relaxed);
 
             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
             let util = accounts
@@ -2256,6 +2386,12 @@ impl Manager {
     /// control-injected `pool_tried` — a member that is only in the set because
     /// of the injection must be attributed to [`GroupMiss::OnlyControl`], not
     /// silently counted as "already tried".
+    ///
+    /// Every arm after [`GroupMiss::Unknown`] reads only the members of the
+    /// request's own `provider`: the others could never have served it, so a
+    /// group holding none of them is [`GroupMiss::OtherProviderOnly`], and a
+    /// Codex member beside the excluded control account does not hide that the
+    /// control exclusion is the reason.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn classify_group_miss(
         accounts: &[AccountRuntime],
@@ -2267,6 +2403,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: &str,
         reserved: &HashSet<String>,
         parked: &HashSet<String>,
@@ -2279,6 +2416,23 @@ impl Manager {
             .collect();
         if members.is_empty() {
             return GroupMiss::Unknown;
+        }
+        // Narrowed to the request's provider: a Claude request is never served
+        // by a Codex account, nor the reverse, so a member of the other provider
+        // is no candidate and must not be what the reason describes. By provider
+        // ONLY: a row deleted from the file keeps its slot (`removed`) and its old
+        // groups until a restart, and dropping it here would have a fleet with no
+        // Codex account name a provider it does not have.
+        let members: Vec<usize> = members
+            .into_iter()
+            .filter(|idx| {
+                accounts
+                    .get(*idx)
+                    .is_some_and(|account| account.provider == provider)
+            })
+            .collect();
+        if members.is_empty() {
+            return GroupMiss::OtherProviderOnly;
         }
         if members.iter().all(|idx| Some(*idx) == control_excluded) {
             return GroupMiss::OnlyControl;
@@ -2301,6 +2455,7 @@ impl Manager {
                         now,
                         now_ms,
                         is_fable,
+                        provider,
                         Some(group),
                         Some(group),
                         reserved,
@@ -2324,6 +2479,12 @@ impl Manager {
     /// but must still pass the session's ACTUAL ask here, because a
     /// reservation is not a preference. Every other caller passes the same
     /// value for both.
+    ///
+    /// `provider` is the REQUEST's provider, and it is checked before anything
+    /// else: an account of the other provider is not a weaker candidate, it is
+    /// not a candidate at all, since its credential means nothing to the
+    /// request's upstream. An exhausted Anthropic fleet answers 429 rather than
+    /// spilling onto a Codex account, and the reverse.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn eligible(
         account: &AccountRuntime,
@@ -2334,11 +2495,15 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: Option<&str>,
         reserved_group: Option<&str>,
         reserved: &HashSet<String>,
         parked: &HashSet<String>,
     ) -> bool {
+        if account.provider != provider {
+            return false;
+        }
         if account.disabled || account.status == AccountStatus::Error {
             return false;
         }
@@ -2653,6 +2818,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        provider: crate::provider::Provider,
         respect_pacing: bool,
         group: Option<&str>,
     ) -> Option<usize> {
@@ -2673,6 +2839,7 @@ impl Manager {
                 now,
                 now_ms,
                 is_fable,
+                provider,
                 group,
                 group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
                 &reserved_groups,
@@ -2691,6 +2858,7 @@ impl Manager {
                         now,
                         now_ms,
                         is_fable,
+                        provider,
                         group,
                         group,
                         &reserved_groups,
@@ -2738,6 +2906,7 @@ impl Manager {
     /// non-pacing eligibility (disabled/error/rate-limit/quota) still applies, so a
     /// genuinely exhausted fleet still yields `None` (a real 429), while a merely
     /// all-paced fleet always yields the coolest account. Read-only.
+    #[allow(clippy::too_many_arguments)]
     fn pick_least_loaded(
         &self,
         accounts: &[AccountRuntime],
@@ -2745,6 +2914,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: Option<&str>,
     ) -> Option<usize> {
         let reserved_groups = self.reserved_groups();
@@ -2764,6 +2934,7 @@ impl Manager {
                 now,
                 now_ms,
                 is_fable,
+                provider,
                 group,
                 group,
                 &reserved_groups,
@@ -2796,9 +2967,9 @@ impl Manager {
     /// The Fable last-resort pick (three-tier gate): reached only when
     /// [`Self::pick_eligible`] and [`Self::pick_least_loaded`] both already
     /// returned `None` for a Fable request. Mirrors [`Self::eligible`]'s
-    /// non-model gates (disabled/error/live hold/shared five-hour and
-    /// seven-day windows/standard limits/group) but — unlike `eligible` and
-    /// `pick_least_loaded` — does **not** hard-skip on
+    /// non-model gates (the request's provider/disabled/error/live hold/shared
+    /// five-hour and seven-day windows/standard limits/group) but — unlike
+    /// `eligible` and `pick_least_loaded` — does **not** hard-skip on
     /// [`Self::model_blocked`]'s prediction; it excludes only an account
     /// upstream has genuinely rejected on `7d_oi`
     /// ([`crate::quota::Quota::model_weekly_rejected`]). Ignores `group`
@@ -2818,6 +2989,7 @@ impl Manager {
         tried: &HashSet<usize>,
         now: OffsetDateTime,
         now_ms: i64,
+        provider: crate::provider::Provider,
     ) -> Option<usize> {
         let reserved_groups = self.reserved_groups();
         let parked_groups = self.parked_groups();
@@ -2825,6 +2997,13 @@ impl Manager {
         let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
             if tried.contains(&idx) {
+                continue;
+            }
+            // `eligible`'s first gate, asked by hand because this pass does not
+            // call it. Not hypothetical: an account of the other provider has no
+            // `7d_oi` window at all, so it reads as the FRESHEST candidate below
+            // and would win this pick outright.
+            if account.provider != provider {
                 continue;
             }
             if account.disabled || account.status == AccountStatus::Error {
@@ -3123,6 +3302,7 @@ mod revalidation_sticky_tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3138,6 +3318,7 @@ mod revalidation_sticky_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3150,6 +3331,7 @@ mod revalidation_sticky_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3217,7 +3399,7 @@ mod revalidation_sticky_tests {
         // OTHER un-held alternate — the assertion three accounts (not two)
         // makes real, per B's own fixture comment.
         let served = manager
-            .select_revalidation(&HashSet::new(), now, None, Some(key))
+            .select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages")
             .expect("an un-held alternate serves this revalidation request");
         assert_eq!(
             served, sticky_dest,
@@ -3279,6 +3461,7 @@ mod sticky_divert_replay_tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3294,6 +3477,7 @@ mod sticky_divert_replay_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3306,6 +3490,7 @@ mod sticky_divert_replay_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3449,6 +3634,7 @@ mod strict_group_door_tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3464,6 +3650,7 @@ mod strict_group_door_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3476,6 +3663,7 @@ mod strict_group_door_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3943,6 +4131,7 @@ mod reserved_gate_agreement_tests {
             &Account {
                 name: "probe".to_string(),
                 account_type: crate::config::AccountType::OAuth,
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -3958,6 +4147,7 @@ mod reserved_gate_agreement_tests {
                 seat_tier: None,
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -3999,6 +4189,7 @@ mod reserved_gate_agreement_tests {
                     now,
                     now_ms,
                     false,
+                    crate::provider::Provider::Anthropic,
                     None,
                     None,
                     &reserved,
@@ -4069,6 +4260,7 @@ mod reserved_gate_agreement_tests {
                     now,
                     now_ms,
                     false,
+                    crate::provider::Provider::Anthropic,
                     Some(ask),
                     Some(ask),
                     &reserved,
@@ -4111,6 +4303,7 @@ mod group_miss_tests {
             &Account {
                 name: name.to_string(),
                 account_type: crate::config::AccountType::OAuth,
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -4126,6 +4319,7 @@ mod group_miss_tests {
                 seat_tier: None,
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -4149,6 +4343,7 @@ mod group_miss_tests {
             now,
             odt_to_ms(now),
             false,
+            crate::provider::Provider::Anthropic,
             group,
             &HashSet::new(),
             &HashSet::new(),
@@ -4232,6 +4427,67 @@ mod group_miss_tests {
             GroupMiss::Paced
         );
     }
+
+    /// `account`, as a Codex account.
+    fn codex_account(name: &str, groups: &[&str]) -> AccountRuntime {
+        let mut runtime = account(name, groups, false);
+        runtime.provider = crate::provider::Provider::Codex;
+        runtime
+    }
+
+    /// A Claude request to a group whose only member is a Codex account is not
+    /// a busy group: no Claude request will ever be served there, because Claude
+    /// and Codex accounts never serve each other's requests. The reason says
+    /// that, rather than "every account in the requested group is currently
+    /// unavailable", which reads as something time will fix.
+    #[test]
+    fn a_claude_request_to_a_codex_only_group_is_other_provider_only() {
+        let accounts = [
+            account("worker@example.com", &["dev"], false),
+            codex_account("bob@example.com/codex", &["lab"]),
+        ];
+        let miss = classify(&accounts, None, &PacingConfig::default(), "lab");
+        assert_eq!(miss, GroupMiss::OtherProviderOnly, "{miss:?}");
+        assert_eq!(miss.as_str(), "other-provider-only");
+        assert_eq!(
+            miss.explain(),
+            "the requested group has no account of this request's provider: Claude and Codex accounts never serve each other's requests"
+        );
+    }
+
+    /// A group holding the excluded control account and a Codex account is,
+    /// to a Claude request, a group holding only the control account: the Codex
+    /// member is not a candidate, so the reason is the control exclusion.
+    #[test]
+    fn a_control_plus_codex_group_is_only_control() {
+        let accounts = [
+            account("gil@example.com", &["research"], false),
+            codex_account("bob@example.com/codex", &["research"]),
+            account("worker@example.com", &[], false),
+        ];
+        assert_eq!(
+            classify(&accounts, Some(0), &PacingConfig::default(), "research"),
+            GroupMiss::OnlyControl
+        );
+    }
+
+    /// A row deleted from the file keeps its rotation slot and its old groups
+    /// until a restart. The narrowing is by provider only, so such a slot still
+    /// counts as a member of its own provider: a fleet with no Codex account,
+    /// whose group's only member was just deleted, keeps answering "unavailable"
+    /// and never names a provider it does not have.
+    #[test]
+    fn a_group_holding_only_a_removed_claude_slot_is_all_gated() {
+        let mut accounts = [
+            account("gone@example.com", &["lab"], true),
+            account("worker@example.com", &[], false),
+        ];
+        accounts[0].removed = true;
+        assert_eq!(
+            classify(&accounts, None, &PacingConfig::default(), "lab"),
+            GroupMiss::AllGated
+        );
+    }
 }
 
 /// Tests for the reset-urgency bucket ([`Manager::reset_urgency_tier`]) — the
@@ -4258,6 +4514,7 @@ mod reset_urgency_tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4273,6 +4530,7 @@ mod reset_urgency_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4285,6 +4543,7 @@ mod reset_urgency_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -4513,6 +4772,7 @@ mod fable_last_resort_tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4528,6 +4788,7 @@ mod fable_last_resort_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4540,6 +4801,7 @@ mod fable_last_resort_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -4892,6 +5154,7 @@ mod stale_pin_load_tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -4907,6 +5170,7 @@ mod stale_pin_load_tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4925,6 +5189,7 @@ mod stale_pin_load_tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -5079,5 +5344,894 @@ mod stale_pin_load_tests {
         let pins = manager.affinity.lock().expect("affinity lock poisoned");
         assert_eq!(pins.len(), 7, "no stale pin was evicted by the filter");
         assert!((1..=6).all(|k| pins.get(&k).map(|&(i, _)| i) == Some(1)));
+    }
+}
+
+/// **Selection filters by provider FIRST**: a Claude request and a Codex
+/// account have nothing to say to each other, in either direction (see
+/// `docs/architecture.md`, "Codex requests").
+///
+/// Every way out of `select_with_group` is a door, and an exhausted Anthropic
+/// fleet must answer 429 rather than spill onto a Codex account through any of
+/// them: the pool pick ([`Manager::eligible`]), the hard account lock, a
+/// session's pin, the control-preferred overlay, the Fable last resort, and the
+/// revalidation serve the proxy falls back to when the pick comes back empty.
+/// Each test below names the door it guards and the line that closes it.
+#[cfg(test)]
+mod provider_filter_tests {
+    use super::*;
+    use crate::config::{Account, ProxyConfig};
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::provider::Provider;
+    use crate::quota::QuotaWindow;
+    use crate::warmer::LiveWarmer;
+    use std::collections::HashSet;
+    use time::Duration;
+
+    const ANTHROPIC_PATH: &str = "/v1/messages";
+    const CODEX_PATH: &str = "/backend-api/codex/responses";
+
+    /// A healthy Anthropic account, the same shape every other module in this
+    /// file builds.
+    fn account(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
+            codex_home: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// The same account, on the Codex upstream.
+    fn codex(name: &str) -> Account {
+        Account {
+            provider: Provider::Codex,
+            ..account(name)
+        }
+    }
+
+    /// [`account`] as a runtime row, built by the constructor `assemble` uses,
+    /// for the pure [`Manager::eligible`] predicate.
+    fn runtime(name: &str) -> AccountRuntime {
+        AccountRuntime::from_config(&account(name), false)
+    }
+
+    #[test]
+    fn a_loaded_strict_codex_peer_exit_is_skipped_by_every_selection_path() {
+        let peer = tcr_peer_wire::PeerId([0x55; 32]);
+        let mut failures = Vec::new();
+        for door in ["pool", "affinity", "locked", "revalidation", "bound"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(crate::paths::CONFIG_FILE);
+            let mut config = config_with(vec![
+                Account {
+                    egress: crate::config::Egress::Via(peer),
+                    egress_strict: true,
+                    ..codex("alice@example.com/codex")
+                },
+                codex("bob@example.com/codex"),
+            ]);
+            config.proxy.port = 9;
+            if door == "locked" {
+                config.lock_account = Some("alice@example.com/codex".into());
+            }
+            crate::config::save(&path, &config).unwrap();
+            let config = crate::config::load(&path).unwrap();
+            assert_eq!(
+                config.accounts.len(),
+                2,
+                "the row remains available for repair"
+            );
+            assert!(config.accounts[0].egress_strict);
+            let manager = build(config);
+            let now = OffsetDateTime::now_utc();
+            pin(&manager, 77, 0, odt_to_ms(now));
+            let got = match door {
+                "pool" | "locked" => {
+                    manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None)
+                }
+                "affinity" => {
+                    manager.select(&HashSet::new(), now, None, Some(77), CODEX_PATH, None)
+                }
+                "revalidation" => {
+                    manager.select_revalidation(&HashSet::new(), now, None, Some(77), CODEX_PATH)
+                }
+                "bound" => manager.select_bound(
+                    0,
+                    &HashSet::new(),
+                    now,
+                    false,
+                    None,
+                    None,
+                    WarmWindow::DEFAULT,
+                ),
+                _ => unreachable!(),
+            };
+            let expected = if matches!(door, "locked" | "bound") {
+                None
+            } else {
+                Some(1)
+            };
+            if got != expected {
+                failures.push(format!("{door}: selected {got:?}, expected {expected:?}"));
+            }
+            if matches!(door, "affinity" | "revalidation") && pin_of(&manager, 77) != Some(1) {
+                failures.push(format!(
+                    "{door}: retained the unusable account's affinity pin"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn supported_peer_exit_settings_keep_their_selection_behavior() {
+        let peer = tcr_peer_wire::PeerId([0x55; 32]);
+        for (provider, egress, strict) in [
+            (Provider::Anthropic, crate::config::Egress::Via(peer), true),
+            (Provider::Codex, crate::config::Egress::Via(peer), false),
+            (Provider::Codex, crate::config::Egress::Local, true),
+        ] {
+            let manager = build(config_with(vec![Account {
+                provider,
+                egress,
+                egress_strict: strict,
+                ..account("alice@example.com")
+            }]));
+            let path = match provider {
+                Provider::Anthropic => ANTHROPIC_PATH,
+                Provider::Codex => CODEX_PATH,
+            };
+            assert_eq!(
+                manager.select(
+                    &HashSet::new(),
+                    OffsetDateTime::now_utc(),
+                    None,
+                    None,
+                    path,
+                    None
+                ),
+                Some(0),
+                "{provider:?} {egress:?}, strict={strict} remains selectable"
+            );
+        }
+    }
+
+    fn config_with(accounts: Vec<Account>) -> Config {
+        Config {
+            quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
+            proxy: ProxyConfig::default(),
+            upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
+            switch_threshold: 0.90,
+            fable_weekly_threshold: None,
+            pacing: PacingConfig::default(),
+            account_throttle: ThrottleConfig::default(),
+            fleet_throttle: ThrottleConfig::default(),
+            lock_account: None,
+            control_account: None,
+            control_reserve: 0.05,
+            control_pooled: false,
+            control_identity: Default::default(),
+            reset_urgency_tier_hours: 24,
+            http1_only: false,
+            accounts,
+            group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn build(config: Config) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// Seed a live pin directly, the same shape as `strict_group_door_tests::pin`.
+    fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .insert(key, (idx, touched_ms));
+    }
+
+    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx)
+    }
+
+    /// Set account `idx`'s window to `utilization`, resetting two hours out.
+    fn set_window(
+        manager: &Manager,
+        idx: usize,
+        window: fn(&mut crate::quota::Quota) -> &mut Option<QuotaWindow>,
+        utilization: f64,
+    ) {
+        let now = OffsetDateTime::now_utc();
+        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        *window(&mut accounts[idx].quota) = Some(QuotaWindow {
+            utilization,
+            reset: Some(now + Duration::hours(2)),
+        });
+    }
+
+    #[test]
+    fn classify_request_treats_the_codex_responses_path_as_inference() {
+        assert_eq!(
+            classify_request("/backend-api/codex/responses"),
+            RequestClass::Inference
+        );
+        assert_eq!(classify_request("/v1/messages"), RequestClass::Inference);
+        // Every other Codex path is relayed by the proxy before classification matters; it must at
+        // least not be mistaken for inference.
+        assert_ne!(
+            classify_request("/backend-api/wham/usage"),
+            RequestClass::Inference
+        );
+    }
+
+    /// The pool pick's door: `eligible` refuses a provider mismatch before any
+    /// other check, in both directions.
+    ///
+    /// Watched red: delete `eligible`'s `if account.provider != provider`
+    /// guard and the first assertion passes a Codex account for an Anthropic
+    /// request.
+    #[test]
+    fn eligible_refuses_an_account_of_the_other_provider() {
+        let mut codex = runtime("alice@example.com");
+        codex.provider = crate::provider::Provider::Codex;
+        let anthropic = runtime("bob@example.com");
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let pacing = PacingConfig::default();
+        let empty = HashSet::new();
+        // Same call shape as the existing `eligible` tests in this file; only `provider` is new.
+        assert!(
+            !Manager::eligible(
+                &codex,
+                0.9,
+                None,
+                &pacing,
+                false,
+                now,
+                now_ms,
+                false,
+                crate::provider::Provider::Anthropic,
+                None,
+                None,
+                &empty,
+                &empty
+            ),
+            "a Codex account must never serve an Anthropic request"
+        );
+        assert!(
+            !Manager::eligible(
+                &anthropic,
+                0.9,
+                None,
+                &pacing,
+                false,
+                now,
+                now_ms,
+                false,
+                crate::provider::Provider::Codex,
+                None,
+                None,
+                &empty,
+                &empty
+            ),
+            "an Anthropic account must never serve a Codex request"
+        );
+        assert!(Manager::eligible(
+            &codex,
+            0.9,
+            None,
+            &pacing,
+            false,
+            now,
+            now_ms,
+            false,
+            crate::provider::Provider::Codex,
+            None,
+            None,
+            &empty,
+            &empty
+        ));
+    }
+
+    /// One Codex account free and the only Anthropic account disabled: the
+    /// Anthropic request gets `None`, which the proxy turns into an honest
+    /// 429, and the Codex request is served.
+    ///
+    /// Watched red: the same `eligible` guard; without it the Anthropic request
+    /// lands on the Codex account.
+    #[test]
+    fn select_with_only_codex_accounts_free_refuses_an_anthropic_request() {
+        let disabled_anthropic = Account {
+            disabled: Some(true),
+            ..account("bob@example.com")
+        };
+        let manager = build(config_with(vec![
+            codex("alice@example.com"),
+            disabled_anthropic,
+        ]));
+        let picked = manager.select(
+            &HashSet::new(),
+            OffsetDateTime::now_utc(),
+            Some("claude-opus-5"),
+            None,
+            "/v1/messages",
+            None,
+        );
+        assert_eq!(
+            picked, None,
+            "an exhausted Anthropic fleet must 429, never spill to Codex"
+        );
+        let picked = manager.select(
+            &HashSet::new(),
+            OffsetDateTime::now_utc(),
+            Some("gpt-6-astra"),
+            None,
+            "/backend-api/codex/responses",
+            None,
+        );
+        assert_eq!(
+            picked,
+            Some(0),
+            "the Codex account serves the Codex request"
+        );
+    }
+
+    /// A hard lock constrains its own provider only. The other provider still
+    /// selects from its own pool and never receives the locked credential.
+    #[test]
+    fn a_hard_account_lock_never_serves_the_other_provider() {
+        let mut config = config_with(vec![codex("alice@example.com"), account("bob@example.com")]);
+        config.lock_account = Some("alice@example.com".to_string());
+        let manager = build(config);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, ANTHROPIC_PATH, None),
+            Some(1),
+            "a Codex lock must leave the Anthropic pool available"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None),
+            Some(0),
+            "the lock still holds for its own provider's requests"
+        );
+    }
+
+    /// A Claude lock leaves Codex selection independent, while its own
+    /// provider continues to use the exact locked slot.
+    #[test]
+    fn a_hard_account_lock_on_an_anthropic_account_never_serves_a_codex_request() {
+        let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+        config.lock_account = Some("alice@example.com".to_string());
+        let manager = build(config);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, CODEX_PATH, None),
+            Some(1),
+            "a Claude lock must leave the Codex pool available"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, ANTHROPIC_PATH, None),
+            Some(0),
+            "the lock still holds for its own provider's requests"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_claude_lock_does_not_hide_codex_capacity() {
+        let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+        config.lock_account = Some("alice@example.com".into());
+        let manager = build(config);
+        assert!(manager.codex_account_can_serve_eventually(None));
+        assert!(manager.codex_account_can_serve_eventually(Some(1)));
+        assert!(!manager.codex_account_can_serve_eventually(Some(0)));
+        assert_eq!(
+            manager.select(
+                &HashSet::from([0]),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                ANTHROPIC_PATH,
+                None
+            ),
+            None,
+            "the lock still prevents failover within its own provider"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_codex_lock_uses_its_slot_not_a_shared_name() {
+        let mut config = config_with(vec![
+            Account {
+                disabled: Some(true),
+                account_uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+                ..codex("alice@example.com")
+            },
+            Account {
+                account_uuid: Some("22222222-2222-2222-2222-222222222222".into()),
+                ..codex("alice@example.com")
+            },
+        ]);
+        config.lock_account = Some("alice@example.com".into());
+        let manager = build(config);
+        assert!(
+            !manager.codex_account_can_serve_eventually(None),
+            "a healthy same-named row is not the locked slot"
+        );
+        assert!(!manager.codex_account_can_serve_eventually(Some(1)));
+        assert_eq!(
+            manager.select(
+                &HashSet::from([0]),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                CODEX_PATH,
+                None
+            ),
+            None,
+            "a failed locked slot never falls through to its same-named sibling"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_unsupported_exit_excludes_only_its_exact_slot() {
+        let manager = build(config_with(vec![
+            Account {
+                account_uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+                egress: crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32])),
+                egress_strict: true,
+                ..codex("alice@example.com")
+            },
+            Account {
+                account_uuid: Some("22222222-2222-2222-2222-222222222222".into()),
+                ..codex("alice@example.com")
+            },
+        ]));
+        let now = OffsetDateTime::now_utc();
+        pin(&manager, 77, 1, odt_to_ms(now));
+        assert_eq!(
+            manager.codex_accounts_with_unsupported_exit(),
+            HashSet::from([0])
+        );
+        assert!(manager.codex_account_can_serve_eventually(Some(1)));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(77), CODEX_PATH, None),
+            Some(1)
+        );
+        assert_eq!(
+            pin_of(&manager, 77),
+            Some(1),
+            "the healthy same-named account keeps its pin"
+        );
+    }
+
+    #[test]
+    fn provider_isolation_request_reads_do_not_wait_for_a_config_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
+        let mut config = config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+        config.proxy.port = 9;
+        crate::config::save(&path, &config).unwrap();
+        let manager = Manager::new(
+            config.clone(),
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            Some(path.clone()),
+        );
+        assert_eq!(manager.provider_account_count(Provider::Anthropic), 1);
+        let writing = manager.config_write.lock().unwrap();
+        config.accounts.remove(0);
+        crate::config::save(&path, &config).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let count = worker_manager.provider_account_count(Provider::Anthropic);
+            let selected = worker_manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                ANTHROPIC_PATH,
+                None,
+            );
+            let codex_available = worker_manager.codex_account_can_serve_eventually(None);
+            done_tx.send((count, selected, codex_available)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let result = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(writing);
+        worker.join().unwrap();
+        assert_eq!(
+            result.expect("request reads must use cached state during an in-flight config write"),
+            (1, Some(0), true)
+        );
+        assert_eq!(
+            manager.provider_account_count(Provider::Anthropic),
+            0,
+            "the completed delete is reloaded on the next request"
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                ANTHROPIC_PATH,
+                None
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_isolation_fleet_throttle_does_not_pace_the_other_upstream() {
+        for first in [Provider::Anthropic, Provider::Codex] {
+            let mut config =
+                config_with(vec![account("alice@example.com"), codex("bob@example.com")]);
+            config.fleet_throttle = ThrottleConfig {
+                min_spacing_ms: Some(60_000),
+                burst: Some(1),
+            };
+            let manager = build(config);
+            let first_idx = match first {
+                Provider::Anthropic => 0,
+                Provider::Codex => 1,
+            };
+            let second_idx = 1 - first_idx;
+            let paths = [ANTHROPIC_PATH, CODEX_PATH];
+            manager.throttle_send(paths[first_idx], first_idx).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                manager.throttle_send(paths[second_idx], second_idx),
+            )
+            .await
+            .expect("the other provider has its own fleet burst");
+            for idx in [first_idx, second_idx] {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        manager.throttle_send(paths[idx], idx)
+                    )
+                    .await
+                    .is_err(),
+                    "same-provider requests still consume the fleet throttle"
+                );
+            }
+        }
+    }
+
+    async fn assert_org_throttle_is_provider_scoped(org_uuid: Option<&str>) {
+        for first_idx in [0, 1] {
+            let mut accounts = vec![
+                account("alice@example.com"),
+                codex("bob@example.com"),
+                account("carol@example.com"),
+                codex("dave@example.com"),
+            ];
+            for account in &mut accounts {
+                account.org_uuid = org_uuid.map(str::to_string);
+                account.org_name = Some("Example Org".into());
+            }
+            let mut config = config_with(accounts);
+            config.account_throttle = ThrottleConfig {
+                min_spacing_ms: Some(60_000),
+                burst: Some(1),
+            };
+            let manager = build(config);
+            let second_idx = 1 - first_idx;
+            let paths = [ANTHROPIC_PATH, CODEX_PATH];
+            manager.throttle_send(paths[first_idx], first_idx).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                manager.throttle_send(paths[second_idx], second_idx),
+            )
+            .await
+            .expect("equal organization identities on different providers have independent bursts");
+            for idx in [first_idx, second_idx] {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        manager.throttle_send(paths[idx], idx + 2)
+                    )
+                    .await
+                    .is_err(),
+                    "accounts in one organization on the same provider still share its throttle"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_isolation_org_throttle_uuid_does_not_pace_the_other_upstream() {
+        assert_org_throttle_is_provider_scoped(Some("11111111-1111-1111-1111-111111111111")).await;
+    }
+
+    #[tokio::test]
+    async fn provider_isolation_org_throttle_name_does_not_pace_the_other_upstream() {
+        assert_org_throttle_is_provider_scoped(None).await;
+    }
+
+    /// **A SESSION'S PIN NEVER CROSSES PROVIDERS.** The affinity fast path
+    /// serves a pin that fails `eligible` whenever the account is still alive
+    /// (`Manager::account_hard_ok`) and the session is warm: the over-threshold
+    /// pin-honor serve. A pin on the other provider's account passes
+    /// `account_hard_ok`, which knows nothing about the request, so without its
+    /// own check that serve hands an Anthropic request to a Codex account.
+    ///
+    /// A DIVERT and not a re-key: the mismatch is a fact about this request,
+    /// like the model-class and strict-group diverts, so the pin stays where
+    /// the session's other traffic is warm.
+    ///
+    /// Watched red: delete the fast path's provider divert and the request is
+    /// served on the pinned Codex account (`Some(0)`) by the pin-honor serve.
+    #[test]
+    fn a_pin_on_the_other_providers_account_is_diverted_never_served() {
+        let manager = build(config_with(vec![
+            codex("alice@example.com"),
+            account("bob@example.com"),
+        ]));
+        let now = OffsetDateTime::now_utc();
+        // Touched just now, so the session is warm and the pin-honor serve is live.
+        pin(&manager, 7, 0, odt_to_ms(now));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(7), ANTHROPIC_PATH, None),
+            Some(1),
+            "the Anthropic request is served by the Anthropic account"
+        );
+        assert_eq!(
+            pin_of(&manager, 7),
+            Some(0),
+            "a divert, not a re-key: the session keeps its pin"
+        );
+    }
+
+    /// **THE CONTROL-PREFERRED OVERLAY'S DOOR.** Only the Codex responses path
+    /// is inference; every other `/backend-api/` path classifies as
+    /// control-preferred, and the overlay routes it through
+    /// `Manager::control_eligible`, which deliberately bypasses `eligible`. The
+    /// control account is an Anthropic identity (`assemble` refuses a Codex
+    /// one), so without a provider check a Codex control-plane request is
+    /// routed onto it. The proxy relays those paths under the client's own
+    /// bearer before selection; this is the picker's own guarantee.
+    ///
+    /// Watched red: drop the overlay's provider check and the Codex request is
+    /// served on the Anthropic control account (`Some(1)`).
+    #[test]
+    fn the_control_overlay_never_routes_the_other_providers_request() {
+        let mut config = config_with(vec![codex("alice@example.com"), account("bob@example.com")]);
+        config.control_account = Some(crate::config::ControlAccountRef::Name(
+            "bob@example.com".to_string(),
+        ));
+        let manager = build(config);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/backend-api/wham/usage",
+                None
+            ),
+            Some(0),
+            "a Codex control-plane request degrades to its own provider's pool, never the Anthropic control account"
+        );
+        // The control: an Anthropic control-plane request still prefers it.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/organizations", None),
+            Some(1),
+            "control-preferred routing is unchanged for its own provider"
+        );
+    }
+
+    /// **THE FABLE LAST RESORT'S DOOR.** `pick_fable_last_resort` mirrors
+    /// `eligible`'s gates by hand rather than calling it, and a Codex account
+    /// carries no `7d_oi` window at all (tcr reads no model-scoped window from
+    /// Codex), so it reads as the FRESHEST candidate and would win the last
+    /// resort outright.
+    ///
+    /// Watched red: drop the last resort's provider check and the Fable request
+    /// is served on the Codex account (`Some(1)`).
+    #[test]
+    fn the_fable_last_resort_never_reaches_the_other_provider() {
+        let manager = build(config_with(vec![
+            account("alice@example.com"),
+            codex("bob@example.com"),
+        ]));
+        // Over the predicted Fable threshold (0.90), not rejected upstream: the
+        // shape that sends a Fable request to the last resort.
+        set_window(&manager, 0, |q| &mut q.seven_day_oi, 0.97);
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                Some("claude-fable-5"),
+                None,
+                ANTHROPIC_PATH,
+                None
+            ),
+            Some(0),
+            "the last resort spends its one request on the Anthropic account, never the Codex one"
+        );
+    }
+
+    /// **THE REVALIDATION SERVE'S DOOR**, the one the proxy opens when the pick
+    /// comes back empty (`revalidationServe` ships ON). Its fallback serves the
+    /// least-utilized account that passes the hard gates alone, and an idle
+    /// Codex account is the least utilized account on any mixed fleet whose
+    /// Anthropic half is over the soft threshold.
+    ///
+    /// Watched red: drop the provider check from `select_revalidation`'s
+    /// `hard_ok` and the Anthropic request is revalidated onto the Codex
+    /// account (`Some(1)`).
+    #[test]
+    fn codex_and_claude_revalidation_valves_are_independent() {
+        for order in [
+            [(CODEX_PATH, 1), (ANTHROPIC_PATH, 0)],
+            [(ANTHROPIC_PATH, 0), (CODEX_PATH, 1)],
+        ] {
+            let manager = build(config_with(vec![
+                account("alice@example.com"),
+                codex("bob@example.com"),
+            ]));
+            set_window(&manager, 0, |quota| &mut quota.five_hour, 0.99);
+            set_window(&manager, 1, |quota| &mut quota.five_hour, 0.99);
+            let now = OffsetDateTime::now_utc();
+            for (path, index) in order {
+                assert_eq!(
+                    manager.select(&HashSet::new(), now, None, None, path, None),
+                    None
+                );
+                assert_eq!(
+                    manager.select_revalidation(&HashSet::new(), now, None, None, path),
+                    Some(index),
+                    "one provider must not spend the other's revalidation valve"
+                );
+                assert_eq!(
+                    manager.select_revalidation(&HashSet::new(), now, None, None, path),
+                    None,
+                    "same-provider bursts remain bounded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revalidation_never_serves_the_other_provider() {
+        let manager = build(config_with(vec![
+            account("alice@example.com"),
+            codex("bob@example.com"),
+        ]));
+        set_window(&manager, 0, |q| &mut q.five_hour, 0.95);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, ANTHROPIC_PATH, None),
+            None,
+            "precondition: the Anthropic pool reads exhausted to the normal pick"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None, ANTHROPIC_PATH),
+            Some(0),
+            "revalidation serves the over-threshold Anthropic account, never the idle Codex one"
+        );
+    }
+
+    /// **THE REVALIDATION SERVE'S PIN-HONOR DOOR**, the pin half of the test
+    /// above. A session pinned on the Codex account sends an Anthropic request
+    /// into `select_revalidation`: the pin-honor serve must refuse the pin (its
+    /// `hard_ok` asks the provider first) and the fallback serves the Anthropic
+    /// account. The pin itself is KEPT: the Codex account is alive
+    /// (`Manager::account_hard_ok` judges the account, not the request), so this
+    /// is a divert like `select`'s other-provider divert, never a re-key.
+    ///
+    /// Watched red twice: drop the provider check from `select_revalidation`'s
+    /// `hard_ok` and the pin-honor serve hands the request to the Codex account
+    /// (`Some(0)`); make the keep-pin test ask the provider too (a re-key) and
+    /// the session's pin moves to the Anthropic account.
+    #[test]
+    fn revalidation_diverts_a_pin_on_the_other_providers_account_and_keeps_it() {
+        let manager = build(config_with(vec![
+            codex("alice@example.com"),
+            account("bob@example.com"),
+        ]));
+        let now = OffsetDateTime::now_utc();
+        // Touched just now: a warm session, so nothing but the provider stands
+        // between the pin and the pin-honor serve.
+        pin(&manager, 7, 0, odt_to_ms(now));
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, Some(7), ANTHROPIC_PATH),
+            Some(1),
+            "the Anthropic request is revalidated onto the Anthropic account"
+        );
+        assert_eq!(
+            pin_of(&manager, 7),
+            Some(0),
+            "a divert, not a re-key: the session keeps its pin"
+        );
+    }
+
+    /// The Fable weekly bucket is an Anthropic fact; a Codex request never
+    /// consults it, at either place a request's class is computed
+    /// (`select_with_group` and `select_revalidation`).
+    ///
+    /// The model id is a fixture that merely CONTAINS "fable", because that is
+    /// all `crate::model::is_fable_model` asks. No Codex account carries a
+    /// `7d_oi` window (tcr reads no model-scoped window from Codex), so one is
+    /// set by hand here: it is the only way to observe the gate, and the test
+    /// pins the rule rather than a failure seen live.
+    ///
+    /// Watched red: drop the `provider == Anthropic` term from either `is_fable`
+    /// and that call answers `None` (the window reads as a hard rejection).
+    #[test]
+    fn a_codex_request_never_consults_the_fable_weekly_bucket() {
+        let now = OffsetDateTime::now_utc();
+        let manager = build(config_with(vec![codex("alice@example.com")]));
+        set_window(&manager, 0, |q| &mut q.seven_day_oi, 1.0);
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("gpt-6-fable"),
+                None,
+                CODEX_PATH,
+                None
+            ),
+            Some(0),
+            "select must not gate a Codex request on the Fable bucket"
+        );
+        // A second manager: the revalidation serve spends a fleet-wide 2 s
+        // window per serve, and this assertion must not depend on that.
+        let manager = build(config_with(vec![codex("alice@example.com")]));
+        set_window(&manager, 0, |q| &mut q.seven_day_oi, 1.0);
+        assert_eq!(
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("gpt-6-fable"),
+                None,
+                CODEX_PATH
+            ),
+            Some(0),
+            "select_revalidation must not gate a Codex request on the Fable bucket"
+        );
     }
 }

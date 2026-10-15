@@ -1,6 +1,6 @@
-//! Proves a first run works: `tcr status` on a box with no config must exit 0
-//! and leave a real config file behind, under the new name `~/.config/tcr.json`.
-//! An install that already has `~/.config/teamclaude.json` keeps using it.
+//! Proves first-run file creation through status and offline accounts, plus status
+//! output through an existing empty config on an isolated port. Fresh installs use `~/.config/tcr.json`;
+//! an install that already has `~/.config/teamclaude.json` keeps using it.
 //!
 //! This is an end-to-end test of the BUILT BINARY rather than a unit test of
 //! `config::load_or_init`, because the defect it guards was never in the load
@@ -11,20 +11,27 @@
 //! the dmg showed an error in the menu bar while the proxy behind it was up. A
 //! unit test on the config module would have stayed green through all of that.
 //!
+//! An explicit missing config takes the first-empty-fleet offline path before any
+//! port probe. Existing-config status fixtures name an isolated port.
+//!
 //! # Isolation
 //!
 //! Same rules as `tests/headless_sigterm.rs`: `HOME` points at a fresh
 //! [`tempfile::TempDir`] and `XDG_CACHE_HOME` is removed, both set on the
 //! spawned [`Command`] rather than on this test process, so the real
 //! `~/.config/teamclaude.json` — which holds working credentials — and the live
-//! proxy reading it are never touched. Nothing here binds a port or signals a
-//! process: `tcr status` with no server running falls back to its offline
-//! snapshot, which is exactly the first-run case under test.
+//! proxy reading it are never touched. A test-only libc guard rejects port 3456 and
+//! non-loopback connections before they leave the child, and records attempts without
+//! account data. Its positive control uses only an owned ephemeral listener. Status
+//! with an explicit fixture port falls back to its offline snapshot.
+#[path = "support/connect_guard.rs"]
+mod connect_guard;
+
 use std::path::PathBuf;
 use std::process::Command;
 
 /// The config path the child will resolve from its own `HOME`
-/// (`config::default_path`) when nothing is there yet: the new name.
+/// (`config::default_path`).
 fn config_path_in(home: &std::path::Path) -> PathBuf {
     home.join(".config").join(tcr::paths::CONFIG_FILE)
 }
@@ -36,10 +43,37 @@ fn legacy_config_path_in(home: &std::path::Path) -> PathBuf {
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
 fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
+    if args.first() == Some(&"status") {
+        let explicit = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--config").then(|| std::path::PathBuf::from(pair[1])));
+        let path = explicit.clone().unwrap_or_else(|| config_path_in(home));
+        if path.exists() {
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let port = config["proxy"]["port"]
+                .as_u64()
+                .expect("an existing status fixture configures its port");
+            assert_ne!(port, 3456, "never contact the live proxy");
+        } else {
+            assert!(
+                explicit.is_some(),
+                "missing-file status must name its isolated config explicitly"
+            );
+            assert!(
+                path.starts_with(home),
+                "the new file belongs to this fixture's HOME"
+            );
+        }
+    }
     let bin = env!("CARGO_BIN_EXE_tcr");
-    let out = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .env("HOME", home)
+        .env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
         // A scratch HOME does not scratch the login Keychain: the first-run
         // path now imports this machine's Claude Code login when it finds one,
         // and on a developer's mac that is a REAL credential. Pointing the
@@ -51,9 +85,12 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
             "TCR_CLAUDE_CODE_CREDENTIALS",
             home.join("no-such-claude-code-credentials.json"),
         )
-        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_CACHE_HOME");
+    let guard = connect_guard::ConnectGuard::attach(&mut command, home);
+    let out = command
         .output()
         .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));
+    guard.assert_no_connections();
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -66,59 +103,82 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
 /// the `config i/o error: No such file or directory` text in stderr — observed
 /// on `346ea60` before the fix, not hypothesised.
 #[test]
-fn status_with_no_config_exits_zero_and_creates_the_file() {
+fn status_with_an_empty_config_exits_zero_offline() {
     let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
     let config = config_path_in(home.path());
-    assert!(
-        !config.exists(),
-        "the scratch HOME must start with no config — this test proves the FIRST run"
-    );
+    std::fs::create_dir_all(config.parent().expect("the config's parent"))
+        .expect("create the fixture config directory");
+    let before = b"{\"proxy\":{\"port\":9},\"accounts\":[]}";
+    std::fs::write(&config, before).expect("write the isolated empty config");
 
     let (code, stdout, stderr) = run_tcr(home.path(), &["status", "--json"]);
     assert_eq!(
         code,
         Some(0),
-        "`tcr status --json` on a fresh HOME must exit 0 (TcrBar renders any other \
+        "`tcr status --json` on an empty fleet must exit 0 (TcrBar renders any other \
          exit as a failed poll). stderr={stderr}"
     );
 
-    // The file is on disk afterwards, and it is a config a later run can read —
-    // asserted by parsing it, not by `exists()`, so a zero-byte or half-written
-    // file cannot pass.
+    // A read-only status must retain the explicit fixture port and the config bytes.
     let written = std::fs::read_to_string(&config)
         .unwrap_or_else(|err| panic!("no config at {} after the run: {err}", config.display()));
     let parsed: serde_json::Value =
         serde_json::from_str(&written).unwrap_or_else(|err| panic!("unparseable config: {err}"));
+    assert_eq!(written.as_bytes(), before);
+    assert_eq!(parsed["proxy"]["port"], 9);
     assert_eq!(
         parsed.get("accounts").and_then(|a| a.as_array()),
         Some(&vec![]),
         "a created config must hold an empty accounts array, got {written}"
     );
 
-    // stdout stays a decodable fleet array for TcrBar and for `jq` — never an
-    // error string. Its LENGTH is deliberately not asserted here: `status`
-    // probes the configured port, and a developer box may have a real proxy
-    // answering on it, whose fleet is not this tempdir's. `tcr accounts` below
-    // is the offline verb and carries the empty-fleet assertion instead.
-    // Nothing from that stdout is echoed into a panic message: it can hold real
-    // account names.
+    // The status read is offline and this fixture has no accounts, so the array is empty.
     let fleet: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|_| panic!("`status --json` stdout is not a JSON document"));
-    assert!(
-        fleet.is_array(),
-        "`status --json` must emit a JSON array, not an object or a string"
-    );
+    assert_eq!(fleet, serde_json::json!([]));
     assert!(
         stderr.contains("no accounts configured — run `tcr login` to add one"),
         "the empty-fleet hint must be on stderr, got: {stderr}"
     );
-    assert!(
-        stderr.contains("created") && stderr.contains(tcr::paths::CONFIG_FILE),
-        "creating the config must say so once, got: {stderr}"
+}
+
+/// Status itself initializes a missing file, not only the offline accounts verb.
+/// The creation-aware status path never probes a default port for this empty first run.
+#[test]
+fn status_with_an_explicit_missing_config_creates_an_empty_offline_fleet() {
+    let home = tempfile::tempdir().unwrap();
+    let config = config_path_in(home.path());
+    assert!(!config.exists());
+    let (code, stdout, stderr) = run_tcr(
+        home.path(),
+        &["status", "--json", "--config", config.to_str().unwrap()],
     );
+    assert_eq!(
+        code,
+        Some(0),
+        "a first status read must initialize the file: {stderr}"
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    assert_eq!(document["accounts"], serde_json::json!([]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn a_first_run_text_status_still_explains_claudes_route() {
+    let home = tempfile::tempdir().unwrap();
+    let config = config_path_in(home.path());
+    let (code, stdout, _) = run_tcr(
+        home.path(),
+        &["status", "--config", config.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(0));
     assert!(
-        !legacy_config_path_in(home.path()).exists(),
-        "a fresh install gets only the new name"
+        stdout.contains("Claude") && stdout.contains("verdict:"),
+        "first-run text status retains the environment-only Claude route verdict"
     );
 }
 
@@ -172,6 +232,14 @@ fn accounts_with_no_config_exits_zero_with_an_empty_table() {
         config_path_in(home.path()).exists(),
         "`tcr accounts` must create the config it could not find"
     );
+    assert!(
+        stderr.contains("created") && stderr.contains(tcr::paths::CONFIG_FILE),
+        "creating the config must say so once, got: {stderr}"
+    );
+    assert!(
+        !legacy_config_path_in(home.path()).exists(),
+        "a fresh install gets only the new name"
+    );
 }
 
 /// The second run must be an ordinary run: no second "created" line, still
@@ -193,5 +261,128 @@ fn the_second_run_reuses_the_file_it_created() {
         std::fs::read(config_path_in(home.path())).expect("the config is still there"),
         after_first,
         "a read-only verb must leave the file byte-for-byte alone"
+    );
+}
+
+/// [`run_tcr`]'s command, with codex's own login pinned inside the scratch `HOME`: `CODEX_HOME`
+/// and `TCR_CODEX_AUTH` are removed, so the only codex login the child can find is
+/// `<home>/.codex/auth.json`. A developer's mac usually has a real one at `~/.codex`, and a
+/// first run that found it would print a line these assertions are not about.
+fn command_without_codex(home: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .args(args)
+        .env("HOME", home)
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("no-such-claude-code-credentials.json"),
+        )
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("CODEX_HOME")
+        .env_remove("TCR_CODEX_AUTH");
+    command
+}
+
+/// Run `command`, returning (exit code, stdout, stderr).
+fn outcome(command: &mut Command) -> (Option<i32>, String, String) {
+    let out = command
+        .output()
+        .unwrap_or_else(|err| panic!("spawning the built tcr binary failed: {err}"));
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `tcr <args…>` through [`command_without_codex`].
+fn run_tcr_without_codex(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
+    outcome(&mut command_without_codex(home, args))
+}
+
+/// `text` with the scratch HOME, as written and in its canonical form, replaced by `<home>`.
+fn normalize_home(text: &str, home: &std::path::Path) -> String {
+    let mut out = text.to_string();
+    if let Ok(canonical) = std::fs::canonicalize(home) {
+        out = out.replace(&canonical.display().to_string(), "<home>");
+    }
+    out.replace(&home.display().to_string(), "<home>")
+}
+
+/// What a first run prints with no codex login on the machine, pinned before the empty-fleet
+/// hint learned about codex logins: with no evidence of codex, the lines are exactly the ones a
+/// Claude-only first run always printed. Twice, each on a fresh HOME: once with no
+/// `CODEX_HOME`, and once with `CODEX_HOME` naming an empty folder.
+#[test]
+fn an_empty_fleet_without_a_codex_login_prints_todays_lines() {
+    const STDERR: &str = "[tcr] created <home>/.config/tcr.json with no accounts\n\
+                          no accounts configured — run `tcr login` to add one\n";
+
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let (code, stdout, stderr) = run_tcr_without_codex(home.path(), &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "no accounts configured\n");
+    assert_eq!(normalize_home(&stderr, home.path()), STDERR);
+
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let empty_codex_home = tempfile::tempdir().expect("an empty CODEX_HOME must be creatable");
+    let (code, stdout, stderr) = outcome(
+        command_without_codex(home.path(), &["accounts"])
+            .env("CODEX_HOME", empty_codex_home.path()),
+    );
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "no accounts configured\n");
+    assert_eq!(normalize_home(&stderr, home.path()), STDERR);
+}
+
+/// Puts a file's mode back to `0o600` when dropped, so a test that made it unreadable leaves
+/// nothing behind that its tempdir cannot clean up, whether its assertions pass or not.
+struct RestoreMode<'a>(&'a std::path::Path);
+
+impl Drop for RestoreMode<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _restored = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// A first run on a machine where codex holds a login prints one more stderr line, after the
+/// empty-fleet line: the two ways to pool codex. The login is evidence and nothing more: it is
+/// checked for existence, never opened (the file here is unreadable to everyone, and still
+/// counts), never imported, and left exactly as it was.
+#[test]
+fn a_codex_login_on_disk_adds_one_hint_line() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
+    let login = home.path().join(".codex").join("auth.json");
+    std::fs::create_dir_all(login.parent().expect("the login has a parent"))
+        .expect("creating the scratch .codex dir");
+    std::fs::write(&login, "").expect("writing an empty login file");
+    std::fs::set_permissions(&login, std::fs::Permissions::from_mode(0o000))
+        .expect("making the login unreadable");
+    let _restore = RestoreMode(&login);
+
+    let (code, stdout, stderr) = run_tcr_without_codex(home.path(), &["accounts"]);
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "no accounts configured\n");
+    assert_eq!(
+        normalize_home(&stderr, home.path()),
+        "[tcr] created <home>/.config/tcr.json with no accounts\n\
+         no accounts configured — run `tcr login` to add one\n\
+         [tcr] found a codex login at <home>/.codex/auth.json: `tcr login --codex` adds a Codex \
+         account of tcr's own, and `tcr login --from-codex` imports that one with guarded \
+         token updates shared through auth.json\n"
+    );
+
+    let after = std::fs::metadata(&login).expect("the login is still there");
+    assert_eq!(after.len(), 0, "the login file is untouched");
+    assert_eq!(after.mode() & 0o777, 0o000, "the login file keeps its mode");
+    let written = std::fs::read_to_string(config_path_in(home.path())).expect("the config");
+    let parsed: serde_json::Value = serde_json::from_str(&written).expect("a readable config");
+    assert_eq!(
+        parsed.get("accounts").and_then(|a| a.as_array()),
+        Some(&vec![]),
+        "nothing is imported from a codex login: {written}"
     );
 }

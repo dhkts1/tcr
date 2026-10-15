@@ -5,7 +5,11 @@ import TcrBarCore
 /// every quota window carries. Named once here rather than nested in
 /// ``AccountCard`` so both Compact and Comfortable build their rows from the
 /// one type, instead of one of them re-deriving it.
+///
+/// `window` says which slot the row is, which its label no longer does on its
+/// own: a Codex plan's window is labelled by its length (`30d`).
 struct QuotaWindowSpec {
+    let window: Account.QuotaWindow
     let label: String
     let value: Double?
     let tint: QuotaBarTintSource
@@ -192,7 +196,7 @@ struct QuotaRow: View {
         .frame(minHeight: V4.lineHeight(V4.dimSize))
         .padding(.top, V4.quotaMarginTop)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label) window")
+        .accessibilityLabel(QuotaFormat.spokenWindowLabel(label))
         .accessibilityValue(
             QuotaFormat.spokenWindowValue(
                 value: value, state: role, resetAtMs: resetAtMs, now: now))

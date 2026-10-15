@@ -13,6 +13,11 @@ import Foundation
 ///   live count was 17, not 14. The extra three were sessions that had just
 ///   started, which is exactly the moment an operator most wants to see one
 ///   appear, so a brand-new session must stay visible on its own.
+///
+/// Claude sessions only. The rule was measured on Claude Code's cache-warming
+/// stubs, and nothing measured it on codex: a one-shot `codex exec` is one
+/// request and no tool call, the same shape, and folding it away would hide a
+/// session someone ran on purpose.
 public enum SessionWarmup {
     /// Two requests: enough for a cache-warming round trip, not enough to be
     /// a session anyone is actually driving.
@@ -24,7 +29,8 @@ public enum SessionWarmup {
     public static let idleThresholdSeconds: TimeInterval = 5 * 60
 
     public static func isWarmup(_ session: JoinedSession, now: Date) -> Bool {
-        session.session.requests <= maxRequests
+        session.session.provider != .codex
+            && session.session.requests <= maxRequests
             && session.session.tools.calls == 0
             && now.timeIntervalSince(session.lastSeenAt) > idleThresholdSeconds
     }
@@ -74,9 +80,14 @@ public struct SessionsFold: Equatable {
     /// fold.
     public var totalCount: Int { visible.count + warmups.count }
 
+    /// What the folded sessions spent, summed over the priced ones
+    /// (``Session/pricedCostUsd``): an unpriced session adds no dollars, rather
+    /// than a zero nobody measured.
     public var warmupCost: Double? {
         var spend: Double?
-        for session in warmups { spend = UsageTotals.addCost(spend, session.session.costUsd) }
+        for session in warmups {
+            spend = UsageTotals.addCost(spend, session.session.pricedCostUsd)
+        }
         return spend
     }
 

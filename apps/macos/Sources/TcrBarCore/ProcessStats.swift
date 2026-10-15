@@ -391,6 +391,39 @@ public enum ProcessKill {
     }
 }
 
+/// How many codex sessions are running on this Mac: one input of the Accounts tab's line that
+/// says codex is running and nothing reaches tcr.
+///
+/// What the process table calls codex. The native binary is named `codex`. The npm package
+/// runs as `node`, with the shim's path as an argument after the program's own name, and
+/// starts the native binary as its child; that child is the same session and is not counted
+/// twice. A shape this misses draws no line, never a false one.
+///
+/// The arguments are read for `node` processes only, and only to test that suffix: they are
+/// never kept, logged or shown.
+public enum CodexProcesses {
+    /// The sessions in `table`: every `node` whose arguments after its own name hold a path
+    /// ending in `/codex`, plus every `codex` whose parent is not one of those. `arguments` is
+    /// asked about `node` processes only, and `nil` (an argument list that cannot be read)
+    /// counts as no match.
+    public static func count(in table: [ProcessSnapshot], arguments: (Int32) -> [String]?) -> Int {
+        var shims: Set<Int32> = []
+        for process in table where process.name == "node" {
+            guard let argv = arguments(process.pid) else { continue }
+            if argv.dropFirst().contains(where: { $0.hasSuffix("/codex") }) {
+                shims.insert(process.pid)
+            }
+        }
+        let natives = table.filter { $0.name == "codex" && !shims.contains($0.parentPid) }
+        return shims.count + natives.count
+    }
+
+    /// The live count, off one walk of the process table.
+    public static func readLive() -> Int {
+        count(in: ProcessTable.read(), arguments: ProcessTable.arguments(pid:))
+    }
+}
+
 /// The live process table. The one impure thing in this file.
 public enum ProcessTable {
     /// Every process this user can see, as ``ProcessSnapshot`` values.
@@ -443,6 +476,37 @@ public enum ProcessTable {
                     + Double(info.pbi_start_tvusec) / 1_000_000),
             cpuSeconds: usage?.cpuSeconds ?? 0,
             residentBytes: usage?.residentBytes ?? 0)
+    }
+
+    /// One process's argument list, `argv[0]` first, or `nil` when it cannot be read: another
+    /// user's process, a process that exited, or a buffer shorter than it says.
+    ///
+    /// `sysctl` with `KERN_PROCARGS2`, sized by a first call with no buffer. The buffer holds
+    /// `argc` as an `Int32`, the executable's path, NUL padding, then `argc` NUL-terminated
+    /// strings; the environment that follows is never read.
+    public static func arguments(pid: Int32) -> [String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 else { return nil }
+        let argcSize = MemoryLayout<Int32>.size
+        guard size > argcSize else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, u_int(mib.count), &buffer, &size, nil, 0) == 0, size > argcSize
+        else { return nil }
+        let argc = buffer.withUnsafeBytes { Int($0.load(as: Int32.self)) }
+        guard argc > 0 else { return nil }
+        var index = argcSize
+        // The executable's path, then the NUL padding after it.
+        while index < size, buffer[index] != 0 { index += 1 }
+        while index < size, buffer[index] == 0 { index += 1 }
+        var arguments: [String] = []
+        while arguments.count < argc, index < size {
+            let start = index
+            while index < size, buffer[index] != 0 { index += 1 }
+            arguments.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return arguments.count == argc ? arguments : nil
     }
 
     /// `proc_pid_rusage`'s two figures: CPU nanoseconds (user + system) and

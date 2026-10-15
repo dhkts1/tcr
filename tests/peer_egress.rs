@@ -1528,14 +1528,14 @@ fn capture() -> (Collector, tracing::subscriber::DefaultGuard) {
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in egress tests".into())) })
     }
 }
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _access_token: String) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -1563,6 +1563,7 @@ fn fake_account() -> Account {
     Account {
         name: "alice@example.com".to_string(),
         account_type: tcr::config::AccountType::OAuth,
+        provider: Default::default(),
         account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
         org_uuid: None,
         org_name: None,
@@ -1578,6 +1579,7 @@ fn fake_account() -> Account {
         seat_tier: None,
         egress: tcr::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }
@@ -1616,6 +1618,7 @@ fn fleet_with(upstream: &str, accounts: Vec<Account>) -> Arc<Manager> {
         rename_write_error: None,
         proxy: ProxyConfig::default(),
         upstream: upstream.to_string(),
+        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: 0.95,
         fable_weekly_threshold: None,
         pacing: PacingConfig {
@@ -2273,7 +2276,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     // matches on the name, and this file is written by the binary under test.
     std::fs::write(
         &config,
-        r#"{"accounts":[{"name":"work-fake","accessToken":"not-a-real-token"}]}"#,
+        r#"{"proxy":{"port":9},"accounts":[{"name":"work-fake","accessToken":"not-a-real-token"}]}"#,
     )
     .expect("the config fixture writes");
 
@@ -2391,7 +2394,42 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
 
 /// `tcr peer <args>` out of this build, never the installed binary.
 fn run_tcr_peer(peers: &std::path::Path, args: &[&str]) -> (String, String, bool) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+    let home = peers
+        .parent()
+        .expect("the peers fixture has a directory")
+        .join("cli-home");
+    let config_dir = home.join(".config");
+    let codex_home = home.join("codex");
+    std::fs::create_dir_all(&config_dir).expect("create the fixture's config directory");
+    std::fs::create_dir_all(&codex_home).expect("create the fixture's Codex directory");
+    let default_config = config_dir.join("teamclaude.json");
+    if !default_config.exists() {
+        std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
+            .expect("write the fixture's offline default config");
+    }
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .env("HOME", &home)
+        .env("CFFIXED_USER_HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("CODEX_HOME", &codex_home)
+        .env("TCR_CODEX_AUTH", codex_home.join("auth.json"))
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("claude-credentials.json"),
+        );
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    let output = command
         .arg("peer")
         .args(args)
         .arg("--peers")
@@ -3977,26 +4015,125 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
     }
 }
 
-/// G-new-1: the peer gateway's origin allow-list must be the SAME list the
-/// local proxy enforces, `src/mitm.rs`'s `ALLOWED_HOSTS`, not a second
-/// literal that merely agrees today. `PEER_EGRESS_HOSTS` is now defined as
-/// `crate::mitm::ALLOWED_HOSTS` directly, so this test is a pointer-equal
-/// check on top of the value check: watch it fail by reverting
-/// `PEER_EGRESS_HOSTS` to its own literal array of the same two hosts, which
-/// passes the value assertion below and fails the pointer one.
+/// Local interception and LAN egress have different scopes. Codex is local only;
+/// peer gateways keep the two Anthropic origins they carried before it was added.
 #[test]
-fn peer_egress_hosts_is_the_local_proxys_allow_list_not_a_second_copy() {
+fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
     assert_eq!(
         tcr::peer::egress::PEER_EGRESS_HOSTS,
-        tcr::mitm::ALLOWED_HOSTS,
-        "the two origin allow-lists drifted"
+        &["api.anthropic.com", "platform.claude.com"]
     );
-    assert!(
-        std::ptr::eq(
-            tcr::peer::egress::PEER_EGRESS_HOSTS.as_ptr(),
-            tcr::mitm::ALLOWED_HOSTS.as_ptr(),
-        ),
-        "PEER_EGRESS_HOSTS must be defined AS mitm::ALLOWED_HOSTS, not a second literal that \
-         merely equals it today"
+    assert!(egress::host_allowed("api.anthropic.com", 443));
+    assert!(egress::host_allowed("platform.claude.com", 443));
+    assert!(!egress::host_allowed("chatgpt.com", 443));
+    assert!(!egress::host_allowed("CHATGPT.COM", 443));
+}
+
+/// **A Codex account is never carried, pinned or not, in this version** (Codex
+/// stays off the mesh). `pinned_egress` builds its URL
+/// from the ANTHROPIC upstream and splices an Anthropic body, so a pinned Codex
+/// account's request went through its Mac to `api.anthropic.com` wearing a
+/// ChatGPT bearer. Its pin is one this Mac cannot honour, answered exactly like
+/// one: refused by name on a strict account, one warn line and the direct path
+/// on a loose one, and the pacing slot left unspent for the direct path to take.
+///
+/// The gateway here is live and grants the carry, so the origin's counter is
+/// the proof: a carry that happened would show up there.
+///
+/// Watched red by deleting the Codex arm in `pinned_egress`: both requests are
+/// carried to the origin through the gateway.
+#[tokio::test]
+async fn codex_pinned_account_is_never_carried() {
+    let dir = scratch("pinned-codex");
+    let peers = dir.join("tcr-peers.json");
+    let requester = tcr::peer::id::NodeKey::load_or_mint(&dir)
+        .expect("mint this node's keypair in the scratch dir");
+    let gateway = node();
+
+    let origin = loopback().await;
+    let origin_addr = origin.local_addr().expect("the origin address");
+    let arrived = origin_exit(origin);
+
+    let gateway_listener = loopback().await;
+    let gateway_addr = gateway_listener.local_addr().expect("the gateway address");
+    let gateway_task = gateway_serving(
+        gateway_listener,
+        gateway.secret,
+        vec![row(&requester.id(), "requester", Vec::new(), true)],
+        origin_addr,
+        1024 * 1024,
+        2,
     );
+
+    let mut file = PeerFile::default();
+    file.peers.push(row(
+        &gateway.id,
+        "gateway",
+        vec![gateway_addr.to_string()],
+        false,
+    ));
+    file.peers[0].allow.carry = true;
+    tcr::peer::config::save(&peers, &file).expect("write the peers file");
+
+    let (collector, _guard) = capture();
+    for strict in [true, false] {
+        let manager = fleet_with(
+            &format!("https://{ORIGIN}"),
+            vec![Account {
+                provider: tcr::provider::Provider::Codex,
+                ..pinned_account(&gateway.id, strict)
+            }],
+        );
+        let answer = egress::pinned_egress(egress::PinnedAttempt {
+            path_and_query: tcr::provider::CODEX_RESPONSES_PATH,
+            ..attempt(&manager, &axum::http::Method::POST, &peers)
+        })
+        .await;
+        match (strict, answer) {
+            (true, egress::PinnedEgress::Answered(response)) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(response.headers()["x-should-retry"], "false");
+                assert!(!response.headers().contains_key("retry-after"));
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("the refusal body reads");
+                let body = String::from_utf8_lossy(&body);
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert!(
+                    json.get("type").is_none(),
+                    "the refusal uses Codex's envelope"
+                );
+                assert_eq!(json["error"]["code"], "pool_unavailable");
+                assert!(
+                    body.contains("alice@example.com") && body.contains("Codex"),
+                    "the refusal names the account and why its pin cannot be honoured: {body}"
+                );
+            }
+            (false, egress::PinnedEgress::TakeTheDirectPath { paced }) => assert!(
+                !paced,
+                "nothing was paced inside the exit lock, so the direct path takes the slot"
+            ),
+            (strict, _) => panic!(
+                "a Codex account's pin is refused when strict and falls back when loose \
+                 (strict: {strict}); it is never carried"
+            ),
+        }
+    }
+    assert_eq!(
+        count(&arrived),
+        0,
+        "a Codex request must never leave through the pinned Mac"
+    );
+    let lines = collector.matching("does not leave through a peer");
+    assert_eq!(
+        lines.len(),
+        1,
+        "the loose account says so exactly once: {:?}",
+        collector.messages()
+    );
+    assert_eq!(
+        lines[0].fields.get("account").map(String::as_str),
+        Some("alice@example.com")
+    );
+    gateway_task.abort();
 }

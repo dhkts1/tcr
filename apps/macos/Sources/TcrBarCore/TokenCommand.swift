@@ -16,6 +16,29 @@ public enum TokenCommand {
         ["token", query]
     }
 
+    /// The row menu item's title. A Codex row's token is a ChatGPT bearer, and the
+    /// item says so.
+    public static func menuTitle(for account: Account) -> String {
+        switch account.provider {
+        case .anthropic: return "Copy Access Token"
+        case .codex: return "Copy ChatGPT Access Token"
+        }
+    }
+
+    /// The item's help, or `nil` on a Claude row, whose item has none.
+    ///
+    /// A ChatGPT bearer works only with its account-id header, and nothing else on
+    /// the item says that: pasted anywhere without the header it is refused, which
+    /// would read as a token that does not work.
+    public static func menuHelp(for account: Account) -> String? {
+        switch account.provider {
+        case .anthropic: return nil
+        case .codex:
+            return "Copies this account's ChatGPT bearer. It works only with the account's "
+                + "chatgpt-account-id header, which the codex CLI sends for you."
+        }
+    }
+
     /// Why no token was produced. `tcr`'s own words, unparaphrased.
     public struct Failure: Error, Equatable, Sendable {
         public let exitCode: Int32

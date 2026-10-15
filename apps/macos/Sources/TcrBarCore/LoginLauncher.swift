@@ -133,6 +133,65 @@ public enum LoginLauncher {
             """
     }
 
+    /// The Codex sign-in for a `tcr` that predates `tcr login --codex` but can
+    /// import a codex login: `codex login` in a fresh folder, then the import of
+    /// that folder.
+    ///
+    /// The folder is made beside tcr's config (`$HOME/.config`), and both traps
+    /// stand before codex runs, so the folder is removed on every exit: the
+    /// import succeeding or failing, a closed window, or Ctrl-C. No line replaces
+    /// the shell, because a replaced shell never runs its EXIT trap. The
+    /// `|| exit 1` stops the script when the folder cannot be made: an empty
+    /// `CODEX_HOME` is codex's own default home, and `codex login` would sign in
+    /// over the login the codex CLI keeps there.
+    ///
+    /// A re-login passes `--account` with the login's email
+    /// (``codexAccountArgument(_:)``). An old import has no other check of which
+    /// account came back.
+    public static func codexLoginScript(
+        forExecutableAt path: String, reloggingIn name: String? = nil
+    ) -> String {
+        """
+        #!/bin/sh
+        # Opened by TcrBar. This tcr predates `tcr login --codex`, so the sign-in
+        # runs as two commands: codex signs in inside a folder of its own, and tcr
+        # imports that login. The folder is removed when this window closes.
+        d=$(mktemp -d "$HOME/.config/tcr-codex-login.XXXX") || exit 1
+        trap 'rm -rf "$d"' EXIT
+        trap 'exit 1' HUP INT TERM
+        CODEX_HOME="$d" codex login && \(posixQuote(path)) login --from-codex --codex-home "$d"\
+        \(codexAccountArgument(name))
+        """
+    }
+
+    /// The import for a `tcr` whose import cannot report to the sheet: it prints
+    /// prose for a person, so it runs in Terminal. It reads the folder in place and
+    /// never removes it: that folder is the codex CLI's own.
+    public static func codexImportScript(
+        forExecutableAt path: String, codexHome: String, reloggingIn name: String? = nil
+    ) -> String {
+        """
+        #!/bin/sh
+        # Opened by TcrBar. This tcr's import of a codex login talks to a person,
+        # not to the sheet, so it runs here.
+        exec \(posixQuote(path)) login --from-codex --codex-home \(posixQuote(codexHome))\
+        \(codexAccountArgument(name))
+        """
+    }
+
+    /// ` --account '<email>'` for a re-login or re-import, or nothing.
+    ///
+    /// An older `tcr` checks a Codex login only by its email, so the argument is
+    /// the row's name up to its first `/` (`erin@example.com/codex` gives
+    /// `erin@example.com`), and only when that part is an email. Otherwise no
+    /// `--account` is passed, and the import matches the row by identity.
+    static func codexAccountArgument(_ name: String?) -> String {
+        guard let name else { return "" }
+        let email = String(name.prefix { $0 != "/" })
+        guard email.contains("@") else { return "" }
+        return " --account \(posixQuote(email))"
+    }
+
     /// Which rows `tcr mint` should run against — one account, or every
     /// account carrying a group label. Mirrors the CLI's own two flags
     /// (`tcr mint --account <name>` / `tcr mint --group <name>`) rather than
@@ -219,6 +278,50 @@ public enum LoginLauncher {
         let script = mintScript(forExecutableAt: executable.path, target: target)
         return writeAndOpen(
             script, filenamePrefix: "tcr-mint", uuid: uuid(), open: open)
+    }
+
+    /// The Codex sign-in's Terminal hand-off for a `tcr` without
+    /// `tcr login --codex` (``codexLoginScript(forExecutableAt:reloggingIn:)``),
+    /// shaped like ``launch(reloggingIn:uuid:resolve:open:)``.
+    @discardableResult
+    public static func launchCodexLogin(
+        reloggingIn name: String? = nil,
+        uuid: () -> UUID = UUID.init,
+        resolve: () -> Result<URL, TcrTool.NotFound> = { TcrTool.resolve() },
+        open: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    ) -> Result<URL, Failure> {
+        let executable: URL
+        switch resolve() {
+        case .success(let url): executable = url
+        case .failure(let missing): return .failure(.toolMissing(searched: missing.searched))
+        }
+
+        let script = codexLoginScript(forExecutableAt: executable.path, reloggingIn: name)
+        return writeAndOpen(
+            script, filenamePrefix: "tcr-codex-login", uuid: uuid(), open: open)
+    }
+
+    /// The import's Terminal hand-off for a `tcr` whose import cannot report to
+    /// the sheet (``codexImportScript(forExecutableAt:codexHome:reloggingIn:)``),
+    /// shaped like ``launch(reloggingIn:uuid:resolve:open:)``.
+    @discardableResult
+    public static func launchCodexImport(
+        codexHome: String,
+        reloggingIn name: String? = nil,
+        uuid: () -> UUID = UUID.init,
+        resolve: () -> Result<URL, TcrTool.NotFound> = { TcrTool.resolve() },
+        open: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    ) -> Result<URL, Failure> {
+        let executable: URL
+        switch resolve() {
+        case .success(let url): executable = url
+        case .failure(let missing): return .failure(.toolMissing(searched: missing.searched))
+        }
+
+        let script = codexImportScript(
+            forExecutableAt: executable.path, codexHome: codexHome, reloggingIn: name)
+        return writeAndOpen(
+            script, filenamePrefix: "tcr-codex-import", uuid: uuid(), open: open)
     }
 
     /// Write a composed script to a per-invocation temp path and open it, the

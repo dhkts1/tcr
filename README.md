@@ -36,8 +36,8 @@ account whose prompt cache is already warm, and it shows you what the traffic wo
   author's own traffic, ending 2026-10-13, 97.6% of prompt tokens were read from cache.
 - **One proxy serves every session.** Each Claude Code session on the machine gets its own pin, and
   you can add, disable or remove accounts while it runs.
-- **You can watch it.** A macOS menu-bar app and a terminal dashboard show every window, every
-  session, and what the traffic would have cost at list price.
+- **You can watch it.** A macOS menu-bar app and a terminal dashboard show every window and every
+  session, and the app shows what the traffic would have cost at list price.
 - **It stays on your machine.** No telemetry and no crash reporting. Tokens, logs and pins are
   files on your own disk.
 
@@ -78,7 +78,8 @@ To have a plain `claude` go through tcr, run `tcr setup shell` (a `claude` funct
 startup file, for terminals) or `tcr setup claude-settings` (one key in `~/.claude/settings.json`, for
 every launch, at the cost that claude cannot reach Anthropic while tcr is stopped). Both refuse
 rather than overwrite a `claude` alias, function or base URL you already have, and both take
-`--remove`. TcrBar asks once which you want. Details: [`tcr setup`](docs/cli.md#tcr-setup).
+`--remove`. TcrBar asks once which you want, on a fleet with a Claude account to serve claude.
+Details: [`tcr setup`](docs/cli.md#tcr-setup).
 
 ### Verify a download
 
@@ -103,14 +104,16 @@ removes TcrBar and its login item.
 Nothing deletes your data for you. `~/.config/tcr.json` (`~/.config/teamclaude.json` on an older
 install) holds working credentials for every account in the pool, so delete it too, along with
 `~/.cache/tcr/` (or `~/.cache/teamclaude/`) and any
-`ANTHROPIC_BASE_URL`, `HTTPS_PROXY` or `NODE_EXTRA_CA_CERTS` you exported. Every file `tcr` keeps
-is listed in [`docs/architecture.md`](docs/architecture.md#files-on-disk), and the full steps are
-under [Uninstalling](docs/architecture.md#uninstalling).
+`ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS` or `CODEX_CA_CERTIFICATE` you exported,
+and any `chatgpt.com` entry you added to `NO_PROXY`. Every file `tcr` keeps is listed in
+[`docs/architecture.md`](docs/architecture.md#files-on-disk), and the full steps are under
+[Uninstalling](docs/architecture.md#uninstalling).
 
 ## Usage
 
 ```sh
 tcr login          # PKCE browser flow, once per account you want in the pool
+tcr login --codex  # the same for a Codex (ChatGPT) account, for codex through the pool
 tcr                # start the proxy with the live TUI (q quits)
 tcr run -- <args>  # launch Claude Code already pointed at the proxy
 ```
@@ -132,11 +135,25 @@ export NODE_EXTRA_CA_CERTS=<the CA path tcr logs at boot>
 ```
 
 Forward-proxy mode decrypts TLS with a locally generated certificate, so the client has to trust
-it; `tcr` prints the CA path to use when it starts. The config lives at `~/.config/tcr.json`
-(an install that already has `~/.config/teamclaude.json` keeps using that), and `name` and
-`accessToken` are the only required keys. Every other
-key, its default and the file's permissions are in
-[`docs/configuration.md`](docs/configuration.md).
+it; `tcr` prints the CA path to use when it starts, naming `NODE_EXTRA_CA_CERTS`, and
+`CODEX_CA_CERTIFICATE` too once the config holds a Codex account. With a certificate it minted
+itself (CA `~/.config/tcr-ca.pem`) it decrypts `chatgpt.com` only for a Codex connection
+that opts in with `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`, while the pool holds a
+Codex account. `tcr run --codex` sets that marker and the CA. An unmarked `HTTPS_PROXY`,
+including the one inherited from a Claude `tcr run` session, tunnels `chatgpt.com` untouched
+and leaves the client on its own login. Marked connections relay paths outside `/backend-api/`
+with the client's credential. `codex` takes no CA from `NODE_EXTRA_CA_CERTS`:
+`CODEX_CA_CERTIFICATE` is its variable for one, `SSL_CERT_FILE` serves while that is unset,
+and a CA already in the system trust store works too. Claude launches set only
+`NODE_EXTRA_CA_CERTS`, preserving a nested Codex client's own CA choice. A pooled Codex launch
+sets `CODEX_CA_CERTIFICATE` only when you have not supplied it, and preserves an explicit
+`NODE_EXTRA_CA_CERTS` too. Its shell tools receive an unmarked proxy URL, so their ChatGPT
+requests keep their own TLS and login; explicitly configured child environments can override
+that default. Keep the marker scoped to `tcr run --codex` rather than exporting it to a shell.
+The config lives at `~/.config/tcr.json` (an install that has only
+`~/.config/teamclaude.json` keeps using that), and `name` and
+`accessToken` are the only required keys. Every other key, its default and the file's permissions
+are in [`docs/configuration.md`](docs/configuration.md).
 
 ### Managing the fleet
 
@@ -147,16 +164,16 @@ config file on its next request. Every flag is in [`docs/cli.md`](docs/cli.md).
 | Command | What it does |
 |---|---|
 | `tcr accounts [--probe]` | List the pool. `--probe` refreshes quota live instead of reading the file. |
-| `tcr status [--json]` | Probe every account and print the fleet. `--json` is what the panel and TUI read. |
+| `tcr status [--json]` | Probe every account and print the fleet. `--json` is what the panel reads. |
 | `tcr priority <account> [N \| --first \| --last]` | Set the rotation tier. |
 | `tcr enable` / `tcr disable <account>` | Take an account in or out of rotation. |
 | `tcr remove <account>` | Delete an account, disabling it live first. |
-| `tcr control <account> [--clear \| --show]` | Nominate the account that serves control-plane traffic. |
+| `tcr control <account> [--clear \| --show]` | Nominate the Claude account that serves control-plane traffic. |
 | `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
 | `tcr run --group <name>` | Start a session that prefers one group. |
 | `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour. The panel's Sessions and Tools tabs read the same feed. |
-| `tcr list --json` | Print every account in claude-swap's list format, so CodexBar can show them. Never probes. |
-| `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day. Needs no running proxy. |
+| `tcr list --json` | Print every Claude account in claude-swap's list format, so CodexBar can show them. Never probes. |
+| `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day, and by provider when the period holds Codex traffic. Needs no running proxy. |
 | `tcr token <account>` | Print an account's access token to stdout, for piping. |
 | `tcr update` | Update `tcr` in place, from the checkout or the published installer. |
 
@@ -191,14 +208,16 @@ it. Quota probes are reads that spend nothing and keep an idle account's numbers
 account runs them on its own random schedule, so the fleet never reaches Anthropic in one burst on
 a fixed period, and a restart scatters them again instead of lining them up.
 
-**Everything is priced.** Every request served goes into a local ledger at Anthropic's list prices,
-per account and per model, split into input, output, cache reads and cache writes. The panel and
-the terminal dashboard show today's spend, the burn rate over the last hour, the model mix and the
-cache hit rate. The ledger reloads from disk at boot, so a restart does not reset the day. None of
-this is a bill: these accounts are subscriptions, and list price is simply the one unit you can
-compare across accounts, models and days. Traffic that could not be priced shows no figure rather
-than a zero, an account that served nothing shows a real zero, and a window holding both reports
-the priced part next to the count it could not price.
+**Everything is priced.** Every request served goes into a local ledger, priced at the API list
+price of its model's own provider, per account and per model, split into input, output, cache
+reads and cache writes. No OpenAI model has a built-in price, so a Codex request stays unpriced
+until [`pricing`](docs/configuration.md#pricing-and-usageretentiondays) names its model. The
+panel shows today's spend, the burn rate over the last hour and the cache hit rate; the terminal
+dashboard shows no spend. The ledger reloads from disk at boot, so a restart does
+not reset the day. None of this is a bill: these accounts are subscriptions, and list price is
+simply the one unit you can compare across accounts, models and days. Traffic that could not be
+priced shows no figure rather than a zero, an account that served nothing shows a real zero, and
+a window holding both reports the priced part next to the count it could not price.
 
 OAuth tokens refresh in the background, so accounts do not expire while you work. Accounts can
 carry labels, and a labelled set can be *reserved* so only traffic that asks for it goes there. One
@@ -207,12 +226,32 @@ prompts; inference never picks that account, so it stays clean. You can add, ena
 remove accounts while the proxy runs, which matters because a restart is what costs you warm pins.
 There is a native macOS menu-bar app and a terminal dashboard.
 
+**Codex accounts rotate too.** The pool can also hold ChatGPT logins for OpenAI's `codex` CLI,
+kept apart from the Claude accounts: a Codex request is only ever served by a Codex account, and
+a Claude request never by one. `tcr login --codex` signs a Codex account in with a login of tcr's
+own, so the `codex` CLI keeps the login it has. `tcr login --from-codex` imports the login `codex`
+already holds instead. tcr shares refreshed tokens through guarded updates to that folder's
+`auth.json` and can recover tokens for the same ChatGPT account. Sharing remains best effort:
+a simultaneous `codex` refresh can race the file update. `tcr login --codex` avoids that shared
+file. `tcr run --codex -- exec "…"` launches `codex` through the pool, where those
+accounts are picked, refreshed and probed the way Claude's are, and `tcr doctor --codex` says
+whether `codex` is pooled and, if it is not, why. The import and its token-sharing guards are in
+[`docs/cli.md`](docs/cli.md#--from-codex-importing-the-login-codex-already-has); what tcr does
+with a Codex request is in [`docs/architecture.md`](docs/architecture.md#codex-requests).
+
 ## Watching it
 
-`apps/macos` holds TcrBar, a native front end over the same `tcr status --json` the TUI reads. The
-menu-bar item is the whole app, with no Dock icon and no window. Its icon shows the capacity left
-across the whole fleet rather than the worst account, because one used-up account in a rotating
-pool is the rotation working, not an alarm.
+`apps/macos` holds TcrBar, a native front end over `tcr status --json`; the terminal dashboard
+reads the running proxy's own state instead. The menu-bar item is the whole app, with no Dock icon
+and no window. Its icon shows the capacity left across the whole fleet rather than the worst
+account, because one used-up account in a rotating pool is the rotation working, not an alarm.
+
+TcrBar and the terminal dashboard both tell the two providers apart. TcrBar counts each pool on
+its own: the menu-bar count reads Claude first ("3/4 · 1/2"), the cup follows the emptier pool
+unless Settings pins it to one, the strip under the tabs gives each pool its own row, and the
+Accounts tab has a CLAUDE and a CODEX section. The dashboard's banner gives each provider its own
+segment (`CLAUDE 1/3 eligible │ CODEX 2/4 eligible`), and its account list a section each.
+`tcr status --json` marks each Codex row `"provider": "codex"`.
 
 The panel has four tabs. **Accounts** has one row per account, with a line for each quota window
 showing a bar, a percentage and the countdown to that window's reset. Each row also shows probe
@@ -255,8 +294,9 @@ account and choose Keep Card Open to leave it open.
 
 ![tcr live TUI](assets/tui-demo.gif)
 
-The TUI runs on both macOS and Linux and shows everything the panel does, plus the live session
-tree: which conversation is pinned to which account, and which ones diverted.
+The TUI runs on both macOS and Linux. It shows the accounts, their quota windows and why each one
+is out, the live session tree (which conversation is pinned to which account, and which ones
+diverted) and the request log. The spend figures are the panel's.
 
 `tcr demo` runs the real TUI against fake accounts, which is how these screenshots were made. It
 needs no config and contacts nothing.
@@ -266,18 +306,20 @@ needs no config and contacts nothing.
 ## How it works
 
 One TCP listener serves both modes. It peeks at the first eight bytes of each connection without
-consuming them and decides from those. A `CONNECT` to an Anthropic API host has its TLS terminated
-with a locally generated leaf certificate, any other `CONNECT` is copied through as raw bytes, and
-plain HTTP is base-URL mode. Each request then runs a bounded rotation loop: pick an eligible
-account, refresh its token if it is about to expire, swap the client's credentials for the pooled
-one, send, and rotate to another account on a 401, 429, 529 or transport failure.
+consuming them and decides from those. A `CONNECT` to an Anthropic API host, or to `chatgpt.com`
+on a marked Codex connection while the pool holds an account, has its TLS terminated with a locally
+generated leaf certificate, any other `CONNECT` is copied through as raw bytes, and plain HTTP is base-URL
+mode. Each request then runs a bounded rotation loop: pick an eligible account, refresh its token
+if it is about to expire, swap the client's credentials for the pooled one, send, and rotate to
+another account on a 401, 429, 529 or transport failure.
 
 Quota numbers come from the response headers of traffic `tcr` already serves. Between requests, a
-probe that spends nothing against Anthropic's OAuth usage endpoint keeps them fresh. The probe
-never calls `/v1/messages`, so an idle account's bars stay accurate instead of freezing at their
-last served value. A window that has passed its reset reads as fresh rather than full, worked out
-against the clock at the moment it is read, so neither the display nor the scheduler can act on a
-stale bar. The request-flow diagram, the selection order and the probe schedule are in
+probe that spends nothing keeps them fresh: Anthropic's OAuth usage endpoint for a Claude account,
+Codex's `/backend-api/wham/usage` for a Codex one. The probe never calls `/v1/messages`, so an
+idle account's bars stay accurate instead of freezing at their last served value. A window that
+has passed its reset reads as fresh rather than full, worked out against the clock at the moment
+it is read, so neither the display nor the scheduler can act on a stale bar. The request-flow
+diagram, the selection order and the probe schedule are in
 [`docs/architecture.md`](docs/architecture.md).
 
 ## Peers
@@ -320,7 +362,7 @@ Code itself holds.
 Each row comes from that project's own README and docs, read on 2026-10-13. "Not stated" means its
 README does not say, not that the tool cannot.
 
-Another tool fits better if you need Windows (claude-swap, ccs, cux), want Codex, Gemini or other
+Another tool fits better if you need Windows (claude-swap, ccs, cux), want Gemini or other
 providers behind the same tool (teamclaude, ccs, Quotio), want no proxy in the request path
 (claude-swap, cux, cc-account-switcher), or need an open-source license for commercial use (every
 other row).
@@ -356,9 +398,9 @@ keeps them for conversations still within the cache lifetime.
 ### How long does the cache stay warm?
 
 Five minutes after its last use, unless the request asks for an hour. From 1.1.19 `tcr` rewrites
-every cache breakpoint to the hour, so a conversation you come back to within the hour resumes warm
-instead of writing its prefix again. On a subscription the hour costs the five-hour window what
-five minutes does (measured 2026-10-06). `cacheTtlRewrite` in
+every Claude request's cache breakpoint to the hour, so a conversation you come back to within the
+hour resumes warm instead of writing its prefix again. On a subscription the hour costs the
+five-hour window what five minutes does (measured 2026-10-06). `cacheTtlRewrite` in
 [`docs/configuration.md`](docs/configuration.md) turns it off.
 
 ### What happens when an account runs out?
@@ -370,8 +412,10 @@ already on that account moves once, and pays one cache rebuild.
 ### Does it run on Linux, and with API keys?
 
 The `tcr` CLI and terminal dashboard run on Linux as static builds for x86_64 and aarch64. TcrBar,
-the menu-bar app, is macOS only. Accounts are Claude subscriptions logged in through the browser;
-`tcr` does not serve Anthropic API keys.
+the menu-bar app, is macOS only. Accounts are Claude subscriptions logged in through the browser,
+or ChatGPT logins for Codex, signed in with `tcr login --codex` or imported with
+`tcr login --from-codex`. `tcr` does not serve Anthropic API keys, and refuses a Codex login made
+with an API key too ([`docs/cli.md`](docs/cli.md#--from-codex-importing-the-login-codex-already-has)).
 
 ## Documentation
 
@@ -380,7 +424,7 @@ the menu-bar app, is macOS only. Accounts are Claude subscriptions logged in thr
 | [`docs/configuration.md`](docs/configuration.md) | Every config key, its type, default and source citation. |
 | [`docs/cli.md`](docs/cli.md) | Every command and flag, exit codes, account resolution. |
 | [`docs/peers.md`](docs/peers.md) | Finding, trusting and sharing accounts with other Macs on your network. |
-| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, account selection, quota probes, files on disk, verifying a download, uninstalling. |
+| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, Codex requests, account selection, quota probes, files on disk, verifying a download, uninstalling. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptoms and what they mean. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, test and lint gates, what `main` requires. |
 
@@ -394,18 +438,30 @@ loopback callers for the API key, and nothing creates a `proxy.apiKey` for you, 
 install the only check is being on this host. Set a key if you want a tighter boundary than that.
 
 **The forward proxy is an open tunnel on purpose.** Its allowlist of hosts it may decrypt has three entries:
-`api.anthropic.com`, `console.anthropic.com` and `platform.anthropic.com`. Every other `CONNECT`
+`api.anthropic.com`, `platform.claude.com` and `chatgpt.com`. Every other `CONNECT`
 target is copied through as raw bytes and is never decrypted or filtered, which makes `tcr` an
 unrestricted forward proxy to any host for any local process. Claude Code needs it to work that
 way, so treat it as a tunnel and not as a firewall. Which hosts are actually decrypted depends on
 the leaf certificate in use, and [`MITM-DESIGN.md`](MITM-DESIGN.md) works through that.
+`chatgpt.com` is decrypted only on a marked Codex connection while the pool holds an account,
+and tunnelled untouched otherwise.
 
-**Credentials.** On the two inference paths, `tcr` drops the client's own `authorization` and
-`x-api-key` headers before adding the pooled Bearer token, so a client credential is never sent
-alongside ours. Everything else a client sends under its own bearer (connector list, plugins,
-settings, bootstrap) is relayed under that bearer unchanged, because those calls are about the
-client's identity. The proxy checks that identity against `controlAccount` (see `controlIdentity`
-in [`docs/configuration.md`](docs/configuration.md)).
+**Credentials.** On the inference paths, Anthropic's two and Codex's `responses`,
+`images/generations`, `images/edits`, `memories/trace_summarize` and `alpha/search`
+under `/backend-api/codex/`, `tcr` drops the client's own `authorization` and `x-api-key`
+headers before adding the pooled Bearer token, so a client credential is never sent alongside
+ours. On Codex's it also replaces the client's `chatgpt-account-id` header with the serving
+account's. The one exception is a Codex request that names a workspace routing of its own
+(`x-openai-account-routing-override` or `x-openai-fedramp`, which `codex` sends for a
+data-residency or FedRAMP workspace): it is relayed under the client's own bearer and account
+id, inference included, and never pooled, and `tcr login --from-codex` refuses to import such a
+login. As a backstop, `tcr` also drops both headers from every Codex request it pools.
+Everything else a client sends under its own bearer (connector list, plugins, settings,
+bootstrap) is relayed under that bearer unchanged, because those calls are about the client's
+identity. The proxy checks an Anthropic client's identity against `controlAccount` (see
+`controlIdentity` in [`docs/configuration.md`](docs/configuration.md)); it never checks a Codex
+client's, because resolving a ChatGPT bearer through Anthropic's profile endpoint would hand
+that token to Anthropic.
 
 `git config core.hooksPath .githooks` turns on a pre-commit secret scan and the other gates
 listed in [CONTRIBUTING.md](CONTRIBUTING.md#git-hooks). Treat it as a backstop: it only sees what
@@ -425,8 +481,9 @@ than in a public issue.
 ## It does not phone home
 
 `tcr` has no telemetry and no crash reporting. Your config, logs, session pins and OAuth tokens are
-files on your own disk. It makes two kinds of outbound call: to Anthropic on your behalf, and to
-GitHub to check for a newer version.
+files on your own disk. It makes two kinds of outbound call: to Anthropic on your behalf (and,
+for Codex accounts, to OpenAI at `chatgpt.com` and `auth.openai.com`), and to GitHub to check for
+a newer version.
 
 The cost falls on whoever hits a bug. There is no error stream to search and no session to replay,
 so a good bug report is worth more here than in a project that watches its users. #323 was

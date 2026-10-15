@@ -4,7 +4,10 @@
 //! `normalizeUsageBucket`, `findScopedWeeklyLimit`). On an interval the manager
 //! probes **every** OAuth account's quota via the Anthropic OAuth *usage*
 //! endpoint — which reports utilization WITHOUT spending message quota — so idle
-//! accounts' bars stay fresh instead of freezing at their last-served value.
+//! accounts' bars stay fresh instead of freezing at their last-served value. A
+//! Codex account is read from Codex's own usage endpoint instead
+//! ([`crate::codex_probe`]): [`LiveUsageProber`] picks the endpoint by the
+//! [`ProbeCredential`]'s provider.
 //!
 //! The endpoint reports utilization as a percentage in `0..=100`, so a raw `1`
 //! means 1%, not 100%: [`normalize_usage_bucket`] divides by 100.
@@ -78,6 +81,11 @@ pub struct Usage {
     /// report this field" or "its shape was not one we recognise" — never a
     /// fabricated `0.0`; see [`parse_extra_usage_usd`].
     pub extra_usage_usd: Option<f64>,
+    /// What a Codex usage probe said beyond the buckets: the plan's windows and their
+    /// lengths, its plan, credits, spend control and refusal kind
+    /// ([`crate::codex_probe::CodexProbeFacts`]). Anthropic's probe leaves it `None`, so an
+    /// Anthropic reading folds into the quota exactly as it did before the field existed.
+    pub codex: Option<crate::codex_probe::CodexProbeFacts>,
 }
 
 /// Why a probe failed. `status` carries the HTTP code when there was one — the
@@ -221,6 +229,7 @@ pub fn usage_from_payload(data: &Value) -> Usage {
         seven_day: normalize_usage_bucket(data.get("seven_day")),
         seven_day_oi: normalize_usage_bucket(fable.as_ref()),
         extra_usage_usd: parse_extra_usage_usd(data),
+        codex: None,
     }
 }
 
@@ -280,15 +289,36 @@ async fn fetch_usage_at(
 /// after any manager lock is released.
 pub type ProbeFuture = Pin<Box<dyn Future<Output = Result<Usage, ProbeError>> + Send>>;
 
-/// Abstraction over "turn an access token into usage", so the probe loop can be
-/// exercised in tests without hitting the network.
-pub trait UsageProber: Send + Sync {
-    fn probe(&self, access_token: String) -> ProbeFuture;
+/// What a probe needs to identify itself: the provider picks the endpoint, the bearer pays,
+/// and Codex additionally needs the account header codex sends beside its bearer
+/// ([`crate::provider::CODEX_ACCOUNT_HEADER`]).
+#[derive(Debug, Clone)]
+pub struct ProbeCredential {
+    pub provider: crate::provider::Provider,
+    pub access_token: String,
+    pub account_id: Option<String>,
 }
 
-/// The production prober: a real HTTPS call to the Anthropic usage endpoint.
+/// Abstraction over "turn an account's credential into usage", so the probe loop can be
+/// exercised in tests without hitting the network.
+pub trait UsageProber: Send + Sync {
+    fn probe(&self, credential: ProbeCredential) -> ProbeFuture;
+
+    /// The base a Codex probe goes to, for a test to check before anything probes: a wiring
+    /// regression would otherwise send that test's fixture bearer to the real backend. `None`
+    /// for a prober that sends nothing anywhere.
+    #[cfg(test)]
+    fn codex_base(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// The production prober: one real HTTPS call to the usage endpoint of the credential's
+/// provider, Anthropic's [`USAGE_URL`] or Codex's under the base
+/// [`LiveUsageProber::with_codex_base`] sets ([`crate::codex_probe`]).
 pub struct LiveUsageProber {
     client: reqwest::Client,
+    codex_base: String,
 }
 
 impl LiveUsageProber {
@@ -301,7 +331,16 @@ impl LiveUsageProber {
                 .no_proxy()
                 .build()
                 .expect("build reqwest client"),
+            codex_base: crate::provider::CODEX_UPSTREAM.to_string(),
         }
+    }
+
+    /// Probe Codex accounts under `base` instead of [`crate::provider::CODEX_UPSTREAM`]: the
+    /// configured `codexUpstream`, so a Codex account's quota is read from the same origin its
+    /// inference goes to.
+    pub fn with_codex_base(mut self, base: String) -> Self {
+        self.codex_base = base;
+        self
     }
 }
 
@@ -312,9 +351,30 @@ impl Default for LiveUsageProber {
 }
 
 impl UsageProber for LiveUsageProber {
-    fn probe(&self, access_token: String) -> ProbeFuture {
+    fn probe(&self, credential: ProbeCredential) -> ProbeFuture {
         let client = self.client.clone();
-        Box::pin(async move { fetch_usage(&client, &access_token).await })
+        match credential.provider {
+            crate::provider::Provider::Anthropic => {
+                Box::pin(async move { fetch_usage(&client, &credential.access_token).await })
+            }
+            crate::provider::Provider::Codex => {
+                let base = self.codex_base.clone();
+                Box::pin(async move {
+                    crate::codex_probe::fetch_usage(
+                        &client,
+                        &base,
+                        &credential.access_token,
+                        credential.account_id.as_deref(),
+                    )
+                    .await
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn codex_base(&self) -> Option<&str> {
+        Some(&self.codex_base)
     }
 }
 

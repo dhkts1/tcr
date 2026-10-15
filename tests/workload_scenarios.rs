@@ -104,6 +104,7 @@ fn account(name: &str, priority: i64) -> Account {
     Account {
         name: name.to_string(),
         account_type: tcr::config::AccountType::OAuth,
+        provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
         org_name: None,
@@ -119,6 +120,7 @@ fn account(name: &str, priority: i64) -> Account {
         seat_tier: None,
         egress: tcr::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }
@@ -137,7 +139,7 @@ fn pacing(cap: u32) -> PacingConfig {
 /// takes them.
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
         Box::pin(async {
             Err(OAuthError::Transient(
                 "no refresher in workload tests".into(),
@@ -148,7 +150,7 @@ impl TokenRefresher for NeverRefreshes {
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _access_token: String) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -220,6 +222,7 @@ impl Fleet {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: SWITCH_THRESHOLD,
             fable_weekly_threshold: None,
             pacing,

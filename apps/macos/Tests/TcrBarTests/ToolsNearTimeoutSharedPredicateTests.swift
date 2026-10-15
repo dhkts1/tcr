@@ -48,6 +48,45 @@ final class ToolsNearTimeoutSharedPredicateTests: XCTestCase {
             entry.isNearTimeout(now: now, timeoutSeconds: 600, warnWithinSeconds: 6000))
     }
 
+    /// A Codex call that carries its own timeout is measured against it, not against the 600 s
+    /// Bash cap. It stands for codex's one-shot `exec_command`, whose `timeout_ms` argument
+    /// (120000 here) is the only timeout a Codex call carries; codex offers that schema only
+    /// when managed requirements turn its interactive shell off. 100 s into 120 is 20 s from
+    /// being killed, which the Bash rule would call calm.
+    func testACodexCallFillsTowardItsOwnTimeout() throws {
+        let now = Date()
+        let call = try decodedCall(tool: "exec_command", secondsAgo: 100, now: now, timeoutSeconds: 120)
+        let entry = SessionToolEntry(sessionId: "s1", call: call, provider: .codex)
+        XCTAssertTrue(entry.isNearTimeout(now: now, timeoutSeconds: 600, warnWithinSeconds: 60))
+        XCTAssertEqual(call.timeoutCap(bashTimeout: 600), 120)
+    }
+
+    /// codex's default `exec_command` is the interactive one, which takes no timeout, so its
+    /// calls arrive without one: no cap, no ring, and never near, however long they run. A zero
+    /// timeout is no timeout either, and a Claude `Bash` call keeps the Bash tool's own cap.
+    func testACodexCallWithNoTimeoutHasNoRing() throws {
+        let now = Date()
+        let call = try decodedCall(tool: "exec_command", secondsAgo: 100, now: now)
+        XCTAssertFalse(call.capped)
+        XCTAssertNil(call.timeoutCap(bashTimeout: 600))
+        for secondsAgo in [100.0, 590, 20_000] {
+            let entry = SessionToolEntry(
+                sessionId: "s1",
+                call: try decodedCall(tool: "exec_command", secondsAgo: secondsAgo, now: now),
+                provider: .codex)
+            XCTAssertFalse(
+                entry.isNearTimeout(now: now, timeoutSeconds: 600, warnWithinSeconds: 60),
+                "\(secondsAgo)s")
+        }
+
+        let zero = try decodedCall(tool: "exec_command", secondsAgo: 100, now: now, timeoutSeconds: 0)
+        XCTAssertFalse(zero.capped)
+        XCTAssertNil(zero.timeoutCap(bashTimeout: 600))
+
+        let bash = try decodedCall(tool: "Bash", secondsAgo: 100, now: now)
+        XCTAssertEqual(bash.timeoutCap(bashTimeout: 600), 600)
+    }
+
     /// `Fleet.toolsNearTimeoutCount` (what the summary line reads) must equal a
     /// fresh filter of `toolsRunning` (what the row-drawing loop iterates) run
     /// through the exact same predicate — proven by construction, one function
@@ -90,6 +129,20 @@ final class ToolsNearTimeoutSharedPredicateTests: XCTestCase {
             source.contains("let isNearTimeout = (remaining"),
             "the row is back to computing its own near-timeout boolean inline instead of "
                 + "reading the shared predicate")
+    }
+
+    /// A running call decoded from the wire's own JSON, so `timeoutSeconds` goes through the
+    /// real decoder.
+    private func decodedCall(
+        tool: String, secondsAgo: Double, now: Date, timeoutSeconds: Int? = nil
+    ) throws -> ToolCall {
+        var object: [String: Any] = [
+            "tool": tool,
+            "startedMs": Int64(now.addingTimeInterval(-secondsAgo).timeIntervalSince1970 * 1000),
+        ]
+        if let timeoutSeconds { object["timeoutSeconds"] = timeoutSeconds }
+        return try JSONDecoder().decode(
+            ToolCall.self, from: JSONSerialization.data(withJSONObject: object))
     }
 
     private func panelSource(_ relative: String) throws -> String {

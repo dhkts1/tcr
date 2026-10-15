@@ -9,21 +9,27 @@ impl Manager {
     /// a client request that was retried across accounts (bug #4). Request counting
     /// happens once, in [`Manager::record_served`].
     ///
-    /// A response that CARRIED the unified 5h header also latches
+    /// The account's PROVIDER picks the parser, never the headers: Anthropic's
+    /// [`crate::quota::Quota::update_from_headers`] or Codex's
+    /// [`crate::quota::Quota::update_from_codex_refusal`]. A `match`, so a third provider
+    /// decides here instead of inheriting either. `status` is the response's HTTP status,
+    /// which the Codex parser reads in place of Anthropic's `unified-status` header (a 2xx
+    /// is `allowed`, a refusal 429 `rejected`); the Anthropic parser ignores it.
+    ///
+    /// A response that CARRIED the 5h window also latches
     /// [`AccountRuntime::quota_known`], on the same terms and for the same reason
     /// [`Self::apply_usage`] does: those headers are a first-hand read of this
     /// account's session window, so an account serving live traffic must not go on
     /// reading as "we have never seen this account's quota" — it plainly is not
     /// true, and keep-warm's gate is asking exactly that question. A response
-    /// WITHOUT the header latches nothing: an error page or a non-Anthropic
-    /// upstream tells us nothing about the window, and silence must never be
-    /// mistaken for evidence.
+    /// WITHOUT it latches nothing: an error page tells us nothing about the window,
+    /// and silence must never be mistaken for evidence.
     ///
     /// `probe_status` is deliberately still untouched here — that field is about
     /// probe HEALTH, which a served response says nothing about.
     ///
     /// Returns whether THIS response's headers carried the 5h window — the same
-    /// signal [`crate::quota::Quota::update_from_headers`] returns, passed through
+    /// signal either parser returns, passed through
     /// so a caller like [`Manager::warm_account`] can tell "evidence read" apart
     /// from "silence" on this specific response, not just the account's
     /// once-ever `quota_known` latch. Deliberately NOT `#[must_use]`: most
@@ -31,12 +37,39 @@ impl Manager {
     /// only care about the side effect of folding the headers in, and forcing
     /// every one of them to consume the bool would be pure churn unrelated to
     /// this fix.
-    pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) -> bool {
+    pub fn update_quota(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+    ) -> bool {
+        let refusal = (status == 429)
+            .then(|| {
+                crate::quota::CodexQuotaRefusal::parse(headers, &[], OffsetDateTime::now_utc())
+            })
+            .flatten();
+        self.update_quota_with_codex_refusal(idx, headers, status, refusal.as_ref())
+    }
+
+    pub(crate) fn update_quota_with_codex_refusal(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        refusal: Option<&crate::quota::CodexQuotaRefusal>,
+    ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
-                    let read_five_hour = account.quota.update_from_headers(headers);
+                    let read_five_hour = match account.provider {
+                        crate::provider::Provider::Anthropic => {
+                            account.quota.update_from_headers(headers)
+                        }
+                        crate::provider::Provider::Codex => account
+                            .quota
+                            .update_from_codex_refusal(headers, status, refusal),
+                    };
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
                     // Any response that DOES carry the 5h window is proof this
@@ -121,11 +154,15 @@ impl Manager {
     /// Deliberately does NOT touch the request counter: a client request retried
     /// across accounts reaches this once per upstream RESPONSE, and counting
     /// requests here is bug #4. That count happens in [`Manager::record_served`].
-    pub fn record_usage(&self, idx: usize, record: crate::usage::UsageRecord) {
+    pub fn record_usage(&self, idx: usize, mut record: crate::usage::UsageRecord) {
         let (name, (uuid, org)) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
+                    // The serving account's provider, which files the ledger line (`p`) and
+                    // puts a Codex record in the weekly window. Read under the lock that
+                    // already resolves its identity.
+                    record.provider = account.provider;
                     account.input_tokens += record.input_total();
                     account.output_tokens += record.output;
                     account.cache_read_tokens += record.cache_read;
@@ -164,8 +201,11 @@ impl Manager {
     }
 
     /// Attach `dir` as the usage ledger: replay today's and yesterday's files
-    /// back through the recording path so a restart does not lose the day, prune
-    /// day files past `retention_days`, then start appending.
+    /// back through the recording path so a restart does not lose the day (and
+    /// the week before them too when the fleet holds a Codex account, so its
+    /// weekly window survives as well), prune day files past `retention_days`,
+    /// then start appending. Each account's provider goes to the ledger with its
+    /// identity: it decides whether the week is replayed.
     ///
     /// Only the SERVING process calls this. Returns what the replay found so the
     /// caller can log whether the day was restored or genuinely started at zero.
@@ -189,21 +229,29 @@ impl Manager {
                 org: crate::identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref())
                     .map(str::to_string),
                 org_name: a.org_name.clone().filter(|s| !s.is_empty()),
+                provider: a.provider,
             })
             .collect();
         self.usage
             .attach_ledger(dir, retention_days, &accounts, crate::now_ms())
     }
 
-    /// This account's usage row as of `now_ms` — see
-    /// [`crate::usage::UsageTracker::row`].
+    /// This account's usage row as of `now_ms` (see [`crate::usage::UsageTracker::row`]), plus a
+    /// Codex row's weekly window. `seven_day` is the weekly reset and the window's length, both
+    /// in milliseconds, and `None` leaves `seven_day_window` absent.
     pub(super) fn usage_row(
         &self,
         idx: usize,
         now_ms: i64,
         five_hour_reset_ms: Option<i64>,
+        seven_day: Option<(i64, i64)>,
     ) -> tcr_status_wire::UsageRow {
-        self.usage.row(idx, now_ms, five_hour_reset_ms)
+        let mut row = self.usage.row(idx, now_ms, five_hour_reset_ms);
+        row.seven_day_window = seven_day.and_then(|(reset_ms, length_ms)| {
+            self.usage
+                .seven_day_window(idx, now_ms, reset_ms, length_ms)
+        });
+        row
     }
 
     /// The configured usage-ledger retention, in days
@@ -282,7 +330,22 @@ impl Manager {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
+                    let was_codex_refused = match account.provider {
+                        crate::provider::Provider::Anthropic => false,
+                        crate::provider::Provider::Codex => {
+                            account.quota.status.as_deref() == Some("rejected")
+                        }
+                    };
                     account.quota.apply_usage(usage);
+                    if was_codex_refused
+                        && account.quota.status.as_deref() != Some("rejected")
+                        && account.hold_cause == HoldCause::RateLimit
+                    {
+                        account.rate_limited_until_ms = None;
+                        if account.status == AccountStatus::Throttled {
+                            account.status = AccountStatus::Active;
+                        }
+                    }
                     let flipped = !account.quota_known;
                     account.quota_known = true;
                     flipped
@@ -360,6 +423,29 @@ impl Manager {
             account.rate_limited_until_ms = Some(until);
             account.hold_cause = HoldCause::RateLimit;
             tracing::info!(account = %account.name, hold_seconds = hold, "rate limited");
+        }
+    }
+
+    /// A measured future quota deadline may be days away. Without one, cap the
+    /// retry delay so a spend cap cannot bench an account until an unrelated reset.
+    /// A successful probe also releases the hold when it reads the refusal as over.
+    pub fn mark_codex_quota_limited(&self, idx: usize, seconds: i64) {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            let now = OffsetDateTime::now_utc();
+            let hold = account
+                .quota
+                .codex
+                .refusal_reset
+                .filter(|reset| *reset > now)
+                .map_or_else(
+                    || seconds.clamp(1, MAX_RATE_LIMIT_HOLD_SECONDS),
+                    |reset| reset.unix_timestamp().saturating_sub(now.unix_timestamp()),
+                );
+            account.status = AccountStatus::Throttled;
+            account.rate_limited_until_ms =
+                Some(crate::now_ms().saturating_add(hold.saturating_mul(1000)));
+            account.hold_cause = HoldCause::RateLimit;
         }
     }
 

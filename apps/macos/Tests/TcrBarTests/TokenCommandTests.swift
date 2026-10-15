@@ -40,4 +40,39 @@ final class TokenCommandTests: XCTestCase {
             result, .failure(TokenCommand.Failure(exitCode: 1, message: "Error: no account matches 'nobody'"))
         )
     }
+
+    /// On a Codex row the item copies a ChatGPT bearer, which works only with its
+    /// account-id header, and nothing else on the item says so. A Claude row's
+    /// item keeps today's title and has no help, as today.
+    func testTheCopyItemNamesChatGPTOnACodexRow() throws {
+        let fleet = try decodeFleet(
+            [canonicalRow("alice@example.com"), canonicalRow("bob@example.com/codex")])
+        let alice = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
+        let bob = try XCTUnwrap(fleet.accounts.first { $0.name == "bob@example.com/codex" })
+        XCTAssertEqual(TokenCommand.menuTitle(for: alice), "Copy Access Token")
+        XCTAssertNil(TokenCommand.menuHelp(for: alice))
+        XCTAssertEqual(TokenCommand.menuTitle(for: bob), "Copy ChatGPT Access Token")
+        XCTAssertEqual(
+            TokenCommand.menuHelp(for: bob),
+            "Copies this account's ChatGPT bearer. It works only with the account's "
+                + "chatgpt-account-id header, which the codex CLI sends for you.")
+    }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
 }

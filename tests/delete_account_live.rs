@@ -17,11 +17,16 @@
 //! probe, warm or refresh loop and sends nothing upstream. The `tcr` binary gets
 //! a scratch `HOME`, no `XDG_CACHE_HOME`, and `TCR_CLAUDE_CODE_CREDENTIALS`
 //! pointing at a file that does not exist, so it can read neither the real
-//! config nor the Keychain. Every account is invented.
+//! config nor the Keychain. Every account is invented. Ordinary fixture rows omit refresh
+//! tokens so offline status cannot probe Claude's real usage endpoint. A test-only libc
+//! guard rejects the live proxy and non-loopback connections before any data is sent.
 //!
 //! Every status read asserts `source == "live"`. An offline read builds its rows
 //! from the config file, which the delete has already edited, so it would pass
 //! these tests whether or not the running proxy dropped anything.
+
+#[path = "support/connect_guard.rs"]
+mod connect_guard;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -66,11 +71,19 @@ async fn boot_after(
     let config = dir.join("teamclaude.json");
     std::fs::write(
         &config,
-        format!(r#"{{ "proxy": {{ "port": {port} }}, {extra} "accounts": [{accounts}] }}"#),
+        format!(r#"{{ "proxy": {{ "port": {port} }}, "upstream": "http://127.0.0.1:0", "codexUpstream": "http://127.0.0.1:0", {extra} "accounts": [{accounts}] }}"#),
     )
     .expect("write the scratch config");
     before_load(&config);
     let loaded = tcr::config::load(&config).expect("load the scratch config");
+    assert_eq!(
+        loaded.upstream, "http://127.0.0.1:0",
+        "Claude inference stays on the fixture's upstream"
+    );
+    assert_eq!(
+        loaded.codex_upstream, "http://127.0.0.1:0",
+        "offline Codex probes must fail closed"
+    );
     let manager = Manager::with_live_refresher(loaded, follows_file.then(|| config.clone()));
     let served = Arc::clone(&manager);
     tokio::spawn(async move { tcr::mitm::serve(listener, served, None).await });
@@ -111,17 +124,21 @@ async fn tcr(fleet: &Fleet, args: &[&str]) -> Run {
     let config = fleet.config.clone();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new(env!("CARGO_BIN_EXE_tcr"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        command
             .args(&args)
             .arg("--config")
             .arg(&config)
             .env("HOME", &home)
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("TCR_CODEX_AUTH", home.join("no-such-codex-auth.json"))
             .env_remove("XDG_CACHE_HOME")
             .env("TCR_CLAUDE_CODE_CREDENTIALS", claude_code_login(&home))
             .env("NO_COLOR", "1")
-            .current_dir(&home)
-            .output()
-            .expect("run tcr");
+            .current_dir(&home);
+        let guard = connect_guard::ConnectGuard::attach(&mut command, &home);
+        let out = command.output().expect("run tcr");
+        guard.assert_no_connections();
         Run {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -169,7 +186,7 @@ fn file_names(path: &Path) -> Vec<String> {
 fn oauth(name: &str, extra: &str) -> String {
     format!(
         r#"{{ "name": "{name}", "type": "oauth", "accessToken": "at-{name}",
-             "refreshToken": "rt-{name}", "expiresAt": 4102444800000 {extra} }}"#
+             "expiresAt": 4102444800000 {extra} }}"#
     )
 }
 
@@ -257,6 +274,7 @@ async fn quota_state_does_not_change_a_delete() {
                 seven_day: None,
                 seven_day_oi: None,
                 extra_usage_usd: None,
+                codex: None,
             },
         );
     }
@@ -629,6 +647,15 @@ async fn a_login_after_a_delete_brings_the_account_back_serving() {
     assert!(file_names(&fleet.config).contains(&"alice@example.com".to_string()));
 }
 
+#[tokio::test]
+async fn deletion_rows_cannot_probe_a_live_claude_usage_endpoint() {
+    let fleet = boot(&oauth("alice@example.com", ""), "", true).await;
+    assert!(
+        fleet.manager.probeable_indices().is_empty(),
+        "an offline deletion fixture must not probe Claude's fixed real usage endpoint"
+    );
+}
+
 // --- fleet ----------------------------------------------------------------------
 
 #[tokio::test]
@@ -827,4 +854,181 @@ async fn remove_from_group_shows_on_the_next_poll() {
         rows[0]["groups"].as_array().is_none_or(Vec::is_empty),
         "{rows:?}"
     );
+}
+
+// --- Codex rows: a ChatGPT user in a workspace -------------------------------------
+
+/// A Codex row in the shape an import writes: `accountUuid` the ChatGPT user, `orgUuid` the
+/// workspace, plus any `extra` keys.
+fn codex(name: &str, user: &str, workspace: &str, extra: &str) -> String {
+    oauth(
+        name,
+        &format!(
+            r#", "provider": "codex", "credentialVersion": 2, "accountUuid": "{user}",
+               "orgUuid": "{workspace}" {extra}"#
+        ),
+    )
+}
+
+/// One delete takes one seat, and only that one: the Claude twin of the same person stays
+/// (another provider), the other seat of the same workspace stays (another ChatGPT user), and
+/// the same user's other workspace stays (another workspace).
+#[tokio::test]
+async fn a_codex_delete_takes_only_that_seat() {
+    let fleet = boot(
+        &[
+            oauth(
+                "alice@example.com",
+                r#", "accountUuid": "11111111-1111-4111-8111-111111111111""#,
+            ),
+            codex(
+                "alice@example.com/codex",
+                "55555555-5555-4555-8555-555555555555",
+                "66666666-6666-4666-8666-666666666666",
+                "",
+            ),
+            codex(
+                "bob@example.com",
+                "77777777-7777-4777-8777-777777777777",
+                "66666666-6666-4666-8666-666666666666",
+                "",
+            ),
+            codex(
+                "erin@example.com",
+                "88888888-8888-4888-8888-888888888888",
+                "99999999-9999-4999-8999-999999999999",
+                "",
+            ),
+            codex(
+                "work",
+                "88888888-8888-4888-8888-888888888888",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "",
+            ),
+        ]
+        .join(","),
+        "",
+        true,
+    )
+    .await;
+    delete_and_expect(
+        &fleet,
+        "alice@example.com/codex",
+        &[
+            "alice@example.com",
+            "bob@example.com",
+            "erin@example.com",
+            "work",
+        ],
+    )
+    .await;
+    delete_and_expect(
+        &fleet,
+        "work",
+        &["alice@example.com", "bob@example.com", "erin@example.com"],
+    )
+    .await;
+}
+
+/// A Codex row saved before the ChatGPT user was split from the workspace (the workspace in
+/// `accountUuid`, no `orgUuid`) is matched by no login of the new shape, so a login after its
+/// delete adds a row of its own, serving, with its folder. Deleted again, the same login
+/// revives that row in place, with the folder it brings and no login error.
+#[tokio::test]
+async fn an_old_shape_codex_row_is_replaced_live_and_comes_back_after_a_delete() {
+    let fleet = boot(
+        &[
+            oauth("dana@example.com", ""),
+            oauth(
+                "carol@example.com",
+                r#", "provider": "codex", "credentialVersion": 2,
+                   "accountUuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb""#,
+            ),
+        ]
+        .join(","),
+        "",
+        true,
+    )
+    .await;
+    delete_and_expect(&fleet, "carol@example.com", &["dana@example.com"]).await;
+
+    let login = |codex_home: &str| -> tcr::config::Account {
+        serde_json::from_str(&codex(
+            "carol@example.com",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            &format!(r#", "codexHome": "{codex_home}""#),
+        ))
+        .expect("a Codex login")
+    };
+    assert!(matches!(
+        fleet
+            .manager
+            .add_or_update_account(login("/Users/example/.codex")),
+        tcr::manager::AddAccountOutcome::Added { .. }
+    ));
+    let rows = poll(&fleet).await;
+    assert_eq!(names(&rows), vec!["dana@example.com", "carol@example.com"]);
+    assert_eq!(rows[1]["disabled"], false, "{rows:?}");
+    assert_eq!(rows[1]["codexHome"], "/Users/example/.codex", "{rows:?}");
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fleet.config).unwrap()).unwrap();
+    let carols: Vec<&Value> = doc["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "carol@example.com")
+        .collect();
+    assert_eq!(carols.len(), 1, "{doc}");
+    assert_eq!(
+        carols[0]["accountUuid"],
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    );
+    assert_eq!(carols[0]["orgUuid"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+
+    delete_and_expect(&fleet, "carol@example.com", &["dana@example.com"]).await;
+    assert!(matches!(
+        fleet
+            .manager
+            .add_or_update_account(login("/Users/example/.codex-b")),
+        tcr::manager::AddAccountOutcome::Updated { .. }
+    ));
+    let rows = poll(&fleet).await;
+    assert_eq!(names(&rows), vec!["dana@example.com", "carol@example.com"]);
+    assert_eq!(rows[1]["disabled"], false, "{rows:?}");
+    assert_eq!(rows[1]["codexHome"], "/Users/example/.codex-b", "{rows:?}");
+    assert!(rows[1].get("loginError").is_none(), "{rows:?}");
+}
+
+/// A Codex row taken out of the file by hand and put back with another folder comes back with
+/// the file's folder: the file's row is the truth again.
+#[tokio::test]
+async fn a_codex_row_restored_by_hand_takes_the_files_codex_home() {
+    let fleet = boot(
+        &[
+            codex(
+                "erin@example.com",
+                "88888888-8888-4888-8888-888888888888",
+                "99999999-9999-4999-8999-999999999999",
+                r#", "codexHome": "/Users/example/.codex""#,
+            ),
+            oauth("dana@example.com", ""),
+        ]
+        .join(","),
+        "",
+        true,
+    )
+    .await;
+    let original = std::fs::read_to_string(&fleet.config).unwrap();
+    let mut doc: Value = serde_json::from_str(&original).unwrap();
+    let mut erin = doc["accounts"].as_array_mut().unwrap().remove(0);
+    std::fs::write(&fleet.config, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    assert_eq!(names(&poll(&fleet).await), vec!["dana@example.com"]);
+
+    erin["codexHome"] = Value::from("/Users/example/.codex-b");
+    doc["accounts"].as_array_mut().unwrap().insert(0, erin);
+    std::fs::write(&fleet.config, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    let rows = poll(&fleet).await;
+    assert_eq!(names(&rows), vec!["erin@example.com", "dana@example.com"]);
+    assert_eq!(rows[0]["codexHome"], "/Users/example/.codex-b", "{rows:?}");
 }

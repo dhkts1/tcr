@@ -282,9 +282,12 @@ enum V4 {
     static var toolRowRingSize: CGFloat { compact ? 20 : 22 }
     static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
-    /// The Bash tool's own timeout — the denominator the ring fills toward, and
-    /// the figure the ring's help and spoken value state.
-    static let toolTimeoutSeconds: Double = 600
+    /// The Bash tool's own timeout — the denominator a Claude `Bash` call's ring
+    /// fills toward, and the figure the ring's help and spoken value state. It
+    /// is ``ToolCall/bashTimeoutSeconds``, the figure the running list's sort
+    /// and the near-timeout count read, so the three cannot drift. A codex call
+    /// that carries its own timeout fills toward that instead.
+    static let toolTimeoutSeconds: Double = ToolCall.bashTimeoutSeconds
     /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
     /// and the row says how long is left (Gil, 2026-09-13: "red plus
     /// `· 20s to timeout` within 60 s of the 600 s limit").
@@ -298,6 +301,12 @@ enum V4 {
     /// tab. A hit target smaller than the glyph's own confidence is how a
     /// mis-click kills the wrong command.
     static let killHitTarget: CGFloat = 24
+    /// The slot a running Codex call's row gives the words "no Kill", where a Claude
+    /// call's row draws its ✕: tcr cannot match a codex call to a process, so it offers
+    /// none, and says so. The label measures 34.4 pt at the 12 pt mute size (32.0 pt at
+    /// Compact's 11 pt), and this is that plus a margin: 11 pt wider than the ✕'s target,
+    /// which a Codex row's name gives up.
+    static let noKillWidth: CGFloat = 35
     /// The glyph inside that target. Smaller than the box on purpose: the box
     /// is what the pointer must hit, the glyph is what the eye must not be
     /// dominated by — a running row is about its command, not about the way
@@ -594,6 +603,13 @@ enum V4 {
     /// it, so a 12 pt plan wrapping under a 15 pt name still occupies 21 pt.
     static var rowLineHeight: CGFloat { lineHeight(nameSize) }
 
+    /// What a block's top margin becomes after a block whose bottom margin is `previous`:
+    /// adjacent CSS margins collapse to the larger, and SwiftUI adds paddings, so the
+    /// block pays only the difference.
+    static func marginAfter(_ own: CGFloat, previous: CGFloat) -> CGFloat {
+        max(own, previous) - previous
+    }
+
     /// What a block's top margin becomes when it follows the segmented strip.
     ///
     /// Adjacent CSS margins COLLAPSE to the larger of the two: the strip's
@@ -601,7 +617,7 @@ enum V4 {
     /// gap, not 26. SwiftUI adds paddings, which is how the first v4 render put
     /// 29 pt of nothing under the tabs against the mockup's 15.
     static func marginAfterStrip(_ own: CGFloat) -> CGFloat {
-        max(own, segMarginBottom) - segMarginBottom
+        marginAfter(own, previous: segMarginBottom)
     }
 
     // MARK: - One-line account rows (option H: `.slim`, `.wline`, `.bandhead`)
@@ -672,6 +688,12 @@ enum V4 {
     /// 2026-10-14): option H's 32, or less if a grouped line could not fit both
     /// labels and "100%" twice at this density.
     static var lineBarWidth: CGFloat { AccountLineFit.barWidth(lineRoom, lineMetrics) }
+    /// The same bar, for a panel whose lines draw `labels`: a Codex window
+    /// labelled by its length (`30d`) widens the label column, and the bar gives
+    /// it the room. With `5h` and `7d` alone it is ``lineBarWidth``.
+    static func lineBarWidth(labels: [String]) -> CGFloat {
+        AccountLineFit.barWidth(lineRoom, lineMetrics, labels: labels)
+    }
     /// `.slim+.slim{border-top:1px solid rgba(57,62,67,.6)}`: the hairline at
     /// 60 %, between rows only.
     static let lineDividerAlpha: Double = 0.6
@@ -725,6 +747,11 @@ enum V4 {
     /// `.hstrip{gap:2px;height:14px;margin:5px 0 5px}`, `.hseg{border-radius:3px}`.
     static let stripHeight: CGFloat = 14
     static let stripGap: CGFloat = 2
+    /// The break between the Claude and the Codex segments, in a fleet holding both. No mockup
+    /// draws two pools: three ``stripGap``s read as a break at any segment width.
+    static let stripPoolGap: CGFloat = 6
+    /// The spacer drawn at that break: the segment row's own ``stripGap`` already sits on each side.
+    static var stripPoolSpacer: CGFloat { stripPoolGap - 2 * stripGap }
     static let stripMarginV: CGFloat = 5
     static let stripSegmentRadius: CGFloat = 3
     /// `.hseg.spent{background:rgba(234,90,86,.55)}`, `.hseg.off{background:
