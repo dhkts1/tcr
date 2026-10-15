@@ -332,7 +332,13 @@ enum PeersSnapshotBuilder {
         "A trusted Mac carries your traffic when this Mac has no path of its own, and reads "
         + "none of it."
 
-    static func snapshot(from document: PeerListDocument, now: Date) -> PeersSnapshot {
+    /// `holdsCodex` is whether the fleet holds a Codex account. Two sentences live
+    /// in the snapshot rather than the view, the untrusted row's promise and the
+    /// carrying row's meter, and with a Codex account both name Claude
+    /// (``PeersCodexCopy``), because no Mac carries a Codex request.
+    static func snapshot(from document: PeerListDocument, now: Date, holdsCodex: Bool = false)
+        -> PeersSnapshot
+    {
         guard document.supported else {
             return PeersSnapshot(
                 unsupported: true, failure: nil, finding: false, sharing: false, rows: [],
@@ -346,7 +352,7 @@ enum PeersSnapshotBuilder {
             rows: document.peers.map {
                 row(
                     $0, sharing: document.sharing, now: now, names: peerNames(document),
-                    liveAnswered: document.liveAnswered)
+                    liveAnswered: document.liveAnswered, holdsCodex: holdsCodex)
             },
             answeringOn: document.answeringOn,
             readAt: now,
@@ -420,7 +426,7 @@ enum PeersSnapshotBuilder {
 
     private static func row(
         _ entry: PeerListDocument.PeerEntry, sharing: Bool, now: Date,
-        names: [String: String] = [:], liveAnswered: Bool? = nil
+        names: [String: String] = [:], liveAnswered: Bool? = nil, holdsCodex: Bool = false
     ) -> PeerRowModel {
         let address = entry.address ?? entry.name ?? "unknown"
         let named = entry.name != nil
@@ -435,8 +441,7 @@ enum PeersSnapshotBuilder {
                 : "found \(seen.phrase) · not trusted · no name announced"
             let promise =
                 named
-                ? "Trust shows the same six digits here and on \(title). Press Trust on both "
-                    + "and it can carry your traffic without reading it."
+                ? PeersCodexCopy.untrustedPromise(title: title, holdsCodex: holdsCodex)
                 : "This Mac's owner turned announcing its name off, so it shows an address "
                     + "until you trust it. Trust still compares six digits, and the name "
                     + "arrives with the handshake."
@@ -459,7 +464,9 @@ enum PeersSnapshotBuilder {
         // ONE meter, built once and asked twice: the pills have to agree with
         // it about whether the lease is over, and deriving "ended" a second
         // time is how the row ends up with a live pill over a dead meter.
-        let meter = meter(entry, title: title, sharing: sharing, awake: seen.awake, now: now)
+        let meter = meter(
+            entry, title: title, sharing: sharing, awake: seen.awake, now: now,
+            holdsCodex: holdsCodex)
         // Which of the three absences this row's empty path list means, and
         // only this caller can answer it.
         //
@@ -581,7 +588,7 @@ enum PeersSnapshotBuilder {
     /// carry-only row gets bytes per hour; anything else gets a sentence.
     private static func meter(
         _ entry: PeerListDocument.PeerEntry, title: String, sharing: Bool, awake: Bool,
-        now: Date
+        now: Date, holdsCodex: Bool = false
     ) -> PeerMeter {
         // The ended arm goes FIRST, because every arm below it describes a
         // lease that is running. A Mac whose only lease had ended kept its
@@ -652,8 +659,8 @@ enum PeersSnapshotBuilder {
                 GatewayBytes(
                     bytesPerHour: bytes,
                     capBytesPerHour: cap,
-                    sentence: "\(title) is carrying your encrypted bytes and can open none of "
-                        + "them, out of \(PeerFormat.megabytes(cap)) MB an hour."))
+                    sentence: PeersCodexCopy.gatewaySentence(
+                        title: title, capBytesPerHour: cap, holdsCodex: holdsCodex)))
         }
         if entry.carries {
             // No sentence: this row says exactly what ``carrySentence`` says
@@ -713,6 +720,15 @@ final class PeerController: ObservableObject {
     /// seconds later.
     @Published private(set) var refusal = PeerRefusal()
 
+    /// Whether the fleet holds a Codex account, set by the panel from each poll
+    /// (`FleetView.syncPeersProvider()`).
+    ///
+    /// No Mac lends, serves or carries a Codex request, so while this is true every
+    /// Peers promise about borrowing or carrying names Claude. The words the tab
+    /// draws follow it at once; the two sentences that live in the snapshot (the
+    /// untrusted promise and the carrying meter) follow it from the next read.
+    @Published var holdsCodex = false
+
     /// The snapshot exactly as it was read, before the waiting overlay.
     ///
     /// Kept so that clearing an address from ``knocked`` restores the found
@@ -731,12 +747,13 @@ final class PeerController: ObservableObject {
         self.readSnapshot = .empty
     }
 
-    private init(pinned: PeersSnapshot, refusal: PeerRefusal) {
+    private init(pinned: PeersSnapshot, refusal: PeerRefusal, holdsCodex: Bool) {
         self.interval = StatusPoller.defaultInterval
         self.isPinned = true
         self.snapshot = pinned
         self.readSnapshot = pinned
         self.refusal = refusal
+        self.holdsCodex = holdsCodex
     }
 
     /// A controller that reads nothing, runs nothing and answers `pinned`
@@ -744,10 +761,12 @@ final class PeerController: ObservableObject {
     ///
     /// `refusal` is how the harness draws the banner: a refused verb has no
     /// fixture otherwise, because nothing in a render run can press a button.
-    static func pinned(_ snapshot: PeersSnapshot, refusal: PeerRefusal = PeerRefusal())
-        -> PeerController
-    {
-        PeerController(pinned: snapshot, refusal: refusal)
+    /// `holdsCodex` draws the tab of a fleet holding a Codex account; the
+    /// snapshot passed in is built with the same flag.
+    static func pinned(
+        _ snapshot: PeersSnapshot, refusal: PeerRefusal = PeerRefusal(), holdsCodex: Bool = false
+    ) -> PeerController {
+        PeerController(pinned: snapshot, refusal: refusal, holdsCodex: holdsCodex)
     }
 
     /// Starts the three second read, which then runs for as long as this view
@@ -780,7 +799,12 @@ final class PeerController: ObservableObject {
 
     func refresh() async {
         guard !isPinned else { return }
-        let read = await Task.detached(priority: .userInitiated) { await Self.read() }.value
+        // Read here, on the main actor, and handed to the detached read: the flag
+        // is the panel's, and the read runs off the main actor.
+        let holdsCodex = self.holdsCodex
+        let read = await Task.detached(priority: .userInitiated) {
+            await Self.read(holdsCodex: holdsCodex)
+        }.value
         readSnapshot = read
         publish()
     }
@@ -1251,7 +1275,7 @@ final class PeerController: ObservableObject {
     /// their CLI is old is the wrong sentence. Classified on the exit code
     /// and on `tcr`'s own "unrecognized subcommand" wording rather than on
     /// one of them alone.
-    private nonisolated static func read() async -> PeersSnapshot {
+    private nonisolated static func read(holdsCodex: Bool) async -> PeersSnapshot {
         switch TcrTool.resolve() {
         case .failure(let notFound):
             return PeersSnapshotBuilder.failed(
@@ -1279,7 +1303,8 @@ final class PeerController: ObservableObject {
                         || text.contains("unexpected argument")
                     {
                         return PeersSnapshotBuilder.snapshot(
-                            from: PeerListDocument(supported: false), now: Date())
+                            from: PeerListDocument(supported: false), now: Date(),
+                            holdsCodex: holdsCodex)
                     }
                     let detail = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                     return PeersSnapshotBuilder.failed(
@@ -1292,7 +1317,7 @@ final class PeerController: ObservableObject {
                 // every failure inside it lands as `.unsupported` and the tab
                 // draws exactly the file half it always did.
                 return PeersSnapshotBuilder.snapshot(
-                    from: document.mergingLive(await live), now: Date())
+                    from: document.mergingLive(await live), now: Date(), holdsCodex: holdsCodex)
             } catch {
                 _ = await live
                 return PeersSnapshotBuilder.failed(
@@ -1505,6 +1530,13 @@ struct PeersTabV4: View {
                     }
                 }
                 shareCard
+                // Where Codex requests go, said once, under the card whose
+                // promises it qualifies. Only in a fleet holding a Codex account:
+                // a Claude-only fleet's tab is the one it always was.
+                if controller.holdsCodex {
+                    MuteText(text: PeersCodexCopy.codexStaysOnThisMac, lineLimit: nil)
+                        .padding(.horizontal, V4.sectionHeadMarginSide)
+                }
                 countLine
                 if let footer = snapshot.limitedFooter {
                     limitedLine(footer)
@@ -1527,6 +1559,7 @@ struct PeersTabV4: View {
                     peerName: row.title,
                     run: pairing,
                     snapshotMode: snapshotMode,
+                    holdsCodex: controller.holdsCodex,
                     onFinished: { pinned in
                         if pinned { Task { await controller.refresh() } }
                     },
@@ -1639,7 +1672,7 @@ struct PeersTabV4: View {
     /// runs the arithmetic without a view at all.
     private var peerListHeight: CGFloat {
         PeerPanelHeight.listViewportHeight(
-            rows: snapshot.rowShapes, metrics: Self.heightMetrics)
+            rows: snapshot.rowShapes, metrics: Self.heightMetrics(holdsCodex: controller.holdsCodex))
     }
 
     // MARK: Collapsed
@@ -1761,8 +1794,8 @@ struct PeersTabV4: View {
             PeerPill(
                 text: "\(answering.inFlight) in flight",
                 role: .disclosure,
-                help: "Requests of yours that \(answering.peer) is serving on its own accounts, "
-                    + "and reading, at this moment.")
+                help: PeersCodexCopy.inFlightPillHelp(
+                    peer: answering.peer, holdsCodex: controller.holdsCodex))
         }
         .padding(.top, V4.marginAfterStrip(V4.cardGap))
         .padding(.horizontal, V4.sectionHeadMarginSide)
@@ -1824,7 +1857,7 @@ struct PeersTabV4: View {
         let on = snapshot.sharing
         let names = snapshot.rows.filter { $0.trust == .trusted }.map(\.title)
         return switchCard(
-            title: "Share accounts with trusted Macs",
+            title: PeersCodexCopy.shareCardTitle(holdsCodex: controller.holdsCodex),
             state: shareStateLine(on: on, names: names),
             isOn: on,
             enabled: snapshot.canShare,
@@ -1835,22 +1868,22 @@ struct PeersTabV4: View {
         .padding(.top, V4.cardGap)
     }
 
+    /// What the Share card says it is doing. With a Codex account in the fleet
+    /// every promise names Claude (``PeersCodexCopy``); "Off, and it stays off…"
+    /// and "On, and applying to nobody…" promise nothing and stay as they are.
     private func shareStateLine(on: Bool, names: [String]) -> String {
         guard snapshot.canShare else { return "Off, and it stays off until a Mac is trusted." }
-        guard on else { return "Off. Trusted Macs carry your traffic but never read it." }
+        guard on else { return PeersCodexCopy.shareStateOff(holdsCodex: controller.holdsCodex) }
         if names.isEmpty { return "On, and applying to nobody at the moment." }
-        return "On. \(PeerFormat.list(names)) may serve your requests."
+        return PeersCodexCopy.shareStateOn(names: names, holdsCodex: controller.holdsCodex)
     }
 
     private func shareYesLine(on: Bool, names: [String]) -> String {
         guard snapshot.canShare else {
-            return "On means a trusted Mac may serve your requests with its own accounts, and "
-                + "read them. There is nothing to share with yet."
+            return PeersCodexCopy.yesCannotShare(holdsCodex: controller.holdsCodex)
         }
         guard on else {
-            let who = names.first.map { "\($0) may" } ?? "a trusted Mac may"
-            return "On means \(who) serve your requests with its accounts, and read them. "
-                + "Which Mac, how much and for how long: Settings."
+            return PeersCodexCopy.yesOff(firstName: names.first, holdsCodex: controller.holdsCodex)
         }
         return "Off stops both directions at the next request: a Mac that was answering for "
             + "you stops, and you stop answering for it. Work in flight finishes."
@@ -2430,8 +2463,7 @@ struct PeersTabV4: View {
                 if snapshot.sharing {
                     PeerPill(
                         text: "sharing", role: .disclosure,
-                        help: "Trusted Macs may serve your requests on their own accounts, and "
-                            + "read them.")
+                        help: PeersCodexCopy.sharingPillHelp(holdsCodex: controller.holdsCodex))
                 } else if snapshot.finding {
                     PeerPill(
                         text: "finding", role: .ok,
@@ -2441,8 +2473,13 @@ struct PeersTabV4: View {
             // The fact every trusted row used to repeat, said once, where a
             // reader meets it before the rows rather than seven times inside
             // them. Drawn whenever the head is, so the height budget's
-            // `carrySentenceLines` is a constant and not a guess.
-            MuteText(text: PeersSnapshotBuilder.carrySentence, lineLimit: nil)
+            // `carrySentenceLines` is a constant and not a guess. With a Codex
+            // account in the fleet it names Claude, and still wraps to two lines.
+            MuteText(
+                text: controller.holdsCodex
+                    ? PeersCodexCopy.carrySentence(holdsCodex: true)
+                    : PeersSnapshotBuilder.carrySentence,
+                lineLimit: nil)
         }
         .padding(.top, V4.sectionHeadMarginTop)
         .padding(.horizontal, V4.sectionHeadMarginSide)
@@ -2541,10 +2578,24 @@ struct PeersTabV4: View {
     /// the budget cannot see comes out of the footer.
     static let knockDetailLines: CGFloat = 3
 
+    /// How many lines the Codex line under the Share card wraps to at this panel's
+    /// width: "Codex requests always leave from this Mac: …" is about 505 pt of text
+    /// at Compact's mute size and 544 pt at Comfortable's, more than the panel's
+    /// 372 pt and less than twice its column, so two lines at either density.
+    ///
+    /// Charged only in a fleet holding a Codex account, the only fleet that draws
+    /// it, for the reason ``carrySentenceLines`` is a constant: growth the budget
+    /// cannot see comes out of the footer.
+    static let codexLineLines: CGFloat = 2
+
+    /// What ``PeerPanelHeight`` charges for this tab, at the density now
+    /// resolved, in a fleet with no Codex account.
+    static var heightMetrics: PeerPanelHeight.Metrics { heightMetrics(holdsCodex: false) }
+
     /// What ``PeerPanelHeight`` charges for this tab, at the density now
     /// resolved. Read off `V4` here (the one place that knows both), and
     /// passed in, so the arithmetic stays testable in `TcrBarCore`.
-    static var heightMetrics: PeerPanelHeight.Metrics {
+    static func heightMetrics(holdsCodex: Bool) -> PeerPanelHeight.Metrics {
         PeerPanelHeight.Metrics(
             nameLineHeight: V4.lineHeight(V4.nameSize),
             subLineHeight: V4.lineHeight(V4.muteSize),
@@ -2559,6 +2610,7 @@ struct PeersTabV4: View {
                     + 2 * V4.lineHeight(V4.muteSize) + 2 * V4.cardInsetV)
                 + V4.sectionHeadMarginTop + V4.lineHeight(V4.sectionHeadSize)
                 + carrySentenceLines * V4.lineHeight(V4.muteSize)
+                + (holdsCodex ? codexLineLines * V4.lineHeight(V4.muteSize) : 0)
                 + V4.footerMarginTop + V4.lineHeight(V4.byToolLineSize),
             // One knock card as it is actually drawn: the name line, the
             // address row it shares with its pill, the three lines its
@@ -2575,16 +2627,18 @@ struct PeersTabV4: View {
                 + 3 * V4.knockLineGap + hitTarget + 2 * V4.cardInsetV)
     }
 
+    /// A pill's help, which is also its VoiceOver value. The four that promise
+    /// carrying or serving name Claude in a fleet holding a Codex account.
     private func pillHelp(_ text: String) -> String {
+        let holdsCodex = controller.holdsCodex
         switch text {
-        case "trusted": return "Pinned on both Macs. It can carry your traffic."
+        case "trusted": return PeersCodexCopy.trustedPillHelp(holdsCodex: holdsCodex)
         case PeersSnapshotBuilder.carryPillText:
-            return "May hold your encrypted bytes and can open none of them. The path line "
-                + "under the row says whether it is doing so now."
+            return PeersCodexCopy.carryPillHelp(holdsCodex: holdsCodex)
         case PeerLendDirection.youLend.pillText:
-            return "May serve your requests on its own accounts, and read them."
+            return PeersCodexCopy.youLendPillHelp(holdsCodex: holdsCodex)
         case PeerLendDirection.theyLend.pillText:
-            return "Serving your requests on its own accounts right now, and reading them."
+            return PeersCodexCopy.theyLendPillHelp(holdsCodex: holdsCodex)
         case "asleep": return "Not answering. The offer stands and resumes when it wakes."
         case "no headroom": return "It has nothing spare, so nothing was asked of it."
         default: return text
@@ -3344,6 +3398,9 @@ struct PeerTrustSheetHost: View {
     let peerName: String
     @ObservedObject var run: PeerPairRun
     var snapshotMode: Bool = false
+    /// Whether the fleet holds a Codex account: the sheet then says what the pin
+    /// buys as Claude traffic, because a trusted Mac never carries a Codex request.
+    var holdsCodex: Bool = false
     /// When this panel sent the request, which is the instant this host was
     /// first built: the sheet IS the pairing, and it opens on the same press
     /// that starts the process. `@State` so a redraw does not restart the
@@ -3366,6 +3423,7 @@ struct PeerTrustSheetHost: View {
             // holding the knock enforces.
             expiresIn: PeerAdmission.knockExpirySeconds - Date().timeIntervalSince(sentAt),
             snapshotMode: snapshotMode,
+            holdsCodex: holdsCodex,
             onTrust: { run.submitComparedCode() },
             // Cancel on a live run stops the child and leaves the sheet
             // saying so; on a settled one there is nothing to stop and the
@@ -3433,6 +3491,9 @@ struct PeerTrustSheet: View {
     /// deadline, so a rendered picture of it is the same on every run.
     var expiresIn: TimeInterval?
     var snapshotMode: Bool = false
+    /// Whether the fleet holds a Codex account. The comparing and done sentences
+    /// then name Claude traffic (``PeerPairState/sentence(peerName:expiresIn:holdsCodex:)``).
+    var holdsCodex: Bool = false
     var onTrust: () -> Void = {}
     var onCancel: () -> Void = {}
 
@@ -3456,12 +3517,16 @@ struct PeerTrustSheet: View {
                 comparedField
             }
 
-            Text(state.sentence(peerName: peerName, expiresIn: expiresIn))
-                .font(V4.font(V4.dimSize))
-                .foregroundStyle(Tok.inkDim)
-                .fixedSize(horizontal: false, vertical: true)
-                .lineSpacing(V4.lineSpacing(V4.dimSize))
-                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(
+                holdsCodex
+                    ? state.sentence(peerName: peerName, expiresIn: expiresIn, holdsCodex: true)
+                    : state.sentence(peerName: peerName, expiresIn: expiresIn)
+            )
+            .font(V4.font(V4.dimSize))
+            .foregroundStyle(Tok.inkDim)
+            .fixedSize(horizontal: false, vertical: true)
+            .lineSpacing(V4.lineSpacing(V4.dimSize))
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             // The other Mac's half of the job, named while this one waits. A
             // "waiting" sheet with no instruction leaves the person at the

@@ -26,6 +26,9 @@
 //! entries created before org UUIDs were stored. When the identity fields are all
 //! absent — the shape of every config written before they existed — the
 //! comparison falls back to name equality, which unique names make exact.
+//!
+//! All of it within ONE provider: records of two providers are never the same
+//! account, whatever their names and ids say ([`same_identity`]).
 
 use crate::config::Account;
 use std::collections::HashSet;
@@ -61,6 +64,17 @@ pub fn uuid_key_of(account_uuid: Option<&str>) -> Option<&str> {
 
 /// Whether two account records refer to the same account+org.
 ///
+/// - Records of different providers never do, whatever their names and ids say.
+///   Every provider is its own identity space: an Anthropic account and a Codex
+///   account of one person legitimately share an email, and an id one provider
+///   minted names nothing at the other. Compared across providers, the name
+///   fallback below calls a Codex row and a same-named Anthropic row one account,
+///   and a rotated Codex credential stamped onto the Anthropic row overwrites that
+///   row's own single-use refresh token, which then 400s (`invalid_grant`) and
+///   leaves it dead until re-authed by hand: the failure [`resolve`] refuses a
+///   [`Resolved::Many`] tie to prevent. Asked here, first, so
+///   [`same_identity_strict`], [`resolve`] and every caller of this function
+///   inherit it, and no call site has to remember a filter of its own.
 /// - Both have an `account_uuid`: it must match. If both org keys are known they
 ///   must also match; but if either side's org is still unknown we treat them as
 ///   the same. This lets a freshly-profiled login backfill a legacy entry (which
@@ -68,6 +82,9 @@ pub fn uuid_key_of(account_uuid: Option<&str>) -> Option<&str> {
 ///   an org key, a *different* org is correctly seen as a distinct account.
 /// - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
 pub fn same_identity(a: &Account, b: &Account) -> bool {
+    if a.provider != b.provider {
+        return false;
+    }
     match (uuid_key(a), uuid_key(b)) {
         (Some(ua), Some(ub)) => {
             if ua != ub {
@@ -98,8 +115,12 @@ pub fn same_identity(a: &Account, b: &Account) -> bool {
 /// Records with no UUID are never strict-equal. `same_identity` falls back to name
 /// equality there, and two entries sharing a name are genuinely indistinguishable
 /// — there is no stricter fact to prefer one by.
+///
+/// Built on [`same_identity`] rather than beside it, so it inherits that function's
+/// provider guard: records of different providers are never strict-equal either.
 pub fn same_identity_strict(a: &Account, b: &Account) -> bool {
-    matches!((uuid_key(a), uuid_key(b)), (Some(ua), Some(ub)) if ua == ub)
+    same_identity(a, b)
+        && matches!((uuid_key(a), uuid_key(b)), (Some(ua), Some(ub)) if ua == ub)
         && org_key(a) == org_key(b)
 }
 
@@ -130,6 +151,10 @@ pub enum Resolved {
 /// credential onto account B's record overwrites B's own single-use refresh token,
 /// which then 400s (`invalid_grant`) on its next use and leaves B dead until it is
 /// re-authed by hand.
+///
+/// A candidate of another provider than `target`'s is never a match, loose or
+/// strict ([`same_identity`]'s provider guard), so every caller resolves within
+/// `target`'s own provider without filtering its candidates first.
 pub fn resolve<'a, I>(candidates: I, target: &Account) -> Resolved
 where
     I: IntoIterator<Item = (usize, &'a Account)>,
@@ -303,7 +328,14 @@ pub fn match_one<T: Queryable>(accounts: &[T], query: &str) -> Match {
 /// Build a lightweight probe [`Account`] carrying only the identity fields, for
 /// [`same_identity`] comparison against stored records (upsert / persist). The
 /// non-identity fields are placeholders and never read by the identity helpers.
+///
+/// `provider` is REQUIRED, never defaulted: [`same_identity`] never matches records
+/// of different providers, and a default is a provider a caller can forget. A
+/// forgotten one reads as Anthropic and matches nothing of the provider it meant: a
+/// Codex account's pin or bound token restored that way would match no row at all,
+/// or the same-named Anthropic one.
 pub fn probe(
+    provider: crate::provider::Provider,
     name: &str,
     account_uuid: Option<String>,
     org_uuid: Option<String>,
@@ -312,6 +344,7 @@ pub fn probe(
     Account {
         name: name.to_string(),
         account_type: crate::config::AccountType::OAuth,
+        provider,
         account_uuid,
         org_uuid,
         org_name,
@@ -327,6 +360,7 @@ pub fn probe(
         seat_tier: None,
         egress: crate::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }
@@ -342,6 +376,7 @@ mod tests {
         org_name: Option<&str>,
     ) -> Account {
         probe(
+            crate::provider::Provider::Anthropic,
             name,
             account_uuid.map(str::to_string),
             org_uuid.map(str::to_string),
@@ -568,6 +603,98 @@ mod tests {
             resolve(
                 duplicates.iter().enumerate(),
                 &acct("me@example.com", Some("u1"), Some("org-a"), None)
+            ),
+            Resolved::Many
+        );
+    }
+
+    /// A Codex record built for these tests, beside [`acct`]'s Anthropic one.
+    fn codex(name: &str, account_uuid: Option<&str>, org_uuid: Option<&str>) -> Account {
+        probe(
+            crate::provider::Provider::Codex,
+            name,
+            account_uuid.map(str::to_string),
+            org_uuid.map(str::to_string),
+            None,
+        )
+    }
+
+    /// Every provider is its own identity space: a Codex record and an Anthropic one
+    /// with the same name AND the same account uuid and org are not one account,
+    /// loosely or strictly, so a Codex target resolves to nothing among Anthropic
+    /// candidates.
+    ///
+    /// Watched red: drop the provider guard from `same_identity` and the Codex target
+    /// resolves to the Anthropic row.
+    #[test]
+    fn a_record_of_another_provider_never_matches_even_on_name_and_uuid() {
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+        let anthropic = acct("alice@example.com", Some(UUID), Some("org-1"), None);
+        let target = codex("alice@example.com", Some(UUID), Some("org-1"));
+        assert_eq!(
+            resolve([(0, &anthropic)], &target),
+            Resolved::None,
+            "a Codex target must never resolve to an Anthropic row"
+        );
+        assert!(!same_identity(&target, &anthropic));
+        assert!(!same_identity_strict(&target, &anthropic));
+    }
+
+    /// A Codex row and an Anthropic row sharing a name, neither with a uuid: the name
+    /// fallback alone calls both of them the target, which is a refused tie. The
+    /// provider tells them apart, in both directions.
+    ///
+    /// Watched red: drop the provider guard and both targets tie (`Many`).
+    #[test]
+    fn a_same_named_pair_of_two_providers_resolves_to_the_targets_own_row() {
+        let candidates = [
+            acct("alice@example.com", None, None, None),
+            codex("alice@example.com", None, None),
+        ];
+        assert_eq!(
+            resolve(
+                candidates.iter().enumerate(),
+                &codex("alice@example.com", None, None)
+            ),
+            Resolved::One(1),
+            "the Codex target resolves to the Codex row"
+        );
+        assert_eq!(
+            resolve(
+                candidates.iter().enumerate(),
+                &acct("alice@example.com", None, None, None)
+            ),
+            Resolved::One(0),
+            "the Anthropic target resolves to the Anthropic row"
+        );
+    }
+
+    /// The guard's positive control: the same two shapes with every record Anthropic,
+    /// which is every record written before Codex existed, resolve exactly as they
+    /// always did. Same name and same uuid is one account; a same-named pair with no
+    /// uuid is still a tie, refused.
+    ///
+    /// Watched red against a guard that over-blocks: compare the providers the wrong
+    /// way round and the Anthropic pair stops matching at all.
+    #[test]
+    fn an_anthropic_only_fleet_resolves_exactly_as_before() {
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+        let row = acct("alice@example.com", Some(UUID), Some("org-1"), None);
+        assert_eq!(
+            resolve(
+                [(0, &row)],
+                &acct("alice@example.com", Some(UUID), Some("org-1"), None)
+            ),
+            Resolved::One(0)
+        );
+        let twins = [
+            acct("alice@example.com", None, None, None),
+            acct("alice@example.com", None, None, None),
+        ];
+        assert_eq!(
+            resolve(
+                twins.iter().enumerate(),
+                &acct("alice@example.com", None, None, None)
             ),
             Resolved::Many
         );

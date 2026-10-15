@@ -6,10 +6,12 @@
 //! How a request flows (mirrors `teamclaude/src/mitm.js`, reusing `tcr`'s
 //! account-selection + token-injection instead of reimplementing the forward):
 //!   1. A client sends `CONNECT <host>:<port>`. We peek the request line.
-//!   2. `api.anthropic.com` and `platform.claude.com` (Claude Code's own OAuth
-//!      refresh host, `POST /v1/oauth/token`) are MITM-terminated **only when
-//!      the leaf certificate actually loaded for this process covers that
-//!      host** — see [`host_allowed`] (policy) and
+//!   2. `api.anthropic.com`, `platform.claude.com` (Claude Code's own OAuth
+//!      refresh host, `POST /v1/oauth/token`) and `chatgpt.com` (Codex's
+//!      inference and backend host, on a marked Codex connection while the pool holds an account:
+//!      `host_intercepted`) are MITM-terminated **only when the leaf
+//!      certificate actually loaded for this process covers that host** —
+//!      see [`host_allowed`] (policy) and
 //!      [`host_covered_by_loaded_leaf`] (SAN truthfulness) below, both of which
 //!      must agree. When they do: we reply `200 Connection Established`,
 //!      TLS-accept with our leaf (a cert the client already trusts via its
@@ -17,7 +19,8 @@
 //!      as base-URL mode — authenticate, select an account, inject the pooled
 //!      `Bearer`, forward to the real upstream.
 //!   3. Every OTHER host — and any policy-allowed host the loaded leaf does
-//!      NOT cover — is **blind-tunneled**: a raw TCP byte-pipe to
+//!      NOT cover, and an unmarked `chatgpt.com` connection or one with no pooled account —
+//!      is **blind-tunneled**: a raw TCP byte-pipe to
 //!      `<host>:<port>` with TLS left untouched (we never see plaintext and
 //!      inject nothing). This matches the JS proxy's open tunnel for
 //!      everything else Claude Code needs (its bridge, telemetry) through the
@@ -34,6 +37,15 @@
 //! verbatim — no proxy handler change is needed. The outbound client keeps
 //! `.no_proxy()` (set in [`crate::manager`]) so we never loop our own upstream
 //! back through an ambient `HTTPS_PROXY`.
+//!
+//! Codex connections opt in with `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`.
+//! Codex's HTTP client passes proxy URL userinfo to reqwest; its WebSocket client enables
+//! the pinned Tungstenite forks' proxy support (`openai/codex` `http-client/src/outbound_proxy.rs`,
+//! `websocket-client/src/dialer.rs`, `Cargo.toml`). Both send that userinfo as HTTP CONNECT
+//! [`CODEX_PROXY_AUTHORIZATION`]. The pinned Tungstenite `proxy.rs`
+//! parses a username without a password and builds the same Basic header as reqwest's
+//! hyper-util matcher. This permits one listener without terminating another client's
+//! `chatgpt.com` TLS. The marker selects routing; it is not an authentication secret.
 
 use std::io;
 use std::net::SocketAddr;
@@ -45,6 +57,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt as _;
+use tracing::instrument::WithSubscriber as _;
 
 use crate::manager::Manager;
 
@@ -63,16 +76,75 @@ use crate::manager::Manager;
 /// (`POST /v1/oauth/token`) targets — 2 occurrences in the same binary — and
 /// `src/proxy.rs`'s `RelayMode::Raw` handling for that path was unreachable in
 /// MITM mode without it.
-pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
+///
+/// `chatgpt.com` was added 2026-10 for Codex, whose inference and backend
+/// calls go there by default (`openai/codex` `model-provider-info/src/lib.rs:80`,
+/// `CHATGPT_CODEX_BASE_URL`). It is intercepted only on a marked Codex connection while the pool
+/// holds a Codex account (`host_intercepted`), so an unmarked client or a codex with none keeps
+/// its own login. A login whose workspace is routed to another backend origin
+/// sends its calls there instead, to a host not on this list; tcr pools no such
+/// workspace, and relays a request that names a routing of its own on the
+/// client's credential (`crate::provider::CODEX_ROUTING_HEADERS`).
+/// `auth.openai.com` is deliberately NOT here: it is where the Codex client
+/// refreshes its OWN token, and that exchange must reach the real host
+/// untouched — tcr has nothing to inject into it, and Codex refresh tokens are
+/// single-use, so a refresh tcr mishandled would cost the client its login.
+/// Off this list it is blind-tunneled.
+///
+/// Peer egress has its own narrower list ([`crate::peer::egress::PEER_EGRESS_HOSTS`]);
+/// adding a local interception host grants no LAN gateway access to it.
+pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com", "chatgpt.com"];
+
+/// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
+/// This is a route marker, not process authentication. The launch makes shell-tool
+/// proxies unmarked through Codex's shell policy; explicit MCP proxy env and other
+/// helper processes can still inherit the marker and must opt out when needed.
+pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
+/// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
+pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
+
+/// Does a proxy URL opt in to Codex interception? Used by the doctor without displaying userinfo.
+pub fn codex_proxy_marked(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.username() == CODEX_PROXY_USERNAME && url.password().is_none_or(str::is_empty)
+    })
+}
+
+/// Read the marker from CONNECT headers only, without exposing or forwarding proxy credentials.
+fn codex_connect_marked(head: &str) -> bool {
+    let (expected_scheme, expected_value) = CODEX_PROXY_AUTHORIZATION
+        .split_once(' ')
+        .expect("the Codex proxy marker has a scheme and value");
+    head.lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("proxy-authorization")
+                && value.trim().split_once(' ').is_some_and(|(scheme, value)| {
+                    scheme.eq_ignore_ascii_case(expected_scheme) && value.trim() == expected_value
+                })
+        })
+}
 
 /// SAN list for the rcgen fallback leaf (the policy allowlist + the JS test
 /// host, kept so a regenerated chain still answers the credential-free
 /// `www.example.org` probe). This is also the REQUIRED coverage set: a
 /// persisted leaf whose sidecar (see [`load_tls_in`]) does not match this
 /// exactly is treated as stale and re-minted.
+///
+/// That makes adding a host here, as `chatgpt.com` was in 2026-10, the whole
+/// upgrade path for an install serving a leaf tcr minted: its sidecar stops
+/// matching, so on the next start [`load_tls_in`] takes its "persisted leaf
+/// SAN coverage is stale" branch and [`remint_leaf_under_persisted_ca`] signs
+/// a fresh leaf under the CA key persisted beside it. The CA its clients
+/// already trust stays valid, so nobody re-trusts anything. (A chain minted
+/// before `tcr-ca.key` existed rotates its CA once instead; see
+/// [`MintedPaths::ca_key`].)
 const FALLBACK_LEAF_SANS: &[&str] = &[
     "api.anthropic.com",
     "platform.claude.com",
+    "chatgpt.com",
     "www.example.org",
 ];
 
@@ -83,12 +155,12 @@ const FALLBACK_LEAF_SANS: &[&str] = &[
 /// `serve`/`serve_with_shutdown`/`handle_conn`/`handle_connect` carries just
 /// the acceptor, not the `TlsAssets` it came from — so [`handle_connect`],
 /// which has no other way to reach the coverage of the leaf it is about to
-/// present, reads it here via [`host_covered_by_loaded_leaf`]. Tests do NOT
-/// rely on this global: they read [`TlsAssets::covered_hosts`] directly off
-/// the value `load_tls_in` returns, so they stay deterministic under parallel
-/// test execution in the same binary. Starts empty — "nothing loaded yet" —
-/// which is the safe default: under-claiming coverage means blind-tunnel,
-/// never a broken handshake.
+/// present, reads it here via [`host_covered_by_loaded_leaf`]. The lib tests
+/// read `TlsAssets::covered_hosts` off the returned value instead; a test that
+/// opens a tunnel does rely on this global, which is why
+/// `tests/intercepted_host.rs` is its own binary. Starts empty — "nothing
+/// loaded yet" — which is the safe default: under-claiming coverage means
+/// blind-tunnel, never a broken handshake.
 static COVERED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn set_covered_hosts(hosts: &[String]) {
@@ -139,6 +211,46 @@ pub struct TlsAssets {
     /// decision SAN-truthful: [`host_covered_by_loaded_leaf`] reads a
     /// process-wide snapshot of it.
     pub covered_hosts: Vec<String>,
+    /// Which `load_tls_in` branch produced [`Self::acceptor`]'s leaf. The
+    /// coverage above says WHAT is intercepted; this says WHY, which is the
+    /// half `tcr run --codex` needs when `chatgpt.com` is missing: a restart
+    /// re-mints a stale minted leaf, and never changes the JS one.
+    pub leaf: LeafSource,
+}
+
+/// Where a loaded leaf came from, one variant per kind of `load_tls_in`
+/// branch. Carried to clients on the status wire as
+/// [`crate::status::MitmStatus::leaf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafSource {
+    /// Branch A: the JS proxy's `teamclaude-leaf.pem`. Its coverage is pinned
+    /// to `api.anthropic.com` (unknowable without an x509 parser) and tcr
+    /// never re-mints it, so no restart widens what it intercepts.
+    Js,
+    /// Branches B, C and D: a chain tcr minted under `tcr-ca.pem`
+    /// ([`minted_ca_path`]), covering `FALLBACK_LEAF_SANS` by construction
+    /// and re-minted at boot whenever that set changes.
+    Minted,
+}
+
+impl TlsAssets {
+    /// The hosts `handle_connect` can terminate with this leaf: every
+    /// [`ALLOWED_HOSTS`] entry the leaf covers. That is
+    /// `host_allowed && host_covered_by_loaded_leaf`, evaluated over every host
+    /// the policy names, read off this value rather than the process-wide
+    /// `COVERED_HOSTS`. `handle_connect` also requires a marker and a pooled Codex
+    /// account for `chatgpt.com` (`host_intercepted`), checked on every CONNECT
+    /// independently of this leaf; so `chatgpt.com`
+    /// is listed here whether or not the pool holds one. Raw
+    /// [`Self::covered_hosts`] would over-report: a minted leaf also carries
+    /// `www.example.org`, which is never intercepted.
+    pub fn intercepted_hosts(&self) -> Vec<String> {
+        ALLOWED_HOSTS
+            .iter()
+            .filter(|host| leaf_covers(&self.covered_hosts, host))
+            .map(|host| (*host).to_string())
+            .collect()
+    }
 }
 
 /// Is `host` one we intend to MITM-terminate, by POLICY? Case-insensitive.
@@ -153,6 +265,41 @@ pub struct TlsAssets {
 /// exists at all.
 pub fn host_allowed(host: &str) -> bool {
     ALLOWED_HOSTS.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Is `host` one [`handle_connect`] intercepts NOW, by policy? [`host_allowed`], plus one
+/// conditions that belong to `chatgpt.com` ([`crate::provider::CODEX_HOST`]) alone: the CONNECT
+/// carries the Codex marker and the pool holds a Codex account (`codex_accounts`, which
+/// [`Manager::provider_account_count`] counts in any state, leaving out a Codex account deleted
+/// while the server runs). With none, a codex that reached tcr
+/// could only be answered `no_codex_account`; blind-tunneled, it runs on its own login, as it
+/// did before tcr pooled Codex, with no CA to trust and its WebSocket intact. Asked on every
+/// CONNECT, so an account imported into a running server takes effect on the next tunnel.
+///
+/// Coverage is the separate question [`host_covered_by_loaded_leaf`] answers. Pure, with
+/// [`host_allowed`]'s host matching — unit-tested.
+fn host_intercepted(host: &str, codex_accounts: usize, codex_connection: bool) -> bool {
+    host_allowed(host)
+        && (!host.eq_ignore_ascii_case(crate::provider::CODEX_HOST)
+            || (codex_accounts > 0 && codex_connection))
+}
+
+/// [`host_intercepted`] against `manager`'s Codex accounts, counted on every call and never
+/// cached. Only a marked ChatGPT CONNECT needs the count: other tunnels never wait
+/// behind the config write lock. Configured but unusable pools remain explicitly pooled;
+/// their HTTP requests get an immediate configuration error instead of a retryable hold.
+fn intercepts_now(manager: &Manager, host: &str, codex_connection: bool) -> bool {
+    if !host.eq_ignore_ascii_case(crate::provider::CODEX_HOST) {
+        return host_allowed(host);
+    }
+    if !codex_connection {
+        return false;
+    }
+    host_intercepted(
+        host,
+        manager.provider_account_count(crate::provider::Provider::Codex),
+        true,
+    )
 }
 
 /// Parse the target of a `CONNECT host:port HTTP/1.1` request line. Returns the
@@ -180,6 +327,44 @@ fn config_dir() -> PathBuf {
     crate::config::default_path()
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Where tcr's own CA lives (`~/.config/tcr-ca.pem`): the CA every
+/// [`LeafSource::Minted`] leaf chains to, and one that stays put across leaf
+/// re-mints now that its key is persisted beside it (branch D).
+///
+/// A path, not a load: no IO at all. A CLIENT names the running proxy's CA
+/// with this, never with [`load_tls`], which re-mints a stale leaf on disk
+/// while the proxy keeps serving the leaf it loaded at boot (nothing reloads
+/// it) and so reports coverage that proxy does not have.
+pub fn minted_ca_path() -> PathBuf {
+    MintedPaths::in_dir(&config_dir()).ca
+}
+
+/// Resolve the CA of an existing usable leaf without writing certificate material.
+/// Server startup owns SAN migrations and minting. A client must keep trusting the
+/// persisted chain even when its sidecar is stale or its CA key predates persistence.
+/// Like the server loader, a valid JS leaf takes precedence over a minted chain.
+/// This lookup never changes the process-wide loaded-leaf coverage.
+pub fn existing_ca_path_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    ensure_crypto_provider();
+    let js_cert = dir.join(crate::legacy_names::JS_LEAF_CERT);
+    let js_key = dir.join(crate::legacy_names::JS_LEAF_KEY);
+    if js_cert.is_file() && js_key.is_file() && build_acceptor(&js_cert, &js_key).is_ok() {
+        let ca = dir.join(crate::legacy_names::JS_CA_CERT);
+        if !ca.is_file() {
+            return Ok(None);
+        }
+        load_certs(&ca)?;
+        return Ok(Some(ca));
+    }
+    let minted = MintedPaths::in_dir(dir);
+    if !minted.all_present() {
+        return Ok(None);
+    }
+    build_acceptor(&minted.leaf_cert, &minted.leaf_key)?;
+    load_certs(&minted.ca)?;
+    Ok(Some(minted.ca))
 }
 
 /// Ensure a process-wide rustls crypto provider is installed before building a
@@ -282,11 +467,25 @@ fn sans_match(sidecar: &[String], required: &[&str]) -> bool {
 /// `.key` if present and loadable (the primary path — a cert Gil's clients
 /// already trust), else reuse the chain we minted on an earlier run, else mint a
 /// fresh CA+leaf with rcgen and persist it.
-pub fn load_tls() -> anyhow::Result<TlsAssets> {
-    load_tls_in(&config_dir())
+///
+/// `holds_codex` is whether the config holds a Codex account. It changes only
+/// what a load says: once one is configured, the fresh-CA hint and the re-mint
+/// line name `CODEX_CA_CERTIFICATE` beside `NODE_EXTRA_CA_CERTS`
+/// ([`ca_export_hint`], [`remint_note`]), because codex reads its extra CA from
+/// that variable alone. Without one, both read as they always did.
+pub fn load_tls(holds_codex: bool) -> anyhow::Result<TlsAssets> {
+    load_tls_in_with(&config_dir(), holds_codex)
 }
 
-/// [`load_tls`] against an explicit config dir (for tests).
+/// [`load_tls`] against an explicit config dir: for tests, the integration tests that run the
+/// real listener over a leaf in a temp dir among them.
+///
+/// Every successful call also replaces the process-wide coverage (`COVERED_HOSTS`) that
+/// `handle_connect` reads for every listener in this process, whatever acceptor that listener
+/// was given. Loading the JS leaf narrows it to `api.anthropic.com`, so a concurrent
+/// `chatgpt.com` or `platform.claude.com` tunnel in the same process is blind-tunnelled to the
+/// real host. A test that opens tunnels must not share a binary with one that loads the JS leaf
+/// (see `tests/intercepted_host.rs`).
 ///
 /// Three branches, in order, and this is the function that makes the whole
 /// module SAN-truthful — every return path sets `covered_hosts` to what the
@@ -302,7 +501,7 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
 ///   outage. Asymmetric costs, so the conservative side is the only side.
 /// - **B: our own previously-minted chain.** Reused ONLY when a sidecar file
 ///   beside it (`tcr-leaf.sans`, one host per line, written by every mint)
-///   matches [`FALLBACK_LEAF_SANS`] exactly. A leaf minted before this SAN set
+///   matches `FALLBACK_LEAF_SANS` exactly. A leaf minted before this SAN set
 ///   changed carries the OLD coverage — reusing it unconditionally is exactly
 ///   the bug this change exists to fix (see the module doc comment): it is
 ///   what let a "just add the host to a const" change silently break the
@@ -317,7 +516,13 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
 ///   than one.
 /// - **C: mint fresh.** `covered_hosts` is `FALLBACK_LEAF_SANS`, known by
 ///   construction.
-fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
+pub fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
+    load_tls_in_with(dir, false)
+}
+
+/// [`load_tls_in`], with [`load_tls`]'s `holds_codex` threaded to the two notices a load can
+/// print: the re-mint line and the fresh-CA hint.
+fn load_tls_in_with(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAssets> {
     ensure_crypto_provider();
     let leaf_cert = dir.join(crate::legacy_names::JS_LEAF_CERT);
     let leaf_key = dir.join(crate::legacy_names::JS_LEAF_KEY);
@@ -347,6 +552,7 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
                     acceptor,
                     ca_path,
                     covered_hosts,
+                    leaf: LeafSource::Js,
                 });
             }
             Err(err) => {
@@ -374,6 +580,7 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
                         acceptor,
                         ca_path: Some(minted.ca),
                         covered_hosts,
+                        leaf: LeafSource::Minted,
                     });
                 }
                 Err(err) => {
@@ -387,12 +594,12 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
             );
         }
 
-        if let Some(assets) = remint_leaf_under_persisted_ca(&minted) {
+        if let Some(assets) = remint_leaf_under_persisted_ca(&minted, holds_codex) {
             return Ok(assets);
         }
     }
 
-    generate_and_persist(dir)
+    generate_and_persist(dir, holds_codex)
 }
 
 /// Branch D: sign a fresh leaf under the CA key already persisted beside
@@ -402,8 +609,8 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
 /// [`generate_and_persist`], which mints a brand-new CA. That fallback is the
 /// one unavoidable CA rotation described on [`MintedPaths::ca_key`]; after it,
 /// this branch is what keeps every later SAN change from rotating the CA
-/// again.
-fn remint_leaf_under_persisted_ca(minted: &MintedPaths) -> Option<TlsAssets> {
+/// again. `holds_codex` words its log line ([`remint_note`]).
+fn remint_leaf_under_persisted_ca(minted: &MintedPaths, holds_codex: bool) -> Option<TlsAssets> {
     if !(minted.ca.is_file() && minted.ca_key.is_file()) {
         return None;
     }
@@ -423,12 +630,14 @@ fn remint_leaf_under_persisted_ca(minted: &MintedPaths) -> Option<TlsAssets> {
         tracing::info!(
             cert = %minted.leaf_cert.display(),
             hosts = ?covered_hosts,
-            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+            "{}",
+            remint_note(holds_codex)
         );
         Ok(TlsAssets {
             acceptor,
             ca_path: Some(minted.ca.clone()),
             covered_hosts,
+            leaf: LeafSource::Minted,
         })
     })();
     match result {
@@ -471,14 +680,15 @@ fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'sta
 /// persist them to `~/.config/tcr-{ca,leaf}.pem` + `tcr-ca.key` + `tcr-leaf.key`
 /// (both keys `0600`) plus the `tcr-leaf.sans` coverage sidecar, and hand back
 /// an acceptor over the fresh leaf. The CA path is advertised so the user can
-/// `export NODE_EXTRA_CA_CERTS=<ca>`.
+/// `export NODE_EXTRA_CA_CERTS=<ca>`, and `CODEX_CA_CERTIFICATE=<ca>` too once
+/// the config holds a Codex account (`holds_codex`, [`ca_export_hint`]).
 ///
 /// Only ever mints a NEW CA — reusing an existing one is
 /// [`remint_leaf_under_persisted_ca`]'s job, tried first by [`load_tls_in`].
 /// This is the path that used to re-mint (and thus rotate) the CA on every
 /// SAN change; persisting `tcr-ca.key` here is what makes that a one-time
 /// cost instead of a recurring one.
-fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
+fn generate_and_persist(dir: &Path, holds_codex: bool) -> anyhow::Result<TlsAssets> {
     let ca = generate_ca()?;
     let ca_cert_pem = ca
         .cert_pem
@@ -497,16 +707,67 @@ fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
     let acceptor = build_acceptor(&minted.leaf_cert, &minted.leaf_key)?;
     let covered_hosts = fallback_hosts_vec();
     set_covered_hosts(&covered_hosts);
-    eprintln!(
-        "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}",
-        minted.ca.display()
-    );
+    eprintln!("{}", ca_export_hint(&minted.ca, holds_codex));
     tracing::info!(hosts = ?covered_hosts, "MITM: minted a fresh CA + leaf");
     Ok(TlsAssets {
         acceptor,
         ca_path: Some(minted.ca),
         covered_hosts,
+        leaf: LeafSource::Minted,
     })
+}
+
+/// Compare certificate bytes, so an extra-CA bundle can retain corporate roots and tcr's CA.
+/// An identical path needs no second read; the route already checked tcr's CA exists.
+pub fn ca_bundle_contains(bundle: &Path, ca: &Path) -> bool {
+    if bundle == ca {
+        return true;
+    }
+    let certs = |path: &Path| -> std::io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        let bytes = std::fs::read(path)?;
+        rustls_pemfile::certs(&mut bytes.as_slice()).collect()
+    };
+    match (certs(bundle), certs(ca)) {
+        (Ok(bundle), Ok(required)) => {
+            !required.is_empty() && required.iter().all(|cert| bundle.contains(cert))
+        }
+        _ => false,
+    }
+}
+
+/// Scope Codex's proxy marker and CA to its launch; never export either for the whole shell.
+/// Claude can keep using its existing NODE_EXTRA_CA_CERTS setup.
+pub fn ca_export_hint(ca: &Path, holds_codex: bool) -> String {
+    let mut line = format!(
+        "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}",
+        ca.display()
+    );
+    if holds_codex {
+        line.push_str("\n[tcr] for Codex, use `tcr run --codex` to scope proxy routing and CA trust to that launch");
+    }
+    line
+}
+
+/// The log line for a leaf re-minted under the persisted CA, which keeps every exported CA
+/// variable valid: `NODE_EXTRA_CA_CERTS`, and `CODEX_CA_CERTIFICATE` once the config holds a
+/// Codex account.
+fn remint_note(holds_codex: bool) -> &'static str {
+    if holds_codex {
+        "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS and \
+         CODEX_CA_CERTIFICATE stay valid"
+    } else {
+        "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+    }
+}
+
+/// The server's boot log line naming how a client trusts the CA it loaded:
+/// `NODE_EXTRA_CA_CERTS`, and `CODEX_CA_CERTIFICATE` once the config holds a Codex account.
+pub fn advertise_note(holds_codex: bool) -> &'static str {
+    if holds_codex {
+        "MITM: advertise this CA via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE"
+    } else {
+        "MITM: advertise this CA via NODE_EXTRA_CA_CERTS"
+    }
 }
 
 /// A CA's private key, PEM-encoded, plus its cert PEM when we happen to have
@@ -630,6 +891,17 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// A per-listener transport seam for isolated integration tests. Production listeners
+/// always use the ordinary host-and-port connector through serve or serve_with_shutdown.
+#[doc(hidden)]
+pub type TunnelConnector = Arc<
+    dyn Fn(String, u16) -> futures::future::BoxFuture<'static, io::Result<TcpStream>> + Send + Sync,
+>;
+
+fn direct_tunnel_connector() -> TunnelConnector {
+    Arc::new(|host, port| Box::pin(TcpStream::connect((host, port))))
+}
+
 /// Run the hybrid listener forever: accept, classify each connection
 /// (`CONNECT` → MITM, else base-URL), and serve it on its own task. `tls` is
 /// `None` only when TLS material could not be loaded at all — CONNECT then
@@ -640,6 +912,26 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
 /// the loop dies with the test's runtime.
 pub async fn serve(listener: TcpListener, manager: Arc<Manager>, tls: Option<Arc<TlsAcceptor>>) {
     serve_with_shutdown(listener, manager, tls, std::future::pending::<()>()).await;
+}
+
+/// Test support: run the same listener and CONNECT handler with an explicit blind transport.
+/// Tests can supply a connector that only dials a held loopback socket, so a broken
+/// interception decision cannot resolve or connect to a real upstream.
+#[doc(hidden)]
+pub async fn serve_with_tunnel_connector(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    connector: TunnelConnector,
+) {
+    serve_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        std::future::pending::<()>(),
+        connector,
+    )
+    .await;
 }
 
 /// [`serve`], plus a shutdown branch on the accept loop.
@@ -659,6 +951,23 @@ pub async fn serve_with_shutdown(
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
     shutdown: impl std::future::Future<Output = ()>,
+) {
+    serve_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        shutdown,
+        direct_tunnel_connector(),
+    )
+    .await;
+}
+
+async fn serve_with_shutdown_using_connector(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl std::future::Future<Output = ()>,
+    connector: TunnelConnector,
 ) {
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -681,11 +990,15 @@ pub async fn serve_with_shutdown(
         };
         let manager = manager.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_conn(stream, peer, manager, tls).await {
-                tracing::debug!(error = %err, "connection ended with error");
+        let connector = Arc::clone(&connector);
+        tokio::spawn(
+            async move {
+                if let Err(err) = handle_conn(stream, peer, manager, tls, connector).await {
+                    tracing::debug!(error = %err, "connection ended with error");
+                }
             }
-        });
+            .with_current_subscriber(),
+        );
     }
 }
 
@@ -695,14 +1008,15 @@ async fn handle_conn(
     peer: SocketAddr,
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
+    connector: TunnelConnector,
 ) -> io::Result<()> {
     if peek_is_connect(&stream).await? {
-        handle_connect(stream, peer, manager, tls).await
+        handle_connect(stream, peer, manager, tls, connector).await
     } else {
         // Base-URL mode: cleartext straight through the router. `serve_http`
         // auto-negotiates, so an h2-prior-knowledge client is served as h2 here
-        // and everything else stays h1.
-        serve_http(stream, peer, manager).await;
+        // and everything else stays h1. No tunnel, so no intercepted host.
+        serve_http(stream, peer, manager, None).await;
         Ok(())
     }
 }
@@ -742,6 +1056,7 @@ async fn handle_connect(
     peer: SocketAddr,
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
+    connector: TunnelConnector,
 ) -> io::Result<()> {
     let head = read_request_head(&mut stream).await?;
     let first_line = head.lines().next().unwrap_or("");
@@ -763,15 +1078,31 @@ async fn handle_connect(
     // host it cannot cover fails the client's TLS handshake outright; blind-
     // tunneling it is strictly safer, and it is exactly today's behavior for
     // an uncovered host, not a new failure mode.
-    if !host_allowed(&host) {
-        return tunnel(stream, &host, port).await;
+    //
+    // And `chatgpt.com` is blind-tunneled without Codex's marker, or with no pooled account
+    // ([`intercepts_now`]): there is no pooled account to serve a codex, and it
+    // keeps its own login. Counted on every CONNECT, never cached, so an import
+    // takes effect on the next tunnel.
+    let codex_marked = codex_connect_marked(&head);
+    let policy_intercepts = intercepts_now(&manager, &host, codex_marked);
+    let leaf_covers_host = policy_intercepts && host_covered_by_loaded_leaf(&host);
+    if host.eq_ignore_ascii_case(crate::provider::CODEX_HOST) {
+        tracing::debug!(
+            peer_port = peer.port(),
+            codex_marked,
+            intercepted = leaf_covers_host && tls.is_some(),
+            "Codex CONNECT"
+        );
     }
-    if !host_covered_by_loaded_leaf(&host) {
+    if !policy_intercepts {
+        return tunnel(stream, &host, port, &connector).await;
+    }
+    if !leaf_covers_host {
         tracing::debug!(
             %host,
             "MITM: host is policy-allowed but the loaded leaf does not cover it — blind-tunneling instead of a broken handshake"
         );
-        return tunnel(stream, &host, port).await;
+        return tunnel(stream, &host, port, &connector).await;
     }
 
     let Some(acceptor) = tls else {
@@ -791,7 +1122,7 @@ async fn handle_connect(
             return Ok(());
         }
     };
-    serve_http(tls_stream, peer, manager).await;
+    serve_http(tls_stream, peer, manager, Some(host)).await;
     Ok(())
 }
 
@@ -802,8 +1133,13 @@ async fn handle_connect(
 /// open-tunnel behavior the JS `teamclaude` proxy provides (and Claude Code needs
 /// to reach `platform.claude.com`, its bridge, and telemetry). Only reachable
 /// from `127.0.0.1`, so it is no wider a network surface than the local shell.
-async fn tunnel(mut client: TcpStream, host: &str, port: u16) -> io::Result<()> {
-    let mut upstream = match TcpStream::connect((host, port)).await {
+async fn tunnel(
+    mut client: TcpStream,
+    host: &str,
+    port: u16,
+    connector: &TunnelConnector,
+) -> io::Result<()> {
+    let mut upstream = match connector(host.to_string(), port).await {
         Ok(s) => s,
         Err(err) => {
             tracing::debug!(%host, port, error = %err, "MITM: tunnel connect failed");
@@ -855,7 +1191,13 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
 /// CONNECT traffic stays h1 because the rustls `ServerConfig` built in
 /// [`build_acceptor`] advertises no ALPN protocols, so `h2` is never offered on
 /// that handshake.
-async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>)
+///
+/// `intercepted` is the host of the `CONNECT` tunnel `io` was decrypted from:
+/// [`handle_connect`] passes it, and base-URL mode has none. Every request on the
+/// connection carries it as a [`crate::proxy::InterceptedHost`], which no client can
+/// forge, so `proxy::handle` holds each request to the host the tunnel was opened
+/// to, not to the one the request declares.
+async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>, intercepted: Option<String>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -883,6 +1225,11 @@ where
             // Tag the request with the client's address so the auth layer can exempt
             // loopback clients from the api-key gate (see proxy::ClientAddr).
             req.extensions_mut().insert(crate::proxy::ClientAddr(peer));
+            // A request decrypted from a tunnel carries the tunnel's host (see above).
+            if let Some(host) = &intercepted {
+                req.extensions_mut()
+                    .insert(crate::proxy::InterceptedHost(host.clone()));
+            }
             // When affinity is on, tag every request on this connection with the
             // connection's session key so selection pins to one account.
             if let Some(key) = session_key {
@@ -951,6 +1298,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn existing_client_ca_keeps_js_leaf_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let minted = load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        let minted_bytes = std::fs::read(&minted).unwrap();
+        let (ca, leaf, key, _) = generate_chain(FALLBACK_LEAF_SANS).unwrap();
+        write_file(
+            &dir.path().join(crate::legacy_names::JS_LEAF_CERT),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        write_file(
+            &dir.path().join(crate::legacy_names::JS_LEAF_KEY),
+            key.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let js_ca = dir.path().join(crate::legacy_names::JS_CA_CERT);
+        write_file(&js_ca, ca.as_bytes(), 0o644).unwrap();
+        assert_eq!(
+            existing_ca_path_in(dir.path()).unwrap(),
+            Some(js_ca.clone())
+        );
+        std::fs::remove_file(&js_ca).unwrap();
+        assert_eq!(
+            existing_ca_path_in(dir.path()).unwrap(),
+            None,
+            "a valid JS leaf without its CA must not advertise the competing minted CA"
+        );
+        assert_eq!(std::fs::read(minted).unwrap(), minted_bytes);
+    }
+
     /// A minted chain must be reused on the next load. Re-minting silently
     /// invalidates the `NODE_EXTRA_CA_CERTS` the user exported after the first
     /// run, so the fallback path breaks on its second use.
@@ -977,6 +1357,77 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each [`load_tls_in`] branch names the leaf it loaded, and what that leaf
+    /// lets the listener intercept is [`ALLOWED_HOSTS`] ∩ its coverage: the two
+    /// facts a running proxy reports on its status wire
+    /// ([`crate::status::MitmStatus`]) and `tcr run --codex` pools on, with the
+    /// account rows. A minted leaf (C, then B, then D) lets it intercept every
+    /// policy host, `chatgpt.com` included (terminated only while the pool
+    /// holds a Codex account), and never `www.example.org`, which it carries
+    /// for the JS probe but [`handle_connect`] blind-tunnels.
+    /// The JS leaf (A) wins even over a minted chain that covers more, and
+    /// intercepts `api.anthropic.com` alone: the one state no restart fixes.
+    #[test]
+    fn each_load_branch_reports_its_leaf_and_what_it_intercepts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let minted = crate::status::MitmStatus {
+            intercepted_hosts: vec![
+                "api.anthropic.com".to_string(),
+                "platform.claude.com".to_string(),
+                "chatgpt.com".to_string(),
+            ],
+            leaf: "minted".to_string(),
+        };
+
+        let fresh = load_tls_in(dir.path()).expect("C: mint a chain");
+        assert_eq!(fresh.leaf, LeafSource::Minted, "C: a fresh mint");
+        assert_eq!(crate::status::MitmStatus::of(Some(&fresh)), minted, "C");
+
+        let reused = load_tls_in(dir.path()).expect("B: reuse it");
+        assert_eq!(reused.leaf, LeafSource::Minted, "B: a reused mint");
+        assert_eq!(crate::status::MitmStatus::of(Some(&reused)), minted, "B");
+
+        write_sans_sidecar(&dir.path().join("tcr-leaf.sans"), &["api.anthropic.com"])
+            .expect("drift the sidecar");
+        let reminted = load_tls_in(dir.path()).expect("D: re-mint under the same CA");
+        assert_eq!(reminted.leaf, LeafSource::Minted, "D: a re-mint");
+        assert_eq!(crate::status::MitmStatus::of(Some(&reminted)), minted, "D");
+
+        let (_ca, leaf, key, _ca_key) =
+            generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS leaf");
+        write_file(
+            &dir.path().join(crate::legacy_names::JS_LEAF_CERT),
+            leaf.as_bytes(),
+            0o644,
+        )
+        .expect("write leaf");
+        write_file(
+            &dir.path().join(crate::legacy_names::JS_LEAF_KEY),
+            key.as_bytes(),
+            0o600,
+        )
+        .expect("write key");
+        let js = load_tls_in(dir.path()).expect("A: the JS leaf");
+        assert_eq!(js.leaf, LeafSource::Js, "A: the JS pair wins");
+        assert_eq!(
+            crate::status::MitmStatus::of(Some(&js)),
+            crate::status::MitmStatus {
+                intercepted_hosts: vec!["api.anthropic.com".to_string()],
+                leaf: "js".to_string(),
+            },
+            "A"
+        );
+
+        assert_eq!(
+            crate::status::MitmStatus::of(None),
+            crate::status::MitmStatus {
+                intercepted_hosts: Vec::new(),
+                leaf: "none".to_string(),
+            },
+            "no TLS material: MITM off"
+        );
     }
 
     /// The pre-existing JS leaf still wins over our own minted chain, and with no
@@ -1100,6 +1551,197 @@ mod tests {
         assert!(!host_allowed(""));
     }
 
+    /// `chatgpt.com`, Codex's inference and backend host, is policy-allowed
+    /// case-insensitively; a lookalike that merely contains the name is not.
+    /// `auth.openai.com`, where the Codex client refreshes its OWN token, is
+    /// not allowed either: that exchange has to reach the real host untouched,
+    /// so it must keep taking the blind tunnel.
+    #[test]
+    fn chatgpt_com_is_policy_allowed_and_lookalikes_are_not() {
+        assert!(host_allowed("chatgpt.com"));
+        assert!(host_allowed("CHATGPT.COM"));
+        assert!(!host_allowed("evil.chatgpt.com.attacker.net"));
+        assert!(
+            !host_allowed("auth.openai.com"),
+            "the client's own refresh stays a blind tunnel"
+        );
+        assert!(!host_allowed("api.openai.com"));
+    }
+
+    /// With no Codex account in the pool, `chatgpt.com` is blind-tunneled, so a codex that
+    /// reaches tcr runs on its own login instead of being answered `no_codex_account`; with one,
+    /// it is intercepted.
+    #[test]
+    fn an_unmarked_chatgpt_connect_is_tunneled_even_with_a_codex_pool() {
+        assert!(!host_intercepted("chatgpt.com", 1, false));
+    }
+
+    #[test]
+    fn only_the_codex_proxy_authorization_marks_a_connect() {
+        for header in [
+            "Proxy-Authorization: Basic dGNyLWNvZGV4Og==",
+            "proxy-authorization: basic dGNyLWNvZGV4Og==",
+        ] {
+            let head = format!("CONNECT chatgpt.com:443 HTTP/1.1\r\n{header}\r\n\r\n");
+            assert!(codex_connect_marked(&head));
+            assert!(host_intercepted(
+                "chatgpt.com",
+                1,
+                codex_connect_marked(&head)
+            ));
+        }
+        for header in [
+            "",
+            "Authorization: Basic dGNyLWNvZGV4Og==",
+            "Proxy-Authorization: Basic dGNyLWNvZGV4",
+            "Proxy-Authorization: Bearer dGNyLWNvZGV4Og==",
+        ] {
+            let head = format!("CONNECT chatgpt.com:443 HTTP/1.1\r\n{header}\r\n\r\n");
+            assert!(!codex_connect_marked(&head), "{header}");
+            assert!(!host_intercepted(
+                "chatgpt.com",
+                1,
+                codex_connect_marked(&head)
+            ));
+        }
+        assert!(codex_proxy_marked("http://tcr-codex@127.0.0.1:3999"));
+        assert!(codex_proxy_marked("http://tcr-codex:@127.0.0.1:3999"));
+        assert!(!codex_proxy_marked("http://127.0.0.1:3999"));
+        assert!(!codex_proxy_marked("http://other@127.0.0.1:3999"));
+    }
+
+    #[test]
+    fn chatgpt_com_is_intercepted_only_while_the_pool_holds_a_codex_account() {
+        for host in ["chatgpt.com", "CHATGPT.COM", "ChatGPT.com"] {
+            assert!(
+                !host_intercepted(host, 0, true),
+                "{host}: no Codex account, so the tunnel must be blind"
+            );
+            assert!(host_intercepted(host, 1, true), "{host}: one Codex account");
+            assert!(
+                host_intercepted(host, 3, true),
+                "{host}: three Codex accounts"
+            );
+        }
+    }
+
+    /// The Codex condition is `chatgpt.com`'s alone: the Anthropic hosts are intercepted whatever
+    /// the pool's Codex count, and a host off the policy list never is, whatever it is.
+    #[test]
+    fn only_chatgpt_com_waits_for_a_codex_account() {
+        for (codex_accounts, marked) in [(0, false), (0, true), (1, false), (1, true)] {
+            for host in ["api.anthropic.com", "platform.claude.com"] {
+                assert!(
+                    host_intercepted(host, codex_accounts, marked),
+                    "{host} with {codex_accounts} Codex account(s)"
+                );
+            }
+            for host in [
+                "auth.openai.com",
+                "api.openai.com",
+                "evil.chatgpt.com.attacker.net",
+                "chatgpt.com.",
+                "example.com",
+                "",
+            ] {
+                assert!(
+                    !host_intercepted(host, codex_accounts, marked),
+                    "{host:?} with {codex_accounts} Codex account(s)"
+                );
+            }
+        }
+    }
+
+    /// The count [`handle_connect`] decides on is the pool's Codex accounts, read at each
+    /// CONNECT: a Claude-only pool blind-tunnels `chatgpt.com` and intercepts its own hosts, and
+    /// a Codex account added to the running pool, disabled even (an account counts in any
+    /// state), turns `chatgpt.com` on for the next tunnel.
+    #[test]
+    fn a_claude_only_pool_tunnels_chatgpt_com_until_a_codex_account_is_added() {
+        let m = dummy_manager();
+        assert!(
+            !intercepts_now(&m, "chatgpt.com", true),
+            "a Claude-only pool must blind-tunnel chatgpt.com"
+        );
+        assert!(intercepts_now(&m, "api.anthropic.com", true));
+
+        m.add_account(crate::config::Account {
+            name: "bob@example.com/codex".to_string(),
+            account_type: crate::config::AccountType::OAuth,
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-fake-codex".to_string(),
+            refresh_token: Some("rt-fake-codex".to_string()),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: Some(true),
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
+            codex_home: None,
+            extra: serde_json::Map::new(),
+        });
+        assert!(intercepts_now(&m, "chatgpt.com", true), "an imported account enables interception; a disabled pool gets an immediate configuration error");
+    }
+
+    #[test]
+    fn unrelated_connects_never_wait_for_a_config_write() {
+        for (host, marked, expected) in [
+            ("example.com", false, false),
+            ("api.anthropic.com", false, true),
+            ("chatgpt.com", false, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, b"{}").unwrap();
+            let manager = dummy_manager_at(Some(path));
+            let held = manager.clone();
+            let (ready, acquired) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                held.with_config_write_for_test(|| {
+                    ready.send(()).unwrap();
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(2));
+                })
+            });
+            acquired.recv().unwrap();
+            let start = std::time::Instant::now();
+            assert_eq!(intercepts_now(&manager, host, marked), expected);
+            let elapsed = start.elapsed();
+            let _ = release.send(());
+            holder.join().unwrap();
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "{host} waited {elapsed:?}"
+            );
+        }
+    }
+
+    /// [`FALLBACK_LEAF_SANS`] is "the policy allowlist + the JS test host", so
+    /// every [`ALLOWED_HOSTS`] entry must be one of its SANs. A host that is
+    /// policy-allowed but absent from the leaf tcr mints (a typo such as
+    /// `chatgtp.com` in one of the two lists) is never terminated:
+    /// [`handle_connect`]'s coverage check blind-tunnels it, correctly and
+    /// silently, so nothing else would ever notice. Asked the way production
+    /// asks it: [`leaf_covers`] over the coverage branches B, C and D report.
+    #[test]
+    fn every_policy_host_is_covered_by_the_leaf_tcr_mints() {
+        let covered = fallback_hosts_vec();
+        for host in ALLOWED_HOSTS {
+            assert!(
+                leaf_covers(&covered, host),
+                "{host} is policy-allowed but the leaf tcr mints would not cover it, so it \
+                 would be blind-tunneled forever: {covered:?}"
+            );
+        }
+    }
+
     /// The load-bearing property: `platform.claude.com` is policy-allowed AND
     /// covered by a freshly-minted leaf (branch C, [`FALLBACK_LEAF_SANS`]), so
     /// it is intercepted.
@@ -1214,6 +1856,31 @@ mod tests {
         assert!(leaf_covers(&third.covered_hosts, "platform.claude.com"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The upgrade path for every existing install: a sidecar written before
+    /// `chatgpt.com` joined [`FALLBACK_LEAF_SANS`] must read as stale. Branch B
+    /// of [`load_tls_in`] reports `FALLBACK_LEAF_SANS` itself as the reused
+    /// leaf's coverage, so a pre-Codex sidecar that still matched would claim
+    /// `chatgpt.com` for a leaf that cannot present it, and once tcr intercepts
+    /// `chatgpt.com`, every Codex handshake it terminates would fail. The
+    /// mismatch is what re-mints the leaf instead.
+    #[test]
+    fn a_sidecar_from_before_codex_is_stale_and_forces_a_remint() {
+        let before: Vec<String> = [
+            "api.anthropic.com",
+            "platform.claude.com",
+            "www.example.org",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(
+            !sans_match(&before, FALLBACK_LEAF_SANS),
+            "the pre-Codex SAN set must read as stale"
+        );
+        let now: Vec<String> = FALLBACK_LEAF_SANS.iter().map(|s| s.to_string()).collect();
+        assert!(sans_match(&now, FALLBACK_LEAF_SANS));
     }
 
     /// A persisted leaf whose sidecar MATCHES the required coverage is reused
@@ -1338,7 +2005,13 @@ mod tests {
 
         // Tunnel the accepted (tcr) side out to the echo upstream.
         tokio::spawn(async move {
-            let _ = tunnel(server_side, "127.0.0.1", echo_port).await;
+            let _ = tunnel(
+                server_side,
+                "127.0.0.1",
+                echo_port,
+                &direct_tunnel_connector(),
+            )
+            .await;
         });
 
         // The tunnel first writes the CONNECT-OK line.
@@ -1384,6 +2057,10 @@ mod tests {
     /// call and no auth gate — the cheapest real route through `serve_http`'s
     /// router to observe which HTTP version `serve_connection` negotiated.
     fn dummy_manager() -> Arc<Manager> {
+        dummy_manager_at(None)
+    }
+
+    fn dummy_manager_at(config_path: Option<std::path::PathBuf>) -> Arc<Manager> {
         let config = crate::config::Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
@@ -1395,6 +2072,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
             upstream: "http://127.0.0.1:1".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: crate::config::PacingConfig::default(),
@@ -1410,6 +2088,7 @@ mod tests {
             accounts: vec![crate::config::Account {
                 name: "dummy".to_string(),
                 account_type: crate::config::AccountType::OAuth,
+                provider: Default::default(),
                 account_uuid: None,
                 org_uuid: None,
                 org_name: None,
@@ -1425,6 +2104,7 @@ mod tests {
                 seat_tier: None,
                 egress: crate::config::Egress::Local,
                 egress_strict: false,
+                codex_home: None,
                 extra: serde_json::Map::new(),
             }],
             group_settings: std::collections::HashMap::new(),
@@ -1437,7 +2117,7 @@ mod tests {
             Arc::new(crate::oauth::NoRefresh),
             Arc::new(crate::probe::LiveUsageProber::new()),
             Arc::new(crate::warmer::LiveWarmer::new()),
-            None,
+            config_path,
         )
     }
 
@@ -1460,7 +2140,9 @@ mod tests {
                     // never swallowed silently, so a test that fails because the
                     // connection died has the reason in the captured log rather
                     // than presenting as an unexplained client-side error.
-                    if let Err(err) = handle_conn(stream, peer, manager, None).await {
+                    if let Err(err) =
+                        handle_conn(stream, peer, manager, None, direct_tunnel_connector()).await
+                    {
                         tracing::debug!(error = %err, "connection ended with error");
                     }
                 });
@@ -1504,5 +2186,41 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    }
+
+    /// The CA notices name `CODEX_CA_CERTIFICATE` beside `NODE_EXTRA_CA_CERTS` once the config
+    /// holds a Codex account, since codex reads its extra CA from that variable alone. Without one
+    /// each reads as it always did.
+    #[test]
+    fn the_ca_export_hint_names_both_variables_with_a_codex_account() {
+        let ca = Path::new("/Users/example/.config/tcr-ca.pem");
+        assert_eq!(
+            ca_export_hint(ca, false),
+            "[tcr] minted a fresh MITM CA — trust it with:\n         \
+             export NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem"
+        );
+        assert_eq!(
+            ca_export_hint(ca, true),
+            "[tcr] minted a fresh MITM CA — trust it with:\n         \
+             export NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem\n\
+             [tcr] for Codex, use `tcr run --codex` to scope proxy routing and CA trust to that launch"
+        );
+        assert_eq!(
+            remint_note(false),
+            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+        );
+        assert_eq!(
+            remint_note(true),
+            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS and \
+             CODEX_CA_CERTIFICATE stay valid"
+        );
+        assert_eq!(
+            advertise_note(false),
+            "MITM: advertise this CA via NODE_EXTRA_CA_CERTS"
+        );
+        assert_eq!(
+            advertise_note(true),
+            "MITM: advertise this CA via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE"
+        );
     }
 }

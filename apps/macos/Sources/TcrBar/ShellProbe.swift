@@ -108,6 +108,7 @@ enum ShellProbe {
             // operator's `keepThisMacAwake` preference. See `AwakeController.harness()`.
             awake: AwakeController.harness(),
             updater: Updater(startingUpdater: false),
+            codexPresence: CodexPresenceController(initialPresence: .absent, resolver: { (.absent, nil) }),
             // Same posture for the release notes: remembers nothing, and a
             // fetcher that cannot reach anything — a probe run must neither
             // write `lastSeenVersion` nor touch the network.

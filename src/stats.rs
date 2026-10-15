@@ -6,9 +6,12 @@
 //! so a bar the TUI draws is never a stale cached value — that is the display half
 //! of bug #2's fix.
 
+use std::path::Path;
+
 use time::OffsetDateTime;
 
 use crate::probe::ProbeStatus;
+use crate::provider::Provider;
 
 /// One row of the recent-request ring buffer.
 #[derive(Debug, Clone)]
@@ -18,6 +21,25 @@ pub struct RequestLogEntry {
     pub path: String,
     pub status: u16,
     pub account: String,
+    /// The provider the request was for, decided by its path as the proxy routed it. The
+    /// dashboard's log shortens a Codex path to its tail, so it must not have to guess the
+    /// provider back from the path it shortens.
+    pub provider: Provider,
+}
+
+/// `path` with the home folder shown as `~`, for a line a person reads: `~/.codex` rather
+/// than the full path. Only a whole leading component counts, so `/Users/example2` is not
+/// inside `/Users/example`. With no home, or a home that is the root or empty, the path is
+/// returned as it is.
+pub fn short_path(path: &str, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|home| home.parent().is_some()) else {
+        return path.to_string();
+    };
+    match Path::new(path).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_string(),
+    }
 }
 
 /// How close an account is to its own switch threshold, evaluated live. Drives
@@ -92,11 +114,25 @@ pub enum GateReason {
     Standard,
     /// A dead credential (`AccountStatus::Error`) — needs a re-login, never self-frees.
     Login,
-    /// Anthropic answered `anthropic-ratelimit-unified-status: rejected` for this
-    /// account. Unlike a window it carries no reset to wait on, so it never
-    /// self-frees. Long held out of rotation by
+    /// The provider itself refused this account. On an Anthropic account that is
+    /// an `anthropic-ratelimit-unified-status: rejected` header; on a Codex account
+    /// it is a 429 whose body or reached-type header identifies a quota refusal
+    /// ([`crate::quota::CodexQuotaRefusal::parse`]). Unlike a window it carries no
+    /// reset to wait on, so it names no time. It still ends without a human: a usage
+    /// probe that sees one of the account's windows roll clears it, on either
+    /// provider, and on a Codex account so does a probe that reads the account
+    /// allowed ([`crate::quota::Quota::apply_usage`]). Long held out of rotation by
     /// [`crate::manager::Manager::account_hard_ok`], it had no reason of its own
     /// here and so rendered as [`GateReason::Ok`].
+    ///
+    /// That is the verdict [`crate::manager::Manager::account_gate`] returns, and
+    /// the one the pin and control gates read. A SNAPSHOT reports a Codex refusal
+    /// more precisely ([`crate::manager::Manager::codex_refusal_gate`]): as the full
+    /// window that refused it, freeing at that window's reset (or with no time once
+    /// that reset has passed and no probe has yet confirmed the roll), else as the
+    /// live hold while it lasts: [`Self::Hold`], or [`Self::Refused`] when an upstream
+    /// 403 armed it. So on a Codex row this variant means a standing refusal that
+    /// neither explains.
     Rejected,
     /// Operator-disabled — held out until re-enabled, never self-frees.
     Disabled,
@@ -122,13 +158,31 @@ pub enum GateReason {
 /// A single account's live-computed view.
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
+    /// This account's rotation index: the one [`crate::manager::Manager::set_disabled`],
+    /// [`crate::manager::Manager::set_current`], the session pins and the sessions use.
+    ///
+    /// [`StatsSnapshot::accounts`] leaves out rows deleted from the config while the process
+    /// runs, and those rows keep their slots, so a row's position in that list equals its slot
+    /// only until a row before it is deleted. Anything that acts on an account it found by its
+    /// position in the list acts through this.
+    ///
+    /// Never on any wire: no status row, quota row or session row carries it, and a snapshot
+    /// rebuilt from a status document numbers its rows by position.
+    pub slot: usize,
     pub name: String,
+    /// Which upstream this account belongs to, carried from
+    /// [`crate::manager::AccountRuntime::provider`]. It decides which vocabulary
+    /// the plan fields below speak, and so which function labels them — see
+    /// [`Self::plan_label`].
+    pub provider: Provider,
     /// The account's plan as the profile endpoint reported it, verbatim, plus
     /// the two fields that refine it — carried straight from
-    /// [`crate::manager::AccountRuntime`]. The customer-facing LABEL is derived
-    /// from these by [`tcr_status_wire::plan_label`] one layer out, so this
-    /// snapshot stays the provider's own word and exactly one place turns it
-    /// into English. `None` means never profiled.
+    /// [`crate::manager::AccountRuntime`]. On a Codex account the first is the
+    /// ChatGPT plan from the login's `chatgpt_plan_type` claim and the other two
+    /// are `None`. The customer-facing LABEL is derived from these by
+    /// [`Self::plan_label`] one layer out, so this snapshot stays the provider's
+    /// own word and exactly one place turns it into English. `None` means never
+    /// profiled.
     pub organization_type: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub seat_tier: Option<String>,
@@ -183,11 +237,23 @@ pub struct AccountSnapshot {
     /// Why this account is out of rotation right now (the latest-clearing hard
     /// gate), computed live via [`crate::manager::Manager::account_gate`] for the
     /// general (non-Fable) view. [`GateReason::Ok`] when in rotation.
+    ///
+    /// One remap, for display only: on a Codex account whose `account_gate` is
+    /// [`GateReason::Rejected`], this reports the full window that refused it, with
+    /// [`Self::free_at`] at that window's reset (`None` once that reset has passed,
+    /// until a probe confirms the roll), else the live hold, [`GateReason::Hold`] or,
+    /// when an upstream 403 armed it, [`GateReason::Refused`], with `free_at` at the
+    /// hold's end while that hold lasts
+    /// ([`crate::manager::Manager::codex_refusal_gate`]). The pin and control gates
+    /// still read the unmapped verdict.
     pub gate: GateReason,
     /// When [`Self::gate`] clears — the instant ALL active hard gates have lifted.
     /// `None` when in rotation (`Ok`), when the gate never self-frees
     /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
-    /// we cannot promise a time).
+    /// we cannot promise a time). On a Codex refusal it is when the gate SHOWN
+    /// clears, not the refusal: the refusing window's reset, after which the refusal
+    /// stands until a probe confirms the roll, or the hold's end, after which a
+    /// refusal no window explains still reads [`GateReason::Rejected`].
     pub free_at: Option<OffsetDateTime>,
     /// Count of stream failures this account's streams carried within the decay
     /// window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`): an in-band SSE
@@ -246,9 +312,102 @@ pub struct AccountSnapshot {
     /// honest-null discipline `cacheHitRatio` follows: an unmeasured zero read
     /// as a measurement is how a real prompt-cache catastrophe went unseen.
     pub usage: Option<tcr_status_wire::UsageRow>,
+    /// What this account reports as a Codex account, and an Anthropic one never
+    /// does — see [`CodexFacts`]. `CodexFacts::default()`, nothing reported, on
+    /// every Anthropic account.
+    pub codex: CodexFacts,
 }
 
-/// Whether a live session was keyed on a stable client identity (x-api-key /
+/// What a Codex account reports and an Anthropic one never does: which quota
+/// windows its plan has and how long they are, why ChatGPT refused it, its
+/// credits and spend control, why its login is dead, and the folder its login
+/// was imported from.
+///
+/// Grouped in one struct so an Anthropic row is the one line
+/// `codex: CodexFacts::default()`, instead of eight fields every Anthropic
+/// literal must spell out.
+///
+/// `None` and `false` mean "not reported", never "reported absent". The one
+/// value that is a fact rather than a gap is `quota_windows: Some(vec![])`: a
+/// plan that reported no usage window at all, which is not the same as one
+/// whose windows are unknown (`None`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexFacts {
+    /// The usage windows the plan reported, from `"fiveHour"` and `"sevenDay"`,
+    /// in that order. `None`: unknown. `Some(vec![])`: the plan reported none.
+    pub quota_windows: Option<Vec<String>>,
+    /// The length, in minutes, the five-hour slot's window reported.
+    pub five_hour_window_minutes: Option<u32>,
+    /// The length, in minutes, the weekly slot's window reported.
+    pub seven_day_window_minutes: Option<u32>,
+    /// Why ChatGPT refused the account, verbatim (`rate_limit_reached`, or a
+    /// credits or spend-cap kind), present exactly while the refusal stands.
+    pub limit_reached_type: Option<String>,
+    /// Whether the account's spend control is reached.
+    pub spend_control_reached: bool,
+    /// The account's credits, once reported.
+    pub credits: Option<tcr_status_wire::CodexCredits>,
+    /// Why the account's login is known dead (`refresh_token_reused`, …).
+    pub login_error: Option<String>,
+    /// The absolute path of the folder the account's login was imported from.
+    pub codex_home: Option<String>,
+    /// Refreshed tokens still need guarded publication to the imported Codex login.
+    pub token_sync_pending: bool,
+}
+
+impl AccountSnapshot {
+    /// The customer-facing plan label every surface shows: the `plan` key of
+    /// `tcr status --json`, the `plan=` token of its text form and the TUI's dim
+    /// suffix, so the three cannot disagree. An Anthropic account is labelled from
+    /// its three profile fields by [`tcr_status_wire::plan_label`], a Codex account
+    /// from its ChatGPT plan alone by [`tcr_status_wire::codex_plan_label`]. The
+    /// two vocabularies do not overlap: `plan_label` has never met `pro` and would
+    /// pass it through as the bare raw word.
+    pub fn plan_label(&self) -> Option<String> {
+        match self.provider {
+            Provider::Anthropic => tcr_status_wire::plan_label(
+                self.organization_type.as_deref(),
+                self.rate_limit_tier.as_deref(),
+                self.seat_tier.as_deref(),
+            ),
+            Provider::Codex => tcr_status_wire::codex_plan_label(self.organization_type.as_deref()),
+        }
+    }
+
+    /// Why this Codex account's login is dead, as one clause for a person: the refresh error
+    /// it died with ([`CodexFacts::login_error`]), in words. `None` on an Anthropic account, and
+    /// on a Codex account with no recorded error, which leaves the caller to say only that the
+    /// account needs a re-login.
+    ///
+    /// The one place the clause is worded, so the dashboard's re-login hint and `tcr status`'s
+    /// re-login line cannot disagree. A reused refresh token on a row imported from a codex
+    /// folder names that folder (`home` shown as `~`, see [`short_path`]): ChatGPT refresh
+    /// tokens are single-use, and the codex CLI sharing the login is what spent it first.
+    pub fn relogin_why(&self, home: Option<&Path>) -> Option<String> {
+        match self.provider {
+            Provider::Anthropic => return None,
+            Provider::Codex => {}
+        }
+        let code = self.codex.login_error.as_deref()?;
+        Some(match code {
+            "refresh_token_reused" => match self.codex.codex_home.as_deref() {
+                Some(folder) => format!(
+                    "the codex CLI in {} refreshed this shared login first",
+                    short_path(folder, home)
+                ),
+                None => "another copy of this login refreshed first".to_string(),
+            },
+            "refresh_token_expired" => "the login expired".to_string(),
+            "refresh_token_invalidated" => "the login was revoked".to_string(),
+            "invalid_grant" => "ChatGPT rejected the refresh (invalid_grant)".to_string(),
+            "http_401" => "ChatGPT answered the refresh with 401".to_string(),
+            other => format!("ChatGPT refused the refresh ({other})"),
+        })
+    }
+}
+
+/// Whether a live session was keyed on a stable client identity (a Codex
+/// request's `session-id` header, tier 0 and Codex paths only; x-api-key /
 /// metadata.user_id), on a hash of its cacheable prefix (`system` + `tools`)
 /// because it had no stronger identity, or had neither and served unpinned.
 /// DISPLAY-only — never a routing input.
@@ -290,6 +449,10 @@ pub struct SessionSnapshot {
     pub last_served_account: String,
     pub requests: u64,
     pub last_seen: Option<OffsetDateTime>,
+    /// The provider of the account this session is pinned to ([`Self::account`]), else of the
+    /// one that last served it. A session belongs to one provider for its whole life, so the
+    /// dashboard can mark a Codex session's group without guessing it from a name.
+    pub provider: Provider,
     /// [`SessionKind::Stable`] when keyed on a stable client identity (x-api-key /
     /// `metadata.user_id`); [`SessionKind::Prefix`] when there was none but the
     /// request's `system`/`tools` hash pinned it anyway; [`SessionKind::Fallback`]
@@ -302,12 +465,46 @@ pub struct SessionSnapshot {
     pub kind: SessionKind,
 }
 
+/// The account serving each provider right now, as positions in [`StatsSnapshot::accounts`]:
+/// the account that most recently served a request of that provider. `None` for a provider
+/// that has served nothing since the process started, or whose serving row was deleted.
+///
+/// One per provider because a mixed fleet serves both at once: the account a Claude request
+/// last went to says nothing about where codex's requests go, and a single index made one
+/// provider's serving account vanish from the dashboard every time the other one served.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CurrentByProvider {
+    pub anthropic: Option<usize>,
+    pub codex: Option<usize>,
+}
+
+impl CurrentByProvider {
+    /// The account serving `provider`.
+    pub fn get(&self, provider: Provider) -> Option<usize> {
+        match provider {
+            Provider::Anthropic => self.anthropic,
+            Provider::Codex => self.codex,
+        }
+    }
+
+    /// Record `idx` as the account serving `provider`.
+    pub fn set(&mut self, provider: Provider, idx: usize) {
+        match provider {
+            Provider::Anthropic => self.anthropic = Some(idx),
+            Provider::Codex => self.codex = Some(idx),
+        }
+    }
+}
+
 /// The whole picture the TUI paints each tick.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub accounts: Vec<AccountSnapshot>,
     /// Index of the account that most recently served a request, if any.
     pub current: Option<usize>,
+    /// The account serving each provider, as positions in [`Self::accounts`], the space
+    /// [`Self::current`] uses. Read it through [`Self::serving`].
+    pub current_by_provider: CurrentByProvider,
     /// Most-recent-first request log.
     pub recent: Vec<RequestLogEntry>,
     /// Live per-session serving stats in a STABLE order (pinned account, then
@@ -327,10 +524,29 @@ pub struct StatsSnapshot {
     pub wire_sessions_summary: tcr_status_wire::SessionsSummary,
 }
 
+impl StatsSnapshot {
+    /// The account serving `provider`, as a position in [`Self::accounts`], the space
+    /// [`Self::current`] uses: [`Self::current_by_provider`]'s entry, else [`Self::current`]
+    /// when that account belongs to `provider`. So a snapshot that carries only `current` (one
+    /// built by hand, or from a source that does not track a serving account per provider)
+    /// still marks its serving row.
+    pub fn serving(&self, provider: Provider) -> Option<usize> {
+        self.current_by_provider.get(provider).or_else(|| {
+            self.current.filter(|&idx| {
+                self.accounts
+                    .get(idx)
+                    .is_some_and(|a| a.provider == provider)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::GateReason;
+    use super::*;
     use serde::de::{Deserialize as _, Visitor};
+    use std::path::Path;
 
     /// What the probe deserializer below hands back: serde's own list of the
     /// enum's wire names, or a sign that the derive took some other path.
@@ -438,6 +654,143 @@ mod tests {
         assert!(
             missing.is_empty(),
             "docs/troubleshooting.md has no `| `<token>` |` table row for gate token(s) {missing:?}"
+        );
+    }
+
+    /// The home folder reads `~`, and only as a whole leading component: a sibling folder whose
+    /// name merely starts with the home's is not inside it.
+    #[test]
+    fn short_path_shows_home_as_a_tilde() {
+        let home = Some(Path::new("/Users/example"));
+        assert_eq!(short_path("/Users/example/.codex", home), "~/.codex");
+        assert_eq!(short_path("/opt/codex", home), "/opt/codex");
+        // A sibling whose name merely starts with the home's. Shown under /srv because the
+        // repository's disclosure gate refuses a /Users/<name>/ path for any name but a few
+        // fixture ones, and a sibling of /Users/example cannot be one of them.
+        let srv = Some(Path::new("/srv/example"));
+        assert_eq!(
+            short_path("/srv/example2/.codex", srv),
+            "/srv/example2/.codex"
+        );
+        assert_eq!(short_path("/srv/example/.codex", srv), "~/.codex");
+        assert_eq!(
+            short_path("/Users/example/.codex", None),
+            "/Users/example/.codex"
+        );
+    }
+
+    /// A signed-out Codex row, its login dead with `login_error`, imported from `codex_home`.
+    fn signed_out_codex_row(
+        login_error: Option<&str>,
+        codex_home: Option<&str>,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            slot: 0,
+            name: "erin@example.com".to_string(),
+            provider: Provider::Codex,
+            organization_type: Some("team".to_string()),
+            rate_limit_tier: None,
+            seat_tier: None,
+            org_uuid: None,
+            org_name: None,
+            priority: 0,
+            status: "error".to_string(),
+            disabled: false,
+            five_hour: None,
+            five_hour_reset: None,
+            seven_day: None,
+            seven_day_reset: None,
+            seven_day_oi: None,
+            seven_day_oi_reset: None,
+            requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            last_used: None,
+            rate_limited_until: None,
+            probe_status: ProbeStatus::Error,
+            last_probe: None,
+            quota_updated_at: None,
+            probe_error: None,
+            quota_state: QuotaState::Normal,
+            gate: GateReason::Login,
+            free_at: None,
+            stream_error_count: 0,
+            last_stream_error: None,
+            groups: Vec::new(),
+            reserved_groups: Vec::new(),
+            parked_groups: Vec::new(),
+            control_allowed_groups: Vec::new(),
+            usage: None,
+            codex: CodexFacts {
+                login_error: login_error.map(str::to_string),
+                codex_home: codex_home.map(str::to_string),
+                ..CodexFacts::default()
+            },
+        }
+    }
+
+    #[test]
+    fn provider_dispatch_keeps_plan_and_login_metadata_separate() {
+        let mut account = signed_out_codex_row(Some("refresh_token_expired"), None);
+        account.organization_type = Some("pro".into());
+        for (provider, plan, why) in [
+            (Provider::Anthropic, "pro", None),
+            (Provider::Codex, "ChatGPT Pro", Some("the login expired")),
+        ] {
+            account.provider = provider;
+            assert_eq!(account.plan_label().as_deref(), Some(plan), "{provider:?}");
+            assert_eq!(account.relogin_why(None).as_deref(), why, "{provider:?}");
+        }
+    }
+
+    /// Why a Codex login died, one sentence per refresh error, in the words the dashboard's
+    /// re-login hint and `tcr status` both print. A reused refresh token names the codex CLI's
+    /// folder when the row was imported from one, because that CLI is what refreshed first.
+    #[test]
+    fn the_relogin_why_follows_the_login_error() {
+        let home = Some(Path::new("/Users/example"));
+        let why = |login_error: Option<&str>, codex_home: Option<&str>| {
+            signed_out_codex_row(login_error, codex_home).relogin_why(home)
+        };
+        assert_eq!(
+            why(Some("refresh_token_reused"), Some("/Users/example/.codex")).as_deref(),
+            Some("the codex CLI in ~/.codex refreshed this shared login first")
+        );
+        assert_eq!(
+            why(Some("refresh_token_reused"), None).as_deref(),
+            Some("another copy of this login refreshed first")
+        );
+        for codex_home in [Some("/Users/example/.codex"), None] {
+            for (login_error, sentence) in [
+                ("refresh_token_expired", "the login expired"),
+                ("refresh_token_invalidated", "the login was revoked"),
+                (
+                    "invalid_grant",
+                    "ChatGPT rejected the refresh (invalid_grant)",
+                ),
+                ("http_401", "ChatGPT answered the refresh with 401"),
+                (
+                    "token_revoked_by_admin",
+                    "ChatGPT refused the refresh (token_revoked_by_admin)",
+                ),
+            ] {
+                assert_eq!(
+                    why(Some(login_error), codex_home).as_deref(),
+                    Some(sentence),
+                    "{login_error} with codex_home {codex_home:?}"
+                );
+            }
+            assert_eq!(why(None, codex_home), None, "no login error, no why");
+        }
+
+        let mut anthropic = signed_out_codex_row(Some("refresh_token_reused"), None);
+        anthropic.provider = Provider::Anthropic;
+        assert_eq!(
+            anthropic.relogin_why(home),
+            None,
+            "an Anthropic row has no Codex login to explain"
         );
     }
 }

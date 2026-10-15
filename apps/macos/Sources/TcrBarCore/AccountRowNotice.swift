@@ -16,7 +16,16 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
     /// like an error.
     public enum Tone: Equatable, Sendable {
         case failure
+        /// A state the account is in, drawn red like a failure but spoken as
+        /// written: a signed-out Codex login, say. It is not an action that
+        /// failed, which is why it is never spoken as "Failed: …".
+        case alert
         case note
+        /// A caution about how the account is set up, spoken as written: a Codex row's
+        /// group-add warning, that no Codex request reaches the group. Drawn in the
+        /// panel's dim ink, not a note's amber, which beside a row's near-limit amber
+        /// read as a quota state.
+        case caution
     }
 
     public let text: String
@@ -31,28 +40,48 @@ public struct AccountRowNotice: Equatable, Sendable, Identifiable {
 
     /// Every notice for one row, failures first, in a fixed order so the lines
     /// do not swap places between two polls.
+    ///
+    /// `codexNote` is a Codex row's own note (``CodexCardFacts/noteLine(reloginRefusal:loginError:codexHome:groupAddWarning:home:)``),
+    /// after the failures and before the note on a success: a state the account
+    /// is in outranks a remark on something that worked. `nil` on every Claude
+    /// row, which therefore gets exactly the lines it always did.
+    ///
+    /// A failure that carries the refusal of a bundled tcr too old to read a
+    /// config holding a Codex account reads as the sentence naming that tcr
+    /// (``PredatesCodexRefusal/displayed(_:)``), since tcr's own words name a
+    /// version and not the fix. Such a tcr refuses every command with the same
+    /// words, so a line whose text an earlier line already has is dropped: the
+    /// row says it once. Lines of different texts are all kept, as before, and
+    /// two failures of tcr's own words never share a text, because each starts
+    /// with its own prefix.
     public static func collect(
         deleteFailure: RemoveAccountCommand.Failure?,
         deleteNotice: String?,
         groupFailure: (group: String, failure: GroupCommand.Failure)?,
-        toggleFailure: AccountCommand.Failure?
+        toggleFailure: AccountCommand.Failure?,
+        codexNote: AccountRowNotice? = nil
     ) -> [AccountRowNotice] {
         var lines: [AccountRowNotice] = []
         if let deleteFailure {
-            lines.append(AccountRowNotice(text: deleteFailure.summary, tone: .failure))
+            lines.append(failure(deleteFailure.summary))
         }
         if let groupFailure {
-            lines.append(
-                AccountRowNotice(
-                    text: "group “\(groupFailure.group)”: \(groupFailure.failure.summary)",
-                    tone: .failure))
+            lines.append(failure("group “\(groupFailure.group)”: \(groupFailure.failure.summary)"))
         }
         if let toggleFailure {
-            lines.append(AccountRowNotice(text: toggleFailure.summary, tone: .failure))
+            lines.append(failure(toggleFailure.summary))
+        }
+        if let codexNote {
+            lines.append(codexNote)
         }
         if let deleteNotice {
             lines.append(AccountRowNotice(text: deleteNotice, tone: .note))
         }
-        return lines
+        var seen = Set<String>()
+        return lines.filter { seen.insert($0.text).inserted }
+    }
+
+    private static func failure(_ text: String) -> AccountRowNotice {
+        AccountRowNotice(text: PredatesCodexRefusal.displayed(text), tone: .failure)
     }
 }

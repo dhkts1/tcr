@@ -228,4 +228,66 @@ final class AccountExitTests: XCTestCase {
             }
         }
     }
+
+    // MARK: A Codex row's exit
+
+    /// No Mac lends, serves or carries a Codex request, so a Codex card states where
+    /// it exits instead of offering a picker whose every peer choice the CLI refuses.
+    /// The statement is the same for a local exit, a preference for another Mac, and
+    /// a strict exit that names no Mac. A Claude row has no statement: it keeps its
+    /// picker.
+    func testACodexRowsExitIsTheStaysOnThisMacStatement() throws {
+        let fleet = try decodeFleet(
+            [canonicalRow("alice@example.com"), canonicalRow("bob@example.com/codex")])
+        let alice = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
+        let bob = try XCTUnwrap(fleet.accounts.first { $0.name == "bob@example.com/codex" })
+        let stays = "Codex accounts always leave from this Mac in this version."
+        XCTAssertEqual(AccountExit.codexStatement, stays)
+        XCTAssertEqual(AccountExit.statement(for: bob, exit: AccountExit(route: .local)), stays)
+        XCTAssertEqual(
+            AccountExit.statement(for: bob, exit: AccountExit(route: .via("studio-mac"))), stays,
+            "an exit through another Mac that is not strict is a preference, and the "
+                + "request leaves from this Mac anyway")
+        XCTAssertEqual(
+            AccountExit.statement(for: bob, exit: AccountExit(route: .unknown("via"), strict: true)),
+            stays, "a strict exit that names no Mac locks nothing to another Mac")
+        XCTAssertNil(AccountExit.statement(for: alice, exit: AccountExit(route: .local)))
+    }
+
+    /// A strict exit through another Mac makes tcr refuse every request routed to a
+    /// Codex account, so the card says so and gives the command that clears the
+    /// lock, naming the account.
+    func testAStrictExitToAnotherMacSaysTcrRefusesIt() throws {
+        let fleet = try decodeFleet(
+            [canonicalRow("alice@example.com"), canonicalRow("bob@example.com/codex")])
+        let alice = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
+        let bob = try XCTUnwrap(fleet.accounts.first { $0.name == "bob@example.com/codex" })
+        let exit = AccountExit(
+            route: .via(String(repeating: "0", count: 52)), strict: true, peerDown: true,
+            waitingSeconds: 40)
+        XCTAssertEqual(
+            AccountExit.statement(for: bob, exit: exit),
+            "Locked to exit from another Mac, which a Codex account cannot do, so tcr refuses "
+                + "every request routed to it. Clear the lock with "
+                + "`tcr peer account bob@example.com/codex --exits-from local --no-must`.")
+        XCTAssertNil(AccountExit.statement(for: alice, exit: exit))
+    }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
 }

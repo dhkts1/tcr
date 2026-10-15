@@ -16,12 +16,20 @@ import Foundation
 /// Deliberately NOT a health check: a member that is merely disabled or
 /// rate-limited right now still counts as routable, because that is transient and
 /// this is about the group's permanent shape.
+///
+/// **Claude routing is judged over the members that can serve a Claude request.**
+/// A Codex member never serves one, so it never makes a group look routable: a
+/// group whose only Claude member is the control account routes nothing however
+/// many Codex accounts share its label.
 public enum GroupRouting {
-    /// `false` when the group has no members at all, or when every member is the
-    /// control account. `controlName == nil` means no control account is set (or
-    /// the panel could not resolve one), in which case membership alone decides.
+    /// `false` when the group has no Claude members at all, or when every Claude
+    /// member is the control account. `controlName == nil` means no control account
+    /// is set (or the panel could not resolve one), in which case membership alone
+    /// decides.
     public static func routes(group: String, accounts: [Account], controlName: String?) -> Bool {
-        let members = accounts.filter { ($0.groups ?? []).contains(group) }
+        let members = accounts.filter {
+            $0.provider == .anthropic && ($0.groups ?? []).contains(group)
+        }
         guard !members.isEmpty else { return false }
         guard let controlName else { return true }
         if allowsControlAccount(group: group, accounts: accounts) { return true }
@@ -178,6 +186,19 @@ public enum GroupCommand {
         case clean
         case spoke(notice: String)
         case failed(Failure)
+    }
+
+    /// The warning in a successful command's stderr: its first line that starts with
+    /// `warning: `, without that prefix, or `nil` when it warned of nothing.
+    ///
+    /// Adding a Codex account to a group succeeds and warns that no Codex request can
+    /// ask for a group. That warning is what the account's line keeps; the rest of
+    /// stderr is a remark on a success.
+    public static func warning(inNotice notice: String) -> String? {
+        let prefix = "warning: "
+        return notice.split(whereSeparator: \.isNewline)
+            .first { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
     }
 
     /// Pure classification of a finished invocation.

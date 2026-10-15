@@ -160,8 +160,176 @@ impl Manager {
         self.accounts.read().expect("accounts lock poisoned").len()
     }
 
+    /// How many accounts belong to `provider`, in any state (disabled, held, rejected): every
+    /// account that could ever serve a request of that provider, since `eligible` refuses the
+    /// other provider's first. The proxy asks its "is the rotation spent" and "how many accounts
+    /// are exhausted" questions of this and not of the fleet-wide [`Self::account_count`], so a
+    /// mixed fleet answers an Anthropic request exactly as its Anthropic half alone would.
+    ///
+    /// Deleted slots never count: they cannot serve another request. Refresh the file's
+    /// account list before counting so a request sees a completed live delete before selection
+    /// runs. An in-flight file writer is never waited on by the request path.
+    pub fn provider_account_count(&self, provider: crate::provider::Provider) -> usize {
+        self.reload_groups_if_changed();
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .filter(|a| a.provider == provider)
+            .filter(|a| !a.removed)
+            .count()
+    }
+
+    /// Whether waiting could leave a Codex account usable. Operator-disabled, parked,
+    /// removed, reserved, dead-login and unsupported strict peer-exit rows need a
+    /// configuration change; quota/refusal holds are timers and still count here.
+    /// A bound conversation or hard account lock cannot recover on another row.
+    pub(crate) fn codex_account_can_serve_eventually(&self, bound_to: Option<usize>) -> bool {
+        self.codex_candidate_counts(bound_to, None, |_| false).0 > 0
+    }
+
+    /// Whether every otherwise usable Codex account has a live access-refusal hold.
+    /// Inspect the hold directly: a later quota window can hide it in the reported gate.
+    pub(crate) fn codex_pool_is_refused(
+        &self,
+        now: OffsetDateTime,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+    ) -> bool {
+        let now_ms = odt_to_ms(now);
+        let (candidates, refused) = self.codex_candidate_counts(bound_to, group, |account| {
+            account.hold_cause == HoldCause::Refused
+                && account
+                    .rate_limited_until_ms
+                    .is_some_and(|until| until > now_ms)
+        });
+        candidates > 0 && candidates == refused
+    }
+
+    /// Count candidate slots and the subset satisfying `matches`, under one accounts read.
+    /// Config/group snapshots are released before that read, so no request-side guard
+    /// waits on config persistence or nests config and accounts locks.
+    fn codex_candidate_counts(
+        &self,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+        matches: impl Fn(&AccountRuntime) -> bool,
+    ) -> (usize, usize) {
+        self.fold_codex_candidates(bound_to, group, (0, 0), |(total, matching), _, account| {
+            (total + 1, matching + usize::from(matches(account)))
+        })
+    }
+
+    /// The exhaustion deadline must fold the same slots that can recover by
+    /// waiting. Disabled or unsupported siblings must not hide a real reset.
+    pub(super) fn codex_candidate_indices(
+        &self,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+    ) -> HashSet<usize> {
+        self.fold_codex_candidates(bound_to, group, HashSet::new(), |mut indices, idx, _| {
+            indices.insert(idx);
+            indices
+        })
+    }
+
+    fn fold_codex_candidates<T>(
+        &self,
+        bound_to: Option<usize>,
+        group: Option<&str>,
+        initial: T,
+        mut fold: impl FnMut(T, usize, &AccountRuntime) -> T,
+    ) -> T {
+        self.reload_groups_if_changed();
+        let unsupported = self.codex_accounts_with_unsupported_exit();
+        let parked = self.parked_groups();
+        let reserved = self.reserved_groups();
+        let locked = self.locked_account_for(crate::provider::Provider::Codex);
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .enumerate()
+            .filter(|(idx, account)| match account.provider {
+                crate::provider::Provider::Anthropic => false,
+                crate::provider::Provider::Codex => {
+                    !account.removed
+                        && bound_to.is_none_or(|bound| bound == *idx)
+                        && locked.is_none_or(|locked_idx| locked_idx == *idx)
+                        && group.is_none_or(|group| account.groups.iter().any(|g| g == group))
+                        && !account.disabled
+                        && account.status != AccountStatus::Error
+                        && !Self::parked_blocks(account, &parked)
+                        && !Self::reserved_blocks(account, group, &reserved)
+                        && !unsupported.contains(idx)
+                }
+            })
+            .fold(initial, |value, (idx, account)| fold(value, idx, account))
+    }
+
+    /// The live locked slot, when the lock belongs to this request's provider.
+    /// A lock never disables another provider's independent pool.
+    pub(crate) fn locked_account_for(&self, provider: crate::provider::Provider) -> Option<usize> {
+        let idx = self.locked_idx?;
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .filter(|account| !account.removed && account.provider == provider)
+            .map(|_| idx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_config_write_for_test(&self, f: impl FnOnce()) {
+        let _guard = self.config_write.lock().expect("config write poisoned");
+        f();
+    }
+
+    /// Account `idx`'s `last_selected_seq`, the tick a selection stamps on the account it
+    /// picks (`0` = never picked). Test-only: it is how a test proves a request was answered
+    /// without any account being SELECTED, which `requests` (a count of SERVED requests)
+    /// cannot tell apart from an account picked and then never sent to.
+    #[cfg(test)]
+    pub(crate) fn last_selected_seq(&self, idx: usize) -> Option<u64> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.last_selected_seq)
+    }
+
+    /// Edit account `idx`'s quota in place. Test-only: it is how a test puts an account behind
+    /// a window or a refusal without speaking its provider's header dialect, which is a
+    /// different parser for each provider.
+    #[cfg(test)]
+    pub(crate) fn edit_quota_for_test(
+        &self,
+        idx: usize,
+        edit: impl FnOnce(&mut crate::quota::Quota),
+    ) {
+        if let Some(account) = self
+            .accounts
+            .write()
+            .expect("accounts lock poisoned")
+            .get_mut(idx)
+        {
+            edit(&mut account.quota);
+        }
+    }
+
+    /// The Anthropic origin. A request's own origin, which depends on its provider, is
+    /// [`Self::upstream_for`].
     pub fn upstream(&self) -> &str {
         &self.upstream
+    }
+
+    /// The origin a request for `provider` is rewritten to. `upstream()` stays the Anthropic
+    /// accessor its existing callers (profile fetch, control identity) mean.
+    pub fn upstream_for(&self, provider: crate::provider::Provider) -> &str {
+        match provider {
+            crate::provider::Provider::Anthropic => &self.upstream,
+            crate::provider::Provider::Codex => &self.codex_upstream,
+        }
     }
 
     pub fn proxy_api_key(&self) -> Option<&str> {
@@ -241,11 +409,79 @@ impl Manager {
             .get(idx)
             .and_then(|a| a.account_uuid.clone())
     }
+
+    /// The ChatGPT account id a Codex row's requests and probes carry as `chatgpt-account-id`:
+    /// its workspace, the row's non-empty `org_uuid`, else its `account_uuid`, where a row
+    /// saved before the workspace was split from the user keeps that id. `None` for an index
+    /// that no longer exists, or a row with neither.
+    pub fn codex_account_id(&self, idx: usize) -> Option<String> {
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let row = accounts.get(idx)?;
+        row.org_uuid
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .or(row.account_uuid.as_deref())
+            .map(str::to_string)
+    }
+
+    /// A slot's immutable provider, including retired slots. Bound history still
+    /// needs this identity to release a conversation through its normal warning path.
+    pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.provider)
+    }
+
+    /// A provider only while its slot remains live. Rotation counts must match
+    /// provider_account_count, which excludes retired rows.
+    pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .filter(|account| !account.removed)
+            .map(|account| account.provider)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_slots_keep_their_provider_identity_but_do_not_count_in_live_rotation() {
+        let manager = manager_with(
+            r#"{"accounts":[
+                {"name":"alice@example.com","accessToken":"at-alice"},
+                {"name":"bob@example.com","accessToken":"at-bob","provider":"codex"}
+            ]}"#,
+        );
+        for (idx, provider) in [
+            crate::provider::Provider::Anthropic,
+            crate::provider::Provider::Codex,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(manager.provider(idx), Some(provider));
+            assert_eq!(manager.live_provider(idx), Some(provider));
+            manager.accounts.write().unwrap()[idx].removed = true;
+            assert_eq!(
+                manager.provider(idx),
+                Some(provider),
+                "bound history retains a removed slot's provider identity"
+            );
+            assert_eq!(
+                manager.live_provider(idx),
+                None,
+                "a retired slot cannot consume a live rotation step"
+            );
+        }
+        assert_eq!(manager.provider(2), None);
+        assert_eq!(manager.live_provider(2), None);
+    }
 
     fn manager_with(config: &str) -> Arc<Manager> {
         let config: Config = serde_json::from_str(config).expect("the inline test config parses");

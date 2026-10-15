@@ -143,6 +143,32 @@ final class PeerPairingTests: XCTestCase {
                 state.sentence(peerName: "studio-mac").contains("\u{2014}"),
                 "an em dash is in the pairing copy")
         }
+        // The same words in a fleet holding a Codex account, where what a trusted
+        // Mac can carry is Claude traffic: the compare sentence still sends the
+        // operator to the other screen, and still asserts nothing about it.
+        let mixed = comparing.sentence(peerName: "studio-mac", holdsCodex: true)
+        XCTAssertTrue(
+            mixed.contains("Read them off that screen and type them here"),
+            "the mixed compare sentence no longer tells the operator to read the OTHER "
+                + "screen: \(mixed)")
+        XCTAssertFalse(
+            mixed.contains("the same six digits"),
+            "the mixed sheet asserts the two numbers match: \(mixed)")
+        XCTAssertTrue(
+            mixed.hasSuffix(
+                "A match pins its key and it can carry your Claude traffic without reading it."),
+            "the mixed compare sentence does not name Claude: \(mixed)")
+        XCTAssertEqual(
+            sentence.replacingOccurrences(of: "your traffic", with: "your Claude traffic"), mixed,
+            "the mixed compare sentence is not today's with Claude named")
+        for state in [
+            PeerPairState.asking(instance: "8f"), .comparing(code: "418902"),
+            .done(peer: "tcr-4b8we1r0zp"), .refused("no"), .cancelled,
+        ] {
+            XCTAssertFalse(
+                state.sentence(peerName: "studio-mac", holdsCodex: true).contains("\u{2014}"),
+                "an em dash is in the mixed fleet's pairing copy")
+        }
     }
 
     // MARK: - The field

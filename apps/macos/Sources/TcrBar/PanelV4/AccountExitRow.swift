@@ -106,6 +106,28 @@ struct AccountExitRow: View {
     }
 }
 
+/// "Exits from", on a Codex account's card: one sentence in place of the picker.
+///
+/// A Codex request always leaves from this Mac in this version, so there is no
+/// Mac to choose and no "must" to set, and a picker offering them would be a
+/// control that cannot do what it says. The sentence comes from
+/// ``AccountExit/statement(for:exit:)``, which also says how to clear an exit
+/// locked to another Mac, the one exit that makes tcr refuse the account. That
+/// command is drawn as ``CommandProseText``: without its backticks, never broken
+/// inside `--no-must` or the account's name, and copied from the sentence's menu.
+struct AccountExitStatement: View {
+    let text: String
+
+    var body: some View {
+        CommandProseText(text: text, size: V4.muteSize)
+            .font(V4.font(V4.muteSize))
+            .foregroundStyle(Tok.mute)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, V4.quotaMarginTop)
+            .accessibilityLabel(CommandProse.spoken(text))
+    }
+}
+
 /// The compact switch the mockup's `.sw2.small` draws, by hand.
 ///
 /// Not a `Toggle(.switch)`: `ImageRenderer` draws one as the "prohibited"

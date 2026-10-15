@@ -298,6 +298,10 @@ impl AccountStatus {
 pub struct AccountRuntime {
     pub name: String,
     pub account_type: config::AccountType,
+    /// Which upstream this credential belongs to; copied from `config::Account::provider` at
+    /// boot and never changed afterwards. Selection filters on it FIRST (`select::eligible`):
+    /// a Claude request and a Codex account have nothing to say to each other.
+    pub provider: crate::provider::Provider,
     /// The pooled account's own UUID, injected into the outbound request body's
     /// `metadata.user_id.account_uuid` so it matches the token we serve with
     /// (see [`crate::account_uuid`]). `None` leaves the body unchanged.
@@ -433,6 +437,17 @@ pub struct AccountRuntime {
     pub rate_limited_until_ms: Option<i64>,
     /// What armed `rate_limited_until_ms`; read only to name the gate.
     pub hold_cause: HoldCause,
+    /// Why a Codex row's login is known dead: the OAuth code its last refresh was rejected with
+    /// (`refresh_token_reused`, `invalid_grant`, …), else `http_<status>`. Set by a rejected
+    /// refresh (`manager/refresh.rs`), cleared by a successful refresh or a re-login of the row
+    /// ([`Manager::add_or_update_account`]). Always `None` on an Anthropic row. Not persisted:
+    /// a restart forgets it, and the next refresh learns it again.
+    pub login_error: Option<String>,
+    /// [`config::Account::codex_home`]: the imported login's folder, for guarded token sharing
+    /// and the status wire. A re-login replaces it with the submission's.
+    pub codex_home: Option<String>,
+    /// Latest shared tokens awaiting guarded auth.json publication; never part of status.
+    pub(crate) pending_codex_writeback: Option<refresh::PendingCodexWriteback>,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -726,6 +741,7 @@ impl AccountRuntime {
         Self {
             name: account.name.clone(),
             account_type: account.account_type.clone(),
+            provider: account.provider,
             account_uuid: account.account_uuid.clone(),
             org_uuid: account.org_uuid.clone(),
             org_name: account.org_name.clone(),
@@ -761,6 +777,9 @@ impl AccountRuntime {
             last_served_ms: 0,
             rate_limited_until_ms: None,
             hold_cause: HoldCause::RateLimit,
+            login_error: None,
+            codex_home: account.codex_home.clone(),
+            pending_codex_writeback: refresh::PendingCodexWriteback::from_config(account),
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
@@ -839,6 +858,28 @@ impl DisablePersist {
             }),
         }
     }
+
+    /// [`Self::warning`] for a row of `provider`. Only the duplicate notice differs: two
+    /// entries that share a Codex login are told apart by neither of them holding it twice,
+    /// so a Codex row names that remedy (remove one, or re-import it under a name of its own),
+    /// where a Claude row keeps its `orgUuid` remedy. Every other outcome reads the same for
+    /// both providers.
+    pub fn warning_for(
+        self,
+        disabled: bool,
+        provider: crate::provider::Provider,
+    ) -> Option<&'static str> {
+        match provider {
+            crate::provider::Provider::Anthropic => self.warning(disabled),
+            crate::provider::Provider::Codex => match self {
+                Self::Ambiguous => Some(
+                    "NOT SAVED: two config entries share this Codex login — remove the duplicate \
+                     (tcr remove <name>), or re-import it with --name",
+                ),
+                _ => self.warning(disabled),
+            },
+        }
+    }
 }
 
 /// What [`Manager::set_control_by_query`] did. Same shape as
@@ -860,6 +901,27 @@ pub enum SetControlOutcome {
     /// past the loader's rename migration. Listed so the caller can tell the
     /// user which rows to go fix.
     Ambiguous(Vec<String>),
+    /// The query named a Codex account, which cannot be the control account
+    /// ([`codex_control_refusal`]); carries its name. Nothing was changed: the
+    /// boot path ignores such a `controlAccount`, so accepting it here would
+    /// persist a setting the next start throws away.
+    CodexAccount(String),
+}
+
+/// Why a Codex account cannot be the control account, in the words both places
+/// that meet one use: boot, which ignores a `controlAccount` naming one, and
+/// `tcr control`, which refuses to set one. The control account is an Anthropic
+/// identity (its bootstrap calls, its probe, its `controlIdentity` check), and
+/// Codex has no counterpart yet.
+pub const CODEX_HAS_NO_CONTROL_ACCOUNT: &str = "Codex has no control-account semantics yet";
+
+/// `tcr control`'s refusal of the Codex account `name`, live
+/// ([`SetControlOutcome::CodexAccount`]) and offline alike.
+pub fn codex_control_refusal(name: &str) -> String {
+    format!(
+        "'{name}' is a Codex account, and {CODEX_HAS_NO_CONTROL_ACCOUNT}, so it cannot be the \
+         control account."
+    )
 }
 
 /// What [`Manager::set_control`] achieved about DURABILITY — whether the
@@ -1047,9 +1109,11 @@ pub struct Manager {
     config: Mutex<Config>,
     /// Serializes the whole read-modify-write of the CONFIG FILE, and nothing else
     /// (**INV1**). Every writer — [`Self::persist_now`], [`Self::persist_tokens`],
-    /// [`Self::persist_disabled`] — holds this across its whole read, modify,
-    /// `sync_all` and rename, so two persists can never interleave and a stale
-    /// document can never clobber a just-rotated single-use refresh token.
+    /// [`Self::persist_disabled`], and the two plan writers, the profile backfill
+    /// (`backfill_plan_if_unknown`) and a Codex plan change (`record_codex_plan`) —
+    /// holds this across its whole read, modify, `sync_all` and rename, so two
+    /// persists can never interleave and a stale document can never clobber a
+    /// just-rotated single-use refresh token.
     ///
     /// It exists so `self.config` no longer has to do that job (**INV2**). The
     /// config mutex is taken on the PER-CONNECTION path —
@@ -1060,8 +1124,9 @@ pub struct Manager {
     ///
     /// Lock order is `config_write` → `config`, never the reverse: nothing that
     /// holds `config` ever reaches for this. A `()` payload — it guards an external
-    /// resource (the file), not data.
-    config_write: Mutex<()>,
+    /// resource (the file), not data. Shared ownership lets async callers move the
+    /// complete write, including its lock wait, onto a blocking worker.
+    config_write: Arc<Mutex<()>>,
     config_path: Option<PathBuf>,
     /// Set once, by [`Self::release_mutation_ownership`], when this process has
     /// handed the listening socket to a successor and is only draining.
@@ -1087,6 +1152,9 @@ pub struct Manager {
     /// a flag a future caller can unset by mistake.
     mutation_released: AtomicBool,
     upstream: String,
+    /// Where a Codex account's requests go ([`config::Config::codex_upstream`]). Read
+    /// through [`Self::upstream_for`]; `upstream` above stays the Anthropic origin.
+    codex_upstream: String,
     proxy_api_key: Option<String>,
     global_threshold: f64,
     /// Override for the Fable weekly bucket alone — see
@@ -1134,13 +1202,27 @@ pub struct Manager {
     /// `BTreeMap` for deterministic wire order, matching
     /// [`config::Config::group_colors`]'s own return type.
     group_colors: RwLock<BTreeMap<String, String>>,
+    /// What this process's MITM listener can intercept by its policy and leaf,
+    /// recorded once by `server::serve` from its boot-time TLS load
+    /// ([`Self::record_mitm_status`]). `OnceLock` because the listener's leaf
+    /// is loaded once and never reloaded (whether it terminates `chatgpt.com`
+    /// also depends on the Codex accounts, counted on every CONNECT); unset
+    /// means this process loaded no TLS material, which [`Self::mitm_status`]
+    /// reports as MITM off.
+    mitm: std::sync::OnceLock<crate::status::MitmStatus>,
+    /// The Codex 429s this process sent itself in the last ten minutes, and the latest one
+    /// ([`Self::note_codex_refusal`], [`Self::codex_traffic`]). A leaf lock, never held with
+    /// another. In memory only: a restart empties it.
+    codex_refused: Mutex<CodexRefusals>,
+    /// The Codex requests relayed unpooled for their own routing in the last ten minutes
+    /// ([`Self::note_codex_unpooled`]). A leaf lock, never held with another. In memory only.
+    codex_unpooled: Mutex<MinuteRing>,
     /// The config file's mtime as of the last successful (or unmodified-since)
     /// [`Self::reload_groups_if_changed`] check. `None` before the first check.
-    /// Guarded by `config_write` at every access — see that lock's doc and
-    /// `reload_groups_if_changed`'s for why: this and the file read it gates
-    /// must move together, or two racing reload calls could both see a stale
-    /// `None`/old value and redundantly re-parse (harmless) or, worse, one
-    /// could advance it past a write the other hasn't applied yet.
+    /// Read under its own mutex for the unchanged-file fast path; advanced only
+    /// under `config_write` after applying a complete file snapshot. Reloads also
+    /// recheck it under that write guard, so racing checks cannot advance past an
+    /// edit another reload has not applied.
     groups_reload_mtime: Mutex<Option<std::time::SystemTime>>,
     /// Per-account request pacing knobs, snapshotted from the config at
     /// construction. Default (all `None`) → inert → selection is byte-identical to
@@ -1169,8 +1251,9 @@ pub struct Manager {
     /// no path ever runs the other way round.
     usage: crate::usage::UsageTracker,
     /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
-    /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
-    /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
+    /// or `None` when unlocked / the name did not match. For its own provider,
+    /// [`Self::select`] returns `i` (bypassing rotation/affinity/migration) with
+    /// no failover; the other provider's pool remains independent.
     locked_idx: Option<usize>,
     /// The resolved identity-bound control account (index of the account named
     /// by `config.controlAccount`), or `None` when unset / the name did not
@@ -1200,12 +1283,20 @@ pub struct Manager {
     /// Lock order: taken ALONE. [`Self::throttle_send`] releases this guard before
     /// touching [`Self::fleet_tat_ms`] — the two are never held together.
     org_tat_ms: AsyncMutex<HashMap<String, i64>>,
-    /// GCRA theoretical-arrival-time (epoch ms) for the fleet-wide ceiling. Same
-    /// discipline as [`Self::org_tat_ms`]: held only for the O(1) update, released
-    /// before any sleep.
-    fleet_tat_ms: AsyncMutex<i64>,
+    /// GCRA theoretical-arrival-times (epoch ms) for each provider's fleet ceiling.
+    /// Independent upstreams never spend one another's burst budget. Same discipline
+    /// as [`Self::org_tat_ms`]: held only for the O(1) update, released before sleep.
+    fleet_tat_ms: AsyncMutex<HashMap<crate::provider::Provider, i64>>,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
+    /// The slot that most recently served each provider, as [`Self::current`] is for either:
+    /// the dashboard marks the account serving Claude and the one serving codex at once.
+    /// [`Self::snapshot`] re-counts each into a position among the rows it lists.
+    ///
+    /// Lock order: taken alone, after [`Self::current`] is released. `snapshot` reads it while
+    /// it holds the accounts lock, so [`Self::set_current`] reads the slot's provider (the
+    /// accounts lock, released) BEFORE it takes this or `current`.
+    current_by_provider: Mutex<crate::stats::CurrentByProvider>,
     /// Monotonic counter handed out one tick at a time by [`Manager::select`] to
     /// stamp the account it picks, so the next select prefers a different one
     /// (load spread). Starts at 1 so 0 reads unambiguously as "never selected".
@@ -1291,6 +1382,8 @@ pub struct Manager {
     /// Anti-storm valve for over-threshold revalidation-serve: epoch-ms before which
     /// no new revalidation serve is issued. See [`Manager::select_revalidation`].
     next_revalidation_at_ms: std::sync::atomic::AtomicI64,
+    /// Codex has its own revalidation budget; a Claude fallback never spends it.
+    next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64,
     /// Connection-scoped affinity for NOISE traffic (`/api/event_logging`,
     /// `/mcp-registry` — see [`select::classify_request`]): connection key
     /// ([`crate::proxy::SessionKey`]'s wrapped `u64`, minted per-connection by
@@ -1492,6 +1585,7 @@ impl Manager {
         accounts: Vec<AccountRuntime>,
     ) -> Arc<Self> {
         let upstream = config.upstream.clone();
+        let codex_upstream = config.codex_upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let fable_weekly_threshold = config.fable_weekly_threshold;
@@ -1565,6 +1659,23 @@ impl Manager {
                 }
             }
         });
+        // The control account is an Anthropic identity: the one Claude Code's
+        // bootstrap calls resolve to, probed and `controlIdentity`-checked as one.
+        // Codex has no counterpart in this version, so a Codex row named here is
+        // warned about and ignored rather than half-honoured. A `match`,
+        // so a third provider decides this here instead of inheriting an answer.
+        let control_idx = control_idx.filter(|&idx| {
+            accounts.get(idx).is_none_or(|account| match account.provider {
+                crate::provider::Provider::Anthropic => true,
+                crate::provider::Provider::Codex => {
+                    tracing::warn!(
+                        account = %account.name,
+                        "controlAccount names a Codex account; {CODEX_HAS_NO_CONTROL_ACCOUNT}, ignoring it"
+                    );
+                    false
+                }
+            })
+        });
 
         let usage = crate::usage::UsageTracker::new(
             accounts.len(),
@@ -1582,10 +1693,11 @@ impl Manager {
             warm_in_flight: AtomicBool::new(false),
             warm_wake: Notify::new(),
             config: Mutex::new(config),
-            config_write: Mutex::new(()),
+            config_write: Arc::new(Mutex::new(())),
             config_path,
             mutation_released: AtomicBool::new(false),
             upstream,
+            codex_upstream,
             proxy_api_key,
             global_threshold,
             fable_weekly_threshold,
@@ -1594,6 +1706,9 @@ impl Manager {
             control_allowed_groups: RwLock::new(control_allowed_groups),
             spill_groups: RwLock::new(spill_groups),
             group_colors: RwLock::new(group_colors),
+            mitm: std::sync::OnceLock::new(),
+            codex_refused: Mutex::new(CodexRefusals::default()),
+            codex_unpooled: Mutex::new(MinuteRing::default()),
             groups_reload_mtime: Mutex::new(None),
             pacing,
             account_throttle,
@@ -1601,9 +1716,10 @@ impl Manager {
             locked_idx,
             control_idx: RwLock::new(control_idx),
             org_tat_ms: AsyncMutex::new(HashMap::new()),
-            fleet_tat_ms: AsyncMutex::new(0),
+            fleet_tat_ms: AsyncMutex::new(HashMap::new()),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
+            current_by_provider: Mutex::new(crate::stats::CurrentByProvider::default()),
             select_seq: AtomicU64::new(1),
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
@@ -1617,6 +1733,7 @@ impl Manager {
             wire_sessions_dirty: AtomicBool::new(false),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
+            next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             conn_affinity: Mutex::new(HashMap::new()),
             divert_ledger: Mutex::new(HashMap::new()),
             control_reserve,
@@ -1632,7 +1749,7 @@ impl Manager {
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
             tracing::warn!(
                 account = %name, idx = i,
-                "ACCOUNT LOCK ACTIVE — all traffic pinned to one account; rotation/affinity/migration bypassed, no failover"
+                "ACCOUNT LOCK ACTIVE — this provider's traffic pinned to one account; rotation/affinity/migration bypassed, no failover"
             );
         }
 
@@ -1642,10 +1759,11 @@ impl Manager {
     /// Convenience constructor for the real binary (live OAuth refresher + live
     /// usage prober).
     pub fn with_live_refresher(config: Config, config_path: Option<PathBuf>) -> Arc<Self> {
+        let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
         Self::new(
             config,
             Arc::new(LiveRefresher::new()),
-            Arc::new(LiveUsageProber::new()),
+            Arc::new(prober),
             Arc::new(LiveWarmer::new()),
             config_path,
         )
@@ -1659,10 +1777,11 @@ impl Manager {
     pub fn from_runtimes(accounts: Vec<AccountRuntime>) -> Arc<Self> {
         let config: Config = serde_json::from_str("{}")
             .expect("an empty JSON object is always a valid default config");
+        let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
         Self::assemble(
             config,
             Arc::new(LiveRefresher::new()),
-            Arc::new(LiveUsageProber::new()),
+            Arc::new(prober),
             Arc::new(LiveWarmer::new()),
             None,
             accounts,
@@ -1706,9 +1825,16 @@ impl Manager {
     /// A `retry-after` hint (seconds) for a synthetic 429 when every account is
     /// exhausted: the soonest instant at which SOME account genuinely re-enters
     /// rotation, clamped to at least 1s, defaulting to 60s when nothing is known.
-    /// The seconds half of [`Self::exhaustion_hint`]; see it for the derivation.
-    pub fn retry_after_hint(&self, now: OffsetDateTime, is_fable: bool) -> i64 {
-        self.exhaustion_hint(now, is_fable, None).retry_after
+    /// The seconds half of [`Self::exhaustion_hint`]; see it for the derivation, and for why
+    /// it folds only `provider`'s accounts.
+    pub fn retry_after_hint(
+        &self,
+        now: OffsetDateTime,
+        is_fable: bool,
+        provider: crate::provider::Provider,
+    ) -> i64 {
+        self.exhaustion_hint(now, is_fable, provider, None)
+            .retry_after
     }
 
     /// [`Self::retry_after_hint`], scoped to the members of one group.
@@ -1729,9 +1855,11 @@ impl Manager {
         &self,
         now: OffsetDateTime,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: &str,
     ) -> i64 {
-        self.exhaustion_hint(now, is_fable, Some(group)).retry_after
+        self.exhaustion_hint(now, is_fable, provider, Some(group))
+            .retry_after
     }
 
     /// Everything a synthetic exhausted 429 can honestly tell the client, derived
@@ -1773,13 +1901,34 @@ impl Manager {
     /// reserved-blocked by its own group ([`Self::reserved_blocks`]). `None` is
     /// the "unrequested traffic" view [`Self::snapshot`] reports — a promise this
     /// hint makes must hold for the traffic that would actually hit the 429.
+    ///
+    /// `provider` narrows the fold to the request's own provider's accounts, before
+    /// anything else is asked of them. An account of the other provider can never
+    /// serve this request (`eligible` refuses it first), so its reset says nothing
+    /// about when this one can be served: folding it in let a Codex account freeing
+    /// in two seconds time a Claude client's wait, and its gate inflate the count of
+    /// accounts "out", while every Anthropic account stayed out for an hour.
+    ///
+    /// **An all-rejected Codex fleet** is the one place a terminal gate contributes.
+    /// `rejected` has no clear-instant (`Self::account_terminal_gate`), so a Codex
+    /// fleet whose every account answered a quota refusal used to report the 60-second
+    /// sentinel, which the Codex client renders as "resets in 60 seconds" for a window
+    /// days away. When EVERY account folded is `rejected`, each Codex one contributes
+    /// when it can be expected back (`Self::rejected_codex_free_at_ms`): the refusal body's
+    /// measured reset, then the latest live reset among its windows at or over its threshold,
+    /// and only with neither its rate-limit hold's expiry. Measured Codex quota holds preserve
+    /// that full deadline instead of using the transient hold's one-hour cap. An
+    /// Anthropic `rejected` still contributes nothing, so Anthropic's hint is unchanged:
+    /// it is upstream's verdict, which need not belong to any window this account stores
+    /// (see `rejected_account_reports_a_rejected_gate`).
     pub fn exhaustion_hint(
         &self,
         now: OffsetDateTime,
         is_fable: bool,
+        provider: crate::provider::Provider,
         group: Option<&str>,
     ) -> ExhaustionHint {
-        self.exhaustion_hint_over(now, is_fable, group, None)
+        self.exhaustion_hint_over(now, is_fable, Some(provider), group, None)
     }
 
     /// [`Self::exhaustion_hint`] for a request that ONE account alone may serve.
@@ -1798,28 +1947,48 @@ impl Manager {
         is_fable: bool,
         idx: usize,
     ) -> ExhaustionHint {
-        self.exhaustion_hint_over(now, is_fable, None, Some(idx))
+        self.exhaustion_hint_over(now, is_fable, None, None, Some(idx))
     }
 
-    /// The one derivation behind both hint forms: `group` narrows to a group's members, `only`
-    /// to a single account index.
+    /// The one derivation behind both hint forms: `provider` narrows to one provider's
+    /// accounts, `group` to a group's members, `only` to a single account index. The
+    /// single-account form passes no provider: the one account it names is the request's
+    /// bound account, which `proxy::handle` only ever takes from the request's own provider.
     fn exhaustion_hint_over(
         &self,
         now: OffsetDateTime,
         is_fable: bool,
+        provider: Option<crate::provider::Provider>,
         group: Option<&str>,
         only: Option<usize>,
     ) -> ExhaustionHint {
         let now_ms = odt_to_ms(now);
+        let codex_candidates = match provider.or_else(|| only.and_then(|idx| self.provider(idx))) {
+            Some(crate::provider::Provider::Codex) => {
+                Some(self.codex_candidate_indices(only, group))
+            }
+            Some(crate::provider::Provider::Anthropic) | None => None,
+        };
         let reserved_groups = self.reserved_groups();
         let parked_groups = self.parked_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
         let mut soonest: Option<(i64, GateReason)> = None;
+        // The all-rejected Codex fold (see `exhaustion_hint`): whether every account
+        // folded is `rejected`, and the soonest instant a rejected Codex one is expected
+        // back. Used only when the first is still true after the loop.
+        let mut every_one_rejected = true;
+        let mut rejected_codex_soonest: Option<i64> = None;
         for (_, account) in accounts
             .iter()
             .enumerate()
             .filter(|&(idx, _)| only.is_none_or(|only| only == idx))
+            .filter(|&(idx, _)| {
+                codex_candidates
+                    .as_ref()
+                    .is_none_or(|candidates| candidates.contains(&idx))
+            })
+            .filter(|(_, account)| provider.is_none_or(|p| account.provider == p))
             .filter(|(_, account)| group.is_none_or(|g| account.groups.iter().any(|m| m == g)))
         {
             let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
@@ -1834,6 +2003,19 @@ impl Manager {
                 &reserved_groups,
                 &parked_groups,
             );
+            if reason == GateReason::Rejected {
+                match account.provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => {
+                        if let Some(at) = Self::rejected_codex_free_at_ms(account, threshold, now) {
+                            rejected_codex_soonest =
+                                Some(rejected_codex_soonest.map_or(at, |best| best.min(at)));
+                        }
+                    }
+                }
+            } else {
+                every_one_rejected = false;
+            }
             if reason != GateReason::Ok {
                 *gated.entry(reason).or_insert(0) += 1;
             }
@@ -1842,6 +2024,11 @@ impl Manager {
             };
             if soonest.is_none_or(|(best, _)| at < best) {
                 soonest = Some((at, reason));
+            }
+        }
+        if every_one_rejected {
+            if let Some(at) = rejected_codex_soonest {
+                soonest = Some((at, GateReason::Rejected));
             }
         }
         match soonest {
@@ -1857,6 +2044,168 @@ impl Manager {
                 binding: None,
                 gated,
             },
+        }
+    }
+
+    /// When a `rejected` CODEX account can be expected back, for the exhaustion hint
+    /// alone (see [`Self::exhaustion_hint`]), in epoch ms and only while still ahead of
+    /// `now`: the refusal body's measured reset, then the latest live reset among its
+    /// windows at or over `threshold` (every one has to roll before it can serve), else its
+    /// rate-limit hold's expiry. `None` when none is known.
+    ///
+    /// A measured Codex quota deadline keeps its full duration
+    /// ([`Self::mark_codex_quota_limited`]); only transient rate limits use the bounded hold.
+    /// The account stays rejected until a usage probe sees the window it stored roll, reads
+    /// the account allowed ([`crate::quota::Quota::apply_usage`]), or a served 2xx carrying a
+    /// window reads it allowed.
+    fn rejected_codex_free_at_ms(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+    ) -> Option<i64> {
+        let now_ms = odt_to_ms(now);
+        account
+            .quota
+            .codex
+            .refusal_reset
+            .map(odt_to_ms)
+            .or_else(|| {
+                Self::rejected_codex_window(account, threshold, now)
+                    .map(|(_, reset)| odt_to_ms(reset))
+            })
+            .or(account.rate_limited_until_ms)
+            .filter(|&at| at > now_ms)
+    }
+
+    /// The window that is holding a `rejected` CODEX account out, and when it rolls: among its
+    /// five-hour and weekly windows at or over `threshold` with a live reset, the one whose
+    /// reset is latest, since every one of them has to roll before the account serves. `None`
+    /// when no window explains the refusal.
+    ///
+    /// One answer for both of its readers, [`Self::rejected_codex_free_at_ms`] (when the
+    /// exhaustion hint expects the account back) and [`Self::codex_refusal_gate`] (what the
+    /// snapshot reports), so the two cannot name different windows.
+    fn rejected_codex_window(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+    ) -> Option<(GateReason, OffsetDateTime)> {
+        [
+            (GateReason::FiveHour, account.quota.five_hour),
+            (GateReason::SevenDay, account.quota.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(gate, window)| {
+            let window = window.filter(|w| w.effective(now) >= threshold)?;
+            Some((gate, window.live_reset(now)?))
+        })
+        .max_by_key(|&(_, reset)| reset)
+    }
+
+    /// The window that refused a `rejected` CODEX account and has reached its reset since, with
+    /// no probe yet to read the new window: among its five-hour and weekly windows whose STORED
+    /// utilization is at or over `threshold` and whose reset is at or before `now`, the one
+    /// whose reset is latest, as in [`Self::rejected_codex_window`]. `None` when no such window
+    /// is stored.
+    ///
+    /// The stored utilization, not [`crate::quota::QuotaWindow::effective`], which reads a
+    /// window past its reset as `0.0`: that the window rolled is the clock's inference, and the
+    /// refusal stands until a usage probe reads the new window
+    /// ([`crate::quota::Quota::apply_usage`]), or a served 2xx that carries a window reads the
+    /// account allowed.
+    fn rolled_codex_window(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+    ) -> Option<GateReason> {
+        [
+            (GateReason::FiveHour, account.quota.five_hour),
+            (GateReason::SevenDay, account.quota.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(gate, window)| {
+            let window = window.filter(|w| w.utilization >= threshold)?;
+            Some((gate, window.reset.filter(|&reset| reset <= now)?))
+        })
+        .max_by_key(|&(_, reset)| reset)
+        .map(|(gate, _)| gate)
+    }
+
+    /// The gate a CODEX account at its usage limit REPORTS: the window that refused it, with
+    /// that window's reset as the time it frees, in place of a `Rejected` that names no time.
+    /// Only a Codex row whose `account_gate` is `Rejected` is changed:
+    ///
+    /// 1. a full window with a live reset ([`Self::rejected_codex_window`]) reports its own gate,
+    ///    `FiveHour` or `SevenDay`, freeing at that reset;
+    /// 2. else a full window whose reset has passed, with no probe yet to confirm the roll
+    ///    ([`Self::rolled_codex_window`]), keeps its own gate, with no time;
+    /// 3. else a hold still in the future reports itself, freeing at the hold's end: `Hold`, or
+    ///    `Refused` when an upstream 403 armed it, the name `account_gate` gives that hold;
+    /// 4. else it stays `Rejected`, with no time.
+    ///
+    /// Why: ChatGPT's usage-limit refusal names the window it refused on, and that window's
+    /// headers carry its reset, so the account's return is known. Anthropic's `rejected` is its
+    /// own verdict and names no window, so an Anthropic row is returned unchanged.
+    ///
+    /// Why rule 2: past the reset the window has rolled as far as the clock knows, but tcr has
+    /// not read the new window, and the refusal stands until a usage probe reads it, or until a
+    /// served response from the account answers 2xx with a window
+    /// (`Quota::update_from_codex_refusal`) or refuses again. The row keeps naming that window,
+    /// with no time, so it does not read as a refusal no window explains. The hold the refusal
+    /// armed has lapsed by then, so the account is back in the pool and may be sent a request in
+    /// those minutes.
+    ///
+    /// Why rule 3 holds even for a refusal that carried no reset: the proxy arms a hold for every
+    /// Codex quota refusal, to its body's measured reset, then its windows' reset
+    /// (`quota::codex_hold_seconds`), else to the 429's `retry-after`, else for 60 seconds.
+    /// Measured quota deadlines are preserved in full. While that hold is live the
+    /// account really is held, with a known end, so `Hold` and its countdown are the truth; once
+    /// the hold lapses, the refusal that still stands reads `Rejected`. The live hold can also be
+    /// an upstream 403's ([`Self::mark_refused`]): once the refusal's own hold lapses the account
+    /// is back in the pool, which never reads `rejected`, and a 403 then holds it for
+    /// [`REFUSED_HOLD_SECONDS`]. That hold reads `Refused` here, as it does on any other row.
+    ///
+    /// Display only, and only [`Self::snapshot`] calls it. Selection still reads the refusal
+    /// through `account_terminal_gate`, and the exhaustion hint through `account_gate`, so this
+    /// remap changes neither whether the account is held out nor when the hint expects it back.
+    /// The probe cadence does read the snapshot row, so `schedule::ProbeUrgency::of` takes a
+    /// standing refusal from the row's `limit_reached_type` as well as from `Rejected`, and the
+    /// remap cannot slow the probe that ends the refusal either.
+    /// The tokens are ones every client already parses: they are variants of the closed
+    /// `GateReason` enum, so no older CLI fails to read a payload that carries them.
+    pub(super) fn codex_refusal_gate(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+        gate: GateReason,
+        free_at: Option<OffsetDateTime>,
+    ) -> (GateReason, Option<OffsetDateTime>) {
+        match account.provider {
+            crate::provider::Provider::Anthropic => return (gate, free_at),
+            crate::provider::Provider::Codex => {}
+        }
+        if gate != GateReason::Rejected {
+            return (gate, free_at);
+        }
+        if let Some((window, reset)) = Self::rejected_codex_window(account, threshold, now) {
+            return (window, Some(reset));
+        }
+        if let Some(window) = Self::rolled_codex_window(account, threshold, now) {
+            return (window, None);
+        }
+        match account
+            .rate_limited_until_ms
+            .filter(|&until| until > odt_to_ms(now))
+        {
+            // Named by its cause, as `account_gate` names a hold on a row with no refusal.
+            Some(until) => (
+                match account.hold_cause {
+                    HoldCause::RateLimit => GateReason::Hold,
+                    HoldCause::Refused => GateReason::Refused,
+                },
+                ms_to_odt(until),
+            ),
+            None => (GateReason::Rejected, None),
         }
     }
 
@@ -2032,6 +2381,7 @@ impl Manager {
         account_uuid: Option<String>,
         org_uuid: Option<String>,
         org_name: Option<String>,
+        provider: crate::provider::Provider,
         tokens: &Tokens,
     ) {
         // Defence in depth: `refresh_plan` already refuses to produce a refresh
@@ -2048,7 +2398,32 @@ impl Manager {
         // alone, so a rotated token lands on the RIGHT entry when the same email
         // is logged into two orgs (finding #9). With all identity fields None
         // (today's config) same_identity falls back to name equality — unchanged.
-        let probe = crate::identity::probe(name, account_uuid, org_uuid, org_name);
+        //
+        // The provider rides on the probe, as on every probe, and here it decides:
+        // `identity::same_identity` never matches a row of another provider, so only
+        // rows of this one are candidates, both in the `resolve` below and in the
+        // pairing `save_tokens_for`'s merge makes. An Anthropic row and a Codex row
+        // may share a name, and when either lacks an account UUID the name fallback
+        // alone calls them one account — a tie that would refuse to persist this
+        // rotation, or a pairing that would stamp it onto the other provider's row.
+        let probe = crate::identity::probe(provider, name, account_uuid, org_uuid, org_name);
+        let sync_pending = match provider {
+            crate::provider::Provider::Anthropic => None,
+            crate::provider::Provider::Codex => {
+                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                accounts
+                    .iter()
+                    .find(|a| {
+                        a.provider == provider
+                            && a.name == name
+                            && a.account_uuid == probe.account_uuid
+                            && a.org_uuid == probe.org_uuid
+                    })
+                    .and_then(|a| a.pending_codex_writeback.as_ref())
+                    .map(refresh::PendingCodexWriteback::record)
+            }
+        };
+
         // INV1 — the modify and the save must be ONE atomic step against the file.
         // Without that, two concurrent refreshes race: a stale save clobbers the
         // other account's just-rotated refresh token, which then 400s
@@ -2087,6 +2462,19 @@ impl Manager {
                     // `Some(...)` on every reachable refresh success.
                     account.refresh_token = tokens.refresh_token.clone();
                     account.expires_at = Some(tokens.expires_at_ms);
+                    match provider {
+                        crate::provider::Provider::Anthropic => {}
+                        crate::provider::Provider::Codex => match sync_pending {
+                            Some(value) => {
+                                account
+                                    .extra
+                                    .insert(config::CODEX_SYNC_PENDING_KEY.to_string(), value);
+                            }
+                            None => {
+                                account.extra.remove(config::CODEX_SYNC_PENDING_KEY);
+                            }
+                        },
+                    }
                 }
             }
             (config.clone(), placement)
@@ -2200,12 +2588,11 @@ impl Manager {
     /// those, or this would fight [`Self::persist_now`] / [`Self::persist_tokens`]
     /// / [`Self::persist_disabled`]'s read-modify-write of the SAME file.
     ///
-    /// Takes `config_write` (INV1, see that field's doc) across the mtime
-    /// check AND the file read/parse — the same discipline every writer of
-    /// this file already uses, so a reload can never straddle a concurrent
-    /// persist's write. [`config::write_atomic`]'s temp-file-then-rename
-    /// already rules out a torn read on its own; this keeps reload from being
-    /// the one reader that does not bother.
+    /// Checks the cached mtime before touching `config_write`. When a file change
+    /// needs reloading, takes that lock without waiting and checks mtime again under
+    /// the guard, keeping the same read/parse serialization as config writers.
+    /// Requests use the last completed snapshot during an in-flight write or fsync;
+    /// the next cadence check after the writer releases applies its completed edit.
     ///
     /// A file that cannot be stat'd, read, or parsed **keeps every current
     /// in-memory value** and logs a warning — never blanks the fleet's groups
@@ -2217,29 +2604,43 @@ impl Manager {
         let Some(path) = &self.config_path else {
             return;
         };
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
-        let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(m) => m,
+        let read_mtime = || match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => Some(mtime),
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     path = %path.display(),
                     "group reload: could not stat config file, keeping current groups"
                 );
-                return;
+                None
             }
         };
+        let Some(mtime) = read_mtime() else {
+            return;
+        };
+        if *self
+            .groups_reload_mtime
+            .lock()
+            .expect("groups reload mtime lock poisoned")
+            == Some(mtime)
         {
-            let last = self
-                .groups_reload_mtime
-                .lock()
-                .expect("groups reload mtime lock poisoned");
-            if *last == Some(mtime) {
-                return;
-            }
+            return;
+        }
+        let _writing = match self.config_write.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("config write lock poisoned"),
+        };
+        let Some(mtime) = read_mtime() else {
+            return;
+        };
+        if *self
+            .groups_reload_mtime
+            .lock()
+            .expect("groups reload mtime lock poisoned")
+            == Some(mtime)
+        {
+            return;
         }
         match config::load(path) {
             Ok(fresh) => {
@@ -2360,6 +2761,7 @@ impl Manager {
             let fresh_control = fresh.control_account.as_ref().map(|c| c.name().to_string());
             for (idx, account) in accounts.iter_mut().enumerate() {
                 let probe = crate::identity::probe(
+                    account.provider,
                     &account.name,
                     account.account_uuid.clone(),
                     account.org_uuid.clone(),
@@ -2401,6 +2803,9 @@ impl Manager {
                     account.access_token = matched.access_token.clone();
                     account.refresh_token = matched.refresh_token.clone();
                     account.expires_at_ms = matched.expires_at.map(oauth::normalize_expires_at);
+                    // The folder too. `login_error` is left as it is, as `status` is: a restored
+                    // entry holds whatever tokens it held, and the next refresh decides.
+                    account.codex_home = matched.codex_home.clone();
                     changed.push(format!("{}: back in the config", account.name));
                     if fresh_control.as_deref() == Some(account.name.as_str()) {
                         let mut control = self.control_idx.write().expect("control lock poisoned");
@@ -2443,6 +2848,7 @@ impl Manager {
             for candidate in &fresh.accounts {
                 let already_known = accounts.iter().any(|existing| {
                     let probe = crate::identity::probe(
+                        existing.provider,
                         &existing.name,
                         existing.account_uuid.clone(),
                         existing.org_uuid.clone(),
@@ -2516,10 +2922,12 @@ impl Manager {
             Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
-            // Resolved by identity, exactly as `persist_tokens` and `save_disabled`
-            // resolve, so all three land on the same record. An unbreakable tie
-            // writes nothing: `save_disabled` refuses one too, and memory must not
-            // drift onto a record the file was not allowed to touch.
+            // Resolved by identity, through the one `identity::resolve` that
+            // `persist_tokens` and `save_disabled` resolve through, with the provider
+            // riding on `target` (`set_disabled` builds it from the row), so all three
+            // land on the same record and never on a row of another provider. An
+            // unbreakable tie writes nothing: `save_disabled` refuses one too, and
+            // memory must not drift onto a record the file was not allowed to touch.
             if let crate::identity::Resolved::One(position) =
                 crate::identity::resolve(config.accounts.iter().enumerate(), target)
             {
@@ -2608,7 +3016,15 @@ impl Manager {
         // (config, then accounts) — the shape a deadlock is made of.
         let target = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-            let Some(account) = accounts.get_mut(idx) else {
+            // A row deleted from the config keeps its slot, parked and unlisted, and
+            // `disabled` is all that keeps it out of rotation (`eligible` never reads
+            // `removed`), so it answers as a row that no longer exists: enabling it would
+            // serve an account the operator deleted, on its in-memory credentials, until a
+            // restart. Checked under this write lock, so no reload can mark or revive the
+            // row between the check and the write. Reached by a dashboard key drawn before
+            // the delete, and by `set_disabled_by_query`, which resolves under a read lock
+            // it releases before calling here.
+            let Some(account) = accounts.get_mut(idx).filter(|account| !account.removed) else {
                 return DisablePersist::NoSuchAccount;
             };
             account.disabled = disabled;
@@ -2616,7 +3032,12 @@ impl Manager {
                 account.status = AccountStatus::Active;
                 account.rate_limited_until_ms = None;
             }
+            // `save_disabled` locates the row by this probe, and
+            // `identity::same_identity` never matches a row of the other provider:
+            // a probe built with the wrong provider (Anthropic) addresses no Codex
+            // row, so a Codex account's bench would never reach disk.
             crate::identity::probe(
+                account.provider,
                 &account.name,
                 account.account_uuid.clone(),
                 account.org_uuid.clone(),
@@ -2861,7 +3282,11 @@ impl Manager {
                 .expect("accounts lock poisoned")
                 .get(i)
                 .map(|a| {
+                    // Carries the account's provider for the reason
+                    // `set_disabled`'s probe does: `save_control_account`
+                    // checks the row through `config::locate_account_entry`.
                     crate::identity::probe(
+                        a.provider,
                         &a.name,
                         a.account_uuid.clone(),
                         a.org_uuid.clone(),
@@ -2893,7 +3318,14 @@ impl Manager {
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
             match match_listed(&accounts[..], query) {
-                crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
+                // Refused here as boot ignores it (see `assemble`): a `match`, so a third
+                // provider decides this too instead of inheriting an answer.
+                crate::identity::Match::One(idx) => match accounts[idx].provider {
+                    crate::provider::Provider::Anthropic => (idx, accounts[idx].name.clone()),
+                    crate::provider::Provider::Codex => {
+                        return SetControlOutcome::CodexAccount(accounts[idx].name.clone())
+                    }
+                },
                 crate::identity::Match::None => return SetControlOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
                     return SetControlOutcome::Ambiguous(names)
@@ -2906,9 +3338,22 @@ impl Manager {
         }
     }
 
-    /// Record which account actually served the most recent request.
+    /// Record which account actually served the most recent request, and that it is now the
+    /// account serving its provider.
+    ///
+    /// The slot's provider is read FIRST, which takes and releases the accounts lock, and only
+    /// then are `current` and `current_by_provider` taken, one at a time. [`Self::snapshot`]
+    /// holds the accounts lock while it takes both, so holding either of them here while
+    /// taking the accounts lock would be the two orders a deadlock is made of.
     pub fn set_current(&self, idx: usize) {
+        let provider = self.provider(idx);
         *self.current.lock().expect("current lock poisoned") = Some(idx);
+        if let Some(provider) = provider {
+            self.current_by_provider
+                .lock()
+                .expect("current_by_provider lock poisoned")
+                .set(provider, idx);
+        }
     }
 
     /// Append a new account to the live rotation and return its index.
@@ -3027,7 +3472,11 @@ impl Manager {
     /// loop inside the function body for why at most one retry is ever
     /// needed and why it cannot reopen the TOCTOU above.
     pub fn add_or_update_account(&self, mut account: config::Account) -> AddAccountOutcome {
+        // The submission's provider rides on the probe, so a Codex submission never
+        // resolves to an Anthropic row that shares its name, live or on disk
+        // (`identity::same_identity`): it is added beside it, never stamped onto it.
         let target = crate::identity::probe(
+            account.provider,
             &account.name,
             account.account_uuid.clone(),
             account.org_uuid.clone(),
@@ -3085,6 +3534,7 @@ impl Manager {
                         (
                             i,
                             crate::identity::probe(
+                                a.provider,
                                 &a.name,
                                 a.account_uuid.clone(),
                                 a.org_uuid.clone(),
@@ -3107,6 +3557,7 @@ impl Manager {
                                     crate::identity::same_identity(
                                         &target,
                                         &crate::identity::probe(
+                                            a.provider,
                                             &a.name,
                                             a.account_uuid.clone(),
                                             a.org_uuid.clone(),
@@ -3148,6 +3599,18 @@ impl Manager {
                         if row.removed {
                             row.removed = false;
                             row.disabled = account.disabled.unwrap_or(false);
+                        }
+                        // A Codex re-login brings a live login, so whatever killed the last one
+                        // no longer holds, and the folder it came from (or none, for a login
+                        // of tcr's own) is the submission's. Whatever the row's status was, so
+                        // neither sits inside the two conditions above.
+                        match account.provider {
+                            crate::provider::Provider::Anthropic => {}
+                            crate::provider::Provider::Codex => {
+                                row.login_error = None;
+                                row.codex_home = account.codex_home.clone();
+                                row.pending_codex_writeback = None;
+                            }
                         }
                         // F6: the submitted type always wins — this route only
                         // ever carries a real credential, so a row whose stored
@@ -3222,6 +3685,13 @@ impl Manager {
                         let target = config::Account {
                             name: row.name.clone(),
                             account_type: row.account_type.clone(),
+                            // The SUBMISSION's provider: `persist_replaced`
+                            // writes through `config::locate_account_entry`,
+                            // which never matches a row of the other provider,
+                            // so a default (Anthropic) here would append an
+                            // Anthropic row carrying a Codex credential instead
+                            // of updating the Codex row in place.
+                            provider: account.provider,
                             account_uuid: row.account_uuid.clone(),
                             org_uuid: row.org_uuid.clone(),
                             org_name: row.org_name.clone(),
@@ -3251,6 +3721,10 @@ impl Manager {
                             // silently drop an operator's exit-node pin.
                             egress: existing_pin.egress,
                             egress_strict: existing_pin.strict,
+                            // The row's folder, just set from the submission: a row revived
+                            // from a delete has no file entry left, so the write appends this
+                            // whole `target`, and the folder reaches the file only through it.
+                            codex_home: row.codex_home.clone(),
                             extra: serde_json::Map::new(),
                         };
                         Resolution::Updated {
@@ -3432,6 +3906,12 @@ impl Manager {
         for_disk.access_token = fresh.access_token.clone();
         for_disk.refresh_token = fresh.refresh_token.clone();
         for_disk.expires_at = fresh.expires_at;
+        match fresh.provider {
+            crate::provider::Provider::Anthropic => {}
+            crate::provider::Provider::Codex => {
+                for_disk.extra.remove(config::CODEX_SYNC_PENDING_KEY);
+            }
+        }
 
         let outcome = config::save_account(path, &for_disk);
         // INV3, mirroring `persist_disabled`: touch the in-memory snapshot only
@@ -3450,6 +3930,8 @@ impl Manager {
                         entry.access_token = for_disk.access_token.clone();
                         entry.refresh_token = for_disk.refresh_token.clone();
                         entry.expires_at = for_disk.expires_at;
+                        entry.codex_home = for_disk.codex_home.clone();
+                        entry.extra.remove(config::CODEX_SYNC_PENDING_KEY);
                     }
                 }
                 // No in-memory entry carries this identity either — the disk
@@ -3504,6 +3986,101 @@ impl Manager {
                 );
                 AddPersist::WriteFailed
             }
+        }
+    }
+}
+
+/// How many one-minute buckets a [`MinuteRing`] holds: the minutes it counts back.
+const TRAFFIC_RING_MINUTES: i64 = 10;
+
+/// A count over the last ten minutes, in ten one-minute buckets keyed by the minute
+/// (`now_ms / 60_000`). A bucket counts only while its minute is one of the last ten, so a
+/// quiet stretch empties the count with no sweep; a bump that lands on a slot holding an
+/// older minute resets it first.
+#[derive(Debug, Default)]
+struct MinuteRing {
+    buckets: [(i64, u64); TRAFFIC_RING_MINUTES as usize],
+}
+
+impl MinuteRing {
+    fn bump(&mut self, now_ms: i64) {
+        let minute = now_ms.div_euclid(60_000);
+        let slot = &mut self.buckets[minute.rem_euclid(TRAFFIC_RING_MINUTES) as usize];
+        if slot.0 != minute {
+            *slot = (minute, 0);
+        }
+        slot.1 += 1;
+    }
+
+    fn count(&self, now_ms: i64) -> u64 {
+        let minute = now_ms.div_euclid(60_000);
+        self.buckets
+            .iter()
+            .filter(|(at, _)| *at <= minute && minute - *at < TRAFFIC_RING_MINUTES)
+            .map(|(_, n)| n)
+            .sum()
+    }
+}
+
+/// The Codex 429s this process sent itself: their ten-minute count, and the latest one's
+/// error `type` and when it was sent.
+#[derive(Debug, Default)]
+struct CodexRefusals {
+    ring: MinuteRing,
+    last: Option<(tcr_status_wire::CodexRefusalKind, i64)>,
+}
+
+impl Manager {
+    /// Count a 429 this process answered a Codex request with itself, under its body's kind.
+    /// Fed by `proxy::exhausted_response`'s Codex arms.
+    pub fn note_codex_refusal(&self, kind: tcr_status_wire::CodexRefusalKind, now_ms: i64) {
+        let mut refused = self
+            .codex_refused
+            .lock()
+            .expect("codex_refused lock poisoned");
+        refused.ring.bump(now_ms);
+        refused.last = Some((kind, now_ms));
+    }
+
+    /// Count a Codex request relayed on the client's own credential, unpooled, because it named
+    /// a routing of its own (`x-openai-account-routing-override` or `x-openai-fedramp`).
+    pub fn note_codex_unpooled(&self, now_ms: i64) {
+        self.codex_unpooled
+            .lock()
+            .expect("codex_unpooled lock poisoned")
+            .bump(now_ms);
+    }
+
+    /// What this process did with Codex requests in the ten minutes before `now_ms`: the 429s
+    /// it sent itself, and the requests it relayed unpooled. The latest refusal's type and time
+    /// are reported only while the refused count is above zero, so the wire never pairs a zero
+    /// count with a stale type.
+    ///
+    /// Both counts live in memory and a restart empties them: until the next refusal, a
+    /// restarted proxy reports none, though codex may still be failing.
+    pub fn codex_traffic(&self, now_ms: i64) -> tcr_status_wire::CodexTraffic {
+        let (refused_10m, last) = {
+            let refused = self
+                .codex_refused
+                .lock()
+                .expect("codex_refused lock poisoned");
+            let count = refused.ring.count(now_ms);
+            (count, refused.last.filter(|_| count > 0))
+        };
+        let unpooled_10m = self
+            .codex_unpooled
+            .lock()
+            .expect("codex_unpooled lock poisoned")
+            .count(now_ms);
+        let (last_refusal, last_refusal_at_ms) = match last {
+            Some((error_type, at_ms)) => (Some(error_type), Some(at_ms)),
+            None => (None, None),
+        };
+        tcr_status_wire::CodexTraffic {
+            refused_10m,
+            last_refusal,
+            last_refusal_at_ms,
+            unpooled_10m,
         }
     }
 }
@@ -3585,6 +4162,7 @@ mod tests {
         Account {
             name: name.to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -3600,6 +4178,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3621,6 +4200,7 @@ mod tests {
             rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
+            codex_upstream: crate::config::default_codex_upstream(),
             switch_threshold: 0.90,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -3655,7 +4235,11 @@ mod tests {
     }
 
     impl TokenRefresher for CountingRefresher {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             let calls = self.calls.clone();
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -3663,6 +4247,7 @@ mod tests {
                 // up on the coalescing lock.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 Ok::<Tokens, OAuthError>(Tokens {
+                    id_token: None,
                     access_token: "fresh-access".to_string(),
                     refresh_token: Some("fresh-refresh".to_string()),
                     expires_at_ms: crate::now_ms() + 3_600_000,
@@ -3681,7 +4266,11 @@ mod tests {
     }
 
     impl TokenRefresher for TransientThenOkRefresher {
-        fn refresh(&self, refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            refresh_token: String,
+        ) -> RefreshFuture {
             let calls = self.calls.clone();
             let tokens_seen = self.tokens_seen.clone();
             Box::pin(async move {
@@ -3699,6 +4288,7 @@ mod tests {
                     ))
                 } else {
                     Ok(Tokens {
+                        id_token: None,
                         access_token: "fresh-access".to_string(),
                         refresh_token: Some("fresh-refresh".to_string()),
                         expires_at_ms: crate::now_ms() + 3_600_000,
@@ -3766,8 +4356,17 @@ mod tests {
     async fn permanently_rejected_account_never_recovers_and_its_backoff_grows() {
         struct AlwaysRejects;
         impl TokenRefresher for AlwaysRejects {
-            fn refresh(&self, _refresh_token: String) -> RefreshFuture {
-                Box::pin(async { Err(OAuthError::AuthRejected { status: 400 }) })
+            fn refresh(
+                &self,
+                _provider: crate::provider::Provider,
+                _refresh_token: String,
+            ) -> RefreshFuture {
+                Box::pin(async {
+                    Err(OAuthError::AuthRejected {
+                        status: 400,
+                        code: None,
+                    })
+                })
             }
         }
         let manager = build_manager_with_prober(
@@ -3810,7 +4409,7 @@ mod tests {
 
     struct NoProber;
     impl UsageProber for NoProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(ProbeError {
                     status: None,
@@ -3827,8 +4426,8 @@ mod tests {
         ok_token: String,
     }
     impl UsageProber for ScriptedProber {
-        fn probe(&self, access_token: String) -> ProbeFuture {
-            let ok = access_token == self.ok_token;
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            let ok = credential.access_token == self.ok_token;
             Box::pin(async move {
                 if ok {
                     Ok(Usage {
@@ -3839,6 +4438,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -3863,7 +4463,7 @@ mod tests {
     }
 
     impl UsageProber for RetryAfterProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(ProbeError {
@@ -3875,7 +4475,7 @@ mod tests {
         }
     }
     impl UsageProber for FirstOkThen429Prober {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if n == 0 {
@@ -3887,6 +4487,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -3907,7 +4508,7 @@ mod tests {
     /// `five_hour.is_some()` would leave such an account warm-INELIGIBLE forever.
     struct ColdOkProber;
     impl UsageProber for ColdOkProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Ok(Usage {
                     five_hour: None,
@@ -3917,6 +4518,7 @@ mod tests {
                     }),
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -4153,7 +4755,9 @@ mod tests {
             None,
             None,
             None,
+            crate::provider::Provider::Anthropic,
             &Tokens {
+                id_token: None,
                 access_token: "at-a-rotated".to_string(),
                 refresh_token: Some("rt-a-rotated".to_string()),
                 expires_at_ms: crate::now_ms() + 3_600_000,
@@ -4173,6 +4777,81 @@ mod tests {
             serde_json::json!("rt-b-relogin"),
             "rotating acct-a reverted acct-b's re-auth; that token is single-use \
              and acct-b is now dead until `tcr login`"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A rotated Codex credential is persisted onto the Codex row, and the Anthropic
+    /// row that shares its name keeps its own.
+    ///
+    /// Neither row carries an account UUID, so identity alone falls back to the name
+    /// and calls the two rows one account; only the provider tells them apart. Both
+    /// halves of the write depend on it: provider-blind, `persist_tokens`' own
+    /// placement ties and refuses, and so does the merge that pairs on-disk entries
+    /// with loaded accounts — either way the rotated single-use refresh token never
+    /// reaches the file, and the Codex account is dead after the next restart.
+    #[test]
+    fn a_rotated_codex_token_persists_onto_the_codex_row_beside_a_same_named_anthropic_row() {
+        let path = tmp_config_path("codex-beside-anthropic");
+        let mut anthropic = account("alice@example.com", 0);
+        anthropic.access_token = "at-anthropic".to_string();
+        anthropic.refresh_token = Some("rt-anthropic".to_string());
+        let mut codex = account("alice@example.com", 1);
+        codex.provider = crate::provider::Provider::Codex;
+        codex.access_token = "at-codex".to_string();
+        codex.refresh_token = Some("rt-codex".to_string());
+        let manager = build_manager_with_path(config_with(vec![anthropic, codex]), path.clone());
+
+        // Establish the file from the manager's own snapshot, so an unchanged row
+        // below cannot just mean nothing ever writes here.
+        manager.persist_now();
+
+        manager.persist_tokens(
+            "alice@example.com",
+            None,
+            None,
+            None,
+            crate::provider::Provider::Codex,
+            &Tokens {
+                id_token: None,
+                access_token: "at-codex-rotated".to_string(),
+                refresh_token: Some("rt-codex-rotated".to_string()),
+                expires_at_ms: crate::now_ms() + 3_600_000,
+            },
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("the config stays valid JSON");
+        let row_of = |provider: Option<&str>| {
+            value["accounts"]
+                .as_array()
+                .expect("an accounts array")
+                .iter()
+                .find(|row| row.get("provider").and_then(serde_json::Value::as_str) == provider)
+                .unwrap_or_else(|| panic!("no row with provider {provider:?}: {value}"))
+                .clone()
+        };
+        let anthropic_row = row_of(None);
+        assert_eq!(
+            anthropic_row["refreshToken"],
+            serde_json::json!("rt-anthropic"),
+            "a Codex rotation must leave the Anthropic row's own credential alone: {value}"
+        );
+        assert_eq!(
+            anthropic_row["accessToken"],
+            serde_json::json!("at-anthropic")
+        );
+        let codex_row = row_of(Some("codex"));
+        assert_eq!(
+            codex_row["refreshToken"],
+            serde_json::json!("rt-codex-rotated"),
+            "the rotated Codex token must reach the Codex row: {value}"
+        );
+        assert_eq!(
+            codex_row["accessToken"],
+            serde_json::json!("at-codex-rotated")
         );
 
         std::fs::remove_file(&path).ok();
@@ -4273,6 +4952,296 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A Codex usage prober whose every answer names one ChatGPT plan and nothing else.
+    struct CodexPlanProber {
+        plan: &'static str,
+    }
+
+    impl UsageProber for CodexPlanProber {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            let plan = self.plan;
+            Box::pin(async move {
+                Ok(Usage {
+                    codex: Some(crate::codex_probe::CodexProbeFacts {
+                        plan_type: Some(plan.into()),
+                        ..Default::default()
+                    }),
+                    ..Usage::default()
+                })
+            })
+        }
+    }
+
+    /// **A Codex account's plan follows its usage probe**, and the change is written to that
+    /// row's `organizationType` and to no other key. A refresh carries no new plan, so before
+    /// this a plan changed at ChatGPT (Plus to Pro here) stayed what the login said at import.
+    /// The write is the surgical `save_plan`, and an unchanged plan writes nothing at all.
+    ///
+    /// Watched red, one break at a time: pass `Some("")` as the rate-limit tier to `save_plan`
+    /// and the document gains a `rateLimitTier`; drop the call in `probe_account` and the
+    /// runtime plan stays `plus`.
+    #[tokio::test]
+    async fn a_plus_to_pro_probe_updates_the_plan_and_saves_only_that_key() {
+        let path = tmp_config_path("codex-plan");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+                  "credentialVersion": 2,
+                  "accountUuid": "22222222-2222-4222-8222-222222222222",
+                  "organizationType": "plus", "groups": ["orchard"], "priority": 0,
+                  "accessToken": "at-bob", "refreshToken": "rt-bob",
+                  "expiresAt": 4102444800000 }
+            ] }"#,
+        )
+        .unwrap();
+        let original = read_config_json(&path);
+        let manager = Manager::new(
+            crate::config::load(&path).unwrap(),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(CodexPlanProber { plan: "pro" }),
+            Arc::new(NoWarmer),
+            Some(path.clone()),
+        );
+        // The Anthropic profile endpoint is never this plan's source: a Codex row skips the
+        // backfill, and the counting fake keeps the live endpoint out should that ever break.
+        let profile_calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::clone(&profile_calls),
+        }));
+
+        manager.probe_account(0).await;
+
+        assert_eq!(
+            manager.accounts.read().expect("accounts lock poisoned")[0]
+                .organization_type
+                .as_deref(),
+            Some("pro"),
+            "the runtime row follows the probe's plan"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .plan_label()
+                .as_deref(),
+            Some("ChatGPT Pro")
+        );
+        let mut expected = original.clone();
+        expected["accounts"][0]["organizationType"] = serde_json::json!("pro");
+        assert_eq!(
+            read_config_json(&path),
+            expected,
+            "the plan is saved, and no other key moves"
+        );
+        assert_eq!(profile_calls.load(Ordering::Relaxed), 0);
+
+        let saved = std::fs::read(&path).unwrap();
+        manager.probe_account(0).await;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            saved,
+            "an unchanged plan writes nothing"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Run `probe_account(0)` on its own thread while this one holds `config_write`, and answer
+    /// the config file's bytes as they were while the lock was held, then as they are once it
+    /// was released and the probe finished. The bytes are read before the release, and asserted
+    /// on only after the join, so a writer that ignores the lock fails the test, not hangs it.
+    fn config_while_and_after_the_write_lock(
+        manager: &Manager,
+        path: &std::path::Path,
+    ) -> (String, String) {
+        let writing = manager
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        let held = std::thread::scope(|scope| {
+            let probe = scope.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the probe")
+                    .block_on(manager.probe_account(0));
+            });
+            // Long enough for the probe to reach its write, which must wait.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let held = std::fs::read_to_string(path).unwrap();
+            drop(writing);
+            probe.join().expect("the probe finished");
+            held
+        });
+        (held, std::fs::read_to_string(path).unwrap())
+    }
+
+    /// **The Codex plan write holds the config writers' lock** (INV1). `save_plan` reads the
+    /// whole document, changes one key and writes the document back, so without the lock a
+    /// read taken before another writer's rename and written after it puts back what that
+    /// writer replaced: a refresh token it had just rotated, which is single-use and already
+    /// spent, so that account is dead after its next restart. While another writer holds the
+    /// lock, nothing reaches the file; once it is released, the plan does.
+    ///
+    /// Watched red: without the lock, the new plan is on disk while the lock is still held.
+    #[test]
+    fn a_codex_plan_write_waits_for_the_config_write_lock() {
+        let path = tmp_config_path("codex-plan-lock");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+                  "credentialVersion": 2,
+                  "accountUuid": "22222222-2222-4222-8222-222222222222",
+                  "organizationType": "plus", "priority": 0,
+                  "accessToken": "at-bob", "refreshToken": "rt-bob",
+                  "expiresAt": 4102444800000 }
+            ] }"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let manager = Manager::new(
+            crate::config::load(&path).unwrap(),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(CodexPlanProber { plan: "pro" }),
+            Arc::new(NoWarmer),
+            Some(path.clone()),
+        );
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let (held, after) = config_while_and_after_the_write_lock(&manager, &path);
+        assert_eq!(
+            held, before,
+            "nothing reaches the file while another writer holds the lock"
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after["accounts"][0]["organizationType"], "pro",
+            "once the lock is released, the plan is written"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The plan the profile backfill learns is written under the same lock, for the same
+    /// reason: it is the other writer `save_plan` has.
+    ///
+    /// Watched red: without the lock, the learned plan is on disk while the lock is still held.
+    #[test]
+    fn a_backfilled_plan_write_waits_for_the_config_write_lock() {
+        let path = tmp_config_path("plan-backfill-lock");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "priority": 0 }
+            ] }"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let manager = build_manager_with_path(crate::config::load(&path).unwrap(), path.clone());
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan {
+                organization_type: Some("claude_team".to_string()),
+                rate_limit_tier: None,
+                seat_tier: None,
+            },
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let (held, after) = config_while_and_after_the_write_lock(&manager, &path);
+        assert_eq!(
+            held, before,
+            "nothing reaches the file while another writer holds the lock"
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after["accounts"][0]["organizationType"], "claude_team",
+            "once the lock is released, the plan is written"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A Codex usage prober that answers with what the real parser makes of one payload.
+    struct CodexPayloadProber {
+        payload: serde_json::Value,
+    }
+
+    impl UsageProber for CodexPayloadProber {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            let usage = crate::codex_probe::usage_from_payload(&self.payload);
+            Box::pin(async move { Ok(usage) })
+        }
+    }
+
+    /// **An empty `plan_type` names no plan.** A probe that answers `""`, or only whitespace,
+    /// leaves the account's plan as it was, in memory and on disk, so the plan label never goes
+    /// blank. A plan the probe does name is still taken verbatim.
+    ///
+    /// Watched red: take `plan_type` with no emptiness check, and the row's plan becomes `""`.
+    #[tokio::test]
+    async fn a_probe_with_an_empty_plan_type_leaves_the_plan_as_it_was() {
+        for plan_type in ["", "   "] {
+            let path = tmp_config_path("codex-empty-plan");
+            std::fs::write(
+                &path,
+                r#"{ "accounts": [
+                    { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+                      "credentialVersion": 2,
+                      "accountUuid": "22222222-2222-4222-8222-222222222222",
+                      "organizationType": "plus", "groups": ["orchard"], "priority": 0,
+                      "accessToken": "at-bob", "refreshToken": "rt-bob",
+                      "expiresAt": 4102444800000 }
+                ] }"#,
+            )
+            .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let manager = Manager::new(
+                crate::config::load(&path).unwrap(),
+                Arc::new(CountingRefresher {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(CodexPayloadProber {
+                    payload: serde_json::json!({ "plan_type": plan_type, "rate_limit": null }),
+                }),
+                Arc::new(NoWarmer),
+                Some(path.clone()),
+            );
+            manager.set_plan_prober(Arc::new(CountingPlanProber {
+                plan: crate::probe::Plan::default(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }));
+
+            manager.probe_account(0).await;
+
+            assert_eq!(
+                manager.accounts.read().expect("accounts lock poisoned")[0]
+                    .organization_type
+                    .as_deref(),
+                Some("plus"),
+                "plan_type {plan_type:?} names no plan"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                    .plan_label()
+                    .as_deref(),
+                Some("ChatGPT Plus"),
+                "plan_type {plan_type:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "plan_type {plan_type:?} writes nothing"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
     /// A profile fetch that failed says nothing about the account's quota or its
     /// credential. Recording a probe failure over a cosmetic label would bench a
     /// healthy account, so this path must be entirely silent on failure — and
@@ -4359,6 +5328,1209 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A prober that records the credential of every probe and answers an empty
+    /// success, so a test reads exactly what [`Manager::probe_account`] built.
+    struct RecordingProber {
+        seen: Arc<Mutex<Vec<crate::probe::ProbeCredential>>>,
+    }
+
+    impl UsageProber for RecordingProber {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+            self.seen
+                .lock()
+                .expect("seen lock poisoned")
+                .push(credential);
+            Box::pin(async { Ok(Usage::default()) })
+        }
+    }
+
+    /// **A probe names the account it is for, not just the bearer it pays with.** The
+    /// provider picks the usage endpoint, and a Codex probe must also send its ChatGPT
+    /// account id in `chatgpt-account-id`, which is the row's `account_uuid`. An Anthropic
+    /// row and a Codex row are probed, so each provider's credential is pinned beside the
+    /// other's.
+    ///
+    /// Watched red: build the credential with `account_id: None` and the Codex row's
+    /// account id is missing.
+    #[tokio::test]
+    async fn a_probe_credential_names_the_accounts_provider_and_account_uuid() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let anthropic = Account {
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com", 1)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![anthropic, codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RecordingProber {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        // The Anthropic row's plan backfill would otherwise ask the live profile endpoint.
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        manager.probe_account(0).await;
+        manager.probe_account(1).await;
+
+        let seen: Vec<_> = seen
+            .lock()
+            .expect("seen lock poisoned")
+            .iter()
+            .map(|c| (c.provider, c.access_token.clone(), c.account_id.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    crate::provider::Provider::Anthropic,
+                    "at-alice@example.com".to_string(),
+                    Some("11111111-1111-4111-8111-111111111111".to_string()),
+                ),
+                (
+                    crate::provider::Provider::Codex,
+                    "at-bob@example.com".to_string(),
+                    Some("22222222-2222-4222-8222-222222222222".to_string()),
+                ),
+            ],
+            "each probe carries its own row's provider, bearer and account id"
+        );
+    }
+
+    /// **A Codex probe names the workspace.** A Codex row's `chatgpt-account-id` is its
+    /// workspace, `org_uuid`, since `account_uuid` became the ChatGPT user; a row saved before
+    /// that split carries the workspace in `account_uuid` and no `org_uuid`, and keeps sending
+    /// it. An Anthropic row's credential still names its `account_uuid`.
+    ///
+    /// Watched red: with the Codex arm reading `account_uuid`, bob's probe names his user.
+    #[tokio::test]
+    async fn a_codex_probe_names_the_workspace_and_falls_back_to_the_account_uuid() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let anthropic = Account {
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
+            org_uuid: Some("66666666-6666-4666-8666-666666666666".to_string()),
+            ..account("bob@example.com", 1)
+        };
+        let older = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("77777777-7777-4777-8777-777777777777".to_string()),
+            ..account("carol@example.com", 2)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![anthropic, codex, older]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RecordingProber {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        for idx in 0..3 {
+            manager.probe_account(idx).await;
+        }
+
+        let seen: Vec<_> = seen
+            .lock()
+            .expect("seen lock poisoned")
+            .iter()
+            .map(|c| (c.provider, c.account_id.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    crate::provider::Provider::Anthropic,
+                    Some("11111111-1111-4111-8111-111111111111".to_string()),
+                ),
+                (
+                    crate::provider::Provider::Codex,
+                    Some("66666666-6666-4666-8666-666666666666".to_string()),
+                ),
+                (
+                    crate::provider::Provider::Codex,
+                    Some("77777777-7777-4777-8777-777777777777".to_string()),
+                ),
+            ]
+        );
+    }
+
+    /// A refresher that rejects every refresh as `status` with `code`, the way a dead login is
+    /// rejected.
+    struct RejectsWith {
+        status: u16,
+        code: Option<&'static str>,
+    }
+    impl TokenRefresher for RejectsWith {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
+            let (status, code) = (self.status, self.code);
+            Box::pin(async move { Err(OAuthError::AuthRejected { status, code }) })
+        }
+    }
+
+    /// A refresher that rejects its first refresh as a reused token, and succeeds after.
+    struct RejectsOnce {
+        calls: Arc<AtomicUsize>,
+    }
+    impl TokenRefresher for RejectsOnce {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    Err(OAuthError::AuthRejected {
+                        status: 400,
+                        code: Some("refresh_token_reused"),
+                    })
+                } else {
+                    Ok(crate::oauth::Tokens {
+                        id_token: None,
+                        access_token: "at-fresh".to_string(),
+                        refresh_token: Some("rt-fresh".to_string()),
+                        expires_at_ms: crate::now_ms() + 3_600_000,
+                    })
+                }
+            })
+        }
+    }
+
+    fn codex_account(name: &str, priority: i64) -> Account {
+        Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
+            org_uuid: Some("66666666-6666-4666-8666-666666666666".to_string()),
+            ..account(name, priority)
+        }
+    }
+
+    /// **Why a Codex login is dead reaches the wire.** A refresh rejected with an OAuth code
+    /// records that code; one rejected with none records its status. The row goes to `error`
+    /// as any rejected row does. An Anthropic row rejected the same way records nothing, so
+    /// its wire row gains no key.
+    ///
+    /// Watched red: without the store in the rejection arm, the Codex row's error is `None`.
+    #[tokio::test]
+    async fn a_reused_refresh_token_surfaces_as_a_login_error() {
+        let login_error = |status: u16, code: Option<&'static str>, codex: bool| {
+            let row = if codex {
+                codex_account("bob@example.com", 0)
+            } else {
+                account("alice@example.com", 0)
+            };
+            let manager = build_manager(
+                config_with(vec![row]),
+                Arc::new(RejectsWith { status, code }),
+            );
+            async move {
+                manager.ensure_fresh_force(0).await;
+                assert_eq!(manager.account_status(0), Some(AccountStatus::Error));
+                let snap = manager.snapshot(OffsetDateTime::now_utc());
+                assert_eq!(snap.accounts[0].status, "error");
+                snap.accounts[0].codex.login_error.clone()
+            }
+        };
+        assert_eq!(
+            login_error(400, Some("refresh_token_reused"), true).await,
+            Some("refresh_token_reused".to_string())
+        );
+        assert_eq!(
+            login_error(401, None, true).await,
+            Some("http_401".to_string())
+        );
+        assert_eq!(
+            login_error(400, Some("refresh_token_reused"), false).await,
+            None,
+            "an Anthropic row records no login error"
+        );
+    }
+
+    /// **A live login clears it.** The next successful refresh clears the recorded error, and
+    /// so does a re-login of the row through `add_or_update_account`.
+    ///
+    /// Watched red: without the clear in `apply_refresh`, the reused-token error outlives the
+    /// refresh that proved the login alive.
+    #[tokio::test]
+    async fn a_successful_refresh_clears_the_login_error() {
+        let manager = build_manager(
+            config_with(vec![codex_account("bob@example.com", 0)]),
+            Arc::new(RejectsOnce {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let error_of = |manager: &Manager| {
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .codex
+                .login_error
+                .clone()
+        };
+        manager.ensure_fresh_force(0).await;
+        assert_eq!(error_of(&manager), Some("refresh_token_reused".to_string()));
+        assert!(
+            manager.ensure_fresh_force(0).await,
+            "the second refresh succeeds"
+        );
+        assert_eq!(error_of(&manager), None, "a refresh that worked clears it");
+
+        let relogin = build_manager(
+            config_with(vec![codex_account("bob@example.com", 0)]),
+            Arc::new(RejectsWith {
+                status: 400,
+                code: Some("refresh_token_reused"),
+            }),
+        );
+        relogin.ensure_fresh_force(0).await;
+        assert_eq!(error_of(&relogin), Some("refresh_token_reused".to_string()));
+        let fresh = Account {
+            access_token: "at-relogin".to_string(),
+            refresh_token: Some("rt-relogin".to_string()),
+            ..codex_account("bob@example.com", 0)
+        };
+        assert!(matches!(
+            relogin.add_or_update_account(fresh),
+            AddAccountOutcome::Updated { idx: 0, .. }
+        ));
+        assert_eq!(error_of(&relogin), None, "a re-login clears it");
+    }
+
+    /// **The folder rides the wire on Codex rows only.** A Codex row imported from a folder
+    /// echoes it; an Anthropic row has none to echo.
+    ///
+    /// Watched red: without the copy in `from_config`, the Codex row echoes nothing.
+    #[test]
+    fn the_snapshot_echoes_codex_home_on_codex_rows_only() {
+        let codex = Account {
+            codex_home: Some("/Users/example/.codex".to_string()),
+            ..codex_account("bob@example.com", 1)
+        };
+        let manager = build_manager(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(snap.accounts[0].codex.codex_home, None);
+        assert_eq!(
+            snap.accounts[1].codex.codex_home.as_deref(),
+            Some("/Users/example/.codex")
+        );
+    }
+
+    /// **A login revives a deleted Codex row with its new folder and no stale error.** A row
+    /// deleted while the proxy ran keeps its slot, parked; a login of the same identity brings
+    /// it back through `add_or_update_account`'s Updated arm, and the durable write appends the
+    /// whole row again, because the file has no entry left to update. Both of the row's Codex
+    /// facts must come from that login: no `login_error` (the login is live), and the
+    /// submission's folder, in the running proxy and in the file.
+    ///
+    /// Watched red twice: without the `login_error` clear, the revived row still reads
+    /// `refresh_token_reused`; without `codex_home` in the persisted row, the file's entry has
+    /// no `codexHome`.
+    #[tokio::test]
+    async fn a_relogin_of_a_deleted_codex_row_revives_it_with_its_folder_and_no_login_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::paths::CONFIG_FILE);
+        let alice = account("alice@example.com", 0);
+        let bob = Account {
+            codex_home: Some("/Users/example/.codex".to_string()),
+            ..codex_account("bob@example.com", 1)
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({ "accounts": [alice.clone()] }))
+                .expect("serialize"),
+        )
+        .expect("write the file");
+        let manager = Manager::new(
+            config_with(vec![alice, bob.clone()]),
+            Arc::new(RejectsWith {
+                status: 400,
+                code: Some("refresh_token_reused"),
+            }),
+            Arc::new(NoProber),
+            Arc::new(NoWarmer),
+            Some(path.clone()),
+        );
+
+        manager.ensure_fresh_force(1).await;
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(
+            before.accounts.iter().all(|a| a.name != "bob@example.com"),
+            "the file lacks bob, so the reload took him out"
+        );
+
+        let relogin = Account {
+            access_token: "at-bob-fresh".to_string(),
+            refresh_token: Some("rt-bob-fresh".to_string()),
+            codex_home: Some("/Users/example/.codex-b".to_string()),
+            ..bob
+        };
+        assert!(matches!(
+            manager.add_or_update_account(relogin),
+            AddAccountOutcome::Updated { idx: 1, .. }
+        ));
+
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        let bobs: Vec<_> = after
+            .accounts
+            .iter()
+            .filter(|a| a.name == "bob@example.com")
+            .collect();
+        assert_eq!(bobs.len(), 1, "bob is listed once");
+        assert!(!bobs[0].disabled, "a fresh login serves");
+        assert_eq!(bobs[0].codex.login_error, None);
+        assert_eq!(
+            bobs[0].codex.codex_home.as_deref(),
+            Some("/Users/example/.codex-b")
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let entry = doc["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .find(|a| a["name"] == "bob@example.com")
+            .expect("bob is back in the file");
+        assert_eq!(entry["codexHome"], "/Users/example/.codex-b");
+    }
+
+    /// **A row that is gone yields no credential, never an Anthropic one.** The provider
+    /// picks the usage endpoint, so a credential built on the default provider would send the
+    /// bearer to Anthropic's, whichever provider issued it. No row can vanish today, so this
+    /// pins the fallback rather than a path: an index past the end builds nothing, and
+    /// `probe_account` stands down on that (read, not driven: its token read already returns
+    /// early for such an index). The row that is there is the control.
+    ///
+    /// Watched red: fall back to `Provider::default()` and the index past the end gets an
+    /// Anthropic credential.
+    #[test]
+    fn a_row_that_is_gone_yields_no_probe_credential() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager(config_with(vec![codex]), lock_refresher());
+        let gone = manager.probe_credential(1, "at-bob@example.com".to_string());
+        assert!(
+            gone.is_none(),
+            "an index past the end has no provider to pick an endpoint by: {gone:?}"
+        );
+        let control = manager
+            .probe_credential(0, "at-bob@example.com".to_string())
+            .expect("control: the row that is there yields its credential");
+        assert_eq!(control.provider, crate::provider::Provider::Codex);
+        assert_eq!(
+            control.account_id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+    }
+
+    /// **A Codex account is never asked the Anthropic profile endpoint for its plan.** That
+    /// endpoint is the backfill's only source, so asking it for a Codex row hands an OpenAI
+    /// bearer to the wrong provider; and since no plan ever comes back, the once-per-account
+    /// gate never closes and it would be asked again on every probe. The Anthropic row in
+    /// the same fleet is still asked, so the skip is the provider and not a backfill that
+    /// stopped running.
+    ///
+    /// Watched red: drop the Codex early return in `backfill_plan_if_unknown` and the plan
+    /// prober is asked for the Codex row.
+    #[tokio::test]
+    async fn a_codex_account_is_never_asked_the_anthropic_profile_for_its_plan() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 1)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(NoProber),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::clone(&calls),
+        }));
+
+        manager.probe_account(1).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the Codex row must never reach the Anthropic profile endpoint"
+        );
+
+        manager.probe_account(0).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "control: the Anthropic row is still asked"
+        );
+    }
+
+    /// **A Codex `rejected` is lifted by a probe that sees its window roll**, the path an
+    /// Anthropic rejection already takes ([`crate::quota::Quota::apply_usage`]). A Codex
+    /// quota refusal, a 429 carrying `x-codex-rate-limit-reached-type`, marks the account
+    /// `rejected`; `select()` treats that as terminal, so no served response comes back to
+    /// clear it, and before the Codex probe it stood until the process restarted.
+    ///
+    /// End to end from the production constructor: `with_live_refresher` points the live
+    /// prober at the configured `codexUpstream` (a local stub here), the Codex arm sends the
+    /// row's bearer and `chatgpt-account-id`, and the measured weekly-only payload (the
+    /// weekly window in the PRIMARY slot, at 2% once it has rolled) lands in `seven_day`,
+    /// the window the refusal left at 100%.
+    ///
+    /// The prober's Codex base is checked before anything probes, so a regressed wiring
+    /// fails here, offline, instead of sending the fixture bearer to the real backend.
+    ///
+    /// Watched red, one break at a time: drop the `with_codex_base` chain from
+    /// `with_live_refresher` and the prober's base is the real backend's, caught before any
+    /// probe; map the payload by position and the 2% lands in `five_hour`, the stored weekly
+    /// 100% never falls, and the account stays rejected.
+    #[tokio::test]
+    async fn a_codex_rejection_is_lifted_when_a_probe_sees_its_weekly_window_roll() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let usage_endpoint = axum::Router::new().route(
+            crate::provider::CODEX_USAGE_PATH,
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    recorder
+                        .lock()
+                        .expect("recorder lock poisoned")
+                        .push((header("authorization"), header("chatgpt-account-id")));
+                    axum::Json(serde_json::json!({
+                        "plan_type": "pro",
+                        "rate_limit": {
+                            "allowed": true,
+                            "limit_reached": false,
+                            "primary_window": {
+                                "used_percent": 2,
+                                "limit_window_seconds": 604_800,
+                                "reset_after_seconds": 604_000,
+                                "reset_at": now + 604_000,
+                            },
+                            "secondary_window": null,
+                        },
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the usage stub");
+        let codex_upstream = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, usage_endpoint).await;
+        });
+
+        let mut config = config_with(vec![Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com", 0)
+        }]);
+        config.codex_upstream = codex_upstream.clone();
+        let manager = Manager::with_live_refresher(config, None);
+        assert_eq!(
+            manager.prober.codex_base(),
+            Some(codex_upstream.as_str()),
+            "the live prober must probe Codex at the configured codexUpstream"
+        );
+        // The backfill skips a Codex row; should that ever break, this keeps the live
+        // profile endpoint out of the test.
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let codex_request = || {
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                crate::provider::CODEX_RESPONSES_PATH,
+                None,
+            )
+        };
+
+        // The refusal: the weekly window spent, reported in the primary slot.
+        let mut refusal = reqwest::header::HeaderMap::new();
+        refusal.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        refusal.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        refusal.insert(
+            "x-codex-primary-reset-at",
+            (now + 3600).to_string().parse().unwrap(),
+        );
+        refusal.insert(
+            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            "primary".parse().unwrap(),
+        );
+        manager.update_quota(0, &refusal, 429);
+        assert_eq!(
+            manager.accounts.read().expect("accounts lock poisoned")[0]
+                .quota
+                .status
+                .as_deref(),
+            Some("rejected"),
+            "precondition: the refusal marked the account rejected"
+        );
+        assert_eq!(
+            codex_request(),
+            None,
+            "precondition: a rejected account serves nothing"
+        );
+
+        manager.probe_account(0).await;
+
+        assert_eq!(
+            seen.lock().expect("recorder lock poisoned").clone(),
+            vec![(
+                Some("Bearer at-bob@example.com".to_string()),
+                Some("22222222-2222-4222-8222-222222222222".to_string()),
+            )],
+            "one probe, at the configured upstream, with the row's bearer and account id"
+        );
+        let account = manager.accounts.read().expect("accounts lock poisoned")[0].clone();
+        assert_eq!(
+            account.quota.status, None,
+            "the weekly window rolled, so the rejection recorded against it is stale"
+        );
+        assert_eq!(
+            codex_request(),
+            Some(0),
+            "and the account is back in rotation"
+        );
+        let weekly = account.quota.seven_day.expect("the probe's weekly reading");
+        assert!(
+            (weekly.utilization - 0.02).abs() < 1e-9,
+            "the probe's 2% replaced the refusal's 100%, got {}",
+            weekly.utilization
+        );
+        assert!(
+            account.quota.five_hour.is_none(),
+            "the payload carried no five-hour window, so none may be invented"
+        );
+    }
+
+    /// Codex quota headers saying the weekly window (the only one the measured plan
+    /// reports) is `used` percent spent, resetting a day out.
+    fn codex_weekly(used: &str) -> reqwest::header::HeaderMap {
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 86_400;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", used.parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            reset.to_string().parse().unwrap(),
+        );
+        headers
+    }
+
+    /// **A Codex row's `quotaUpdatedAtMs` comes from that row's own readings**, both
+    /// kinds: a served response's Codex quota headers, which `update_quota` routes to
+    /// the Codex parser by the row's provider, and a successful Codex probe. The
+    /// Anthropic row beside it read nothing and stays absent, and a Codex response
+    /// that carried no quota header leaves the time where it was. Walked to the
+    /// `tcr.status.v1` payload, the hop `tcr status --json` reads.
+    ///
+    /// Watched red: without the stamp in `Quota::update_from_codex_refusal`, the
+    /// header reading leaves the Codex row absent.
+    #[tokio::test]
+    async fn a_codex_rows_quota_updated_at_comes_from_its_own_readings() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..account("bob@example.com/codex", 1)
+        };
+        let manager = build_manager_with_prober(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            lock_refresher(),
+            Arc::new(RecordingProber {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            let payload = crate::status::StatusPayload::from_snapshot(
+                &snap,
+                &[],
+                false,
+                None,
+                Default::default(),
+            );
+            let json = serde_json::to_value(&payload).expect("payload serializes");
+            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
+        };
+        let stale = crate::now_ms() - 40 * 60 * 1000;
+        let rewind = |manager: &Manager| {
+            accounts_mut(manager)[1].quota.updated_at = Some(
+                OffsetDateTime::from_unix_timestamp_nanos(stale as i128 * 1_000_000)
+                    .expect("valid instant"),
+            );
+        };
+        assert_eq!(wire_value(&manager, 1), None, "nothing read yet");
+
+        let before = crate::now_ms();
+        manager.update_quota(1, &codex_weekly("40"), 200);
+        let read =
+            wire_value(&manager, 1).expect("a Codex header reading carries quotaUpdatedAtMs");
+        assert!(
+            read >= before,
+            "a fresh Codex reading reads as recent: {read} < {before}"
+        );
+        assert_eq!(
+            wire_value(&manager, 0),
+            None,
+            "the Anthropic row read nothing"
+        );
+
+        rewind(&manager);
+        manager.update_quota(1, &reqwest::header::HeaderMap::new(), 502);
+        assert_eq!(
+            wire_value(&manager, 1),
+            Some(stale),
+            "silence is not a reading"
+        );
+
+        rewind(&manager);
+        let before = crate::now_ms();
+        manager.probe_account(1).await;
+        let probed = wire_value(&manager, 1).expect("still present");
+        assert!(
+            probed >= before,
+            "a successful Codex probe moves it: {probed} < {before}"
+        );
+    }
+
+    /// **#466's shorter probe cadence reads a Codex row by its own readings.** A Codex
+    /// account whose weekly window is at its threshold, or that a Codex quota refusal
+    /// marked rejected below it, is out of rotation, so no served response refreshes it
+    /// and only a probe sees its window roll: it gets the near-limit cadence. An idle
+    /// Codex account keeps the routine one, as does the Anthropic account that read
+    /// nothing. The probe that cadence fires is the row's own provider's
+    /// (`a_probe_credential_names_the_accounts_provider_and_account_uuid` pins the
+    /// credential), and the hourly cap counts each account apart, so a faster Codex
+    /// cadence sends Codex bearers to `wham/usage` and nothing to Anthropic.
+    ///
+    /// Watched red: read every Codex row as routine in `ProbeUrgency::of`, and bob and
+    /// carol lose the shorter cadence.
+    #[test]
+    fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
+        use crate::schedule::ProbeUrgency;
+        let codex = |name: &str, priority: i64| Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(name, priority)
+        };
+        let manager = build_manager(
+            config_with(vec![
+                account("alice@example.com", 0),
+                codex("bob@example.com/codex", 1),
+                codex("carol@example.com/codex", 2),
+                codex("dave@example.com/codex", 3),
+            ]),
+            lock_refresher(),
+        );
+        // bob: at its weekly limit, read from a served 200.
+        manager.update_quota(1, &codex_weekly("97"), 200);
+        // carol: a Codex quota refusal at half its weekly window.
+        let mut refusal = codex_weekly("50");
+        refusal.insert(
+            crate::quota::CODEX_REACHED_TYPE_HEADER,
+            "primary".parse().unwrap(),
+        );
+        manager.update_quota(2, &refusal, 429);
+        // dave: idle.
+        manager.update_quota(3, &codex_weekly("10"), 200);
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let urgency: Vec<(&str, ProbeUrgency)> = snap
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), ProbeUrgency::of(a)))
+            .collect();
+        assert_eq!(
+            urgency,
+            vec![
+                ("alice@example.com", ProbeUrgency::Routine),
+                ("bob@example.com/codex", ProbeUrgency::NearLimit),
+                ("carol@example.com/codex", ProbeUrgency::NearLimit),
+                ("dave@example.com/codex", ProbeUrgency::Routine),
+            ]
+        );
+        assert_eq!(
+            (snap.accounts[2].gate, snap.accounts[2].quota_state),
+            (
+                crate::stats::GateReason::Rejected,
+                crate::stats::QuotaState::Normal
+            ),
+            "control: carol is held by its refusal, not by its threshold"
+        );
+    }
+
+    /// **A Codex refusal keeps the near-limit probe cadence whatever gate its row reports.**
+    /// The snapshot reports a standing refusal as the window or the hold that explains it
+    /// (`Manager::codex_refusal_gate`), not as `Rejected`, and `ProbeUrgency::of` reads that
+    /// row. The refusal still stands until a probe ends it, so the account keeps the cadence a
+    /// `rejected` one gets: while the hold the proxy armed for the refusal lasts (`Hold`),
+    /// while an upstream 403's hold lasts (`Refused`), and past the refusing window's reset
+    /// before a probe confirms the roll (that window, with no time). Every one of them reads
+    /// below its threshold at that moment, so only the refusal can set the cadence. A hold no
+    /// refusal set stays routine, as does the Anthropic account, and so does a refused account
+    /// whose login then died: `Login` outranks `Rejected`, so the refusal never was what held
+    /// it out, and before the remap it read routine too.
+    ///
+    /// Watched red: read only `GateReason::Rejected` in `ProbeUrgency::of`, and bob, carol and
+    /// erin read routine; read any standing refusal whatever the gate, and frank reads
+    /// near-limit.
+    #[test]
+    fn a_codex_refusal_keeps_the_near_limit_cadence_whatever_gate_its_row_reports() {
+        use crate::schedule::ProbeUrgency;
+        use crate::stats::{GateReason, QuotaState};
+        let codex = |name: &str, priority: i64| Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(name, priority)
+        };
+        let manager = build_manager(
+            config_with(vec![
+                account("alice@example.com", 0),
+                codex("bob@example.com/codex", 1),
+                codex("carol@example.com/codex", 2),
+                codex("dave@example.com/codex", 3),
+                codex("erin@example.com/codex", 4),
+                codex("frank@example.com/codex", 5),
+            ]),
+            lock_refresher(),
+        );
+        let refusal = |mut headers: reqwest::header::HeaderMap| {
+            headers.insert(
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "rate_limit_reached".parse().unwrap(),
+            );
+            headers
+        };
+        // bob: refused at half its weekly window, held as the proxy holds every refusal.
+        manager.update_quota(1, &refusal(codex_weekly("50")), 429);
+        manager.mark_rate_limited(1, 1800);
+        // carol: refused on a full weekly window that rolls in half a minute, read a minute on,
+        // before any probe.
+        let soon = OffsetDateTime::now_utc().unix_timestamp() + 30;
+        let mut full = reqwest::header::HeaderMap::new();
+        full.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        full.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        full.insert(
+            "x-codex-primary-reset-at",
+            soon.to_string().parse().unwrap(),
+        );
+        manager.update_quota(2, &refusal(full), 429);
+        // dave: a hold no refusal set, over an idle weekly window.
+        manager.update_quota(3, &codex_weekly("10"), 200);
+        manager.mark_rate_limited(3, 1800);
+        // erin: refused at half its weekly window, then held by an upstream 403.
+        manager.update_quota(4, &refusal(codex_weekly("50")), 429);
+        manager.mark_refused(4);
+        // frank: refused at half its weekly window, then its login died.
+        manager.update_quota(5, &refusal(codex_weekly("50")), 429);
+        accounts_mut(&manager)[5].status = AccountStatus::Error;
+
+        // Past carol's reset, well inside erin's two-minute hold.
+        let later = OffsetDateTime::now_utc() + Duration::minutes(1);
+        let snap = manager.snapshot(later);
+        let rows: Vec<(&str, GateReason, QuotaState, ProbeUrgency)> = snap
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.gate, a.quota_state, ProbeUrgency::of(a)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "alice@example.com",
+                    GateReason::Ok,
+                    QuotaState::Normal,
+                    ProbeUrgency::Routine
+                ),
+                (
+                    "bob@example.com/codex",
+                    GateReason::Hold,
+                    QuotaState::Normal,
+                    ProbeUrgency::NearLimit
+                ),
+                (
+                    "carol@example.com/codex",
+                    GateReason::SevenDay,
+                    QuotaState::Normal,
+                    ProbeUrgency::NearLimit
+                ),
+                (
+                    "dave@example.com/codex",
+                    GateReason::Hold,
+                    QuotaState::Normal,
+                    ProbeUrgency::Routine
+                ),
+                (
+                    "erin@example.com/codex",
+                    GateReason::Refused,
+                    QuotaState::Normal,
+                    ProbeUrgency::NearLimit
+                ),
+                (
+                    "frank@example.com/codex",
+                    GateReason::Login,
+                    QuotaState::Normal,
+                    ProbeUrgency::Routine
+                ),
+            ]
+        );
+    }
+
+    /// **A Codex row's snapshot reports its quota facts, and the refusal's kind exactly while
+    /// that refusal stands.** The refusal sets the kind, the credits and which windows the plan
+    /// has; a probe that sees the window roll ends the refusal and its kind; a new refusal
+    /// brings a new kind, which a probe refreshes while it stands, and that probe, carrying no
+    /// window, reports `[]`: the plan has none, which is a fact, not an unknown; a 2xx that
+    /// carried a window ends it, and a probe then never brings the kind back. An Anthropic row
+    /// reports none of it, even with a stray fact on its quota.
+    ///
+    /// Watched red, one break at a time: fill the facts for every row and the Anthropic row
+    /// reports the stray credits; let the accessor ignore the status and drop the clear on a
+    /// 2xx, and the kind outlives the refusal; filter an empty list out in
+    /// `codex_snapshot_facts`, and the `[]` reads `None`.
+    #[test]
+    fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
+        use crate::codex_probe::CodexProbeFacts;
+        use tcr_status_wire::CodexCredits;
+        let manager = build_manager(
+            config_with(vec![
+                Account {
+                    provider: crate::provider::Provider::Codex,
+                    account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
+                    ..account("bob@example.com", 0)
+                },
+                account("alice@example.com", 1),
+            ]),
+            lock_refresher(),
+        );
+        let snap = |idx: usize| manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].clone();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let now_ms = crate::now_ms();
+        let headers = |pairs: &[(&str, String)]| {
+            let mut h = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                h.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("a name"),
+                    value.parse().expect("a header value"),
+                );
+            }
+            h
+        };
+        let credits = Some(CodexCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("12.50".into()),
+        });
+
+        // 1. The weekly refusal.
+        let refusal = headers(&[
+            ("x-codex-primary-used-percent", "100".into()),
+            ("x-codex-primary-window-minutes", "10080".into()),
+            ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
+            (
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "rate_limit_reached".into(),
+            ),
+            ("x-codex-credits-has-credits", "true".into()),
+            ("x-codex-credits-unlimited", "false".into()),
+            ("x-codex-credits-balance", "12.50".into()),
+        ]);
+        manager.update_quota(0, &refusal, 429);
+        let bob = snap(0).codex;
+        assert_eq!(
+            bob.limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+        assert_eq!(bob.quota_windows, Some(vec!["sevenDay".to_string()]));
+        assert_eq!(bob.seven_day_window_minutes, Some(10_080));
+        assert_eq!(bob.five_hour_window_minutes, None);
+        assert_eq!(bob.credits, credits);
+        assert!(!bob.spend_control_reached);
+
+        // 2. A probe sees the weekly window roll: the refusal ends, and its kind with it.
+        manager.apply_usage(
+            0,
+            &Usage {
+                seven_day: Some(UsageBucket {
+                    utilization: Some(0.02),
+                    reset_at_ms: Some(now_ms + 604_000_000),
+                }),
+                ..Usage::default()
+            },
+        );
+        assert_eq!(snap(0).codex.limit_reached_type, None, "the window rolled");
+
+        // 3. A refusal no full window explains brings its own kind.
+        let refusal_no_full_window = headers(&[
+            ("x-codex-primary-used-percent", "40".into()),
+            ("x-codex-primary-window-minutes", "10080".into()),
+            ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
+            (
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "workspace_credits".into(),
+            ),
+        ]);
+        manager.update_quota(0, &refusal_no_full_window, 429);
+        assert_eq!(
+            snap(0).codex.limit_reached_type.as_deref(),
+            Some("workspace_credits")
+        );
+
+        // 4. While it stands, a probe's kind refreshes it.
+        let probe_kind = Usage {
+            codex: Some(CodexProbeFacts {
+                limit_reached_type: Some("rate_limit_reached".into()),
+                ..Default::default()
+            }),
+            ..Usage::default()
+        };
+        manager.apply_usage(0, &probe_kind);
+        assert_eq!(
+            snap(0).codex.limit_reached_type.as_deref(),
+            Some("rate_limit_reached"),
+            "the probe refreshes the kind while the refusal stands"
+        );
+        assert_eq!(
+            snap(0).codex.quota_windows,
+            Some(Vec::new()),
+            "a probe that carried no window says the plan reports none: [], not unknown"
+        );
+
+        // 5. A 2xx that carried a window ends the refusal; a probe never brings its kind back.
+        let ok_with_window = headers(&[
+            ("x-codex-primary-used-percent", "41".into()),
+            ("x-codex-primary-window-minutes", "10080".into()),
+            ("x-codex-primary-reset-at", (now + 3 * 86_400).to_string()),
+        ]);
+        manager.update_quota(0, &ok_with_window, 200);
+        assert_eq!(snap(0).codex.limit_reached_type, None, "the 2xx ended it");
+        manager.apply_usage(0, &probe_kind);
+        assert_eq!(
+            snap(0).codex.limit_reached_type,
+            None,
+            "a probe never brings the kind back without a refusal"
+        );
+
+        // 6. Control: the Anthropic row reports none of it, even with a stray fact.
+        let anthropic_ok =
+            headers(&[("anthropic-ratelimit-unified-5h-utilization", "0.20".into())]);
+        manager.update_quota(1, &anthropic_ok, 200);
+        assert_eq!(snap(1).codex, crate::stats::CodexFacts::default());
+        manager.accounts.write().expect("accounts lock poisoned")[1]
+            .quota
+            .codex
+            .credits = Some(CodexCredits::default());
+        assert_eq!(
+            snap(1).codex,
+            crate::stats::CodexFacts::default(),
+            "only a Codex row ever reports these facts"
+        );
+    }
+
+    /// **A Codex refusal ends when a usage probe reads the account allowed**: allowed, not at
+    /// its limit, its spend control not reached, and no refusal kind. That is the backend's own
+    /// verdict, so a probe ends a refusal no window explains (a spend cap, credits) once ChatGPT
+    /// ends it. Each condition is needed: a probe that reads any one of them otherwise, or that
+    /// carries no `rate_limit` at all, leaves the refusal and its kind standing. The window-roll
+    /// lift still ends a refusal on a probe that says not allowed, and an Anthropic rejection is
+    /// untouched: its probe carries no verdict.
+    ///
+    /// Driven through the real payload parser (`codex_probe::usage_from_payload`), each probe at
+    /// the refusal's own 60 percent, so no window rolls.
+    ///
+    /// Watched red, one condition dropped at a time: without `allowed`, the probe carrying no
+    /// `rate_limit` lifts the refusal; without `limit_reached`, the probe allowed but at its
+    /// limit does; without the spend control, the spend-control probe does; without the kind,
+    /// the probe carrying one does.
+    #[test]
+    fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
+        use crate::codex_probe::usage_from_payload;
+        use serde_json::{json, Value};
+        let manager = build_manager(
+            config_with(vec![
+                Account {
+                    provider: crate::provider::Provider::Codex,
+                    account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
+                    ..account("bob@example.com", 0)
+                },
+                account("alice@example.com", 1),
+            ]),
+            lock_refresher(),
+        );
+        let gate = |idx: usize| {
+            let row = manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].clone();
+            (row.gate, row.codex.limit_reached_type)
+        };
+        let codex_request = || {
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                crate::provider::CODEX_RESPONSES_PATH,
+                None,
+            )
+        };
+        let reset_at = (OffsetDateTime::now_utc() + Duration::days(5)).unix_timestamp();
+        // The Pro refusal: its one window, the weekly one, at 60 percent in the primary slot.
+        let refuse = || {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("x-codex-primary-used-percent", "60".parse().unwrap());
+            h.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+            h.insert(
+                "x-codex-primary-reset-at",
+                reset_at.to_string().parse().unwrap(),
+            );
+            h.insert(
+                crate::quota::CODEX_REACHED_TYPE_HEADER,
+                "rate_limit_reached".parse().unwrap(),
+            );
+            manager.update_quota(0, &h, 429);
+        };
+        let payload = |allowed: bool, limit_reached: bool, spend: bool, kind: Value, used: u32| {
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": allowed,
+                    "limit_reached": limit_reached,
+                    "primary_window": {
+                        "used_percent": used,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": reset_at,
+                    },
+                    "secondary_window": null,
+                },
+                "spend_control": { "reached": spend },
+                "rate_limit_reached_type": kind,
+            })
+        };
+        let refused = (GateReason::Rejected, Some("rate_limit_reached".to_string()));
+
+        refuse();
+        assert_eq!(gate(0), refused, "precondition: refused, with its kind");
+
+        let kind = json!({ "type": "rate_limit_reached", "details": "fixture" });
+        for (case, probe) in [
+            (
+                "not allowed, at its limit",
+                payload(false, true, false, Value::Null, 60),
+            ),
+            (
+                "allowed but at its limit",
+                payload(true, true, false, Value::Null, 60),
+            ),
+            (
+                "spend control reached",
+                payload(true, false, true, Value::Null, 60),
+            ),
+            (
+                "carrying a refusal kind",
+                payload(true, false, false, kind, 60),
+            ),
+            (
+                "no rate_limit",
+                json!({
+                    "plan_type": "pro",
+                    "rate_limit": null,
+                    "spend_control": { "reached": false },
+                }),
+            ),
+        ] {
+            manager.apply_usage(0, &usage_from_payload(&probe));
+            assert_eq!(gate(0), refused, "{case}: the refusal and its kind stand");
+        }
+
+        manager.apply_usage(
+            0,
+            &usage_from_payload(&payload(true, false, false, Value::Null, 60)),
+        );
+        assert_eq!(
+            gate(0),
+            (GateReason::Ok, None),
+            "read allowed: the refusal and its kind end"
+        );
+        // The pool pick (`Manager::eligible`) reads the hold and the windows, never `rejected`,
+        // so this holds before the lift too: what the lift ends is the refusal itself, its kind
+        // and the gate every reader is shown, and with them the pin and control gates that read
+        // `rejected` (`account_terminal_gate`).
+        assert_eq!(codex_request(), Some(0), "and the account serves");
+
+        // The window-roll lift, on a probe that says not allowed: the weekly reading fell.
+        refuse();
+        assert_eq!(gate(0), refused, "a fresh refusal");
+        manager.apply_usage(
+            0,
+            &usage_from_payload(&payload(false, false, false, Value::Null, 2)),
+        );
+        assert_eq!(gate(0), (GateReason::Ok, None), "the window rolled");
+
+        // Control: an Anthropic rejection, probed at the same reading, stands.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[1].quota.status = Some("rejected".to_string());
+            accounts[1].quota.seven_day = Some(crate::quota::QuotaWindow {
+                utilization: 0.6,
+                reset: Some(OffsetDateTime::now_utc() + Duration::days(5)),
+            });
+        }
+        manager.apply_usage(
+            1,
+            &Usage {
+                seven_day: Some(UsageBucket {
+                    utilization: Some(0.6),
+                    reset_at_ms: Some(reset_at * 1000),
+                }),
+                ..Usage::default()
+            },
+        );
+        assert_eq!(
+            gate(1).0,
+            GateReason::Rejected,
+            "an Anthropic probe lifts nothing"
+        );
+    }
+
     /// A unique temp path per test — the suite runs tests in parallel threads of
     /// ONE process, so a pid-only name collides.
     fn tmp_config_path(tag: &str) -> PathBuf {
@@ -4381,7 +6553,7 @@ mod tests {
             "anthropic-ratelimit-unified-5h-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(idx, &h);
+        manager.update_quota(idx, &h, 200);
     }
 
     /// Set account `idx`'s weekly (`7d`) window near/over threshold with a future
@@ -4398,7 +6570,7 @@ mod tests {
             "anthropic-ratelimit-unified-7d-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(idx, &h);
+        manager.update_quota(idx, &h, 200);
     }
 
     /// Build a config carrying an unmodelled top-level `warmupSeconds` value.
@@ -4803,8 +6975,13 @@ mod tests {
                                           // `<= 60` control on CI (#189) with nothing wrong in the code.
         let now = OffsetDateTime::now_utc();
 
-        let fleet = manager.retry_after_hint(now, false);
-        let scoped = manager.retry_after_hint_for_group(now, false, "codereview");
+        let fleet = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
+        let scoped = manager.retry_after_hint_for_group(
+            now,
+            false,
+            crate::provider::Provider::Anthropic,
+            "codereview",
+        );
 
         // Control: the fleet-wide hint really is won by the outsider, so the
         // assertion below is measuring the group scoping and not a tautology.
@@ -5413,6 +7590,62 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A Codex row the file names while the proxy runs is ADMITTED by the reload
+    /// even when the running fleet holds an Anthropic row of the same name with no
+    /// uuid, and that Anthropic row keeps its own groups. Provider-blind, the name
+    /// fallback called the Codex row already known through the Anthropic row, so it
+    /// was never admitted, and the group carry handed the Codex row's groups to the
+    /// Anthropic one. The Codex row carries a uuid, as a real one does (the ChatGPT
+    /// account id): it does not help, because the Anthropic side has none.
+    ///
+    /// Watched red: drop the provider guard from `identity::same_identity` and the
+    /// Codex row is never admitted, while the Anthropic row takes its groups.
+    #[test]
+    fn reload_admits_a_codex_row_named_like_a_running_anthropic_row() {
+        let path = tmp_config_path("reload-codex-beside-anthropic");
+        let boot = config_with(vec![account_in_groups(
+            "alice@example.com",
+            0,
+            &["anthropic-team"],
+        )]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account_in_groups("alice@example.com", 1, &["codex-team"])
+        };
+        config::save(&path, &config_with(vec![codex])).expect("write reload config");
+        manager.reload_groups_if_changed();
+
+        let rows: Vec<(String, crate::provider::Provider, Vec<String>)> = manager
+            .accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .map(|a| (a.name.clone(), a.provider, a.groups.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "alice@example.com".to_string(),
+                    crate::provider::Provider::Anthropic,
+                    vec!["anthropic-team".to_string()]
+                ),
+                (
+                    "alice@example.com".to_string(),
+                    crate::provider::Provider::Codex,
+                    vec!["codex-team".to_string()]
+                ),
+            ],
+            "the Codex row is admitted beside the Anthropic row, each with its own groups"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     /// C-4 regression: `Self::account_egress` indexes `self.config.accounts`
     /// with a RUNTIME index (`self.accounts`). Before this fix, the APP-35
     /// admission arm above (`reload_admits_an_account_added_to_the_file_after_boot`)
@@ -5718,6 +7951,97 @@ mod tests {
             lock_refresher(),
         );
         assert_eq!(unmatched.control(), None);
+    }
+
+    /// A `controlAccount` naming a Codex account is warned about and ignored:
+    /// the control account is an Anthropic identity (its bootstrap calls, its
+    /// probe, its `controlIdentity` check), and Codex has no counterpart in this
+    /// version. The same name resolves when the row is Anthropic,
+    /// so the `None` below is the provider and not a name that never matched.
+    ///
+    /// Watched red: drop the provider filter after `assemble`'s control
+    /// resolution and the Codex row resolves (`Some(1)`).
+    #[test]
+    fn assemble_ignores_a_codex_control_account() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager(
+            config_with_control(
+                vec![account("alice@example.com", 0), codex],
+                "bob@example.com",
+            ),
+            lock_refresher(),
+        );
+        assert_eq!(
+            manager.control(),
+            None,
+            "a Codex control account must be ignored at boot"
+        );
+
+        let anthropic = build_manager(
+            config_with_control(
+                vec![
+                    account("alice@example.com", 0),
+                    account("bob@example.com", 0),
+                ],
+                "bob@example.com",
+            ),
+            lock_refresher(),
+        );
+        assert_eq!(
+            anthropic.control(),
+            Some(1),
+            "the control: an Anthropic row resolves"
+        );
+    }
+
+    #[test]
+    fn upstream_for_routes_each_provider_to_its_own_host() {
+        // Built the way the other tests here build a manager, from a Config whose `upstream` and
+        // `codex_upstream` name two different hosts.
+        let mut config = config_with(vec![account("alice@example.com", 0)]);
+        config.upstream = "http://anthropic.test".to_string();
+        config.codex_upstream = "http://codex.test".to_string();
+        let manager = build_manager(config, lock_refresher());
+        assert_eq!(
+            manager.upstream_for(crate::provider::Provider::Anthropic),
+            "http://anthropic.test"
+        );
+        assert_eq!(
+            manager.upstream_for(crate::provider::Provider::Codex),
+            "http://codex.test"
+        );
+        assert_eq!(
+            manager.upstream(),
+            "http://anthropic.test",
+            "the Anthropic-only accessor is unchanged"
+        );
+    }
+
+    /// `Manager::provider` reads each runtime row's own provider, which
+    /// `AccountRuntime::from_config` copied from the config row, and `None`
+    /// only past the end.
+    ///
+    /// Watched red: have the accessor answer the default for every row and the
+    /// Codex row reads as Anthropic.
+    #[test]
+    fn provider_reads_each_rows_own_provider() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            lock_refresher(),
+        );
+        assert_eq!(
+            manager.provider(0),
+            Some(crate::provider::Provider::Anthropic)
+        );
+        assert_eq!(manager.provider(1), Some(crate::provider::Provider::Codex));
+        assert_eq!(manager.provider(2), None, "an index past the end");
     }
 
     /// The exact bug this unit fixes: a legacy bare-string `controlAccount`
@@ -6442,6 +8766,48 @@ mod tests {
         assert_eq!(manager.control(), None);
     }
 
+    /// `tcr control` naming a Codex account is refused at runtime, as boot ignores one
+    /// (`assemble_ignores_a_codex_control_account`): nothing is set, so nothing is
+    /// persisted, and a control account already in place stays. The Anthropic row of
+    /// the same fleet is set, so the refusal is the provider's and not a name that
+    /// never matched.
+    ///
+    /// Watched red: drop the provider check from `set_control_by_query` and the Codex
+    /// row is applied.
+    #[test]
+    fn set_control_by_query_refuses_a_codex_account() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com/codex", 0)
+        };
+        let manager = build_manager(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            lock_refresher(),
+        );
+        let refused = SetControlOutcome::CodexAccount("bob@example.com/codex".to_string());
+        assert_eq!(
+            manager.set_control_by_query(Some("bob@example.com/codex")),
+            refused
+        );
+        assert_eq!(manager.control(), None, "nothing is set");
+
+        manager.set_control_by_query(Some("alice@example.com"));
+        assert_eq!(
+            manager.control(),
+            Some(0),
+            "control: the Anthropic row is set"
+        );
+        assert_eq!(
+            manager.set_control_by_query(Some("bob@example.com/codex")),
+            refused
+        );
+        assert_eq!(
+            manager.control(),
+            Some(0),
+            "the control account already in place stays"
+        );
+    }
+
     #[test]
     fn set_control_by_query_no_match_and_ambiguous() {
         let manager = build_manager(
@@ -6563,6 +8929,7 @@ mod tests {
                 now,
                 now_ms,
                 false,
+                crate::provider::Provider::Anthropic,
                 None,
                 None,
                 &HashSet::new(),
@@ -6582,6 +8949,7 @@ mod tests {
                 later,
                 later_ms,
                 false,
+                crate::provider::Provider::Anthropic,
                 None,
                 None,
                 &HashSet::new(),
@@ -6765,6 +9133,7 @@ mod tests {
                 now,
                 now_ms,
                 false,
+                crate::provider::Provider::Anthropic,
                 None,
                 None,
                 &HashSet::new(),
@@ -6853,7 +9222,7 @@ mod tests {
             "anthropic-ratelimit-unified-5h-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(0, &headers);
+        manager.update_quota(0, &headers, 200);
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(1)
@@ -6961,7 +9330,9 @@ mod tests {
                         None,
                         None,
                         None,
+                        crate::provider::Provider::Anthropic,
                         &Tokens {
+                            id_token: None,
                             access_token: format!("new-at-{i}"),
                             refresh_token: Some(format!("new-rt-{i}")),
                             expires_at_ms: crate::now_ms() + 3_600_000,
@@ -7001,13 +9372,18 @@ mod tests {
     }
 
     impl TokenRefresher for BlockingRefresher {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             let started = self.started.clone();
             let release = self.release.clone();
             Box::pin(async move {
                 started.notify_one();
                 release.notified().await;
                 Ok::<Tokens, OAuthError>(Tokens {
+                    id_token: None,
                     access_token: "fresh-access".to_string(),
                     refresh_token: Some("fresh-refresh".to_string()),
                     expires_at_ms: crate::now_ms() + 3_600_000,
@@ -7110,6 +9486,68 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.access_token(0).as_deref(), Some("fresh-access"));
+    }
+
+    /// A refresher that records the provider each refresh was asked for, then mints a
+    /// fresh token so the refresh applies.
+    struct ProviderRecordingRefresher {
+        providers: Arc<Mutex<Vec<crate::provider::Provider>>>,
+    }
+
+    impl TokenRefresher for ProviderRecordingRefresher {
+        fn refresh(
+            &self,
+            provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
+            self.providers
+                .lock()
+                .expect("providers lock poisoned")
+                .push(provider);
+            Box::pin(async {
+                Ok::<Tokens, OAuthError>(Tokens {
+                    id_token: None,
+                    access_token: "fresh-access".to_string(),
+                    refresh_token: Some("fresh-refresh".to_string()),
+                    expires_at_ms: crate::now_ms() + 3_600_000,
+                })
+            })
+        }
+    }
+
+    /// The manager asks for each account's refresh under that account's own provider,
+    /// because the live refresher sends the token to that provider's endpoint: a Codex
+    /// refresh token posted to Anthropic is rejected, and a rejection marks a healthy
+    /// account `Error`.
+    #[tokio::test]
+    async fn a_refresh_is_requested_for_the_accounts_own_provider() {
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let mut codex = account("codex-row", 1);
+        codex.provider = crate::provider::Provider::Codex;
+        let manager = build_manager(
+            config_with(vec![account("anthropic-row", 0), codex]),
+            Arc::new(ProviderRecordingRefresher {
+                providers: providers.clone(),
+            }),
+        );
+
+        assert!(
+            manager.ensure_fresh_force(1).await,
+            "precondition: the Codex row's refresh must apply"
+        );
+        assert!(
+            manager.ensure_fresh_force(0).await,
+            "precondition: the Anthropic row's refresh must apply"
+        );
+
+        assert_eq!(
+            *providers.lock().expect("providers lock poisoned"),
+            vec![
+                crate::provider::Provider::Codex,
+                crate::provider::Provider::Anthropic
+            ],
+            "each refresh must be requested under its own account's provider"
+        );
     }
 
     /// The refresh coalescing lock now lives on `AccountRuntime` itself rather than
@@ -7592,7 +10030,7 @@ mod tests {
 
         // A response with no rate-limit headers (an error page) is silence, not
         // a reading: the stale time stands.
-        manager.update_quota(0, &reqwest::header::HeaderMap::new());
+        manager.update_quota(0, &reqwest::header::HeaderMap::new(), 502);
         assert_eq!(wire_value(&manager, 0), Some(stale));
 
         // A header update after the stale probe moves it forward.
@@ -7602,7 +10040,7 @@ mod tests {
             "anthropic-ratelimit-unified-5h-utilization",
             "0.30".parse().expect("header value"),
         );
-        manager.update_quota(0, &headers);
+        manager.update_quota(0, &headers, 200);
         let moved = wire_value(&manager, 0).expect("still present");
         assert!(
             moved >= before,
@@ -7625,7 +10063,7 @@ mod tests {
             "0.40".parse().expect("header value"),
         );
         assert!(
-            !manager.update_quota(0, &weekly_only),
+            !manager.update_quota(0, &weekly_only, 200),
             "control: this response carries no 5h window"
         );
         let moved = wire_value(&manager, 0).expect("still present");
@@ -7684,7 +10122,7 @@ mod tests {
         status: u16,
     }
     impl UsageProber for AlwaysStatusProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let status = self.status;
             Box::pin(async move {
                 Err(ProbeError {
@@ -7783,7 +10221,7 @@ mod tests {
             state: Arc<std::sync::Mutex<usize>>,
         }
         impl UsageProber for FlakyProber {
-            fn probe(&self, _access_token: String) -> ProbeFuture {
+            fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
                 let mut n = self.state.lock().expect("lock poisoned");
                 *n += 1;
                 // 5xx, 5xx, OK, 5xx, 5xx — never THREE in a row.
@@ -7806,6 +10244,7 @@ mod tests {
                             seven_day: None,
                             seven_day_oi: None,
                             extra_usage_usd: None,
+                            codex: None,
                         })
                     }
                 })
@@ -7881,7 +10320,7 @@ mod tests {
     async fn probe_transport_failure_is_visible_error() {
         struct NetFailProber;
         impl UsageProber for NetFailProber {
-            fn probe(&self, _access_token: String) -> ProbeFuture {
+            fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
                 Box::pin(async {
                     Err(ProbeError {
                         status: None,
@@ -7933,7 +10372,7 @@ mod tests {
                 "anthropic-ratelimit-unified-7d-reset",
                 reset.to_string().parse().unwrap(),
             );
-            manager.update_quota(idx, &h);
+            manager.update_quota(idx, &h, 200);
         };
         set_7d(0, "0.95"); // over the 0.90 threshold, under 100% → NearLimit
         set_7d(1, "1.20"); // over 100% → Exhausted
@@ -7988,7 +10427,7 @@ mod tests {
                 "anthropic-ratelimit-unified-7d-reset",
                 reset.to_string().parse().unwrap(),
             );
-            manager.update_quota(idx, &h);
+            manager.update_quota(idx, &h, 200);
         };
         set_7d(0, "0.92"); // under the 0.95 default → real headroom, Normal
         set_7d(1, "0.96"); // over 0.95, under 100% → NearLimit
@@ -8065,8 +10504,8 @@ mod tests {
         // Simulate two upstream responses for a single client request (e.g. a
         // 429 that recorded a spent bucket, then the retry's 200).
         let headers = reqwest::header::HeaderMap::new();
-        manager.update_quota(0, &headers);
-        manager.update_quota(0, &headers);
+        manager.update_quota(0, &headers, 429);
+        manager.update_quota(0, &headers, 200);
         // Exactly one terminal serve.
         manager.record_served(0, now, None, SessionKind::Fallback);
 
@@ -8313,7 +10752,7 @@ mod tests {
             "anthropic-ratelimit-unified-7d_oi-reset",
             reset.to_string().parse().unwrap(),
         );
-        manager.update_quota(idx, &h);
+        manager.update_quota(idx, &h, 200);
     }
 
     /// HEADLINE per-model routing: a Fable request SKIPS an account whose `7d_oi`
@@ -9102,7 +11541,13 @@ mod tests {
             "every account is over the soft threshold → normal select benches all"
         );
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                Some(key),
+                "/v1/messages"
+            ),
             Some(other),
             "the revalidation serve routes the Fable request to an account that can \
              answer it"
@@ -10020,12 +12465,13 @@ mod tests {
                     reset_at_ms: Some(reset_ms),
                 }),
                 extra_usage_usd: None,
+                codex: None,
             },
         );
         // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
         // bucket, so it is what makes that window drive the hint. A non-Fable
         // request ignores 7d_oi entirely and falls through to the 60s default.
-        let hint = manager.retry_after_hint(now, true);
+        let hint = manager.retry_after_hint(now, true, crate::provider::Provider::Anthropic);
         assert!(
             hint > 60,
             "the 7d_oi reset must drive the hint past the 60s default, got {hint}"
@@ -10039,7 +12485,7 @@ mod tests {
         // no other gate the hint falls back to the 60s default — proof the
         // `is_fable` scoping is honoured, not hard-coded.
         assert_eq!(
-            manager.retry_after_hint(now, false),
+            manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic),
             60,
             "a non-Fable request ignores the 7d_oi bucket"
         );
@@ -10301,7 +12747,7 @@ mod tests {
 
         // retry_after_hint must now reflect the real 600s, not the 8s Hold.
         let manager = Manager::from_runtimes(vec![a]);
-        let hint = manager.retry_after_hint(now, false);
+        let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
         let expected = ((odt_to_ms(reset) - now_ms + 999) / 1000).max(1);
         assert_eq!(hint, expected, "hint must be the 600s reset, got {hint}");
         assert!(hint > 500, "must not report the 8s hold, got {hint}");
@@ -10412,6 +12858,209 @@ mod tests {
             (GateReason::Rejected, None),
             "a rejected account must not advertise a window reset as its recovery"
         );
+    }
+
+    /// A refused account as the snapshot sees it: `provider`, `rejected`, and the two windows
+    /// as (utilization, reset from `now`). Thresholds are the default 0.95.
+    fn refused_runtime(
+        provider: crate::provider::Provider,
+        now: OffsetDateTime,
+        five_hour: Option<(f64, Duration)>,
+        seven_day: Option<(f64, Duration)>,
+    ) -> AccountRuntime {
+        let window = |(utilization, reset_in): (f64, Duration)| crate::quota::QuotaWindow {
+            utilization,
+            reset: Some(now + reset_in),
+        };
+        let mut account = AccountRuntime::from_config(&account("refused", 0), false);
+        account.provider = provider;
+        account.quota.status = Some("rejected".into());
+        account.quota.five_hour = five_hour.map(window);
+        account.quota.seven_day = seven_day.map(window);
+        account
+    }
+
+    /// The (gate, free-at in Unix seconds) the snapshot reports for account 0.
+    fn reported_gate(manager: &Manager, now: OffsetDateTime) -> (GateReason, Option<i64>) {
+        let row = &manager.snapshot(now).accounts[0];
+        (row.gate, row.free_at.map(OffsetDateTime::unix_timestamp))
+    }
+
+    /// **A Codex account at its weekly limit reports `SevenDay` and the weekly reset**, not a
+    /// `Rejected` with no time: ChatGPT's usage-limit refusal names the window, and the window
+    /// outranks the hour-long hold the refusal also armed.
+    ///
+    /// Watched red: return the input unchanged from `codex_refusal_gate` and this reads
+    /// `Rejected`.
+    #[test]
+    fn a_weekly_refusal_reports_seven_day_and_its_reset() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.3, Duration::hours(2))),
+            Some((1.0, Duration::days(3))),
+        )]);
+        manager.mark_rate_limited(0, 3600);
+        assert_eq!(
+            reported_gate(&manager, now),
+            (
+                GateReason::SevenDay,
+                Some((now + Duration::days(3)).unix_timestamp())
+            )
+        );
+    }
+
+    /// The five-hour window that refused an account is its gate, with that window's reset. With
+    /// both windows full, both have to roll before it serves, so the later reset, the weekly
+    /// one, is the gate.
+    ///
+    /// Watched red: take the earliest reset instead of the latest and the both-full case reads
+    /// `FiveHour`.
+    #[test]
+    fn a_five_hour_refusal_reports_five_hour() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((1.0, Duration::minutes(52))),
+            Some((0.17, Duration::days(5))),
+        )]);
+        assert_eq!(
+            reported_gate(&manager, now),
+            (
+                GateReason::FiveHour,
+                Some((now + Duration::minutes(52)).unix_timestamp())
+            )
+        );
+
+        let both_full = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((1.0, Duration::hours(1))),
+            Some((1.0, Duration::days(3))),
+        )]);
+        assert_eq!(
+            reported_gate(&both_full, now),
+            (
+                GateReason::SevenDay,
+                Some((now + Duration::days(3)).unix_timestamp())
+            ),
+            "both full: the later reset is when the account serves again"
+        );
+    }
+
+    /// A refusal no full window explains (credits, a spend cap) but that armed a hold reports
+    /// the hold, until the hold's end.
+    #[test]
+    fn a_refusal_with_no_full_window_holds_until_its_reset() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )]);
+        manager.mark_rate_limited(0, 1800);
+        let row = manager.snapshot(now).accounts[0].clone();
+        assert!(row.rate_limited_until.is_some(), "the hold is armed");
+        assert_eq!(row.gate, GateReason::Hold);
+        assert_eq!(row.free_at, row.rate_limited_until);
+    }
+
+    /// **A standing refusal whose live hold an upstream 403 armed reports `Refused`**, the gate
+    /// a 403's hold reads on every other row, until the hold's end. A refused Codex account is
+    /// back in the pool once the refusal's own hold lapses, since the pick reads the hold and
+    /// the windows and never `rejected`, so the live hold can be a 403's
+    /// (`Manager::mark_refused`). The remap reports a live hold under the name `account_gate`
+    /// gives it.
+    ///
+    /// Watched red: report every live hold as `Hold`, and this reads `Hold`.
+    #[test]
+    fn a_refusal_held_by_an_upstream_403_reports_refused() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )]);
+        manager.mark_refused(0);
+        let row = manager.snapshot(now).accounts[0].clone();
+        assert!(row.rate_limited_until.is_some(), "the 403's hold is armed");
+        assert_eq!(row.gate, GateReason::Refused);
+        assert_eq!(row.free_at, row.rate_limited_until);
+    }
+
+    /// **The window that refused an account keeps its gate past its reset, with no time, until a
+    /// probe confirms the roll.** The clock says the window has rolled; a usage probe, or a
+    /// served 2xx that carries a window, ends the refusal. Reading `Rejected` in between would
+    /// turn a spent row into a refused one for the minutes until the next probe. The hold the
+    /// refusal armed, to that same reset, has lapsed by then too. Weekly and five-hour alike.
+    ///
+    /// Watched red: without the rolled-window rule, past the reset this reads
+    /// `(Rejected, None)`.
+    #[test]
+    fn a_refusing_window_past_its_reset_keeps_its_gate_until_a_probe_confirms_the_roll() {
+        let now = OffsetDateTime::now_utc();
+        let weekly = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            None,
+            Some((1.0, Duration::minutes(1))),
+        )]);
+        weekly.mark_rate_limited(0, 60);
+        assert_eq!(
+            reported_gate(&weekly, now),
+            (
+                GateReason::SevenDay,
+                Some((now + Duration::minutes(1)).unix_timestamp())
+            ),
+            "before the reset: the window, and its reset"
+        );
+        assert_eq!(
+            reported_gate(&weekly, now + Duration::minutes(2)),
+            (GateReason::SevenDay, None),
+            "past the reset, no probe yet: the same window, with no time"
+        );
+
+        let five_hour = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((1.0, Duration::minutes(1))),
+            Some((0.3, Duration::days(5))),
+        )]);
+        assert_eq!(
+            reported_gate(&five_hour, now + Duration::minutes(2)),
+            (GateReason::FiveHour, None)
+        );
+    }
+
+    /// With neither a full window nor a hold, nothing names a time: still `Rejected`.
+    #[test]
+    fn a_refusal_with_neither_stays_rejected() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )]);
+        assert_eq!(reported_gate(&manager, now), (GateReason::Rejected, None));
+    }
+
+    /// Anthropic's `rejected` is its own verdict and names no time, so its row is exactly what
+    /// `account_gate` says, a full weekly window or not.
+    #[test]
+    fn an_anthropic_rejected_row_is_unchanged() {
+        let now = OffsetDateTime::now_utc();
+        let manager = Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Anthropic,
+            now,
+            None,
+            Some((1.0, Duration::days(3))),
+        )]);
+        assert_eq!(reported_gate(&manager, now), (GateReason::Rejected, None));
     }
 
     /// The drift guard, and the reason R7 exists. [`Manager::account_gate`] (what
@@ -10706,7 +13355,7 @@ mod tests {
         c.quota.five_hour = Some(window(0.99, Some(at(900))));
 
         let manager = Manager::from_runtimes(vec![a, b, c]);
-        let hint = manager.retry_after_hint(now, false);
+        let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
 
         // Correct = C's 900s reset. The pre-fix raw-min over every window's reset
         // returned ~100s: it counted B's reset (an Error account that never returns)
@@ -10741,7 +13390,7 @@ mod tests {
         c.quota.five_hour = Some(window(0.99, Some(at(900))));
 
         let manager = Manager::from_runtimes(vec![a, b, c]);
-        let hint = manager.exhaustion_hint(now, false, None);
+        let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
         assert_eq!(
             hint.binding,
             Some(GateReason::FiveHour),
@@ -10754,7 +13403,7 @@ mod tests {
         );
         assert_eq!(
             hint.retry_after,
-            manager.retry_after_hint(now, false),
+            manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic),
             "the seconds half is byte-identical to retry_after_hint"
         );
         let counts: Vec<(GateReason, usize)> = hint.gated.iter().map(|(r, n)| (*r, *n)).collect();
@@ -10779,7 +13428,7 @@ mod tests {
         a.switch_threshold = Some(0.90);
         a.quota.seven_day = Some(window(0.99, None));
         let manager = Manager::from_runtimes(vec![a]);
-        let hint = manager.exhaustion_hint(now, false, None);
+        let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
         assert_eq!(hint.retry_after, 60);
         assert_eq!(hint.free_at, None);
         assert_eq!(hint.binding, None);
@@ -10801,7 +13450,9 @@ mod tests {
         // exactly that many whole seconds.
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.exhaustion_hint(now, false, None).retry_after,
+            manager
+                .exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None)
+                .retry_after,
             2,
             "the control: fleet-wide, the sooner account wins"
         );
@@ -10815,6 +13466,192 @@ mod tests {
             hint.gated.get(&GateReason::Hold),
             Some(&1),
             "only the one account is counted: {hint:?}"
+        );
+    }
+
+    /// **A 429's wait is timed on the request's own provider.** An account of the
+    /// other provider can never serve the request, so its reset says nothing about when this
+    /// one can be served: a Claude fleet out for seven seconds is not "back in two" because
+    /// a Codex account is, nor the reverse. Both orders, every entry point (the fleet hint,
+    /// its seconds half, and the group form a strict request uses), and the gate count names
+    /// only the provider's own account.
+    ///
+    /// Watched red: drop the provider filter in `exhaustion_hint_over` and the sooner account
+    /// wins for both providers.
+    #[test]
+    fn codex_exhaustion_hint_folds_only_the_requests_own_provider() {
+        use crate::provider::Provider;
+        for (anthropic_hold, codex_hold) in [(7, 2), (2, 7)] {
+            let mut codex = AccountRuntime::from_config(&account_in_groups("b", 0, &["g"]), false);
+            codex.provider = Provider::Codex;
+            let manager = Manager::from_runtimes(vec![
+                AccountRuntime::from_config(&account_in_groups("a", 0, &["g"]), false),
+                codex,
+            ]);
+            manager.mark_rate_limited(0, anthropic_hold);
+            manager.mark_rate_limited(1, codex_hold);
+            // Read AFTER the marks, so each hold rounds up to exactly its own length.
+            let now = OffsetDateTime::now_utc();
+            for (provider, hold) in [
+                (Provider::Anthropic, anthropic_hold),
+                (Provider::Codex, codex_hold),
+            ] {
+                let hint = manager.exhaustion_hint(now, false, provider, None);
+                assert_eq!(
+                    hint.retry_after,
+                    hold,
+                    "{} is timed on its own account: {hint:?}",
+                    provider.as_str()
+                );
+                assert_eq!(
+                    hint.gated.get(&GateReason::Hold),
+                    Some(&1),
+                    "only {}'s own account is counted: {hint:?}",
+                    provider.as_str()
+                );
+                assert_eq!(manager.retry_after_hint(now, false, provider), hold);
+                assert_eq!(
+                    manager.retry_after_hint_for_group(now, false, provider, "g"),
+                    hold,
+                    "the group form folds the provider too"
+                );
+            }
+        }
+    }
+
+    /// **A Codex 429's wait is the earliest Codex window reset**, not the 60-second
+    /// placeholder: once `x-codex-*` headers fill a Codex account's weekly window, the
+    /// provider-scoped hint folds it like any other window over threshold. Driven through
+    /// `update_quota` with the shape the real backend sends (only the weekly window, in the
+    /// primary slot), so it is the dispatch that fills the window: an Anthropic account
+    /// handed the SAME headers learns nothing from them and times nothing.
+    ///
+    /// Watched red, one arm of the dispatch in `update_quota` at a time: the Codex arm given
+    /// the Anthropic parser leaves the Codex hint at the 60-second placeholder, and the
+    /// Anthropic arm given the Codex parser times the Anthropic hint on a Codex window.
+    #[test]
+    fn codex_headers_time_the_codex_hint_and_never_the_anthropic_one() {
+        use crate::provider::Provider;
+        let mut codex = AccountRuntime::from_config(&account("b", 0), false);
+        codex.provider = Provider::Codex;
+        let manager = Manager::from_runtimes(vec![
+            AccountRuntime::from_config(&account("a", 0), false),
+            codex,
+        ]);
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 1800;
+        let mut weekly_full = reqwest::header::HeaderMap::new();
+        weekly_full.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        weekly_full.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        weekly_full.insert(
+            "x-codex-primary-reset-at",
+            reset.to_string().parse().unwrap(),
+        );
+        for idx in [0, 1] {
+            assert!(
+                !manager.update_quota(idx, &weekly_full, 200),
+                "a weekly window alone is no five-hour read, for either parser"
+            );
+        }
+        let now = OffsetDateTime::now_utc();
+
+        let codex_hint = manager.exhaustion_hint(now, false, Provider::Codex, None);
+        assert_eq!(
+            codex_hint.binding,
+            Some(GateReason::SevenDay),
+            "the Codex account is out on its weekly window: {codex_hint:?}"
+        );
+        assert!(
+            (1795..=1800).contains(&codex_hint.retry_after),
+            "the Codex wait is the window's reset, not the 60s placeholder: {codex_hint:?}"
+        );
+        assert_eq!(
+            codex_hint.free_at.map(OffsetDateTime::unix_timestamp),
+            Some(reset)
+        );
+
+        let anthropic_hint = manager.exhaustion_hint(now, false, Provider::Anthropic, None);
+        assert_eq!(
+            (anthropic_hint.binding, anthropic_hint.free_at),
+            (None, None),
+            "the Anthropic account read nothing from Codex headers: {anthropic_hint:?}"
+        );
+    }
+
+    /// **An all-rejected Codex fleet is timed on the windows it stored, then on its
+    /// holds**, never on the 60-second sentinel. `rejected` is a terminal gate with no
+    /// clear-instant, so with every Codex account refused the hint used to say "60" for
+    /// a weekly window days away. Each refused account here is out on its weekly window
+    /// and held at the one-hour ceiling: the hint names the SOONER stored weekly reset,
+    /// not the hour-long hold. With no window stored, the hold's expiry answers.
+    ///
+    /// The two controls pin the fold's edges: a fleet that is not ALL rejected keeps the
+    /// ordinary fold (its held account frees first), and an all-rejected ANTHROPIC fleet
+    /// is untouched, still the sentinel.
+    ///
+    /// Watched red: drop the fold after the loop and the first two answer 60; prefer the
+    /// hold over the stored window and the first answers the hour.
+    #[test]
+    fn an_all_rejected_codex_fleet_is_timed_on_its_stored_windows_then_its_holds() {
+        use crate::provider::Provider;
+        let now = OffsetDateTime::now_utc();
+        let rejected = |name: &str, provider: Provider, weekly_reset_in: Option<i64>| {
+            let mut account = AccountRuntime::from_config(&account(name, 0), false);
+            account.provider = provider;
+            account.quota.status = Some("rejected".to_string());
+            account.quota.seven_day = weekly_reset_in.map(|secs| crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::seconds(secs)),
+            });
+            account
+        };
+
+        let fleet = Manager::from_runtimes(vec![
+            rejected("a", Provider::Codex, Some(3 * 86_400)),
+            rejected("b", Provider::Codex, Some(2 * 86_400)),
+        ]);
+        fleet.mark_rate_limited(0, 3600);
+        fleet.mark_rate_limited(1, 3600);
+        let hint = fleet.exhaustion_hint(now, false, Provider::Codex, None);
+        assert_eq!(
+            hint.free_at.map(OffsetDateTime::unix_timestamp),
+            Some((now + Duration::seconds(2 * 86_400)).unix_timestamp()),
+            "the sooner stored weekly reset, not the 60s sentinel nor the hour-long hold: {hint:?}"
+        );
+        assert_eq!(hint.binding, Some(GateReason::Rejected));
+        assert_eq!(hint.gated.get(&GateReason::Rejected), Some(&2));
+
+        let no_window = Manager::from_runtimes(vec![rejected("a", Provider::Codex, None)]);
+        no_window.mark_rate_limited(0, 300);
+        let hint =
+            no_window.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Codex, None);
+        assert!(
+            (299..=300).contains(&hint.retry_after) && hint.free_at.is_some(),
+            "with no window stored, the hold's expiry: {hint:?}"
+        );
+
+        let mixed =
+            Manager::from_runtimes(vec![rejected("a", Provider::Codex, Some(2 * 86_400)), {
+                let mut held = AccountRuntime::from_config(&account("b", 0), false);
+                held.provider = Provider::Codex;
+                held
+            }]);
+        mixed.mark_rate_limited(1, 30);
+        let hint = mixed.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Codex, None);
+        assert_eq!(
+            hint.binding,
+            Some(GateReason::Hold),
+            "control: not every account is rejected, so the ordinary fold answers: {hint:?}"
+        );
+        assert!((29..=30).contains(&hint.retry_after), "{hint:?}");
+
+        let anthropic =
+            Manager::from_runtimes(vec![rejected("a", Provider::Anthropic, Some(2 * 86_400))]);
+        anthropic.mark_rate_limited(0, 300);
+        let hint = anthropic.exhaustion_hint(now, false, Provider::Anthropic, None);
+        assert_eq!(
+            (hint.retry_after, hint.free_at, hint.binding),
+            (60, None, None),
+            "control: an all-rejected Anthropic fleet keeps the sentinel: {hint:?}"
         );
     }
 
@@ -10907,6 +13744,322 @@ mod tests {
         );
         assert_eq!(manager.config.lock().unwrap().accounts[0].disabled, None);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A Codex account's bench reaches ITS row. `config::locate_account_entry`
+    /// never matches a row of the other provider, so the probe `set_disabled`
+    /// locates the row by must carry the runtime account's provider: built as
+    /// Anthropic it addresses nothing, and the bench silently does not survive a
+    /// restart.
+    ///
+    /// Watched red: build `set_disabled`'s probe with `Provider::Anthropic` in
+    /// place of `account.provider` and the outcome is `NoEntry`, with the Codex
+    /// row unflagged.
+    #[test]
+    fn set_disabled_on_a_codex_account_persists_to_its_codex_row() {
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            "codex-disable",
+        );
+
+        assert_eq!(
+            manager.set_disabled(1, true),
+            DisablePersist::Persisted,
+            "the Codex account's bench must reach its own row"
+        );
+        let after = read_config_json(&path);
+        assert_eq!(after["accounts"][1]["disabled"], serde_json::json!(true));
+        assert_eq!(after["accounts"][1]["provider"], serde_json::json!("codex"));
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "the Anthropic row must be untouched: {after}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `account` as a Codex account, told from the others by its name alone (no workspace or
+    /// user id, unlike [`codex_account`], whose rows all share one login).
+    fn codex_account_named(name: &str) -> Account {
+        Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(name, 0)
+        }
+    }
+
+    /// Delete every account but `kept` from the config at `path` while `manager` runs, the way
+    /// `tcr remove` or a hand edit does, and take the snapshot that notices. The sleep moves the
+    /// file's mtime, which is what the reload watches.
+    fn delete_from_disk(
+        manager: &Manager,
+        path: &std::path::Path,
+        kept: Vec<Account>,
+    ) -> StatsSnapshot {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        config::save(path, &config_with(kept)).expect("rewrite the test config");
+        manager.snapshot(OffsetDateTime::now_utc())
+    }
+
+    fn names(snapshot: &StatsSnapshot) -> Vec<&str> {
+        snapshot.accounts.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    fn slots(snapshot: &StatsSnapshot) -> Vec<usize> {
+        snapshot.accounts.iter().map(|a| a.slot).collect()
+    }
+
+    /// The dashboard marks the account serving EACH provider, so the manager remembers one per
+    /// provider: a Codex request served after a Claude one must not erase which account is
+    /// serving Claude. `current` keeps its meaning, the account that served last of either.
+    #[test]
+    fn the_serving_account_is_tracked_per_provider() {
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                account("alice@example.com", 0),
+                codex_account_named("bob@example.com/codex"),
+            ]),
+            "serving-per-provider",
+        );
+        manager.set_current(0);
+        manager.set_current(1);
+
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: Some(1),
+            }
+        );
+        assert_eq!(snapshot.current, Some(1));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The serving accounts are positions in the snapshot's list, as `current` is, so a row
+    /// deleted above one moves it up by one, and a deleted serving row reads as nothing serving.
+    /// A slot is never what the list is indexed by: after the first delete, carol is slot 2 and
+    /// position 1.
+    #[test]
+    fn the_serving_account_survives_a_deleted_row_above_it() {
+        let alice = account("alice@example.com", 0);
+        let carol = codex_account_named("carol@example.com/codex");
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                alice.clone(),
+                codex_account_named("bob@example.com/codex"),
+                carol.clone(),
+            ]),
+            "serving-past-a-delete",
+        );
+        manager.set_current(0);
+        manager.set_current(2);
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(slots(&before), [0, 1, 2]);
+        assert_eq!(
+            before.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: Some(2),
+            }
+        );
+
+        let without_bob = delete_from_disk(&manager, &path, vec![alice.clone(), carol]);
+        // First, that the reload happened at all: a file it could not parse would keep every
+        // row, and the assertions below would pass or fail for that reason instead.
+        assert_eq!(
+            names(&without_bob),
+            ["alice@example.com", "carol@example.com/codex"]
+        );
+        assert_eq!(slots(&without_bob), [0, 2]);
+        assert_eq!(
+            without_bob.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: Some(1),
+            }
+        );
+        assert_eq!(without_bob.current, Some(1));
+
+        let without_carol = delete_from_disk(&manager, &path, vec![alice]);
+        assert_eq!(names(&without_carol), ["alice@example.com"]);
+        assert_eq!(
+            without_carol.current_by_provider,
+            crate::stats::CurrentByProvider {
+                anthropic: Some(0),
+                codex: None,
+            }
+        );
+        assert_eq!(without_carol.current, None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A session carries the provider of the account it is pinned to, and a log line the
+    /// provider it was pushed with. A session pinned to a row deleted from the config keeps
+    /// that row's provider, as it keeps that row's name: the pin still points at the slot.
+    #[test]
+    fn sessions_and_log_entries_carry_their_provider() {
+        let alice = account("alice@example.com", 0);
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                alice.clone(),
+                codex_account_named("bob@example.com/codex"),
+            ]),
+            "session-provider",
+        );
+        let now_ms = crate::now_ms();
+        manager.seed_session(0xA11CE, 0, 3, now_ms, SessionKind::Stable);
+        pin_session(&manager, 0xA11CE, 0);
+        manager.seed_session(0xB0B, 1, 5, now_ms, SessionKind::Stable);
+        pin_session(&manager, 0xB0B, 1);
+        for (path, provider) in [
+            ("/v1/messages", crate::provider::Provider::Anthropic),
+            (
+                crate::provider::CODEX_RESPONSES_PATH,
+                crate::provider::Provider::Codex,
+            ),
+        ] {
+            manager.push_log(RequestLogEntry {
+                time: OffsetDateTime::now_utc(),
+                method: "POST".to_string(),
+                path: path.to_string(),
+                status: 200,
+                account: String::new(),
+                provider,
+            });
+        }
+
+        let provider_of = |snapshot: &StatsSnapshot, account: &str| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|s| s.account == account)
+                .unwrap_or_else(|| {
+                    panic!("no session pinned to {account}: {:?}", snapshot.sessions)
+                })
+                .provider
+        };
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            provider_of(&snapshot, "alice@example.com"),
+            crate::provider::Provider::Anthropic
+        );
+        assert_eq!(
+            provider_of(&snapshot, "bob@example.com/codex"),
+            crate::provider::Provider::Codex
+        );
+        let logged: Vec<(&str, crate::provider::Provider)> = snapshot
+            .recent
+            .iter()
+            .map(|e| (e.path.as_str(), e.provider))
+            .collect();
+        assert_eq!(
+            logged,
+            [
+                (
+                    crate::provider::CODEX_RESPONSES_PATH,
+                    crate::provider::Provider::Codex
+                ),
+                ("/v1/messages", crate::provider::Provider::Anthropic),
+            ]
+        );
+
+        let without_bob = delete_from_disk(&manager, &path, vec![alice]);
+        assert_eq!(names(&without_bob), ["alice@example.com"]);
+        assert_eq!(
+            provider_of(&without_bob, "bob@example.com/codex"),
+            crate::provider::Provider::Codex,
+            "a session pinned to a deleted row keeps its provider"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A row deleted from the config keeps its slot, parked and unlisted, and only `disabled`
+    /// keeps it out of rotation: `eligible` never reads `removed`. So no key may reach it. An
+    /// enable would put an account the operator deleted back into rotation on its in-memory
+    /// credentials until a restart, and a bench would report a save for a row nobody can see.
+    #[test]
+    fn a_deleted_row_is_never_benched_or_enabled() {
+        let bob = account("bob@example.com", 0);
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0), bob.clone()]),
+            "deleted-row-keys",
+        );
+        manager.snapshot(OffsetDateTime::now_utc());
+        let without_alice = delete_from_disk(&manager, &path, vec![bob]);
+        assert_eq!(names(&without_alice), ["bob@example.com"]);
+        let on_disk = std::fs::read(&path).expect("read the test config");
+
+        assert_eq!(
+            manager.set_disabled(0, false),
+            DisablePersist::NoSuchAccount,
+            "an enable must not reach a deleted row"
+        );
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert!(accounts[0].removed, "the deleted row is still marked");
+            assert!(
+                accounts[0].disabled,
+                "and still parked: an enable of it would put it back in rotation"
+            );
+        }
+        assert_eq!(
+            manager.set_disabled(0, true),
+            DisablePersist::NoSuchAccount,
+            "a bench of a deleted row is refused too"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read the test config"),
+            on_disk,
+            "nothing was written for a row the file no longer holds"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The duplicate notice a Codex row gets names the Codex remedy: remove the duplicate or
+    /// re-import it under its own name. Giving each entry its own `orgUuid`, the Claude remedy,
+    /// does nothing for two entries that share one ChatGPT login. Every other outcome, and every
+    /// Claude row, reads exactly as `warning` does.
+    #[test]
+    fn the_codex_duplicate_notice_names_the_codex_remedy() {
+        const CODEX_DUPLICATE: &str = "NOT SAVED: two config entries share this Codex login \
+            — remove the duplicate (tcr remove <name>), or re-import it with --name";
+        let outcomes = [
+            DisablePersist::Persisted,
+            DisablePersist::NoConfigFile,
+            DisablePersist::NoSuchAccount,
+            DisablePersist::NoEntry,
+            DisablePersist::Ambiguous,
+            DisablePersist::WriteFailed,
+        ];
+        for disabled in [true, false] {
+            assert_eq!(
+                DisablePersist::Ambiguous.warning_for(disabled, crate::provider::Provider::Codex),
+                Some(CODEX_DUPLICATE)
+            );
+            for outcome in outcomes {
+                assert_eq!(
+                    outcome.warning_for(disabled, crate::provider::Provider::Anthropic),
+                    outcome.warning(disabled),
+                    "a Claude row reads {outcome:?} as it always has"
+                );
+                if outcome != DisablePersist::Ambiguous {
+                    assert_eq!(
+                        outcome.warning_for(disabled, crate::provider::Provider::Codex),
+                        outcome.warning(disabled),
+                        "{outcome:?} says the same about either provider"
+                    );
+                }
+            }
+        }
+        assert!(
+            DisablePersist::Ambiguous
+                .warning_for(true, crate::provider::Provider::Anthropic)
+                .is_some_and(|text| text.ends_with("give each its own orgUuid")),
+            "the Claude duplicate notice keeps its remedy"
+        );
     }
 
     /// A manager with NO `config_path` — every test here, `tcr demo`, and
@@ -11895,6 +15048,57 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Re-adding a Codex account replaces the credential on ITS row. The
+    /// Updated arm hands `persist_replaced` a target it builds itself, and
+    /// `config::locate_account_entry` never matches a row of the other
+    /// provider: a target that defaulted to Anthropic found no row and APPENDED
+    /// one, an Anthropic row carrying the Codex credential, which the next boot
+    /// would send to the Anthropic upstream.
+    ///
+    /// Watched red: give the Updated target `provider: Default::default()` and
+    /// the file grows a second row with no `provider` key.
+    #[test]
+    fn re_adding_a_codex_account_updates_its_row_and_appends_no_anthropic_duplicate() {
+        let stored = Account {
+            provider: crate::provider::Provider::Codex,
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            ..account("bob@example.com", 0)
+        };
+        let (manager, path) =
+            build_manager_with_disk(config_with(vec![stored.clone()]), "codex-readd");
+
+        let submission = Account {
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..stored
+        };
+        let outcome = manager.add_or_update_account(submission);
+        assert!(
+            matches!(
+                outcome,
+                AddAccountOutcome::Updated {
+                    idx: 0,
+                    persist: AddPersist::Persisted,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let after = read_config_json(&path);
+        let rows = after["accounts"].as_array().expect("an accounts array");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a Codex re-add must update its own row, never append a duplicate: {after}"
+        );
+        assert_eq!(rows[0]["provider"], serde_json::json!("codex"));
+        assert_eq!(rows[0]["refreshToken"], serde_json::json!("rt-fresh"));
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Preservation guard: a submission with NO identity fields at all (a bare
     /// name) resolves on NAME EQUALITY alone — `same_identity`'s fallback when
     /// either side has no uuid — and a name that matches nothing is APPENDED,
@@ -12046,6 +15250,46 @@ mod tests {
             manager.warm_targets(),
             vec![1],
             "an at/over-threshold account is not a warm target"
+        );
+    }
+
+    /// **A Codex account is never a keep-warm target.** A warm is an Anthropic inference
+    /// request: `warm_account` POSTs `/v1/messages` to the Anthropic `upstream` with the
+    /// row's bearer, so warming a Codex row would hand its OpenAI bearer to Anthropic, and
+    /// on the right host would spend a real Codex turn. The Codex row here is otherwise an
+    /// ideal target (probed, cold, idle) and the Anthropic row in the same state is warmed,
+    /// so the exclusion is the provider and nothing else.
+    ///
+    /// Watched red: drop the provider filter in `warm_targets` and the Codex row is listed
+    /// and its bearer warmed.
+    #[tokio::test]
+    async fn warm_targets_never_lists_a_codex_account() {
+        let warmed = Arc::new(Mutex::new(Vec::new()));
+        let codex = Account {
+            provider: crate::provider::Provider::Codex,
+            ..account("bob@example.com", 0)
+        };
+        let manager = build_manager_with_warmer(
+            config_with(vec![account("alice@example.com", 0), codex]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RecordingWarmer {
+                warmed: Arc::clone(&warmed),
+            }),
+        );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "only the Anthropic row is a keep-warm target"
+        );
+        manager.warm_all().await;
+        assert_eq!(
+            warmed.lock().expect("warmed lock poisoned").clone(),
+            vec!["at-alice@example.com".to_string()],
+            "no warm request ever carries the Codex row's bearer"
         );
     }
 
@@ -12215,6 +15459,7 @@ mod tests {
             seven_day: None,
             seven_day_oi: None,
             extra_usage_usd: None,
+            codex: None,
         };
         for cycle in 0..5 {
             manager.apply_usage(0, &headerless_probe);
@@ -12905,7 +16150,7 @@ mod tests {
             "every account is over the soft threshold → normal select benches all"
         );
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(1),
             "revalidation serves the least-utilized allowed account"
         );
@@ -12934,14 +16179,14 @@ mod tests {
         }
 
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            manager.select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages"),
             Some(2),
             "pin-honor serves the session's warm pinned account, NOT the least-utilized other"
         );
         // The pin-honor path must NOT have burned the fallback throttle window: an
         // unaffiliated (no-pin) fallback serve still succeeds immediately.
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(0),
             "pin-honor does not consume the fallback anti-storm window"
         );
@@ -12960,7 +16205,7 @@ mod tests {
             pins.insert(key, (2, odt_to_ms(now)));
         }
         assert_eq!(
-            manager2.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            manager2.select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages"),
             Some(0),
             "a rejected pin falls back to the least-utilized survivor"
         );
@@ -13011,7 +16256,7 @@ mod tests {
         // not rejected, no hold. It clears every ACCOUNT-level hard gate.
         let tried = HashSet::from([2usize]);
         assert_eq!(
-            manager.select_revalidation(&tried, now, None, Some(key)),
+            manager.select_revalidation(&tried, now, None, Some(key), "/v1/messages"),
             Some(0),
             "a tried pin cannot serve THIS request → the least-utilized survivor does"
         );
@@ -13062,7 +16307,7 @@ mod tests {
         set_over_threshold(&rejected, 2, 0.999, "rejected");
         pin_session(&rejected, 2);
         assert_eq!(
-            rejected.select_revalidation(&tried, now, None, Some(key)),
+            rejected.select_revalidation(&tried, now, None, Some(key), "/v1/messages"),
             Some(0),
             "a rejected pin is skipped; the least-utilized survivor serves"
         );
@@ -13087,7 +16332,7 @@ mod tests {
         }
         pin_session(&held, 2);
         assert_eq!(
-            held.select_revalidation(&tried, now, None, Some(key)),
+            held.select_revalidation(&tried, now, None, Some(key), "/v1/messages"),
             Some(0),
             "a pin held past its cache lifetime is skipped; the survivor serves"
         );
@@ -13111,7 +16356,7 @@ mod tests {
 
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(1),
             "the least-utilized account is rejected → skip it, serve the allowed one"
         );
@@ -13126,7 +16371,7 @@ mod tests {
         set_over_threshold(&manager2, 0, 0.960, "rejected");
         set_over_threshold(&manager2, 1, 0.990, "rejected");
         assert_eq!(
-            manager2.select_revalidation(&HashSet::new(), now, None, None),
+            manager2.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             None,
             "all accounts rejected → no revalidation target, honest 429"
         );
@@ -13147,7 +16392,7 @@ mod tests {
         }
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(1),
             "a live-held account is a HARD block — skipped even as least-utilized"
         );
@@ -13165,12 +16410,12 @@ mod tests {
         set_over_threshold(&manager, 1, 0.990, "allowed_warning");
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             Some(0),
             "first call serves"
         );
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, None, None),
+            manager.select_revalidation(&HashSet::new(), now, None, None, "/v1/messages"),
             None,
             "a second call within the spacing window is throttled to None"
         );
@@ -13215,7 +16460,13 @@ mod tests {
         // Fable request: account 0's Fable weekly is a hard reject → skip → serve 1.
         let (manager, now) = build();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), None),
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                None,
+                "/v1/messages"
+            ),
             Some(1),
             "a Fable request skips the Fable-exhausted account even when least-utilized"
         );
@@ -13224,9 +16475,71 @@ mod tests {
         // gates Fable traffic only; on shared dims account 0 is least-utilized).
         let (manager, now) = build();
         assert_eq!(
-            manager.select_revalidation(&HashSet::new(), now, Some("claude-opus-4-6"), None),
+            manager.select_revalidation(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages"
+            ),
             Some(0),
             "a non-Fable request still serves the Fable-exhausted account"
         );
+    }
+
+    /// A manager with no account, for the Codex traffic counts, which no account owns.
+    fn traffic_manager() -> Arc<Manager> {
+        build_manager(
+            config_with(Vec::new()),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+    }
+
+    /// The refused count covers the last ten minutes, by the minute: a 429 drops out once ten
+    /// whole minutes have passed since the minute it was sent in. The latest refusal's type and
+    /// time ride with the count, and go when it reaches zero, so the wire never pairs a zero
+    /// count with a stale type.
+    ///
+    /// Watched red: summing all ten buckets whatever their minute keeps the first refusal in
+    /// the count at the tenth minute.
+    #[test]
+    fn the_refused_ring_counts_ten_minutes_of_codex_429s() {
+        // 2026-01-01T00:00:00Z, on a minute boundary.
+        let t0: i64 = 1_767_225_600_000;
+        let manager = traffic_manager();
+        manager.note_codex_refusal(tcr_status_wire::CodexRefusalKind::UsageLimitReached, t0);
+        manager.note_codex_refusal(
+            tcr_status_wire::CodexRefusalKind::PoolUnavailable,
+            t0 + 300_000,
+        );
+        assert_eq!(
+            manager.codex_traffic(t0 + 599_000),
+            tcr_status_wire::CodexTraffic {
+                refused_10m: 2,
+                last_refusal: Some(tcr_status_wire::CodexRefusalKind::PoolUnavailable),
+                last_refusal_at_ms: Some(t0 + 300_000),
+                unpooled_10m: 0,
+            }
+        );
+        assert_eq!(manager.codex_traffic(t0 + 600_000).refused_10m, 1);
+        let emptied = manager.codex_traffic(t0 + 900_000);
+        assert_eq!(emptied.refused_10m, 0);
+        assert_eq!(emptied.last_refusal, None);
+        assert_eq!(emptied.last_refusal_at_ms, None);
+    }
+
+    /// The unpooled count covers the same ten minutes, by the same minute buckets.
+    #[test]
+    fn the_unpooled_ring_counts_routed_relays() {
+        let t0: i64 = 1_767_225_600_000;
+        let manager = traffic_manager();
+        for _ in 0..3 {
+            manager.note_codex_unpooled(t0);
+        }
+        assert_eq!(manager.codex_traffic(t0 + 599_000).unpooled_10m, 3);
+        assert_eq!(manager.codex_traffic(t0 + 600_000).unpooled_10m, 0);
+        assert_eq!(manager.codex_traffic(t0 + 599_000).refused_10m, 0);
     }
 }

@@ -3,6 +3,52 @@ import XCTest
 
 @testable import TcrBarCore
 
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// Canonical alice under another name and her own org, in no group, with `overrides`: a
+/// second Claude identity with alice's facts.
+private func aliceCopy(
+    _ name: String, org: String, _ overrides: [String: Any] = [:]
+) throws -> [String: Any] {
+    var all: [String: Any] = ["name": name, "orgUuid": org, "groups": [String]()]
+    for (key, value) in overrides { all[key] = value }
+    return try canonicalRow("alice@example.com", all)
+}
+
+/// A Claude pool of 3 of 4 ready: alice and two copies of her, ready, and frank, spent on
+/// the week.
+private func claudeThreeOfFour() throws -> [[String: Any]] {
+    [
+        try canonicalRow("alice@example.com", ["groups": [String]()]),
+        try aliceCopy("nina@example.com", org: "33333333-3333-4333-8333-333333333333"),
+        try aliceCopy("omar@example.com", org: "44444444-4444-4444-8444-444444444444"),
+        try aliceCopy(
+            "frank@example.com", org: "22222222-2222-4222-8222-222222222222",
+            [
+                "quotaState": "spent", "quota": 1.0, "sevenDay": 1.0, "sevenDayState": "spent",
+                "held": [
+                    ["window": "7d", "minutesUntilReset": 4320, "resetAtMs": 1_767_484_800_000]
+                ],
+            ]),
+    ]
+}
+
 /// The menu-bar image, checked at the level a unit test can reach: the `NSImage`
 /// this app hands to the status button.
 ///
@@ -164,6 +210,84 @@ final class MenuBarMarkTests: XCTestCase {
 
         let image = try XCTUnwrap(MenuBarMark.image(fraction: 1, tint: .awake(loudTint)))
         XCTAssertEqual(image.accessibilityDescription, on)
+    }
+
+    // MARK: - A fleet holding Codex accounts
+
+    /// The mark speaks each pool that has an enabled account, Claude first. A fleet with
+    /// no Codex account keeps the sentence it always had.
+    func testAMixedFleetSpeaksBothPools() throws {
+        let fleet = try decodeFleet(
+            try [
+                "alice@example.com", "bob@example.com/codex", "carol@example.com",
+                "dana@example.com", "erin@example.com/codex", "gil@example.com",
+                "hal@example.com", "ivy@example.com", "jo@example.com", "kim@example.com",
+            ].map { try canonicalRow($0) })
+        let spoken = "tcr fleet capacity: Claude 1 of 1 ready, Codex 3 of 9 ready"
+        XCTAssertEqual(MenuBarMark.accessibilityDescription(awake: false, fleet: fleet), spoken)
+
+        let awake = MenuBarMark.accessibilityDescription(awake: true, fleet: fleet)
+        XCTAssertTrue(awake.hasPrefix(spoken), awake)
+        XCTAssertTrue(awake.hasSuffix(". Keeping this Mac awake."), awake)
+
+        let knocked = MenuBarMark.accessibilityDescription(awake: false, knocks: 1, fleet: fleet)
+        XCTAssertTrue(knocked.hasPrefix("1 Mac is asking to connect."), knocked)
+        XCTAssertTrue(knocked.hasSuffix(spoken), knocked)
+
+        let claudeOnly = try decodeFleet([canonicalRow("alice@example.com")])
+        XCTAssertEqual(
+            MenuBarMark.accessibilityDescription(awake: false, fleet: claudeOnly),
+            "tcr fleet capacity")
+        XCTAssertEqual(
+            try XCTUnwrap(
+                MenuBarMark.image(fraction: 1, tint: .template, fleet: fleet)
+            ).accessibilityDescription, spoken)
+    }
+
+    /// A Codex-only fleet speaks its one pool.
+    func testACodexOnlyFleetSpeaksItsPool() throws {
+        let fleet = try decodeFleet(
+            try [
+                "bob@example.com/codex", "dana@example.com", "carol@example.com",
+                "erin@example.com/codex",
+            ].map { try canonicalRow($0) })
+        XCTAssertEqual(
+            MenuBarMark.accessibilityDescription(awake: false, fleet: fleet),
+            "tcr fleet capacity: Codex 2 of 4 ready")
+    }
+
+    /// Each part of the count is amber only when its own pool is near: nothing ready and
+    /// something close. The cup, following the emptier pool, is amber in both fleets.
+    func testOnlyTheNearHalfIsAmber() throws {
+        let codexNear = PollState.loaded(
+            try decodeFleet(
+                try claudeThreeOfFour() + [
+                    canonicalRow("ivy@example.com"), canonicalRow("carol@example.com"),
+                ]))
+        XCTAssertEqual(
+            codexNear.countsParts,
+            [
+                PollState.CountsPart(text: "3/4", isNear: false),
+                PollState.CountsPart(text: "0/2", isNear: true),
+            ])
+        XCTAssertEqual(codexNear.countsNearHalves, [false, true])
+        XCTAssertEqual(codexNear.capacityTintKind(awake: false, cupPool: .emptier), .near)
+
+        let claudeNear = PollState.loaded(
+            try decodeFleet([
+                try aliceCopy(
+                    "nina@example.com", org: "33333333-3333-4333-8333-333333333333",
+                    ["quotaState": "near", "quota": 0.9]),
+                try canonicalRow("bob@example.com/codex"), try canonicalRow("dana@example.com"),
+            ]))
+        XCTAssertEqual(
+            claudeNear.countsParts,
+            [
+                PollState.CountsPart(text: "0/1", isNear: true),
+                PollState.CountsPart(text: "2/2", isNear: false),
+            ])
+        XCTAssertEqual(claudeNear.countsNearHalves, [true, false])
+        XCTAssertEqual(claudeNear.capacityTintKind(awake: false, cupPool: .emptier), .near)
     }
 
     // MARK: - Rasterising

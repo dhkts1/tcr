@@ -86,6 +86,13 @@ final class QuotaRowSpokenValueTests: XCTestCase {
         XCTAssertEqual(QuotaState.ok.token, "ok")
     }
 
+    /// A row names its own window. A Codex plan's 30-day window is spoken as the
+    /// `30d window` it is drawn as, and the `5h` row says what it always said.
+    func testARowSpeaksItsOwnLabel() {
+        XCTAssertEqual(QuotaFormat.spokenWindowLabel("30d"), "30d window")
+        XCTAssertEqual(QuotaFormat.spokenWindowLabel("5h"), "5h window")
+    }
+
     // MARK: - The Fable weekly window (Gil: "why i dont see fable like we had before?")
 
     /// The Fable window's tint may never borrow the composite `quotaState` the

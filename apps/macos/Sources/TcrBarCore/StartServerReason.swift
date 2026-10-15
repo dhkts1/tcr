@@ -12,6 +12,13 @@ import Foundation
 /// verbatim, into `.incumbentHoldsPort`'s `message`, so a safe start's own
 /// failed attempt is where this line comes from, not a separate port probe.
 extension ServerController.State {
+    public func summary(executablePath: String?) -> String {
+        if case .exited(_, let message) = self, PredatesCodexRefusal.matches(message) {
+            return PredatesCodexRefusal.displayed(message, executablePath: executablePath)
+        }
+        return summary
+    }
+
     /// The plain sentence for a disabled "Start server" control, or `nil` when
     /// starting again is not futile: every state but a non-proxy holder,
     /// including a `tcr` proxy already on the port (the common, benign case,
@@ -38,5 +45,47 @@ extension ServerController.State {
         let port = message[portRange]
         let name = message[nameRange].trimmingCharacters(in: .whitespaces)
         return "Port \(port) is held by \(name). Take over stops it."
+    }
+}
+
+/// The refusal a `tcr` built before Codex accounts gives when the config it loads holds
+/// one, and the sentence TcrBar says in its place.
+///
+/// The producer is tcr's config loader (`src/config.rs`): an account whose
+/// `credentialVersion` is newer than the build understands is refused, with the whole
+/// load, rather than read in a shape it does not know. A Codex account is written at a
+/// newer version than any `tcr` from before Codex accounts understands, so every
+/// command that loads the config, the server's own start included, fails with this
+/// refusal, and tcr's words name a version, not the fix. TcrBar matches it to say which
+/// tcr is too old, and what to do.
+///
+/// The match skips the account's name and both numbers: the name is a person's, and
+/// the numbers move each time a credential shape does. The words between them are
+/// pinned against the loader's source by a test.
+public enum PredatesCodexRefusal {
+    /// Whether `text` carries the config loader's refusal of a newer credential shape.
+    public static func matches(_ text: String) -> Bool {
+        guard
+            let regex = try? NSRegularExpression(
+                pattern: #"carries credentialVersion \d+, which this build only understands up to \d+"#)
+        else { return false }
+        return regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    /// `text` as a single line shows it: the sentence naming the selected tcr when
+    /// `text` carries the refusal, and otherwise `text` unchanged.
+    public static func displayed(_ text: String, executablePath: String? = nil) -> String {
+        guard matches(text) else { return text }
+        // Only the initial Codex shape identifies a provider. Future credential
+        // changes can belong to Claude too, so explain the general version refusal.
+        if text.range(
+            of: #"carries credentialVersion 2, which this build only understands up to [01]\b"#,
+            options: .regularExpression) == nil
+        {
+            let selected = executablePath.map { "The tcr at \($0)" } ?? "The selected tcr"
+            return selected + " cannot read this config's credentials. Update that tcr and try again."
+        }
+        return CodexSignInCopy.predatesCodexTitle + ". "
+            + CodexSignInCopy.predatesCodexDetail(executablePath: executablePath)
     }
 }

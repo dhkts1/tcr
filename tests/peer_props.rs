@@ -212,14 +212,14 @@ const GUARD: f64 = SWITCH_THRESHOLD - CONTROL_RESERVE;
 
 struct NeverRefreshes;
 impl TokenRefresher for NeverRefreshes {
-    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+    fn refresh(&self, _provider: tcr::provider::Provider, _refresh_token: String) -> RefreshFuture {
         Box::pin(async { Err(OAuthError::Transient("no refresher in prop tests".into())) })
     }
 }
 
 struct NeverProbes;
 impl UsageProber for NeverProbes {
-    fn probe(&self, _access_token: String) -> ProbeFuture {
+    fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
         Box::pin(async {
             Err(ProbeError {
                 status: None,
@@ -249,6 +249,7 @@ fn fake_account(index: usize) -> Account {
     Account {
         name: format!("acct{index}@example.com"),
         account_type: tcr::config::AccountType::OAuth,
+        provider: Default::default(),
         account_uuid: Some(format!("1111111{index}-1111-1111-1111-111111111111")),
         org_uuid: None,
         org_name: None,
@@ -268,6 +269,7 @@ fn fake_account(index: usize) -> Account {
         seat_tier: None,
         egress: tcr::config::Egress::Local,
         egress_strict: false,
+        codex_home: None,
         extra: serde_json::Map::new(),
     }
 }
@@ -280,6 +282,7 @@ fn fleet(accounts: Vec<Account>) -> Arc<Manager> {
         rename_write_error: None,
         proxy: ProxyConfig::default(),
         upstream: "http://127.0.0.1:1".to_string(),
+        codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
         switch_threshold: SWITCH_THRESHOLD,
         fable_weekly_threshold: None,
         pacing: PacingConfig {
@@ -355,7 +358,7 @@ proptest! {
                 "anthropic-ratelimit-unified-5h-reset",
                 reset.to_string().parse().expect("a header value"),
             );
-            manager.update_quota(idx, &headers);
+            manager.update_quota(idx, &headers, 200);
         }
 
         let f_scope = manager.lendable_fraction(&scope, tcr_peer_wire::Window::FiveHour, now);

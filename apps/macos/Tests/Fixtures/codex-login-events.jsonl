@@ -1,0 +1,5 @@
+{"event":"browser","opened":true,"url":"https://auth.openai.com/oauth/authorize?client_id=app_EXAMPLE&state=EXAMPLE"}
+{"event":"waiting"}
+{"event":"notice","text":"tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep the marker scoped to that launch, since unmarked connections keep their own login"}
+{"account":"bob@example.com","event":"saved","plan":"ChatGPT Pro","provider":"codex"}
+{"code":"codex-identity","event":"error","reason":"the ChatGPT login that came back is carol@example.com, not the one 'erin@example.com/codex' holds. Sign out of chatgpt.com in the browser first, or use a private window, then retry `tcr login --codex --account erin@example.com/codex`. Nothing was written."}

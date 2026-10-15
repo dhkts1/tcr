@@ -59,6 +59,7 @@ const fn key(name: &'static str, kind: KeyKind) -> KnownKey {
 const KNOWN_KEYS: &[KnownKey] = &[
     key("proxy", KeyKind::Modelled),
     key("upstream", KeyKind::Modelled),
+    key("codexUpstream", KeyKind::Modelled),
     key("switchThreshold", KeyKind::Modelled),
     key("fableWeeklyThreshold", KeyKind::Modelled),
     key("pacing", KeyKind::Modelled),
@@ -294,6 +295,42 @@ mod tests {
     fn no_key_is_registered_twice() {
         let unique: BTreeSet<&str> = KNOWN_KEYS.iter().map(|known| known.name).collect();
         assert_eq!(unique.len(), KNOWN_KEYS.len());
+    }
+
+    /// A config holding a Codex account names no unknown key. The top-level
+    /// `codexUpstream` is a `Config` field, registered as modelled; the
+    /// per-account `provider` and `credentialVersion` sit inside `accounts`,
+    /// which this registry never looks into. Asked both ways [`unknown_keys`]
+    /// documents: the whole file, which leans on the registry, and the `extra`
+    /// map that `tcr doctor` and the boot line hand it.
+    ///
+    /// Watched red: drop the `codexUpstream` line and the whole-file answer names
+    /// it, with `upstream` as its nearest spelling.
+    #[test]
+    fn a_codex_config_names_no_unknown_key() {
+        let file = json!({
+            "proxy": {"port": 3456},
+            "upstream": "https://api.anthropic.com",
+            "codexUpstream": "http://127.0.0.1:9100",
+            "accounts": [
+                {"name": "alice@example.com", "accessToken": "at-a", "credentialVersion": 1},
+                {"name": "alice@example.com/codex", "provider": "codex", "type": "oauth",
+                 "accessToken": "at-c", "accountUuid": "11111111-1111-4111-8111-111111111111",
+                 "credentialVersion": 2}
+            ]
+        });
+        assert_eq!(unknown_keys(&file), Vec::new(), "the whole file");
+        let config: crate::config::Config =
+            serde_json::from_value(file).expect("a Codex config parses");
+        assert_eq!(
+            config.accounts[1].provider,
+            crate::provider::Provider::Codex
+        );
+        assert_eq!(
+            unknown_keys(&Value::Object(config.extra.clone())),
+            Vec::new(),
+            "the unmodelled map doctor and the boot line read"
+        );
     }
 
     /// The camelCase name serde gives a snake_case field under

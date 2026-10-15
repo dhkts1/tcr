@@ -133,6 +133,67 @@ final class ToolsTabDataTests: XCTestCase {
             running.map(\.call.commandHead), ["a bash call", "an agent", "no start time"])
     }
 
+    /// A call with its own, shorter timeout outranks an older `Bash` call when its deadline is
+    /// nearer: the Bash call started 400 s earlier but has 600 s to run, so it is killed at
+    /// 1,600,000 ms, while the Codex call's 120 s run out at 1,520,000 ms.
+    func testRunningCallsSortNearestTheirOwnDeadlineFirst() throws {
+        let payload = """
+            {"supported": true, "sessions": [
+              {"sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+               "account": "alice@example.com", "firstSeenMs": 900000, "lastSeenMs": 1000000,
+               "tools": {"running": [
+                 {"tool": "Bash", "commandHead": "cargo test", "startedMs": 1000000}]}},
+              {"sessionId": "019a3c5e-0000-7000-8000-000000000002",
+               "account": "bob@example.com/codex", "provider": "codex",
+               "firstSeenMs": 1300000, "lastSeenMs": 1400000,
+               "tools": {"running": [
+                 {"tool": "exec_command", "commandHead": "cargo build", "startedMs": 1400000,
+                  "timeoutSeconds": 120}]}}]}
+            """
+        let read = try Fleet.decodeSessions(Data(payload.utf8))
+        XCTAssertEqual(read.sessions.count, 2)
+        let fleet = Fleet(accounts: [], sessions: read.sessions, sessionsSupported: true)
+        XCTAssertEqual(fleet.toolsRunning.map(\.call.tool), ["exec_command", "Bash"])
+    }
+
+    // MARK: - Codex calls
+
+    /// A Codex session's calls sit in the same three lists as Claude's, each entry carrying the
+    /// provider of the session that made it, and BY TOOL files them under the Codex buckets.
+    func testCodexCallsJoinRunningSlowestAndByTool() throws {
+        let canonical = try Fleet.decodeSessions(CanonicalFixtures.data("codex-sessions.json"))
+        let fleet = Fleet(accounts: [], sessions: canonical.sessions, sessionsSupported: true)
+
+        let codexCall = try XCTUnwrap(fleet.toolsRunning.first { $0.call.tool == "exec_command" })
+        XCTAssertEqual(codexCall.provider, .codex)
+        // codex's default shell tool is the interactive `exec_command`, which takes no timeout.
+        XCTAssertNil(codexCall.call.timeoutSeconds)
+        XCTAssertEqual(fleet.toolsRunning.first { $0.call.tool == "Bash" }?.provider, .anthropic)
+
+        let categories = try XCTUnwrap(fleet.toolsByCategory)
+        XCTAssertEqual(
+            categories.map(\.name), ["Bash", "Read/Grep/Edit", "Codex shell", "Codex edit"])
+        XCTAssertEqual(categories.map(\.calls), [8, 4, 2, 1])
+
+        let slowCodexSession = """
+            {"supported": true, "sessions": [
+              {"sessionId": "019a3c5e-0000-7000-8000-000000000005",
+               "account": "bob@example.com/codex", "provider": "codex",
+               "firstSeenMs": 1767225425000, "lastSeenMs": 1767225550000,
+               "tools": {"calls": 1, "slowest": [
+                 {"tool": "exec_command", "commandHead": "cargo test",
+                  "endedMs": 1767225500000, "seconds": 42.0}]}}]}
+            """
+        let added = try Fleet.decodeSessions(Data(slowCodexSession.utf8)).sessions
+        XCTAssertEqual(added.count, 1)
+        let wider = Fleet(
+            accounts: [], sessions: canonical.sessions + added, sessionsSupported: true)
+        let slowest = try XCTUnwrap(wider.toolsSlowest.first)
+        XCTAssertEqual(slowest.call.tool, "exec_command")
+        XCTAssertEqual(slowest.call.seconds, 42.0)
+        XCTAssertEqual(slowest.provider, .codex)
+    }
+
     // MARK: - BY TOOL
 
     /// The line the bars were replaced with, exactly as

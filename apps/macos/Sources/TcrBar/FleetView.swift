@@ -37,6 +37,27 @@ struct FleetView: View {
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
+    /// What this Mac shows of codex, decided by the caller once per panel open.
+    /// The empty fleet reads it for its one Codex line
+    /// (``CodexPresence/emptyFleetHint(home:)``). It is a parameter for the same
+    /// reason ``snapshotMode`` is: the render harness passes `.absent`, except in
+    /// the one scene that names its own.
+    ///
+    /// Add account… and the sign-in sheet read it through ``effectivePresence``,
+    /// which also counts the fleet's own Codex rows.
+    let codexPresence: CodexPresence
+    let resolveCodexPresenceForLogin: (() async -> CodexPresence)?
+    /// What the panel keeps under a Codex account's line for this app run: a
+    /// refused re-login and a group add's warning. Owned by the shell so a note
+    /// survives the panel closing, and observed so recording one redraws the
+    /// lines. The render harness hands each scene its own.
+    @ObservedObject var codexNotes: CodexNoteStore
+    @ObservedObject private var codexBannerSnapshot: CodexBannerSnapshot
+    /// The tcr inside TcrBar when this Mac has no other, resolved by the shell
+    /// beside ``codexPresence``: the Codex line and a saved Codex sign-in say how
+    /// to start codex through the pool with it. The render harness passes
+    /// `initialBundledTcrWithoutCLI` instead.
+    let bundledTcrWithoutCLI: String?
 
     /// Render the account list unscrolled, for the PNG harness only.
     ///
@@ -56,6 +77,11 @@ struct FleetView: View {
     /// Opens the Settings window (gear button, `⌘,`). Same closure shape as
     /// ``onWhatsNew``, and for the same reason: the render harness passes `{}`.
     var onSettings: () -> Void = {}
+    /// Runs a picker for the sign-in sheet, the codex folder to import or the codex
+    /// to use, and keeps the panel up while it runs (the shell's
+    /// `runOpenPanel(_:)`). Same closure shape as ``onSettings``, and for the same
+    /// reason: the render harness passes nothing and can open no panel.
+    var runOpenPanel: (NSOpenPanel) -> URL? = { _ in nil }
     /// Run when **Find Macs on this network** is switched ON, which is where
     /// notification permission is asked for. Same closure shape and same
     /// reason as the two above: the render harness passes `{}`, so a rendered
@@ -86,6 +112,7 @@ struct FleetView: View {
     /// up: one piece of state rather than a session plus a separate
     /// `isPresented` flag that can disagree with it.
     @State private var loginSession: LoginSession?
+    @State private var checkingLoginCapability = false
 
     /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -193,6 +220,12 @@ struct FleetView: View {
     /// touches disk.
     @State private var sessionFiles: [String: SessionFile] = [:]
 
+    /// The Codex sessions' rollout files, remembered across polls — see
+    /// ``CodexRolloutJoin``. Merged into ``sessionFiles`` by
+    /// ``refreshSessionFiles()``.
+    @State private var codexRolloutJoin = CodexRolloutJoin()
+    @State private var sessionFilesReading = false
+
     /// What the box itself is doing, for the Tools tab's machine line. `nil`
     /// until the first reading lands, which is the state the line draws
     /// nothing in: the alternative is "load 0.0 of 0" for one frame, and a
@@ -229,6 +262,28 @@ struct FleetView: View {
     /// so `body` never touches disk. See ``ClaudeRouteRead``.
     @State private var claudeRoute: ClaudeRouteRead.Route?
 
+    /// The running codex sessions (``CodexProcesses``), read only while the
+    /// fleet holds a Codex account, so a Claude-only fleet never pays for the
+    /// walk. `nil` before the first read, and whenever the fleet holds none.
+    @State private var codexCount: Int?
+
+    /// When this app first saw the Codex accounts that can serve at zero
+    /// requests, on a live read, in a row: ``zeroRequestsSince``'s clock for the
+    /// Codex line (``CodexBanner/codexRequests(_:)``).
+    @State private var codexZeroRequestsSince: Date?
+
+    /// Whether this Mac shares its accounts with trusted Macs, for the Codex
+    /// refusal line, when the render harness names it; `nil` reads the peers
+    /// controller.
+    private let peerSharingSeed: Bool?
+
+    /// The home folder a Codex path is shortened against, as `~`.
+    private let homeDirectory: String
+
+    /// The tcr inside TcrBar when this Mac has no other, for the Codex line that
+    /// says to start codex with `tcr run --codex`; `nil` while unknown.
+    private let bundledTcrSeed: String?
+
     /// The kill a confirm is currently open for, `nil` when none is.
     ///
     /// The request holds what the DIALOG needs to name — the command and the
@@ -259,9 +314,17 @@ struct FleetView: View {
         removeController: RemoveAccountController,
         routeController: ClaudeRouteController,
         startServerAtLaunch: Binding<Bool>,
+        codexPresence: CodexPresence,
+        resolveCodexPresenceForLogin: (() async -> CodexPresence)? = nil,
+        // `nil` means a store of the panel's own, made below: a default argument
+        // is evaluated off the main actor, where the store cannot be made.
+        codexNotes: CodexNoteStore? = nil,
+        codexBannerSnapshot: CodexBannerSnapshot? = nil,
+        bundledTcrWithoutCLI: String? = nil,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
+        runOpenPanel: @escaping (NSOpenPanel) -> URL? = { _ in nil },
         onFindingTurnedOn: @escaping () -> Void = {},
         initialTab: PanelTab = .accounts,
         // Found in review (2026-09-12): `snapshotMode` never reads
@@ -297,6 +360,23 @@ struct FleetView: View {
         initialZeroRequestsSince: Date? = nil,
         initialClaudeCount: Int? = nil,
         initialClaudeRoute: ClaudeRouteRead.Route? = nil,
+        // Seeded for the same reason as the three above, for the Codex line:
+        // the render harness never reads the process table or the real clock, so
+        // without these no scene can be five minutes into a quiet Codex pool with
+        // codex running.
+        initialCodexCount: Int? = nil,
+        initialCodexZeroRequestsSince: Date? = nil,
+        // Seeded because the harness never reads the peers file: the one scene
+        // whose refusal line says trusted Macs cannot serve Codex requests names
+        // the sharing it draws. `nil`, the live app's value, reads the controller.
+        initialPeerSharing: Bool? = nil,
+        // The home a Codex path is shortened against. The harness never names
+        // the real home: `nil`, the live app's value, reads ``HomePath/current``.
+        initialHomeDirectory: String? = nil,
+        // The tcr inside TcrBar when no other is found, which the Codex line
+        // names. Seeded because a render never reads the bundle or the disk for
+        // it; the live app resolves it beside ``codexPresence``.
+        initialBundledTcrWithoutCLI: String? = nil,
         // The row (``FleetSectionRow/id``) whose hover card shows on the first
         // frame. The render harness has no pointer, so this is the only way it
         // can draw the card; the live app leaves it `nil` and the pointer
@@ -322,9 +402,15 @@ struct FleetView: View {
         self.removeController = removeController
         self.routeController = routeController
         self._startServerAtLaunch = startServerAtLaunch
+        self.codexBannerSnapshot = codexBannerSnapshot ?? CodexBannerSnapshot()
+        self.codexPresence = codexPresence
+        self.resolveCodexPresenceForLogin = resolveCodexPresenceForLogin
+        self.codexNotes = codexNotes ?? CodexNoteStore()
+        self.bundledTcrWithoutCLI = bundledTcrWithoutCLI
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings
+        self.runOpenPanel = runOpenPanel
         self.onFindingTurnedOn = onFindingTurnedOn
         self._selectedTab = State(initialValue: initialTab)
         self._sessionFiles = State(initialValue: initialSessionFiles)
@@ -334,6 +420,11 @@ struct FleetView: View {
         self._zeroRequestsSince = State(initialValue: initialZeroRequestsSince)
         self._claudeCount = State(initialValue: initialClaudeCount)
         self._claudeRoute = State(initialValue: initialClaudeRoute)
+        self._codexCount = State(initialValue: initialCodexCount)
+        self._codexZeroRequestsSince = State(initialValue: initialCodexZeroRequestsSince)
+        self.peerSharingSeed = initialPeerSharing
+        self.homeDirectory = initialHomeDirectory ?? HomePath.current
+        self.bundledTcrSeed = initialBundledTcrWithoutCLI
         self._hoverCard = State(initialValue: HoverCardTracker(shown: initialHoverCard))
         self._litAccount = State(initialValue: initialLitAccount)
         self._keptOpen = State(
@@ -364,23 +455,37 @@ struct FleetView: View {
         // `RenderStates.swift`'s sessions-tab fixtures.
         .onAppear {
             if !snapshotMode {
-                sessionFiles = SessionFiles.read()
+                codexBannerSnapshot.observe(codexBannerCandidate)
+                codexBannerSnapshot.observeSessionsLine(codexSessionsNoticeCandidate)
+                refreshSessionFiles()
                 machine = MachineStats.read()
-                refreshRunningProcesses()
                 refreshClaudeCount()
                 claudeRoute = ClaudeRouteRead.current()
+                refreshCodexCount()
             }
+            syncPeersProvider()
+        }
+        .onChange(of: codexSessionsNoticeCandidate) { line in
+            if !snapshotMode { codexBannerSnapshot.observeSessionsLine(line) }
+        }
+        .onChange(of: codexBannerCandidate) { candidate in
+            if !snapshotMode { codexBannerSnapshot.observe(candidate) }
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
-                sessionFiles = SessionFiles.read()
+                codexBannerSnapshot.observe(codexBannerCandidate)
+                codexBannerSnapshot.observeSessionsLine(codexSessionsNoticeCandidate)
+                refreshSessionFiles()
                 machine = MachineStats.read()
-                refreshRunningProcesses()
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
+                refreshCodexCount()
+                refreshCodexZeroRequestsSince()
                 pruneKeptOpenCards()
+                reconcileCodexNotes()
             }
+            syncPeersProvider()
         }
         // The kill confirm. `docs/design/tools-tab.md`: "a destructive control
         // confirms … kill asks once, names the command it will signal."
@@ -406,9 +511,11 @@ struct FleetView: View {
         }
         // The sheet IS `loginSession != nil` — dismissing by any route (Esc,
         // click-away) runs the same cancel the button does, because a login
-        // left running would keep a loopback listener open for the rest of its
-        // 2-minute timeout, ready to accept a callback for a flow the person
-        // just abandoned.
+        // left running would keep a loopback listener open, ready to accept a
+        // callback for a flow the person just abandoned: for the rest of a
+        // Claude login's 2-minute timeout, and for good on a Codex sign-in,
+        // whose `codex login` has no timeout. Quitting TcrBar, or a rebuild
+        // that drops the session, cancels it too (`LoginSession.cancel()`).
         .sheet(
             isPresented: Binding(
                 get: { loginSession != nil },
@@ -418,12 +525,19 @@ struct FleetView: View {
             if let loginSession {
                 LoginSheetHost(
                     session: loginSession,
+                    bundledTcrWithoutCLI: bundledTcrWithoutCLI,
                     onCopyLink: { url in
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(url.absoluteString, forType: .string)
                     },
                     onCancel: { endLogin(cancelling: true) },
-                    onDone: { endLogin(cancelling: false) }
+                    onDone: { endLogin(cancelling: false) },
+                    onChoose: { request in beginLogin(request) },
+                    onImportLink: { chooseCodexFolder(for: loginSession) },
+                    onConfirmImport: {
+                        if let request = loginSession.request { beginLogin(request) }
+                    },
+                    onChooseCodex: { chooseCodexExecutable(for: loginSession) }
                 )
             }
         }
@@ -470,7 +584,10 @@ struct FleetView: View {
     @ViewBuilder
     private func hoverCardBody(_ row: FleetSectionRow) -> some View {
         if case .loaded(let fleet) = poller.state {
-            AccountHoverCardContent(row: row, now: Date(), snapshotMode: snapshotMode) {
+            AccountHoverCardContent(
+                row: row, now: Date(), snapshotMode: snapshotMode,
+                namesProvider: fleet.holdsCodex
+            ) {
                 v4AccountRow(row.account, in: fleet, actionsOnly: true)
             } menu: {
                 v4AccountRow(row.account, in: fleet, menuOnly: true)
@@ -537,6 +654,48 @@ struct FleetView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, V4.summaryPaddingSide)
                 .padding(.bottom, V4.summaryPaddingBottom)
+        }
+    }
+
+    /// The one Codex line, under the Claude one and built the same way: amber
+    /// when it asks for action, dim when it only reports. Every input is what
+    /// this panel measured or the harness seeded. See ``CodexBanner``. Its
+    /// commands are drawn as ``CommandProseText``: without their backticks,
+    /// never broken inside a path or a flag, and copied from the line's menu.
+    private var codexSessionsNoticeCandidate: String? {
+        poller.state.loadedFleet.flatMap(SessionsCodexCopy.trafficWithoutSessionsLine)
+    }
+
+    private func codexSessionsNotice(_ fleet: Fleet) -> String? {
+        snapshotMode && !codexBannerSnapshot.hasOpened
+            ? SessionsCodexCopy.trafficWithoutSessionsLine(fleet) : codexBannerSnapshot.sessionsLine
+    }
+
+    private var codexBannerCandidate: CodexBanner? {
+        guard let fleet = poller.state.loadedFleet else { return nil }
+        return currentCodexBanner(fleet)
+    }
+
+    private func currentCodexBanner(_ fleet: Fleet) -> CodexBanner? {
+        CodexBanner.current(
+            fleet: fleet, codexProcesses: codexCount,
+            codexQuietFor: codexZeroRequestsSince.map { Date().timeIntervalSince($0) },
+            peerSharing: peerSharingSeed ?? peers.snapshot.sharing,
+            bundledTcrWithoutCLI: snapshotMode ? bundledTcrSeed : bundledTcrWithoutCLI)
+    }
+
+    @ViewBuilder
+    private func codexBanner(_ fleet: Fleet) -> some View {
+        if let banner = snapshotMode && !codexBannerSnapshot.hasOpened
+            ? currentCodexBanner(fleet) : codexBannerSnapshot.shown
+        {
+            CommandProseText(text: banner.text, size: V4.muteSize)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(banner.tint == .near ? Tok.near : Tok.dim)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, V4.summaryPaddingSide)
+                .padding(.bottom, V4.summaryPaddingBottom)
+                .accessibilityLabel(CommandProse.spoken(banner.text))
         }
     }
 
@@ -627,7 +786,11 @@ struct FleetView: View {
                 if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
                 noRequestsBanner(fleet)
+                // The question about claude follows the Claude line, and the
+                // Codex line comes last. The shell freezes it for this opening,
+                // so polling cannot insert it or move the account list.
                 claudeRoutePrompt
+                codexBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
             // header at ``header`` has always carried and the v4 summary block
             // dropped: a server that predates the sessions wire reports no
@@ -841,12 +1004,23 @@ struct FleetView: View {
             },
             // Read here, on the panel's own controllers, because option H's
             // rows never drew them: a refused delete looked like no click.
+            //
+            // A Codex row also carries its own note: why it is signed out, from
+            // the refresh error the server reports. It rides the same lines, so
+            // it shows under the row without a hover and is read in list order.
             notices: { account in
                 AccountRowNotice.collect(
                     deleteFailure: removeController.failure(for: account.ref),
                     deleteNotice: removeController.notice(for: account.ref),
                     groupFailure: groupController.failure(forAccount: account.ref),
-                    toggleFailure: accounts.failure(for: account.ref))
+                    toggleFailure: accounts.failure(for: account.ref),
+                    codexNote: account.provider == .codex
+                        ? CodexCardFacts.noteLine(
+                            reloginRefusal: codexNotes.notes.reloginRefusal(for: account.ref),
+                            loginError: account.loginError, codexHome: account.codexHome,
+                            groupAddWarning: codexNotes.notes.groupAddWarning(for: account.ref)
+                        ).map(AccountRowNotice.init(codexNote:))
+                        : nil)
             },
             menu: { account in
                 // The row's own actions, from the ONE definition of them —
@@ -878,11 +1052,13 @@ struct FleetView: View {
             accounts: accounts,
             control: control,
             onChanged: { await poller.pollOnce() },
-            onRelogin: { reloginAccount(account.ref) },
+            onRelogin: { reloginAccount(account) },
+            onReimport: { reimportAccount(account) },
             onMint: { mintAccountToken(account.ref) },
             onMintGroup: { group in mintGroupTokens(group) },
             groupController: groupController,
             removeController: removeController,
+            codexNotes: codexNotes,
             allAccounts: fleet.accounts,
             snapshotMode: snapshotMode,
             menuOnly: menuOnly,
@@ -907,7 +1083,7 @@ struct FleetView: View {
                     v4Actions
                 }
                 if let loginError {
-                    Text(loginError)
+                    Text(PredatesCodexRefusal.displayed(loginError))
                         .font(V4.font(V4.muteSize))
                         .foregroundStyle(Tok.spent)
                         .fixedSize(horizontal: false, vertical: true)
@@ -918,7 +1094,7 @@ struct FleetView: View {
                 // repeats the state of the button beside it is a line the
                 // mockup's footer does not have and does not need.
                 if !server.state.isOurChild {
-                    Text(server.state.summary)
+                    Text(server.summary)
                         .font(V4.font(V4.footerSize))
                         .foregroundStyle(Tok.mute)
                         .fixedSize(horizontal: false, vertical: true)
@@ -990,15 +1166,27 @@ struct FleetView: View {
 
     /// Where this tab's numbers come from — the mockup gives each tab its own
     /// provenance line rather than repeating one global block on all three.
+    /// Sessions and Tools name codex once the loaded fleet holds a Codex
+    /// account (``SessionsCodexCopy``); before a fleet loads they say what
+    /// they always said.
     private var v4FooterLeading: String {
         switch visibleTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
-        // Both lines are sized to fit beside their trailing fact at 372 pt:
-        // the longer "proxy + Claude Code session files" and "from request
-        // bodies only · nothing logged" both drew truncated, and the second
-        // is the panel's one privacy claim.
-        case .sessions: return "proxy + session files"
-        case .tools: return "request bodies only · nothing logged"
+        // Both Claude-only lines, here and in ``SessionsCodexCopy``, are sized
+        // to fit beside their trailing fact at 372 pt: the longer "proxy +
+        // Claude Code session files" and "from request bodies only · nothing
+        // logged" both drew truncated, and the second is the panel's one
+        // privacy claim.
+        case .sessions:
+            if case .loaded(let fleet) = poller.state {
+                return SessionsCodexCopy.sessionsFooter(fleet)
+            }
+            return "proxy + session files"
+        case .tools:
+            if case .loaded(let fleet) = poller.state {
+                return SessionsCodexCopy.toolsFooter(holdsCodex: fleet.holdsCodex)
+            }
+            return "request bodies only · nothing logged"
         case .peers: return "peer mesh · nothing built yet"
         }
     }
@@ -1006,6 +1194,13 @@ struct FleetView: View {
     private var v4FooterTrailing: String? {
         if visibleTab == .sessions { return "sparkline: req/min, 30m" }
         guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
+        // With a Codex account the Tools footer's provenance sentence says
+        // "request and response bodies · nothing logged", 268.8 pt, and beside
+        // "server abc1234" the row leaves it 239.0: the privacy claim would be
+        // cut to make room for a build id the other tabs still show. The
+        // sentence outranks the id (`PanelFooter`'s own rule), so here the id
+        // goes.
+        if visibleTab == .tools, fleet.holdsCodex { return nil }
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }
 
@@ -1034,7 +1229,8 @@ struct FleetView: View {
                 if !fleetIsEmpty {
                     V4Button(
                         title: "Add account…",
-                        help: Self.addAccountHelp
+                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent)
+                            ?? Self.addAccountHelp
                     ) { addAccount() }
                 }
                 Spacer(minLength: 0)
@@ -1325,12 +1521,25 @@ struct FleetView: View {
                 tint: Tok.spent
             )
         case .commandFailed(let code, let message):
-            banner(
-                icon: Tok.unreadableGlyph,
-                title: "tcr status failed (exit \(code))",
-                detail: message.isEmpty ? "The server is probably not running." : message,
-                tint: Tok.spent
-            )
+            if PredatesCodexRefusal.matches(message) {
+                // The selected tcr cannot read a config holding a Codex account, and
+                // its refusal names a credential version, not the fix. The banner
+                // names the tcr and the fix; tcr's own words stay in the tooltip.
+                banner(
+                    icon: Tok.unreadableGlyph,
+                    title: CodexSignInCopy.predatesCodexTitle,
+                    detail: CodexSignInCopy.predatesCodexDetail,
+                    tint: Tok.spent
+                )
+                .help(message)
+            } else {
+                banner(
+                    icon: Tok.unreadableGlyph,
+                    title: "tcr status failed (exit \(code))",
+                    detail: message.isEmpty ? "The server is probably not running." : message,
+                    tint: Tok.spent
+                )
+            }
         case .undecodable(let message):
             // The decoder's own text is a Swift `DecodingError` description —
             // key paths and type names. It is the right thing to keep and the
@@ -1350,7 +1559,7 @@ struct FleetView: View {
         case .loaded(let fleet):
             if fleet.accounts.isEmpty {
                 // The remedy is a button now, not an instruction: signing in
-                // runs in the app (``beginLogin(reloggingIn:)``), and telling
+                // runs in the app (``beginLogin(_:)``), and telling
                 // someone to go and type a command is the worst version of an
                 // empty state — it names work the panel can do for them.
                 VStack(alignment: .leading, spacing: V4.buttonGap) {
@@ -1362,11 +1571,15 @@ struct FleetView: View {
                         icon: "tray",
                         title: "No accounts configured",
                         detail: "tcr answered, and the fleet is empty. Add one to start serving.",
-                        tint: Tok.dim
+                        tint: Tok.dim,
+                        // Only on evidence of codex: with none there is no line,
+                        // and the empty fleet is the one it always was.
+                        extra: codexPresence.emptyFleetHint(home: homeDirectory)
                     )
                     V4Button(
                         title: "Add account…",
-                        help: Self.addAccountHelp
+                        help: CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent)
+                            ?? Self.addAccountHelp
                     ) { addAccount() }
                 }
             } else {
@@ -1517,10 +1730,14 @@ struct FleetView: View {
                 detail: detail,
                 tint: Tok.unknown)
         } else if fleet.sessions.isEmpty {
+            // A proxy too old to record Codex sessions lists none, while a
+            // Codex row says codex was busy: that is said, rather than an
+            // idle hour nobody had.
             banner(
                 icon: "person.2",
                 title: "No live sessions",
-                detail: "Nothing has spoken to the proxy in the last hour.",
+                detail: codexSessionsNotice(fleet)
+                    ?? SessionsCodexCopy.emptyDetail(fleet),
                 tint: Tok.inkDim)
         } else {
             let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
@@ -1532,17 +1749,31 @@ struct FleetView: View {
             // "Show N more sessions" button already follows.
             let fold = SessionsFold(joined, now: Date())
             let displayed = warmupsExpanded ? joined : fold.visible
+            let trafficNotice = codexSessionsNotice(fleet)
             if snapshotMode {
-                sessionsTabBody(displayed: displayed, fold: fold)
+                sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
             } else {
-                ScrollView { sessionsTabBody(displayed: displayed, fold: fold) }
-                    .frame(height: visibleRowsHeight(for: fleet))
+                ScrollView {
+                    sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
+                }
+                .frame(height: visibleRowsHeight(for: fleet))
             }
         }
     }
 
-    private func sessionsTabBody(displayed: [JoinedSession], fold: SessionsFold) -> some View {
+    /// `trafficNotice` is ``SessionsCodexCopy/trafficWithoutSessionsLine(_:)``: above the
+    /// list, because the list itself cannot say that its Codex sessions are
+    /// missing, only that the ones it has are there.
+    private func sessionsTabBody(
+        displayed: [JoinedSession], fold: SessionsFold, trafficNotice: String?
+    ) -> some View {
         VStack(alignment: .leading, spacing: Tok.cardGap) {
+            if let trafficNotice {
+                Text(trafficNotice)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             sessionsList(displayed)
             warmupFoldLine(fold)
         }
@@ -1713,9 +1944,10 @@ struct FleetView: View {
                     // clause at all on a server that does not send it: the two
                     // earlier rounds of this bridge left the `$` out entirely
                     // for exactly that reason, and the field existing is what
-                    // changed, not the rule.
-                    if let cost = row.session.costUsd {
-                        Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
+                    // changed, not the rule. `costLabel` marks partial prices as lower
+                    // bounds and omits a rounded zero while some work remains unpriced.
+                    if let cost = row.session.costLabel {
+                        Text(" · \(cost)").monospacedDigit()
                             .lineLimit(1).layoutPriority(1)
                     }
                     // How long this session's prompt cache stays warm, from the server's
@@ -1786,8 +2018,18 @@ struct FleetView: View {
     /// account that got cut ("sonnet-5 · h…" in `--render-states`). Absent while
     /// the proxy has not attributed the session to an account yet, never
     /// guessed.
+    ///
+    /// In a fleet holding both providers a Codex session's subtitle leads with
+    /// `Codex` (``SessionsCodexCopy/subtitleLead(for:in:)``), read off the
+    /// fleet in ``poller`` as ``v4Badges`` reads it. A Claude row's subtitle is
+    /// what it always was.
     private func sessionSubtitle(_ row: JoinedSession, showProject: Bool) -> String {
-        [
+        var lead: String?
+        if case .loaded(let fleet) = poller.state {
+            lead = SessionsCodexCopy.subtitleLead(for: row.session, in: fleet)
+        }
+        return [
+            lead,
             showProject ? row.project : nil,
             row.session.account.map(AccountName.short),
             row.session.model.map(QuotaFormat.modelLabel),
@@ -1859,7 +2101,12 @@ struct FleetView: View {
             // word: it is the join-has-no-file case, not a fourth state
             // this build has a name for, and inventing one here would claim
             // a reading nobody made.
+            //
+            // A Codex session says how long ago it was last seen, "2m ago":
+            // tcr cannot see what codex does between requests, so it never
+            // calls one idle or waiting.
             let age = row.ageLabel(now: now)
+            if row.session.provider == .codex { return SessionsCodexCopy.trailing(age: age) }
             switch row.activity {
             case .waiting: return "waiting \(age)"
             case .idle: return "idle \(age)"
@@ -1926,7 +2173,7 @@ struct FleetView: View {
         }
     }
 
-    /// RUNNING NOW — one two-line item per call, longest-running first
+    /// RUNNING NOW — one two-line item per call, nearest its own deadline first
     /// (``Fleet/toolsRunning`` sorts them), five before the fold.
     @ViewBuilder
     private func runningNowSection(_ fleet: Fleet) -> some View {
@@ -1938,7 +2185,8 @@ struct FleetView: View {
             // Finding 5 stated the denominator the ring fills toward here, as
             // "· ring fills toward the 600s timeout". It now sits on the ring
             // itself (its help and its spoken "4m 18s of 600s"): no
-            // explanatory captions over the rows (Gil, 2026-10-14).
+            // explanatory captions over the rows (Gil, 2026-10-14). That holds
+            // for a codex call too, whose ring may fill toward its own timeout.
             toolsSection("RUNNING NOW", subtitle: "\(entries.count)") {
                 ForEach(Array(visible.enumerated()), id: \.offset) { index, entry in
                     if index > 0 { itemRule }
@@ -2149,15 +2397,17 @@ struct FleetView: View {
         let elapsed = entry.call.startedMs.map { started in
             max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
         }
-        // Only a Bash call HAS a timeout to be near: an Agent or a Read has no
-        // cap this build knows, so it draws no ring and can never be "20s
-        // from" anything. `ToolCall.capped` is the ONE place that decides
-        // that — the running list's own sort (`Fleet.toolsRunning`) reads the
-        // same property — and the ring, the tint and the label all read it
-        // here too; the first draft decided it per site and printed "17s
-        // left" beside a call with no ring.
-        let capped = entry.call.capped
-        let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
+        // A call HAS a timeout to be near only when this build knows its cap:
+        // its own, when the wire carries one (a codex call), or the Bash
+        // tool's 600s for a Claude `Bash` call. An Agent, a Read or a codex
+        // call with no timeout has none, so it draws no ring and can never be
+        // "20s from" anything. `ToolCall.timeoutCap(bashTimeout:)` is the ONE
+        // place that decides that — the running list's own sort
+        // (`Fleet.toolsRunning`) reads the same expression — and the ring, the
+        // tint and the label all read it here too; the first draft decided it
+        // per site and printed "17s left" beside a call with no ring.
+        let cap = entry.call.timeoutCap(bashTimeout: bashTimeoutSeconds)
+        let remaining = cap.flatMap { cap in elapsed.map { cap - $0 } }
         // The ONE expression this row and the tab's own summary line
         // (``toolsSummaryLine``, via ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)``)
         // both read — see ``SessionToolEntry/isNearTimeout(now:timeoutSeconds:warnWithinSeconds:)``'s
@@ -2179,18 +2429,20 @@ struct FleetView: View {
                 // `.tool .tt{gap:6px}` for this row, and two of the points
                 // that pay for the cpu/memory clause beside the session name.
                 HStack(spacing: V4.pillGap) {
-                    if capped {
+                    if let cap {
                         ProgressRing(
-                            fraction: (elapsed ?? 0) / bashTimeoutSeconds,
+                            fraction: (elapsed ?? 0) / cap,
                             tint: isNearTimeout ? Tok.spent : Tok.ok,
                             accessibilityText: elapsed.map {
-                                "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
+                                "\(durationLabel($0)) of \(Int(cap))s"
                             },
                             size: V4.toolRowRingSize
                         )
                         // The denominator, where the ring is: the section
                         // head used to carry it as a caption over every row.
-                        .help("Fills toward the \(Int(bashTimeoutSeconds))s tool timeout")
+                        // `cap`, as the ring itself: a codex call's own
+                        // timeout, or the Bash tool's 600s.
+                        .help("Fills toward the \(Int(cap))s tool timeout")
                     }
                     // Elapsed and "20s left" are ONE reading, so they are one
                     // Text: a call in the warning band is red AND says how
@@ -2203,9 +2455,29 @@ struct FleetView: View {
                     .font(V4.font(V4.dimSize))
                     .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
                     .lineLimit(1)
-                    if stats != nil { killButton(entry) }
+                    // tcr cannot match a codex call to a process, so it never
+                    // offers to kill one, and says so in the ✕'s place: an
+                    // empty slot would read as a button that failed to draw.
+                    if entry.provider == .codex {
+                        noKillLabel
+                    } else if stats != nil {
+                        killButton(entry)
+                    }
                 }
             })
+    }
+
+    /// The words a running Codex call's row shows where a Claude call's ✕
+    /// goes, in the panel's mute style, in a slot of their own width
+    /// (``V4/noKillWidth``). The help and VoiceOver say why.
+    private var noKillLabel: some View {
+        Text(SessionsCodexCopy.noKill)
+            .font(V4.font(V4.muteSize))
+            .foregroundStyle(Tok.mute)
+            .lineLimit(1)
+            .frame(width: V4.noKillWidth)
+            .help(SessionsCodexCopy.noKillHelp)
+            .accessibilityLabel(SessionsCodexCopy.noKillHelp)
     }
 
     /// The ✕ at the trailing end of a running row.
@@ -2316,6 +2588,33 @@ struct FleetView: View {
         refreshRunningProcesses()
     }
 
+    /// One poll's session files: Claude Code's, and, when this Mac has a codex
+    /// home, the first line of the rollout codex wrote for each Codex session
+    /// the proxy lists (``CodexRolloutJoin``, which looks each one up once).
+    /// A Claude file wins an id clash. Read on appear and on each poll, never
+    /// in `snapshotMode`, like the Claude files alone were.
+    private func refreshSessionFiles() {
+        guard !sessionFilesReading else { return }
+        sessionFilesReading = true
+        let home = codexPresence.codexHome
+        let ids = Set(
+            poller.state.loadedFleet?.sessions.filter { $0.provider == .codex }.map(\.sessionId) ?? [])
+        let join = codexRolloutJoin
+        Task {
+            let reading = await PanelSessionFiles.read(
+                codexHome: home, sessionIds: ids, join: join, now: Date())
+            sessionFilesReading = false
+            // A changed home starts a fresh lookup rather than publishing the old home's join.
+            guard home == codexPresence.codexHome else {
+                refreshSessionFiles()
+                return
+            }
+            codexRolloutJoin = reading.join
+            sessionFiles = reading.files
+            refreshRunningProcesses()
+        }
+    }
+
     /// One poll's process reading for every RUNNING Bash call on the tab.
     ///
     /// Bash only: `ProcessMatch` matches a SHELL child, and an Agent or Read
@@ -2350,6 +2649,17 @@ struct FleetView: View {
         claudeCount = ProcessTable.read().filter { $0.name == "claude" }.count
     }
 
+    /// The running codex sessions, off one more walk of the process table, and
+    /// only while the fleet holds a Codex account: a Claude-only fleet never
+    /// pays for it. See ``CodexBanner``.
+    private func refreshCodexCount() {
+        guard case .loaded(let fleet) = poller.state, fleet.holdsCodex else {
+            codexCount = nil
+            return
+        }
+        codexCount = CodexProcesses.readLive()
+    }
+
     /// Drops every kept-open account the poll that just landed no longer
     /// lists, so a card never stays open as a ghost of an account that left.
     /// Only off a loaded fleet: an unreachable proxy says nothing about which
@@ -2360,6 +2670,33 @@ struct FleetView: View {
         guard pruned != keptOpen else { return }
         keptOpen = pruned
         UserDefaults.standard.set(keptOpen.ids, forKey: Self.keptOpenCardsKey)
+    }
+
+    /// Tells the Peers tab whether the fleet holds a Codex account, from the poll
+    /// that just landed (`false` while no fleet is loaded). No Mac lends, serves or
+    /// carries a Codex request, so with one the tab names Claude in every promise
+    /// about borrowing or carrying. Written only when it changes, so an unchanged
+    /// fleet costs the tab no redraw. It reads nothing from the machine, so it runs
+    /// in `snapshotMode` too.
+    private func syncPeersProvider() {
+        let holdsCodex = poller.state.loadedFleet?.holdsCodex == true
+        if peers.holdsCodex != holdsCodex {
+            peers.holdsCodex = holdsCodex
+        }
+    }
+
+    /// Drops every Codex note the poll that just landed has moved past: a refused
+    /// re-login once its row's state changes, a group add's warning once its row
+    /// leaves that group, and either once its row leaves the fleet. Only off a
+    /// loaded fleet, for the reason ``pruneKeptOpenCards()`` gives: a failed poll
+    /// says nothing about the rows, so it leaves every note as it was. With the
+    /// time that poll's read began, so a poll already under way when a group add
+    /// returned, which still lists the groups from before it, keeps that add's
+    /// warning.
+    private func reconcileCodexNotes() {
+        guard case .loaded(let fleet) = poller.state else { return }
+        let pollBegan = poller.lastPollBegan ?? .distantFuture
+        codexNotes.reconcile(with: fleet.accounts, pollBegan: pollBegan)
     }
 
     /// "Keep Card Open" / "Close Card": the line turns into the card, or the
@@ -2386,14 +2723,39 @@ struct FleetView: View {
         }
     }
 
+    /// ``refreshZeroRequestsSince()`` for the Codex line: advances or clears
+    /// ``codexZeroRequestsSince`` off the poll that just landed. The pure check
+    /// is ``CodexBanner/codexRequests(_:)``.
+    private func refreshCodexZeroRequestsSince() {
+        guard case .loaded(let fleet) = poller.state,
+            let total = CodexBanner.codexRequests(fleet)
+        else {
+            codexZeroRequestsSince = nil
+            return
+        }
+        if total > 0 {
+            codexZeroRequestsSince = nil
+        } else if codexZeroRequestsSince == nil {
+            codexZeroRequestsSince = Date()
+        }
+    }
+
     /// The Accounts tab's no-requests banner text, or `nil` when it must not
-    /// show. See ``NoRequestsBanner``.
+    /// show. See ``NoRequestsBanner``. Beside a Codex account the proxy does
+    /// serve requests, so the sentence names Claude.
+    ///
+    /// In a fleet holding a Codex account the live clock already clears without
+    /// an enabled Claude account; the first guard makes the text say the same to
+    /// a seeded clock. A Claude-only fleet skips the check and draws exactly what
+    /// it drew.
     private func noRequestsBannerText(_ fleet: Fleet) -> String? {
+        guard !fleet.holdsCodex || NoRequestsBanner.totalRequests(fleet) != nil else { return nil }
         guard let since = zeroRequestsSince, let route = claudeRoute else { return nil }
         return NoRequestsBanner.text(
             liveFor: Date().timeIntervalSince(since),
             claudeCount: claudeCount,
-            route: route)
+            route: route,
+            namesClaude: fleet.holdsCodex)
     }
 
     /// One of today's slowest calls — the same item, with a pill where the
@@ -2404,13 +2766,16 @@ struct FleetView: View {
             trailing: {
                 if let seconds = entry.call.seconds {
                     // A killed call says so in WORDS, never red against grey
-                    // alone, and the spoken value says it too.
-                    let spoken = ToolCallLabel.spoken(
-                        seconds: seconds, timeout: bashTimeoutSeconds)
-                    let timedOut = ToolCallLabel.timedOut(
-                        seconds: seconds, timeout: bashTimeoutSeconds)
+                    // alone, and the spoken value says it too. Judged against
+                    // the call's own timeout: the Bash tool's 600s for a Claude
+                    // call, and for a codex call the timeout it named, or none,
+                    // so it never reads "timed out" at a limit it did not have.
+                    let timeout = ToolCallLabel.judgedTimeout(
+                        for: entry, bashTimeout: bashTimeoutSeconds)
+                    let spoken = ToolCallLabel.spoken(seconds: seconds, timeout: timeout)
+                    let timedOut = ToolCallLabel.timedOut(seconds: seconds, timeout: timeout)
                     V4Pill(
-                        text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
+                        text: ToolCallLabel.pill(seconds: seconds, timeout: timeout),
                         role: timedOut ? .bad : .neutral,
                         uppercased: timedOut
                     )
@@ -2455,9 +2820,11 @@ struct FleetView: View {
                         .layoutPriority(1)
                     // ` · Bash`, REPLACED by ` · 640% · 2.1G` once a process
                     // is matched. The tool word goes rather than the figure
-                    // because this row's tool is already said by the ring
-                    // (only a Bash call has one), by the ✕ (only a Bash call
-                    // can be killed) and by the hover text, which is
+                    // because this row's tool is already said by the ring (a
+                    // codex call that names a timeout draws one too, but only
+                    // a Bash call is ever matched to a process, so a ring
+                    // beside no tool word is a Bash call's), by the ✕ (only a
+                    // Bash call can be killed) and by the hover text, which is
                     // `pid 48765 · Bash · 640% cpu` — the pid and the unit
                     // being what you check after deciding, not while scanning.
                     //
@@ -2470,7 +2837,10 @@ struct FleetView: View {
                     // 11 for the figure. The point that buys is also what made
                     // the line fit with the session name whole.
                     if meta.isEmpty {
-                        MuteText(text: " · \(entry.call.tool)")
+                        MuteText(
+                            text: " · "
+                                + ToolCallLabel.rowWord(
+                                    forTool: entry.call.tool, provider: entry.provider))
                     } else {
                         StatText(text: meta)
                             .help(metaHover ?? "")
@@ -2515,13 +2885,16 @@ struct FleetView: View {
         return String(sessionId.prefix(8))
     }
 
-    /// The Bash tool's own timeout — the one denominator this build knows,
-    /// and the reason `docs/design/panel-tabs.md` names 600s specifically:
-    /// "The ten slowest calls today all sit at 600s: the Bash tool's own
-    /// timeout." A non-Bash running call has no known denominator and draws
-    /// no ring, per finding 5's own fix ("state the denominator … set to the
-    /// third ring") — inventing one for a tool this build has no timeout
-    /// figure for would be the same overclaim finding 5 exists to remove.
+    /// The Bash tool's own timeout — the denominator for a Claude `Bash` call,
+    /// whose wire names none, and the reason `docs/design/panel-tabs.md` names
+    /// 600s specifically: "The ten slowest calls today all sit at 600s: the
+    /// Bash tool's own timeout." A codex call that names its own timeout fills
+    /// toward that instead (``ToolCall/timeoutCap(bashTimeout:)``), and SLOWEST
+    /// TODAY judges it by that (``ToolCallLabel/judgedTimeout(for:bashTimeout:)``).
+    /// Any other running call has no known denominator and draws no ring, per
+    /// finding 5's own fix ("state the denominator … set to the third ring") —
+    /// inventing one for a tool this build has no timeout figure for would be
+    /// the same overclaim finding 5 exists to remove.
     private var bashTimeoutSeconds: Double { V4.toolTimeoutSeconds }
 
     /// How many running calls the tab draws before its disclosure button —
@@ -2572,21 +2945,31 @@ struct FleetView: View {
         let working = joined.filter { $0.activity == .busy }.count
         let waiting = joined.filter { $0.activity == .waiting }.count
         var numbers: [Text] = []
-        if let hourly = fleet.burnRateSegment {
-            numbers.append(summaryPhrase(hourly))
-        }
-        if let today = fleet.todayCost {
-            numbers.append(summaryPhrase("\(QuotaFormat.usd(today)) today"))
-        }
-        if let live = fleet.sessionsLiveCost {
-            numbers.append(summaryPhrase("\(QuotaFormat.usd(live)) live"))
-        }
-        if !fleet.accounts.isEmpty {
-            numbers.append(
-                summaryPhrase("\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
-        }
-        if fleet.toolsTotalErrors > 0 {
-            numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err"))
+        // A fleet holding a Codex account counts each pool apart
+        // (``SessionsCodexCopy/summaryClauses(_:)``): Codex requests are never
+        // priced, so one fleet-wide burn rate and one account ratio would file
+        // them as Claude's missing dollars. Every other fleet keeps the line
+        // below.
+        if let clauses = SessionsCodexCopy.summaryClauses(fleet) {
+            numbers = clauses.map(summaryPhrase)
+        } else {
+            if let hourly = fleet.burnRateSegment {
+                numbers.append(summaryPhrase(hourly))
+            }
+            if let today = fleet.todayCost {
+                numbers.append(summaryPhrase("\(QuotaFormat.usd(today)) today"))
+            }
+            if let live = fleet.sessionsLiveCostLabel {
+                numbers.append(summaryPhrase("\(live) live"))
+            }
+            if !fleet.accounts.isEmpty {
+                numbers.append(
+                    summaryPhrase(
+                        "\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
+            }
+            if fleet.toolsTotalErrors > 0 {
+                numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err"))
+            }
         }
         return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack(alignment: .firstTextBaseline) {
@@ -2863,7 +3246,7 @@ struct FleetView: View {
         switch kind {
         case .ok: return Tok.color(for: QuotaState.ok)
         case .near: return Tok.color(for: QuotaState.near)
-        case .spent, .needsRelogin, .rejected: return Tok.spent
+        case .spent, .needsRelogin, .rejected, .unreachable: return Tok.spent
         case .unknown: return Tok.unknown
         case .unmeasured: return Tok.unmeasured
         case .disabled: return Tok.disabled
@@ -2942,8 +3325,8 @@ struct FleetView: View {
     private func smooshedStatePill(_ account: Account) -> some View {
         if account.health == .needsRelogin {
             StatusPill("needs re-login", tint: Tok.spent)
-        } else if account.isRejected {
-            StatusPill("rejected", tint: Tok.spent)
+        } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
+            StatusPill(LegacyRowCopy.rejectedPillWord(account), tint: Tok.spent)
         } else if account.hasQuotaEvidence {
             StatusPill(account.quotaState.token, tint: Tok.color(for: account.quotaState))
         } else if account.probeStatus.isFailure {
@@ -3149,9 +3532,11 @@ struct FleetView: View {
     /// Persisted across launches under ``expandedGroupsKey`` — a collapsed
     /// group an operator has already opened once should stay open, not
     /// re-collapse on the next poll or the next time the panel opens. Keyed on
-    /// ``FleetGroupKey/token`` rather than the bare name for the same collision
-    /// reason `FleetSectionRow.id` uses it: a group literally named
-    /// `Ungrouped` cannot borrow the sentinel's key.
+    /// ``FleetSection/expansionKey``: a Claude box's key is its group's
+    /// ``FleetGroupKey/token``, as the legacy panel's is, rather than the bare
+    /// name, for the same collision reason `FleetSectionRow.id` uses it — a
+    /// group literally named `Ungrouped` cannot borrow the sentinel's key — and
+    /// a Codex box's key adds `codex:`, so the two boxes of one group open apart.
     ///
     /// ONE set for both collapsed shapes — the parked smoosh and a live
     /// group's summary line. "This group is open" is one fact about one group,
@@ -3165,11 +3550,11 @@ struct FleetView: View {
     /// (`15b-parked-group-expanded`) without a second copy of the literal.
     static let expandedGroupsKey = "expandedGroupNames"
 
-    private func toggleGroupExpansion(_ groupToken: String) {
-        if expandedGroups.contains(groupToken) {
-            expandedGroups.remove(groupToken)
+    private func toggleGroupExpansion(_ key: String) {
+        if expandedGroups.contains(key) {
+            expandedGroups.remove(key)
         } else {
-            expandedGroups.insert(groupToken)
+            expandedGroups.insert(key)
         }
         UserDefaults.standard.set(Array(expandedGroups), forKey: Self.expandedGroupsKey)
     }
@@ -3282,11 +3667,13 @@ struct FleetView: View {
             accounts: accounts,
             control: control,
             onChanged: { await poller.pollOnce() },
-            onRelogin: { reloginAccount(account.ref) },
+            onRelogin: { reloginAccount(account) },
+            onReimport: { reimportAccount(account) },
             onMint: { mintAccountToken(account.ref) },
             onMintGroup: { group in mintGroupTokens(group) },
             groupController: groupController,
             removeController: removeController,
+            codexNotes: codexNotes,
             allAccounts: fleet.accounts,
             enclosingGroupName: enclosingGroupName,
             // Every row reaching this section is parked BECAUSE this named
@@ -3441,7 +3828,11 @@ struct FleetView: View {
         .foregroundStyle(Tok.offline)
     }
 
-    private func banner(icon: String, title: String, detail: String, tint: Color) -> some View {
+    /// `extra`, when given, is one more line under the detail, in its type and
+    /// `Tok.dim`: the empty fleet's Codex hint. Every other banner passes none.
+    private func banner(
+        icon: String, title: String, detail: String, tint: Color, extra: String? = nil
+    ) -> some View {
         HStack(alignment: .top, spacing: Tok.gutter) {
             Image(systemName: icon).foregroundStyle(tint)
             VStack(alignment: .leading, spacing: Tok.tightSpacing) {
@@ -3450,6 +3841,12 @@ struct FleetView: View {
                     .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .foregroundStyle(Tok.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
+                if let extra {
+                    Text(extra)
+                        .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
+                        .foregroundStyle(Tok.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(.vertical, Tok.tightSpacing)
@@ -3468,7 +3865,7 @@ struct FleetView: View {
                 // runs were two different sizes/roles (`Tok.secondaryFont`
                 // 11pt/dim, `Tok.detailDigitFont` 10pt/faint). Literal per
                 // the tokens-parity fence.
-                Text(server.state.summary)
+                Text(server.summary)
                     .font(Tok.freshnessFont)
                     .foregroundStyle(Tok.inkFaint)
                     .fixedSize(horizontal: false, vertical: true)
@@ -3483,7 +3880,7 @@ struct FleetView: View {
             fleetActions
 
             if let loginError {
-                Text(loginError)
+                Text(PredatesCodexRefusal.displayed(loginError))
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
@@ -3547,7 +3944,9 @@ struct FleetView: View {
             // rather than in a Terminal window they have to go and find.
             if !fleetIsEmpty {
                 Button("Add account…") { addAccount() }
-                    .help(Self.addAccountHelp)
+                    .help(
+                        CodexSignInCopy.addAccountHelp(isPresent: effectivePresence.isPresent)
+                            ?? Self.addAccountHelp)
             }
             Spacer(minLength: 0)
         }
@@ -3594,26 +3993,82 @@ struct FleetView: View {
         }
     }
 
+    /// This Mac's codex evidence with the fleet's own Codex rows counted: a fleet
+    /// that holds a Codex account is evidence on any Mac. Add account… offers the
+    /// chooser on it, and each Add account… button names both providers.
+    private var effectivePresence: CodexPresence {
+        var presence = codexPresence
+        if let fleet = poller.state.loadedFleet { presence.fleetHoldsCodex = fleet.holdsCodex }
+        return presence
+    }
+
     /// Sign in, in the app.
     ///
     /// This used to be a Terminal hand-off with no alternative, because
     /// `tcr login` prompted on stdin. `--non-interactive` removed the prompts
     /// (`src/oauth.rs`'s `LoginUi`), so the panel runs the login itself and
-    /// shows a sheet — see ``beginLogin(reloggingIn:)`` for what happens when
+    /// shows a sheet — see ``beginLogin(_:)`` for what happens when
     /// the `tcr` on this machine predates that flag. The ellipsis in the label
     /// is still doing real work: this opens a browser window.
+    ///
+    /// On a Mac with no sign of codex this is the Claude sign-in, started at
+    /// once, exactly as it always was. With one, the sheet opens on the chooser
+    /// first, and nothing runs until a Claude or a Codex account, or the import,
+    /// is picked. The chooser's Codex help depends on whether this tcr has
+    /// `tcr login --codex`, which is asked once and remembered.
     private func addAccount() {
-        beginLogin(reloggingIn: nil)
+        Task { await addAccountAfterProbe() }
     }
 
-    /// Same sign-in, aimed at one existing row: `tcr login --account <name>`
-    /// requests that identity and refuses to write anything if the browser
-    /// hands back a different one.
-    private func reloginAccount(_ account: AccountRef) {
-        beginLogin(reloggingIn: account.name)
+    private func addAccountAfterProbe() async {
+        guard !checkingLoginCapability else { return }
+        checkingLoginCapability = true
+        defer { checkingLoginCapability = false }
+        guard !snapshotMode else { return }
+        var presence = effectivePresence
+        if let resolveCodexPresenceForLogin {
+            presence = await resolveCodexPresenceForLogin()
+            presence.fleetHoldsCodex = poller.state.loadedFleet?.holdsCodex == true
+        }
+        guard presence.isPresent else {
+            beginLogin(.claude(account: nil))
+            return
+        }
+        loginError = nil
+        guard !snapshotMode else { return }
+        switch TcrTool.resolve() {
+        case .failure(let missing):
+            loginError = Self.loginFailureMessage(.toolMissing(searched: missing.searched))
+        case .success(let tcr):
+            let codex = presence.codexExecutable
+            loginSession = LoginSession(
+                request: nil, phase: .choosing,
+                codexSupported: await LoginCapability.probeCodex(executable: tcr),
+                resolvedCodexExecutable: { codex })
+        }
     }
 
-    /// Start an in-app login, or fall back to the Terminal window.
+    /// Same sign-in, aimed at one existing row, by the row's own provider: a
+    /// Claude row runs `tcr login --account <name>` and a Codex row
+    /// `tcr login --codex --account <name>`. Either requests that identity and
+    /// refuses to write anything if the browser hands back a different one.
+    private func reloginAccount(_ account: Account) {
+        beginLogin(account.reloginRequest)
+    }
+
+    /// Take the login the codex folder a row was imported from holds now. The
+    /// sheet opens on the confirmation, which states that sharing the login costs
+    /// that codex one sign-in, and nothing runs until it is accepted.
+    private func reimportAccount(_ account: Account) {
+        guard let request = account.reimportRequest,
+            case .codexImport(let home, let name) = request
+        else { return }
+        loginError = nil
+        guard !snapshotMode else { return }
+        loginSession = LoginSession(request: request, phase: .confirmingImport(home: home, account: name))
+    }
+
+    /// Start a sign-in, in the sheet, or fall back to a Terminal window.
     ///
     /// The fallback is not a nicety. TcrBar and `tcr` update independently, so
     /// the binary this app resolves can be older than the app itself; without
@@ -3621,24 +4076,92 @@ struct FleetView: View {
     /// immediately on an unknown argument where they used to get a Terminal
     /// window that worked. ``LoginCapability/probe(executable:)`` asks that
     /// binary once and remembers the answer.
-    private func beginLogin(reloggingIn name: String?) {
+    ///
+    /// A Codex sign-in or import asks again at every click
+    /// (``LoginCapability/readCodexPath(executable:)``): a `tcr` with
+    /// `tcr login --codex` runs it here; one that can only import a codex login
+    /// gets the two commands in Terminal; and one that predates Codex accounts
+    /// gets the sheet's failed phase naming it, and no script at all, since
+    /// nothing it can run would work. A Terminal fallback closes the sheet first.
+    ///
+    /// A sheet already up, the chooser or the import's confirmation, runs the
+    /// request itself; otherwise a new one is presented.
+    private func beginLogin(_ request: LoginRequest) {
+        Task { await beginLoginAfterProbe(request) }
+    }
+
+    private func beginLoginAfterProbe(_ request: LoginRequest) async {
+        guard !checkingLoginCapability else { return }
+        checkingLoginCapability = true
+        defer { checkingLoginCapability = false }
         loginError = nil
         guard !snapshotMode else { return }
 
         switch TcrTool.resolve() {
         case .failure(let missing):
             loginError = Self.loginFailureMessage(.toolMissing(searched: missing.searched))
+            return
         case .success(let executable):
-            guard LoginCapability.probe(executable: executable) else {
-                if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
-                    loginError = Self.loginFailureMessage(why)
+            switch request {
+            case .claude(let name):
+                guard await LoginCapability.probe(executable: executable) else {
+                    closeSheetForTerminal()
+                    if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
+                        loginError = Self.loginFailureMessage(why)
+                    }
+                    return
                 }
-                return
+            case .codex, .codexImport:
+                switch await LoginCapability.readCodexPath(executable: executable) {
+                case .inSheet:
+                    break
+                case .terminal:
+                    closeSheetForTerminal()
+                    let launched: Result<URL, LoginLauncher.Failure>
+                    if case .codexImport(let home, let name) = request {
+                        launched = LoginLauncher.launchCodexImport(codexHome: home, reloggingIn: name)
+                    } else {
+                        launched = LoginLauncher.launchCodexLogin(reloggingIn: request.account)
+                    }
+                    if case .failure(let why) = launched {
+                        loginError = Self.loginFailureMessage(why)
+                    }
+                    return
+                case .probeFailed:
+                    let reason =
+                        "Could not check Codex sign-in support in \(HomePath.short(executable.path)). Try again or update that tcr."
+                    loginSession = LoginSession(request: request, phase: .failed(reason: reason))
+                    return
+                case .predatesCodex:
+                    loginSession = LoginSession(
+                        request: request, phase: .failed(reason: await pathTcrFlag(for: executable)))
+                    return
+                }
             }
-            let session = LoginSession(account: name)
+        }
+
+        if let session = loginSession {
+            session.begin(request)
+        } else {
+            let codex = effectivePresence.codexExecutable
+            let session = LoginSession(request: request, resolvedCodexExecutable: { codex })
             loginSession = session
             session.start()
         }
+    }
+
+    /// Close a sheet that is up before a Terminal window takes over: the sign-in
+    /// is no longer the sheet's to show.
+    private func closeSheetForTerminal() {
+        if loginSession != nil { endLogin(cancelling: true) }
+    }
+
+    /// The failed sheet's detail for a tcr that predates Codex accounts, naming it
+    /// and its version as Settings › Updates does. It runs `tcr --version`, which
+    /// reads no config.
+    private func pathTcrFlag(for executable: URL) async -> String {
+        let version = await LoginCapability.readVersion(executable: executable)
+        return CodexSignInCopy.pathTcrFlag(path: executable.path, version: version)
     }
 
     /// Close the sheet, and re-poll when something actually changed. A saved
@@ -3646,12 +4169,71 @@ struct FleetView: View {
     /// one poll away from showing it — the row list itself only fills in fully
     /// after the proxy restarts (`CLAUDE.md`'s config-reload rule), which the
     /// sheet says out loud.
+    ///
+    /// A Codex re-login that tcr refused wrote nothing, so nothing the server
+    /// reports says why the row still reads `re-login`. tcr's reason is kept
+    /// under the row for this app run (``CodexNoteStore``). Re-imports and fresh
+    /// adds record nothing: there is no row of theirs to explain.
     private func endLogin(cancelling: Bool) {
         if cancelling { loginSession?.cancel() }
+        if let session = loginSession, case .codex(let name?) = session.request,
+            let refusal = session.refusal,
+            let row = poller.state.loadedFleet?.accounts.first(where: { $0.name == name })
+        {
+            codexNotes.recordReloginRefusal(refusal, for: row)
+        }
         let saved: Bool
         if case .saved = loginSession?.phase { saved = true } else { saved = false }
         loginSession = nil
         if saved { Task { await poller.pollOnce() } }
+    }
+
+    /// The import link's folder picker, shown through the shell's runner so the
+    /// panel stays up behind it. A chosen folder opens the import's confirmation
+    /// in the same sheet; no choice leaves the sheet as it was.
+    private func chooseCodexFolder(for session: LoginSession) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = URL(fileURLWithPath: homeDirectory, isDirectory: true)
+            .appendingPathComponent(".codex", isDirectory: true)
+        panel.message = CodexSignInCopy.importPanelMessage
+        panel.prompt = CodexSignInCopy.panelPrompt
+        guard let url = runOpenPanel(panel) else { return }
+        session.confirmImport(home: url.path, account: nil)
+    }
+
+    /// `Choose codex…`: the codex executable tcr could not find, picked by hand,
+    /// through the shell's runner like the folder picker.
+    ///
+    /// Hidden folders are shown, because npm, nvm and volta all install codex
+    /// under one. Aliases are not resolved, so a symlink is stored as chosen and
+    /// not as the versioned file it points at today. An accepted choice is stored
+    /// for every later Codex sign-in, and the same request runs again with it; a
+    /// refused one stores nothing, and the sheet says why under tcr's reason.
+    private func chooseCodexExecutable(for session: LoginSession) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.resolvesAliases = false
+        panel.message = CodexSignInCopy.codexPanelMessage
+        panel.prompt = CodexSignInCopy.panelPrompt
+        guard let url = runOpenPanel(panel), let request = session.request else { return }
+        let path = url.path
+        guard CodexExecutableChoice.isAcceptable(path: path) else {
+            session.refuseCodexChoice(
+                CodexSignInCopy.refusedCodexChoice(shortPath: HomePath.short(path, home: homeDirectory)))
+            return
+        }
+        UserDefaults.standard.set(path, forKey: TcrTool.codexOverrideDefaultsKey)
+        let codex = effectivePresence.codexExecutable
+        let rerun = LoginSession(request: request, resolvedCodexExecutable: { codex })
+        loginSession = rerun
+        rerun.start()
     }
 
     /// Hand `tcr mint --account <name>` to a Terminal window for one row.
@@ -3747,22 +4329,15 @@ struct FleetView: View {
     /// `tcr server --headless --replace`
     /// — the replacement is performed by `tcr`'s own singleton.
     /// TcrBar signals nothing it did not spawn.
+    ///
+    /// Once the fleet holds a Codex account the alert names Codex sessions too,
+    /// which lose their pins with the rest (``RestartAlertCopy``).
     private func confirmTakeover() {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = "Take over the port from the running proxy?"
-        alert.informativeText = """
-            This kills the proxy currently holding the port and starts a new one \
-            in its place.
-
-            That wipes the session-to-account pin map. Anthropic's prompt cache is \
-            per-account, so every live Claude session is re-pinned to a different \
-            account and pays a full cold prompt-cache prefix on its next request. \
-            It is the most expensive thing this app can do.
-
-            Only do this if the running proxy is stuck or is a build you need to \
-            replace.
-            """
+        let holdsCodex = poller.state.loadedFleet?.holdsCodex == true
+        alert.informativeText = RestartAlertCopy.takeoverInformative(holdsCodex: holdsCodex)
         let takeOver = alert.addButton(withTitle: "Take over port")
         takeOver.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
@@ -4051,6 +4626,10 @@ struct AccountRow: View {
     /// Drawn on every row's context menu, and additionally as the standalone
     /// ``AccountRow/reloginButton`` on a `.needsRelogin` row.
     let onRelogin: () -> Void
+    /// Takes the login the codex folder this row was imported from holds now
+    /// (``FleetView/reimportAccount(_:)``). Offered only on a Codex row that names
+    /// such a folder.
+    let onReimport: () -> Void
     /// Hands `tcr mint --account <this row's name>` to a Terminal window. See
     /// ``FleetView/mintAccountToken(_:)``.
     let onMint: () -> Void
@@ -4066,6 +4645,9 @@ struct AccountRow: View {
     @ObservedObject var groupController: GroupController
     /// Deleting this row's account. See ``RemoveAccountController``.
     @ObservedObject var removeController: RemoveAccountController
+    /// Where a group add's warning about a Codex row is kept, under the row's
+    /// line, for this app run. See ``CodexNoteStore``.
+    let codexNotes: CodexNoteStore
     /// The whole fleet, so ``addToGroupMenu`` can offer every group this
     /// account is not already in, not just the ones visible in whatever
     /// section this row happens to be drawn under.
@@ -4325,8 +4907,8 @@ struct AccountRow: View {
     /// one, even though `disabled` itself reads false), and the third —
     /// `select.rs:809-822` also excludes an account whose `quota.status ==
     /// Some("rejected")`, Anthropic's own verdict — while the snapshot
-    /// `status` this app decodes stays `"active"` (`snapshot.rs:142-153` only
-    /// ever rewrites `Throttled`).
+    /// `status` this app decodes stays `"active"` (`Manager::snapshot` in
+    /// `src/manager/snapshot.rs` only ever rewrites `Throttled`).
     ///
     /// That third gate is read from the wire's `gate` field
     /// (``Account/isRejected``), which the server has emitted since the status
@@ -4469,10 +5051,7 @@ struct AccountRow: View {
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
                 .textSelection(.enabled)
-                .help(
-                    "The organization half of this account's name — the full name is "
-                        + "\(account.name), which is what every `tcr` command takes."
-                )
+                .help(LegacyRowCopy.orgTagHelp(account))
         }
     }
 
@@ -4483,7 +5062,7 @@ struct AccountRow: View {
                 .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
-                .help("This account's plan, as Anthropic reports it for its organization.")
+                .help(LegacyRowCopy.planHelp(account))
         } else if let usageLabel = account.windowUsageLabel {
             // No plan on the wire, but there is still a spend figure to show
             // — draw it alone rather than losing it, the same "an absent
@@ -4557,8 +5136,9 @@ struct AccountRow: View {
                 .transition(.opacity)
         } else if account.health == .needsRelogin {
             EmptyView()
-        } else if account.isRejected {
-            // Anthropic's own verdict, and the third exclusion named above.
+        } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
+            // Anthropic's own verdict, or ChatGPT's refusal of a Codex account,
+            // and the third exclusion named above.
             // Drawn INSTEAD of "rotating": the router will never select this
             // account, so claiming it is in rotation is the exact
             // "misread as its own opposite" defect the other two gates were
@@ -4584,12 +5164,7 @@ struct AccountRow: View {
                 .transition(.opacity)
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
-                .help(
-                    "In the rotation — this account can be picked for traffic, as "
-                        + "far as this build can tell. A quota rejection from "
-                        + "Anthropic can also exclude an account without changing "
-                        + "its status; TcrBar cannot see that gate yet."
-                )
+                .help(LegacyRowCopy.rotatingHelp(account))
                 .transition(.opacity)
         }
     }
@@ -4637,8 +5212,8 @@ struct AccountRow: View {
                     + "out of rotation")
         } else if account.health == .needsRelogin {
             parts.append("not in rotation")
-        } else if account.isRejected {
-            parts.append("rejected by Anthropic, not in rotation")
+        } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
+            parts.append(LegacyRowCopy.rejectedSpoken(account, now: Date()))
         } else {
             parts.append("rotating")
         }
@@ -4686,14 +5261,17 @@ struct AccountRow: View {
         // spoken when it did, because a gate that decides whether Fable
         // requests can land here is not a sighted-user-only fact.
         if let fable = account.fableWeeklySpokenLabel(now: Date()) { parts.append(fable) }
+        // A bundled tcr too old for a config holding a Codex account refuses with
+        // words that name a version; each failure says which tcr and the fix.
         if let failure = accounts.failure(for: account.ref) {
-            parts.append("last action failed: \(failure.summary)")
+            parts.append("last action failed: \(PredatesCodexRefusal.displayed(failure.summary))")
         }
         if let failure = removeController.failure(for: account.ref) {
-            parts.append("last action failed: \(failure.summary)")
+            parts.append("last action failed: \(PredatesCodexRefusal.displayed(failure.summary))")
         }
         if let refused = groupController.failure(forAccount: account.ref) {
-            parts.append("group '\(refused.group)' failed: \(refused.failure.summary)")
+            parts.append(
+                "group '\(refused.group)' failed: \(PredatesCodexRefusal.displayed(refused.failure.summary))")
         }
         // Spoken for the same reason the pill is: a confirmation only a sighted
         // user gets is half built, and the `✓` in `rowLabel` is punctuation to a
@@ -4804,9 +5382,16 @@ struct AccountRow: View {
     ///
     /// Deliberately does NOT add routing or pin controls: that is a separate
     /// feature, not this row's to invent.
+    ///
+    /// Which account items appear is decided by ``Account/availableActions``, one
+    /// core value, so every route to this menu offers the same items: a Codex row
+    /// is not offered the control account, a minted token or the group commands
+    /// that can only fail on it. A Claude row's set is every item, so its menu is
+    /// the one it always was.
     @ViewBuilder
     private var contextMenuItems: some View {
         let enabling = account.disabled
+        let actions = account.availableActions
         // First, and in its own section: it changes how this panel draws the
         // account, not the account, and Gil asked for it in this menu (Gil,
         // 2026-10-14: "The row's right-click menu gains 'Keep card open' /
@@ -4819,25 +5404,37 @@ struct AccountRow: View {
                         : "Shows this account's card in the list all the time, on this Mac.")
             Divider()
         }
-        Button(enabling ? "Enable" : "Disable") {
-            Task { await performToggle(enabling: enabling) }
+        if actions.contains(.toggleEnabled) {
+            Button(enabling ? "Enable" : "Disable") {
+                Task { await performToggle(enabling: enabling) }
+            }
+            .disabled(accounts.isPending(account.ref))
         }
-        .disabled(accounts.isPending(account.ref))
-        Button("Re-login…") { onRelogin() }
-            .help(
-                "Signs in through your browser, requesting this exact account. "
-                    + "`tcr` refuses to save if the browser hands back a different "
-                    + "one. The login it starts now mints a credential good for a "
-                    + "year, so running it on a healthy row is a safe way to get "
-                    + "ahead of the old one expiring."
-            )
+        if actions.contains(.relogin) {
+            Button("Re-login…") { onRelogin() }
+                .help(
+                    account.provider == .codex
+                        ? codexReloginHelp
+                        : "Signs in through your browser, requesting this exact account. "
+                            + "`tcr` refuses to save if the browser hands back a different "
+                            + "one. The login it starts now mints a credential good for a "
+                            + "year, so running it on a healthy row is a safe way to get "
+                            + "ahead of the old one expiring."
+                )
+        }
+        // A Codex row imported from a codex folder can take that folder's login
+        // again, at the cost the confirmation states before anything runs.
+        if account.availableActions.contains(.reimport), let home = account.codexHome {
+            Button(CodexSignInCopy.reimportItem(shortPath: HomePath.short(home))) { onReimport() }
+                .help(CodexSignInCopy.reimportHelp(shortPath: HomePath.short(home)))
+        }
         Divider()
         // Hidden entirely while `control` cannot answer the question at all
         // (``ControlAccountController/unavailable``) — an older `tcr` has no
         // `control` subcommand, and an action this build cannot even read back
         // is worse than no action: a click would exit non-zero with a message
         // about a route that does not exist, on every single row, forever.
-        if !control.unavailable {
+        if actions.contains(.controlAccount), !control.unavailable {
             if control.isControl(account.name) {
                 Button("Clear Control Account") {
                     Task { await performSetControl(name: nil, key: account.id) }
@@ -4854,21 +5451,41 @@ struct AccountRow: View {
                 .disabled(control.isPending(account.id))
             }
         }
-        Divider()
-        Button("Copy Account Name") {
-            copyToPasteboard(account.name)
+        // The rule under the control items closes their section, so a row that
+        // is never offered them (a Codex row) draws one rule here, not two in a
+        // row with nothing between them. A Claude row draws it as it always did.
+        if actions.contains(.controlAccount) {
+            Divider()
+        }
+        if actions.contains(.copyName) {
+            Button("Copy Account Name") {
+                copyToPasteboard(account.name)
+            }
         }
         // The token is a secret: it goes from `tcr token`'s stdout straight
-        // to the pasteboard and is never rendered, logged or kept.
-        Button("Copy Access Token") {
-            Task { await performCopyToken() }
+        // to the pasteboard and is never rendered, logged or kept. On a Codex
+        // row it is a ChatGPT bearer, and the item's title and help say so
+        // (``TokenCommand/menuTitle(for:)``); a Claude row's item has no help.
+        if actions.contains(.copyAccessToken) {
+            if let help = TokenCommand.menuHelp(for: account) {
+                Button(TokenCommand.menuTitle(for: account)) {
+                    Task { await performCopyToken() }
+                }
+                .help(help)
+            } else {
+                Button(TokenCommand.menuTitle(for: account)) {
+                    Task { await performCopyToken() }
+                }
+            }
         }
         // Distinct wording from the button above on purpose: "Copy" hands over
         // a string that already exists and dies in hours, "Mint" makes a new
         // one that does not — the confusion between the two is exactly what
         // prompted this item to exist.
-        Button("Mint Long-Lived Token…") {
-            onMint()
+        if actions.contains(.mintToken) {
+            Button("Mint Long-Lived Token…") {
+                onMint()
+            }
         }
         Divider()
         groupMenuItems
@@ -4877,10 +5494,12 @@ struct AccountRow: View {
         // `dangerZone`'s "Take over port…": the most expensive, least
         // reversible action on the row does not get to sit beside routine
         // ones a misclick could land on instead.
-        Button("Delete Account…") {
-            confirmDeleteAccount()
+        if actions.contains(.deleteAccount) {
+            Button("Delete Account…") {
+                confirmDeleteAccount()
+            }
+            .disabled(removeController.isPending(account.ref))
         }
-        .disabled(removeController.isPending(account.ref))
     }
 
     /// One entry per ``Account/groupMenuActions``, wired directly to
@@ -4895,63 +5514,15 @@ struct AccountRow: View {
         ForEach(account.groupMenuActions, id: \.self) { action in
             switch action {
             case .remove(let group):
-                // First, and disabled because there is nothing to click — this
-                // states a fact about the group, it does not offer to change it.
-                // Without it the panel renders a group that serves nothing
-                // exactly like one that works: a member, a colour, a healthy
-                // row. That is how a group whose only member was the control
-                // account survived on the live fleet, silently falling back on
-                // every request.
-                if !GroupRouting.routes(
-                    group: group, accounts: allAccounts, controlName: control.current)
-                {
-                    Button("⚠︎ “\(group)” routes nothing — control account only") {}
-                        .disabled(true)
-                } else if GroupRouting.allowsControlAccount(group: group, accounts: allAccounts) {
-                    // The opted-in state gets its OWN line rather than just the
-                    // absence of the warning above. Silence would be cheaper and
-                    // is the wrong call here: "opted in" and "I forgot to opt in"
-                    // would look identical, and an unroutable group that looked
-                    // fine is the exact failure this whole menu section exists
-                    // to end.
-                    Button("“\(group)” may use the control account") {}
-                        .disabled(true)
-                }
-                // The USE command, above the two removals. This slot used to copy
-                // `tcr group rm <group> <account>` — the twin of the button
-                // right below it — which made three consecutive entries all
-                // spell a deletion and offered no way at all to start a session
-                // on the group. Copying the command that administers a label was
-                // never what anyone wanted off a row that already carries it.
-                let copyRun = GroupCommand.CopyCommandMenuEntry(
-                    arguments: GroupCommand.runArguments(group: group))
-                Button(copyRun.title) {
-                    copyToPasteboard(copyRun.copiedText)
-                }
-                // Same distinction as the row-level item: this mints a NEW
-                // long-lived token for every member of the group, it does not
-                // copy anything that already exists.
-                Button("Mint Long-Lived Tokens for “\(group)”…") {
-                    onMintGroup(group)
-                }
-                // One click, either direction, with the current state on the
-                // item itself — the only administrative entry in this menu that
-                // takes effect without a restart, which is why it can be a
-                // toggle at all rather than an instruction to go and edit the
-                // config. It sits above the two removals because holding a
-                // group back is the reversible thing to want; deleting it is
-                // not.
-                parkToggle(for: group)
-                Button("Remove from \(group)") {
-                    Task {
-                        await groupController.remove(account: account.ref, from: group)
-                        // The proxy re-reads group membership on the poll
-                        // itself; asking now shows it without waiting one out.
-                        _ = await onChanged()
-                    }
-                }
-                Button("Delete group “\(group)” for everyone…") {
-                    confirmDeleteGroup(group)
+                // Which items, in which order, and in whose words, is the core's
+                // (``AccountActions/groupItems(for:group:accounts:controlName:)``),
+                // so a Codex row is told why it has no run copy and no mint
+                // rather than being offered two items that can only fail.
+                let items = AccountActions.groupItems(
+                    for: account, group: group,
+                    accounts: allAccounts, controlName: control.current)
+                ForEach(items, id: \.self) { item in
+                    groupMenuItem(item, group: group)
                 }
             case .removeAll:
                 Button("Remove from all groups") {
@@ -4968,58 +5539,114 @@ struct AccountRow: View {
         }
     }
 
-    /// The Park/Unpark toggle for one group, with a checkmark showing the
-    /// state it is in right now.
-    ///
-    /// The state is read from the FLEET (`allAccounts`), not from this row: a
-    /// group is parked or not for everyone, and reading this row alone would
-    /// draw an unchecked item on a member the wire happened to omit. Disabled
-    /// while the call is in flight, so a second click cannot queue a second
-    /// subprocess against the same label.
+    /// One item of a group's submenu, as the core listed it.
     @ViewBuilder
-    private func parkToggle(for group: String) -> some View {
-        let parked = allAccounts.contains { ($0.parkedGroups ?? []).contains(group) }
-        Button {
-            Task { await groupController.setParked(group: group, parked: !parked) }
-        } label: {
-            // A leading checkmark rather than `Toggle`: `Menu` contents are
-            // rasterised nowhere (see `RenderStates`' header) and a plain
-            // Button with an explicit mark is what the rest of this menu uses.
-            Label(
-                parked ? "Unpark group “\(group)”" : "Park group “\(group)”",
-                systemImage: parked ? "checkmark" : "pause.circle")
+    private func groupMenuItem(_ item: GroupMenuItem, group: String) -> some View {
+        switch item {
+        case .statement(let text):
+            // Disabled because there is nothing to click — this states a fact
+            // about the group, it does not offer to change it. Without the
+            // routing line the panel renders a group that serves nothing
+            // exactly like one that works: a member, a colour, a healthy row.
+            // That is how a group whose only member was the control account
+            // survived on the live fleet, silently falling back on every
+            // request. The opted-in state gets its OWN line rather than just
+            // the absence of the warning: silence would be cheaper and is the
+            // wrong call here, because "opted in" and "I forgot to opt in"
+            // would look identical.
+            Button(text) {}
+                .disabled(true)
+        case .copyRun:
+            // The USE command, above the two removals. This slot used to copy
+            // `tcr group rm <group> <account>` — the twin of the button
+            // right below it — which made three consecutive entries all
+            // spell a deletion and offered no way at all to start a session
+            // on the group. Copying the command that administers a label was
+            // never what anyone wanted off a row that already carries it.
+            let copyRun = GroupCommand.CopyCommandMenuEntry(
+                arguments: GroupCommand.runArguments(group: group))
+            Button(copyRun.title) {
+                copyToPasteboard(copyRun.copiedText)
+            }
+        case .mintGroup(let title):
+            // Same distinction as the row-level item: this mints a NEW
+            // long-lived token for every member the mint can serve, it does
+            // not copy anything that already exists.
+            Button(title) {
+                onMintGroup(group)
+            }
+        case .park(let title, let parked):
+            // One click, either direction, with the current state on the
+            // item itself — the only administrative entry in this menu that
+            // takes effect without a restart, which is why it can be a
+            // toggle at all rather than an instruction to go and edit the
+            // config. It sits above the two removals because holding a
+            // group back is the reversible thing to want; deleting it is
+            // not. The state is the FLEET's, not this row's: a group is
+            // parked or not for everyone. Disabled while the call is in
+            // flight, so a second click cannot queue a second subprocess
+            // against the same label.
+            Button {
+                Task { await groupController.setParked(group: group, parked: !parked) }
+            } label: {
+                // A leading checkmark rather than `Toggle`: `Menu` contents are
+                // rasterised nowhere (see `RenderStates`' header) and a plain
+                // Button with an explicit mark is what the rest of this menu uses.
+                Label(title, systemImage: parked ? "checkmark" : "pause.circle")
+            }
+            .disabled(groupController.isPending("park/\(group)"))
+        case .removeFromGroup:
+            Button("Remove from \(group)") {
+                Task {
+                    await groupController.remove(account: account.ref, from: group)
+                    // The proxy re-reads group membership on the poll
+                    // itself; asking now shows it without waiting one out.
+                    _ = await onChanged()
+                }
+            }
+        case .deleteGroup:
+            Button("Delete group “\(group)” for everyone…") {
+                confirmDeleteGroup(group)
+            }
         }
-        .disabled(groupController.isPending("park/\(group)"))
-    }
-
-    /// Every group this account is not already a member of, fleet-wide —
-    /// the population ``groupMenuItems``'s "Add to group…" submenu offers.
-    /// Disabled rather than hidden when empty (no group exists yet anywhere
-    /// in the fleet): a missing submenu reads as "this row cannot be added
-    /// to a group", which is not the true reason.
-    private var candidateGroupsToAdd: [String] {
-        let existing = Set(account.groups ?? [])
-        let everyGroup = Set(allAccounts.flatMap { $0.groups ?? [] })
-        return everyGroup.subtracting(existing).sorted()
     }
 
     /// Never disabled, unlike before this round: "New group…" is always a
     /// usable entry even for a fleet with no groups at all yet, which is the
     /// exact gap this menu exists to close.
+    ///
+    /// The groups below it are the core's
+    /// (``AccountActions/addToGroupEntries(for:accounts:)``): every group this
+    /// account is not in, fleet-wide, with a reserved one listed disabled on a
+    /// Codex row, which no Codex request can reach.
     @ViewBuilder
     private var addToGroupMenu: some View {
         Menu("Add to group…") {
             Button("New group…") { presentNewGroupPrompt() }
-            if !candidateGroupsToAdd.isEmpty {
+            let entries = AccountActions.addToGroupEntries(for: account, accounts: allAccounts)
+            if !entries.isEmpty {
                 Divider()
-                ForEach(candidateGroupsToAdd, id: \.self) { group in
-                    Button(group) {
-                        Task { await groupController.add(account: account.ref, to: group) }
+                ForEach(entries, id: \.group) { entry in
+                    Button(entry.title) {
+                        Task {
+                            let attempt = await groupController.add(
+                                account: account.ref, to: entry.group)
+                            // A Codex row's add succeeds with a warning that no Codex
+                            // request can ask for a group; it stays under the line.
+                            if account.provider == .codex, case .accepted(let notice?) = attempt {
+                                codexNotes.recordGroupAddNotice(
+                                    notice, group: entry.group, for: account.ref)
+                            }
+                        }
                     }
-                    let copyAdd = GroupCommand.CopyCommandMenuEntry(
-                        arguments: GroupCommand.addArguments(group: group, account: account.name))
-                    Button(copyAdd.title) {
-                        copyToPasteboard(copyAdd.copiedText)
+                    .disabled(!entry.isEnabled)
+                    if entry.offersCopy {
+                        let copyAdd = GroupCommand.CopyCommandMenuEntry(
+                            arguments: GroupCommand.addArguments(
+                                group: entry.group, account: account.name))
+                        Button(copyAdd.title) {
+                            copyToPasteboard(copyAdd.copiedText)
+                        }
                     }
                 }
             }
@@ -5058,7 +5685,13 @@ struct AccountRow: View {
         let outcome = NewGroupName.evaluate(typed, existingGroups: everyGroupFleetWide)
         switch outcome {
         case .valid(let name):
-            Task { await groupController.add(account: account.ref, to: name) }
+            Task {
+                let attempt = await groupController.add(account: account.ref, to: name)
+                // The same warning as the candidate list's add, kept the same way.
+                if account.provider == .codex, case .accepted(let notice?) = attempt {
+                    codexNotes.recordGroupAddNotice(notice, group: name, for: account.ref)
+                }
+            }
         case .rejected, .duplicate:
             let failureAlert = NSAlert()
             failureAlert.alertStyle = .warning
@@ -5109,17 +5742,17 @@ struct AccountRow: View {
     /// interval, so the row leaves while the person who clicked is still
     /// looking. A refused one stays on the row with `tcr`'s reason
     /// (``AccountRowNotice``).
+    ///
+    /// The words are the core's (``RemoveAccountCommand/confirmation(for:in:deleted:)``):
+    /// a Codex row's alert names its own sign-in, and the last one's says what
+    /// changes for codex.
     private func confirmDeleteAccount() {
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "Delete account “\(account.name)”?"
-        alert.informativeText = """
-            This removes “\(account.name)” and its saved credentials from the config. \
-            It is not reversible from here: getting it back means running `tcr login` \
-            again from scratch.
-
-            The account stops serving at once and leaves this list. No restart is needed.
-            """
+        let copy = RemoveAccountCommand.confirmation(
+            for: account, in: allAccounts, deleted: Set(removeController.notices.keys))
+        alert.messageText = copy.message
+        alert.informativeText = copy.informative
         let delete = alert.addButton(withTitle: "Delete Account")
         delete.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
@@ -5357,19 +5990,15 @@ struct AccountRow: View {
                             "The refresh token was rejected — this account is out "
                                 + "of rotation and serves no traffic until you re-login."
                         )
-                } else if account.isRejected {
+                } else if account.isRejected || account.isRefusedHold || account.isForbiddenHold {
                     // Ahead of the quota cases deliberately. A rejected account
                     // can carry a perfectly ordinary reading — the gate is
                     // Anthropic's, not a quota fact — so `spent`/`ok` would be
                     // a true number attached to a false conclusion about
                     // whether traffic can land here. The cause outranks the
                     // measurement, the same way `needs re-login` above does.
-                    StatusPill("rejected", tint: Tok.spent)
-                        .help(
-                            "Anthropic has rejected this account, so `tcr` sends it no "
-                                + "traffic whatever its quota reads. It returns on their "
-                                + "verdict, not on a reset."
-                        )
+                    StatusPill(LegacyRowCopy.rejectedPillWord(account), tint: Tok.spent)
+                        .help(LegacyRowCopy.rejectedPillHelp(account, now: Date()) ?? "")
                 } else if account.hasQuotaEvidence {
                     StatusPill(account.quotaState.token, tint: quotaTint)
                 } else if account.probeStatus.isFailure {
@@ -5512,21 +6141,23 @@ struct AccountRow: View {
                     .lineLimit(2)
             }
             if let failure = accounts.failure(for: account.ref) {
-                // `tcr`'s own words, verbatim. A toggle that did not happen must
+                // `tcr`'s own words, verbatim, unless they are a bundled tcr's
+                // refusal of a config holding a Codex account, which names a
+                // version rather than the fix. A toggle that did not happen must
                 // never be indistinguishable from one that did.
-                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                Label(PredatesCodexRefusal.displayed(failure.summary), systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = removeController.failure(for: account.ref) {
-                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                Label(PredatesCodexRefusal.displayed(failure.summary), systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = tokenCopyFailure {
-                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                Label(PredatesCodexRefusal.displayed(failure.summary), systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
@@ -5540,7 +6171,7 @@ struct AccountRow: View {
             // closed by the time this appears.
             if let refused = groupController.failure(forAccount: account.ref) {
                 Label(
-                    "group '\(refused.group)': \(refused.failure.summary)",
+                    PredatesCodexRefusal.displayed("group '\(refused.group)': \(refused.failure.summary)"),
                     systemImage: Tok.unreadableGlyph
                 )
                 .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
@@ -5687,16 +6318,37 @@ struct AccountRow: View {
     /// shipped. Untargeted, the row's click could authenticate as whichever
     /// account happened to be signed into the browser; targeted, a mismatch
     /// refuses rather than overwriting the wrong account's credentials.
+    @ViewBuilder
     private var reloginButton: some View {
-        Button("Re-login…") { onRelogin() }
+        let button = Button("Re-login…") { onRelogin() }
             .buttonStyle(.bordered)
             .controlSize(.small)
             .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
             .accessibilityLabel("Re-login \(account.name)")
-            .help(
-                "Signs in through your browser, requesting this exact account. "
-                    + "`tcr` refuses to save if the browser hands back a different one."
-            )
+        if account.provider == .codex {
+            // A Codex row signs in to ChatGPT, and says so: in the help, and to
+            // VoiceOver, which hears the hint where a card shows the button.
+            button
+                .help(codexReloginHelp)
+                .accessibilityHint(CodexSignInCopy.reloginHint)
+        } else {
+            button
+                .help(
+                    "Signs in through your browser, requesting this exact account. "
+                        + "`tcr` refuses to save if the browser hands back a different one."
+                )
+        }
+    }
+
+    /// Re-login's help on a Codex row: the ChatGPT sign-in, or, when this tcr is
+    /// known to lack `tcr login --codex`, the Terminal window that runs instead.
+    /// It reads the answer a probe already gave and never runs one, because it
+    /// words a menu item. Never resolved in a render, which looks at no tcr.
+    private var codexReloginHelp: String {
+        guard !snapshotMode, case .success(let tcr) = TcrTool.resolve(),
+            LoginCapability.knownCodexSupport(executable: tcr) == false
+        else { return CodexSignInCopy.reloginHelp }
+        return CodexSignInCopy.oldTcrHelp
     }
 
     /// `tcr enable <name>` / `tcr disable <name>`, keyed off the account's own

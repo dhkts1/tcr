@@ -2,22 +2,27 @@
 //!
 //! This exists purely to capture a clean, sanitized dashboard screenshot for the
 //! public README: the real TUI shows `@token.security` account names that must
-//! never ship. The demo seeds a [`Manager`] with ~6 believable accounts in varied
-//! states (healthy / near-limit / throttled / dead-cred) and hands it to the real
-//! [`crate::tui::run`] — NO server, NO prober, NO warmer, NO network, NO real
-//! tokens. Quitting (`q` / `Ctrl-C`) and terminal restore reuse the TUI's own
-//! run loop unchanged; nothing here is ever exercised by the serving path.
+//! never ship. The demo seeds a [`Manager`] with six believable Claude accounts in
+//! varied states (healthy / near-limit / throttled / dead-cred) and three Codex ones
+//! (a Pro login with the weekly window only, a Plus login with both windows, a Pro
+//! login at its weekly limit), and hands it to the real dashboard
+//! ([`crate::tui::run_with_facts`]) — NO server, NO prober, NO warmer, NO network,
+//! NO real tokens. Quitting (`q` / `Ctrl-C`) and terminal restore reuse the TUI's
+//! own run loop unchanged; nothing here is ever exercised by the serving path.
 
 use std::io;
 use std::sync::Arc;
 
+use tcr_status_wire::CodexRoute;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::manager::{AccountRuntime, AccountStatus, Manager};
 use crate::probe::ProbeStatus;
-use crate::quota::{Quota, QuotaWindow};
+use crate::provider::Provider;
+use crate::quota::{CodexWindow, CodexWindows, Quota, QuotaWindow};
 use crate::stats::{RequestLogEntry, SessionKind};
+use crate::tui::DashboardFacts;
 
 /// A 5-hour quota window at `util`, resetting a few hours out so it reads live
 /// (a future reset means [`QuotaWindow::effective`] returns the seeded value).
@@ -43,6 +48,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
     AccountRuntime {
         name: name.to_string(),
         account_type: crate::config::AccountType::OAuth,
+        provider: Default::default(),
         account_uuid: None,
         org_uuid: None,
         org_name: Some("Demo Org".to_string()),
@@ -82,6 +88,9 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         last_served_ms: 0,
         rate_limited_until_ms: None,
         hold_cause: crate::manager::HoldCause::RateLimit,
+        login_error: None,
+        codex_home: None,
+        pending_codex_writeback: None,
         refresh_retry_after_ms: None,
         error_retry_after_ms: None,
         error_backoff_ms: 0,
@@ -102,7 +111,26 @@ fn ago_ms(secs: i64) -> i64 {
     crate::now_ms() - secs * 1000
 }
 
-/// Build the six fake account rows described in the demo spec.
+/// A five-hour window's length, as a Codex reading reports it.
+const FIVE_HOURS: CodexWindow = CodexWindow { minutes: Some(300) };
+
+/// A weekly window's length, as a Codex reading reports it.
+const ONE_WEEK: CodexWindow = CodexWindow {
+    minutes: Some(10_080),
+};
+
+/// A Codex row: a ChatGPT login on `plan`, whose readings carried `windows`, as a usage probe
+/// records them. Its windows' utilization is set by the caller.
+fn codex(name: &str, plan: &str, windows: CodexWindows) -> AccountRuntime {
+    let mut row = base(name, 0);
+    row.provider = Provider::Codex;
+    row.organization_type = Some(plan.to_string());
+    row.quota.codex.probed_windows = Some(windows);
+    row
+}
+
+/// Build the fake account rows described in the demo spec: the six Claude rows, then the
+/// three Codex rows.
 fn demo_accounts() -> Vec<AccountRuntime> {
     // alice — green, healthy, actively serving.
     let mut alice = base("alice", 0);
@@ -164,43 +192,284 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     backup.probe_error = Some("refresh token rejected (HTTP 401)".to_string());
     backup.last_probe_ms = Some(ago_ms(45));
 
-    vec![alice, bob, carol, team_prod, dave, backup]
+    // bob@example.com/codex — ChatGPT Pro, whose plan has the weekly window only, so
+    // its 5h cell reads `none`. The account serving Codex (the Codex section's ▶), in use
+    // as its seven-request session and its log line from a second ago say it is.
+    let mut codex_bob = codex(
+        "bob@example.com/codex",
+        "pro",
+        CodexWindows {
+            five_hour: None,
+            seven_day: Some(ONE_WEEK),
+        },
+    );
+    codex_bob.quota.seven_day = Some(seven_day(0.34));
+    codex_bob.requests = 140;
+    codex_bob.input_tokens = 2_900_000;
+    codex_bob.output_tokens = 120_000;
+    codex_bob.last_used_ms = Some(ago_ms(1));
+
+    // dana — ChatGPT Plus, with both windows.
+    let mut dana = codex(
+        "dana@example.com",
+        "plus",
+        CodexWindows {
+            five_hour: Some(FIVE_HOURS),
+            seven_day: Some(ONE_WEEK),
+        },
+    );
+    dana.quota.five_hour = Some(five_hour(0.18));
+    dana.quota.seven_day = Some(QuotaWindow {
+        utilization: 0.25,
+        reset: Some(OffsetDateTime::now_utc() + Duration::days(5)),
+    });
+
+    // carol — ChatGPT Pro at its weekly limit, out until the window resets. `rel` rounds
+    // down, so a reset exactly 3 days out would already paint `7D 2d` when the frame is
+    // drawn a moment later; the 30 seconds keep it at `7D 3d`.
+    let mut codex_carol = codex(
+        "carol@example.com",
+        "pro",
+        CodexWindows {
+            five_hour: None,
+            seven_day: Some(ONE_WEEK),
+        },
+    );
+    codex_carol.quota.seven_day = Some(QuotaWindow {
+        utilization: 1.00,
+        reset: Some(OffsetDateTime::now_utc() + Duration::days(3) + Duration::seconds(30)),
+    });
+
+    vec![
+        alice,
+        bob,
+        carol,
+        team_prod,
+        dave,
+        backup,
+        codex_bob,
+        dana,
+        codex_carol,
+    ]
 }
 
-/// A recent-request log entry `secs` seconds ago.
-fn log_entry(secs: i64, method: &str, path: &str, status: u16, account: &str) -> RequestLogEntry {
+/// A recent-request log entry `secs` seconds ago, for a request to `provider`.
+fn log_entry(
+    secs: i64,
+    method: &str,
+    path: &str,
+    status: u16,
+    account: &str,
+    provider: Provider,
+) -> RequestLogEntry {
     RequestLogEntry {
         time: OffsetDateTime::now_utc() - Duration::seconds(secs),
         method: method.to_string(),
         path: path.to_string(),
         status,
         account: account.to_string(),
+        provider,
+    }
+}
+
+/// The demo's fleet with its sessions and log seeded: everything `tcr demo` draws. A test
+/// draws it too, so the frames it checks are the ones a person sees.
+pub(crate) fn demo_manager() -> Arc<Manager> {
+    let manager = Manager::from_runtimes(demo_accounts());
+
+    // bob@example.com/codex (index 6, the first row after the six Claude ones) serves
+    // Codex, then team-prod (index 3) serves Claude, so team-prod is the account served
+    // last and each section paints its own ▶ marker.
+    let codex_bob = 6;
+    manager.set_current(codex_bob);
+    manager.set_current(3);
+
+    // Two live stable sessions so the sessions pane isn't empty in the screenshot,
+    // and one Codex session.
+    manager.seed_session(0xA1F3, 3, 24, ago_ms(1), SessionKind::Stable);
+    manager.seed_session(0xB2C7, 0, 12, ago_ms(3), SessionKind::Stable);
+    manager.seed_session(0xC0DE, codex_bob, 7, ago_ms(1), SessionKind::Stable);
+
+    // A handful of recent requests, pushed oldest-first (the ring buffer is
+    // reversed to most-recent-first when the snapshot is built).
+    for entry in [
+        log_entry(300, "GET", "/v1/models", 200, "bob", Provider::Anthropic),
+        log_entry(
+            120,
+            "POST",
+            "/v1/messages",
+            200,
+            "carol",
+            Provider::Anthropic,
+        ),
+        log_entry(30, "POST", "/v1/messages", 429, "dave", Provider::Anthropic),
+        log_entry(3, "POST", "/v1/messages", 200, "alice", Provider::Anthropic),
+        log_entry(
+            1,
+            "POST",
+            "/v1/messages",
+            200,
+            "team-prod",
+            Provider::Anthropic,
+        ),
+        log_entry(
+            1,
+            "POST",
+            "/backend-api/codex/responses",
+            200,
+            "bob@example.com/codex",
+            Provider::Codex,
+        ),
+    ] {
+        manager.push_log(entry);
+    }
+
+    manager
+}
+
+/// The facts the demo draws with, fixed for the whole run: Codex pooled, and nothing else
+/// known. The demo then reads none of this machine's MITM state, CA, codex login or home
+/// folder, so it shows no not-pooled, refused or unpooled suffix, and a screenshot of it can
+/// print no path of this machine.
+pub(crate) fn demo_facts() -> DashboardFacts {
+    DashboardFacts {
+        codex_route: Some(CodexRoute {
+            pooled: true,
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
 /// `tcr demo` — seed a fake fleet and launch the real TUI. Purely for a sanitized
 /// README screenshot; returns once the TUI's own quit handling restores the terminal.
 pub async fn run_demo() -> io::Result<()> {
-    let manager = Manager::from_runtimes(demo_accounts());
+    crate::tui::run_with_facts(demo_manager(), demo_facts()).await
+}
 
-    // team-prod (index 3) is the account currently serving — paints the ▶ marker.
-    manager.set_current(3);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::{AccountSnapshot, GateReason};
 
-    // Two live stable sessions so the sessions pane isn't empty in the screenshot.
-    manager.seed_session(0xA1F3, 3, 24, ago_ms(1), SessionKind::Stable);
-    manager.seed_session(0xB2C7, 0, 12, ago_ms(3), SessionKind::Stable);
+    /// `tcr demo` shows a fleet of both providers, so its screenshot shows what tcr draws for
+    /// Codex accounts: three Codex rows beside the six Claude ones, one plan per kind of window
+    /// a plan reports, a Codex session, a Codex request in the log, and the account serving each
+    /// provider.
+    #[test]
+    fn the_demo_seeds_codex_rows_a_session_and_a_log_line() {
+        let snapshot = demo_manager().snapshot(OffsetDateTime::now_utc());
+        let of = |provider: Provider| -> Vec<&AccountSnapshot> {
+            snapshot
+                .accounts
+                .iter()
+                .filter(|a| a.provider == provider)
+                .collect()
+        };
+        let names = |rows: &[&AccountSnapshot]| -> Vec<String> {
+            rows.iter().map(|a| a.name.clone()).collect()
+        };
 
-    // A handful of recent requests, pushed oldest-first (the ring buffer is
-    // reversed to most-recent-first when the snapshot is built).
-    for entry in [
-        log_entry(300, "GET", "/v1/models", 200, "bob"),
-        log_entry(120, "POST", "/v1/messages", 200, "carol"),
-        log_entry(30, "POST", "/v1/messages", 429, "dave"),
-        log_entry(3, "POST", "/v1/messages", 200, "alice"),
-        log_entry(1, "POST", "/v1/messages", 200, "team-prod"),
-    ] {
-        manager.push_log(entry);
+        let codex = of(Provider::Codex);
+        assert_eq!(
+            names(&codex),
+            [
+                "bob@example.com/codex",
+                "dana@example.com",
+                "carol@example.com"
+            ]
+        );
+        assert_eq!(
+            codex.iter().map(|a| a.plan_label()).collect::<Vec<_>>(),
+            [
+                Some("ChatGPT Pro".to_string()),
+                Some("ChatGPT Plus".to_string()),
+                Some("ChatGPT Pro".to_string()),
+            ]
+        );
+        assert_eq!(
+            codex[0].codex.quota_windows,
+            Some(vec!["sevenDay".to_string()])
+        );
+        assert_eq!(
+            codex[1].codex.quota_windows,
+            Some(vec!["fiveHour".to_string(), "sevenDay".to_string()])
+        );
+        assert_eq!(codex[2].gate, GateReason::SevenDay);
+        assert!(
+            codex[2]
+                .free_at
+                .is_some_and(|at| at > OffsetDateTime::now_utc()),
+            "carol's weekly window resets in the future"
+        );
+        assert_eq!(
+            names(&of(Provider::Anthropic)),
+            ["alice", "bob", "carol", "team-prod", "dave", "backup"]
+        );
+
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .any(|s| s.provider == Provider::Codex),
+            "a Codex session is seeded"
+        );
+        assert!(
+            snapshot
+                .recent
+                .iter()
+                .any(|e| e.provider == Provider::Codex && e.path == "/backend-api/codex/responses"),
+            "a Codex request is in the log"
+        );
+
+        let position = |name: &str| {
+            snapshot
+                .accounts
+                .iter()
+                .position(|a| a.name == name)
+                .expect("the demo seeds it")
+        };
+        assert_eq!(
+            snapshot.serving(Provider::Anthropic),
+            Some(position("team-prod"))
+        );
+        assert_eq!(
+            snapshot.serving(Provider::Codex),
+            Some(position("bob@example.com/codex"))
+        );
     }
 
-    crate::tui::run(manager).await
+    /// The account serving Codex in the demo reads as in use, as its seven-request session and
+    /// its log line from a second ago say it is: at least its session's requests, tokens of its
+    /// own, and a last use a second ago, not the idle zeros of an account nothing touched.
+    ///
+    /// Watched red: bob's Codex row reads 0 requests and no last-used time.
+    #[test]
+    fn the_demo_codex_account_in_use_reads_as_used() {
+        let now = OffsetDateTime::now_utc();
+        let snapshot = demo_manager().snapshot(now);
+        let bob = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.name == "bob@example.com/codex")
+            .expect("the demo seeds bob's Codex account");
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|s| s.provider == Provider::Codex)
+            .expect("bob's Codex session");
+        assert!(
+            bob.requests >= session.requests,
+            "the account served at least its session's {} requests, not {}",
+            session.requests,
+            bob.requests
+        );
+        assert!(bob.input_tokens > 0 && bob.output_tokens > 0);
+        let last_used = bob.last_used.expect("a last-used time");
+        assert!(
+            now - last_used < Duration::seconds(5),
+            "last used a second ago, not {}",
+            now - last_used
+        );
+    }
 }

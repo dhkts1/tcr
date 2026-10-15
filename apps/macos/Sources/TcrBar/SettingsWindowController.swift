@@ -112,12 +112,18 @@ struct SettingsDependencies {
     var preference: LaunchPreference
     var countsPreference: MenuBarCountsPreference
     var runningToolsPreference: ShowRunningToolsPreference
+    var cupPoolPreference: MenuBarCupPoolPreference
     var defaultTabPreference: DefaultTabPreference
     var panelDensityPreference: PanelDensityPreference
     var groupController: GroupController
     var updater: Updater
     var claudeRoute: ClaudeRouteController
     var onWhatsNew: () -> Void = {}
+    /// The command-line tcr a shell on this Mac would run, its version, and whether
+    /// it predates Codex accounts, for Settings › Updates. Blocking: the pane runs
+    /// it off the main thread, and only on a fleet holding a Codex account. The
+    /// render harness passes a fixed answer, so no render looks at this Mac's tcr.
+    var pathTcr: @Sendable () -> TcrTool.PathTcr? = { TcrTool.pathTcr() }
 }
 
 /// Reference-counted `.accessory` ↔ `.regular` toggling, the same pattern

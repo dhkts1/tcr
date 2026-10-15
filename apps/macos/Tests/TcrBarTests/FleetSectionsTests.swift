@@ -665,6 +665,210 @@ extension FleetSectionsTests {
         XCTAssertNil(section.todaySpend)
         XCTAssertEqual(section.parkedStatsLine, "")
     }
+
+    // MARK: - One list per provider
+
+    /// A fleet holding both providers draws two lists, Claude's first, each in the tab's own
+    /// order: the loose sections, then the open groups, then the groups closed to one line.
+    func testAMixedFleetListsEachProviderInTabOrderClaudeFirst() throws {
+        let lists = try XCTUnwrap(try canonicalFleet().accountsTabSectionsByProvider(expandedGroups: []))
+        XCTAssertEqual(lists.map(\.provider), [.anthropic, .codex])
+        guard lists.count == 2 else { return }
+
+        XCTAssertEqual(
+            lists[0].sections.map(SectionOutline.init),
+            [SectionOutline(.live, .named("orchard"), ["alice@example.com"])])
+        XCTAssertEqual(
+            lists[1].sections.map(SectionOutline.init),
+            [
+                SectionOutline(
+                    .live, .ungrouped,
+                    [
+                        "bob@example.com/codex", "dana@example.com", "erin@example.com/codex",
+                        "gil@example.com", "hal@example.com", "jo@example.com",
+                    ]),
+                SectionOutline(.outOfTokens, .ungrouped, ["carol@example.com"]),
+                SectionOutline(.live, .named("orchard"), ["ivy@example.com"]),
+                SectionOutline(.live, .named("research"), ["kim@example.com"]),
+            ])
+        for list in lists {
+            XCTAssertTrue(
+                list.sections.allSatisfy { $0.provider == list.provider },
+                "a section in the \(list.provider.token) list belongs to another provider")
+        }
+    }
+
+    /// A group holding accounts of both providers is drawn once in each list, each box
+    /// holding its own provider's members, so its count, tally and spend cover one pool.
+    func testAGroupSpanningBothIsDrawnOncePerSection() throws {
+        let lists = try XCTUnwrap(try canonicalFleet().accountsTabSectionsByProvider(expandedGroups: []))
+        let orchards = lists.map { list in list.sections.filter { $0.group == .named("orchard") } }
+        XCTAssertEqual(orchards.map(\.count), [1, 1], "orchard is drawn once under each head")
+        guard orchards.map(\.count) == [1, 1] else { return }
+
+        let claude = orchards[0][0]
+        let codex = orchards[1][0]
+        XCTAssertEqual(claude.rows.map(\.account.name), ["alice@example.com"])
+        XCTAssertEqual(codex.rows.map(\.account.name), ["ivy@example.com"])
+        XCTAssertNotEqual(
+            claude.id, codex.id, "the two orchard boxes would share one identity in the tab's list")
+    }
+
+    /// A fleet with no Codex row has no per-provider lists: the tab draws its one list, in
+    /// the order and with the identities it always had.
+    func testAClaudeOnlyFleetKeepsMainsSections() throws {
+        let fleet = try decodeFleet([
+            try canonicalRow("alice@example.com"),
+            try canonicalRow("alice@example.com", ["name": "nina@example.com", "groups": [String]()]),
+            try canonicalRow("alice@example.com", ["name": "henry@example.com", "disabled": true]),
+        ])
+        XCTAssertNil(
+            fleet.accountsTabSectionsByProvider(pinning: "alice@example.com", expandedGroups: []))
+        XCTAssertFalse(fleet.drawsProviderHeads)
+
+        let sections = FleetSection.sections(
+            of: fleet.accounts, provider: .anthropic, pinning: "alice@example.com")
+        let displayed = fleet.sectionsInDisplayOrder(pinning: "alice@example.com")
+        XCTAssertEqual(sections, displayed)
+        XCTAssertEqual(sections.map(\.id), displayed.map(\.id))
+        XCTAssertTrue(sections.allSatisfy { $0.provider == .anthropic })
+
+        // Henry keeps alice's orchard, so he is a wholly-parked orchard of his own, after
+        // the live one: the loose section leads, then the named groups in display order.
+        XCTAssertEqual(
+            fleet.accountsTabSections(pinning: "alice@example.com", expandedGroups: [])
+                .map(SectionOutline.init),
+            [
+                SectionOutline(.live, .ungrouped, ["nina@example.com"]),
+                SectionOutline(.live, .named("orchard"), ["alice@example.com"]),
+                SectionOutline(.parked, .named("orchard"), ["henry@example.com"]),
+            ])
+    }
+
+    /// A fleet of one provider draws one list and no head over it, Codex-only included.
+    func testACodexOnlyFleetDrawsNoHeads() throws {
+        let codexOnly = try decodeFleet(
+            ["bob@example.com/codex", "dana@example.com", "carol@example.com", "erin@example.com/codex"]
+                .map { try canonicalRow($0) })
+        let lists = try XCTUnwrap(codexOnly.accountsTabSectionsByProvider(expandedGroups: []))
+        XCTAssertEqual(lists.map(\.provider), [.codex])
+        XCTAssertFalse(codexOnly.drawsProviderHeads)
+        XCTAssertNil(codexOnly.sectionHead(for: .codex))
+
+        XCTAssertTrue(try canonicalFleet().drawsProviderHeads, "positive control: both providers")
+    }
+
+    /// The Accounts tab draws the lists, heads, keys and tally words pinned above, not copies
+    /// of its own, and the strip leaves its gap between the two pools. The test target links
+    /// TcrBarCore alone, so the two views are read as text: comment lines dropped, and all
+    /// whitespace removed from the code and from each anchor, so a wrapped call still matches.
+    func testTheAccountsTabDrawsProviderSectionsFromCore() throws {
+        let tab = try viewCode("PanelV4/AccountsTabV4.swift")
+        let byProvider =
+            "fleet.accountsTabSectionsByProvider(pinning: controlName, expandedGroups: expandedGroups)"
+        XCTAssertGreaterThanOrEqual(
+            occurrences(of: byProvider, in: tab), 2,
+            "the list and the strip no longer both read the per-provider lists")
+        for anchor in [
+            "fleet.sectionHead(for:",
+            ".accessibilityLabel(head.spoken)",
+            "V4.marginAfter(",
+            "expandedGroups.contains(section.expansionKey)",
+            "onToggleGroup(section.expansionKey)",
+            "section.tallyLabel(tally)",
+            "AccountLineFit.lineNames(lists.flatMap(\\.sections))",
+        ] {
+            XCTAssertTrue(
+                tab.contains(squashed(anchor)), "AccountsTabV4.swift no longer contains \(anchor)")
+        }
+        XCTAssertGreaterThanOrEqual(
+            occurrences(of: "RowNotices(notices: notices(row.account))", in: tab), 5,
+            "a row form lost the notices drawn under it")
+        for stale in ["section.group.token", "text: tally.label"] {
+            XCTAssertFalse(
+                tab.contains(squashed(stale)),
+                "AccountsTabV4.swift reads \(stale) again, which is the same for a Codex box")
+        }
+
+        let header = try viewCode("PanelV4/FleetStripHeader.swift")
+        for anchor in ["index == strip.poolBreak", "V4.stripPoolSpacer"] {
+            XCTAssertTrue(
+                header.contains(squashed(anchor)),
+                "FleetStripHeader.swift no longer contains \(anchor)")
+        }
+    }
+
+    /// The code of `relative`, under apps/macos/Sources/TcrBar: comment lines dropped, then
+    /// every whitespace character removed.
+    private func viewCode(_ relative: String) throws -> String {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // -> TcrBarTests
+            .deletingLastPathComponent()  // -> Tests
+            .deletingLastPathComponent()  // -> apps/macos
+            .deletingLastPathComponent()  // -> apps
+            .deletingLastPathComponent()  // -> repo root
+        let file = repoRoot.appendingPathComponent("apps/macos/Sources/TcrBar/\(relative)")
+        let source = try XCTUnwrap(
+            try? String(contentsOf: file, encoding: .utf8),
+            "\(file.lastPathComponent) has moved — update this test's path")
+        let code = source.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        return squashed(code)
+    }
+
+    private func squashed(_ text: String) -> String {
+        text.components(separatedBy: .whitespacesAndNewlines).joined()
+    }
+
+    private func occurrences(of anchor: String, in code: String) -> Int {
+        code.components(separatedBy: squashed(anchor)).count - 1
+    }
+}
+
+/// A section as these assertions read it: its band, its group, and its rows' names in order.
+private struct SectionOutline: Equatable {
+    let band: FleetBand
+    let group: FleetGroupKey
+    let names: [String]
+
+    init(_ band: FleetBand, _ group: FleetGroupKey, _ names: [String]) {
+        self.band = band
+        self.group = group
+        self.names = names
+    }
+
+    init(_ section: FleetSection) {
+        self.init(section.band, section.group, section.rows.map(\.account.name))
+    }
+}
+
+/// One canonical row from apps/macos/Tests/Fixtures/codex-status.json, with `overrides`
+/// written over its JSON object (`NSNull()` writes a JSON null).
+private func canonicalRow(_ name: String, _ overrides: [String: Any] = [:]) throws -> [String: Any] {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    var row = try XCTUnwrap(rows.first { $0["name"] as? String == name }, "no canonical \(name)")
+    for (key, value) in overrides { row[key] = value }
+    return row
+}
+
+private func decodeFleet(_ rows: [[String: Any]]) throws -> Fleet {
+    try Fleet.decode(JSONSerialization.data(withJSONObject: rows))
+}
+
+/// All ten canonical rows: alice (Claude, in orchard) and nine Codex rows.
+private func canonicalFleet() throws -> Fleet {
+    try decodeFleet(
+        [
+            "alice@example.com", "bob@example.com/codex", "carol@example.com", "dana@example.com",
+            "erin@example.com/codex", "gil@example.com", "hal@example.com", "ivy@example.com",
+            "jo@example.com", "kim@example.com",
+        ].map { try canonicalRow($0) })
 }
 
 private func sectionAccount(

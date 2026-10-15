@@ -42,6 +42,11 @@ struct AccountCard<Actions: View>: View {
     /// the whole panel and required a reader to hold "which account" in their
     /// head while scanning the cards below it (review's card-pill ask).
     var isControl: Bool = false
+    /// True in a fleet that also holds Codex accounts: the card's spoken label
+    /// then says which provider a Claude account serves. A Codex card says so
+    /// whatever this is, and a Claude-only fleet passes `false` and hears what
+    /// it always did (``Account/cardSummaryLabel(now:isControl:namesProvider:)``).
+    var namesProvider: Bool = false
     /// The Macs drawing on this account, from `tcr peer ls --json`'s `lentTo`
     ///, the LENDER's own file, so the line costs no wire call and says
     /// nothing a peer told us.
@@ -105,7 +110,7 @@ struct AccountCard<Actions: View>: View {
                         // a card whose exit Mac is down must not also read
                         // green OK at a glance.
                         if exitWaitingPillText == nil {
-                            V4Pill(text: statePillText, role: statePillRole, help: account.stateHelp)
+                            V4Pill(text: statePillText, role: statePillRole, help: stateHelpText)
                         }
                     }
                 }
@@ -144,32 +149,61 @@ struct AccountCard<Actions: View>: View {
             // and preferred readable bars, so it draws the same rows, just at
             // Compact's own tighter density tokens (`V4.quotaLabelWidth`,
             // `V4.quotaMarginTop`, `V4.barHeight`).
-            ForEach(Array(quotaWindows.enumerated()), id: \.element.label) {
-                index, window in
-                QuotaRow(
-                    label: window.label, value: window.value, tint: window.tint,
-                    resetAtMs: window.resetAtMs, now: now,
-                    trailing: rowTail(index),
-                    trailingReserved: usageTail != nil || rowTail(1) != nil,
-                    trailingHelp: index == 1 ? row1TrailingHelp : usageTailHelp,
-                    trailingTint: index == 1 ? fableTailTint : nil)
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(quotaWindows.enumerated()), id: \.element.window) {
+                    index, window in
+                    QuotaRow(
+                        label: window.label, value: window.value, tint: window.tint,
+                        resetAtMs: window.resetAtMs, now: now,
+                        trailing: trailingText(index, window),
+                        trailingReserved: trailingReserved,
+                        trailingHelp: trailingHelp(index, window),
+                        trailingTint: trailingTint(index))
+                }
+                // A Codex plan that reports no usage window draws no row, and this
+                // one line in its place says so, with its credits. `nil` on every
+                // other card, Claude cards included, which draw nothing here.
+                if let line = CodexCardFacts.noWindowsLine(account) {
+                    Text(line.text)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
+                        .padding(.top, V4.quotaMarginTop)
+                        .help(line.help)
+                }
             }
-            if let line = PeerLease.lentToLine(lentTo) {
-                lentLine(line)
+            .frame(
+                minHeight: CGFloat(CodexCardFacts.reservedQuotaRows(account))
+                    * (V4.lineHeight(V4.dimSize) + V4.quotaMarginTop),
+                alignment: .topLeading)
+            // A Codex request always leaves from this Mac, so a Codex card draws
+            // no lease line, and in place of the exit picker one statement of
+            // where its requests leave from (``AccountExit/statement(for:exit:)``).
+            if account.availableActions.contains(.lentToLine) {
+                if let line = PeerLease.lentToLine(lentTo) {
+                    lentLine(line)
+                }
             }
             if let exit {
-                AccountExitRow(
-                    account: account.name, exit: exit, peers: exitPeers,
-                    peerRows: exitPeerRows,
-                    snapshotMode: snapshotMode, onChoose: onChooseExit,
-                    onToggleMust: onToggleExitMust)
+                if let statement = AccountExit.statement(for: account, exit: exit) {
+                    AccountExitStatement(text: statement)
+                } else {
+                    AccountExitRow(
+                        account: account.name, exit: exit, peers: exitPeers,
+                        peerRows: exitPeerRows,
+                        snapshotMode: snapshotMode, onChoose: onChooseExit,
+                        onToggleMust: onToggleExitMust)
+                }
             }
         }
         // `.contain` WITH a label. Without one the container has no accessible
         // name, so it cannot take focus and a user arriving at the card is told
         // nothing about which account they have arrived at.
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(account.cardSummaryLabel(now: now, isControl: isControl))
+        .accessibilityLabel(
+            account.cardSummaryLabel(now: now, isControl: isControl, namesProvider: namesProvider))
     }
 
     /// Decision row 13's line, under the meters: who is drawing on this
@@ -274,7 +308,7 @@ struct AccountCard<Actions: View>: View {
             }
         }
         .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
-        .help(account.name)
+        .help(CodexCardFacts.nameHelp(account))
         .accessibilityValue(account.name)
     }
 
@@ -299,6 +333,11 @@ struct AccountCard<Actions: View>: View {
     /// controls. The controls are counted whether or not this card draws any,
     /// which over-reserves on the handful that pass an empty `actions` closure
     /// rather than under-reserving on every card that does not.
+    ///
+    /// A signed-out Codex card also reserves its visible `Re-login…` button
+    /// (``Account/reservesReloginInNameRow``), so its plan is measured against
+    /// the room the button really leaves and is dropped rather than squeezed.
+    /// Every Claude card subtracts the menu alone, as it always has.
     private var nameRowWidth: CGFloat {
         let outer =
             V4.panelWidth - 2 * V4.panelPaddingSide
@@ -310,7 +349,8 @@ struct AccountCard<Actions: View>: View {
         let pills = pillWords.map(pillWidth)
         let block = pills.reduce(0, +) + V4.pillGap * CGFloat(max(pills.count - 1, 0))
         return outer - 2 * V4.cardInsetH - V4.rowGap - block - V4.pillGap
-            - NameRowFit.actionsSlotWidth
+            - NameRowFit.actionsWidth(
+                reservesRelogin: account.reservesReloginInNameRow, gap: V4.pillGap)
     }
 
     /// Exactly the pills ``body`` draws in the header's trailing slot, in the
@@ -373,8 +413,13 @@ struct AccountCard<Actions: View>: View {
     /// ``AccountExitRow`` draws under the picker, when this account is
     /// must-locked to a Mac that is down right now. `nil` on every other
     /// account, which draws no second pill at all.
+    ///
+    /// `nil` on a Codex card too, whatever its exit says: a Codex request always
+    /// leaves from this Mac and never waits for another one, so the card keeps its
+    /// state pill and draws its exit statement instead.
     private var exitWaitingPillText: String? {
-        exit?.waitingPill(peers: exitPeerRows)
+        guard account.availableActions.contains(.exitPicker) else { return nil }
+        return exit?.waitingPill(peers: exitPeerRows)
     }
 
     /// The sentence behind the waiting pill, the same one
@@ -384,19 +429,60 @@ struct AccountCard<Actions: View>: View {
             + "requests wait until it is back."
     }
 
-    /// ``FleetTally/Kind/pillText``, kept under this name because the pill
-    /// and the spoken label both read it, and a wiring test pins the pill's
-    /// call by it.
-    private var statePillText: String { kind.pillText }
+    /// ``FleetTally/Kind/pillText(for:)``, kept under this name because the
+    /// pill and the spoken label both read it, and a wiring test pins the
+    /// pill's call by it. A refused Codex row reads `Refused`; every other
+    /// row reads the register's own word.
+    private var statePillText: String { kind.pillText(for: account.provider) }
 
     private var statePillRole: V4Pill.Role {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin, .rejected: return .bad
+        case .spent, .needsRelogin, .rejected, .unreachable: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }
+    }
+
+    /// The sentence behind the state pill: ChatGPT's own reason on a Codex card
+    /// where it has one (``CodexCardFacts/stateHelp(_:now:timeZone:home:)``), and
+    /// ``Account/stateHelp`` everywhere else, every Claude card included.
+    private var stateHelpText: String? {
+        guard account.provider == .codex else { return account.stateHelp }
+        return CodexCardFacts.stateHelp(account, now: now) ?? account.stateHelp
+    }
+
+    /// What row `index` draws in the tail column. A Claude card keeps
+    /// ``rowTail(_:)``; a Codex card draws that window's output tokens
+    /// (``CodexCardFacts/tail(_:window:)``), since its plan is not billed per
+    /// request and a dollar figure would be a claim nobody measured.
+    private func trailingText(_ index: Int, _ window: QuotaWindowSpec) -> String? {
+        guard account.provider == .codex else { return rowTail(index) }
+        return CodexCardFacts.tail(account, window: window.window)?.text
+    }
+
+    /// The tail's hover: the Claude card's own, or the Codex tail's, which names
+    /// the window its tokens were counted in.
+    private func trailingHelp(_ index: Int, _ window: QuotaWindowSpec) -> String? {
+        guard account.provider == .codex else {
+            return index == 1 ? row1TrailingHelp : usageTailHelp
+        }
+        return CodexCardFacts.tail(account, window: window.window)?.help
+    }
+
+    /// The tail's colour: the Fable figure's own on a Claude card's second row,
+    /// and the ordinary mute everywhere else, every Codex tail included.
+    private func trailingTint(_ index: Int) -> Color? {
+        guard account.provider == .codex else { return index == 1 ? fableTailTint : nil }
+        return nil
+    }
+
+    /// Whether every row reserves the tail column, so all the bars keep one width:
+    /// when any row the card draws has a tail.
+    private var trailingReserved: Bool {
+        guard account.provider == .codex else { return usageTail != nil || rowTail(1) != nil }
+        return quotaWindows.contains { CodexCardFacts.tail(account, window: $0.window) != nil }
     }
 
     /// What the reserved right-hand column says on row `index`. The plan name
@@ -486,16 +572,31 @@ struct AccountCard<Actions: View>: View {
     /// it like we had before"). A row costs every card a
     /// measured 21 pt; the tail column costs nothing extra, because it is
     /// already reserved for the figure above it.
+    ///
+    /// A Codex card draws only the windows its plan reports
+    /// (``Account/reportedWindows``), each labelled by its length: a Pro plan's one
+    /// weekly row, and no row at all for a plan that reports none. A window the
+    /// plan does not have is not a reading nobody took, so it gets no empty row.
     private var quotaWindows: [QuotaWindowSpec] {
-        [
+        guard account.provider == .codex else {
+            return [
+                QuotaWindowSpec(
+                    window: .fiveHour, label: "5h", value: account.fiveHour,
+                    tint: account.quotaBarTintSource(for: .fiveHour),
+                    resetAtMs: account.fiveHourResetAtMs),
+                QuotaWindowSpec(
+                    window: .sevenDay, label: "7d", value: account.sevenDay,
+                    tint: account.quotaBarTintSource(for: .sevenDay),
+                    resetAtMs: account.sevenDayResetAtMs),
+            ]
+        }
+        return account.reportedWindows.map { window in
             QuotaWindowSpec(
-                label: "5h", value: account.fiveHour,
-                tint: account.quotaBarTintSource(for: .fiveHour),
-                resetAtMs: account.fiveHourResetAtMs),
-            QuotaWindowSpec(
-                label: "7d", value: account.sevenDay,
-                tint: account.quotaBarTintSource(for: .sevenDay),
-                resetAtMs: account.sevenDayResetAtMs),
-        ]
+                window: window, label: account.windowLabel(for: window),
+                value: window == .fiveHour ? account.fiveHour : account.sevenDay,
+                tint: account.quotaBarTintSource(for: window),
+                resetAtMs: window == .fiveHour
+                    ? account.fiveHourResetAtMs : account.sevenDayResetAtMs)
+        }
     }
 }

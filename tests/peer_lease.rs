@@ -41,6 +41,7 @@ use tcr::peer::config::{
 };
 use tcr::peer::lease::{self, Ledger, PeerLeaseProvider, RelayRefusal};
 use tcr::peer::serve;
+use tcr::provider::Provider;
 use tcr_peer_wire::{Lease, LeaseRefusal, LeaseRequest, LeaseUnit, PeerId, Window};
 
 /// **The scrub.** A SERVE frame carries neither `authorization` nor
@@ -1804,13 +1805,17 @@ mod fleet {
 
     struct NeverRefreshes;
     impl TokenRefresher for NeverRefreshes {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: tcr::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             Box::pin(async { Err(OAuthError::Transient("no refresher in lease tests".into())) })
         }
     }
     struct NeverProbes;
     impl UsageProber for NeverProbes {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: tcr::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(ProbeError {
                     status: None,
@@ -1836,6 +1841,7 @@ mod fleet {
         Account {
             name: "lender-fake".to_string(),
             account_type: tcr::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             // One org, so every borrowed request lands in ONE per-org GCRA
             // bucket: which is the bucket the pacing gate measures.
@@ -1853,6 +1859,7 @@ mod fleet {
             seat_tier: None,
             egress: tcr::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -1869,6 +1876,7 @@ mod fleet {
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),
+            codex_upstream: tcr::provider::CODEX_UPSTREAM.to_string(),
             switch_threshold: 0.98,
             fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
@@ -1893,6 +1901,29 @@ mod fleet {
     pub fn lending_manager(upstream: &str, account_throttle: ThrottleConfig) -> Arc<Manager> {
         Manager::new(
             config(upstream, vec![account()], account_throttle),
+            Arc::new(NeverRefreshes),
+            Arc::new(NeverProbes),
+            Arc::new(NeverWarms),
+            None,
+        )
+    }
+
+    /// [`lending_manager`] whose one account is a CODEX account, with the Codex
+    /// origin pointed at `upstream` too: a lender that HAS an account a Codex
+    /// path could be served on, so a refusal of one is a decision and not an
+    /// accident of an Anthropic-only fleet.
+    pub fn codex_lending_manager(upstream: &str) -> Arc<Manager> {
+        let mut config = config(
+            upstream,
+            vec![Account {
+                provider: tcr::provider::Provider::Codex,
+                ..account()
+            }],
+            ThrottleConfig::default(),
+        );
+        config.codex_upstream = upstream.to_string();
+        Manager::new(
+            config,
             Arc::new(NeverRefreshes),
             Arc::new(NeverProbes),
             Arc::new(NeverWarms),
@@ -4708,6 +4739,100 @@ fn a_lend_end_is_parsed_from_a_duration_or_a_clock_against_an_injected_now() {
     }
 }
 
+/// **`lentTo` never names a Codex account, under any scope**: no lease draws on
+/// one, so a Codex card must not read "Lent to".
+///
+/// Three Macs hold one grant each: `all`, `group:work` and
+/// `account:codex-fake`. Every one of them would reach `codex-fake` by scope
+/// alone, which is what makes its absence the assertion that means something.
+/// The control flips the same account to a Claude one, and it then appears
+/// under all three.
+///
+/// Watch it fail by dropping the provider skip in `lent_to`: `codex-fake` then
+/// has a line under every scope.
+#[test]
+fn lent_to_skips_codex_accounts_under_every_scope() {
+    let dir = tempfile::tempdir().expect("a temp home");
+    let peers = dir.path().join("tcr-peers.json");
+
+    let scoped = |scope: tcr_peer_wire::LendScope| {
+        let mut grant = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
+        grant.scope = scope;
+        grant
+    };
+    let mut all = lender_row_for(
+        PeerId([41_u8; 32]),
+        vec![scoped(tcr_peer_wire::LendScope::All)],
+    );
+    all.label = "all-mac".to_string();
+    let mut group = lender_row_for(
+        PeerId([42_u8; 32]),
+        vec![scoped(tcr_peer_wire::LendScope::Group("work".to_string()))],
+    );
+    group.label = "group-mac".to_string();
+    let mut named = lender_row_for(
+        PeerId([43_u8; 32]),
+        vec![scoped(tcr_peer_wire::LendScope::Accounts(vec![
+            "codex-fake".to_string(),
+        ]))],
+    );
+    named.label = "named-mac".to_string();
+    write_peers(&peers, vec![all, group, named]);
+    let store = PeerStore::open(&peers).expect("the peers file");
+
+    let lender = (
+        "lender-fake".to_string(),
+        vec!["work".to_string()],
+        Provider::Anthropic,
+    );
+    let lent = lease::lent_to(
+        &store,
+        &[
+            lender.clone(),
+            (
+                "codex-fake".to_string(),
+                vec!["work".to_string()],
+                Provider::Codex,
+            ),
+        ],
+    );
+    let on_lender: Vec<&str> = lent
+        .get("lender-fake")
+        .expect("the Claude account is lent")
+        .iter()
+        .map(|row| row.peer.as_str())
+        .collect();
+    assert_eq!(
+        on_lender,
+        ["all-mac", "group-mac"],
+        "the `all` and `group:work` grants reach the Claude account: {lent:?}"
+    );
+    assert!(
+        !lent.contains_key("codex-fake"),
+        "no grant reaches a Codex account, whatever its scope says: {lent:?}"
+    );
+
+    // The control: the same account, as a Claude account, is under all three.
+    let lent = lease::lent_to(
+        &store,
+        &[
+            lender,
+            (
+                "codex-fake".to_string(),
+                vec!["work".to_string()],
+                Provider::Anthropic,
+            ),
+        ],
+    );
+    let on_flipped: Vec<&str> = lent
+        .get("codex-fake")
+        .expect("as a Claude account it is lent")
+        .iter()
+        .map(|row| row.peer.as_str())
+        .collect();
+    assert_eq!(on_flipped, ["all-mac", "group-mac", "named-mac"]);
+}
+
 /// **`lentTo`, per account label, from the lender's own grants and no wire** :
 /// the read-only, time-bounded view of a lease from the account's side.
 ///
@@ -4741,8 +4866,12 @@ fn lent_to_names_every_mac_a_grant_lends_one_account_to() {
 
     let store = PeerStore::open(&peers).expect("the peers file");
     let accounts = vec![
-        ("lender-fake".to_string(), vec!["work".to_string()]),
-        ("spare-fake".to_string(), Vec::new()),
+        (
+            "lender-fake".to_string(),
+            vec!["work".to_string()],
+            Provider::Anthropic,
+        ),
+        ("spare-fake".to_string(), Vec::new(), Provider::Anthropic),
     ];
     let lent = lease::lent_to(&store, &accounts);
 
@@ -5284,8 +5413,12 @@ fn lent_to_carries_the_real_scope_the_real_end_and_whether_it_has_passed() {
     let store = PeerStore::open(&peers).expect("the peers file opens");
 
     let accounts = vec![
-        ("lender-fake".to_string(), vec!["work".to_string()]),
-        ("spare-fake".to_string(), Vec::new()),
+        (
+            "lender-fake".to_string(),
+            vec!["work".to_string()],
+            Provider::Anthropic,
+        ),
+        ("spare-fake".to_string(), Vec::new(), Provider::Anthropic),
     ];
     let lent = lease::lent_to(&store, &accounts);
 
@@ -5360,6 +5493,113 @@ fn cli_peers_file(dir: &Path) -> (PathBuf, String) {
     row.label = "attic-nuc".to_string();
     write_peers(&peers, vec![row]);
     (peers, node.to_wire())
+}
+
+/// **`tcr peer lend` and `tcr peer share on` refuse a scope that names a Codex
+/// account, exit 1, and write nothing**, through the binary an operator and the
+/// panel run.
+///
+/// Codex accounts stay on this Mac: no lease draws on one, so a grant scoped to
+/// one would advertise a capability that is not there. The match is the one
+/// the serve path uses for `account:` scopes, the sanitized label. The Codex
+/// row's name is a label, the way `tcr login --codex --name work` writes one:
+/// an email name never reaches this check, because the scope parser refuses an
+/// `@` first.
+///
+/// Clearing stays allowed, so an old lease that names one can still go: a zero
+/// fraction on both verbs, and `--list`. A config that cannot be read skips the
+/// check, as `tcr peer ls` does. The control is the Claude row, which lends as
+/// it always did.
+///
+/// Watch it fail by dropping the guard call: the run exits 0 and writes the
+/// peers file.
+#[test]
+fn peer_lend_and_share_on_refuse_a_codex_scope() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (peers, node) = cli_peers_file(dir.path());
+    let config = dir.path().join("teamclaude.json");
+    std::fs::write(
+        &config,
+        r#"{"accounts":[
+             {"name":"work-fake","accessToken":"not-a-real-token"},
+             {"name":"work","provider":"codex","accessToken":"not-a-real-token",
+              "credentialVersion":2}
+           ]}"#,
+    )
+    .expect("the config fixture writes");
+    let refusal = "'work' is a Codex account, and Codex accounts stay on this Mac: only a Claude account can be lent. Nothing was changed.";
+    let run = |config: &Path, args: &[&str]| -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+            .arg("peer")
+            .args(args)
+            .args(["--peers", peers.to_str().expect("a utf-8 path")])
+            .args(["--config", config.to_str().expect("a utf-8 path")])
+            .output()
+            .unwrap_or_else(|err| panic!("spawn tcr peer {args:?}: {err}"))
+    };
+    let peers_before = std::fs::read(&peers).expect("the peers file reads");
+    let config_before = std::fs::read(&config).expect("the config reads");
+
+    for args in [
+        &["lend", &node, "--scope", "account:work"][..],
+        &["lend", &node, "--scope", "account:work-fake,work"],
+        &["share", "on", "--scope", "account:work"],
+    ] {
+        let out = run(&config, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} is refused: {stderr}{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            stderr.contains(refusal),
+            "{args:?} says why, in the refusal's own words: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&peers).expect("the peers file reads"),
+            peers_before,
+            "{args:?} wrote nothing to the peers file"
+        );
+        assert_eq!(
+            std::fs::read(&config).expect("the config reads"),
+            config_before,
+            "{args:?} wrote nothing to the config"
+        );
+    }
+
+    // Clearing an old grant that names it stays allowed on both verbs.
+    for args in [
+        &["lend", &node, "--scope", "account:work", "--fraction", "0"][..],
+        &["share", "on", "--scope", "account:work", "--fraction", "0"],
+        &["lend", &node, "--list"],
+    ] {
+        let out = run(&config, args);
+        assert!(
+            out.status.success(),
+            "{args:?} still works: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A config that cannot be read skips the check rather than failing the verb.
+    let missing = dir.path().join("no-such-config.json");
+    let out = run(&missing, &["lend", &node, "--scope", "account:work"]);
+    assert!(
+        out.status.success(),
+        "a missing config skips the check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!missing.exists(), "and creates no config either");
+
+    // The control: the Claude row lends as before.
+    let out = run(&config, &["lend", &node, "--scope", "account:work-fake"]);
+    assert!(
+        out.status.success(),
+        "a Claude account is lent: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// **`tcr peer lend --scope group:work` adds a SECOND lease rather than
@@ -7794,7 +8034,7 @@ async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
         "anthropic-ratelimit-unified-7d-utilization",
         "0.10".parse().expect("a header value"),
     );
-    manager.update_quota(0, &measured);
+    manager.update_quota(0, &measured, 200);
     let owner_proxy = fleet::spawn_proxy(manager.clone()).await;
 
     let lender_home = tempfile::tempdir().expect("the lender's temp home");
@@ -7971,7 +8211,10 @@ fn a_lent_to_row_carries_the_wire_id_of_the_mac_it_names() {
     write_peers(&peers, vec![one, two]);
 
     let store = PeerStore::open(&peers).expect("the peers file");
-    let lent = lease::lent_to(&store, &[("lender-fake".to_string(), Vec::new())]);
+    let lent = lease::lent_to(
+        &store,
+        &[("lender-fake".to_string(), Vec::new(), Provider::Anthropic)],
+    );
     let rows = lent
         .get("lender-fake")
         .expect("an `all` grant covers every local account");
@@ -8415,5 +8658,94 @@ async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
         1,
         "and the request really was served upstream, so the 200 above is a serve rather \
          than something short-circuited before the picker"
+    );
+}
+
+/// **No Codex path is relayed over the mesh, from either side** (Codex is not
+/// lent in this version). A lease is sized on the lender's
+/// Anthropic windows, and its picker would serve a Codex request on a Codex
+/// account no lease accounts for. Every Codex path, inference or not, is
+/// refused by the one predicate both halves ask: the borrower's seam builds no
+/// `Ask`, and the frame builder builds no frame.
+///
+/// The controls: the predicate still allows the ordinary Anthropic inference
+/// path, and `/backend-apix/…` is NOT Codex (`Provider::of_path` matches whole
+/// segments), so the refusal is the provider's classification and not a bare
+/// prefix.
+///
+/// Watch it fail by deleting the Codex arm of `serve_is_allowed_for_path`.
+#[test]
+fn codex_paths_never_open_a_relay() {
+    for path in [
+        "/backend-api/codex/responses",
+        "/backend-api/wham/usage",
+        "/backend-api",
+    ] {
+        assert!(
+            !serve::serve_is_allowed_for_path(path),
+            "{path} is a Codex path and must never be relayed"
+        );
+        let ask = ask_for(path);
+        assert!(
+            serve::serve_request_from(&ask, &HeaderMap::new(), LEASE, REQUEST).is_err(),
+            "{path} must not even build a frame"
+        );
+    }
+    assert!(serve::serve_is_allowed_for_path("/v1/messages"));
+    assert!(serve::serve_is_allowed_for_path("/backend-apix/evil"));
+}
+
+/// **A lender refuses a Codex path IN A FRAME, even with a Codex account to
+/// serve it on.** The borrower's refusal is the one that matters; this is the
+/// backstop against an older or a malicious borrower, which here hand-builds a
+/// frame naming the Codex inference path. The lender's own fleet is one CODEX
+/// account over the fake upstream, so a lender that took the frame would serve
+/// it there and the hit count would read 1.
+///
+/// Watch it fail by deleting the Codex arm of `serve_is_allowed_for_path`: the
+/// lender acks, serves the frame on its Codex account, and the upstream counts
+/// the hit.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_path_in_a_frame_is_refused_by_the_lender() {
+    let (upstream, hits, _served) = fleet::spawn_upstream().await;
+    let lender_proxy = fleet::spawn_proxy(fleet::codex_lending_manager(&upstream)).await;
+
+    let pair = hostile_pair();
+    let peer_addr = mesh::spawn_lender(
+        pair.key_dir.clone(),
+        pair.peers_path.clone(),
+        pair.ledger.clone(),
+        lender_proxy,
+        std::sync::Arc::new(tcr::peer::serve::NoFleetUtilization),
+        fleet::dry_manager(),
+    )
+    .await;
+
+    let answered = hostile_serve(
+        peer_addr,
+        &pair.lender_key,
+        &pair.borrower_key,
+        serve::ServeRequest {
+            lease_id: LEASE,
+            request_id: 1,
+            method: "POST".to_string(),
+            path: tcr::provider::CODEX_RESPONSES_PATH.to_string(),
+            query: None,
+            headers: Vec::new(),
+            body_bytes: 2,
+            proto: tcr_peer_wire::PROTO_VERSION,
+            flow: serve::SERVE_FLOW,
+        },
+    )
+    .await;
+
+    assert!(
+        answered.is_err(),
+        "the lender closes on a Codex path rather than serving it: {answered:?}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was served on the lender's Codex account"
     );
 }

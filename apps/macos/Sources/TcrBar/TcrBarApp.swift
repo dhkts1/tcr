@@ -187,6 +187,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // already knows whether to ask "Send claude through tcr?". Each open
         // re-reads it after showing, for the opening after that.
         Task { await shell.claudeRoute.refresh() }
+        Task {
+            await shell.codexPresence.refresh(
+                fleetHoldsCodex: shell.poller.state.loadedFleet?.holdsCodex == true)
+        }
         // One attempt, once per process.
         //
         // This used to need a `didAttemptLaunchStart` flag because `onAppear`

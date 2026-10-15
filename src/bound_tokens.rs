@@ -51,6 +51,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{Account, ConfigError};
 use crate::identity::{self, Resolved};
+use crate::provider::Provider;
 
 /// How old a bound-token pin may be and still be honoured: **24 hours** since the response that
 /// minted it.
@@ -159,12 +160,23 @@ pub struct StoredAccount {
     pub org_uuid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_name: Option<String>,
+    /// The provider of the minting account: part of its identity, since
+    /// [`identity::same_identity`] never matches records of different providers.
+    /// Written only for a Codex account, the rule `config::Account::provider`
+    /// follows, so a file written for an Anthropic-only fleet is exactly what it
+    /// was. Absent reads as Anthropic, which is right for every record written
+    /// before this field existed: every account was Anthropic then. Without it a
+    /// Codex account's tokens would read back as Anthropic after a restart and
+    /// match no row of their own provider.
+    #[serde(default, skip_serializing_if = "Provider::is_anthropic")]
+    pub provider: Provider,
 }
 
 impl StoredAccount {
     /// The identity probe this record resolves through.
     fn probe(&self) -> Account {
         identity::probe(
+            self.provider,
             &self.name,
             self.account_uuid.clone(),
             self.org_uuid.clone(),
@@ -403,6 +415,7 @@ mod tests {
 
     fn account(name: &str, uuid: &str) -> Account {
         identity::probe(
+            Provider::Anthropic,
             name,
             Some(uuid.to_string()),
             Some("org-1".to_string()),
@@ -416,6 +429,7 @@ mod tests {
             account_uuid: Some(uuid.to_string()),
             org_uuid: Some("org-1".to_string()),
             org_name: None,
+            provider: Provider::Anthropic,
         }
     }
 

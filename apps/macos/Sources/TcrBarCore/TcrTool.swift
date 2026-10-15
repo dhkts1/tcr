@@ -11,6 +11,10 @@ public enum TcrTool {
     /// User-facing override, e.g.
     /// `defaults write io.github.dhkts1.tcrbar TcrExecutablePath <path>`.
     public static let overrideDefaultsKey = "TcrExecutablePath"
+    /// The codex executable a person picked with `Choose codex…` when tcr could not
+    /// find one. It is passed to `tcr login --codex` as `TCR_CODEX_BIN`, because a
+    /// TcrBar started from Finder has no shell `PATH` to find an npm or nvm codex on.
+    public static let codexOverrideDefaultsKey = "CodexExecutablePath"
     /// Environment override, useful when launched from a shell.
     public static let overrideEnvKey = "TCR_BIN"
 
@@ -109,6 +113,97 @@ public enum TcrTool {
             if fileManager.isExecutableFile(atPath: candidate.path) { return .success(candidate) }
         }
         return .failure(NotFound(searched: searched))
+    }
+
+    /// The `tcr` a shell on this Mac would run: the first executable `tcr` in
+    /// `searchDirectories` whose directory is not `bundle`.
+    ///
+    /// The overrides are not consulted, and neither is the bundled copy: the question
+    /// is which `tcr` a person typing `tcr` gets, which ``resolve(environment:defaults:home:fileManager:bundle:)``
+    /// answers for TcrBar and not for them.
+    public static func pathExecutable(
+        searchDirectories: [URL] = TcrTool.searchDirectories(),
+        bundle: URL? = bundledDirectory(),
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let bundlePath = bundle?.standardizedFileURL.path
+        for directory in searchDirectories where directory.standardizedFileURL.path != bundlePath {
+            let candidate = directory.appendingPathComponent("tcr")
+            if fileManager.isExecutableFile(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+
+    /// Whether a `tcr` with this `login --help` predates Codex accounts: one that cannot
+    /// import a codex login cannot read a config that holds one either.
+    public static func predatesCodexAccounts(loginHelp: String) -> Bool {
+        !LoginCapability.helpTokens(loginHelp).contains("--from-codex")
+    }
+
+    /// The version in `tcr --version`'s output (`tcr 0.2.44`): the second word of the
+    /// first line, when it starts with a digit.
+    public static func version(fromVersionOutput output: String) -> String? {
+        guard let line = output.split(whereSeparator: \.isNewline).first else { return nil }
+        let words = line.split(whereSeparator: \.isWhitespace)
+        guard words.count >= 2, let first = words[1].first, first.isASCII, first.isNumber else {
+            return nil
+        }
+        return String(words[1])
+    }
+
+    /// The `tcr` a shell would run, its version, and whether it predates Codex accounts.
+    public struct PathTcr: Equatable, Sendable {
+        public let path: String
+        /// `nil` when `tcr --version` printed nothing this app can read.
+        public let version: String?
+        public let predatesCodex: Bool
+
+        public init(path: String, version: String?, predatesCodex: Bool) {
+            self.path = path
+            self.version = version
+            self.predatesCodex = predatesCodex
+        }
+    }
+
+    /// ``pathExecutable(searchDirectories:bundle:fileManager:)``, asked for its version
+    /// and its `login --help`. `nil` when there is no such `tcr`, or its help cannot be
+    /// read, so nothing is flagged on a guess.
+    ///
+    /// Blocking: it runs two processes, so callers run it off the main thread. Neither
+    /// verb reads a config, so a `tcr` too old to read this one still answers.
+    public static func pathTcr() -> PathTcr? {
+        guard let executable = pathExecutable() else { return nil }
+        guard let help = try? run(executable: executable, arguments: ["login", "--help"]),
+            help.exitCode == 0
+        else { return nil }
+        let helpText = (String(data: help.stdout, encoding: .utf8) ?? "") + help.stderr
+        let version = (try? run(executable: executable, arguments: ["--version"])).flatMap {
+            output -> String? in
+            guard output.exitCode == 0 else { return nil }
+            return Self.version(fromVersionOutput: String(decoding: output.stdout, as: UTF8.self))
+        }
+        return PathTcr(
+            path: executable.path, version: version,
+            predatesCodex: predatesCodexAccounts(loginHelp: helpText))
+    }
+
+    /// The path of the `tcr` inside TcrBar when a shell on this Mac would find no other,
+    /// else `nil`. It tells a person how to start codex through the pool when there is no
+    /// command-line `tcr` to type.
+    ///
+    /// Existence checks only: it runs no process.
+    public static func bundledTcrWithoutCLI(
+        searchDirectories: [URL] = TcrTool.searchDirectories(),
+        bundle: URL? = bundledDirectory(),
+        fileManager: FileManager = .default
+    ) -> String? {
+        guard let bundle else { return nil }
+        let bundled = bundle.appendingPathComponent("tcr")
+        guard fileManager.isExecutableFile(atPath: bundled.path),
+            pathExecutable(searchDirectories: searchDirectories, bundle: bundle, fileManager: fileManager)
+                == nil
+        else { return nil }
+        return bundled.path
     }
 
     /// Set `SIGPIPE` to ignored, once per process.
@@ -238,5 +333,19 @@ public enum TcrTool {
             stdout: stdout,
             stderr: String(data: stderr, encoding: .utf8) ?? ""
         )
+    }
+}
+
+/// Whether a path a person picked with `Choose codex…` is something tcr can run.
+public enum CodexExecutableChoice {
+    /// `true` only for a regular file, after following symlinks, that this user may run.
+    ///
+    /// `isExecutableFile` alone is not enough: `access(2)` calls a folder with its
+    /// search bit executable, so a `Codex.app` bundle would pass. A symlink is followed
+    /// on purpose, because npm, Homebrew and nvm all put codex on `PATH` as one.
+    public static func isAcceptable(path: String) -> Bool {
+        var info = stat()
+        guard stat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return false }
+        return FileManager.default.isExecutableFile(atPath: path)
     }
 }

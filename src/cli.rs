@@ -30,7 +30,8 @@ use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
-use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
+use crate::provider::Provider;
+use crate::stats::{AccountSnapshot, CodexFacts, QuotaState, StatsSnapshot};
 use crate::status::{StatusPayload, STATUS_KIND};
 
 /// Reject a group label whose CONTENT could corrupt header composition
@@ -113,9 +114,12 @@ fn warn_if_server_running(config: &Config) {
 /// call sites: the next verb that needs the config gets the first-run behaviour
 /// by construction, not by remembering.
 fn load_config(config_path: &Path) -> anyhow::Result<Config> {
-    let (config, _created) = config::load_or_init(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
-    Ok(config)
+    load_config_with_creation(config_path).map(|(config, _)| config)
+}
+
+fn load_config_with_creation(config_path: &Path) -> anyhow::Result<(Config, bool)> {
+    config::load_or_init(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))
 }
 
 /// A first run's one chance to arrive with an account already in it: when the
@@ -156,10 +160,42 @@ async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -
 /// fleet must stay a well-formed empty fleet there, with the human-facing
 /// nudge on the other channel. The verb still exits 0: no accounts is a state,
 /// not a failure.
+///
+/// Only an empty fleet asks whether codex holds a login of its own
+/// ([`crate::codex_local::codex_login_exists`], a `metadata` call that never
+/// opens the file), so a fleet with accounts costs nothing extra.
 fn warn_if_no_accounts(config: &Config) {
-    if config.accounts.is_empty() {
-        eprintln!("no accounts configured — run `tcr login` to add one");
+    let codex_login = (config.accounts.is_empty() && crate::codex_local::codex_login_exists())
+        .then(crate::codex_local::codex_login_path);
+    for line in no_accounts_lines(config, codex_login.as_deref()) {
+        eprintln!("{line}");
     }
+}
+
+/// The lines [`warn_if_no_accounts`] prints: none for a fleet with accounts, else the
+/// empty-fleet sentence, then, when `codex_login` names the login codex keeps on this
+/// machine, the two ways to pool codex.
+///
+/// The codex line fires on evidence only. A machine with no codex login is a Claude-only
+/// first run and reads exactly as it always did; a machine where codex is signed in is one
+/// whose person uses codex, and should hear that tcr can pool it. tcr never imports that login
+/// on its own: sharing a login permits guarded token updates to its auth file, so it is the
+/// person's choice. `claudeCodeImport: false` does not stop
+/// the line either, since it stops only the Claude Code import.
+fn no_accounts_lines(config: &Config, codex_login: Option<&Path>) -> Vec<String> {
+    if !config.accounts.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["no accounts configured — run `tcr login` to add one".to_string()];
+    if let Some(login) = codex_login {
+        lines.push(format!(
+            "[tcr] found a codex login at {}: `tcr login --codex` adds a Codex account of tcr's \
+             own, and `tcr login --from-codex` imports that one with guarded token updates \
+             shared through auth.json",
+            login.display()
+        ));
+    }
+    lines
 }
 
 /// Load the config for a management verb, warning if a server is live.
@@ -409,22 +445,44 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// The integer a [`PriorityArg`] means against `config`'s accounts.
+/// The integer a [`PriorityArg`] means against `config`'s accounts of `provider`.
 ///
 /// `--first` = `min(0, existing priorities) - 1`; `--last` =
 /// `max(0, existing priorities) + 1`; an explicit `N` is verbatim. The `0` seed
 /// guarantees a relative move always crosses the default tier even when every
 /// existing priority sits on the same side of it.
-fn priority_value(config: &Config, priority: PriorityArg) -> i64 {
+///
+/// "Existing" means the priorities of `provider`'s accounts, the row's own: Claude
+/// and Codex accounts rotate apart, since neither serves the other's requests,
+/// so a Codex account's priority says nothing about where a Claude account sits.
+/// In a fleet with no Codex account that is every account, as it always was.
+fn priority_value(config: &Config, provider: Provider, priority: PriorityArg) -> i64 {
     let existing = config
         .accounts
         .iter()
+        .filter(|a| a.provider == provider)
         .filter_map(|a| a.priority)
         .chain(std::iter::once(0));
     match priority {
         PriorityArg::N(n) => n,
         PriorityArg::First => existing.min().unwrap_or(0) - 1,
         PriorityArg::Last => existing.max().unwrap_or(0) + 1,
+    }
+}
+
+/// What `tcr priority` prints once the value is set: `Set priority of '{name}'
+/// to {value}.`, except that a Codex account moved with `--first` or `--last`
+/// says which end of the Codex rotation it now holds, since that is the only
+/// rotation the move was taken against.
+fn priority_message(name: &str, value: i64, provider: Provider, arg: PriorityArg) -> String {
+    let plain = || format!("Set priority of '{name}' to {value}.");
+    match provider {
+        Provider::Anthropic => plain(),
+        Provider::Codex => match arg {
+            PriorityArg::First => crate::provider_guard::codex_priority_line(name, value, true),
+            PriorityArg::Last => crate::provider_guard::codex_priority_line(name, value, false),
+            PriorityArg::N(_) => plain(),
+        },
     }
 }
 
@@ -448,8 +506,9 @@ pub async fn set_priority(
     priority: PriorityArg,
 ) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    resolve_account(&config.accounts, query)?;
-    let value = priority_value(&config, priority);
+    let idx = resolve_account(&config.accounts, query)?;
+    let provider = config.accounts[idx].provider;
+    let value = priority_value(&config, provider, priority);
 
     match post_set_priority(&config, query, value).await {
         Ok(applied) => {
@@ -459,7 +518,10 @@ pub async fn set_priority(
                     applied.name
                 )
             })?;
-            println!("Set priority of '{}' to {value}.", applied.name);
+            println!(
+                "{}",
+                priority_message(&applied.name, value, provider, priority)
+            );
             return Ok(());
         }
         // Nothing is listening: the file is the whole truth.
@@ -486,7 +548,7 @@ pub async fn set_priority(
                 config.proxy.port,
                 crate::proxy::PRIORITY_PATH,
             );
-            println!("Set priority of '{name}' to {value}.");
+            println!("{}", priority_message(&name, value, provider, priority));
             return Ok(());
         }
         Err(other) => {
@@ -496,13 +558,13 @@ pub async fn set_priority(
                 config.proxy.port,
                 other.why(),
             );
-            println!("Set priority of '{name}' to {value}.");
+            println!("{}", priority_message(&name, value, provider, priority));
             return Ok(());
         }
     }
 
     let name = write_priority(config_path, query, value)?;
-    println!("Set priority of '{name}' to {value}.");
+    println!("{}", priority_message(&name, value, provider, priority));
     Ok(())
 }
 
@@ -586,6 +648,25 @@ fn control_account_group_notice(config: &Config, account: &str, group: &str) -> 
     ))
 }
 
+/// The warning [`add_to_group`] prints when the account being labelled is a
+/// Codex account. Modelled on [`control_account_group_notice`], and pure for the
+/// same reason: the notice is the whole of this fix, so a test asserts its text
+/// rather than capturing stderr.
+///
+/// The label is right to write: it is how `tcr group park` reaches the account,
+/// and it shows in `tcr status`. What it never does is route, because no Codex
+/// request carries a group, and while the group is reserved the account serves
+/// nothing at all. `None` for a Claude row, which is every ordinary add.
+fn codex_group_add_notice(target: &Account, group: &str) -> Option<String> {
+    match target.provider {
+        Provider::Anthropic => None,
+        Provider::Codex => Some(crate::provider_guard::codex_group_add_warning(
+            &target.name,
+            group,
+        )),
+    }
+}
+
 /// `tcr group add <group> <account>` — label `account` with `group`.
 ///
 /// Resolves through [`find_account_by_name`], which applies exactly the rule
@@ -635,6 +716,11 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     // `GroupCommand::classify`'s `spoke` arm, which exists for exactly this
     // "exit 0 but you should read something" case.
     if let Some(notice) = control_account_group_notice(&config, &target.name, group) {
+        eprintln!("{notice}");
+    }
+    // The same warn-don't-refuse rule for a Codex account, whose label parks it
+    // but never routes to it. TcrBar shows the stderr of a successful add.
+    if let Some(notice) = codex_group_add_notice(target, group) {
         eprintln!("{notice}");
     }
     let outcome = config::save_group_membership(config_path, target, group, true)
@@ -751,6 +837,132 @@ pub fn remove_from_group(
     Ok(())
 }
 
+/// What `tcr group reserve` prints, decided before anything is written. Every
+/// line is built by [`plan_reserve`], so a test reads the exact words without
+/// capturing a stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservePlan {
+    /// Printed on stderr before the success line when `--force` reserved a group
+    /// that holds Codex accounts.
+    force_warning: Option<String>,
+    /// The first stdout line when the reservation was written.
+    reserved_line: String,
+    /// The one stdout line when the group was already reserved.
+    already_line: String,
+    /// Printed on stderr after the success line when few accounts are left.
+    low_count_warning: Option<String>,
+}
+
+/// The safety rail and the lines of `tcr group reserve <group>`, or the refusal
+/// to print instead. Pure: it reads `config` and decides; nothing is written.
+///
+/// A fleet with no Codex account ([`Config::holds_codex`]) runs the rail and
+/// the words it always has: refuse when the reservation would leave zero
+/// enabled, unreserved accounts, warn below three. `force` changes nothing
+/// there.
+///
+/// A fleet holding a Codex account counts each provider apart, because neither
+/// serves the other's traffic, and checks two things in order:
+/// 1. **The Claude rail.** Refused when the reservation takes the enabled,
+///    unreserved Claude accounts from at least one to none. A fleet that had no
+///    such account has no Claude pool to protect, so it is not refused. `force`
+///    never lifts this.
+/// 2. **The Codex members.** Refused without `force` when the group holds a
+///    Codex account, in any state: no Codex session can ask for a group, so a
+///    reserved group's Codex members serve nothing (a disabled one is stranded
+///    the moment it is enabled). This runs on an already-reserved group too, as
+///    the rail does. With `force` it proceeds and warns.
+///
+/// The success lines then count what is left per provider, and warn when one
+/// or two Claude accounts are left of a pool that had any.
+fn plan_reserve(config: &Config, group: &str, force: bool) -> Result<ReservePlan, String> {
+    let mut reserved_after = config.reserved_group_names();
+    reserved_after.insert(group.to_string());
+    let sorted_reserved = || -> Vec<String> {
+        config
+            .reserved_group_names()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+
+    if !config.holds_codex() {
+        let remaining = config.unreserved_enabled_count(&reserved_after);
+        if remaining == 0 {
+            let currently_reserved = sorted_reserved();
+            let advice = if currently_reserved.is_empty() {
+                "every enabled account belongs to this group".to_string()
+            } else {
+                format!("unreserve one of: {} first", currently_reserved.join(", "))
+            };
+            return Err(format!(
+                "reserving '{group}' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. {advice}. Nothing changed."
+            ));
+        }
+        return Ok(ReservePlan {
+            force_warning: None,
+            reserved_line: format!(
+                "group '{group}' reserved. {remaining} unreserved enabled account(s) remain."
+            ),
+            already_line: format!(
+                "group '{group}' is already reserved; nothing changed. {remaining} unreserved enabled account(s) remain."
+            ),
+            low_count_warning: (remaining < 3).then(|| {
+                format!(
+                    "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
+                )
+            }),
+        });
+    }
+
+    let claude_before =
+        config.unreserved_enabled_count_for(&config.reserved_group_names(), Provider::Anthropic);
+    let claude_after = config.unreserved_enabled_count_for(&reserved_after, Provider::Anthropic);
+    let codex_after = config.unreserved_enabled_count_for(&reserved_after, Provider::Codex);
+
+    if claude_before >= 1 && claude_after == 0 {
+        let every_claude_in_group = config
+            .accounts
+            .iter()
+            .filter(|a| a.provider == Provider::Anthropic && !a.disabled.unwrap_or(false))
+            .all(|a| a.in_group(group));
+        let advice = if every_claude_in_group {
+            "every enabled Claude account belongs to this group".to_string()
+        } else {
+            format!("unreserve one of: {} first", sorted_reserved().join(", "))
+        };
+        return Err(crate::provider_guard::reserve_leaves_no_claude(
+            group,
+            codex_after,
+            &advice,
+        ));
+    }
+
+    let codex_members: Vec<&str> = config
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Codex && a.in_group(group))
+        .map(|a| a.name.as_str())
+        .collect();
+    if !codex_members.is_empty() && !force {
+        return Err(crate::provider_guard::reserve_strands_codex(
+            group,
+            &codex_members,
+        ));
+    }
+
+    let remaining = crate::provider_guard::reserve_remaining(claude_after, codex_after);
+    Ok(ReservePlan {
+        force_warning: (!codex_members.is_empty())
+            .then(|| crate::provider_guard::reserve_force_warning(group, &codex_members)),
+        reserved_line: format!("group '{group}' reserved. {remaining}"),
+        already_line: format!("group '{group}' is already reserved; nothing changed. {remaining}"),
+        low_count_warning: (claude_before >= 1 && claude_after < 3)
+            .then(|| crate::provider_guard::reserve_few_claude_left(claude_after)),
+    })
+}
+
 /// `tcr group reserve <group>` — mark `group` reserved: from the next
 /// restart, an account carrying it is off-limits to traffic that did not ask
 /// for one of its groups.
@@ -760,37 +972,30 @@ pub fn remove_from_group(
 /// change would leave zero unreserved ENABLED accounts, and warns (but
 /// proceeds) below three. Idempotent: reserving an already-reserved group
 /// succeeds and says so.
+///
+/// The verb without `--force`: [`reserve_group_with`] with `force` false.
 pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    reserve_group_with(config_path, group, false)
+}
+
+/// `tcr group reserve <group> [--force]`: [`plan_reserve`], then the write,
+/// then the lines the plan holds. A refusal is returned before the write, so it
+/// leaves the config byte-identical.
+pub fn reserve_group_with(config_path: &Path, group: &str, force: bool) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
     let config = load_config(config_path)?;
-
-    let mut reserved_after = config.reserved_group_names();
-    reserved_after.insert(group.to_string());
-    let remaining = config.unreserved_enabled_count(&reserved_after);
-    if remaining == 0 {
-        let currently_reserved: Vec<String> = config
-            .reserved_group_names()
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let advice = if currently_reserved.is_empty() {
-            "every enabled account belongs to this group".to_string()
-        } else {
-            format!("unreserve one of: {} first", currently_reserved.join(", "))
-        };
-        bail!(
-            "reserving '{group}' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. {advice}. Nothing changed."
-        );
-    }
+    let plan = plan_reserve(&config, group, force).map_err(anyhow::Error::msg)?;
 
     let outcome = config::save_group_reserved(config_path, group, true)
         .with_context(|| format!("save config at {}", config_path.display()))?;
     match outcome {
         config::GroupReserveWrite::Updated => {
-            println!("group '{group}' reserved. {remaining} unreserved enabled account(s) remain.");
+            if let Some(warning) = &plan.force_warning {
+                eprintln!("{warning}");
+            }
+            println!("{}", plan.reserved_line);
             // Say what reserving actually does, at the one moment an operator is
             // guaranteed to be reading. The second half is the surprising one: it
             // can make a `--group` request WAIT or 429 where it used to be served
@@ -802,15 +1007,16 @@ pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
             println!(
                 "  · a --group {group} request with no member free now waits or returns 429 rather than using another account"
             );
-            if remaining < 3 {
-                eprintln!(
-                    "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
-                );
+            if let Some(warning) = &plan.low_count_warning {
+                eprintln!("{warning}");
             }
             println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupReserveWrite::Unchanged => {
-            println!("group '{group}' is already reserved; nothing changed. {remaining} unreserved enabled account(s) remain.");
+            if let Some(warning) = &plan.force_warning {
+                eprintln!("{warning}");
+            }
+            println!("{}", plan.already_line);
         }
     }
     Ok(())
@@ -1099,8 +1305,39 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
     (groups, ungrouped)
 }
 
-/// Whether a group can serve an inference request at all, as opposed to merely
-/// existing with members and a colour.
+/// The one reason a group can exist and still route nothing, spelled ONCE.
+/// Both `ls` surfaces render this same token — a text `route_block=` field and a
+/// JSON `routeBlock` value — so a script keying on one cannot be surprised by
+/// the other. Two spellings of one fact is how they drift.
+const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
+
+/// The other reason, spelled once the same way: every member is a Codex
+/// account, and no Codex request carries a group, so a Claude session asking
+/// for this group has nobody to be served by.
+const ROUTE_BLOCK_CODEX_ONLY: &str = "codex-only";
+
+/// The provider of the account named `name`, by exact name (names are unique
+/// across a config). `None` for a name no row carries.
+fn provider_of(config: &Config, name: &str) -> Option<Provider> {
+    config
+        .accounts
+        .iter()
+        .find(|account| account.name == name)
+        .map(|account| account.provider)
+}
+
+/// How many of `members` are Codex accounts: the `codex_members=` field of
+/// `tcr group ls`, and its `codexMembers` key.
+fn codex_member_count(config: &Config, members: &[&str]) -> usize {
+    members
+        .iter()
+        .filter(|member| provider_of(config, member) == Some(Provider::Codex))
+        .count()
+}
+
+/// Why a group cannot serve an inference request at all, as opposed to merely
+/// existing with members and a colour: `None` when it routes, or the token that
+/// names the reason.
 ///
 /// **This mirrors a runtime rule and must not drift from it.** The authority is
 /// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
@@ -1113,22 +1350,33 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
 /// compute, since it reads the file and not the running proxy. If the exclusion
 /// rule changes there, this changes with it.
 ///
+/// A Codex member never counts toward routing, because no Codex request carries
+/// a group: the question here is whether a Claude session asking for the group
+/// can be served, and only its Claude members can serve one. So the rule runs
+/// over the Claude members alone, and a group with none reads
+/// [`ROUTE_BLOCK_CODEX_ONLY`] (the runtime's `GroupMiss::OtherProviderOnly`). In
+/// a fleet with no Codex account every member is a Claude member, and the
+/// answer is the one this always gave.
+///
 /// Deliberately NOT a general health check: an account that is merely disabled or
 /// rate-limited right now still counts as routable here, because that is
 /// transient and this line is about the group's permanent shape.
-/// The one reason a group can exist and still route nothing, spelled ONCE.
-/// Both `ls` surfaces render this same token — a text `route_block=` field and a
-/// JSON `routeBlock` value — so a script keying on one cannot be surprised by
-/// the other. Two spellings of one fact is how they drift.
-const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
-
-fn group_routes(config: &Config, group: &str, members: &[&str]) -> bool {
-    match config.control_account.as_ref().map(|c| c.name()) {
-        Some(control) => {
-            members.iter().any(|member| *member != control) || config.group_allows_control(group)
-        }
-        None => !members.is_empty(),
+fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&'static str> {
+    let anthropic: Vec<&str> = members
+        .iter()
+        .copied()
+        .filter(|member| provider_of(config, member) == Some(Provider::Anthropic))
+        .collect();
+    if anthropic.is_empty() {
+        return Some(ROUTE_BLOCK_CODEX_ONLY);
     }
+    let routes = match config.control_account.as_ref().map(|c| c.name()) {
+        Some(control) => {
+            anthropic.iter().any(|member| *member != control) || config.group_allows_control(group)
+        }
+        None => true,
+    };
+    (!routes).then_some(ROUTE_BLOCK_CONTROL_ONLY)
 }
 
 /// `tcr group ls` text: one greppable line per group, then `ungrouped`.
@@ -1139,12 +1387,18 @@ fn render_groups_text(config: &Config) -> String {
     let mut out = String::new();
     for (group, members) in &groups {
         let (color, source) = config.group_color(group);
-        let routes = group_routes(config, group, members);
+        let route_block = group_route_block(config, group, members);
+        let codex_members = codex_member_count(config, members);
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
+            "group {group:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
             members.len(),
             members.join(","),
+            if codex_members > 0 {
+                format!(" codex_members={codex_members}")
+            } else {
+                String::new()
+            },
             if config.is_group_reserved(group) {
                 "yes"
             } else {
@@ -1160,11 +1414,10 @@ fn render_groups_text(config: &Config) -> String {
             } else {
                 "no"
             },
-            if routes { "yes" } else { "no" },
-            if routes {
-                String::new()
-            } else {
-                format!(" route_block={ROUTE_BLOCK_CONTROL_ONLY}")
+            if route_block.is_none() { "yes" } else { "no" },
+            match route_block {
+                None => String::new(),
+                Some(block) => format!(" route_block={block}"),
             },
             source.as_str(),
         );
@@ -1181,23 +1434,29 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
         .iter()
         .map(|(group, members)| {
             let (color, source) = config.group_color(group);
-            let routes = group_routes(config, group, members);
-            serde_json::json!({
+            let route_block = group_route_block(config, group, members);
+            let mut row = serde_json::json!({
                 "group": group,
                 "accounts": members.len(),
                 "members": members,
                 "reserved": config.is_group_reserved(group),
                 "parked": config.is_group_parked(group),
                 "allowsControl": config.group_allows_control(group),
-                "routes": routes,
-                "routeBlock": if routes {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(ROUTE_BLOCK_CONTROL_ONLY.to_string())
+                "routes": route_block.is_none(),
+                "routeBlock": match route_block {
+                    None => serde_json::Value::Null,
+                    Some(block) => serde_json::Value::String(block.to_string()),
                 },
                 "color": color,
                 "colorSource": source.as_str(),
-            })
+            });
+            // Only when there is one, so a group with no Codex member, which is
+            // every group of a fleet with no Codex account, carries no new key.
+            let codex_members = codex_member_count(config, members);
+            if codex_members > 0 {
+                row["codexMembers"] = serde_json::json!(codex_members);
+            }
+            row
         })
         .collect();
     let out = serde_json::json!({ "groups": rows, "ungrouped": ungrouped });
@@ -1463,7 +1722,7 @@ async fn post_set_disabled(
 /// already serializes to the exact wire shape
 /// [`crate::proxy::ADD_ACCOUNT_PATH`] expects (see that route's
 /// `AddAccountRequest` doc-comment), so a caller builds the credential once —
-/// for a real login, or [`crate::oauth::probe_add_capability`]'s deliberately
+/// for a real login, or `crate::oauth::probe_add_route`'s deliberately
 /// blank probe — and this function never re-lists its fields.
 ///
 /// Reuses [`LiveControlError`] rather than a parallel enum, extended with one
@@ -1476,6 +1735,37 @@ async fn post_set_disabled(
 pub(crate) async fn post_add_account(
     config: &Config,
     account: &Account,
+) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
+    post_add_account_with_providers(config, account).await.0
+}
+
+/// [`post_add_account`], plus the providers the answering server advertised in
+/// [`crate::proxy::PROVIDERS_HEADER`] — read off the SAME response, so a caller
+/// that must know whether the server can store a non-Anthropic account learns it
+/// from the probe it already sends, with no second round trip.
+///
+/// The list is read only from an answer the route STAMPED: an unstamped one (an
+/// older tcr's catch-all, the gate's refusal, something that is not tcr at all) is
+/// no proof of anything, and neither is a request that never got an answer. Both
+/// come back as an empty list, which is how "this server never said" reads.
+pub(crate) async fn post_add_account_with_providers(
+    config: &Config,
+    account: &Account,
+) -> (
+    Result<crate::proxy::AddAccountResponse, LiveControlError>,
+    Vec<crate::provider::Provider>,
+) {
+    let mut providers = Vec::new();
+    let result = post_add_account_reading(config, account, &mut providers).await;
+    (result, providers)
+}
+
+/// The request [`post_add_account_with_providers`] makes, with `providers` filled
+/// from a stamped answer's [`crate::proxy::PROVIDERS_HEADER`].
+async fn post_add_account_reading(
+    config: &Config,
+    account: &Account,
+    providers: &mut Vec<crate::provider::Provider>,
 ) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1519,6 +1809,15 @@ pub(crate) async fn post_add_account(
         .get(crate::proxy::ENDPOINT_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
+    if from_route {
+        if let Some(advertised) = response
+            .headers()
+            .get(crate::proxy::PROVIDERS_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            *providers = crate::proxy::providers_in_header(advertised);
+        }
+    }
     let body = response.text().await.unwrap_or_default();
 
     if status.is_success() {
@@ -1535,7 +1834,7 @@ pub(crate) async fn post_add_account(
         return Err(LiveControlError::NoRoute);
     }
     // 400: the route's own request validation (blank name/token) — the
-    // positive capability signal `probe_add_capability` looks for. 409: the
+    // positive capability signal `oauth::probe_add_route` looks for. 409: the
     // submitted identity matched more than one live account.
     if from_route && matches!(status.as_u16(), 400 | 409) {
         return Err(LiveControlError::Rejected(
@@ -1704,6 +2003,17 @@ fn write_control_account(
         None => None,
         Some(q) => Some(config.accounts[resolve_account(&config.accounts, q)?].clone()),
     };
+    // The live route's refusal, offline: boot ignores a `controlAccount` naming a Codex
+    // account, so writing one would persist a setting the next start throws away.
+    if let Some(account) = &target {
+        match account.provider {
+            crate::provider::Provider::Anthropic => {}
+            crate::provider::Provider::Codex => bail!(
+                "{} Nothing was changed.",
+                crate::manager::codex_control_refusal(&account.name)
+            ),
+        }
+    }
     let name = target.as_ref().map(|a| a.name.clone());
     let outcome = config::save_control_account(config_path, target.as_ref())
         .with_context(|| format!("save config at {}", config_path.display()))?;
@@ -1737,12 +2047,41 @@ fn write_control_account(
 /// `None` leaves that half alone: an operator who says `--must` and nothing
 /// else is changing the strictness of a pin they already chose, and re-sending
 /// a pin they did not name would be this function inventing one.
+///
+/// # A Codex account always leaves from this Mac
+///
+/// No Mac carries a Codex request in this version, so a pin to another Mac is
+/// one the exit path can never honour: a loose one is ignored, and a strict one
+/// makes the account ineligible for selection. Both halves that would make
+/// such a pin, `--exits-from <peer>` and `--must`, are therefore refused on a
+/// Codex row before anything is written ([`provider_guard`]). `--exits-from
+/// local` and `--no-must` stay allowed, so a pin written before this refusal
+/// existed can still be cleared.
+///
+/// The check reads the file with [`load_config`], never [`load_for_edit`],
+/// whose running-proxy warning [`edit_account`] already prints. A query the
+/// check cannot resolve, or a file it cannot read, is left to [`edit_account`],
+/// so those errors read exactly as they always have.
+///
+/// [`provider_guard`]: crate::provider_guard::provider_guard
 pub fn set_account_egress(
     config_path: &Path,
     query: &str,
     egress: Option<config::Egress>,
     strict: Option<bool>,
 ) -> anyhow::Result<(String, config::EgressPin)> {
+    let pins_away = matches!(egress, Some(config::Egress::Via(_))) || strict == Some(true);
+    if pins_away {
+        if let Ok(config) = load_config(config_path) {
+            if let Ok(idx) = resolve_account(&config.accounts, query) {
+                crate::provider_guard::provider_guard(
+                    &config.accounts[idx],
+                    crate::provider_guard::ClaudeOnlyVerb::ExitFromPeer,
+                )
+                .map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
     edit_account(config_path, query, |config, idx| {
         if let Some(egress) = egress {
             config.accounts[idx].egress = egress;
@@ -1935,19 +2274,50 @@ fn resolve_thresholds(config: &Config) -> Vec<f64> {
 /// the future. Mirrors `Quota::is_near`'s dimensions (5h + 7d; the model-scoped
 /// `7d_oi` never gates shared rotation, so it is not shown as a hold here).
 struct HeldWindow {
-    label: &'static str,
+    /// `5h` or `7d`; on a Codex row, the window's own length when it reported one
+    /// ([`window_length_label`]).
+    label: String,
     reset: OffsetDateTime,
+}
+
+/// A window's label from its length in minutes, the rule TcrBar labels a Codex window's row
+/// by: whole days read `{n}d`, whole hours `{n}h`, anything else `{n}m`. So 300 is `5h`, 10080
+/// is `7d`, and a 30-day window, 43200, is `30d`.
+fn window_length_label(minutes: u32) -> String {
+    if minutes.is_multiple_of(24 * 60) {
+        format!("{}d", minutes / (24 * 60))
+    } else if minutes.is_multiple_of(60) {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 /// The windows holding account `a` out of rotation, evaluated against its own
 /// `threshold`. `a.five_hour`/`a.seven_day` are already the EFFECTIVE utilizations
 /// and `*_reset` the live (future-only) resets — both baked in at snapshot time —
 /// so a held window always carries a future reset to show.
+///
+/// A Codex row labels each window by the length it reported, so a 30-day window reads
+/// `30d` where the fixed label would claim `7d`; without a reported length, and on every
+/// Anthropic row, the label is the fixed `5h` or `7d`.
 fn held_windows(a: &AccountSnapshot, threshold: f64) -> Vec<HeldWindow> {
+    let label = |fixed: &str, minutes: Option<u32>| match a.provider {
+        Provider::Anthropic => fixed.to_string(),
+        Provider::Codex => minutes.map_or_else(|| fixed.to_string(), window_length_label),
+    };
     let mut held = Vec::new();
     for (label, util, reset) in [
-        ("5h", a.five_hour, a.five_hour_reset),
-        ("7d", a.seven_day, a.seven_day_reset),
+        (
+            label("5h", a.codex.five_hour_window_minutes),
+            a.five_hour,
+            a.five_hour_reset,
+        ),
+        (
+            label("7d", a.codex.seven_day_window_minutes),
+            a.seven_day,
+            a.seven_day_reset,
+        ),
     ] {
         if let (Some(u), Some(reset)) = (util, reset) {
             if u >= threshold {
@@ -2111,6 +2481,22 @@ fn cache_hit_ratio(a: &AccountSnapshot, source: StatusSource) -> Option<f64> {
 /// whether it is a binding hold, so there is nothing left in this renderer to
 /// gate on it. `held_windows`/`held[]` (JSON) keep their own threshold — a
 /// different question this text line never answered.
+///
+/// A Codex row says so right after its name (` provider=codex`, the one
+/// greppable provider marker), and a Claude row's line is the line it always
+/// was. On a Codex row a window token reads `none` when the plan reported its
+/// windows and this one is not among them (a Pro plan has no 5-hour window, a
+/// Business plan may report none), while `n/a` keeps meaning a window expected
+/// and not measured yet. A reading left over for a window the plan no longer
+/// reports does not bring the window back: what the plan reports decides.
+///
+/// After `parked_groups=` a Codex row ends with what only it can say, in this
+/// order and each only when it has something to say ([`codex_tail`]): why its
+/// login died, the limit ChatGPT says it reached, a reached spend control, its
+/// credits, that it is unreachable while reserved (a Codex request carries no
+/// group that could reach it), and its workspace, the first 8 hex digits of its
+/// ChatGPT workspace id. That last one is what tells two rows apart that share
+/// one email in two ChatGPT workspaces.
 pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String {
     if snapshot.accounts.is_empty() {
         return "no accounts configured\n".to_string();
@@ -2118,8 +2504,14 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
     let now = OffsetDateTime::now_utc();
     let mut out = String::new();
     for a in snapshot.accounts.iter() {
-        let five_hour = render_window("5h", a.five_hour, a.five_hour_reset, now);
-        let seven_day = render_window("wk", a.seven_day, a.seven_day_reset, now);
+        let provider = match a.provider {
+            Provider::Codex => " provider=codex",
+            Provider::Anthropic => "",
+        };
+        let five_hour = unreported_window(a, "5h", "fiveHour")
+            .unwrap_or_else(|| render_window("5h", a.five_hour, a.five_hour_reset, now));
+        let seven_day = unreported_window(a, "wk", "sevenDay")
+            .unwrap_or_else(|| render_window("wk", a.seven_day, a.seven_day_reset, now));
         // Fable's model-scoped weekly never gates the general view: no reset field,
         // no countdown, and the whole token is omitted when it was never learned.
         let fable = match a.seven_day_oi {
@@ -2208,23 +2600,21 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         } else {
             format!(" parked_groups={}", a.parked_groups.join(","))
         };
-        // The account's plan, greppable via `plan=Max 20x` and named by the one
-        // function that names it anywhere (`tcr_status_wire::plan_label`).
-        // Omitted entirely — never `plan=unknown` — for an account that has
-        // never been profiled, matching the `fable=`/`groups=` "nothing to say"
-        // idiom. This is the only token that tells two rows sharing an email
-        // apart, so a fabricated value here would be worse than silence.
-        let plan = match tcr_status_wire::plan_label(
-            a.organization_type.as_deref(),
-            a.rate_limit_tier.as_deref(),
-            a.seat_tier.as_deref(),
-        ) {
+        // The account's plan, greppable via `plan=Max 20x` (`plan=ChatGPT Pro`
+        // on a Codex row) and named by the one method that names it anywhere
+        // (`AccountSnapshot::plan_label`). Omitted entirely — never
+        // `plan=unknown` — for an account that has never been profiled,
+        // matching the `fable=`/`groups=` "nothing to say" idiom. This is the
+        // only token that tells two rows sharing an email apart, so a
+        // fabricated value here would be worse than silence.
+        let plan = match a.plan_label() {
             Some(label) => format!(" plan={label}"),
             None => String::new(),
         };
         out.push_str(&format!(
-            "account {} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}{}\n",
+            "account {}{} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}{}{}\n",
             a.name,
+            provider,
             a.priority,
             plan,
             five_hour,
@@ -2241,9 +2631,74 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             groups,
             reserved_groups,
             parked_groups,
+            codex_tail(a),
         ));
     }
     out
+}
+
+/// `{label}=none` for a Codex row whose plan reported its usage windows without `window`
+/// (`"fiveHour"` or `"sevenDay"`), else `None`, leaving the token to [`render_window`]. An
+/// unknown list is not a plan without the window, and a Claude row has no such list at all.
+fn unreported_window(a: &AccountSnapshot, label: &str, window: &str) -> Option<String> {
+    let reported = match a.provider {
+        Provider::Anthropic => return None,
+        Provider::Codex => a.codex.quota_windows.as_ref()?,
+    };
+    (!reported.iter().any(|w| w == window)).then(|| format!("{label}=none"))
+}
+
+/// The tokens that end a Codex row's line, in this order, each only when it has something to
+/// say: ` login_error=` (the raw error the login died with), ` limit_reached=` (the raw limit
+/// ChatGPT says it reached), ` spend_control=reached`, ` credits=` (`unlimited`, else the
+/// balance verbatim while the account has credits), ` reachable=no` (a reserved Codex row,
+/// which no Codex request can reach) and ` workspace=` ([`workspace_token`]). Empty on a Claude
+/// row, whatever its Codex facts hold.
+fn codex_tail(a: &AccountSnapshot) -> String {
+    match a.provider {
+        Provider::Anthropic => return String::new(),
+        Provider::Codex => {}
+    }
+    let mut tail = String::new();
+    if a.codex.token_sync_pending {
+        tail.push_str(" token_sync=pending");
+    }
+    if let Some(code) = &a.codex.login_error {
+        tail.push_str(&format!(" login_error={code}"));
+    }
+    if let Some(kind) = &a.codex.limit_reached_type {
+        tail.push_str(&format!(" limit_reached={kind}"));
+    }
+    if a.codex.spend_control_reached {
+        tail.push_str(" spend_control=reached");
+    }
+    match &a.codex.credits {
+        Some(credits) if credits.unlimited => tail.push_str(" credits=unlimited"),
+        Some(tcr_status_wire::CodexCredits {
+            has_credits: true,
+            balance: Some(balance),
+            ..
+        }) => tail.push_str(&format!(" credits={balance}")),
+        _ => {}
+    }
+    if a.gate == crate::stats::GateReason::Reserved {
+        tail.push_str(" reachable=no");
+    }
+    if let Some(workspace) = a.org_uuid.as_deref().and_then(workspace_token) {
+        tail.push_str(&format!(" workspace={workspace}"));
+    }
+    tail
+}
+
+/// The first 8 hex digits of a ChatGPT workspace id, the dashes skipped, as TcrBar and the
+/// re-login refusal show it; `None` when the id holds fewer than 8.
+fn workspace_token(org_uuid: &str) -> Option<String> {
+    let hex: String = org_uuid
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    (hex.len() == 8).then_some(hex)
 }
 
 /// Where a rendered fleet view's numbers came from.
@@ -2283,6 +2738,11 @@ impl StatusSource {
 /// whose build could be reported — `serverSha` is then `null`, the same
 /// "not measured" idiom `cacheHitRatio` uses, never a placeholder that reads
 /// like a real sha.
+///
+/// It renders no Codex route or traffic: every Codex row comes out without
+/// `codexRoute` and `codexTraffic`, as from a CLI that predates them. `tcr status
+/// --json` itself renders through [`render_accounts_json_at`], with both.
+#[cfg(test)]
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
     thresholds: &[f64],
@@ -2292,7 +2752,8 @@ fn render_accounts_json(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    let rows: Vec<serde_json::Value> = account_status_rows(
+    render_accounts_json_at(
+        OffsetDateTime::now_utc(),
         snapshot,
         thresholds,
         source,
@@ -2300,6 +2761,47 @@ fn render_accounts_json(
         http1_only,
         control,
         group_colors,
+        None,
+        None,
+    )
+}
+
+/// [`render_accounts_json`] at a given clock, with the fleet's Codex route and
+/// traffic.
+///
+/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
+/// are computed against. Taking it as a parameter lets a test compare a fixed
+/// instant with a committed fixture, with no normalisation layer between them.
+///
+/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
+/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
+///
+/// No Codex key ever reaches an Anthropic row — neither these two nor the
+/// account's own Codex facts — so such a row is the bytes it always was.
+#[allow(clippy::too_many_arguments)]
+fn render_accounts_json_at(
+    now: OffsetDateTime,
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+    server: Option<&BuildInfo>,
+    http1_only: bool,
+    control: Option<&str>,
+    group_colors: &std::collections::BTreeMap<String, String>,
+    codex_route: Option<&tcr_status_wire::CodexRoute>,
+    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
+) -> String {
+    let rows: Vec<serde_json::Value> = account_status_rows_at(
+        now,
+        snapshot,
+        thresholds,
+        source,
+        server,
+        http1_only,
+        control,
+        group_colors,
+        codex_route,
+        codex_traffic,
     )
     .into_iter()
     // Round-trip through `Value` rather than serializing the struct
@@ -2316,6 +2818,9 @@ fn render_accounts_json(
 /// The typed rows behind [`render_accounts_json`], one per account in the
 /// snapshot's order. Split out so `tcr list --json` projects the very rows
 /// `tcr status --json` prints instead of building a second copy of them.
+///
+/// Like [`render_accounts_json`], it passes no Codex route or traffic. The list
+/// drops every Codex row anyway ([`is_claude_row`]).
 fn account_status_rows(
     snapshot: &StatsSnapshot,
     thresholds: &[f64],
@@ -2325,7 +2830,35 @@ fn account_status_rows(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> Vec<tcr_status_wire::AccountStatusRow> {
-    let now = OffsetDateTime::now_utc();
+    account_status_rows_at(
+        OffsetDateTime::now_utc(),
+        snapshot,
+        thresholds,
+        source,
+        server,
+        http1_only,
+        control,
+        group_colors,
+        None,
+        None,
+    )
+}
+
+/// [`account_status_rows`] at a given clock, with the fleet's Codex route and
+/// traffic: the typed rows [`render_accounts_json_at`] prints.
+#[allow(clippy::too_many_arguments)]
+fn account_status_rows_at(
+    now: OffsetDateTime,
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+    server: Option<&BuildInfo>,
+    http1_only: bool,
+    control: Option<&str>,
+    group_colors: &std::collections::BTreeMap<String, String>,
+    codex_route: Option<&tcr_status_wire::CodexRoute>,
+    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
+) -> Vec<tcr_status_wire::AccountStatusRow> {
     snapshot
         .accounts
         .iter()
@@ -2333,10 +2866,21 @@ fn account_status_rows(
         .map(|(i, a)| {
             let quota = gating_quota(a);
             let threshold = thresholds.get(i).copied().unwrap_or(1.0);
+            // The Codex keys are written on a Codex row only. An Anthropic row
+            // takes the empty facts and no route or traffic whatever it was
+            // given, so every one of its keys is skipped.
+            let (facts, row_route, row_traffic) = match a.provider {
+                Provider::Anthropic => (CodexFacts::default(), None, None),
+                Provider::Codex => (
+                    a.codex.clone(),
+                    codex_route.cloned(),
+                    codex_traffic.cloned(),
+                ),
+            };
             let held: Vec<tcr_status_wire::HeldWindowRow> = held_windows(a, threshold)
                 .into_iter()
                 .map(|h| tcr_status_wire::HeldWindowRow {
-                    window: h.label.to_string(),
+                    window: h.label,
                     reset_at_ms: (h.reset.unix_timestamp_nanos() / 1_000_000) as i64,
                     minutes_until_reset: (h.reset - now).whole_minutes().max(0),
                 })
@@ -2368,10 +2912,18 @@ fn account_status_rows(
                 quota_state: quota_state_token(a.quota_state).to_string(),
                 // The server's own terminal-gate verdict
                 // (`Manager::account_terminal_gate`/`account_gate`), including the
-                // one TcrBar could not otherwise see: `rejected` (Anthropic's own
-                // `anthropic-ratelimit-unified-status: rejected` header). Before
-                // this field existed, `status` was rewritten only for `Throttled`
-                // (see `snapshot.rs`), so a rejected account still read `status:
+                // one TcrBar could not otherwise see: `rejected`, the provider's
+                // own refusal. On an Anthropic row that is the
+                // `anthropic-ratelimit-unified-status: rejected` header. On a
+                // Codex row, a 429 parsed as `crate::quota::CodexQuotaRefusal`
+                // from its body or reached-type header reads as the full
+                // window that refused it, else as the live hold while it lasts
+                // (`hold`, or `refused` when an upstream 403 armed it), and as
+                // `rejected` only when neither explains it: the snapshot's
+                // display-only remap, `Manager::codex_refusal_gate`, which
+                // routing never reads. Before this field
+                // existed, `status` was rewritten only for `Throttled` (see
+                // `snapshot.rs`), so a rejected account still read `status:
                 // "active"` and the panel drew it as eligible when the router will
                 // never select it. Kebab-case values via `GateReason`'s own
                 // `Serialize`; every one is listed in docs/troubleshooting.md, which
@@ -2625,6 +3177,34 @@ fn account_status_rows(
                     StatusSource::Offline => None,
                     StatusSource::Live => a.usage.clone(),
                 },
+                // Which upstream the account belongs to: `"codex"` on a Codex
+                // row and NO KEY AT ALL on an Anthropic one, never `null`, so
+                // every row a panel built before this key could decode is the
+                // same bytes it always was (the contract fixture pins both).
+                // A config fact, real on both paths like `groups`.
+                provider: match a.provider {
+                    Provider::Anthropic => None,
+                    Provider::Codex => Some(a.provider.as_str().to_string()),
+                },
+                // What a Codex account reports and an Anthropic one never does
+                // (`CodexFacts`), copied from the snapshot. No `source` guard:
+                // unlike the serving counters above, a fact nobody reported is
+                // already `None` or `false` and its key is skipped, so it can
+                // never read as a measurement. Empty on every Anthropic row.
+                quota_windows: facts.quota_windows,
+                five_hour_window_minutes: facts.five_hour_window_minutes,
+                seven_day_window_minutes: facts.seven_day_window_minutes,
+                limit_reached_type: facts.limit_reached_type,
+                spend_control_reached: facts.spend_control_reached,
+                credits: facts.credits,
+                login_error: facts.login_error,
+                codex_home: facts.codex_home,
+                token_sync_pending: facts.token_sync_pending,
+                // Fleet-wide, repeated on every Codex row like `serverSha`:
+                // whether `tcr run --codex` would pool codex, and what the
+                // server did with Codex requests in the last ten minutes.
+                codex_route: row_route,
+                codex_traffic: row_traffic,
                 // The plan, three raw fields and one label. Real on BOTH paths
                 // like `groups`/`control` above: this is a config fact read
                 // from disk, not a serving counter, so the offline path knows
@@ -2638,17 +3218,15 @@ fn account_status_rows(
                 organization_type: a.organization_type.clone(),
                 rate_limit_tier: a.rate_limit_tier.clone(),
                 seat_tier: a.seat_tier.clone(),
-                // Derived HERE, once, from `tcr_status_wire::plan_label` — the
-                // same function the TUI and the plain-text renderer call, so
+                // Derived HERE, once, by `AccountSnapshot::plan_label` — the
+                // same method the TUI and the plain-text renderer call, so
                 // three surfaces cannot disagree about what one row's plan is
-                // named. `null` for an account that has never been profiled: a
-                // fabricated label would defeat the entire point of a field
-                // whose job is telling two identically-named rows apart.
-                plan: tcr_status_wire::plan_label(
-                    a.organization_type.as_deref(),
-                    a.rate_limit_tier.as_deref(),
-                    a.seat_tier.as_deref(),
-                ),
+                // named, and the one place an Anthropic row goes to
+                // `tcr_status_wire::plan_label` and a Codex row to
+                // `codex_plan_label`. `null` for an account that has never been
+                // profiled: a fabricated label would defeat the entire point of
+                // a field whose job is telling two identically-named rows apart.
+                plan: a.plan_label(),
                 // The org, so a client can SHOW which one this row belongs to.
                 // It is not how the row is addressed — the name is. Real on
                 // both paths, like `groups`.
@@ -2680,13 +3258,8 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
     let config = load_config(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
     warn_if_no_accounts(&config);
-    let snapshot = snapshot_offline(
-        config,
-        Arc::new(NoRefresh),
-        Arc::new(LiveUsageProber::new()),
-        probe,
-    )
-    .await;
+    let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
+    let snapshot = snapshot_offline(config, Arc::new(NoRefresh), Arc::new(prober), probe).await;
     // `tcr accounts` is the offline verb by construction — it builds its own
     // Manager and never asks the server — so its serving counters are structurally
     // zero and must render as unmeasured, not as a measurement.
@@ -2697,11 +3270,15 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
 /// Why a live status read did not produce a payload.
 ///
 /// The three variants are not interchangeable, and collapsing them is what made
-/// a wedged proxy unrecoverable: [`incumbent_liveness`] turns them into
+/// a wedged proxy unrecoverable: [`probe_incumbent`] turns them into
 /// "is anything actually serving on this port", and that answer is the
 /// difference between "leave a working proxy alone" and "this process is holding
 /// the socket and answering nothing".
-enum LiveStatusError {
+///
+/// Public for `tcr run --codex`, which pools a session only on what the
+/// RUNNING proxy reports, and says which of these stopped it when it cannot.
+#[derive(Debug)]
+pub enum LiveStatusError {
     /// Nothing is listening on the configured port — the ORDINARY case (`tcr
     /// status` with no server running). Falling back is expected, so it is
     /// reported by the `offline` label alone rather than by a warning.
@@ -2730,7 +3307,8 @@ impl LiveStatusError {
         matches!(self, LiveStatusError::Unusable(_))
     }
 
-    fn why(&self) -> String {
+    /// The failure in a few words, for an operator-facing line.
+    pub fn why(&self) -> String {
         match self {
             LiveStatusError::NoServer => "nothing is listening".to_string(),
             LiveStatusError::NoAnswer(why) | LiveStatusError::Unusable(why) => why.clone(),
@@ -2761,7 +3339,7 @@ pub enum Liveness {
 /// the exact [`STATUS_KIND`] is accepted — a tcr built before the endpoint
 /// existed has no such route, so it forwards this path UPSTREAM and hands back
 /// Anthropic's own error JSON, which must never be rendered as a fleet status.
-async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusError> {
+pub async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusError> {
     parse_live_status(&fetch_live_status_body(config).await?)
 }
 
@@ -2953,14 +3531,66 @@ fn render_sessions_json(supported: bool, sessions: &[tcr_status_wire::SessionRow
     serde_json::json!({ "supported": supported, "sessions": sessions }).to_string()
 }
 
+/// The `tcr sessions` text form: a `supported=… sessions=…` header, then one line per
+/// session, every line ending in a newline. A pure function, so a test can pin the bytes
+/// a person reads without a running proxy. A Codex row adds ` provider=codex` after its
+/// account and ` reasoningTokens=` when non-zero, and prints its cost through
+/// [`session_cost`], while a Claude row prints exactly as before.
+fn render_sessions_text(supported: bool, sessions: &[tcr_status_wire::SessionRow]) -> String {
+    let mut out = format!("supported={supported} sessions={}\n", sessions.len());
+    for row in sessions {
+        out.push_str(&format!(
+            "session={} account={}{} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={}{}\n",
+            row.session_id,
+            row.account.as_deref().unwrap_or("-"),
+            row.provider
+                .as_deref()
+                .map(|p| format!(" provider={p}"))
+                .unwrap_or_default(),
+            row.model.as_deref().unwrap_or("-"),
+            row.requests,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.tools.calls,
+            session_cost(row),
+            if row.reasoning_tokens > 0 {
+                format!(" reasoningTokens={}", row.reasoning_tokens)
+            } else {
+                String::new()
+            },
+        ));
+    }
+    out
+}
+
+/// The value of `costUsd=` on a `tcr sessions` line. A Claude row prints its list-price
+/// figure as it always has, `0.0000` for a model this build cannot price included. A Codex
+/// row never prints a zero nobody measured. It reads `n/a` until one of its requests is
+/// priced, then the priced part, with the count it leaves out while some still are not.
+fn session_cost(row: &tcr_status_wire::SessionRow) -> String {
+    if row.provider.is_none() || (row.cost_usd > 0.0 && row.unpriced_requests == 0) {
+        format!("{:.4}", row.cost_usd)
+    } else if row.cost_usd > 0.0 {
+        format!(
+            "{:.4} unpricedRequests={}",
+            row.cost_usd, row.unpriced_requests
+        )
+    } else {
+        "n/a".to_string()
+    }
+}
+
 /// `tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the
 /// last hour.
 ///
 /// Live-only, with no offline fallback, and that is the whole design: a session
-/// is per-process state that exists nowhere on disk, so an offline rendering
-/// could only ever be an empty list dressed as a measurement. An unreachable
-/// server is an error exit instead — the same failure `status` warns about
-/// before falling back, except here there is nothing to fall back to.
+/// is the running proxy's own state, and the copy it keeps on disk
+/// ([`crate::session_wire_persist`]) is a cache read back at boot, not a record
+/// of what is live, so an offline rendering could only ever be a stale list
+/// dressed as a measurement. An unreachable server is an error exit instead —
+/// the same failure `status` warns about before falling back, except here there
+/// is nothing to fall back to.
 ///
 /// `supported` answers "did this server's payload CARRY a `sessions` key", not
 /// "is the array non-empty". [`StatusPayload::sessions`] is `#[serde(default)]`
@@ -3011,21 +3641,7 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
         // second contract to keep in step with the first.
         println!("{}", render_sessions_json(supported, &payload.sessions));
     } else {
-        println!("supported={supported} sessions={}", payload.sessions.len());
-        for row in &payload.sessions {
-            println!(
-                "session={} account={} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={:.4}",
-                row.session_id,
-                row.account.as_deref().unwrap_or("-"),
-                row.model.as_deref().unwrap_or("-"),
-                row.requests,
-                row.input_tokens,
-                row.output_tokens,
-                row.cache_read_tokens,
-                row.tools.calls,
-                row.cost_usd,
-            );
-        }
+        print!("{}", render_sessions_text(supported, &payload.sessions));
     }
     Ok(())
 }
@@ -3102,8 +3718,9 @@ fn probe_failed(a: &AccountSnapshot) -> bool {
 /// code is [`StatusCheck::exit_code`]. Either way stdout is the same bytes.
 pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Result<i32> {
     // Read-only verb: plain load, no clobber-warning (we never save).
-    let config = load_config(config_path)?;
+    let (config, created) = load_config_with_creation(config_path)?;
     let config = import_claude_code_login_if_empty(config_path, config).await;
+    let first_empty_config = created && config.accounts.is_empty();
     warn_if_no_accounts(&config);
 
     // Read before the match: the offline arm CONSUMES `config`, and the route
@@ -3115,8 +3732,32 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     // not on the route at all).
     let mut served_recently: Option<u64> = None;
 
+    // ONE read of the running proxy, and the Codex route and traffic are taken from it before
+    // the snapshot consumes it. The text form words the route whatever the read gave (offline,
+    // that no proxy answered); `--json` carries the route and the traffic only from a live read.
+    // A newly created empty file configures no existing fleet. Its first status
+    // read is offline; do not probe an unrelated process on the default port.
+    let live_read = if first_empty_config {
+        Err(LiveStatusError::NoServer)
+    } else {
+        fetch_live_status(&config).await
+    };
+    let holds_codex = status_holds_provider(&live_read, &config, Provider::Codex);
+    let ca = crate::mitm::minted_ca_path();
+    let ca_readable = ca.is_file();
+    let codex_route = crate::codex_route::codex_route(
+        live_read.as_ref(),
+        proxy_port,
+        &ca,
+        ca_readable,
+        live_read
+            .as_ref()
+            .map_or(0, crate::codex_route::listed_codex_accounts),
+    );
+    let (wire_route, wire_traffic) = codex_wire_facts(&live_read, proxy_port, &ca, ca_readable);
+
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
-        match fetch_live_status(&config).await {
+        match live_read {
             Ok(payload) => {
                 served_recently = Some(crate::doctor::requests_in_window(
                     &payload,
@@ -3161,13 +3802,9 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                     .as_ref()
                     .map(|c| c.name().to_string());
                 let group_colors = config.group_colors();
-                let snapshot = snapshot_offline(
-                    config,
-                    Arc::new(NoRefresh),
-                    Arc::new(LiveUsageProber::new()),
-                    true,
-                )
-                .await;
+                let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
+                let snapshot =
+                    snapshot_offline(config, Arc::new(NoRefresh), Arc::new(prober), true).await;
                 (
                     StatusSource::Offline,
                     None,
@@ -3190,7 +3827,8 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     if json {
         println!(
             "{}",
-            render_accounts_json(
+            render_accounts_json_at(
+                OffsetDateTime::now_utc(),
                 &snapshot,
                 &thresholds,
                 source,
@@ -3198,16 +3836,11 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 http1_only,
                 control.as_deref(),
                 &group_colors,
+                wire_route.as_ref(),
+                wire_traffic.as_ref(),
             )
         );
     } else {
-        // One greppable `source=` line above the account lines, in the same
-        // key=value idiom, so the provenance is visible without --json.
-        // `http1Only` rides here rather than per-account: it is a server-wide
-        // fact, like `source` itself, not a per-account gating detail — see
-        // `Manager::http1_only`'s doc-comment for why this must NOT be
-        // re-derived from the config file when `source=live`. `groupColors`
-        // rides the same way, one `name:hex` token per group.
         // The route problem goes ABOVE the fleet, because it outranks it: a
         // glance at `tcr status` that shows healthy accounts while Claude Code
         // is pointed at another base URL is the exact reading that cost a
@@ -3216,39 +3849,246 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         // the text form. `--json` is a bare array a script pipes into jq, and
         // a line above it would corrupt that contract.
         let route = crate::doctor::inspect(proxy_port, served_recently);
-        if route.exit_code() != 0 {
-            println!("{}", route.verdict());
-        }
-        let group_colors_field = if group_colors.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " groupColors={}",
-                group_colors
-                    .iter()
-                    .map(|(g, hex)| format!("{g}:{hex}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-        println!(
-            "status source={}{}{} http1Only={}{}",
-            source.as_str(),
-            match source {
-                StatusSource::Live => String::new(),
-                StatusSource::Offline =>
-                    " note=serving-counters-unavailable-no-server-answered".to_string(),
-            },
-            build_fields(server_build.as_ref()),
-            http1_only,
-            group_colors_field,
+        let claude_verdict = (route.exit_code() != 0).then(|| route.verdict());
+        print!(
+            "{}",
+            render_status_text(&StatusText {
+                snapshot: &snapshot,
+                source,
+                server_build: server_build.as_ref(),
+                client_build: &BuildInfo::current(),
+                http1_only,
+                group_colors: &group_colors,
+                claude_verdict,
+                codex_route: Some(&codex_route),
+                holds_codex,
+            })
         );
-        print!("{}", render_accounts(&snapshot, source));
+        // A signed-out Codex row's remedy goes to stderr, below the account lines that name
+        // it. It is not a probe verdict, so it never changes `--check`'s exit code.
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from);
+        for line in relogin_hint_lines(&snapshot, home.as_deref()) {
+            eprintln!("{line}");
+        }
+        // What tcr did with codex lately goes to stderr, below the account lines it points at,
+        // and only for a fleet that holds a Codex account.
+        if holds_provider(&snapshot, Provider::Codex) {
+            if let Some(traffic) = &wire_traffic {
+                for line in codex_traffic_notes(traffic) {
+                    eprintln!("{line}");
+                }
+            }
+        }
     }
     if !check {
         return Ok(0);
     }
     Ok(StatusCheck::of(&snapshot).exit_code())
+}
+
+fn status_holds_provider(
+    live: &Result<StatusPayload, LiveStatusError>,
+    config: &Config,
+    provider: Provider,
+) -> bool {
+    match live {
+        Ok(payload) if payload.mitm.is_some() => {
+            payload.accounts.iter().any(|row| row.provider == provider)
+        }
+        Ok(_) | Err(_) => config
+            .accounts
+            .iter()
+            .any(|account| account.provider == provider),
+    }
+}
+
+/// Does the fleet hold an account of `provider`, in any state?
+fn holds_provider(snapshot: &StatsSnapshot, provider: Provider) -> bool {
+    snapshot.accounts.iter().any(|a| a.provider == provider)
+}
+
+/// The fleet's Codex route and traffic, as `tcr status --json` repeats them on every Codex row:
+/// from a live read only. A read that was not live (nothing listening, no answer, an answer
+/// this build cannot use) gives neither, so `--json` never claims a route it did not read, nor
+/// counts a server it could not ask.
+fn codex_wire_facts(
+    live: &Result<StatusPayload, LiveStatusError>,
+    port: u16,
+    ca: &Path,
+    ca_readable: bool,
+) -> (
+    Option<tcr_status_wire::CodexRoute>,
+    Option<tcr_status_wire::CodexTraffic>,
+) {
+    match live {
+        Ok(payload) => (
+            Some(crate::codex_route::codex_route(
+                Ok(payload),
+                port,
+                ca,
+                ca_readable,
+                crate::codex_route::listed_codex_accounts(payload),
+            )),
+            payload.codex_traffic.clone(),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// The stderr notes `tcr status` prints about what the proxy did with codex in the last ten
+/// minutes, each only when its count is above zero: the pool refusals tcr answered codex with itself,
+/// and the requests it relayed unpooled because they named a routing of their own.
+pub(crate) fn codex_traffic_notes(traffic: &tcr_status_wire::CodexTraffic) -> Vec<String> {
+    let mut notes = Vec::new();
+    if traffic.refused_10m > 0 {
+        notes.push(format!(
+            "[tcr] note codex-refusals: refused_10m={} last_type={} — tcr refused codex \
+             because no Codex account could serve; see the Codex rows above",
+            traffic.refused_10m,
+            traffic.last_refusal.map_or("unknown", |kind| kind.as_str()),
+        ));
+    }
+    if traffic.unpooled_10m > 0 {
+        notes.push(format!(
+            "[tcr] note codex-unpooled: relayed_10m={} — requests from a FedRAMP or \
+             residency-routed ChatGPT login ran on their own credential, unpooled",
+            traffic.unpooled_10m,
+        ));
+    }
+    notes
+}
+
+/// What `tcr status` prints on stdout in its text form, in order: a route verdict when there is
+/// one to give, the `status source=` header, and one line per account. Pure, so the bytes a
+/// Claude-only fleet sees can be pinned.
+pub(crate) struct StatusText<'a> {
+    pub snapshot: &'a StatsSnapshot,
+    pub source: StatusSource,
+    pub server_build: Option<&'a BuildInfo>,
+    pub client_build: &'a BuildInfo,
+    pub http1_only: bool,
+    pub group_colors: &'a std::collections::BTreeMap<String, String>,
+    /// `crate::doctor::Report::verdict()` when Claude's route has a problem (`exit_code() != 0`).
+    pub claude_verdict: Option<String>,
+    /// Whether the running proxy pools codex ([`crate::codex_route::codex_route`]), worded above
+    /// the header when the fleet holds a Codex account and codex is not pooled.
+    pub codex_route: Option<&'a tcr_status_wire::CodexRoute>,
+    /// Provider presence from live rows, or configured rows when an older proxy
+    /// cannot report providers yet.
+    pub holds_codex: bool,
+}
+
+/// The bytes of `tcr status`'s text form, [`StatusText`]'s lines in order, each ending in a
+/// newline.
+pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
+    let mut out = String::new();
+    let holds_claude = holds_provider(text.snapshot, Provider::Anthropic);
+    // Claude's route is this fleet's question only while it holds a Claude account, or none
+    // at all (the empty fleet keeps the verdict it always had). A Codex-only fleet is not
+    // told about a route none of its accounts use.
+    if holds_claude || text.snapshot.accounts.is_empty() {
+        if let Some(verdict) = &text.claude_verdict {
+            out.push_str(verdict);
+            out.push('\n');
+        }
+    }
+    // Codex's route second, so Claude's verdict keeps the first line. Keyed `verdict:` in a
+    // Codex-only fleet, where it is the only verdict there is.
+    let unpooled = text
+        .codex_route
+        .filter(|route| !route.pooled)
+        .and_then(|route| route.reason.as_deref());
+    if let (Some(reason), true) = (unpooled, text.holds_codex) {
+        let key = if holds_claude {
+            "codexVerdict"
+        } else {
+            "verdict"
+        };
+        out.push_str(&format!("{key}: codex is not pooled: {reason}\n"));
+    }
+    // One greppable `source=` line above the account lines, in the same
+    // key=value idiom, so the provenance is visible without --json.
+    // `http1Only` rides here rather than per-account: it is a server-wide
+    // fact, like `source` itself, not a per-account gating detail — see
+    // `Manager::http1_only`'s doc-comment for why this must NOT be
+    // re-derived from the config file when `source=live`. `groupColors`
+    // rides the same way, one `name:hex` token per group.
+    let group_colors_field = if text.group_colors.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " groupColors={}",
+            text.group_colors
+                .iter()
+                .map(|(g, hex)| format!("{g}:{hex}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    out.push_str(&format!(
+        "status source={}{}{} http1Only={}{}{}\n",
+        text.source.as_str(),
+        match text.source {
+            StatusSource::Live => String::new(),
+            StatusSource::Offline =>
+                " note=serving-counters-unavailable-no-server-answered".to_string(),
+        },
+        build_fields(text.server_build, text.client_build),
+        text.http1_only,
+        group_colors_field,
+        eligible_token(text.snapshot),
+    ));
+    out.push_str(&render_accounts(text.snapshot, text.source));
+    out
+}
+
+/// ` eligible=claude:R/N,codex:R/N`, the header's count of each pool's eligible accounts, in a
+/// fleet that holds both providers; empty otherwise, so a Claude-only or Codex-only header is
+/// the one it always was. N is every row of that provider, and R the rows whose gate is `ok`
+/// and that are not disabled: the dashboard's "eligible", which a row held by an upstream 403
+/// or 429 is not.
+fn eligible_token(snapshot: &StatsSnapshot) -> String {
+    let tally = |provider: Provider| {
+        let rows: Vec<&AccountSnapshot> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.provider == provider)
+            .collect();
+        let eligible = rows
+            .iter()
+            .filter(|a| a.gate == crate::stats::GateReason::Ok && !a.disabled)
+            .count();
+        (eligible, rows.len())
+    };
+    let (claude, claude_rows) = tally(Provider::Anthropic);
+    let (codex, codex_rows) = tally(Provider::Codex);
+    if claude_rows == 0 || codex_rows == 0 {
+        return String::new();
+    }
+    format!(" eligible=claude:{claude}/{claude_rows},codex:{codex}/{codex_rows}")
+}
+
+/// The stderr line `tcr status` prints for each Codex row whose login is dead (gate LOGIN), in
+/// row order: the command that signs it in again, after why it died when that is known
+/// ([`AccountSnapshot::relogin_why`], the one place the why is worded, so this line and the
+/// dashboard's re-login hint cannot disagree). With no recorded why, the clause and its colon
+/// are dropped and the line still prints. `home` shows a codex folder under it as `~`.
+fn relogin_hint_lines(snapshot: &StatsSnapshot, home: Option<&Path>) -> Vec<String> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Codex && a.gate == crate::stats::GateReason::Login)
+        .map(|a| {
+            let name = &a.name;
+            let why = a
+                .relogin_why(home)
+                .map(|why| format!(": {why}"))
+                .unwrap_or_default();
+            format!("[tcr] {name} needs re-login{why} — tcr login --codex --account {name}")
+        })
+        .collect()
 }
 
 /// `tcr list --json`: every configured account in claude-swap's list schema v1,
@@ -3278,7 +4118,8 @@ pub async fn list_v1(config_path: &Path) -> i32 {
 /// purpose rather than taken from the order the server returns rows in. The
 /// server's list is its boot-time config plus accounts admitted since
 /// (`Manager::reload_groups_if_changed` appends them), so once the file is
-/// reordered the two orders differ. See [`overlay_live_rows`].
+/// reordered the two orders differ. See [`overlay_live_rows`]. Only Claude rows
+/// are listed ([`is_claude_row`]), so the position is among the file's Claude rows.
 async fn render_list_v1(config_path: &Path, prober: Arc<dyn UsageProber>) -> (String, i32) {
     use tcr_status_wire::cswap_v1::{self, ErrorKind, ErrorV1};
 
@@ -3346,12 +4187,33 @@ async fn render_list_v1(config_path: &Path, prober: Arc<dyn UsageProber>) -> (St
         }
     };
 
+    // claude-swap's list is CodexBar's list of CLAUDE accounts, and the schema has no
+    // field to say a row is anything else, so a Codex account is left out: listed, it
+    // would be drawn as a Claude account, under its email, with its Codex windows on
+    // Claude bars. Dropped after the overlay, so a live row and a file row are judged
+    // alike, and before `from_rows` numbers the slots.
+    let rows: Vec<_> = rows.into_iter().filter(is_claude_row).collect();
+
     match serde_json::to_string_pretty(&cswap_v1::from_rows(&rows)) {
         Ok(document) => (document, 0),
         Err(e) => (
             ErrorV1::new(ErrorKind::RenderFailed, e.to_string()).render(),
             1,
         ),
+    }
+}
+
+/// Whether a status row is a Claude account, the only kind claude-swap's list holds.
+/// An absent `provider` is Anthropic, as on every wire this crate writes; a name this
+/// build does not know is not an account it can vouch for as a Claude one. A `match`,
+/// so a third provider decides here instead of being listed by default.
+fn is_claude_row(row: &tcr_status_wire::AccountStatusRow) -> bool {
+    match row.provider.as_deref() {
+        None => true,
+        Some(name) => match Provider::from_name(name) {
+            Some(Provider::Anthropic) => true,
+            Some(Provider::Codex) | None => false,
+        },
     }
 }
 
@@ -3380,15 +4242,26 @@ fn overlay_live_rows(
     rows
 }
 
-/// `tcr doctor [--json]`: is Claude Code reaching this proxy, and if not, what
-/// decided otherwise. Returns the exit code the caller hands to the process:
-/// 0 routed here and serving, 2 routed somewhere else, 3 routed here with
-/// nothing answering ([`crate::doctor::Report::exit_code`]).
+/// `tcr doctor [--json] [--codex]`: is Claude Code reaching this proxy, and if
+/// not, what decided otherwise; and, for a fleet that holds a Codex account or
+/// with `--codex`, would codex be pooled from this shell. Returns the exit code
+/// the caller hands to the process, with the meanings
+/// [`crate::doctor::Report::exit_code`] gives them: 0 routed here and serving,
+/// 2 routed somewhere else, 3 routed here with nothing answering. Whose code it
+/// is follows the fleet ([`crate::doctor::Diagnosis`]): Claude's while the
+/// fleet holds a Claude account, so a script asking about Claude Code gets the
+/// answer it always got; Codex's for a fleet of Codex accounts alone, and with
+/// `--codex`. A config key this build does not recognise is named and changes
+/// no exit code.
 ///
 /// The live read happens here rather than in `crate::doctor` so there stays
 /// exactly ONE client speaking to the status endpoint, with one set of
 /// timeouts and one api-key rule. Everything this prints is decided by
-/// [`crate::doctor::inspect`], which is pure and tested against a temp HOME.
+/// [`crate::doctor::inspect`] and [`crate::doctor::inspect_codex`], over that
+/// one read. The fleet is the running proxy's when it answered, else the
+/// config's, and only a fleet holding a Codex account, or `--codex`, pays for
+/// the Codex half: a Claude-only fleet's doctor never searches for a codex
+/// binary.
 ///
 /// `LiveStatusError::NoServer` is the only failure that reads as "no proxy
 /// answered" without a word on stderr: it is the ordinary state of a machine
@@ -3396,11 +4269,12 @@ fn overlay_live_rows(
 /// The other two mean something IS on the port and could not be read, which the
 /// operator has to be told, since the request count then reads `none` for a
 /// reason that is not "the proxy is down".
-pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
+pub async fn doctor(config_path: &Path, json: bool, codex_only: bool) -> anyhow::Result<i32> {
     let config = load_config(config_path)?;
-    let served_recently = match fetch_live_status(&config).await {
+    let live = fetch_live_status(&config).await;
+    let served_recently = match &live {
         Ok(payload) => Some(crate::doctor::requests_in_window(
-            &payload,
+            payload,
             crate::doctor::REQUEST_WINDOW_MINUTES,
         )),
         Err(LiveStatusError::NoServer) => None,
@@ -3414,14 +4288,23 @@ pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
         }
     };
 
-    let report =
+    let claude =
         crate::doctor::inspect(config.proxy.port, served_recently).with_config_keys(&config);
+    let holds = |provider| status_holds_provider(&live, &config, provider);
+    let codex = (codex_only || holds(Provider::Codex))
+        .then(|| crate::doctor::inspect_codex(config.proxy.port, live.as_ref(), &config));
+    let diagnosis = crate::doctor::Diagnosis {
+        claude,
+        codex,
+        holds_anthropic: holds(Provider::Anthropic),
+        codex_only,
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+        println!("{}", serde_json::to_string_pretty(&diagnosis.to_json())?);
     } else {
-        println!("{}", report.render_text());
+        println!("{}", diagnosis.render_text());
     }
-    Ok(report.exit_code())
+    Ok(diagnosis.exit_code())
 }
 
 /// The build `key=value` tail of the `status source=` line.
@@ -3430,9 +4313,9 @@ pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
 /// two are the same binary only until someone rebuilds without restarting, which
 /// is the normal state of affairs here (`tcr update` rebuilds on purpose without
 /// restarting). When they differ, the CLI you just ran is newer than the server
-/// answering it — worth seeing before trusting either.
-fn build_fields(server: Option<&BuildInfo>) -> String {
-    let client = BuildInfo::current();
+/// answering it — worth seeing before trusting either. `client` is this binary's
+/// own build (`BuildInfo::current()`), a parameter so the line can be pinned.
+fn build_fields(server: Option<&BuildInfo>, client: &BuildInfo) -> String {
     match server {
         Some(server) => format!(
             " server_sha={} server_dirty={} server_built_at={} client_sha={}",
@@ -3557,7 +4440,9 @@ mod tests {
     /// still succeeds exactly as before this change.
     #[test]
     fn load_for_edit_succeeds_with_no_quarantined_accounts() {
-        let path = write_config("cli-load-no-quarantine", TWO_ACCOUNTS);
+        let mut fixture: serde_json::Value = serde_json::from_str(TWO_ACCOUNTS).unwrap();
+        fixture["proxy"]["port"] = serde_json::json!(9);
+        let path = write_config("cli-load-no-quarantine", &fixture.to_string());
         let config = load_for_edit(&path).expect("a clean config must still load for editing");
         assert_eq!(config.accounts.len(), 2);
         fs::remove_file(&path).ok();
@@ -3654,6 +4539,87 @@ mod tests {
         let config = load(&path);
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].name, "bob@example.com");
+        fs::remove_file(&path).ok();
+    }
+
+    /// **Deleting a Codex account takes out that row and no other**, in the file and in
+    /// the running proxy, though an Anthropic row shares its identity. The two rows below
+    /// carry the same `accountUuid` and no org, the shape in which identity alone calls
+    /// them one account; `config::remove_account_entry` finds the entry it deletes, and
+    /// the proxy's reload finds the runtime row the file lost, both by identity. Only the
+    /// provider keeps either from landing on the Anthropic row.
+    ///
+    /// Watched red: drop the provider guard from `identity::same_identity`, and the
+    /// delete is refused as ambiguous and changes nothing.
+    #[tokio::test]
+    async fn remove_takes_a_codex_account_out_and_leaves_its_anthropic_twin() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = write_config(
+            "live-remove-codex",
+            &format!(
+                r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                     {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                        "refreshToken": "rt-a", "expiresAt": 4102444800000, "priority": 0,
+                        "accountUuid": "11111111-1111-4111-8111-111111111111" }},
+                     {{ "name": "alice@example.com/codex", "provider": "codex", "type": "oauth",
+                        "accessToken": "at-c", "refreshToken": "rt-c", "expiresAt": 4102444800000,
+                        "priority": 0, "accountUuid": "11111111-1111-4111-8111-111111111111",
+                        "credentialVersion": 2 }}
+                   ] }}"#
+            ),
+        );
+        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+
+        remove_account(&path, "alice@example.com/codex")
+            .await
+            .expect("the Codex row is deleted");
+
+        let live = manager.snapshot(OffsetDateTime::now_utc());
+        let listed: Vec<(&str, Provider)> = live
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.provider))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("alice@example.com", Provider::Anthropic)],
+            "the serving process dropped the Codex row and only it"
+        );
+        let pick = |path: &str| {
+            manager.select(
+                &std::collections::HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                path,
+                None,
+            )
+        };
+        assert_eq!(
+            pick(crate::provider::CODEX_RESPONSES_PATH),
+            None,
+            "the deleted Codex account never serves again"
+        );
+        assert_eq!(
+            pick("/v1/messages"),
+            Some(0),
+            "the Anthropic twin still serves"
+        );
+
+        let config = load(&path);
+        let on_disk: Vec<(&str, Provider, &str)> = config
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.provider, a.access_token.as_str()))
+            .collect();
+        assert_eq!(
+            on_disk,
+            vec![("alice@example.com", Provider::Anthropic, "at-a")],
+            "the file lost the Codex row and kept the Anthropic one, credential and all"
+        );
         fs::remove_file(&path).ok();
     }
 
@@ -3855,6 +4821,129 @@ mod tests {
             .expect_err("an ambiguous live query must not be applied");
         assert!(err.to_string().contains("ambiguous"), "{err}");
         assert_eq!(before, fs::read_to_string(&path).unwrap());
+        fs::remove_file(&path).ok();
+    }
+
+    /// Two Claude and two Codex accounts with these priorities, parsed in memory:
+    /// no file, and nothing to dial.
+    fn priority_fleet(alice: i64, carol: i64, bob: i64, dana: i64) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a", "priority": alice },
+                { "name": "carol@example.com", "accessToken": "at-c", "priority": carol },
+                { "name": "bob@example.com/codex", "provider": "codex", "accessToken": "at-b",
+                  "priority": bob },
+                { "name": "dana@example.com/codex", "provider": "codex", "accessToken": "at-d",
+                  "priority": dana }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// `--first` and `--last` take the min and max over the row's OWN provider,
+    /// with the same `0` seed: Claude and Codex accounts rotate apart. A Codex
+    /// row's relative move names the end of the Codex rotation it now holds; an
+    /// explicit value, and any Claude move, prints the line it always printed.
+    #[test]
+    fn priority_first_and_last_stay_within_the_rows_provider() {
+        let fleet = priority_fleet(1, -1, 4, -4);
+        assert_eq!(
+            priority_value(&fleet, Provider::Anthropic, PriorityArg::First),
+            -2,
+            "a min over both providers would give -5"
+        );
+        assert_eq!(
+            priority_value(&fleet, Provider::Anthropic, PriorityArg::Last),
+            2,
+            "a max over both providers would give 5"
+        );
+
+        let fleet = priority_fleet(6, -6, 2, -2);
+        assert_eq!(
+            priority_value(&fleet, Provider::Codex, PriorityArg::First),
+            -3
+        );
+        assert_eq!(
+            priority_value(&fleet, Provider::Codex, PriorityArg::Last),
+            3
+        );
+
+        assert_eq!(
+            priority_message(
+                "bob@example.com/codex",
+                -3,
+                Provider::Codex,
+                PriorityArg::First
+            ),
+            "Set priority of 'bob@example.com/codex' to -3, the front of the Codex rotation."
+        );
+        assert_eq!(
+            priority_message(
+                "bob@example.com/codex",
+                3,
+                Provider::Codex,
+                PriorityArg::Last
+            ),
+            "Set priority of 'bob@example.com/codex' to 3, the back of the Codex rotation."
+        );
+        assert_eq!(
+            priority_message(
+                "bob@example.com/codex",
+                5,
+                Provider::Codex,
+                PriorityArg::N(5)
+            ),
+            "Set priority of 'bob@example.com/codex' to 5."
+        );
+        assert_eq!(
+            priority_message(
+                "alice@example.com",
+                -2,
+                Provider::Anthropic,
+                PriorityArg::First
+            ),
+            "Set priority of 'alice@example.com' to -2."
+        );
+    }
+
+    /// `tcr priority <codex row> --first` writes the value worked out over the
+    /// Codex rows: `set_priority` hands `priority_value` the row's provider, which
+    /// the pure test above cannot see. On a port nothing serves, so the live half
+    /// finds no proxy and the file is the whole truth.
+    #[tokio::test]
+    async fn priority_on_a_codex_row_writes_its_own_providers_value() {
+        let port = dead_port().await;
+        let json = serde_json::json!({
+            "proxy": { "port": port },
+            "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 6 },
+                { "name": "carol@example.com", "type": "oauth", "accessToken": "at-c",
+                  "priority": -6 },
+                { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+                  "accessToken": "at-b", "credentialVersion": 2, "priority": 2 },
+                { "name": "dana@example.com/codex", "provider": "codex", "type": "oauth",
+                  "accessToken": "at-d", "credentialVersion": 2, "priority": -2 }
+            ]
+        })
+        .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["proxy"]["port"], serde_json::json!(port));
+        assert_ne!(
+            parsed["proxy"]["port"],
+            serde_json::json!(3456),
+            "never the port a live proxy serves on"
+        );
+        let path = write_config("priority-codex", &json);
+
+        set_priority(&path, "bob@example.com/codex", PriorityArg::First)
+            .await
+            .expect("no proxy answers, so the file is written");
+        assert_eq!(
+            load(&path).accounts[2].priority,
+            Some(-3),
+            "min(0, the Codex rows' 2 and -2) - 1; over every row it would be -7"
+        );
         fs::remove_file(&path).ok();
     }
 
@@ -4286,6 +5375,157 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    // --- group reserve in a fleet holding Codex accounts ----------------------
+
+    /// alice is the only Claude account, and she is in `orchard`; bob and dana
+    /// are enabled Codex accounts in no group.
+    const ONE_CLAUDE_TWO_CODEX: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "groups": ["orchard"] },
+        { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-b", "credentialVersion": 2 },
+        { "name": "dana@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-d", "credentialVersion": 2 }
+      ]
+    }"#;
+
+    /// `orchard` holds alice (Claude) and bob (Codex); carol (Claude) and dana
+    /// (Codex) are in no group.
+    const ORCHARD_HOLDS_CODEX: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "groups": ["orchard"] },
+        { "name": "carol@example.com", "type": "oauth", "accessToken": "at-c" },
+        { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-b", "credentialVersion": 2, "groups": ["orchard"] },
+        { "name": "dana@example.com/codex", "provider": "codex", "type": "oauth",
+          "accessToken": "at-d", "credentialVersion": 2 }
+      ]
+    }"#;
+
+    /// The rail counts Claude accounts: reserving the group that holds the only
+    /// Claude account leaves two Codex accounts unreserved, and they cannot serve
+    /// a Claude session, so it is refused. `--force` does not lift it, and the
+    /// refusal leaves the file byte-identical.
+    #[test]
+    fn reserving_the_last_claude_account_counts_claude_only() {
+        let refusal = "reserving 'orchard' would leave 0 unreserved enabled Claude accounts — Claude could serve no unrequested traffic, and the 2 Codex account(s) left cannot serve it. every enabled Claude account belongs to this group. Nothing changed.";
+        let path = write_config("reserve-last-claude", ONE_CLAUDE_TWO_CODEX);
+        let config = load(&path);
+        assert_eq!(
+            plan_reserve(&config, "orchard", false),
+            Err(refusal.to_string())
+        );
+        assert_eq!(
+            plan_reserve(&config, "orchard", true),
+            Err(refusal.to_string()),
+            "--force lifts only the Codex-members refusal, never the Claude rail"
+        );
+
+        let before = fs::read(&path).unwrap();
+        let err = reserve_group_with(&path, "orchard", true).expect_err("the rail refuses");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        fs::remove_file(&path).ok();
+    }
+
+    /// A group holding a Codex account is refused without `--force`, because a
+    /// Codex session cannot ask for a group: while it is reserved, its Codex
+    /// members serve nothing. The remedy names the first of them.
+    #[test]
+    fn reserving_a_group_with_codex_members_needs_force() {
+        let refusal = "reserving 'orchard' strands its Codex account(s) bob@example.com/codex: a Codex session cannot ask for a group, so while 'orchard' is reserved they serve nothing. Remove them first (`tcr group rm orchard bob@example.com/codex`), or pass --force to reserve it anyway. Nothing changed.";
+        let path = write_config("reserve-codex-members", ORCHARD_HOLDS_CODEX);
+        assert_eq!(
+            plan_reserve(&load(&path), "orchard", false),
+            Err(refusal.to_string())
+        );
+
+        let before = fs::read(&path).unwrap();
+        let err = reserve_group_with(&path, "orchard", false).expect_err("refused without --force");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        fs::remove_file(&path).ok();
+    }
+
+    /// `--force` reserves it and says, per provider, what is left: one Claude
+    /// account and one Codex account stay unreserved, and one Claude account is
+    /// few enough to warn about. The already-reserved line ends with the same
+    /// clause, and the Codex-members refusal still applies to a group that is
+    /// already reserved.
+    #[test]
+    fn force_reserve_warns_and_counts_per_provider() {
+        let path = write_config("reserve-force", ORCHARD_HOLDS_CODEX);
+        let plan = plan_reserve(&load(&path), "orchard", true).expect("--force reserves it");
+        assert_eq!(
+            plan.force_warning,
+            Some("warning: 'orchard' holds the Codex account(s) bob@example.com/codex. A Codex session cannot ask for a group, so while 'orchard' is reserved they serve nothing — `tcr group rm orchard bob@example.com/codex` returns one to the pool.".to_string())
+        );
+        assert_eq!(
+            plan.reserved_line,
+            "group 'orchard' reserved. 1 unreserved enabled Claude account(s) and 1 Codex account(s) remain."
+        );
+        assert_eq!(
+            plan.already_line,
+            "group 'orchard' is already reserved; nothing changed. 1 unreserved enabled Claude account(s) and 1 Codex account(s) remain."
+        );
+        assert_eq!(
+            plan.low_count_warning,
+            Some("warning: only 1 unreserved enabled Claude account(s) remain — ordinary (unrequested) Claude traffic may starve.".to_string())
+        );
+
+        reserve_group_with(&path, "orchard", true).expect("--force writes the reservation");
+        assert!(load(&path).is_group_reserved("orchard"));
+
+        let before = fs::read(&path).unwrap();
+        assert!(
+            reserve_group_with(&path, "orchard", false).is_err(),
+            "an already-reserved group holding a Codex account still needs --force"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        reserve_group_with(&path, "orchard", true).expect("and with it, it is already reserved");
+        fs::remove_file(&path).ok();
+    }
+
+    /// A fleet with no Codex account keeps every word the reserve verb printed
+    /// before Codex accounts existed, and `--force` changes nothing in it.
+    #[test]
+    fn a_claude_only_fleets_reserve_sentence_is_unchanged() {
+        let zero_path = write_config("reserve-claude-only-zero", ALL_IN_ONE_GROUP);
+        let all_in_one = load(&zero_path);
+        let refusal = "reserving 'codereview' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. every enabled account belongs to this group. Nothing changed.";
+        assert_eq!(
+            plan_reserve(&all_in_one, "codereview", false),
+            Err(refusal.to_string())
+        );
+        assert_eq!(
+            plan_reserve(&all_in_one, "codereview", true),
+            Err(refusal.to_string())
+        );
+
+        let grouped_path = write_config("reserve-claude-only", GROUPED_ACCOUNTS);
+        let grouped = load(&grouped_path);
+        let plan = plan_reserve(&grouped, "codereview", false).expect("carol stays unreserved");
+        assert_eq!(
+            plan,
+            ReservePlan {
+                force_warning: None,
+                reserved_line: "group 'codereview' reserved. 1 unreserved enabled account(s) remain."
+                    .to_string(),
+                already_line: "group 'codereview' is already reserved; nothing changed. 1 unreserved enabled account(s) remain."
+                    .to_string(),
+                low_count_warning: Some(
+                    "warning: only 1 unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
+                        .to_string()
+                ),
+            }
+        );
+        assert_eq!(plan_reserve(&grouped, "codereview", true), Ok(plan));
+        fs::remove_file(&zero_path).ok();
+        fs::remove_file(&grouped_path).ok();
+    }
+
     // --- group park / unpark ------------------------------------------------
 
     /// Mirrors [`reserve_then_unreserve_round_trips_and_is_idempotent`]:
@@ -4624,6 +5864,245 @@ mod tests {
         assert!(
             control_account_group_notice(&config, "worker@example.com", "dev").is_none(),
             "an ordinary account must not be warned about"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The offline half of `tcr control` (no server, or one too old for the live route)
+    /// refuses a Codex account the way the live route does, so `tcr control` cannot
+    /// persist a `controlAccount` the next boot would ignore. The file is left as it was.
+    ///
+    /// The config names a port nothing listens on ([`dead_port`]): an edit asks whether a
+    /// server is running on the config's port, and without one that is 3456, where a live
+    /// tcr may be serving.
+    ///
+    /// Watched red: drop the provider check from `write_control_account` and the file
+    /// names the Codex row.
+    #[tokio::test]
+    async fn write_control_account_refuses_a_codex_account_and_writes_nothing() {
+        let port = dead_port().await;
+        let path = write_config(
+            "control-codex",
+            &serde_json::json!({
+                "proxy": { "port": port },
+                "accounts": [
+                    { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                      "expiresAt": 1_893_456_000_000_i64, "priority": 0 },
+                    { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+                      "accountUuid": "11111111-1111-4111-8111-111111111111", "accessToken": "at-b",
+                      "refreshToken": "rt-b", "expiresAt": 1_893_456_000_000_i64, "priority": 0 }
+                ]
+            })
+            .to_string(),
+        );
+        let before = fs::read_to_string(&path).unwrap();
+        let err = write_control_account(&path, Some("bob@example.com/codex"))
+            .expect_err("a Codex account cannot be the control account");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("bob@example.com/codex")
+                && message.contains(crate::manager::CODEX_HAS_NO_CONTROL_ACCOUNT),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing was written"
+        );
+        assert_eq!(
+            write_control_account(&path, Some("alice@example.com")).unwrap(),
+            Some("alice@example.com".to_string()),
+            "control: the Anthropic row is set"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- the exit lock on a Codex account -------------------------------------
+
+    /// alice (Claude) and bob (Codex) on a port nothing serves: an edit asks
+    /// whether a server is running on the config's port, and without one that is
+    /// 3456, where a live tcr may be serving. `bob_extra` is merged into bob's row.
+    async fn alice_and_codex_bob(tag: &str, bob_extra: serde_json::Value) -> std::path::PathBuf {
+        let port = dead_port().await;
+        let mut bob = serde_json::json!({
+            "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+            "accessToken": "at-b", "refreshToken": "rt-b", "credentialVersion": 2
+        });
+        if let (Some(row), Some(extra)) = (bob.as_object_mut(), bob_extra.as_object()) {
+            row.extend(extra.clone());
+        }
+        let json = serde_json::json!({
+            "proxy": { "port": port },
+            "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a" },
+                bob
+            ]
+        });
+        assert_ne!(json["proxy"]["port"], serde_json::json!(3456));
+        write_config(tag, &json.to_string())
+    }
+
+    /// `tcr peer account <codex> --exits-from <peer>` is refused, and so is
+    /// `--must` on its own, which would make an old pin strict: a Codex request
+    /// always leaves from this Mac. Each refusal leaves the file byte-identical,
+    /// and the same pin on a Claude row is written as it always was.
+    #[tokio::test]
+    async fn exits_from_a_peer_is_refused_on_a_codex_row() {
+        let refusal = "'bob@example.com/codex' is a Codex account, and a Codex request always leaves from this Mac, so it cannot exit from another Mac. Nothing was changed.";
+        let path = alice_and_codex_bob("egress-codex", serde_json::json!({})).await;
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let before = fs::read(&path).unwrap();
+
+        let err = set_account_egress(
+            &path,
+            "bob@example.com/codex",
+            Some(config::Egress::Via(peer)),
+            None,
+        )
+        .expect_err("a Codex account cannot be pinned to another Mac");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+
+        let err = set_account_egress(&path, "bob@example.com/codex", None, Some(true))
+            .expect_err("--must alone would make an old pin strict");
+        assert_eq!(err.to_string(), refusal);
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+
+        let (name, pin) = set_account_egress(
+            &path,
+            "alice@example.com",
+            Some(config::Egress::Via(peer)),
+            None,
+        )
+        .expect("control: a Claude row is pinned as before");
+        assert_eq!(name, "alice@example.com");
+        assert_eq!(pin.egress, config::Egress::Via(peer));
+        fs::remove_file(&path).ok();
+    }
+
+    /// `--exits-from local --no-must` stays allowed on a Codex row, so a pin
+    /// written before the refusal existed can still be cleared.
+    #[tokio::test]
+    async fn exits_from_local_still_clears_an_old_codex_pin() {
+        let peer = tcr_peer_wire::PeerId([7_u8; 32]);
+        let path = alice_and_codex_bob(
+            "egress-codex-clear",
+            serde_json::json!({ "egress": format!("via {}", peer.to_wire()), "egressStrict": true }),
+        )
+        .await;
+        assert_eq!(
+            load(&path).accounts[1].egress_pin(),
+            config::EgressPin {
+                egress: config::Egress::Via(peer),
+                strict: true
+            },
+            "the fixture carries the old strict pin"
+        );
+
+        set_account_egress(
+            &path,
+            "bob@example.com/codex",
+            Some(config::Egress::Local),
+            Some(false),
+        )
+        .expect("local and --no-must clear the old pin");
+        assert_eq!(
+            load(&path).accounts[1].egress_pin(),
+            config::EgressPin {
+                egress: config::Egress::Local,
+                strict: false
+            }
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- groups and Codex accounts --------------------------------------------
+
+    /// `tcr group add` on a Codex account says on stderr what the label does and
+    /// does not do, and still writes it: the label parks the account, and the
+    /// command's idempotent exit-0 contract with TcrBar is unchanged.
+    #[tokio::test]
+    async fn group_add_on_a_codex_row_warns_on_stderr() {
+        let path = alice_and_codex_bob("group-add-codex", serde_json::json!({})).await;
+        let config = load(&path);
+        assert_eq!(
+            codex_group_add_notice(&config.accounts[1], "orchard"),
+            Some("warning: 'bob@example.com/codex' is a Codex account. A Codex session cannot ask for a group, so 'orchard' labels it and can park it, but never routes to it; while 'orchard' is reserved, it serves nothing.".to_string())
+        );
+        assert_eq!(
+            codex_group_add_notice(&config.accounts[0], "orchard"),
+            None,
+            "a Claude row is an ordinary add"
+        );
+
+        add_to_group(&path, "orchard", "bob@example.com/codex")
+            .expect("the label is written all the same");
+        assert!(load(&path).accounts[1].in_group("orchard"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr group ls` counts a group's Codex members apart, and `routes=` keeps
+    /// meaning "a Claude session asking for this group can be served": it counts
+    /// Claude members only, because no Codex request carries a group. A group of
+    /// Codex members alone says why it routes nothing, and a group with no Codex
+    /// member reads exactly as it always did.
+    #[test]
+    fn group_ls_counts_codex_members_and_routes_counts_anthropic_only() {
+        let path = write_config(
+            "group-ls-codex",
+            r#"{
+              "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "groups": ["mixed", "solo"] },
+                { "name": "bob@example.com/codex", "provider": "codex", "type": "oauth",
+                  "accessToken": "at-b", "credentialVersion": 2, "groups": ["mixed", "lab"] }
+              ]
+            }"#,
+        );
+        let config = load(&path);
+
+        let text = render_groups_text(&config);
+        let line = |group: &str| -> String {
+            text.lines()
+                .find(|line| line.starts_with(&format!("group {group} ")))
+                .unwrap_or_else(|| panic!("a line for {group}: {text}"))
+                .to_string()
+        };
+        let mixed = line("mixed");
+        assert!(
+            mixed.contains(" members=alice@example.com,bob@example.com/codex codex_members=1 "),
+            "{mixed}"
+        );
+        assert!(mixed.contains(" routes=yes "), "{mixed}");
+        let lab = line("lab");
+        assert!(lab.contains(" codex_members=1 "), "{lab}");
+        assert!(lab.contains(" routes=no route_block=codex-only "), "{lab}");
+        let solo = line("solo");
+        assert!(!solo.contains("codex_members"), "{solo}");
+        assert!(solo.contains(" routes=yes "), "{solo}");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
+        let row = |name: &str| -> serde_json::Value {
+            value["groups"]
+                .as_array()
+                .expect("groups array")
+                .iter()
+                .find(|r| r["group"] == name)
+                .expect("group row")
+                .clone()
+        };
+        assert_eq!(row("mixed")["codexMembers"], serde_json::json!(1));
+        assert_eq!(row("mixed")["routes"], serde_json::json!(true));
+        assert_eq!(row("mixed")["routeBlock"], serde_json::Value::Null);
+        assert_eq!(row("lab")["codexMembers"], serde_json::json!(1));
+        assert_eq!(row("lab")["routes"], serde_json::json!(false));
+        assert_eq!(row("lab")["routeBlock"], serde_json::json!("codex-only"));
+        assert!(
+            row("solo").get("codexMembers").is_none(),
+            "a group with no Codex member carries no new key: {}",
+            row("solo")
         );
         fs::remove_file(&path).ok();
     }
@@ -5076,6 +6555,7 @@ mod tests {
         Account {
             name: String::new(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5091,6 +6571,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -5109,6 +6590,54 @@ mod tests {
         assert!(
             matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("required")),
             "a stamped 400 is a structural Rejected, not a guess from status alone: {err:?}"
+        );
+    }
+
+    /// The providers a STAMPED answer names come back beside it, read off the very probe
+    /// `oauth::probe_add_route` already sends. The same header on an UNSTAMPED answer — an older
+    /// tcr's catch-all, anything that is not this route — is no proof of anything and is not read.
+    #[tokio::test]
+    async fn post_add_account_with_providers_reads_them_off_a_stamped_answer_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = add_route_config(port);
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
+        assert!(
+            matches!(answer, Err(LiveControlError::Rejected(_))),
+            "the blank probe is still the route's own stamped 400: {answer:?}"
+        );
+        assert_eq!(
+            providers,
+            vec![
+                crate::provider::Provider::Anthropic,
+                crate::provider::Provider::Codex
+            ]
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let unstamped = axum::Router::new().fallback(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    [(crate::proxy::PROVIDERS_HEADER, "anthropic,codex")],
+                    "",
+                )
+            });
+            let _ = axum::serve(listener, unstamped).await;
+        });
+        let config = add_route_config(port);
+        let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
+        assert!(
+            matches!(answer, Err(LiveControlError::NoRoute)),
+            "{answer:?}"
+        );
+        assert!(
+            providers.is_empty(),
+            "an unstamped answer names no providers, whatever its headers say: {providers:?}"
         );
     }
 
@@ -5171,6 +6700,7 @@ mod tests {
         let account = Account {
             name: "new@example.com".to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5186,6 +6716,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let applied = post_add_account(&config, &account)
@@ -5227,6 +6758,7 @@ mod tests {
         let account = Account {
             name: "dup@example.com".to_string(),
             account_type: crate::config::AccountType::OAuth,
+            provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
             org_name: None,
@@ -5242,6 +6774,7 @@ mod tests {
             seat_tier: None,
             egress: crate::config::Egress::Local,
             egress_strict: false,
+            codex_home: None,
             extra: serde_json::Map::new(),
         };
         let err = post_add_account(&config, &account)
@@ -5324,7 +6857,7 @@ mod tests {
         util: f64,
     }
     impl UsageProber for FixedProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let util = self.util;
             Box::pin(async move {
                 Ok(Usage {
@@ -5335,6 +6868,7 @@ mod tests {
                     seven_day: None,
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -5347,7 +6881,7 @@ mod tests {
         calls: Arc<AtomicU64>,
     }
     impl UsageProber for CountingProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Ok(Usage {
@@ -5358,6 +6892,7 @@ mod tests {
                     seven_day: None,
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -5444,6 +6979,61 @@ mod tests {
             .as_str()
             .is_some_and(|m| !m.is_empty()));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// **`tcr list --json` never hands CodexBar a Codex account as one of its Claude
+    /// accounts.** The document is claude-swap's list, which CodexBar reads as Claude
+    /// accounts and nothing else, and it has no field that could say otherwise: listed,
+    /// a ChatGPT login would be drawn as a Claude account, under its email, with its
+    /// Codex windows on Claude bars. The Claude rows keep their file order and number
+    /// from 1 among themselves.
+    ///
+    /// Watched red: list every row, and the Codex account takes slot 2 as a second
+    /// `alice@example.com`.
+    #[tokio::test]
+    async fn list_v1_never_lists_a_codex_account() {
+        let json = format!(
+            r#"{{ "proxy": {{ "port": {} }}, "accounts": [
+                 {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                    "refreshToken": "rt-a", "expiresAt": 4102444800000 }},
+                 {{ "name": "alice@example.com/codex", "provider": "codex", "type": "oauth",
+                    "accessToken": "at-c", "refreshToken": "rt-c", "expiresAt": 4102444800000,
+                    "accountUuid": "11111111-1111-4111-8111-111111111111", "credentialVersion": 2 }},
+                 {{ "name": "bob@example.com", "type": "oauth", "accessToken": "at-b",
+                    "refreshToken": "rt-b", "expiresAt": 4102444800000 }}
+               ] }}"#,
+            unused_port()
+        );
+        let path = write_config("list-v1-codex", &json);
+        let calls = Arc::new(AtomicU64::new(0));
+        let (document, code) = render_list_v1(
+            &path,
+            Arc::new(CountingProber {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(code, 0, "{document}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "it still never probes");
+        let doc: serde_json::Value = serde_json::from_str(&document).expect("one JSON document");
+        let got: Vec<(i64, &str)> = doc["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .map(|a| {
+                (
+                    a["number"].as_i64().expect("number"),
+                    a["email"].as_str().expect("email"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, "alice@example.com"), (2, "bob@example.com")],
+            "{document}"
+        );
     }
 
     /// Slots follow the FILE, whatever order the server returns rows in: a row
@@ -5920,6 +7510,80 @@ mod tests {
         }
     }
 
+    /// A Codex account reads as one on both `tcr status` surfaces, through the LIVE
+    /// path the TcrBar panel polls: its JSON row carries `provider: "codex"` and the
+    /// ChatGPT plan label, and its text line names the same plan. The Anthropic row
+    /// beside it carries no `provider` key at all — what keeps a panel that predates
+    /// the key decoding it unchanged — and keeps its Anthropic label.
+    ///
+    /// Through a real socket from a running server, not from a hand-built snapshot:
+    /// the provider has to survive `Manager::snapshot`, the server's `StatusPayload`
+    /// and the client's `into_snapshot` before a renderer sees it, and the contract
+    /// fixture renders a snapshot directly, so it sees none of those three hops.
+    /// Binds port 0, never the config's 3456.
+    #[tokio::test]
+    async fn live_status_shows_a_codex_accounts_provider_and_chatgpt_plan() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = load_from(
+            r#"{
+              "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "expiresAt": 1893456000000, "priority": 0,
+                  "organizationType": "claude_max", "rateLimitTier": "default_claude_max_20x" },
+                { "name": "alice@example.com/codex", "type": "oauth", "provider": "codex",
+                  "accountUuid": "11111111-1111-4111-8111-111111111111",
+                  "organizationType": "pro", "accessToken": "at-c", "refreshToken": "rt-c",
+                  "expiresAt": 1893456000000, "priority": 1 }
+              ]
+            }"#,
+        );
+        config.proxy.port = port;
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let payload = match fetch_live_status(&config).await {
+            Ok(p) => p,
+            Err(LiveStatusError::NoServer) => panic!("the spawned server did not answer"),
+            Err(err) => panic!("live status unusable: {}", err.why()),
+        };
+        let (snapshot, thresholds) = payload.into_snapshot();
+
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let (claude, codex) = (&rows[0], &rows[1]);
+        assert_eq!(codex["provider"], "codex", "{codex}");
+        assert_eq!(codex["plan"], "ChatGPT Pro", "{codex}");
+        assert_eq!(
+            codex["organizationType"], "pro",
+            "the raw claim still rides beside the label: {codex}"
+        );
+        assert!(
+            claude.get("provider").is_none(),
+            "an Anthropic row carries no provider key, not even null: {claude}"
+        );
+        assert_eq!(claude["plan"], "Max 20x", "{claude}");
+
+        let text = render_accounts(&snapshot, StatusSource::Live);
+        let line_for = |name: &str| {
+            text.lines()
+                .find(|l| l.starts_with(&format!("account {name} ")))
+                .unwrap_or_else(|| panic!("no line for {name}:\n{text}"))
+        };
+        let codex_line = line_for("alice@example.com/codex");
+        assert!(codex_line.contains("plan=ChatGPT Pro"), "{codex_line}");
+        let claude_line = line_for("alice@example.com");
+        assert!(claude_line.contains("plan=Max 20x"), "{claude_line}");
+    }
+
     /// The offline path has no serving process, so `serverSha` is `null` — the
     /// same "not measured" idiom as `cacheHitRatio`, and never this CLI's own sha
     /// standing in for a server's.
@@ -5964,7 +7628,7 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-07-26T00:00:00Z".to_string(),
         };
-        let live = build_fields(Some(&server));
+        let live = build_fields(Some(&server), &BuildInfo::current());
         assert!(live.contains("server_sha=cd146ce"), "{live}");
         assert!(live.contains("server_dirty=false"), "{live}");
         assert!(
@@ -5976,7 +7640,7 @@ mod tests {
             "{live}"
         );
 
-        let offline = build_fields(None);
+        let offline = build_fields(None, &BuildInfo::current());
         assert!(
             !offline.contains("server_sha="),
             "no server, no server fields: {offline}"
@@ -5987,7 +7651,7 @@ mod tests {
         );
 
         // An unknown dirty flag reads as `unknown`, never as `false`.
-        let murky = build_fields(Some(&BuildInfo::default()));
+        let murky = build_fields(Some(&BuildInfo::default()), &BuildInfo::current());
         assert!(murky.contains("server_dirty=unknown"), "{murky}");
     }
 
@@ -6047,6 +7711,108 @@ mod tests {
         assert!(!payload_carries_sessions("not json at all"));
     }
 
+    /// What `tcr sessions` prints for a Claude-only fleet, pinned before the sessions wire
+    /// learned about Codex: every later change must leave these bytes exactly as they are. The
+    /// rows are built from JSON holding only the keys a Claude session has always carried, so
+    /// the golden cannot lean on a field added after it. The second row's model has no price in
+    /// this build and prints `costUsd=0.0000`. That zero is a known defect, kept on purpose:
+    /// fixing it would change what a Claude-only fleet prints.
+    #[test]
+    fn claude_only_sessions_text_is_unchanged() {
+        let rows: Vec<tcr_status_wire::SessionRow> = serde_json::from_value(serde_json::json!([
+            {
+                "sessionId": "a1f3c2d4-0000-4000-8000-000000000001",
+                "account": "alice@example.com",
+                "model": "claude-opus-5",
+                "firstSeenMs": 1_767_223_200_000_i64,
+                "lastSeenMs": 1_767_225_597_000_i64,
+                "requests": 24,
+                "inputTokens": 180_000,
+                "outputTokens": 9_200,
+                "cacheReadTokens": 160_000,
+                "cacheCreationTokens": 12_000,
+                "tools": { "calls": 12 },
+                "costUsd": 1.2034,
+                "cacheTtlSecs": 3600
+            },
+            {
+                "sessionId": "22222222-2222-4222-8222-222222222222",
+                "account": "carol@example.com",
+                "model": "claude-opus-4-5",
+                "firstSeenMs": 1_767_225_000_000_i64,
+                "lastSeenMs": 1_767_225_060_000_i64,
+                "requests": 1,
+                "inputTokens": 10,
+                "outputTokens": 2
+            },
+            {
+                "sessionId": "33333333-3333-4333-8333-333333333333",
+                "firstSeenMs": 1_767_225_000_000_i64,
+                "lastSeenMs": 1_767_225_000_000_i64,
+                "requests": 1
+            }
+        ]))
+        .expect("session rows in today's shape");
+        assert_eq!(
+            render_sessions_text(true, &rows),
+            concat!(
+                "supported=true sessions=3\n",
+                "session=a1f3c2d4-0000-4000-8000-000000000001 account=alice@example.com model=claude-opus-5 requests=24 inputTokens=180000 outputTokens=9200 cacheReadTokens=160000 toolCalls=12 costUsd=1.2034\n",
+                "session=22222222-2222-4222-8222-222222222222 account=carol@example.com model=claude-opus-4-5 requests=1 inputTokens=10 outputTokens=2 cacheReadTokens=0 toolCalls=0 costUsd=0.0000\n",
+                "session=33333333-3333-4333-8333-333333333333 account=- model=- requests=1 inputTokens=0 outputTokens=0 cacheReadTokens=0 toolCalls=0 costUsd=0.0000\n",
+            )
+        );
+        assert_eq!(
+            render_sessions_text(false, &[]),
+            "supported=false sessions=0\n"
+        );
+    }
+
+    /// A Codex session's line names its provider after the account and never prints a cost
+    /// nobody measured: `costUsd=n/a` while no request was priced, including before its first
+    /// response finished; the priced part and the count it leaves out when only some were; the
+    /// plain figure when all were. Reasoning tokens print when there are any.
+    #[test]
+    fn a_codex_session_line_carries_provider_and_its_unpriced_figures() {
+        let codex =
+            |id: &str, cost: f64, unpriced: u64, reasoning: u64| -> tcr_status_wire::SessionRow {
+                serde_json::from_value(serde_json::json!({
+                    "sessionId": id,
+                    "account": "bob@example.com/codex",
+                    "provider": "codex",
+                    "model": "gpt-5.1-codex",
+                    "firstSeenMs": 1_767_224_880_000_i64,
+                    "lastSeenMs": 1_767_225_599_000_i64,
+                    "requests": 7,
+                    "inputTokens": 95_000,
+                    "outputTokens": 4_100,
+                    "cacheReadTokens": 80_000,
+                    "tools": { "calls": 3 },
+                    "costUsd": cost,
+                    "unpricedRequests": unpriced,
+                    "reasoningTokens": reasoning
+                }))
+                .expect("a Codex session row")
+            };
+        let rows = [
+            codex("019a3c5e-0000-7000-8000-000000000002", 0.0, 7, 1_200),
+            codex("44444444-4444-4444-8444-444444444444", 0.42, 3, 0),
+            codex("55555555-5555-4555-8555-555555555555", 1.5, 0, 0),
+            codex("66666666-6666-4666-8666-666666666666", 0.0, 0, 0),
+        ];
+        let tail = "account=bob@example.com/codex provider=codex model=gpt-5.1-codex requests=7 inputTokens=95000 outputTokens=4100 cacheReadTokens=80000 toolCalls=3";
+        assert_eq!(
+            render_sessions_text(true, &rows),
+            format!(
+                "supported=true sessions=4\n\
+                 session=019a3c5e-0000-7000-8000-000000000002 {tail} costUsd=n/a reasoningTokens=1200\n\
+                 session=44444444-4444-4444-8444-444444444444 {tail} costUsd=0.4200 unpricedRequests=3\n\
+                 session=55555555-5555-4555-8555-555555555555 {tail} costUsd=1.5000\n\
+                 session=66666666-6666-4666-8666-666666666666 {tail} costUsd=n/a\n"
+            )
+        );
+    }
+
     /// The document shape the Swift poller decodes. Written as literal text
     /// rather than round-tripped through the same `json!` macro that produced
     /// it — an assertion built from the code under test proves only that the
@@ -6068,6 +7834,9 @@ mod tests {
             req_per_minute: vec![0, 1, 2],
             cost_usd: 0.5,
             cache_ttl_secs: Some(3600),
+            provider: None,
+            unpriced_requests: 0,
+            reasoning_tokens: 0,
         };
         let rendered = render_sessions_json(true, std::slice::from_ref(&row));
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
@@ -6314,6 +8083,90 @@ mod tests {
         }
     }
 
+    /// **`tcr status --check` counts a Codex row's failed probe like any other.** The
+    /// rule is "an enabled account's last probe failed", and a Codex account is probed
+    /// at its own provider's usage endpoint, so its failure is a probe failure of the
+    /// fleet: exit 4. The same row disabled is out of the rule, as an Anthropic one is.
+    /// Built through the real offline snapshot over a prober that refuses only Codex
+    /// credentials, so the row that fails is failed by its OWN provider's probe, and the
+    /// Anthropic row's healthy probe is the control.
+    ///
+    /// Watched red: exempt a Codex row in `probe_failed`, and the enabled case reads
+    /// clean.
+    #[tokio::test]
+    async fn status_check_counts_an_enabled_codex_rows_failed_probe() {
+        struct CodexRefusingProber {
+            seen: Arc<std::sync::Mutex<Vec<Provider>>>,
+        }
+        impl UsageProber for CodexRefusingProber {
+            fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
+                let provider = credential.provider;
+                self.seen.lock().expect("seen lock poisoned").push(provider);
+                Box::pin(async move {
+                    match provider {
+                        Provider::Anthropic => Ok(Usage {
+                            five_hour: Some(UsageBucket {
+                                utilization: Some(0.2),
+                                reset_at_ms: None,
+                            }),
+                            seven_day: None,
+                            seven_day_oi: None,
+                            extra_usage_usd: None,
+                            codex: None,
+                        }),
+                        Provider::Codex => Err(crate::probe::ProbeError {
+                            status: Some(401),
+                            message: "HTTP 401: token rejected".to_string(),
+                            retry_after_secs: None,
+                        }),
+                    }
+                })
+            }
+        }
+
+        for (disabled, want) in [
+            (false, StatusCheck::ProbeFailed),
+            (true, StatusCheck::Clean),
+        ] {
+            let config: Config = serde_json::from_str(&format!(
+                r#"{{ "accounts": [
+                     {{ "name": "alice@example.com", "accessToken": "at-a", "refreshToken": "rt-a",
+                        "expiresAt": 4102444800000 }},
+                     {{ "name": "bob@example.com/codex", "provider": "codex", "accessToken": "at-b",
+                        "refreshToken": "rt-b", "expiresAt": 4102444800000,
+                        "accountUuid": "22222222-2222-4222-8222-222222222222", "disabled": {disabled} }}
+                   ] }}"#
+            ))
+            .expect("a test config parses");
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let snapshot = snapshot_offline(
+                config,
+                Arc::new(NoRefresh),
+                Arc::new(CodexRefusingProber {
+                    seen: Arc::clone(&seen),
+                }),
+                true,
+            )
+            .await;
+            assert_eq!(
+                snapshot.accounts[0].probe_status,
+                ProbeStatus::Ok,
+                "control: the Anthropic row's own probe is healthy"
+            );
+            assert_eq!(StatusCheck::of(&snapshot), want, "disabled: {disabled}");
+            if !disabled {
+                assert_eq!(snapshot.accounts[1].provider, Provider::Codex);
+                assert_eq!(snapshot.accounts[1].probe_status, ProbeStatus::Error);
+                assert!(
+                    seen.lock()
+                        .expect("seen lock poisoned")
+                        .contains(&Provider::Codex),
+                    "the Codex row was probed with a Codex credential"
+                );
+            }
+        }
+    }
+
     // --- no-refresh guarantee (Fix 1) --------------------------------------
 
     /// A prober that always fails as if the usage endpoint rejected the token
@@ -6321,7 +8174,7 @@ mod tests {
     /// [`NoRefresh`] has declined to refresh it.
     struct RejectingProber;
     impl UsageProber for RejectingProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             Box::pin(async {
                 Err(crate::probe::ProbeError {
                     status: Some(401),
@@ -6341,7 +8194,11 @@ mod tests {
         calls: Arc<AtomicU64>,
     }
     impl TokenRefresher for RecordingRefresher {
-        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        fn refresh(
+            &self,
+            _provider: crate::provider::Provider,
+            _refresh_token: String,
+        ) -> RefreshFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(OAuthError::Transient(
@@ -6509,10 +8366,10 @@ mod tests {
     /// 7d threshold, each with a future reset — so both windows read as held.
     struct WindowProber;
     impl UsageProber for WindowProber {
-        fn probe(&self, access_token: String) -> ProbeFuture {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let now = crate::now_ms();
             Box::pin(async move {
-                if access_token == "at-a" {
+                if credential.access_token == "at-a" {
                     Ok(Usage {
                         five_hour: Some(UsageBucket {
                             utilization: Some(0.95),
@@ -6521,6 +8378,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Ok(Usage {
@@ -6531,6 +8389,7 @@ mod tests {
                         }),
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 }
             })
@@ -6606,10 +8465,10 @@ mod tests {
     /// invisible case).
     struct BelowThresholdWindowProber;
     impl UsageProber for BelowThresholdWindowProber {
-        fn probe(&self, access_token: String) -> ProbeFuture {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let now = crate::now_ms();
             Box::pin(async move {
-                if access_token == "at-a" {
+                if credential.access_token == "at-a" {
                     Ok(Usage {
                         five_hour: Some(UsageBucket {
                             utilization: Some(0.3),
@@ -6618,6 +8477,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 } else {
                     Ok(Usage {
@@ -6625,6 +8485,7 @@ mod tests {
                         seven_day: None,
                         seven_day_oi: None,
                         extra_usage_usd: None,
+                        codex: None,
                     })
                 }
             })
@@ -6889,7 +8750,7 @@ mod tests {
     /// exhaustion line, with a future reset — so the window binds and reads `spent`.
     struct ExhaustedProber;
     impl UsageProber for ExhaustedProber {
-        fn probe(&self, _access_token: String) -> ProbeFuture {
+        fn probe(&self, _credential: crate::probe::ProbeCredential) -> ProbeFuture {
             let now = crate::now_ms();
             Box::pin(async move {
                 Ok(Usage {
@@ -6900,6 +8761,7 @@ mod tests {
                     seven_day: None,
                     seven_day_oi: None,
                     extra_usage_usd: None,
+                    codex: None,
                 })
             })
         }
@@ -6970,7 +8832,11 @@ mod tests {
         org: (Option<&str>, Option<&str>),
     ) -> AccountSnapshot {
         AccountSnapshot {
+            slot: 0,
             name: name.to_string(),
+            // Anthropic unless the sample says otherwise: its one Codex row
+            // overrides this after construction, as row 2 does `free_at`.
+            provider: Provider::Anthropic,
             organization_type: plan.0.map(str::to_string),
             rate_limit_tier: plan.1.map(str::to_string),
             seat_tier: plan.2.map(str::to_string),
@@ -7014,6 +8880,7 @@ mod tests {
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage,
+            codex: Default::default(),
         }
     }
 
@@ -7052,6 +8919,7 @@ mod tests {
                     / 1e9
             }),
             unpriced_requests: if price.is_some() { 0 } else { requests },
+            reasoning_tokens: 0,
         }
     }
 
@@ -7083,6 +8951,7 @@ mod tests {
                 Some((nanos(totals.cost_usd) + nanos(other.cost_usd)) as f64 / 1e9)
             },
             unpriced_requests,
+            reasoning_tokens: totals.reasoning_tokens + other.reasoning_tokens,
         }
     }
 
@@ -7137,6 +9006,25 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            seven_day_window: None,
+        }
+    }
+
+    /// A fixture row's `usage` for an account that has served nothing: what the
+    /// usage tracker reports for one, every bucket a MEASURED zero (`costUsd:
+    /// 0.0`, never the `null` that means "could not be priced") and no `window`,
+    /// because no five-hour reset was ever learned to name the window's start.
+    fn contract_idle_usage() -> tcr_status_wire::UsageRow {
+        let idle = tcr_status_wire::UsageTotals {
+            cost_usd: Some(0.0),
+            ..Default::default()
+        };
+        tcr_status_wire::UsageRow {
+            today: idle,
+            window: None,
+            last_hour: idle,
+            today_by_model: std::collections::BTreeMap::new(),
+            seven_day_window: None,
         }
     }
 
@@ -7291,6 +9179,35 @@ mod tests {
                 (None, None, None),
                 (None, None),
             ),
+            // A Codex account, under the name the import gives a ChatGPT login
+            // whose email an Anthropic row already holds (`<email>/codex`). Its
+            // plan is the raw `chatgpt_plan_type` claim, labelled `ChatGPT
+            // Pro`, with no rate-limit tier, no seat and no org: a ChatGPT
+            // workspace is named by its account id alone. Probed, with a
+            // WEEKLY reading only, which is all the Codex backend reports, and
+            // idle, so its usage is the measured zero. Disabled, so it adds
+            // nothing to the capacity counts a panel derives from this sample:
+            // a panel that predates `provider` would count an enabled Codex row
+            // as Claude capacity, and the Swift suite pins those counts.
+            contract_account(
+                "bob@example.com/codex",
+                4,
+                "active",
+                true,
+                None,
+                None,
+                Some(0.10),
+                Some(seven_day_reset),
+                None,
+                None,
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                Some(contract_idle_usage()),
+                (Some("pro"), None, None),
+                (None, None),
+            ),
         ];
         let mut accounts = accounts;
         // `freeAtMs` and `rateLimitedUntilMs` must be pinned as *numbers*
@@ -7303,12 +9220,16 @@ mod tests {
         // Same reason for `quotaUpdatedAtMs`: a number on the ordinary row, null
         // on the others, so both shapes are pinned.
         accounts[0].quota_updated_at = Some(fixture_instant(1_767_225_600_000));
+        // The sample's one non-Anthropic row, so it pins both shapes of the
+        // `provider` key: absent on the four rows above, `"codex"` here.
+        accounts[4].provider = Provider::Codex;
 
         let thresholds = vec![0.9; accounts.len()];
         (
             StatsSnapshot {
                 accounts,
                 current: Some(0),
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
@@ -7403,6 +9324,385 @@ mod tests {
         );
     }
 
+    /// `tcr status`'s text form over the contract sample's Anthropic rows, as a live
+    /// server at `abc1234` answers a client at `def5678`, with `claude_verdict` above the
+    /// header when there is one.
+    fn claude_only_status_text(claude_verdict: Option<&str>) -> String {
+        let (mut snapshot, _) = status_contract_snapshot();
+        snapshot
+            .accounts
+            .retain(|row| row.provider == Provider::Anthropic);
+        let server = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let client = BuildInfo {
+            sha: "def5678".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        // The group colors `status_contract_rendered` builds.
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            (
+                "codereview".to_string(),
+                crate::config::derive_group_color("codereview"),
+            ),
+            ("dev".to_string(), "#0a84ff".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        render_status_text(&StatusText {
+            snapshot: &snapshot,
+            source: StatusSource::Live,
+            server_build: Some(&server),
+            client_build: &client,
+            http1_only: false,
+            group_colors: &group_colors,
+            claude_verdict: claude_verdict.map(str::to_string),
+            // Not pooled, and a Claude-only fleet still prints no Codex line.
+            codex_route: Some(&js_leaf_route()),
+            holds_codex: holds_provider(&snapshot, Provider::Codex),
+        })
+    }
+
+    /// The bytes `tcr status` prints for a fleet with no Codex account, pinned before the
+    /// status text learned about Codex accounts: every line a Codex fleet gains must leave a
+    /// Claude-only fleet's text byte for byte as it was, the route verdict above the header
+    /// included.
+    #[test]
+    fn claude_only_status_text_is_unchanged() {
+        assert_eq!(
+            claude_only_status_text(None),
+            "status source=live server_sha=abc1234 server_dirty=false \
+             server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
+             groupColors=codereview:#63cbfe,dev:#0a84ff\n\
+             account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
+             state=ok status=active probe=ok stream_errors=2 last_stream_error=overloaded_error \
+             groups=codereview,dev\n\
+             account bob@example.com priority=1 plan=Team 5x 5h=95% wk=91% fable=10% cache=75% \
+             state=near status=active probe=rate-limited stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account carol@example.com priority=2 plan=Team Standard 5h=100% wk=100% fable=50% \
+             cache=75% state=spent status=throttled probe=error stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
+             probe=never stream_errors=0 disabled\n"
+        );
+        assert_eq!(
+            claude_only_status_text(Some(
+                "verdict: this proxy is not on Claude's route: \
+                 /Users/example/.claude/settings.json sets https://gateway.example.com"
+            )),
+            "verdict: this proxy is not on Claude's route: \
+             /Users/example/.claude/settings.json sets https://gateway.example.com\n\
+             status source=live server_sha=abc1234 server_dirty=false \
+             server_built_at=2026-01-01T00:00:00Z client_sha=def5678 http1Only=false \
+             groupColors=codereview:#63cbfe,dev:#0a84ff\n\
+             account alice@example.com priority=0 plan=Max 20x 5h=4% wk=1% fable=0% cache=75% \
+             state=ok status=active probe=ok stream_errors=2 last_stream_error=overloaded_error \
+             groups=codereview,dev\n\
+             account bob@example.com priority=1 plan=Team 5x 5h=95% wk=91% fable=10% cache=75% \
+             state=near status=active probe=rate-limited stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account carol@example.com priority=2 plan=Team Standard 5h=100% wk=100% fable=50% \
+             cache=75% state=spent status=throttled probe=error stream_errors=2 \
+             last_stream_error=overloaded_error\n\
+             account dave@example.com priority=3 5h=n/a wk=n/a cache=n/a state=ok status=active \
+             probe=never stream_errors=0 disabled\n"
+        );
+    }
+
+    /// The Claude verdict the text-form tests print above the header.
+    const CLAUDE_VERDICT: &str = "verdict: this proxy is not on Claude's route: \
+                                  /Users/example/.claude/settings.json sets \
+                                  https://gateway.example.com";
+
+    /// The JS-leaf route's reason, as `tcr run --codex` words it for a proxy on :3999.
+    fn js_leaf_reason() -> String {
+        format!(
+            "the proxy on :3999 is serving the JS {} leaf, which covers api.anthropic.com \
+             only and is never re-minted — a restart will not change this; see \
+             docs/troubleshooting.md",
+            crate::legacy_names::JS_PROXY_BIN
+        )
+    }
+
+    /// The status read of a proxy on :3999, as `fetch_live_status` hands it over: parsed from
+    /// the wire, with `mitm` as given, `codex_rows` Codex accounts and `traffic` as its counts.
+    fn live_payload(
+        mitm: serde_json::Value,
+        codex_rows: usize,
+        traffic: Option<serde_json::Value>,
+    ) -> StatusPayload {
+        let accounts: Vec<serde_json::Value> = (0..codex_rows)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("codex{i}@example.com/codex"), "provider": "codex",
+                    "priority": i, "status": "active", "disabled": false, "requests": 0,
+                    "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
+                    "cacheCreationTokens": 0, "probeStatus": "ok", "quotaState": "normal",
+                    "gate": "ok", "threshold": 0.9,
+                })
+            })
+            .collect();
+        let mut wire = serde_json::json!({
+            "kind": STATUS_KIND,
+            "accounts": accounts,
+            "build": {"sha": "abc1234"},
+            "mitm": mitm,
+        });
+        if let Some(traffic) = traffic {
+            wire["codex_traffic"] = traffic;
+        }
+        serde_json::from_value(wire).expect("a status payload")
+    }
+
+    fn route_test_ca() -> &'static Path {
+        Path::new("/tmp/tcr-run-test/tcr-ca.pem")
+    }
+
+    /// The route of a proxy on :3999 serving the JS teamclaude leaf: not pooled.
+    fn js_leaf_route() -> tcr_status_wire::CodexRoute {
+        let payload = live_payload(
+            serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"}),
+            1,
+            None,
+        );
+        crate::codex_route::codex_route(Ok(&payload), 3999, route_test_ca(), true, 1)
+    }
+
+    fn pooled_route() -> tcr_status_wire::CodexRoute {
+        tcr_status_wire::CodexRoute {
+            pooled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_older_proxy_uses_configured_codex_provider_presence() {
+        let old = live_payload(serde_json::Value::Null, 0, None);
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "accounts": [{"name":"alice@example.com/codex", "provider":"codex", "accessToken":"at-fake"}]
+        })).unwrap();
+        assert!(status_holds_provider(&Ok(old), &config, Provider::Codex));
+        let current = live_payload(
+            serde_json::json!({"interceptedHosts": [], "leaf":"minted"}),
+            0,
+            None,
+        );
+        assert!(
+            !status_holds_provider(&Ok(current), &config, Provider::Codex),
+            "a current server's live deletion overrides stale configured rows"
+        );
+    }
+
+    /// `tcr status`'s text form over `snapshot`, as the golden renders it, with the Claude
+    /// verdict and the Codex route given.
+    fn status_text_of(
+        snapshot: &StatsSnapshot,
+        claude_verdict: Option<&str>,
+        codex_route: &tcr_status_wire::CodexRoute,
+    ) -> String {
+        let build = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        render_status_text(&StatusText {
+            snapshot,
+            source: StatusSource::Live,
+            server_build: Some(&build),
+            client_build: &build,
+            http1_only: false,
+            group_colors: &std::collections::BTreeMap::new(),
+            claude_verdict: claude_verdict.map(str::to_string),
+            codex_route: Some(codex_route),
+            holds_codex: holds_provider(snapshot, Provider::Codex),
+        })
+    }
+
+    /// **A fleet that holds a Codex account is told, above the header, when codex is not
+    /// pooled**, keyed `codexVerdict:` beside Claude's own verdict, which keeps the first line.
+    /// A pooled route prints nothing.
+    #[test]
+    fn the_codex_verdict_prints_only_with_a_codex_account_not_pooled() {
+        // The contract sample: four Anthropic rows and a disabled Codex row.
+        let (snapshot, _) = status_contract_snapshot();
+        let js = js_leaf_route();
+        let text = status_text_of(&snapshot, None, &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("codexVerdict: codex is not pooled: {}", js_leaf_reason())
+        );
+        assert!(lines[1].starts_with("status source="), "{text}");
+
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], CLAUDE_VERDICT, "Claude's verdict stays first");
+        assert_eq!(
+            lines[1],
+            format!("codexVerdict: codex is not pooled: {}", js_leaf_reason())
+        );
+        assert!(lines[2].starts_with("status source="), "{text}");
+
+        let text = status_text_of(&snapshot, None, &pooled_route());
+        assert!(text.starts_with("status source="), "{text}");
+        assert!(!text.contains("codex is not pooled"), "{text}");
+    }
+
+    /// **A Codex-only fleet is not told about Claude's route**, which none of its accounts
+    /// uses: its one verdict is codex's, keyed `verdict:`. A pooled route leaves the header
+    /// first, and an empty fleet keeps Claude's verdict as it always had it.
+    ///
+    /// Watched red: with Claude's verdict printed whatever the fleet holds, the Codex-only
+    /// fleet opens with Claude's route.
+    #[test]
+    fn the_claude_verdict_is_skipped_in_a_codex_only_fleet() {
+        let (mut snapshot, _) = status_contract_snapshot();
+        snapshot
+            .accounts
+            .retain(|row| row.provider == Provider::Codex);
+        let js = js_leaf_route();
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("verdict: codex is not pooled: {}", js_leaf_reason())
+        );
+        assert!(lines[1].starts_with("status source="), "{text}");
+        assert!(
+            !text.contains("this proxy is not on Claude's route"),
+            "{text}"
+        );
+
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &pooled_route());
+        assert!(text.starts_with("status source="), "{text}");
+
+        snapshot.accounts.clear();
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], CLAUDE_VERDICT, "an empty fleet keeps it");
+        assert!(lines[1].starts_with("status source="), "{text}");
+        assert!(!text.contains("codex is not pooled"), "{text}");
+    }
+
+    /// **The stderr notes say what tcr did with codex in the last ten minutes**, each only
+    /// when its count is above zero.
+    #[test]
+    fn status_prints_the_codex_traffic_notes_on_stderr() {
+        let traffic = tcr_status_wire::CodexTraffic {
+            refused_10m: 12,
+            last_refusal: Some(tcr_status_wire::CodexRefusalKind::UsageLimitReached),
+            last_refusal_at_ms: Some(1),
+            unpooled_10m: 3,
+        };
+        assert_eq!(
+            codex_traffic_notes(&traffic),
+            [
+                "[tcr] note codex-refusals: refused_10m=12 last_type=usage_limit_reached — tcr \
+                 refused codex because no Codex account could serve; see the Codex \
+                 rows above",
+                "[tcr] note codex-unpooled: relayed_10m=3 — requests from a FedRAMP or \
+                 residency-routed ChatGPT login ran on their own credential, unpooled",
+            ]
+        );
+        assert!(
+            codex_traffic_notes(&tcr_status_wire::CodexTraffic::default()).is_empty(),
+            "nothing to say"
+        );
+        let refused_only = tcr_status_wire::CodexTraffic {
+            unpooled_10m: 0,
+            ..traffic
+        };
+        let notes = codex_traffic_notes(&refused_only);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("[tcr] note codex-refusals:"),
+            "{notes:?}"
+        );
+    }
+
+    /// **`--json` carries a Codex route only from a live read.** Nothing listening, no answer,
+    /// or one this build cannot use: none of them is a route, so no row claims one.
+    #[test]
+    fn the_route_is_absent_offline() {
+        for live in [
+            Err(LiveStatusError::NoServer),
+            Err(LiveStatusError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            )),
+            Err(LiveStatusError::Unusable(
+                "HTTP 401 Unauthorized".to_string(),
+            )),
+        ] {
+            let facts = codex_wire_facts(&live, 3999, route_test_ca(), true);
+            assert_eq!(facts, (None, None), "{live:?}");
+        }
+    }
+
+    /// **The route and the traffic ride the Codex rows only**: the same on every Codex row, and
+    /// on no Anthropic row, whose bytes stay what they were.
+    #[test]
+    fn route_and_traffic_ride_only_codex_rows() {
+        let live = Ok(live_payload(
+            serde_json::json!({
+                "interceptedHosts": ["api.anthropic.com", "platform.claude.com", "chatgpt.com"],
+                "leaf": "minted",
+            }),
+            1,
+            Some(serde_json::json!({
+                "refused10m": 2,
+                "lastRefusal": "pool_unavailable",
+                "lastRefusalAtMs": 1_767_225_000_000_i64,
+                "unpooled10m": 0,
+            })),
+        ));
+        let (route, traffic) = codex_wire_facts(&live, 3999, route_test_ca(), true);
+        assert_eq!(route, Some(pooled_route()));
+        assert_eq!(traffic.as_ref().map(|t| t.refused_10m), Some(2));
+
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let build = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let rendered = render_accounts_json_at(
+            OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("a valid instant"),
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            Some(&build),
+            false,
+            None,
+            &std::collections::BTreeMap::new(),
+            route.as_ref(),
+            traffic.as_ref(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rendered).expect("an array");
+        assert_eq!(rows.len(), 5);
+        let mut anthropic = 0;
+        for row in &rows {
+            if row["name"] == "bob@example.com/codex" {
+                assert_eq!(
+                    row["codexRoute"],
+                    serde_json::to_value(&route).expect("a route")
+                );
+                assert_eq!(
+                    row["codexTraffic"],
+                    serde_json::to_value(&traffic).expect("the traffic")
+                );
+            } else {
+                anthropic += 1;
+                assert!(row.get("codexRoute").is_none(), "{row}");
+                assert!(row.get("codexTraffic").is_none(), "{row}");
+            }
+        }
+        assert_eq!(anthropic, 4);
+    }
+
     /// The fixture is only worth pinning if it is *representative*: a sample
     /// covering one shape would pin one shape. Asserted against the committed
     /// bytes rather than the renderer, so a fixture regenerated from a
@@ -7413,7 +9713,7 @@ mod tests {
             .expect("committed contract fixture is readable");
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&committed).expect("fixture is a bare JSON array");
-        assert_eq!(rows.len(), 4, "one row per covered shape");
+        assert_eq!(rows.len(), 5, "one row per covered shape");
 
         let states: Vec<&str> = rows
             .iter()
@@ -7522,11 +9822,1024 @@ mod tests {
         );
         for row in &rows {
             let name = row["name"].as_str().expect("name is a string");
+            let email = name.strip_suffix("/codex").unwrap_or(name);
             assert!(
-                name.ends_with("@example.com"),
+                email.ends_with("@example.com"),
                 "every fixture account is obviously fake: {name}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The canonical Codex fixtures TcrBar decodes.
+    // ---------------------------------------------------------------------
+
+    /// One of the canonical Codex fixtures, read from where TcrBar's decode tests read it
+    /// (`apps/macos/Tests/Fixtures/`). The same file, never a copy: one set of fixtures
+    /// with two proofs, the panel's decode and this renderer's output, is what keeps the
+    /// producer and the consumer from drifting apart.
+    fn canonical_fixture(name: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("apps/macos/Tests/Fixtures")
+            .join(name);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("cannot read the canonical fixture {}: {e}", path.display())
+        });
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("the canonical fixture {} is not JSON: {e}", path.display()))
+    }
+
+    /// The canonical fixtures' clock, 2026-01-01T00:00:00Z. Every time in them is an
+    /// offset from it.
+    const CANONICAL_NOW_MS: i64 = 1_767_225_600_000;
+    const SECOND_MS: i64 = 1_000;
+    const MINUTE_MS: i64 = 60 * SECOND_MS;
+    const HOUR_MS: i64 = 60 * MINUTE_MS;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    /// A weekly window's length, 10,080 minutes.
+    const WEEK_MS: i64 = 7 * DAY_MS;
+
+    /// The keys a Codex row may carry and an Anthropic row never does.
+    const CODEX_ROW_KEYS: [&str; 11] = [
+        "quotaWindows",
+        "fiveHourWindowMinutes",
+        "sevenDayWindowMinutes",
+        "limitReachedType",
+        "spendControlReached",
+        "credits",
+        "loginError",
+        "codexHome",
+        "tokenSyncPending",
+        "codexRoute",
+        "codexTraffic",
+    ];
+
+    #[test]
+    fn codex_pending_token_sync_has_a_text_status_hint() {
+        let (mut snapshot, _) = status_contract_snapshot();
+        let account = &mut snapshot.accounts[0];
+        account.provider = Provider::Codex;
+        account.codex.token_sync_pending = true;
+        assert!(codex_tail(account).contains("token_sync=pending"));
+        account.provider = Provider::Anthropic;
+        assert!(codex_tail(account).is_empty());
+    }
+
+    /// The instant `offset_ms` from the canonical clock.
+    fn canonical_at(offset_ms: i64) -> OffsetDateTime {
+        fixture_instant(CANONICAL_NOW_MS + offset_ms)
+    }
+
+    /// The serving build both fixtures name.
+    fn fixture_build() -> BuildInfo {
+        BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The fleet-wide Codex facts every canonical Codex row repeats: codex is pooled, and
+    /// in the last ten minutes tcr refused twelve requests itself and relayed three on the
+    /// client's own credential.
+    fn canonical_codex_route_and_traffic(
+    ) -> (tcr_status_wire::CodexRoute, tcr_status_wire::CodexTraffic) {
+        (
+            tcr_status_wire::CodexRoute {
+                pooled: true,
+                ..Default::default()
+            },
+            tcr_status_wire::CodexTraffic {
+                refused_10m: 12,
+                last_refusal: Some(tcr_status_wire::CodexRefusalKind::UsageLimitReached),
+                last_refusal_at_ms: Some(1_767_225_560_000),
+                unpooled_10m: 3,
+            },
+        )
+    }
+
+    /// The keys whose values differ between two JSON objects, from the union of both
+    /// objects' keys, so a key only one side carries is named too.
+    fn differing_keys(got: &serde_json::Value, want: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = got
+            .as_object()
+            .into_iter()
+            .chain(want.as_object())
+            .flat_map(|object| object.keys().cloned())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys.retain(|key| got.get(key) != want.get(key));
+        keys
+    }
+
+    /// One bucket of a canonical Codex row's usage, as `Totals::to_wire` reports traffic no
+    /// configured rate prices, which is all Codex traffic: every request unpriced, so
+    /// `costUsd` is `null` once the bucket served anything, and the measured zero `0.0`
+    /// while it served nothing. `input` is BASE input, the row's quota counter less cache
+    /// reads, as `Totals::to_wire` reports it.
+    fn codex_bucket(
+        requests: u64,
+        input: u64,
+        cache_read: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> tcr_status_wire::UsageTotals {
+        tcr_status_wire::UsageTotals {
+            requests,
+            input_tokens: input,
+            cache_read_tokens: cache_read,
+            output_tokens: output,
+            reasoning_tokens: reasoning,
+            unpriced_requests: requests,
+            cost_usd: if requests == 0 { Some(0.0) } else { None },
+            ..Default::default()
+        }
+    }
+
+    /// A canonical Codex row's usage. Each window opens where the usage tracker opens it,
+    /// read off the row's own resets so the two cannot disagree: the five-hour window at
+    /// the five-hour reset minus five hours, the weekly window at the weekly reset minus a
+    /// week. `todayByModel` holds today's one model once today served anything.
+    fn canonical_codex_usage(
+        row: &AccountSnapshot,
+        today: tcr_status_wire::UsageTotals,
+        last_hour: tcr_status_wire::UsageTotals,
+        window: Option<tcr_status_wire::UsageTotals>,
+        seven_day_window: Option<tcr_status_wire::UsageTotals>,
+    ) -> tcr_status_wire::UsageRow {
+        let opened = |reset: Option<OffsetDateTime>, length_ms: i64| {
+            let reset = reset.expect("a window's usage needs the window's reset");
+            (reset.unix_timestamp_nanos() / 1_000_000) as i64 - length_ms
+        };
+        tcr_status_wire::UsageRow {
+            today,
+            window: window.map(|totals| tcr_status_wire::UsageWindow {
+                since: opened(row.five_hour_reset, crate::usage::FIVE_HOURS_MS),
+                totals,
+            }),
+            last_hour,
+            today_by_model: if today.requests > 0 {
+                [("gpt-5.1-codex".to_string(), today)].into_iter().collect()
+            } else {
+                std::collections::BTreeMap::new()
+            },
+            seven_day_window: seven_day_window.map(|totals| tcr_status_wire::UsageWindow {
+                since: opened(row.seven_day_reset, WEEK_MS),
+                totals,
+            }),
+        }
+    }
+
+    /// A canonical Codex row before the facts its state adds: active, probed `ok`, in no
+    /// group, nothing served, every Codex fact unreported. Built by [`contract_account`],
+    /// so a new [`AccountSnapshot`] field breaks this sample as it breaks the contract one.
+    fn canonical_codex_row(
+        name: &str,
+        priority: i64,
+        plan: &str,
+        org_uuid: &str,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            provider: Provider::Codex,
+            ..contract_account(
+                name,
+                priority,
+                "active",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                None,
+                (Some(plan), None, None),
+                (Some(org_uuid), None),
+            )
+        }
+    }
+
+    /// The snapshot behind `codex-status.json`: its ten rows in fixture order, alice's
+    /// Claude row and one Codex row per state, each with a threshold of 0.85.
+    ///
+    /// Only facts are set here. Every derived key, `quota`, the per-window states, `held`,
+    /// `secondsUntilFree`, `cacheHitRatio` and `plan`, is the renderer's to compute, which
+    /// is what makes the comparison a proof of the renderer rather than of this function.
+    fn canonical_codex_snapshot() -> (StatsSnapshot, Vec<f64>) {
+        use crate::stats::GateReason;
+        use tcr_status_wire::CodexCredits;
+
+        let at = canonical_at;
+        let idle = codex_bucket(0, 0, 0, 0, 0);
+        let weekly_only = || CodexFacts {
+            quota_windows: Some(vec!["sevenDay".to_string()]),
+            seven_day_window_minutes: Some(10_080),
+            ..CodexFacts::default()
+        };
+        let both_windows = || CodexFacts {
+            quota_windows: Some(vec!["fiveHour".to_string(), "sevenDay".to_string()]),
+            five_hour_window_minutes: Some(300),
+            seven_day_window_minutes: Some(10_080),
+            ..CodexFacts::default()
+        };
+
+        // Claude, OK, in ORCHARD: contract row 1 with its windows moved into the future.
+        let mut alice_usage = contract_usage("claude-sonnet-5");
+        alice_usage.window = alice_usage.window.map(|w| tcr_status_wire::UsageWindow {
+            since: 1_767_217_140_000,
+            ..w
+        });
+        let alice = contract_account(
+            "alice@example.com",
+            0,
+            "active",
+            false,
+            Some(0.47),
+            Some(at(2 * HOUR_MS + 39 * MINUTE_MS)),
+            Some(0.20),
+            Some(at(4 * DAY_MS)),
+            Some(0.62),
+            Some(at(4 * DAY_MS)),
+            crate::probe::ProbeStatus::Ok,
+            None,
+            QuotaState::Normal,
+            &["orchard"],
+            Some(alice_usage),
+            (Some("claude_max"), Some("default_claude_max_20x"), None),
+            (
+                Some("11111111-1111-1111-1111-111111111111"),
+                Some("Example Personal"),
+            ),
+        );
+
+        // OK, one weekly window.
+        let mut bob = AccountSnapshot {
+            seven_day: Some(0.34),
+            seven_day_reset: Some(at(4 * DAY_MS)),
+            last_probe: Some(at(-30 * SECOND_MS)),
+            requests: 42,
+            input_tokens: 1_100_000,
+            cache_read_tokens: 902_000,
+            output_tokens: 22_000,
+            codex: weekly_only(),
+            ..canonical_codex_row(
+                "bob@example.com/codex",
+                1,
+                "pro",
+                "55555555-5555-4555-8555-555555555555",
+            )
+        };
+        bob.usage = Some(canonical_codex_usage(
+            &bob,
+            codex_bucket(42, 198_000, 902_000, 22_000, 9_000),
+            codex_bucket(7, 30_000, 160_000, 4_100, 1_200),
+            None,
+            Some(codex_bucket(
+                1_480, 11_000_000, 50_000_000, 1_100_000, 420_000,
+            )),
+        ));
+
+        // SPENT on its weekly window, with credits left.
+        let mut carol = AccountSnapshot {
+            seven_day: Some(1.0),
+            seven_day_reset: Some(at(3 * DAY_MS + 4 * HOUR_MS)),
+            last_probe: Some(at(-30 * SECOND_MS)),
+            quota_state: QuotaState::Exhausted,
+            gate: GateReason::SevenDay,
+            free_at: Some(at(3 * DAY_MS + 4 * HOUR_MS)),
+            requests: 310,
+            input_tokens: 5_400_000,
+            cache_read_tokens: 4_806_000,
+            output_tokens: 61_000,
+            codex: CodexFacts {
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                credits: Some(CodexCredits {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: Some("12.50".to_string()),
+                }),
+                ..weekly_only()
+            },
+            ..canonical_codex_row(
+                "carol@example.com",
+                2,
+                "pro",
+                "66666666-6666-4666-8666-666666666666",
+            )
+        };
+        carol.usage = Some(canonical_codex_usage(
+            &carol,
+            codex_bucket(310, 594_000, 4_806_000, 61_000, 21_000),
+            idle,
+            None,
+            Some(codex_bucket(
+                2_900,
+                20_000_000,
+                140_000_000,
+                5_400_000,
+                2_100_000,
+            )),
+        ));
+
+        // OK, both windows.
+        let mut dana = AccountSnapshot {
+            five_hour: Some(0.18),
+            five_hour_reset: Some(at(3 * HOUR_MS + 2 * MINUTE_MS)),
+            seven_day: Some(0.25),
+            seven_day_reset: Some(at(5 * DAY_MS)),
+            last_probe: Some(at(-30 * SECOND_MS)),
+            requests: 96,
+            input_tokens: 2_000_000,
+            cache_read_tokens: 1_700_000,
+            output_tokens: 260_000,
+            codex: both_windows(),
+            ..canonical_codex_row(
+                "dana@example.com",
+                3,
+                "plus",
+                "77777777-7777-4777-8777-777777777777",
+            )
+        };
+        dana.usage = Some(canonical_codex_usage(
+            &dana,
+            codex_bucket(96, 300_000, 1_700_000, 260_000, 70_000),
+            codex_bucket(9, 30_000, 150_000, 24_000, 6_000),
+            Some(codex_bucket(31, 100_000, 540_000, 210_000, 55_000)),
+            Some(codex_bucket(400, 1_400_000, 7_600_000, 640_000, 180_000)),
+        ));
+
+        // NEEDS RE-LOGIN, imported from a folder.
+        let mut erin = AccountSnapshot {
+            status: "error".to_string(),
+            five_hour: Some(0.0),
+            five_hour_reset: None,
+            seven_day: Some(0.40),
+            seven_day_reset: Some(at(2 * DAY_MS)),
+            probe_status: crate::probe::ProbeStatus::Error,
+            last_probe: Some(at(-MINUTE_MS)),
+            probe_error: Some("refresh_token_reused".to_string()),
+            gate: GateReason::Login,
+            codex: CodexFacts {
+                login_error: Some("refresh_token_reused".to_string()),
+                codex_home: Some("/Users/example/.codex".to_string()),
+                ..both_windows()
+            },
+            ..canonical_codex_row(
+                "erin@example.com/codex",
+                4,
+                "team",
+                "88888888-8888-4888-8888-888888888888",
+            )
+        };
+        erin.usage = Some(canonical_codex_usage(
+            &erin,
+            idle,
+            idle,
+            None,
+            Some(codex_bucket(120, 1_000_000, 4_000_000, 140_000, 50_000)),
+        ));
+
+        // REFUSED with no window full: the spend control.
+        let mut gil = AccountSnapshot {
+            five_hour: Some(0.15),
+            five_hour_reset: Some(at(3 * HOUR_MS + 2 * MINUTE_MS)),
+            seven_day: Some(0.10),
+            seven_day_reset: Some(at(6 * DAY_MS)),
+            last_probe: Some(at(-MINUTE_MS)),
+            gate: GateReason::Rejected,
+            requests: 24,
+            input_tokens: 400_000,
+            cache_read_tokens: 284_000,
+            output_tokens: 52_000,
+            codex: CodexFacts {
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                spend_control_reached: true,
+                ..both_windows()
+            },
+            ..canonical_codex_row(
+                "gil@example.com",
+                5,
+                "team",
+                "99999999-9999-4999-8999-999999999999",
+            )
+        };
+        gil.usage = Some(canonical_codex_usage(
+            &gil,
+            codex_bucket(24, 116_000, 284_000, 52_000, 14_000),
+            codex_bucket(2, 9_000, 21_000, 3_000, 800),
+            Some(codex_bucket(20, 96_000, 234_000, 48_000, 13_000)),
+            Some(codex_bucket(140, 900_000, 2_100_000, 310_000, 90_000)),
+        ));
+
+        // REFUSED, still held: throttled for the 47 minutes its hold has left, since a Codex
+        // hold never outlasts an hour.
+        let mut hal = AccountSnapshot {
+            status: "throttled".to_string(),
+            seven_day: Some(0.60),
+            seven_day_reset: Some(at(5 * DAY_MS)),
+            last_probe: Some(at(-2 * MINUTE_MS)),
+            gate: GateReason::Hold,
+            free_at: Some(at(47 * MINUTE_MS)),
+            rate_limited_until: Some(at(47 * MINUTE_MS)),
+            requests: 77,
+            input_tokens: 1_900_000,
+            cache_read_tokens: 1_520_000,
+            output_tokens: 40_000,
+            codex: CodexFacts {
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                ..weekly_only()
+            },
+            ..canonical_codex_row(
+                "hal@example.com",
+                6,
+                "pro",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            )
+        };
+        hal.usage = Some(canonical_codex_usage(
+            &hal,
+            codex_bucket(77, 380_000, 1_520_000, 40_000, 15_000),
+            idle,
+            None,
+            Some(codex_bucket(900, 8_000_000, 32_000_000, 1_900_000, 700_000)),
+        ));
+
+        // NEAR on its five-hour window, in ORCHARD.
+        let mut ivy = AccountSnapshot {
+            five_hour: Some(0.88),
+            five_hour_reset: Some(at(52 * MINUTE_MS)),
+            seven_day: Some(0.17),
+            seven_day_reset: Some(at(6 * DAY_MS)),
+            last_probe: Some(at(-40 * SECOND_MS)),
+            quota_state: QuotaState::NearLimit,
+            gate: GateReason::FiveHour,
+            free_at: Some(at(52 * MINUTE_MS)),
+            groups: vec!["orchard".to_string()],
+            requests: 60,
+            input_tokens: 1_300_000,
+            cache_read_tokens: 1_014_000,
+            output_tokens: 260_000,
+            codex: both_windows(),
+            ..canonical_codex_row(
+                "ivy@example.com",
+                7,
+                "plus",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+        };
+        ivy.usage = Some(canonical_codex_usage(
+            &ivy,
+            codex_bucket(60, 286_000, 1_014_000, 260_000, 70_000),
+            codex_bucket(20, 90_000, 330_000, 80_000, 22_000),
+            Some(codex_bucket(52, 240_000, 860_000, 210_000, 60_000)),
+            Some(codex_bucket(300, 1_600_000, 5_400_000, 900_000, 250_000)),
+        ));
+
+        // OK with no usage window at all, and unlimited credits.
+        let mut jo = AccountSnapshot {
+            last_probe: Some(at(-50 * SECOND_MS)),
+            requests: 30,
+            input_tokens: 300_000,
+            cache_read_tokens: 225_000,
+            output_tokens: 6_000,
+            codex: CodexFacts {
+                quota_windows: Some(Vec::new()),
+                credits: Some(CodexCredits {
+                    has_credits: true,
+                    unlimited: true,
+                    balance: None,
+                }),
+                ..CodexFacts::default()
+            },
+            ..canonical_codex_row(
+                "jo@example.com",
+                8,
+                "business",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+        };
+        jo.usage = Some(canonical_codex_usage(
+            &jo,
+            codex_bucket(30, 75_000, 225_000, 6_000, 1_000),
+            idle,
+            None,
+            None,
+        ));
+
+        // UNREACHABLE: its one group, RESEARCH, is reserved.
+        let mut kim = AccountSnapshot {
+            seven_day: Some(0.05),
+            seven_day_reset: Some(at(6 * DAY_MS)),
+            last_probe: Some(at(-3 * MINUTE_MS)),
+            gate: GateReason::Reserved,
+            groups: vec!["research".to_string()],
+            reserved_groups: vec!["research".to_string()],
+            codex: weekly_only(),
+            ..canonical_codex_row(
+                "kim@example.com",
+                9,
+                "pro",
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            )
+        };
+        kim.usage = Some(canonical_codex_usage(
+            &kim,
+            idle,
+            idle,
+            None,
+            Some(codex_bucket(40, 200_000, 700_000, 30_000, 9_000)),
+        ));
+
+        let accounts = vec![alice, bob, carol, dana, erin, gil, hal, ivy, jo, kim];
+        let thresholds = vec![0.85; accounts.len()];
+        (
+            StatsSnapshot {
+                accounts,
+                current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
+                recent: Vec::new(),
+                sessions: Vec::new(),
+                wire_sessions: Vec::new(),
+                wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+            },
+            thresholds,
+        )
+    }
+
+    /// The two sessions behind `codex-sessions.json`: a Claude session with a running
+    /// `Bash`, and a Codex session with a running `exec_command`. That is codex's default,
+    /// interactive tool, which has no timeout argument, so the call carries none.
+    fn canonical_codex_sessions() -> Vec<tcr_status_wire::SessionRow> {
+        let ms = |offset_ms: i64| CANONICAL_NOW_MS + offset_ms;
+        let ramp = |zeros: usize, tail: &[u16]| -> Vec<u16> {
+            std::iter::repeat_n(0, zeros)
+                .chain(tail.iter().copied())
+                .collect()
+        };
+        let bucket = |tool: &str, calls: u64, seconds_p50: f64| tcr_status_wire::ToolBucketRow {
+            tool: tool.to_string(),
+            calls,
+            seconds_p50,
+            ..Default::default()
+        };
+        let slow = |tool: &str, seconds: f64, head: &str, class: Option<&str>, ended_ms: i64| {
+            tcr_status_wire::SlowToolRow {
+                tool: tool.to_string(),
+                seconds,
+                command_head: Some(head.to_string()),
+                command_class: class.map(str::to_string),
+                ended_ms,
+            }
+        };
+        let claude = tcr_status_wire::SessionRow {
+            session_id: "a1f3c2d4-0000-4000-8000-000000000001".to_string(),
+            account: Some("alice@example.com".to_string()),
+            model: Some("claude-opus-5".to_string()),
+            first_seen_ms: ms(-40 * MINUTE_MS),
+            last_seen_ms: ms(-3 * SECOND_MS),
+            requests: 24,
+            input_tokens: 180_000,
+            output_tokens: 9_200,
+            cache_read_tokens: 160_000,
+            cache_creation_tokens: 12_000,
+            tools: tcr_status_wire::SessionToolsRow {
+                calls: 12,
+                running: vec![tcr_status_wire::RunningToolRow {
+                    tool: "Bash".to_string(),
+                    started_ms: ms(-20 * SECOND_MS),
+                    command_head: Some("cargo test".to_string()),
+                    command_class: Some("build".to_string()),
+                    timeout_seconds: None,
+                }],
+                by_tool: vec![bucket("Bash", 8, 2.5), bucket("Read", 4, 0.1)],
+                // The ten slowest of its twelve calls.
+                slowest: vec![
+                    slow(
+                        "Bash",
+                        12.0,
+                        "cargo build --release",
+                        Some("build"),
+                        ms(-295 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        6.0,
+                        "cargo build",
+                        Some("build"),
+                        ms(-230 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        3.0,
+                        "rg -n TODO",
+                        Some("search"),
+                        ms(-175 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.5,
+                        "cargo test -p example",
+                        Some("build"),
+                        ms(-250 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.5,
+                        "git status",
+                        Some("git-local"),
+                        ms(-160 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.0,
+                        "git status",
+                        Some("git-local"),
+                        ms(-320 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        2.0,
+                        "cargo test",
+                        Some("build"),
+                        ms(-110 * SECOND_MS),
+                    ),
+                    slow(
+                        "Bash",
+                        1.5,
+                        "git status",
+                        Some("git-local"),
+                        ms(-125 * SECOND_MS),
+                    ),
+                    slow(
+                        "Read",
+                        0.4,
+                        "Read /Users/example/git/tcr/src/session_wire.rs",
+                        None,
+                        ms(-280 * SECOND_MS),
+                    ),
+                    slow(
+                        "Read",
+                        0.1,
+                        "Read /Users/example/git/tcr/src/proxy.rs",
+                        None,
+                        ms(-350 * SECOND_MS),
+                    ),
+                ],
+                ..Default::default()
+            },
+            // Twenty of its 24 requests fall in the ring; the other four came before it.
+            req_per_minute: ramp(22, &[1, 2, 3, 2, 4, 3, 5, 0]),
+            cost_usd: 1.2034,
+            cache_ttl_secs: Some(3600),
+            provider: None,
+            unpriced_requests: 0,
+            reasoning_tokens: 0,
+        };
+        let codex = tcr_status_wire::SessionRow {
+            session_id: "019a3c5e-0000-7000-8000-000000000002".to_string(),
+            account: Some("bob@example.com/codex".to_string()),
+            model: Some("gpt-5.1-codex".to_string()),
+            first_seen_ms: ms(-175 * SECOND_MS),
+            last_seen_ms: ms(-50 * SECOND_MS),
+            requests: 7,
+            input_tokens: 95_000,
+            output_tokens: 4_100,
+            cache_read_tokens: 80_000,
+            cache_creation_tokens: 0,
+            tools: tcr_status_wire::SessionToolsRow {
+                calls: 3,
+                running: vec![tcr_status_wire::RunningToolRow {
+                    tool: "exec_command".to_string(),
+                    started_ms: ms(-45 * SECOND_MS),
+                    command_head: Some("cargo build".to_string()),
+                    command_class: Some("build".to_string()),
+                    timeout_seconds: None,
+                }],
+                by_tool: vec![
+                    bucket("exec_command", 2, 4.0),
+                    bucket("apply_patch", 1, 0.2),
+                ],
+                slowest: vec![
+                    slow(
+                        "exec_command",
+                        4.0,
+                        "cargo test",
+                        Some("build"),
+                        ms(-115 * SECOND_MS),
+                    ),
+                    slow(
+                        "exec_command",
+                        4.0,
+                        "cargo check",
+                        Some("build"),
+                        ms(-55_500),
+                    ),
+                    slow("apply_patch", 0.2, "apply_patch", None, ms(-94_800)),
+                ],
+                ..Default::default()
+            },
+            req_per_minute: ramp(26, &[2, 3, 2, 0]),
+            cost_usd: 0.0,
+            cache_ttl_secs: None,
+            provider: Some("codex".to_string()),
+            unpriced_requests: 7,
+            reasoning_tokens: 1_200,
+        };
+        vec![claude, codex]
+    }
+
+    /// `render_accounts_json_at`, given the facts behind `codex-status.json`, emits exactly
+    /// the rows TcrBar decodes from that file: every key and every derived value, compared
+    /// as `serde_json::Value`s with no normalisation and no rounding.
+    ///
+    /// The fixture belongs to the panel, whose decode tests read the same file; this is
+    /// the producer's half of that contract. A key renamed, dropped or computed differently
+    /// fails here before it reaches a screen. The render runs at the fixture's own clock,
+    /// so `held` and `secondsUntilFree` come out as committed with nothing to normalise.
+    #[test]
+    fn canonical_codex_status_matches_the_renderer() {
+        let (snapshot, thresholds) = canonical_codex_snapshot();
+        let (route, traffic) = canonical_codex_route_and_traffic();
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            ("orchard".to_string(), "#30d158".to_string()),
+            ("research".to_string(), "#bf5af2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let rendered = render_accounts_json_at(
+            fixture_instant(CANONICAL_NOW_MS),
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            Some(&fixture_build()),
+            false,
+            None,
+            &group_colors,
+            Some(&route),
+            Some(&traffic),
+        );
+        let rendered: Vec<serde_json::Value> =
+            serde_json::from_str(&rendered).expect("the renderer emits a JSON array");
+        let serde_json::Value::Array(fixture) = canonical_fixture("codex-status.json") else {
+            panic!("codex-status.json is a bare array");
+        };
+
+        assert_eq!(fixture.len(), 10, "codex-status.json carries ten rows");
+        assert_eq!(rendered.len(), 10, "the renderer emits one row per account");
+        let names = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter()
+                .map(|r| r["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&rendered),
+            names(&fixture),
+            "the renderer emits the fixture's rows in the fixture's order"
+        );
+        // Row by row, naming the keys: one assertion over the whole array prints over a
+        // thousand lines and points at none of them.
+        for (got, want) in rendered.iter().zip(&fixture) {
+            if got != want {
+                panic!(
+                    "{} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
+                    want["name"],
+                    differing_keys(got, want)
+                );
+            }
+        }
+    }
+
+    /// `render_sessions_json` emits exactly `codex-sessions.json` for the two sessions
+    /// behind it.
+    ///
+    /// The session shape the panel decodes, pinned the way the status rows are: the Codex
+    /// keys present on the Codex session, and absent, never `null` or `0`, on the Claude one,
+    /// whose bytes are the ones it had before Codex existed.
+    #[test]
+    fn canonical_codex_sessions_match_the_renderer() {
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_sessions_json(true, &canonical_codex_sessions()))
+                .expect("valid JSON");
+        let fixture = canonical_fixture("codex-sessions.json");
+        let (Some(got), Some(want)) = (
+            rendered["sessions"].as_array(),
+            fixture["sessions"].as_array(),
+        ) else {
+            panic!("both documents carry a sessions array: {rendered} / {fixture}");
+        };
+        for (got, want) in got.iter().zip(want) {
+            if got != want {
+                panic!(
+                    "session {} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
+                    want["sessionId"],
+                    differing_keys(got, want)
+                );
+            }
+        }
+        assert_eq!(
+            rendered, fixture,
+            "render_sessions_json no longer emits codex-sessions.json"
+        );
+    }
+
+    /// **A Codex row's held window is labelled by its length**, in the JSON `held` array and in
+    /// the text `held=` token alike: a 30-day weekly window reads `30d`, where the fixed label
+    /// would say `7d`, the length the plan does not have. Without a reported length the label
+    /// is the fixed one, and an Anthropic row keeps `7d` whatever its facts hold.
+    ///
+    /// Watched red: label every window by its slot, as before, and the 30-day row reads `7d`.
+    #[test]
+    fn a_codex_held_window_is_labelled_by_its_length() {
+        let now = fixture_instant(CANONICAL_NOW_MS);
+        let full_weekly = |provider: Provider, minutes: Option<u32>| AccountSnapshot {
+            provider,
+            seven_day: Some(1.0),
+            seven_day_reset: Some(canonical_at(3 * DAY_MS)),
+            codex: CodexFacts {
+                seven_day_window_minutes: minutes,
+                ..CodexFacts::default()
+            },
+            ..canonical_codex_row(
+                "bob@example.com/codex",
+                0,
+                "pro",
+                "55555555-5555-4555-8555-555555555555",
+            )
+        };
+        let held_labels = |row: AccountSnapshot| -> (Vec<String>, String) {
+            let snapshot = StatsSnapshot {
+                accounts: vec![row.clone()],
+                current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
+                recent: Vec::new(),
+                sessions: Vec::new(),
+                wire_sessions: Vec::new(),
+                wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+            };
+            let json = render_accounts_json_at(
+                now,
+                &snapshot,
+                &[0.85],
+                StatusSource::Live,
+                None,
+                false,
+                None,
+                &std::collections::BTreeMap::new(),
+                None,
+                None,
+            );
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(&json).expect("the renderer emits a JSON array");
+            let held = rows[0]["held"]
+                .as_array()
+                .expect("every row carries held")
+                .iter()
+                .map(|h| h["window"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (held, held_suffix(&row, 0.85, now))
+        };
+
+        let (json, text) = held_labels(full_weekly(Provider::Codex, Some(43_200)));
+        assert_eq!(
+            json,
+            vec!["30d".to_string()],
+            "a 30-day window, on the wire"
+        );
+        assert!(
+            text.starts_with(" held=30d "),
+            "and in the text token: {text}"
+        );
+
+        let (json, text) = held_labels(full_weekly(Provider::Codex, None));
+        assert_eq!(
+            json,
+            vec!["7d".to_string()],
+            "no reported length: the fixed label"
+        );
+        assert!(text.starts_with(" held=7d "), "{text}");
+
+        let (json, text) = held_labels(full_weekly(Provider::Anthropic, Some(43_200)));
+        assert_eq!(
+            json,
+            vec!["7d".to_string()],
+            "an Anthropic row is unchanged"
+        );
+        assert!(text.starts_with(" held=7d "), "{text}");
+    }
+
+    /// An Anthropic row renders exactly as the committed contract fixture holds it, with no
+    /// Codex key: with no Codex fact, and again with every Codex fact set and a Codex route
+    /// and traffic passed in.
+    ///
+    /// This is the compatibility promise for a Claude-only fleet: `tcr status --json` prints
+    /// the bytes it always did. The renderer writes the Codex keys on Codex rows only, so
+    /// neither a snapshot that wrongly carries a Codex fact nor a fleet-wide route can reach
+    /// an Anthropic row. Compared with the committed file, never a regenerated copy.
+    #[test]
+    fn anthropic_rows_serialize_with_no_new_key() {
+        let (mut snapshot, mut thresholds) = status_contract_snapshot();
+        snapshot.accounts.truncate(4);
+        thresholds.truncate(4);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .all(|a| a.provider == Provider::Anthropic),
+            "the contract's first four rows are its Anthropic rows"
+        );
+        assert_eq!(thresholds, vec![0.9; 4]);
+
+        let committed: Vec<serde_json::Value> = serde_json::from_str(
+            &fs::read_to_string(status_contract_fixture_path())
+                .expect("committed contract fixture is readable"),
+        )
+        .expect("the contract fixture is a bare JSON array");
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            (
+                "codereview".to_string(),
+                crate::config::derive_group_color("codereview"),
+            ),
+            ("dev".to_string(), "#0a84ff".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (route, traffic) = canonical_codex_route_and_traffic();
+        let render = |snapshot: &StatsSnapshot| -> Vec<serde_json::Value> {
+            let json = render_accounts_json_at(
+                // After every instant in the contract sample, so each clock-derived field
+                // clamps exactly as it does in the committed file.
+                fixture_instant(1_767_398_400_000),
+                snapshot,
+                &thresholds,
+                StatusSource::Live,
+                Some(&fixture_build()),
+                false,
+                None,
+                &group_colors,
+                Some(&route),
+                Some(&traffic),
+            );
+            serde_json::from_str(&json).expect("the renderer emits a JSON array")
+        };
+        let check = |pass: &str, rows: Vec<serde_json::Value>| {
+            assert_eq!(rows.len(), 4, "{pass}: one row per account");
+            for (row, committed) in rows.iter().zip(&committed) {
+                let name = row["name"].as_str().expect("every row has a name");
+                for key in CODEX_ROW_KEYS {
+                    assert!(row.get(key).is_none(), "{pass}: {name} carries {key}");
+                }
+                if let Some(usage) = row.get("usage") {
+                    assert!(
+                        usage.get("sevenDayWindow").is_none(),
+                        "{pass}: {name}'s usage carries sevenDayWindow"
+                    );
+                    let mut buckets = vec![&usage["today"], &usage["lastHour"]];
+                    buckets.extend(usage.get("window"));
+                    buckets.extend(
+                        usage["todayByModel"]
+                            .as_object()
+                            .expect("todayByModel is an object")
+                            .values(),
+                    );
+                    for bucket in buckets {
+                        assert!(
+                            bucket.get("reasoningTokens").is_none(),
+                            "{pass}: a bucket of {name}'s usage carries reasoningTokens: {bucket}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    row, committed,
+                    "{pass}: {name} is not the committed contract row"
+                );
+            }
+        };
+
+        check("with no Codex fact", render(&snapshot));
+
+        for account in &mut snapshot.accounts {
+            account.codex = CodexFacts {
+                quota_windows: Some(vec!["fiveHour".to_string(), "sevenDay".to_string()]),
+                five_hour_window_minutes: Some(300),
+                seven_day_window_minutes: Some(10_080),
+                limit_reached_type: Some("rate_limit_reached".to_string()),
+                spend_control_reached: true,
+                credits: Some(tcr_status_wire::CodexCredits {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: Some("12.50".to_string()),
+                }),
+                login_error: Some("refresh_token_reused".to_string()),
+                codex_home: Some("/Users/example/.codex".to_string()),
+                token_sync_pending: true,
+            };
+        }
+        check("with every Codex fact set", render(&snapshot));
     }
 
     /// `groups` on the JSON path: an array for a labelled account (including
@@ -7829,7 +11142,9 @@ mod tests {
     /// Bridge test #7.
     fn reserved_groups_snapshot() -> (StatsSnapshot, Vec<f64>) {
         let base = AccountSnapshot {
+            slot: 0,
             name: String::new(),
+            provider: Provider::Anthropic,
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
@@ -7865,6 +11180,7 @@ mod tests {
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage: None,
+            codex: Default::default(),
         };
         let accounts = vec![
             AccountSnapshot {
@@ -7886,6 +11202,7 @@ mod tests {
             StatsSnapshot {
                 accounts,
                 current: None,
+                current_by_provider: crate::stats::CurrentByProvider::default(),
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
@@ -8071,7 +11388,7 @@ mod tests {
     fn save_after_edit_does_not_revert_a_rotated_credential() {
         let path = write_config(
             "save-after-edit-preserves",
-            r#"{ "accounts": [
+            r#"{ "proxy": { "port": 9 }, "accounts": [
                    { "name": "acct-a", "accessToken": "at-a", "refreshToken": "rt-a", "expiresAt": 1 },
                    { "name": "acct-b", "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1 } ] }"#,
         );
@@ -8114,5 +11431,407 @@ mod tests {
         );
 
         fs::remove_file(&path).ok();
+    }
+
+    /// A snapshot holding `accounts` and nothing else: no account serving, no session, no log.
+    fn snapshot_of(accounts: Vec<AccountSnapshot>) -> StatsSnapshot {
+        StatsSnapshot {
+            accounts,
+            current: None,
+            current_by_provider: crate::stats::CurrentByProvider::default(),
+            recent: Vec::new(),
+            sessions: Vec::new(),
+            wire_sessions: Vec::new(),
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
+        }
+    }
+
+    /// A Codex row says it is one right after its name, and ends with what only a Codex row can
+    /// say, after `parked_groups=` and in a fixed order, each token only when it has something
+    /// to say. A Claude row never prints any of it, whatever its Codex facts hold.
+    #[test]
+    fn codex_account_line_tokens_follow_parked_groups_in_order() {
+        use crate::stats::GateReason;
+        use tcr_status_wire::CodexCredits;
+
+        let mut kim = canonical_codex_row(
+            "kim@example.com",
+            9,
+            "pro",
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        );
+        kim.groups = vec!["orchard".to_string(), "research".to_string()];
+        kim.reserved_groups = vec!["research".to_string()];
+        kim.parked_groups = vec!["orchard".to_string()];
+        kim.gate = GateReason::Reserved;
+        kim.codex.login_error = Some("refresh_token_reused".to_string());
+        kim.codex.limit_reached_type = Some("rate_limit_reached".to_string());
+        kim.codex.spend_control_reached = true;
+        kim.codex.credits = Some(CodexCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("12.50".to_string()),
+        });
+        let line = |row: &AccountSnapshot| {
+            render_accounts(&snapshot_of(vec![row.clone()]), StatusSource::Live)
+        };
+
+        assert_eq!(
+            line(&kim),
+            "account kim@example.com provider=codex priority=9 plan=ChatGPT Pro 5h=n/a wk=n/a \
+             cache=n/a state=ok status=active probe=ok stream_errors=0 \
+             groups=orchard,research reserved_groups=research parked_groups=orchard \
+             login_error=refresh_token_reused limit_reached=rate_limit_reached \
+             spend_control=reached credits=12.50 reachable=no workspace=dddddddd\n"
+        );
+
+        let no_workspace = AccountSnapshot {
+            org_uuid: None,
+            ..kim.clone()
+        };
+        assert_eq!(
+            line(&no_workspace),
+            line(&kim).replace(" workspace=dddddddd", ""),
+            "no workspace id, no workspace token"
+        );
+
+        let mut unlimited = kim.clone();
+        unlimited.codex.credits = Some(CodexCredits {
+            has_credits: false,
+            unlimited: true,
+            balance: None,
+        });
+        assert_eq!(
+            line(&unlimited),
+            line(&kim).replace(" credits=12.50", " credits=unlimited")
+        );
+
+        let mut spent = kim.clone();
+        spent.codex.credits = Some(CodexCredits {
+            has_credits: false,
+            unlimited: false,
+            balance: Some("0.00".to_string()),
+        });
+        assert_eq!(
+            line(&spent),
+            line(&kim).replace(" credits=12.50", ""),
+            "a balance with no credits behind it says nothing"
+        );
+
+        let reachable = AccountSnapshot {
+            gate: GateReason::Ok,
+            ..kim.clone()
+        };
+        assert_eq!(
+            line(&reachable),
+            line(&kim).replace(" reachable=no", ""),
+            "only a reserved Codex row is unreachable"
+        );
+
+        let claude = AccountSnapshot {
+            provider: Provider::Anthropic,
+            ..kim.clone()
+        };
+        let claude_without_codex_facts = AccountSnapshot {
+            codex: CodexFacts::default(),
+            ..claude.clone()
+        };
+        assert_eq!(
+            line(&claude),
+            line(&claude_without_codex_facts),
+            "a Claude row's line never reads its Codex facts"
+        );
+        for token in [
+            " provider=",
+            "=none",
+            " login_error=",
+            " limit_reached=",
+            " spend_control=",
+            " credits=",
+            " reachable=",
+            " workspace=",
+        ] {
+            assert!(
+                !line(&claude).contains(token),
+                "a Claude row printed {token:?}: {}",
+                line(&claude)
+            );
+        }
+    }
+
+    /// `none` is a window the plan does not report, from the row's own list of windows, and
+    /// `n/a` keeps meaning a window expected and not yet measured: an unknown list, or a listed
+    /// window with no reading. A reading left over for a window the plan dropped does not bring
+    /// it back, and a Claude row never reads the list.
+    #[test]
+    fn five_hour_none_and_weekly_none_on_codex_rows() {
+        let windows = |list: &[&str]| Some(list.iter().map(|w| w.to_string()).collect());
+        let codex = |name: &str, quota_windows: Option<Vec<String>>| {
+            let mut row =
+                canonical_codex_row(name, 0, "pro", "55555555-5555-4555-8555-555555555555");
+            row.codex.quota_windows = quota_windows;
+            row
+        };
+        let mut ivy = codex("ivy@example.com", windows(&["sevenDay"]));
+        ivy.five_hour = Some(0.5);
+        let mut alice = contract_account(
+            "alice@example.com",
+            0,
+            "active",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::probe::ProbeStatus::Ok,
+            None,
+            QuotaState::Normal,
+            &[],
+            None,
+            (Some("claude_max"), Some("default_claude_max_20x"), None),
+            (None, None),
+        );
+        alice.codex.quota_windows = windows(&[]);
+        let rows = vec![
+            codex("bob@example.com/codex", windows(&["sevenDay"])),
+            codex("jo@example.com", windows(&[])),
+            codex("dana@example.com", windows(&["fiveHour", "sevenDay"])),
+            codex("hal@example.com", None),
+            ivy,
+            alice,
+        ];
+        let text = render_accounts(&snapshot_of(rows), StatusSource::Live);
+        let lines: Vec<&str> = text.lines().collect();
+        let expected = [
+            ("bob@example.com/codex", " 5h=none wk=n/a cache="),
+            ("jo@example.com", " 5h=none wk=none cache="),
+            ("dana@example.com", " 5h=n/a wk=n/a cache="),
+            ("hal@example.com", " 5h=n/a wk=n/a cache="),
+            ("ivy@example.com", " 5h=none "),
+            ("alice@example.com", " 5h=n/a wk=n/a cache="),
+        ];
+        assert_eq!(lines.len(), expected.len(), "{text}");
+        for (line, (name, holds)) in lines.iter().zip(expected) {
+            assert!(
+                line.starts_with(&format!("account {name} ")),
+                "rows keep their order: {line}"
+            );
+            assert!(line.contains(holds), "{name} must hold {holds:?}: {line}");
+        }
+    }
+
+    /// `tcr accounts` prints `tcr status`'s account line, the Codex tokens included, from its
+    /// offline snapshot. The Claude row is the line it always was: its workspace id prints no
+    /// `workspace=`.
+    #[test]
+    fn accounts_text_carries_the_codex_tokens() {
+        let alice = contract_account(
+            "alice@example.com",
+            0,
+            "active",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::probe::ProbeStatus::Never,
+            None,
+            QuotaState::Normal,
+            &[],
+            None,
+            (Some("claude_max"), Some("default_claude_max_20x"), None),
+            (Some("11111111-1111-1111-1111-111111111111"), None),
+        );
+        let bob = AccountSnapshot {
+            probe_status: crate::probe::ProbeStatus::Never,
+            ..canonical_codex_row(
+                "bob@example.com/codex",
+                1,
+                "pro",
+                "55555555-5555-4555-8555-555555555555",
+            )
+        };
+        assert_eq!(
+            render_accounts(&snapshot_of(vec![alice, bob]), StatusSource::Offline),
+            "account alice@example.com priority=0 plan=Max 20x 5h=n/a wk=n/a cache=n/a state=ok \
+             status=active probe=never stream_errors=n/a\n\
+             account bob@example.com/codex provider=codex priority=1 plan=ChatGPT Pro 5h=n/a \
+             wk=n/a cache=n/a state=ok status=active probe=never stream_errors=n/a \
+             workspace=55555555\n"
+        );
+    }
+
+    /// A Claude row for the header and re-login tests: probed, in no group, its plan known,
+    /// and gated `gate`.
+    fn claude_row(name: &str, gate: crate::stats::GateReason) -> AccountSnapshot {
+        AccountSnapshot {
+            gate,
+            ..contract_account(
+                name,
+                0,
+                "active",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+                &[],
+                None,
+                (Some("claude_max"), Some("default_claude_max_20x"), None),
+                (None, None),
+            )
+        }
+    }
+
+    /// A Codex row for the header and re-login tests, gated `gate`.
+    fn codex_row(name: &str, gate: crate::stats::GateReason) -> AccountSnapshot {
+        AccountSnapshot {
+            gate,
+            ..canonical_codex_row(name, 0, "pro", "55555555-5555-4555-8555-555555555555")
+        }
+    }
+
+    /// A mixed fleet's header counts each pool's eligible accounts: gate `ok` and not
+    /// disabled, over every row of that provider. A fleet of one provider, or of none, keeps
+    /// the header it always had.
+    #[test]
+    fn the_eligible_header_prints_only_in_mixed_fleets() {
+        use crate::stats::GateReason;
+
+        let alice = claude_row("alice@example.com", GateReason::Ok);
+        let frank = claude_row("frank@example.com", GateReason::FiveHour);
+        let bob = codex_row("bob@example.com/codex", GateReason::Ok);
+        let dana = AccountSnapshot {
+            disabled: true,
+            ..codex_row("dana@example.com", GateReason::Ok)
+        };
+        let erin = codex_row("erin@example.com/codex", GateReason::Login);
+        let all = vec![
+            alice.clone(),
+            frank.clone(),
+            bob.clone(),
+            dana.clone(),
+            erin.clone(),
+        ];
+
+        assert_eq!(
+            eligible_token(&snapshot_of(all.clone())),
+            " eligible=claude:1/2,codex:1/3"
+        );
+        assert_eq!(eligible_token(&snapshot_of(vec![alice.clone(), frank])), "");
+        assert_eq!(eligible_token(&snapshot_of(vec![bob, dana, erin])), "");
+        assert_eq!(eligible_token(&snapshot_of(Vec::new())), "");
+
+        // A Codex row held by an upstream 403 is out of rotation until its hold ends.
+        let pat = codex_row("pat@example.com/codex", GateReason::Refused);
+        assert_eq!(
+            eligible_token(&snapshot_of(vec![alice, pat])),
+            " eligible=claude:1/1,codex:0/1"
+        );
+
+        let build = |sha: &str| BuildInfo {
+            sha: sha.to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let group_colors = std::collections::BTreeMap::new();
+        let pooled = tcr_status_wire::CodexRoute {
+            pooled: true,
+            code: None,
+            reason: None,
+            upstream: None,
+        };
+        let text = render_status_text(&StatusText {
+            snapshot: &snapshot_of(all),
+            source: StatusSource::Live,
+            server_build: Some(&build("abc1234")),
+            client_build: &build("def5678"),
+            http1_only: false,
+            group_colors: &group_colors,
+            claude_verdict: None,
+            codex_route: Some(&pooled),
+            holds_codex: true,
+        });
+        let header = text
+            .lines()
+            .find(|line| line.starts_with("status source="))
+            .unwrap_or_else(|| panic!("no header:\n{text}"));
+        assert!(
+            header.ends_with(" eligible=claude:1/2,codex:1/3"),
+            "the count ends the header: {header}"
+        );
+    }
+
+    /// Each Codex row in LOGIN gets one stderr line naming the command that signs it in again,
+    /// and why its login died when that is known, in the words the dashboard uses. A Claude row
+    /// never does, and neither does a Codex row whose gate is not LOGIN.
+    #[test]
+    fn status_prints_one_relogin_hint_per_signed_out_codex_row() {
+        use crate::stats::GateReason;
+
+        let mut erin = codex_row("erin@example.com/codex", GateReason::Login);
+        erin.codex.login_error = Some("refresh_token_reused".to_string());
+        erin.codex.codex_home = Some("/Users/example/.codex".to_string());
+        let ivy = codex_row("ivy@example.com/codex", GateReason::Login);
+        let frank = claude_row("frank@example.com", GateReason::Login);
+        let mut bob = codex_row("bob@example.com/codex", GateReason::Ok);
+        bob.codex.login_error = Some("refresh_token_reused".to_string());
+
+        assert_eq!(
+            relogin_hint_lines(
+                &snapshot_of(vec![erin, ivy, frank, bob]),
+                Some(Path::new("/Users/example"))
+            ),
+            [
+                "[tcr] erin@example.com/codex needs re-login: the codex CLI in ~/.codex \
+                 refreshed this shared login first — tcr login --codex --account \
+                 erin@example.com/codex",
+                "[tcr] ivy@example.com/codex needs re-login — tcr login --codex --account \
+                 ivy@example.com/codex",
+            ]
+        );
+    }
+
+    /// The empty-fleet line, as it always read, and nothing more without a codex login on
+    /// disk. A fleet with accounts prints no hint at all, codex login or not.
+    #[test]
+    fn warn_if_no_accounts_is_unchanged_without_codex_login() {
+        assert_eq!(
+            no_accounts_lines(&load_from(r#"{"accounts": []}"#), None),
+            vec!["no accounts configured — run `tcr login` to add one"]
+        );
+        assert!(no_accounts_lines(
+            &load_from(TWO_ACCOUNTS),
+            Some(Path::new("/Users/example/.codex/auth.json"))
+        )
+        .is_empty());
+    }
+
+    /// An empty fleet on a machine where codex holds a login gets one more line: the two
+    /// ways to pool codex, and the import's guarded token sharing. The login is named, never read.
+    #[test]
+    fn the_first_run_with_a_codex_login_prints_the_codex_hint() {
+        assert_eq!(
+            no_accounts_lines(
+                &load_from(r#"{"accounts": []}"#),
+                Some(Path::new("/Users/example/.codex/auth.json"))
+            ),
+            vec![
+                "no accounts configured — run `tcr login` to add one".to_string(),
+                "[tcr] found a codex login at /Users/example/.codex/auth.json: `tcr login \
+                 --codex` adds a Codex account of tcr's own, and `tcr login --from-codex` \
+                 imports that one with guarded token updates shared through auth.json"
+                    .to_string(),
+            ]
+        );
     }
 }

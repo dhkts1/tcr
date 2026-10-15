@@ -97,6 +97,9 @@ public final class ServerController: ObservableObject {
                     every live session's prompt cache. \(message)
                     """
             case .exited(let code, let message):
+                // A tcr too old for a config holding a Codex account exits on its
+                // config loader's refusal, whose words name a version, not the fix.
+                if PredatesCodexRefusal.matches(message) { return CodexSignInCopy.predatesCodexSentence }
                 let detail = message.isEmpty ? "no output" : message
                 return "Server exited (\(code)): \(detail)"
             case .toolMissing(let searched):
@@ -113,6 +116,9 @@ public final class ServerController: ObservableObject {
     }
 
     @Published public private(set) var state: State = .idle
+    @Published public private(set) var executablePath: String?
+
+    public var summary: String { state.summary(executablePath: executablePath) }
 
     /// The pid of the child this controller currently supervises, or `0`
     /// when there is none. Read from `AbnormalTerminationGuard`'s signal
@@ -366,6 +372,7 @@ public final class ServerController: ObservableObject {
     }
 
     private func spawn(executable: URL, intent: Intent, arguments: [String]) {
+        executablePath = executable.path
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments

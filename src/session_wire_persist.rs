@@ -183,7 +183,9 @@ pub fn save(
 }
 
 /// Read `path`, dropping any session whose `last_seen_ms` is older than
-/// `ttl_ms`, capped at [`PERSIST_CAP`] (freshest first).
+/// `ttl_ms`, capped at [`PERSIST_CAP`] (freshest first). A Codex session whose
+/// last usage still counts in a trailing `ttl_ms` window is kept, by the rule
+/// the live table lists it by ([`WireSession::is_live_at`]).
 ///
 /// Infallible by construction — every failure mode returns an empty map with
 /// `degraded` set, never a panic and never an error the caller must handle.
@@ -235,7 +237,7 @@ pub fn load(path: &Path, now_ms: i64, ttl_ms: i64) -> LoadReport {
     // whatever HashMap iteration order happened to hand back first.
     rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.last_seen_ms));
     for (session_id, session) in rows {
-        if now_ms.saturating_sub(session.last_seen_ms) > ttl_ms {
+        if !session.is_live_at(now_ms, ttl_ms) {
             report.expired += 1;
             continue;
         }
@@ -252,7 +254,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::session_wire::{RunningTool, SlowTool, ToolStats};
+    use crate::provider::Provider;
+    use crate::session_wire::{ModelTokenTally, RunningTool, SlowTool, ToolStats};
 
     fn tmp(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -282,6 +285,7 @@ mod tests {
             req_per_minute: Default::default(),
             by_model: Default::default(),
             cache_ttl_secs: None,
+            ..Default::default()
         }
     }
 
@@ -387,6 +391,7 @@ mod tests {
                 started_ms: now - 500,
                 command_head: Some("until grep -q ready log; do sleep 1; done".to_string()),
                 command_class: Some(crate::session_wire::CommandClass::Wait),
+                timeout_seconds: None,
             },
         );
         let mut sessions = HashMap::new();
@@ -395,6 +400,66 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("read back the file as a string");
         assert!(raw.contains("until grep -q ready log"));
+    }
+
+    /// The new keys are additive. A file written before a session knew its provider, its
+    /// reasoning tokens or a model tally's request count still loads, as the Anthropic
+    /// session it was, with zeros, instead of taking the whole file down. An Anthropic
+    /// session writes no `provider` key at all, and a Codex session round-trips every new key.
+    #[test]
+    fn sessions_persisted_without_the_new_keys_still_load() {
+        let path = tmp("pre-codex");
+        let now = 1_000_000;
+        let mut before = session("alice@example.com", now, 2);
+        before.by_model.insert(
+            "claude-sonnet-5".to_string(),
+            ModelTokenTally {
+                input: 5,
+                ..Default::default()
+            },
+        );
+        let mut old = serde_json::to_value(&before).expect("a session serializes");
+        let fields = old.as_object_mut().expect("a session is an object");
+        assert!(
+            fields.get("provider").is_none(),
+            "an Anthropic session writes no provider key"
+        );
+        fields.remove("reasoning_tokens");
+        fields["by_model"]["claude-sonnet-5"]
+            .as_object_mut()
+            .expect("a tally is an object")
+            .remove("requests");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "version": FORMAT_VERSION, "savedAtMs": now, "sessions": { "sess-old": old } })
+                .to_string(),
+        )
+        .expect("write a file in the old shape");
+        let report = load(&path, now, RESTORE_TTL_MS);
+        assert_eq!(report.degraded, None);
+        let restored = &report.sessions["sess-old"];
+        assert_eq!(restored.provider, Provider::Anthropic);
+        assert_eq!(restored.reasoning_tokens, 0);
+        assert_eq!(restored.by_model["claude-sonnet-5"].requests, 0);
+        assert_eq!(restored.by_model["claude-sonnet-5"].input, 5);
+
+        let mut codex = session("bob@example.com/codex", now, 3);
+        codex.provider = Provider::Codex;
+        codex.reasoning_tokens = 1_200;
+        codex.by_model.insert(
+            "gpt-5.1-codex".to_string(),
+            ModelTokenTally {
+                requests: 7,
+                ..Default::default()
+            },
+        );
+        let mut sessions = HashMap::new();
+        sessions.insert("sess-codex".to_string(), codex);
+        save(&path, &sessions, now).expect("save");
+        let back = &load(&path, now, RESTORE_TTL_MS).sessions["sess-codex"];
+        assert_eq!(back.provider, Provider::Codex);
+        assert_eq!(back.reasoning_tokens, 1_200);
+        assert_eq!(back.by_model["gpt-5.1-codex"].requests, 7);
     }
 
     /// A session whose last request was longer ago than the TTL is dropped at
@@ -420,6 +485,35 @@ mod tests {
         assert!(report.sessions.contains_key("sess-fresh"));
         assert!(!report.sessions.contains_key("sess-stale"));
         assert_eq!(report.expired, 1);
+    }
+
+    /// A Codex session is restored by the rule that keeps it listed: while its last usage,
+    /// recorded when its stream ended, still counts in a trailing `ttl_ms` window, though its
+    /// last request is past it. The usage time survives the round trip, so a restart inside
+    /// that window drops nothing the accounts' usage still counts.
+    ///
+    /// Watched red: on the request's clock alone, the session is dropped as expired.
+    #[test]
+    fn a_codex_session_is_restored_while_its_last_usage_counts() {
+        let path = tmp("codex-usage-window");
+        let request_at = 1_767_225_600_000;
+        let ttl = crate::session_wire::SESSION_TTL_MS;
+        let mut codex = session("bob@example.com/codex", request_at, 1);
+        codex.provider = Provider::Codex;
+        codex.last_usage_ms = Some(request_at + 40_000);
+        let mut sessions = HashMap::new();
+        sessions.insert("sess-codex".to_string(), codex);
+        save(&path, &sessions, request_at + ttl).expect("save");
+
+        let report = load(&path, request_at + ttl + 1, ttl);
+        assert_eq!(report.expired, 0);
+        assert_eq!(
+            report.sessions["sess-codex"].last_usage_ms,
+            Some(request_at + 40_000)
+        );
+
+        let report = load(&path, request_at + ttl + 2 * 60_000, ttl);
+        assert_eq!((report.sessions.len(), report.expired), (0, 1));
     }
 
     /// More sessions than the cap: the newest survive, the oldest are the ones

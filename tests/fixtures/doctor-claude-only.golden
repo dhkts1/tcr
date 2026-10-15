@@ -1,0 +1,57 @@
+== a settings file sends Claude elsewhere
+exit: Some(2)
+-- stdout
+baseUrl: https://gateway.example.com
+baseUrlSource: <home>/.claude/settings.json
+proxyPort: <port>
+portHolder: none
+portHolderIsTcr: unknown
+requests10m: none (no proxy answered)
+shellRoute: not installed
+verdict: this proxy is not on Claude's route: <home>/.claude/settings.json sets https://gateway.example.com
+-- stderr
+== routed here, the proxy answers
+exit: Some(0)
+-- stdout
+baseUrl: http://127.0.0.1:<port>
+baseUrlSource: ANTHROPIC_BASE_URL
+proxyPort: <port>
+portHolder: pid <pid> <holder>
+portHolderIsTcr: no
+requests10m: 3
+shellRoute: not installed
+verdict: Claude is routed to http://127.0.0.1:<port> (ANTHROPIC_BASE_URL); this proxy has served 3 requests
+-- stderr
+== routed here, nothing answers
+exit: Some(3)
+-- stdout
+baseUrl: http://127.0.0.1:<port>
+baseUrlSource: ANTHROPIC_BASE_URL
+proxyPort: <port>
+portHolder: none
+portHolderIsTcr: unknown
+requests10m: none (no proxy answered)
+shellRoute: not installed
+verdict: Claude is routed to http://127.0.0.1:<port> (ANTHROPIC_BASE_URL); no proxy answered on 127.0.0.1:<port>
+-- stderr
+== json, a settings file sends Claude elsewhere
+exit: Some(2)
+-- stdout
+{
+  "baseUrl": "https://gateway.example.com",
+  "baseUrlSource": {
+    "kind": "userSettings",
+    "path": "<home>/.claude/settings.json"
+  },
+  "exitCode": 2,
+  "portHolder": null,
+  "problems": [],
+  "proxyPort": <port>,
+  "requestWindowMinutes": 10,
+  "requestsInWindow": null,
+  "routedHere": false,
+  "shellRoute": null,
+  "unknownKeys": [],
+  "verdict": "verdict: this proxy is not on Claude's route: <home>/.claude/settings.json sets https://gateway.example.com"
+}
+-- stderr

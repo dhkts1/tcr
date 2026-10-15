@@ -31,6 +31,43 @@ pub const CACHE_DIR: &str = "tcr";
 /// The rotating log file prefix inside the new cache directory.
 pub const LOG_PREFIX: &str = "tcr.log";
 
+/// Codex's auth document inside an explicitly selected CODEX_HOME.
+pub const CODEX_AUTH_FILE: &str = "auth.json";
+/// The stable advisory lock shared by tcr's imported-login writers; Codex does not take it.
+const CODEX_AUTH_LOCK_FILE: &str = ".auth.json.tcr-lock";
+/// A private temporary sibling used to publish a guarded imported-login update.
+pub(crate) const CODEX_AUTH_TEMP_PREFIX: &str = ".auth.json.tcr-";
+/// A throwaway CODEX_HOME beside the selected tcr config, removed when sign-in ends.
+pub(crate) const CODEX_LOGIN_PREFIX: &str = "tcr-codex-login.";
+
+/// Codex's state directory: an explicitly selected home wins, otherwise HOME/.codex.
+/// Inputs are already read by the caller so importing a login never reads an ambient home here.
+pub fn codex_home_in(codex_home: Option<PathBuf>, user_home: Option<PathBuf>) -> PathBuf {
+    codex_home.unwrap_or_else(|| {
+        user_home
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".codex")
+    })
+}
+
+/// The auth document in the supplied Codex home; never resolves a default credential store.
+pub fn codex_auth_file(codex_home: &Path) -> PathBuf {
+    codex_home.join(CODEX_AUTH_FILE)
+}
+
+/// The writer lock in the supplied Codex home; never resolves an ambient credential store.
+pub(crate) fn codex_auth_lock_file(codex_home: &Path) -> PathBuf {
+    codex_home.join(CODEX_AUTH_LOCK_FILE)
+}
+
+/// The parent for a throwaway login beside the selected config, including relative configs.
+pub(crate) fn codex_login_parent(config_file: &Path) -> &Path {
+    config_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// The environment the paths are resolved from. Read once by
 /// [`Roots::from_env`]; a test builds one over temp dirs instead of changing
 /// this process's environment, which every other test shares.

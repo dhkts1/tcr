@@ -129,10 +129,20 @@ impl ProbeUrgency {
     /// windows (`QuotaState::from_utilization`); `GateReason::Rejected` adds the
     /// account upstream rejected below its threshold, which only a probe can
     /// clear (see `Quota::drop_rejection_if_a_window_rolled`).
+    ///
+    /// A Codex refusal is that same case under another gate: the snapshot reports
+    /// it as the window or the hold that explains it
+    /// (`Manager::codex_refusal_gate`), not as `Rejected`. So a standing refusal
+    /// is also read from `codex.limit_reached_type`, which is present exactly while
+    /// the refusal stands, and never on an Anthropic row. Not under `Disabled` or
+    /// `Login`: those outrank `Rejected` (`Manager::account_terminal_gate`), so on
+    /// such a row the refusal is not what holds it out, and the remap never runs.
     pub fn of(account: &crate::stats::AccountSnapshot) -> Self {
-        if account.quota_state != crate::stats::QuotaState::Normal
-            || account.gate == crate::stats::GateReason::Rejected
-        {
+        use crate::stats::GateReason;
+        let refused = account.gate == GateReason::Rejected
+            || (account.codex.limit_reached_type.is_some()
+                && !matches!(account.gate, GateReason::Disabled | GateReason::Login));
+        if account.quota_state != crate::stats::QuotaState::Normal || refused {
             ProbeUrgency::NearLimit
         } else {
             ProbeUrgency::Routine
