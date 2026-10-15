@@ -753,6 +753,8 @@ pub struct CodexQuotaFacts {
     /// `rate_limit_reached_type`. Read it through [`Quota::codex_limit_reached_type`], which
     /// answers only while the refusal stands.
     pub limit_reached_type: Option<String>,
+    /// The usage-limit body's absolute Unix-seconds reset, ahead of window-header estimates.
+    pub refusal_reset: Option<OffsetDateTime>,
     /// Whether the last successful probe said the account's spend control is reached.
     pub spend_control_reached: bool,
     /// The account's credits, from the last reading that reported them.
@@ -838,17 +840,53 @@ const CODEX_CREDITS_UNLIMITED_HEADER: &str = "x-codex-credits-unlimited";
 const CODEX_CREDITS_BALANCE_HEADER: &str = "x-codex-credits-balance";
 
 /// Sent on a Codex QUOTA refusal (`codex-api/src/rate_limits.rs`). Its presence is what tcr
-/// reads as "this 429 is the quota", as against any other 429, and its value, verbatim, is the
+/// reads as an independent quota signal beside the error body. Its value, verbatim, is the
 /// refusal's kind ([`CodexQuotaFacts::limit_reached_type`]).
 pub const CODEX_REACHED_TYPE_HEADER: &str = "x-codex-rate-limit-reached-type";
 
-/// Is this Codex response a QUOTA refusal? A 429 that carries
-/// [`CODEX_REACHED_TYPE_HEADER`] is; a 429 without it is some other refusal, which marks
-/// nothing `rejected` and holds its account on `retry-after` alone, never on a window's
-/// reset. One predicate for both readers, [`Quota::update_from_codex_headers`] and the
-/// proxy's hold, so the two cannot disagree about which 429 is which.
-pub fn is_codex_quota_refusal(headers: &impl HeaderView) -> bool {
-    headers.get_str(CODEX_REACHED_TYPE_HEADER).is_some()
+/// Is this Codex 429 a quota refusal? Codex recognizes these body types and codes in
+/// `codex-api/src/api_bridge.rs`; the reached-type header is an independent signal.
+pub fn is_codex_quota_refusal(headers: &impl HeaderView, body: &[u8]) -> bool {
+    headers.get_str(CODEX_REACHED_TYPE_HEADER).is_some() || codex_quota_error(body).is_some()
+}
+
+fn codex_quota_error(body: &[u8]) -> Option<serde_json::Value> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = doc.get("error")?;
+    let quota_type = matches!(
+        error.get("type").and_then(serde_json::Value::as_str),
+        Some("usage_limit_reached" | "usage_not_included" | "insufficient_quota")
+    );
+    let quota_code = matches!(
+        error.get("code").and_then(serde_json::Value::as_str),
+        Some(
+            "insufficient_quota"
+                | "credit_balance_exhausted"
+                | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded"
+                | "organization_usage_limit_exceeded"
+        )
+    );
+    (quota_type || quota_code).then(|| error.clone())
+}
+
+/// `resets_at` is Unix seconds, as Codex's `DateTime::from_timestamp(seconds, 0)` reads it.
+/// Codex does not read `resets_in_seconds`; accept it as a relative-seconds fallback when
+/// the absolute reset is absent or malformed, then let the caller try header windows.
+pub fn codex_body_reset(body: &[u8], now: OffsetDateTime) -> Option<OffsetDateTime> {
+    let document: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = document.get("error")?;
+    error
+        .get("resets_at")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .or_else(|| {
+            error
+                .get("resets_in_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|seconds| *seconds >= 0)
+                .and_then(|seconds| now.checked_add(time::Duration::seconds(seconds)))
+        })
 }
 
 impl Quota {
@@ -882,14 +920,15 @@ impl Quota {
     /// `http_status` stands in for Anthropic's `unified-status` header, which Codex has no
     /// equivalent of. A 2xx that carried a window, from either slot, means this account is
     /// being served (`allowed`). A 429 carrying `x-codex-rate-limit-reached-type`
-    /// ([`is_codex_quota_refusal`]) means it is not (`rejected`). The Codex usage probe
+    /// means it is not (`rejected`); [`Self::update_from_codex_response`] also reads a
+    /// body-only refusal through [`is_codex_quota_refusal`]. The Codex usage probe
     /// ([`crate::codex_probe`]) is what clears it, as the Anthropic probe clears an Anthropic
     /// rejection: its reading is folded through [`Self::apply_usage`], where
     /// `drop_rejection_if_a_window_rolled` drops the `rejected` once a probed window's
     /// utilization falls below the one stored, which is the window rolling, and
     /// `lift_a_codex_refusal_the_probe_reads_allowed` drops it once the probe reads the
     /// account allowed, which is how a refusal no window explains ends. Anything else, a 429
-    /// without that header included, leaves `status` as it was.
+    /// with no quota signal leaves `status` as it was.
     ///
     /// Beside the windows it records the facts the status wire reports
     /// ([`CodexQuotaFacts`]): which windows this response carried and how long each is, the
@@ -906,6 +945,18 @@ impl Quota {
         &mut self,
         headers: &impl HeaderView,
         http_status: u16,
+    ) -> bool {
+        self.update_from_codex_response(headers, http_status, &[])
+    }
+
+    /// Fold Codex quota headers and a bounded error body together. A body-only quota refusal
+    /// is the same rejection as a header refusal; its explicit reset takes precedence.
+    #[must_use]
+    pub fn update_from_codex_response(
+        &mut self,
+        headers: &impl HeaderView,
+        http_status: u16,
+        body: &[u8],
     ) -> bool {
         let now = OffsetDateTime::now_utc();
         // This response's reading of each bucket, (utilization, reported reset, length in
@@ -977,10 +1028,11 @@ impl Quota {
             );
             self.five_hour = Some(QuotaWindow { utilization, reset });
         }
-        let refused = http_status == 429 && is_codex_quota_refusal(headers);
+        let refused = http_status == 429 && is_codex_quota_refusal(headers, body);
         // The refusal's kind is set in the statement that marks the refusal and cleared in the
         // one that ends it, so it is present exactly while the refusal stands.
         if refused {
+            self.codex.refusal_reset = codex_body_reset(body, now);
             self.status = Some("rejected".to_string());
             self.codex.limit_reached_type = headers
                 .get_str(CODEX_REACHED_TYPE_HEADER)
@@ -988,6 +1040,7 @@ impl Quota {
         } else if read_a_window && (200..300).contains(&http_status) {
             self.status = Some("allowed".to_string());
             self.codex.limit_reached_type = None;
+            self.codex.refusal_reset = None;
         }
         if let Some(credits) = codex_credits_from_headers(headers) {
             self.codex.credits = Some(credits);
@@ -1119,6 +1172,18 @@ mod tests {
         fn get_str(&self, name: &str) -> Option<&str> {
             self.0.get(&name.to_lowercase()).map(String::as_str)
         }
+    }
+
+    #[test]
+    fn a_header_quota_refusal_can_read_reset_from_a_body_without_a_limit_type() {
+        let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+        let headers = TestHeaders::new(&[(CODEX_REACHED_TYPE_HEADER, "primary")]);
+        let body = br#"{"error":{"message":"out","resets_at":1900007200}}"#;
+        assert!(is_codex_quota_refusal(&headers, body));
+        assert_eq!(
+            codex_body_reset(body, now).map(|at| at.unix_timestamp()),
+            Some(1_900_007_200)
+        );
     }
 
     #[test]

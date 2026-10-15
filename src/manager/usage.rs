@@ -43,6 +43,17 @@ impl Manager {
         headers: &reqwest::header::HeaderMap,
         status: u16,
     ) -> bool {
+        self.update_quota_with_body(idx, headers, status, &[])
+    }
+
+    /// Include the bounded error body when recognizing a Codex quota refusal.
+    pub fn update_quota_with_body(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        status: u16,
+        body: &[u8],
+    ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
@@ -51,9 +62,9 @@ impl Manager {
                         crate::provider::Provider::Anthropic => {
                             account.quota.update_from_headers(headers)
                         }
-                        crate::provider::Provider::Codex => {
-                            account.quota.update_from_codex_headers(headers, status)
-                        }
+                        crate::provider::Provider::Codex => account
+                            .quota
+                            .update_from_codex_response(headers, status, body),
                     };
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
@@ -393,6 +404,18 @@ impl Manager {
             account.rate_limited_until_ms = Some(until);
             account.hold_cause = HoldCause::RateLimit;
             tracing::info!(account = %account.name, hold_seconds = hold, "rate limited");
+        }
+    }
+
+    /// A Codex quota reset is a measured deadline, which may be days away. Preserve it
+    /// rather than applying the short generic rate-limit hold ceiling.
+    pub fn mark_codex_quota_limited(&self, idx: usize, seconds: i64) {
+        let until = crate::now_ms().saturating_add(seconds.max(0).saturating_mul(1000));
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            account.status = AccountStatus::Throttled;
+            account.rate_limited_until_ms = Some(until);
+            account.hold_cause = HoldCause::RateLimit;
         }
     }
 

@@ -4529,70 +4529,61 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // request, logs the body (`log_upstream_error_body`) and forwards it
                 // verbatim, the same path a 400 or a spent 529 takes.
             } else {
-                // Upstream's own words for this 429, which the headers above cannot
-                // give when it carries none (`quota_rejected=false`, every header
-                // `<absent>`). Every path out of this branch `continue`s, so the body was
-                // always discarded unread; reading it here costs one small buffer.
-                // Bounded in time as well as size: this arm used to return without
-                // touching the body, so a body that never completes must not become
-                // a hang it did not have before.
-                match tokio::time::timeout(
+                // Read the bounded body before deciding whether Codex refused quota. Some
+                // quota errors carry no reached-type header at all.
+                let refusal_body = match tokio::time::timeout(
                     Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
                     read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
                 )
                 .await
                 {
                     Ok(Ok(body)) => {
-                        log_upstream_error_body(idx, account_name.as_deref(), status, &body)
+                        log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                        body
                     }
-                    Ok(Err(_)) | Err(_) => tracing::warn!(
-                        account = account_name.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        "upstream 429 body could not be read within the cap"
-                    ),
-                }
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(
+                            account_index = idx,
+                            "upstream 429 body could not be read within the cap"
+                        );
+                        Bytes::new()
+                    }
+                };
                 let retry_after = retry_after_raw.unwrap_or(60);
-                // A Codex 429 is ACCOUNT-scoped, like an Anthropic quota rejection: hold the
-                // account and rotate. How long depends on what the 429 says it is:
-                //
-                //  - a QUOTA refusal, one carrying `x-codex-rate-limit-reached-type`
-                //    (`quota::is_codex_quota_refusal`; the quota fold above has already marked
-                //    it `rejected`), holds to its windows' reset: the latest reset among the
-                //    full windows, else the fullest window's (`codex_hold_seconds`), else
-                //    `retry-after`, else the same 60s default;
-                //  - any other 429 holds on `retry-after`, else that default, whatever window
-                //    headers it carries. Its windows say how full the account is, not why
-                //    this request was refused, and holding to their reset would bench an
-                //    account for up to an hour over a refusal that clears in seconds.
-                //
-                // Jittered at the ceiling for the same lockstep reason as Anthropic's (see
-                // `jittered_quota_hold`), and logged as ARMED, after that clamp: a weekly
-                // reset days away arms at most the ceiling, and the log says what was armed.
+                // Codex quota bodies name the reset in Unix seconds; prefer it to header
+                // windows, then retry-after, then the short default. Plain rate limits keep
+                // their retry-after even when a response also carries window readings.
                 if provider == crate::provider::Provider::Codex {
-                    let quota_refusal = crate::quota::is_codex_quota_refusal(&up_headers);
+                    manager.update_quota_with_body(idx, &up_headers, 429, &refusal_body);
+                    let quota_refusal =
+                        crate::quota::is_codex_quota_refusal(&up_headers, &refusal_body);
+                    let clock = OffsetDateTime::now_utc();
                     let hold = quota_refusal
                         .then(|| {
-                            crate::quota::codex_hold_seconds(&up_headers, OffsetDateTime::now_utc())
+                            crate::quota::codex_body_reset(&refusal_body, clock)
+                                .map(|reset| {
+                                    reset
+                                        .unix_timestamp()
+                                        .saturating_sub(clock.unix_timestamp())
+                                        .max(0)
+                                })
+                                .or_else(|| crate::quota::codex_hold_seconds(&up_headers, clock))
                         })
                         .flatten()
                         .unwrap_or(retry_after);
-                    let armed = jittered_quota_hold(hold, now.nanosecond());
-                    tracing::info!(
-                        account = account_name.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        reached_type = header_str(crate::quota::CODEX_REACHED_TYPE_HEADER),
-                        quota_refusal,
-                        hold_seconds = armed,
-                        "Codex 429: holding the account and rotating"
-                    );
-                    manager.mark_rate_limited(idx, armed);
-                    tried.insert(idx);
-                    // A hold that is not a quota refusal is a timer, like the no-guidance
-                    // Park below: the soft-wait may take the account back once it expires.
-                    // A quota refusal is not: its account stays `rejected` past any hold.
-                    if !quota_refusal {
+                    if quota_refusal {
+                        manager.mark_codex_quota_limited(idx, hold);
+                    } else {
+                        manager.mark_rate_limited(idx, hold);
                         parked_transient.insert(idx);
                     }
+                    tracing::info!(
+                        account_index = idx,
+                        quota_refusal,
+                        hold_seconds = hold,
+                        "Codex 429: holding the account and rotating"
+                    );
+                    tried.insert(idx);
                     continue;
                 }
                 if !rejections.is_empty() {
@@ -20914,9 +20905,11 @@ mod tests {
                             refusal = refusal.header("retry-after", secs);
                         }
                         return refusal
-                            .body(Body::from(
-                                r#"{"error":{"type":"usage_limit_reached","message":"out"}}"#,
-                            ))
+                            .body(Body::from(if reached_type.is_some() {
+                                r#"{"error":{"type":"usage_limit_reached","message":"out"}}"#
+                            } else {
+                                r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#
+                            }))
                             .expect("429 response");
                     }
                 }
@@ -22764,5 +22757,168 @@ mod tests {
             refusals(&manager),
             (1, Some(CodexRefusalKind::PoolUnavailable))
         );
+    }
+    async fn check_codex_quota_body_case(
+        body: String,
+        reached_header: bool,
+        quota: bool,
+        body_reset: bool,
+    ) {
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 7200;
+        let reply = body.replace("RESET", &reset.to_string());
+        let origin = Router::new().fallback(move || {
+            let reply = reply.clone();
+            async move {
+                let mut response = Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("retry-after", "30")
+                    .header("x-codex-primary-used-percent", "10")
+                    .header("x-codex-primary-reset-at", (reset + 3600).to_string());
+                if reached_header {
+                    response = response.header(crate::quota::CODEX_REACHED_TYPE_HEADER, "primary");
+                }
+                response.body(Body::from(reply)).unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let mut config = codex_fleet("http://127.0.0.1:9", &url);
+        config
+            .extra
+            .insert("revalidationServe".into(), serde_json::json!(false));
+        let manager = Manager::with_live_refresher(config, None);
+        let response = send_codex_turn(&manager).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["error"]["type"],
+            if quota {
+                "usage_limit_reached"
+            } else {
+                "pool_unavailable"
+            }
+        );
+        let held_until = manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+            .rate_limited_until
+            .unwrap()
+            .unix_timestamp();
+        let expected = if quota {
+            reset + if body_reset { 0 } else { 3600 }
+        } else {
+            reset - 7200 + 30
+        };
+        assert!(
+            (held_until - expected).abs() <= 2,
+            "held until {held_until}, expected {expected}"
+        );
+        if quota {
+            assert!(
+                (body["error"]["resets_at"].as_i64().unwrap() - expected).abs() <= 2,
+                "{body}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_quota_body_without_headers_holds_to_its_reset() {
+        check_codex_quota_body_case(
+            r#"{"error":{"type":"usage_limit_reached","resets_at":RESET}}"#.into(),
+            false,
+            true,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_quota_header_without_body_holds_to_its_window() {
+        check_codex_quota_body_case("{}".into(), true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_quota_body_reset_outranks_the_header_window() {
+        check_codex_quota_body_case(
+            r#"{"error":{"type":"usage_limit_reached","resets_at":RESET}}"#.into(),
+            true,
+            true,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_relative_quota_reset_is_in_seconds() {
+        check_codex_quota_body_case(
+            r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}"#.into(),
+            false,
+            true,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_plain_rate_limit_uses_retry_after() {
+        check_codex_quota_body_case("{}".into(), false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_malformed_quota_body_uses_retry_after() {
+        check_codex_quota_body_case("{broken".into(), false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_quota_types_and_codes_all_stop_client_retries() {
+        for error in [
+            r#"{"type":"usage_not_included"}"#,
+            r#"{"type":"insufficient_quota"}"#,
+            r#"{"code":"insufficient_quota"}"#,
+            r#"{"code":"credit_balance_exhausted"}"#,
+            r#"{"code":"organization_spend_limit_exceeded"}"#,
+            r#"{"code":"project_spend_limit_exceeded"}"#,
+            r#"{"code":"organization_usage_limit_exceeded"}"#,
+        ] {
+            let mut error: serde_json::Value = serde_json::from_str(error).unwrap();
+            error["resets_at"] = serde_json::json!("RESET");
+            let body = serde_json::json!({"error":error})
+                .to_string()
+                .replace("\"RESET\"", "RESET");
+            check_codex_quota_body_case(body, false, true, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_exhausted_pool_reports_the_earliest_body_reset() {
+        let earliest = OffsetDateTime::now_utc().unix_timestamp() + 7200;
+        let origin = Router::new().fallback(move |headers: HeaderMap| async move {
+            let later = headers.get("authorization").unwrap() == "Bearer at-carol";
+            let reset = earliest + if later { 3600 } else { 0 };
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error":{"type":"usage_limit_reached","resets_at":reset}})
+                        .to_string(),
+                ))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
+        config
+            .extra
+            .insert("revalidationServe".into(), serde_json::json!(false));
+        let manager = Manager::with_live_refresher(config, None);
+        let body = body_json(send_codex_turn(&manager).await).await;
+        assert_eq!(body["error"]["type"], "usage_limit_reached");
+        assert!(
+            (body["error"]["resets_at"].as_i64().unwrap() - earliest).abs() <= 2,
+            "{body}"
+        );
+        server.abort();
     }
 }

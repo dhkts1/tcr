@@ -2039,8 +2039,15 @@ impl Manager {
         now: OffsetDateTime,
     ) -> Option<i64> {
         let now_ms = odt_to_ms(now);
-        Self::rejected_codex_window(account, threshold, now)
-            .map(|(_, reset)| odt_to_ms(reset))
+        account
+            .quota
+            .codex
+            .refusal_reset
+            .map(odt_to_ms)
+            .or_else(|| {
+                Self::rejected_codex_window(account, threshold, now)
+                    .map(|(_, reset)| odt_to_ms(reset))
+            })
             .or(account.rate_limited_until_ms)
             .filter(|&at| at > now_ms)
     }
