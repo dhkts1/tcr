@@ -777,15 +777,24 @@ mod tests {
     }
 
     /// The one class where the two disagree, as the doc says: serde_json's full
-    /// parse refuses a lone surrogate escape or an out-of-range number, and its
-    /// skip does not, so the tree walk forwarded such a body untouched and the
-    /// splice version extends its breakpoints. Pinned so a change to either side
-    /// is noticed.
+    /// parse refuses a lone surrogate escape, an out-of-range number or nesting
+    /// past its recursion limit of 128, and its skip does not, so the tree walk
+    /// forwarded such a body untouched and the splice version extends its
+    /// breakpoints. Pinned so a change to either side is noticed.
     #[test]
     fn extend_all_ttls_extends_where_only_the_full_parse_refused() {
+        let deep = format!(
+            r#"{{"metadata":{}{},"system":[{{"cache_control":{{}}}}]}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        // `^` stands for a backslash, as in the equivalence fixtures.
+        let lone_surrogate =
+            r#"{"model":"^ud800","system":[{"cache_control":{}}]}"#.replace('^', "\\");
         for body in [
-            r#"{"model":"\ud800","system":[{"cache_control":{}}]}"#,
+            lone_surrogate.as_str(),
             r#"{"metadata":{"n":1e400},"system":[{"cache_control":{}}]}"#,
+            deep.as_str(),
         ] {
             assert!(
                 reference_extend_all_ttls(body.as_bytes()).is_none(),
