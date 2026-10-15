@@ -1121,8 +1121,9 @@ pub struct Manager {
     ///
     /// Lock order is `config_write` → `config`, never the reverse: nothing that
     /// holds `config` ever reaches for this. A `()` payload — it guards an external
-    /// resource (the file), not data.
-    config_write: Mutex<()>,
+    /// resource (the file), not data. Shared ownership lets async callers move the
+    /// complete write, including its lock wait, onto a blocking worker.
+    config_write: Arc<Mutex<()>>,
     config_path: Option<PathBuf>,
     /// Set once, by [`Self::release_mutation_ownership`], when this process has
     /// handed the listening socket to a successor and is only draining.
@@ -1686,7 +1687,7 @@ impl Manager {
             warm_in_flight: AtomicBool::new(false),
             warm_wake: Notify::new(),
             config: Mutex::new(config),
-            config_write: Mutex::new(()),
+            config_write: Arc::new(Mutex::new(())),
             config_path,
             mutation_released: AtomicBool::new(false),
             upstream,

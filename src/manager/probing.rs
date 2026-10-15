@@ -231,7 +231,7 @@ impl Manager {
                 self.apply_usage(idx, &usage);
                 // A Codex probe names the account's ChatGPT plan; keep the row's plan current.
                 if let Some(plan) = usage.codex.as_ref().and_then(|f| f.plan_type.as_deref()) {
-                    self.record_codex_plan(idx, plan);
+                    self.record_codex_plan(idx, plan).await;
                 }
                 // A successful read is first-hand evidence the endpoint is up —
                 // clear any run of 5xx reads the same way a 429's self-clearing
@@ -411,45 +411,16 @@ impl Manager {
             )
         };
 
-        let Some(path) = self.config_path.as_ref() else {
-            return;
-        };
-        // INV1: held across save_plan's whole read + modify + sync + rename. Taken after the
-        // accounts lock above is released, never inside it, so the order stays one-way
-        // (`config_write` before `accounts`).
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
-        match config::save_plan(
-            path,
-            &target,
-            plan.organization_type.as_deref(),
-            plan.rate_limit_tier.as_deref(),
-            plan.seat_tier.as_deref(),
-        ) {
-            Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
-            Ok(outcome) => tracing::warn!(
-                account = %target.name, %outcome,
-                "learned this account's plan but could not persist it — it will be \
-                 re-fetched after a restart"
-            ),
-            Err(err) => tracing::warn!(
-                account = %target.name, error = %err,
-                "learned this account's plan but could not persist it — it will be \
-                 re-fetched after a restart"
-            ),
-        }
+        self.persist_probed_plan(target, plan).await;
     }
 
     /// Keep Codex account `idx`'s ChatGPT plan current from its usage probe's `plan_type`: when
     /// it differs from the row's `organization_type`, record it on the runtime row and write that
     /// one key to the config through [`config::save_plan`].
     ///
-    /// The probe, and not the login's id token, because the token's plan claim is read once, at
-    /// import: a refresh does not bring a new plan, so a Plus account upgraded to Pro would read
-    /// Plus until it was imported again. The usage probe runs on every cadence and names the
-    /// plan each time, so it is the plan's live source.
+    /// The usage probe names the currently served plan on every cadence; an id token's claim
+    /// dates from its last login or refresh. Taking the probe's reading shows a Plus-to-Pro
+    /// upgrade without requiring another import.
     ///
     /// The write is surgical for the reason [`config::save_disabled`] names: the server's
     /// `Config` is a boot-time snapshot, so writing it whole would revert every setting changed
@@ -457,7 +428,7 @@ impl Manager {
     /// `None`, which `save_plan` leaves untouched. An unchanged plan writes nothing, and a write
     /// that fails is logged and dropped, as [`Self::backfill_plan_if_unknown`] does: the runtime
     /// row carries the plan for this process's life, and the next start probes it again.
-    fn record_codex_plan(&self, idx: usize, plan_type: &str) {
+    async fn record_codex_plan(&self, idx: usize, plan_type: &str) {
         let target = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             let Some(account) = accounts.get_mut(idx) else {
@@ -488,28 +459,51 @@ impl Manager {
             )
         };
 
-        let Some(path) = self.config_path.as_ref() else {
+        self.persist_probed_plan(
+            target,
+            crate::probe::Plan {
+                organization_type: Some(plan_type.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    /// Persist either provider's probed plan without a config lock wait, file read or fsync
+    /// blocking a Tokio worker. The same writer lock still covers the complete surgical save.
+    async fn persist_probed_plan(&self, target: config::Account, plan: crate::probe::Plan) {
+        let Some(path) = self.config_path.clone() else {
             return;
         };
-        // INV1: held across save_plan's whole read + modify + sync + rename. Taken after the
-        // accounts lock above is released, never inside it, so the order stays one-way
-        // (`config_write` before `accounts`).
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
-        match config::save_plan(path, &target, Some(plan_type), None, None) {
-            Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
-            Ok(outcome) => tracing::warn!(
-                account = %target.name, %outcome,
-                "recorded this account's new ChatGPT plan but could not persist it — the next \
-                 start will probe it again"
-            ),
-            Err(err) => tracing::warn!(
-                account = %target.name, error = %err,
-                "recorded this account's new ChatGPT plan but could not persist it — the next \
-                 start will probe it again"
-            ),
+        let config_write = Arc::clone(&self.config_write);
+        let name = target.name.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            // INV1: taken after releasing accounts, and held across the whole read,
+            // modify, sync and rename. The async worker waits on neither it nor disk.
+            let _writing = config_write.lock().expect("config write lock poisoned");
+            match config::save_plan(
+                &path,
+                &target,
+                plan.organization_type.as_deref(),
+                plan.rate_limit_tier.as_deref(),
+                plan.seat_tier.as_deref(),
+            ) {
+                Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
+                Ok(outcome) => tracing::warn!(
+                    account = %target.name, %outcome,
+                    "learned this account's plan but could not persist it — it will be \
+                     re-fetched after a restart"
+                ),
+                Err(error) => tracing::warn!(
+                    account = %target.name, %error,
+                    "learned this account's plan but could not persist it — it will be \
+                     re-fetched after a restart"
+                ),
+            }
+        })
+        .await
+        {
+            tracing::warn!(account = %name, %error, "the plan persistence task did not finish");
         }
     }
 
@@ -519,5 +513,130 @@ impl Manager {
     /// anything.
     pub fn set_plan_prober(&self, prober: Arc<dyn crate::probe::PlanProber>) {
         *self.plan_prober.write().expect("plan prober lock poisoned") = prober;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoNetwork;
+
+    impl TokenRefresher for NoNetwork {
+        fn refresh(&self, _: crate::provider::Provider, _: String) -> crate::oauth::RefreshFuture {
+            panic!("a plan probe must not need a refresh");
+        }
+    }
+
+    impl UsageProber for NoNetwork {
+        fn probe(&self, credential: crate::probe::ProbeCredential) -> crate::probe::ProbeFuture {
+            let codex = match credential.provider {
+                crate::provider::Provider::Anthropic => None,
+                crate::provider::Provider::Codex => Some(crate::codex_probe::CodexProbeFacts {
+                    plan_type: Some("pro".into()),
+                    ..Default::default()
+                }),
+            };
+            Box::pin(async move {
+                Ok(crate::probe::Usage {
+                    codex,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    impl AccountWarmer for NoNetwork {
+        fn warm(&self, _: String, _: String) -> crate::warmer::WarmFuture {
+            panic!("a plan probe must not warm an account");
+        }
+    }
+
+    impl crate::probe::PlanProber for NoNetwork {
+        fn plan(&self, _: String) -> crate::probe::PlanFuture {
+            Box::pin(async {
+                crate::probe::Plan {
+                    organization_type: Some("claude_team".into()),
+                    ..Default::default()
+                }
+            })
+        }
+    }
+
+    async fn assert_plan_persistence_does_not_block(provider: crate::provider::Provider) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut account = serde_json::json!({
+            "name": "alice@example.com",
+            "type": "oauth",
+            "provider": provider,
+            "accessToken": "fixture-access",
+            "refreshToken": "fixture-refresh",
+            "expiresAt": 4_102_444_800_000_i64,
+            "priority": 0,
+        });
+        let expected_plan = match provider {
+            crate::provider::Provider::Anthropic => "claude_team",
+            crate::provider::Provider::Codex => {
+                account["organizationType"] = serde_json::json!("plus");
+                account["accountUuid"] = serde_json::json!("11111111-1111-4111-8111-111111111111");
+                "pro"
+            }
+        };
+        std::fs::write(
+            &path,
+            serde_json::json!({ "accounts": [account] }).to_string(),
+        )
+        .unwrap();
+        let manager = Manager::new(
+            config::load(&path).unwrap(),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Arc::new(NoNetwork),
+            Some(path.clone()),
+        );
+        manager.set_plan_prober(Arc::new(NoNetwork));
+
+        // Another config writer can stall on a slow disk. Keep its lock until the async
+        // heartbeat runs; the watchdog releases it if a regression blocks this worker.
+        let holder_manager = Arc::clone(&manager);
+        let still_held = Arc::new(AtomicBool::new(true));
+        let holder_flag = Arc::clone(&still_held);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let writing = holder_manager.config_write.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            holder_flag.store(false, Ordering::SeqCst);
+            drop(writing);
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (_, responsive) = tokio::join!(manager.probe_account(0), async {
+            tokio::task::yield_now().await;
+            let responsive = still_held.load(Ordering::SeqCst);
+            let _ = release_tx.send(());
+            responsive
+        });
+        holder.join().unwrap();
+        assert!(
+            responsive,
+            "{provider:?} plan persistence blocked the async runtime"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["accounts"][0]["organizationType"], expected_plan);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_plan_persistence_does_not_block_the_async_runtime() {
+        assert_plan_persistence_does_not_block(crate::provider::Provider::Codex).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_plan_persistence_does_not_block_the_async_runtime() {
+        assert_plan_persistence_does_not_block(crate::provider::Provider::Anthropic).await;
     }
 }
