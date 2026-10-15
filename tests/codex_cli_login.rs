@@ -9,8 +9,8 @@
 //!   `$HOME/.config/teamclaude.json`, so the real config (working credentials for real accounts)
 //!   and the real `~/.codex` are never read or written. Every sign-in folder tcr makes lands
 //!   beside that config, inside the tempdir.
-//! * `proxy.port` in that config → a port nothing listens on, obtained by binding and releasing
-//!   one, so the route probe never reaches a real proxy on 3456.
+//! * `proxy.port` in that config → `0`, which cannot name an actual listener, so the route probe
+//!   cannot hit another test's reused ephemeral port or a real proxy on 3456.
 //! * `codexUpstream` in that config → a stub on loopback ([`spawn_upstream`]) that clears the
 //!   fake workspaces, so the import's workspace check never reaches chatgpt.com.
 //! * `TCR_CODEX_BIN` → a fake `codex`, a shell script in the tempdir that logs its
@@ -126,14 +126,6 @@ fn fixture() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A port nothing is listening on: bound to learn the number, then released.
-fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
-    let port = listener.local_addr().expect("an address").port();
-    drop(listener);
-    port
-}
-
 /// A stub `codexUpstream` on loopback that answers every request `200` with `answer`, calling
 /// `seen` first. Returns its base URL and how many requests it answered.
 fn spawn_upstream(
@@ -196,8 +188,7 @@ impl Scratch {
         std::fs::write(
             &config,
             format!(
-                r#"{{ "proxy": {{ "port": {} }}, "codexUpstream": "{upstream}", "accounts": {accounts} }}"#,
-                dead_port()
+                r#"{{ "proxy": {{ "port": 0 }}, "codexUpstream": "{upstream}", "accounts": {accounts} }}"#
             ),
         )
         .expect("writing the scratch config");

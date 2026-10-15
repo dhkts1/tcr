@@ -18,10 +18,10 @@
 //! * `TCR_CLAUDE_CODE_CREDENTIALS` → a path that does not exist, so nothing in the run reads the
 //!   developer's Claude Code login out of the login Keychain either (a scratch `HOME` does not
 //!   scratch the Keychain).
-//! * `proxy.port` in the config the test writes → a port nothing is listening on, obtained by
-//!   binding and releasing one. The import probes that port for a live account-add route before it
-//!   writes (`oauth::login_route`), and this machine may well have a real proxy on the default
-//!   3456, which these tests must neither talk to nor add an account to.
+//! * `proxy.port` in the config the test writes → `0`, which cannot name an actual listener.
+//!   The import probes that port for a live account-add route before it writes
+//!   (`oauth::login_route`). A released ephemeral port can be reused by another test's stub;
+//!   port zero avoids that race and never reaches a real proxy on the default 3456.
 //! * `codexUpstream` in the config the test writes → a stub on loopback ([`spawn_codex_upstream`]).
 //!   Before it writes, the import asks `codexUpstream` where the login's workspace is served
 //!   (`codex_login::check_workspace_routing`), and the default is the real chatgpt.com.
@@ -56,18 +56,6 @@ fn fake_codex_auth_json() -> String {
     )
 }
 
-/// A port nothing is listening on: bound to learn the number, then released.
-fn dead_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port must work");
-    let port = listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port();
-    drop(listener);
-    port
-}
-
 /// An accounts/check answer that clears the fixture login's workspace for the pool: served at
 /// chatgpt.com, with no routing override.
 const UNCONSTRAINED_WORKSPACE: &str = r#"{"accounts":{"11111111-1111-4111-8111-111111111111":{"workspace_backend_origin":"NO_CONSTRAINT","account_routing_override":"NO_CONSTRAINT","plan_type":"pro"}},"account_ordering":["11111111-1111-4111-8111-111111111111"]}"#;
@@ -78,6 +66,13 @@ const UNCONSTRAINED_WORKSPACE: &str = r#"{"accounts":{"11111111-1111-4111-8111-1
 fn spawn_codex_upstream(answer: &'static str) -> (String, Arc<AtomicUsize>) {
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub upstream must work");
+    serve_codex_upstream(listener, answer)
+}
+
+fn serve_codex_upstream(
+    listener: std::net::TcpListener,
+    answer: &'static str,
+) -> (String, Arc<AtomicUsize>) {
     let addr = listener
         .local_addr()
         .expect("a bound listener has an address");
@@ -104,7 +99,7 @@ fn spawn_codex_upstream(answer: &'static str) -> (String, Arc<AtomicUsize>) {
     (format!("http://{addr}"), answered)
 }
 
-/// A scratch `HOME` holding a config on a dead port whose `accounts` array is `accounts` (JSON)
+/// A scratch `HOME` holding an offline config whose `accounts` array is `accounts` (JSON)
 /// and whose `codexUpstream` clears the fixture login's workspace. Returns the tempdir and the
 /// config's path.
 fn scratch_home(accounts: &str) -> (tempfile::TempDir, PathBuf) {
@@ -126,8 +121,7 @@ fn scratch_home_answering(
     std::fs::write(
         &config,
         format!(
-            r#"{{ "proxy": {{ "port": {} }}, "codexUpstream": "{upstream}", "accounts": {accounts} }}"#,
-            dead_port()
+            r#"{{ "proxy": {{ "port": 0 }}, "codexUpstream": "{upstream}", "accounts": {accounts} }}"#
         ),
     )
     .expect("writing the scratch config");
@@ -658,6 +652,34 @@ fn events(out: &Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn output_details(out: &Output) -> String {
+    format!(
+        "exit {:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Another test's stub can claim a released ephemeral port before the import probes it.
+#[test]
+fn offline_import_ignores_an_ephemeral_listener_reusing_a_released_port() {
+    let (home, config) = scratch_home("[]");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    let port = u16::try_from(document["proxy"]["port"].as_u64().unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let (_upstream, unrelated_requests) = serve_codex_upstream(listener, UNCONSTRAINED_WORKSPACE);
+    let auth = home.path().join("codex-auth.json");
+    std::fs::write(&auth, fake_codex_auth_json()).unwrap();
+
+    let out = login_from_codex(home.path(), &config, Some(&auth), &["--non-interactive"]);
+
+    assert!(out.status.success(), "{}", output_details(&out));
+    assert_eq!(unrelated_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(accounts_of(&config)[0]["provider"], "codex");
+}
+
 /// `--from-codex --non-interactive` speaks the login protocol: the import's cost as one
 /// `notice`, then each notice that holds (here the first-account one: codex has a login of its
 /// own and no older `tcr` is in reach), then `saved` with the provider and the plan, and no
@@ -712,11 +734,11 @@ fn from_codex_non_interactive_emits_saved_notice_and_error() {
     let auth = home.path().join("codex-auth.json");
     std::fs::write(&auth, fake_codex_auth_json()).expect("writing the fake auth.json");
     let out = login_from_codex(home.path(), &config, Some(&auth), &["--non-interactive"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(1), "{}", output_details(&out));
     let lines = events(&out);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["event"], "error");
-    assert_eq!(lines[0]["code"], "codex-routed");
+    assert_eq!(lines[0]["code"], "codex-routed", "{}", output_details(&out));
     let reason = lines[0]["reason"].as_str().expect("a reason").to_string();
     assert!(
         reason.starts_with(
