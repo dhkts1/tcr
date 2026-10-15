@@ -107,6 +107,19 @@ struct WireSessionsFile {
     sessions: HashMap<String, WireSession>,
 }
 
+/// [`WireSessionsFile`]'s write side: the same JSON, built from references to the caller's
+/// sessions instead of a copy of each, and keyed in sorted order so two saves of one table are
+/// the same bytes. The copy it replaced also landed the sessions in a fresh `HashMap`, whose
+/// random order rewrote about 22,000 of the file's lines on every 5 s flush to change a few
+/// hundred.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSessionsFileRef<'a> {
+    version: u32,
+    saved_at_ms: i64,
+    sessions: std::collections::BTreeMap<&'a str, &'a WireSession>,
+}
+
 /// What a [`load`] made of the file — mirrors [`crate::affinity::LoadReport`]'s
 /// shape and reasoning: every field except `sessions` exists so the caller can
 /// say out loud what it threw away.
@@ -151,12 +164,10 @@ pub fn save(
         rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.last_seen_ms));
         rows.truncate(PERSIST_CAP);
     }
-    let sessions: HashMap<String, WireSession> = rows
-        .into_iter()
-        .map(|(k, s)| (k.clone(), s.clone()))
-        .collect();
+    let sessions: std::collections::BTreeMap<&str, &WireSession> =
+        rows.into_iter().map(|(k, s)| (k.as_str(), s)).collect();
     let count = sessions.len();
-    let file = WireSessionsFile {
+    let file = WireSessionsFileRef {
         version: FORMAT_VERSION,
         saved_at_ms: now_ms,
         sessions,
@@ -538,6 +549,39 @@ mod tests {
             restored.seconds_p50(),
             3.0,
             "the reservoir itself round-tripped, not just the call count"
+        );
+    }
+
+    /// Two saves of one table write the same bytes, and they still read back as the table.
+    /// Before the sessions were written in sorted order, each save landed them in a fresh
+    /// `HashMap` with its own random order, so the file changed on every flush whether or not
+    /// any session had.
+    #[test]
+    fn two_saves_of_one_table_write_the_same_bytes() {
+        let now = crate::now_ms();
+        let sessions: HashMap<String, WireSession> = (0..64)
+            .map(|n| {
+                (
+                    format!("session-fake-{n}"),
+                    session("a@example.com", now - n, n as u64),
+                )
+            })
+            .collect();
+        let first = tmp("same-bytes-1");
+        let second = tmp("same-bytes-2");
+        assert_eq!(save(&first, &sessions, now).expect("first save"), 64);
+        assert_eq!(save(&second, &sessions, now).expect("second save"), 64);
+        assert_eq!(
+            std::fs::read(&first).expect("read the first file"),
+            std::fs::read(&second).expect("read the second file"),
+            "one table must write one file"
+        );
+        let report = load(&first, now, RESTORE_TTL_MS);
+        assert_eq!(report.degraded, None);
+        assert_eq!(report.sessions.len(), 64);
+        assert_eq!(
+            report.sessions.get("session-fake-7").map(|s| s.tools.calls),
+            Some(7)
         );
     }
 }

@@ -420,12 +420,13 @@ impl Manager {
             .is_some_and(|&at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS)
     }
 
-    /// The map as persistable records — each live entry's index replaced by the identity of the
-    /// account at that index.
+    /// The map as a persistable [`bound_tokens::Snapshot`]: each live entry's index replaced by
+    /// the identity of the account at that index, copied once per account rather than once per
+    /// token.
     ///
     /// An entry whose index names no account is skipped rather than written: writing a
     /// placeholder identity is precisely the mis-resolution this design exists to prevent.
-    pub fn bound_token_snapshot(&self) -> Vec<(String, BoundTokenKind, StoredAccount, i64)> {
+    pub fn bound_token_snapshot(&self) -> bound_tokens::Snapshot {
         let entries: Vec<(String, usize, BoundTokenKind, i64)> = {
             let map = self
                 .bound_tokens
@@ -435,27 +436,27 @@ impl Manager {
                 .map(|(hash, (index, kind, minted))| (hash.to_string(), index, kind, minted))
                 .collect()
         };
+        let mut snapshot = bound_tokens::Snapshot::default();
         if entries.is_empty() {
-            return Vec::new();
+            return snapshot;
         }
         let accounts = self.accounts.read().expect("accounts lock poisoned");
-        entries
-            .into_iter()
-            .filter_map(|(hash, index, kind, minted_at_ms)| {
-                let account = accounts.get(index)?;
-                Some((
-                    hash,
-                    kind,
-                    StoredAccount {
-                        name: account.name.clone(),
-                        account_uuid: account.account_uuid.clone(),
-                        org_uuid: account.org_uuid.clone(),
-                        org_name: account.org_name.clone(),
-                    },
-                    minted_at_ms,
-                ))
-            })
-            .collect()
+        let mut slots: Vec<Option<bound_tokens::AccountSlot>> = vec![None; accounts.len()];
+        for (hash, index, kind, minted_at_ms) in entries {
+            let (Some(account), Some(cell)) = (accounts.get(index), slots.get_mut(index)) else {
+                continue;
+            };
+            let slot = *cell.get_or_insert_with(|| {
+                snapshot.account_slot(StoredAccount {
+                    name: account.name.clone(),
+                    account_uuid: account.account_uuid.clone(),
+                    org_uuid: account.org_uuid.clone(),
+                    org_name: account.org_name.clone(),
+                })
+            });
+            snapshot.push(hash, kind, slot, minted_at_ms);
+        }
+        snapshot
     }
 
     /// Write the map to `path`, atomically. Returns how many tokens landed.
@@ -464,7 +465,7 @@ impl Manager {
     /// traffic exactly as it did before the file existed, and pays the rejected turns it was
     /// buying back.
     pub fn flush_bound_tokens(&self, path: &Path) -> Result<usize, ConfigError> {
-        bound_tokens::save(path, &self.bound_token_snapshot(), crate::now_ms())
+        bound_tokens::save(path, self.bound_token_snapshot(), crate::now_ms())
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded
@@ -987,5 +988,37 @@ mod tests {
         assert!(manager
             .bound_token_account(std::slice::from_ref(&newest))
             .is_some());
+    }
+
+    /// What one flush of a full map costs: the snapshot, the file build, the serialization and
+    /// the write. The live proxy does this every 60 s. A timing, not a gate, so it is ignored;
+    /// run it with `cargo test --release --lib flush_at_the_cap_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run by hand"]
+    fn flush_at_the_cap_costs() {
+        let manager = manager_over(&[
+            account("a@example.com", "uuid-a"),
+            account("b@example.com", "uuid-b"),
+        ]);
+        let now = crate::now_ms();
+        let fill: Vec<MintedToken> = (0..BOUND_TOKEN_CAP)
+            .map(|n| (BoundTokenKind::MessageId, format!("msg_fake_{n}")))
+            .collect();
+        let (first, second) = fill.split_at(BOUND_TOKEN_CAP / 2);
+        manager.record_bound_tokens(first, 0, now);
+        manager.record_bound_tokens(second, 1, now);
+        let path = tmp("flush-bench");
+        let rounds: u32 = 10;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            assert_eq!(
+                manager.flush_bound_tokens(&path).expect("flush"),
+                BOUND_TOKEN_CAP
+            );
+        }
+        println!(
+            "flush_bound_tokens at the cap ({BOUND_TOKEN_CAP} entries): {:?} per flush",
+            start.elapsed() / rounds
+        );
     }
 }
