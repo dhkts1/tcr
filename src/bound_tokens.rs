@@ -225,51 +225,103 @@ pub fn path_beside(affinity_path: &Path) -> PathBuf {
     affinity_path.with_file_name(FILE_NAME)
 }
 
-/// Write `tokens` to `path` atomically at `0600`, keeping at most [`BOUND_TOKEN_CAP`] of them
-/// (newest first). `tokens` pairs each record with the identity of the account that minted it;
-/// identities are de-duplicated into the file's account table.
+/// A slot in a [`Snapshot`]'s account list. Only [`Snapshot::account_slot`] makes one, so a
+/// token pushed with it always names an account the snapshot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountSlot(usize);
+
+/// What a flush hands [`save`]: each minting account once, and every token naming its account
+/// by slot.
+///
+/// The shape this replaced carried a full [`StoredAccount`] (four strings) beside every token,
+/// so a full map was 65,536 copies of a handful of identities, copied again inside `save` and
+/// matched back to a table by string comparison, every 60 s. Here the identity is copied once
+/// per account and each token carries a number.
+#[derive(Debug, Default)]
+pub struct Snapshot {
+    accounts: Vec<StoredAccount>,
+    tokens: Vec<StoredBoundToken>,
+}
+
+impl Snapshot {
+    /// The slot for `account`, adding it on first sight. Equal identities share one slot, as
+    /// the file's account table always has.
+    pub fn account_slot(&mut self, account: StoredAccount) -> AccountSlot {
+        if let Some(slot) = self.accounts.iter().position(|a| *a == account) {
+            return AccountSlot(slot);
+        }
+        self.accounts.push(account);
+        AccountSlot(self.accounts.len() - 1)
+    }
+
+    /// One token, minted at `ms` on the account at `slot`.
+    pub fn push(&mut self, hash: String, kind: BoundTokenKind, slot: AccountSlot, ms: i64) {
+        self.tokens.push(StoredBoundToken {
+            hash,
+            kind,
+            account: slot.0,
+            ms,
+        });
+    }
+}
+
+/// Write `snapshot` to `path` atomically at `0600`, keeping at most [`BOUND_TOKEN_CAP`] tokens
+/// (newest first). The file's account table lists only accounts a kept token names, in the
+/// order the hash-sorted tokens first name them, so the bytes do not depend on the order the
+/// snapshot was built in.
 ///
 /// Serialized COMPACT, not pretty: at the cap this file is megabytes, and pretty-printing one
 /// token per four lines roughly triples it for a file no one reads by eye. Returns how many
 /// tokens landed. The caller decides what a failure means; it is never fatal here.
-pub fn save(
-    path: &Path,
-    tokens: &[(String, BoundTokenKind, StoredAccount, i64)],
-    now_ms: i64,
-) -> Result<usize, ConfigError> {
-    let mut tokens = tokens.to_vec();
+pub fn save(path: &Path, snapshot: Snapshot, now_ms: i64) -> Result<usize, ConfigError> {
+    let Snapshot {
+        accounts,
+        mut tokens,
+    } = snapshot;
     if tokens.len() > BOUND_TOKEN_CAP {
-        tokens.sort_by_key(|(_, _, _, ms)| std::cmp::Reverse(*ms));
+        tokens.sort_by_key(|t| std::cmp::Reverse(t.ms));
         tokens.truncate(BOUND_TOKEN_CAP);
     }
     // Stable order keeps the write byte-identical when nothing changed.
-    tokens.sort_by(|a, b| a.0.cmp(&b.0));
+    tokens.sort_by(|a, b| a.hash.cmp(&b.hash));
 
-    let mut accounts: Vec<StoredAccount> = Vec::new();
-    let mut stored: Vec<StoredBoundToken> = Vec::with_capacity(tokens.len());
-    for (hash, kind, account, ms) in tokens {
-        let slot = match accounts.iter().position(|a| *a == account) {
-            Some(slot) => slot,
+    let mut unplaced: Vec<Option<StoredAccount>> = accounts.into_iter().map(Some).collect();
+    let mut placed: Vec<Option<usize>> = vec![None; unplaced.len()];
+    let mut table: Vec<StoredAccount> = Vec::new();
+    for token in &mut tokens {
+        let from = token.account;
+        let to = match placed.get(from).copied().flatten() {
+            Some(to) => to,
             None => {
-                accounts.push(account);
-                accounts.len() - 1
+                let Some(account) = unplaced.get_mut(from).and_then(Option::take) else {
+                    return Err(ConfigError::Io(std::io::Error::other(format!(
+                        "bound-token snapshot names account slot {from}, which it does not hold"
+                    ))));
+                };
+                table.push(account);
+                let to = table.len() - 1;
+                if let Some(cell) = placed.get_mut(from) {
+                    *cell = Some(to);
+                }
+                to
             }
         };
-        stored.push(StoredBoundToken {
-            hash,
-            kind,
-            account: slot,
-            ms,
-        });
+        token.account = to;
     }
-    let count = stored.len();
+    let count = tokens.len();
     let file = BoundTokenFile {
         version: FORMAT_VERSION,
         saved_at_ms: now_ms,
-        accounts,
-        tokens: stored,
+        accounts: table,
+        tokens,
     };
-    crate::config::write_atomic(path, &serde_json::to_string(&file)?)?;
+    // A cache of several megabytes, which `load` reads as empty when it is missing or damaged:
+    // atomic, but not flushed to the disk (see `Durability::Cache`).
+    crate::config::write_atomic_with(
+        path,
+        &serde_json::to_string(&file)?,
+        crate::config::Durability::Cache,
+    )?;
     Ok(count)
 }
 
@@ -388,6 +440,111 @@ mod tests {
         ms: i64,
     ) -> (String, BoundTokenKind, StoredAccount, i64) {
         (hash_token(token), kind, account, ms)
+    }
+
+    /// A [`Snapshot`] built from records that each carry their account, in order, the way
+    /// `Manager::bound_token_snapshot` builds one from the live map.
+    fn records(entries: &[(String, BoundTokenKind, StoredAccount, i64)]) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        for (hash, kind, account, ms) in entries {
+            let slot = snapshot.account_slot(account.clone());
+            snapshot.push(hash.clone(), *kind, slot, *ms);
+        }
+        snapshot
+    }
+
+    /// The tests below predate [`Snapshot`] and state their input as records; this shadows the
+    /// real [`super::save`] only to build the snapshot first, then calls it.
+    fn save(
+        path: &Path,
+        entries: &[(String, BoundTokenKind, StoredAccount, i64)],
+        now_ms: i64,
+    ) -> Result<usize, ConfigError> {
+        super::save(path, records(entries), now_ms)
+    }
+
+    /// The file `save` wrote before [`Snapshot`] existed, rebuilt here as the reference: copy
+    /// every record, keep the newest at the cap, sort by hash, then build the account table by
+    /// comparing each record's identity against it.
+    fn file_before_snapshot(
+        entries: &[(String, BoundTokenKind, StoredAccount, i64)],
+        now_ms: i64,
+    ) -> String {
+        let mut tokens = entries.to_vec();
+        if tokens.len() > BOUND_TOKEN_CAP {
+            tokens.sort_by_key(|(_, _, _, ms)| std::cmp::Reverse(*ms));
+            tokens.truncate(BOUND_TOKEN_CAP);
+        }
+        tokens.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut accounts: Vec<StoredAccount> = Vec::new();
+        let mut stored = Vec::with_capacity(tokens.len());
+        for (hash, kind, account, ms) in tokens {
+            let slot = match accounts.iter().position(|a| *a == account) {
+                Some(slot) => slot,
+                None => {
+                    accounts.push(account);
+                    accounts.len() - 1
+                }
+            };
+            stored.push(StoredBoundToken {
+                hash,
+                kind,
+                account: slot,
+                ms,
+            });
+        }
+        serde_json::to_string(&BoundTokenFile {
+            version: FORMAT_VERSION,
+            saved_at_ms: now_ms,
+            accounts,
+            tokens: stored,
+        })
+        .expect("serialize the reference file")
+    }
+
+    /// Building the file from a [`Snapshot`] changes what a flush copies, never what it writes:
+    /// byte for byte the file the record-copying `save` wrote, under the cap and over it, with
+    /// two slots holding one identity and tokens arriving in no particular order.
+    #[test]
+    fn a_snapshot_writes_the_same_bytes_as_the_record_copies_did() {
+        let now = 1_000_000_000;
+        let identities = [
+            stored_account("a@example.com", "uuid-a"),
+            stored_account("b@example.com", "uuid-b"),
+            stored_account("a@example.com", "uuid-a"),
+            stored_account("c@example.com", "uuid-c"),
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for count in [3_000, BOUND_TOKEN_CAP + 5] {
+            let entries: Vec<(String, BoundTokenKind, StoredAccount, i64)> = (0..count)
+                .map(|n| {
+                    let kind = if next() % 2 == 0 {
+                        BoundTokenKind::MessageId
+                    } else {
+                        BoundTokenKind::ThinkingSignature
+                    };
+                    entry(
+                        &format!("tok_fake_{}", next()),
+                        kind,
+                        identities[n % identities.len()].clone(),
+                        now - n as i64,
+                    )
+                })
+                .collect();
+            let path = tmp("same-bytes");
+            save(&path, &entries, now).expect("save");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read the file"),
+                file_before_snapshot(&entries, now),
+                "{count} tokens: the file must match the record-copying save byte for byte"
+            );
+        }
     }
 
     /// A unique path per test: the suite runs tests in parallel threads of ONE process, so a

@@ -34,9 +34,10 @@
 //! - **Translating index ↔ identity.** The live map is positional, because the response path
 //!   learns an index and must not pay the accounts lock per token; the file is not.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use time::OffsetDateTime;
 
@@ -57,6 +58,80 @@ pub const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
 /// One token as the response path hands it over: its kind and the token itself, unhashed. The
 /// hashing happens here, once, so no caller can forget it.
 pub type MintedToken = (BoundTokenKind, String);
+
+/// What the map holds for one token: the minting account's index, the kind, and the mint time
+/// in ms.
+type Minted = (usize, BoundTokenKind, i64);
+
+/// The bound-token map, with its entries also kept in mint order so that bounding it costs the
+/// entries it drops and not a pass over all of them.
+///
+/// Before this, every record walked the whole map for the TTL and, once the map was full,
+/// copied every key into a list and sorted it to drop the oldest one or two. A busy proxy keeps
+/// the map full (65,536 entries, measured 2026-10-15), so each response that minted a token
+/// paid 4-6 ms for that sort, under the lock the request path reads through, and a live profile
+/// put it at about half of the proxy's busy time. Here bounding pops from the oldest end.
+///
+/// Only these methods touch the two halves, which is what keeps an entry in `by_age` exactly
+/// when it is in `by_hash`, at its current mint time.
+#[derive(Debug, Default)]
+pub(super) struct BoundTokenMap {
+    by_hash: HashMap<Arc<str>, Minted>,
+    /// (mint ms, hash), oldest first. Equal mint times fall to the hash's order; the sort this
+    /// replaced left them to the map's iteration order, so no caller relied on one.
+    by_age: BTreeSet<(i64, Arc<str>)>,
+}
+
+impl BoundTokenMap {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    pub(super) fn get(&self, hash: &str) -> Option<Minted> {
+        self.by_hash.get(hash).copied()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&str, Minted)> + '_ {
+        self.by_hash.iter().map(|(hash, &minted)| (&**hash, minted))
+    }
+
+    /// Set `hash`'s entry, replacing an earlier mint of the same token.
+    pub(super) fn insert(&mut self, hash: &str, value: Minted) {
+        let key = match self.by_hash.get_key_value(hash) {
+            Some((key, &(_, _, old_ms))) => {
+                let key = Arc::clone(key);
+                self.by_age.remove(&(old_ms, Arc::clone(&key)));
+                key
+            }
+            None => Arc::from(hash),
+        };
+        self.by_age.insert((value.2, Arc::clone(&key)));
+        self.by_hash.insert(key, value);
+    }
+
+    /// Set `hash`'s entry only when it has none, because the entry already here is fresher.
+    pub(super) fn insert_if_absent(&mut self, hash: &str, value: Minted) {
+        if !self.by_hash.contains_key(hash) {
+            self.insert(hash, value);
+        }
+    }
+
+    /// Drop every entry minted more than `ttl_ms` before `now_ms`, then the oldest until at most
+    /// `cap` remain. The expired entries are always the oldest ones, so both are pops from the
+    /// same end.
+    pub(super) fn prune(&mut self, now_ms: i64, ttl_ms: i64, cap: usize) {
+        while let Some(oldest_ms) = self.by_age.first().map(|&(minted, _)| minted) {
+            if now_ms.saturating_sub(oldest_ms) <= ttl_ms && self.by_hash.len() <= cap {
+                break;
+            }
+            let Some((_, hash)) = self.by_age.pop_first() else {
+                break;
+            };
+            self.by_hash.remove(&hash);
+        }
+    }
+}
 
 impl Manager {
     /// Flag the bound-token map as changed since the last flush — same relaxed-atomic debounce
@@ -80,6 +155,8 @@ impl Manager {
     /// that is not enough the OLDEST mints are evicted until the map is back under
     /// [`BOUND_TOKEN_CAP`]. Oldest, not newest: an evicted token stops pinning its conversation,
     /// and the conversations most likely to still be live are the ones minted most recently.
+    /// [`BoundTokenMap::prune`] does both by popping from the oldest end, so a full map costs
+    /// this call the entries it drops, not a sort of all of them.
     pub fn record_bound_tokens(&self, tokens: &[MintedToken], account_idx: usize, now_ms: i64) {
         if tokens.is_empty() {
             return;
@@ -90,22 +167,11 @@ impl Manager {
             .expect("bound tokens lock poisoned");
         for (kind, token) in tokens {
             map.insert(
-                bound_tokens::hash_token(token),
+                &bound_tokens::hash_token(token),
                 (account_idx, *kind, now_ms),
             );
         }
-        map.retain(|_, &mut (_, _, minted)| now_ms.saturating_sub(minted) <= BOUND_TOKEN_TTL_MS);
-        if map.len() > BOUND_TOKEN_CAP {
-            let mut by_age: Vec<(String, i64)> = map
-                .iter()
-                .map(|(hash, &(_, _, minted))| (hash.clone(), minted))
-                .collect();
-            by_age.sort_by_key(|&(_, minted)| minted);
-            let excess = map.len() - BOUND_TOKEN_CAP;
-            for (hash, _) in by_age.into_iter().take(excess) {
-                map.remove(&hash);
-            }
-        }
+        map.prune(now_ms, BOUND_TOKEN_TTL_MS, BOUND_TOKEN_CAP);
         drop(map);
         self.mark_bound_tokens_dirty();
     }
@@ -129,7 +195,7 @@ impl Manager {
             .expect("bound tokens lock poisoned");
         tokens
             .iter()
-            .filter_map(|token| map.get(&bound_tokens::hash_token(token)).copied())
+            .filter_map(|token| map.get(&bound_tokens::hash_token(token)))
             .max_by_key(|&(_, _, minted)| minted)
             .map(|(index, kind, _)| (index, kind))
     }
@@ -293,7 +359,7 @@ impl Manager {
             .expect("bound tokens lock poisoned");
         let mut seen: Option<usize> = None;
         for token in tokens {
-            let Some(&(index, _, _)) = map.get(&bound_tokens::hash_token(token)) else {
+            let Some((index, _, _)) = map.get(&bound_tokens::hash_token(token)) else {
                 continue;
             };
             match seen {
@@ -369,43 +435,44 @@ impl Manager {
             .is_some_and(|&at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS)
     }
 
-    /// The map as persistable records — each live entry's index replaced by the identity of the
-    /// account at that index.
+    /// The map as a persistable [`bound_tokens::Snapshot`]: each live entry's index replaced by
+    /// the identity of the account at that index, copied once per account rather than once per
+    /// token.
     ///
     /// An entry whose index names no account is skipped rather than written: writing a
     /// placeholder identity is precisely the mis-resolution this design exists to prevent.
-    pub fn bound_token_snapshot(&self) -> Vec<(String, BoundTokenKind, StoredAccount, i64)> {
+    pub fn bound_token_snapshot(&self) -> bound_tokens::Snapshot {
         let entries: Vec<(String, usize, BoundTokenKind, i64)> = {
             let map = self
                 .bound_tokens
                 .lock()
                 .expect("bound tokens lock poisoned");
             map.iter()
-                .map(|(hash, &(index, kind, minted))| (hash.clone(), index, kind, minted))
+                .map(|(hash, (index, kind, minted))| (hash.to_string(), index, kind, minted))
                 .collect()
         };
+        let mut snapshot = bound_tokens::Snapshot::default();
         if entries.is_empty() {
-            return Vec::new();
+            return snapshot;
         }
         let accounts = self.accounts.read().expect("accounts lock poisoned");
-        entries
-            .into_iter()
-            .filter_map(|(hash, index, kind, minted_at_ms)| {
-                let account = accounts.get(index)?;
-                Some((
-                    hash,
-                    kind,
-                    StoredAccount {
-                        name: account.name.clone(),
-                        account_uuid: account.account_uuid.clone(),
-                        org_uuid: account.org_uuid.clone(),
-                        org_name: account.org_name.clone(),
-                        provider: account.provider,
-                    },
-                    minted_at_ms,
-                ))
-            })
-            .collect()
+        let mut slots: Vec<Option<bound_tokens::AccountSlot>> = vec![None; accounts.len()];
+        for (hash, index, kind, minted_at_ms) in entries {
+            let (Some(account), Some(cell)) = (accounts.get(index), slots.get_mut(index)) else {
+                continue;
+            };
+            let slot = *cell.get_or_insert_with(|| {
+                snapshot.account_slot(StoredAccount {
+                    name: account.name.clone(),
+                    account_uuid: account.account_uuid.clone(),
+                    org_uuid: account.org_uuid.clone(),
+                    org_name: account.org_name.clone(),
+                    provider: account.provider,
+                })
+            });
+            snapshot.push(hash, kind, slot, minted_at_ms);
+        }
+        snapshot
     }
 
     /// Write the map to `path`, atomically. Returns how many tokens landed.
@@ -414,7 +481,7 @@ impl Manager {
     /// traffic exactly as it did before the file existed, and pays the rejected turns it was
     /// buying back.
     pub fn flush_bound_tokens(&self, path: &Path) -> Result<usize, ConfigError> {
-        bound_tokens::save(path, &self.bound_token_snapshot(), crate::now_ms())
+        bound_tokens::save(path, self.bound_token_snapshot(), crate::now_ms())
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded
@@ -444,7 +511,7 @@ impl Manager {
             .lock()
             .expect("bound tokens lock poisoned");
         for (hash, &value) in &report.tokens {
-            map.entry(hash.clone()).or_insert(value);
+            map.insert_if_absent(hash, value);
         }
         report
     }
@@ -714,7 +781,7 @@ mod tests {
             .lock()
             .expect("bound tokens lock poisoned")
             .insert(
-                bound_tokens::hash_token("sig_fake_stale"),
+                &bound_tokens::hash_token("sig_fake_stale"),
                 (
                     0,
                     BoundTokenKind::ThinkingSignature,
@@ -890,6 +957,149 @@ mod tests {
         assert!(
             manager.first_switch_warning(11, 0, t0 + SWITCH_WARNING_TTL_MS),
             "past the warning's life: warn again"
+        );
+    }
+
+    /// The mint order changes what bounding costs, never what it keeps. Replays a mixed sequence
+    /// (re-mints of one token, mint times out of order, some past the TTL) through the map and
+    /// through the prune it replaced, a full TTL retain and then a sort of everything, and
+    /// requires the same entries after every step. Equal mint times are broken by hash in the
+    /// old prune here so that it has one answer.
+    #[test]
+    fn pruning_by_mint_order_keeps_what_the_full_sort_kept() {
+        const CAP: usize = 40;
+        const TTL: i64 = 1_000;
+        let mut map = BoundTokenMap::default();
+        let mut old: HashMap<String, Minted> = HashMap::new();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut cap_evictions, mut ttl_drops) = (0usize, 0usize);
+        let mut now: i64 = 10_000;
+        for step in 0..5_000usize {
+            now += (next() % 7) as i64;
+            for _ in 0..1 + next() % 3 {
+                let hash = bound_tokens::hash_token(&format!("tok_fake_{}", next() % 120));
+                let value = (
+                    step % 3,
+                    BoundTokenKind::MessageId,
+                    now - (next() % 1_500) as i64,
+                );
+                map.insert(&hash, value);
+                old.insert(hash, value);
+            }
+            map.prune(now, TTL, CAP);
+
+            let before = old.len();
+            old.retain(|_, &mut (_, _, minted)| now.saturating_sub(minted) <= TTL);
+            ttl_drops += before - old.len();
+            if old.len() > CAP {
+                let mut by_age: Vec<(i64, String)> = old
+                    .iter()
+                    .map(|(hash, &(_, _, minted))| (minted, hash.clone()))
+                    .collect();
+                by_age.sort();
+                let excess = old.len() - CAP;
+                cap_evictions += excess;
+                for (_, hash) in by_age.into_iter().take(excess) {
+                    old.remove(&hash);
+                }
+            }
+
+            let mut got: Vec<(String, Minted)> =
+                map.iter().map(|(hash, v)| (hash.to_string(), v)).collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut want: Vec<(String, Minted)> =
+                old.iter().map(|(hash, &v)| (hash.clone(), v)).collect();
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                got, want,
+                "step {step}: the two prunes kept different entries"
+            );
+            assert_eq!(
+                map.by_age.len(),
+                map.by_hash.len(),
+                "step {step}: the mint order lists exactly the map's entries"
+            );
+        }
+        // Both ways out of the map must have happened, or the comparison proved nothing.
+        assert!(cap_evictions > 0, "the cap never bound");
+        assert!(ttl_drops > 0, "the TTL never dropped anything");
+    }
+
+    /// What one record costs with the map full, which is where a busy proxy lives: the live map
+    /// sat at exactly [`BOUND_TOKEN_CAP`] on 2026-10-15, so every response that minted a token
+    /// also evicted one. A timing, not a gate, so it is ignored; run it by hand with
+    /// `cargo test --release --lib record_at_the_cap_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run by hand"]
+    fn record_at_the_cap_costs() {
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let now = crate::now_ms();
+        let fill: Vec<MintedToken> = (0..BOUND_TOKEN_CAP)
+            .map(|n| (BoundTokenKind::MessageId, format!("msg_fake_{n}")))
+            .collect();
+        manager.record_bound_tokens(&fill, 0, now - 1_000);
+        let rounds: u32 = 500;
+        let start = std::time::Instant::now();
+        for n in 0..rounds {
+            manager.record_bound_tokens(
+                &sig(&format!("sig_fake_bench_{n}")),
+                0,
+                now + i64::from(n),
+            );
+        }
+        let per_call = start.elapsed() / rounds;
+        println!(
+            "record_bound_tokens at the cap ({BOUND_TOKEN_CAP} entries): {per_call:?} per call"
+        );
+        assert_eq!(
+            manager
+                .bound_tokens
+                .lock()
+                .expect("bound tokens lock poisoned")
+                .len(),
+            BOUND_TOKEN_CAP
+        );
+        let newest = format!("sig_fake_bench_{}", rounds - 1);
+        assert!(manager
+            .bound_token_account(std::slice::from_ref(&newest))
+            .is_some());
+    }
+
+    /// What one flush of a full map costs: the snapshot, the file build, the serialization and
+    /// the write. The live proxy does this every 60 s. A timing, not a gate, so it is ignored;
+    /// run it with `cargo test --release --lib flush_at_the_cap_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run by hand"]
+    fn flush_at_the_cap_costs() {
+        let manager = manager_over(&[
+            account("a@example.com", "uuid-a"),
+            account("b@example.com", "uuid-b"),
+        ]);
+        let now = crate::now_ms();
+        let fill: Vec<MintedToken> = (0..BOUND_TOKEN_CAP)
+            .map(|n| (BoundTokenKind::MessageId, format!("msg_fake_{n}")))
+            .collect();
+        let (first, second) = fill.split_at(BOUND_TOKEN_CAP / 2);
+        manager.record_bound_tokens(first, 0, now);
+        manager.record_bound_tokens(second, 1, now);
+        let path = tmp("flush-bench");
+        let rounds: u32 = 10;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            assert_eq!(
+                manager.flush_bound_tokens(&path).expect("flush"),
+                BOUND_TOKEN_CAP
+            );
+        }
+        println!(
+            "flush_bound_tokens at the cap ({BOUND_TOKEN_CAP} entries): {:?} per flush",
+            start.elapsed() / rounds
         );
     }
 }

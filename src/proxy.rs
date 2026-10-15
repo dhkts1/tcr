@@ -21482,9 +21482,12 @@ mod tests {
             "bob's Codex turn is filed under the model its Responses object names"
         );
         let bound = manager.bound_token_snapshot();
-        assert!(
-            bound.is_empty(),
-            "a Codex body's resp_ id is not a bound token: {bound:?}"
+        let output = tempfile::tempdir().unwrap();
+        assert_eq!(
+            crate::bound_tokens::save(&output.path().join("bound.json"), bound, crate::now_ms())
+                .unwrap(),
+            0,
+            "a Codex body's resp_ id is not a bound token"
         );
     }
 
