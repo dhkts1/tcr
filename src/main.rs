@@ -6981,11 +6981,9 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
 ///
 /// `CODEX_CA_CERTIFICATE` names the same CA for the `codex` a Claude tool or
 /// plugin may start inside this session. That process inherits the proxy vars.
-/// While the pool holds no Codex account, tcr blind-tunnels `chatgpt.com` and
-/// that codex runs on its own login; once the pool holds one, tcr terminates
-/// `chatgpt.com`, and with the CA the nested codex is pooled (without it, its
-/// TLS handshake fails). Claude ignores it. The notice names it once the config
-/// holds a Codex account (`holds_codex`, [`see_through_ca_notice`]).
+/// This proxy URL has no Codex marker, so the nested codex stays on its own login
+/// through a blind tunnel. `tcr run --codex` opts that process into the pool with
+/// the marker. Claude ignores the extra CA variable.
 fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path, holds_codex: bool) {
     let proxy = format!("http://127.0.0.1:{port}");
     cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
@@ -7023,7 +7021,7 @@ fn see_through_ca_notice(ca: &Path, holds_codex: bool) -> String {
 /// SEE-THROUGH mode for `codex`, the only mode tcr routes it in. `codex` keeps
 /// its own backend URL, the real `https://chatgpt.com` for a login served there,
 /// and reaches it through us as a CONNECT proxy; while the pool holds a Codex
-/// account we MITM-terminate `chatgpt.com` with a leaf our CA signed, and
+/// account the proxy URL's `tcr-codex` marker opts its CONNECT into interception, and
 /// `CODEX_CA_CERTIFICATE` is what makes `codex` trust that leaf. A login whose
 /// workspace is routed elsewhere (FedRAMP, data residency) is never pooled: tcr
 /// blind-tunnels another origin, and relays a request that names its routing on
@@ -7033,7 +7031,10 @@ fn see_through_ca_notice(ca: &Path, holds_codex: bool) -> String {
 /// pooled launch adds `NODE_EXTRA_CA_CERTS` on its own, for a `claude` the
 /// session starts ([`apply_nested_claude_ca`]).
 fn apply_codex_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
-    let proxy = format!("http://127.0.0.1:{port}");
+    let proxy = format!(
+        "http://{}@127.0.0.1:{port}",
+        teamclaude_rs::mitm::CODEX_PROXY_USERNAME
+    );
     cmd.env("HTTPS_PROXY", &proxy);
     cmd.env("https_proxy", &proxy);
     // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
@@ -7975,11 +7976,8 @@ mod tests {
     }
 
     /// Claude's see-through env names its CA for codex too. A `codex` that a
-    /// Claude tool or plugin starts inherits this `HTTPS_PROXY`, and while the
-    /// pool holds a Codex account tcr terminates `chatgpt.com` as well as
-    /// `api.anthropic.com`, so without `CODEX_CA_CERTIFICATE` its TLS handshake
-    /// fails. It is the CA node is told to trust: the one that signs the leaf tcr
-    /// presents.
+    /// Claude tool or plugin starts inherits this unmarked `HTTPS_PROXY`, so it
+    /// keeps its own login. An explicit `tcr run --codex` opts into pooling.
     #[test]
     fn see_through_env_lets_a_nested_codex_trust_the_leaf() {
         let mut cmd = std::process::Command::new("true");
@@ -8052,11 +8050,11 @@ mod tests {
             .collect();
         assert_eq!(
             env.get("HTTPS_PROXY").map(String::as_str),
-            Some("http://127.0.0.1:3999")
+            Some("http://tcr-codex@127.0.0.1:3999")
         );
         assert_eq!(
             env.get("https_proxy").map(String::as_str),
-            Some("http://127.0.0.1:3999")
+            Some("http://tcr-codex@127.0.0.1:3999")
         );
         assert_eq!(
             env.get("CODEX_CA_CERTIFICATE").map(String::as_str),
@@ -8975,7 +8973,7 @@ mod tests {
         );
         assert_eq!(
             env.get("HTTPS_PROXY"),
-            Some(&Some("http://127.0.0.1:3999".to_string()))
+            Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string()))
         );
         assert_eq!(
             env.get("CODEX_CA_CERTIFICATE"),

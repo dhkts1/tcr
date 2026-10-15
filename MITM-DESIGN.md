@@ -30,8 +30,8 @@ api.anthropic.com over our own TLS client → stream back).
   `platform.claude.com` added in their place (the evidence is on `ALLOWED_HOSTS`). Being listed is
   necessary, not sufficient: `handle_connect` terminates a listed host only when the leaf loaded for
   this process also covers it, and blind-tunnels one it does not cover rather than present a
-  certificate that fails the handshake (`src/mitm.rs:892-898`). `chatgpt.com` has one condition
-  more: it is terminated only while the pool holds a Codex account, counted again on every `CONNECT`
+  certificate that fails the handshake (`src/mitm.rs:892-898`). `chatgpt.com` requires a marked Codex connection
+  (`HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`) and a pooled Codex account, counted on every `CONNECT`
   (`host_intercepted`), and blind-tunneled otherwise, so a `codex` with no pooled account to serve
   it keeps its own login. The reused `teamclaude-leaf.pem`'s SANs cannot be read without an x509
   parser, so on that path tcr claims `api.anthropic.com` only (`src/mitm.rs:452`) and tunnels the
@@ -40,7 +40,7 @@ api.anthropic.com over our own TLS client → stream back).
   sidecar of every leaf tcr minted earlier stale, so the next start re-mints that leaf under the
   persisted CA key, and a client that already trusts that CA trusts the new leaf with nothing to
   change. That holds only for a client already told about the CA: `codex` takes no CA from
-  `NODE_EXTRA_CA_CERTS`, so, while the pool holds a Codex account, a `codex` routed through tcr that
+  `NODE_EXTRA_CA_CERTS`, so a marked `codex` routed through tcr that
   was never pointed at `~/.config/tcr-ca.pem` fails its `chatgpt.com` handshake until
   `CODEX_CA_CERTIFICATE` names it (`tcr run` and `tcr run --codex` set it for the sessions they
   launch). Two routes rotate the CA instead. One is a chain minted before `tcr-ca.key` existed: with

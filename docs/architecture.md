@@ -40,7 +40,7 @@ ROTATION LOOP (bounded)
 ```
 
 **Base-URL mode** is plain HTTP to the listener. **Forward-proxy mode** terminates TLS for
-Anthropic's own API hosts, and for `chatgpt.com` while the pool holds a Codex account (see
+Anthropic's own API hosts, and for marked `chatgpt.com` connections with a pooled account (see
 [Codex requests](#codex-requests)), using a locally generated leaf, which is why the client
 needs your CA: Claude Code in `NODE_EXTRA_CA_CERTS`, `codex` in `CODEX_CA_CERTIFICATE`. Every
 other host is copied through as raw bytes and is never decrypted. That is what keeps Claude
@@ -56,36 +56,38 @@ intercepting one layer down at `HTTPS_PROXY` keeps the client in its normal conf
 tcr routes `codex`, OpenAI's coding CLI on a ChatGPT login, in forward-proxy mode only: it
 has no base-URL route for `codex` yet. `codex` keeps its own backend URL, the real
 `https://chatgpt.com` for every login tcr pools, sends `CONNECT` through `HTTPS_PROXY`, and
-trusts tcr's leaf through `CODEX_CA_CERTIFICATE`; `tcr run --codex` sets both
+trusts tcr's leaf through `CODEX_CA_CERTIFICATE`; `tcr run --codex` sets the proxy URL to
+`http://tcr-codex@127.0.0.1:<port>` and sets the CA
 ([`cli.md`](cli.md#--codex-launching-codex-through-the-pool)). A request's provider is
-decided by its path: everything under `/backend-api/` is Codex, everything else is Anthropic,
-and a request tcr pools is served only by an account of its own provider. An intercepted host
-has to agree: a request for `chatgpt.com` outside `/backend-api/`, or for `api.anthropic.com`
-or `platform.claude.com` under it, is answered 421, naming the host and the path, and nothing
-is forwarded. Inside a tunnel the host is the `CONNECT` target: a request that declares any
-other host, a loopback one included, or a `Host` that cannot be read, is answered 421 too and
-forwarded nowhere, so a request for one provider's host never reaches the other's upstream.
-Only a base-URL request, which comes through no tunnel, is judged by the host it names, and one
-naming a loopback host, or none, keeps its path's provider.
+decided by its path in base-URL mode: everything under `/backend-api/` is Codex, everything else
+is Anthropic, and a request tcr pools is served only by an account of its own provider.
+Inside a tunnel, the CONNECT target fixes the upstream: marked `chatgpt.com` connections
+relay paths outside `/backend-api/` unchanged with the client's credential. An Anthropic
+host carrying a `/backend-api/` path is answered 421, and nothing is forwarded. A request
+that declares another host, including loopback, or an unreadable Host, is answered 421 too.
 
-tcr terminates `chatgpt.com` only while the pool holds a Codex account, counted again on
-every `CONNECT`. With none it tunnels `chatgpt.com` untouched, and `codex` runs on its own
-login, as it does whenever `chatgpt.com` is in its `NO_PROXY`. A login whose ChatGPT
-workspace is FedRAMP, or routed to a data residency or to a backend of its own, is neither
-pooled nor importable: `tcr login --from-codex` refuses it, another backend is tunnelled
-untouched, and a request that names such a routing (`x-openai-account-routing-override` or
-`x-openai-fedramp`) is relayed on the client's own credential, inference included, and never
-pooled.
+tcr terminates `chatgpt.com` only when CONNECT carries the `tcr-codex` proxy marker and the
+pool holds a Codex account, counted on every CONNECT. Codex's HTTP and WebSocket transports
+both send proxy URL userinfo as `Proxy-Authorization`. Unmarked connections, including a
+manually set `HTTPS_PROXY=http://127.0.0.1:<port>`, are blind-tunneled and use the client's
+own login. A login whose ChatGPT workspace is FedRAMP, routed to a data residency or to a
+backend of its own is neither pooled nor importable: another backend is tunneled untouched,
+and a request naming routing (`x-openai-account-routing-override` or `x-openai-fedramp`) is
+relayed on the client's credential.
 
 Codex stays off the [peer mesh](peers.md) in this version: a Codex account is never lent to a
 peer, and a `codex` request is never borrowed from a peer or carried through one, so it always
 leaves from this Mac.
 
+The pooled model paths under `/backend-api/codex/` are `responses`, `images/generations`,
+`images/edits`, `memories/trace_summarize` and `alpha/search`. Other Codex paths retain the
+client's credential.
+
 ```
-codex   HTTPS_PROXY=http://127.0.0.1:<port>   CODEX_CA_CERTIFICATE=~/.config/tcr-ca.pem
+codex   HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>   CODEX_CA_CERTIFICATE=~/.config/tcr-ca.pem
   |
-  |-- CONNECT chatgpt.com:443         on the allowlist, covered by the leaf, and a Codex
-  |                                   account in the pool: TLS terminated (else a blind tunnel)
+  |-- CONNECT chatgpt.com:443         marker present, leaf covers it, and a pooled account:
+  |                                   TLS terminated (otherwise a blind tunnel)
   |-- CONNECT auth.openai.com:443     blind tunnel: codex refreshes its own login untouched
   |
   |-- GET /backend-api/codex/responses, Upgrade: websocket
@@ -326,7 +328,7 @@ for it. The cache directory is `$XDG_CACHE_HOME/teamclaude` when that variable i
 | `~/.config/.teamclaude.json.tcr-*.tmp` | Left behind when a config write is killed halfway. Same contents as the config, and nothing removes them for you | `0600` |
 | `~/.config/tcr-codex-login.*` | Beside the config file, and only while `tcr login --codex` runs: the `CODEX_HOME` it gives `codex login`, holding that sign-in's `auth.json` until tcr has read it. tcr deletes it on every way out it can see; a SIGKILL of tcr can leave one behind, holding a live ChatGPT login | directory `0700` |
 | `~/.config/tcr-ca.pem`, `tcr-ca.key` | The local CA that signs the leaf certificate, and its private key. `NODE_EXTRA_CA_CERTS` points at the `.pem`, and so does `CODEX_CA_CERTIFICATE` for `codex` | `0644`, `0600` |
-| `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts and `chatgpt.com`, its key, and the host list it was made for. tcr decrypts `chatgpt.com` with it only while the pool holds a Codex account | `0644`, `0600`, `0644` |
+| `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts and `chatgpt.com`, its key, and the host list it was made for. tcr decrypts marked `chatgpt.com` connections only while the pool holds a Codex account | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
 | `~/.config/tcr-node.key`, `tcr-node.pub` | Peers only: this Mac's peer identity key pair | `0600`, `0644` |
 | `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater | |

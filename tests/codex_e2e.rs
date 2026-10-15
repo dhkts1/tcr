@@ -341,42 +341,108 @@ fn write_config(path: &Path, port: u16, upstream: &str, codex_upstream: &str) {
 /// for a sibling `codex_e2e` server, serving the same fleet, could pass a test it never ran.
 /// `RUST_LOG` is pinned because the line is logged at info.
 async fn start_server(upstream: &str, codex_upstream: &str) -> Server {
-    let home = tempfile::tempdir().unwrap();
-    let config = home.path().join(".config").join("teamclaude.json");
-    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-    let port = dead_port();
-    write_config(&config, port, upstream, codex_upstream);
-    let log = std::fs::File::create(home.path().join(SERVER_LOG)).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
-    command
-        .args(["server", "--headless", "--config"])
-        .arg(&config)
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::from(log.try_clone().unwrap()))
-        .stderr(Stdio::from(log));
-    isolate(&mut command, home.path());
-    let child = command.spawn().unwrap();
-    let mut server = Server {
-        child,
-        port,
-        home,
-        config,
-    };
-    let listening = format!("listening on http://127.0.0.1:{port} (headless)");
-    let deadline = Instant::now() + BOOT_TIMEOUT;
-    loop {
-        if server.log().contains(&listening) {
-            return server;
+    start_server_with_first_port(
+        upstream,
+        codex_upstream,
+        dead_port(),
+        tempfile::tempdir().unwrap(),
+    )
+    .await
+}
+
+async fn start_server_with_first_port(
+    upstream: &str,
+    codex_upstream: &str,
+    mut port: u16,
+    home: tempfile::TempDir,
+) -> Server {
+    // Reserving then releasing an ephemeral port races every concurrently booting stub.
+    // Retry only an exited child that never advertised its own successful bind; never replace
+    // or signal the process that won the port. Each attempt gets its own config and log.
+    const ATTEMPTS: usize = 5;
+    let mut home = Some(home);
+    for attempt in 0..ATTEMPTS {
+        let home = home.take().unwrap_or_else(|| tempfile::tempdir().unwrap());
+        let config = home.path().join(".config").join("teamclaude.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        write_config(&config, port, upstream, codex_upstream);
+        let log = std::fs::File::create(home.path().join(SERVER_LOG)).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
+        command
+            .args(["server", "--headless", "--config"])
+            .arg(&config)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        isolate(&mut command, home.path());
+        let child = command.spawn().unwrap();
+        let mut server = Server {
+            child,
+            port,
+            home,
+            config,
+        };
+        let listening = format!("listening on http://127.0.0.1:{port} (headless)");
+        let deadline = Instant::now() + BOOT_TIMEOUT;
+        loop {
+            let log = server.log();
+            if log.contains(&listening) {
+                return server;
+            }
+            if let Some(exit) = server.child.try_wait().unwrap() {
+                let log = server.log(); // The exited child has now flushed its final diagnostic.
+                let collision = exit.code() == Some(4)
+                    || (exit.code() == Some(1)
+                        && log.contains(&format!("Error: failed to bind 127.0.0.1:{port}"))
+                        && log.contains("Address already in use (os error"));
+                assert!(
+                    collision && attempt + 1 < ATTEMPTS,
+                    "tcr server exited ({exit}) before it listened on :{port}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tcr server did not come up on :{port}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if let Some(exit) = server.child.try_wait().unwrap() {
-            panic!("tcr server exited ({exit}) before it listened on :{port}");
+        drop(server); // This child already exited; only its owned handle is cleaned up.
+        port = dead_port();
+    }
+    unreachable!("the last failed attempt panics")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_test_server_retries_a_port_claimed_before_its_child_bound() {
+    for embedded_claim in [false, true] {
+        let incumbent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_port = incumbent.local_addr().unwrap().port();
+        let (upstream, codex_upstream, _) = spawn_origins().await;
+        let home = tempfile::tempdir().unwrap();
+        let owner_dir = home.path().join(".cache").join("teamclaude");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        // Model an embedded proxy that holds the port without answering. Its verified claim
+        // guarantees a stand-down exit rather than depending on this test process's executable name.
+        let owner = teamclaude_rs::singleton::ProxyOwner {
+            pid: std::process::id(),
+            port: occupied_port,
+            sha: "test-fixture".into(),
+            host: teamclaude_rs::singleton::ProxyHost::Embedded,
+        };
+        if embedded_claim {
+            teamclaude_rs::singleton::write_owner_file(
+                &teamclaude_rs::singleton::owner_path_in(&owner_dir, occupied_port),
+                &owner,
+            )
+            .unwrap();
         }
-        assert!(
-            Instant::now() < deadline,
-            "tcr server did not come up on :{port}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let server =
+            start_server_with_first_port(&upstream, &codex_upstream, occupied_port, home).await;
+        assert_ne!(server.port, occupied_port);
+        assert_eq!(incumbent.local_addr().unwrap().port(), occupied_port);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", occupied_port)).is_err());
     }
 }
 
@@ -538,6 +604,51 @@ async fn a_codex_turn_is_pooled_pinned_measured_and_relayed_correctly() {
     assert_eq!(bare.account_id, None, "and with no account id");
 
     assert_each_reached_its_own_origin(&ledger);
+}
+
+/// The proxy URL that `tcr run --codex` exports causes reqwest to send the marker on
+/// CONNECT. The TLS connection stays on the test proxy, whose upstream is a loopback stub.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_marked_codex_connect_reaches_the_pool_and_relays_other_paths() {
+    let (upstream, codex_upstream, ledger) = spawn_origins().await;
+    let server = start_server(&upstream, &codex_upstream).await;
+    let ca = std::fs::read(server.home.path().join(".config/tcr-ca.pem")).unwrap();
+    let proxy =
+        reqwest::Proxy::https(format!("http://tcr-codex@127.0.0.1:{}", server.port)).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .unwrap();
+    let response = client
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .bearer_auth("client-own")
+        .header("session-id", "marked-session")
+        .json(&serde_json::json!({"model": "gpt-6-astra", "input": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await.unwrap();
+    assert_eq!(
+        ledger.last().authorization.as_deref(),
+        Some("Bearer at-alice")
+    );
+
+    let response = client
+        .get("https://chatgpt.com/share/example")
+        .bearer_auth("client-own")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.text().await.unwrap(), "stub: unknown path");
+    let request = ledger.last();
+    assert_eq!(request.origin, CODEX_ORIGIN);
+    assert_eq!(request.path, "/share/example");
+    assert_eq!(request.authorization.as_deref(), Some("Bearer client-own"));
 }
 
 /// Watched red: drop the provider check in `manager::select::eligible` and the second

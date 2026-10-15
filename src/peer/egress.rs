@@ -8,17 +8,12 @@
 //! this path gets its own constant, [`PEER_EGRESS_HOSTS`], deny by default, and
 //! a test that proves the refusal.
 //!
-//! The list is the one the local proxy already enforces (`ALLOWED_HOSTS` in
-//! `src/mitm.rs`): `api.anthropic.com`, `platform.claude.com` and
-//! `chatgpt.com`. The second is not an extra, it is the host Claude Code's own
+//! The list keeps the two Anthropic hosts carried before local Codex pooling:
+//! `api.anthropic.com` and `platform.claude.com`. The second is the host Claude Code's own
 //! OAuth refresh targets, so carrying it is what lets a machine with no
 //! internet refresh its own tokens through a peer and stop dying at the 29-day
-//! wall. The third is Codex's host: it joined the local list with the Codex
-//! provider and is carried by construction, as blind as the other two. Reused,
-//! not reinvented. Carried is not sent: the requester never sends a Codex
-//! request through a peer in this version (`pinned_egress`'s Codex arm
-//! refuses a Codex account's exit pin, and `src/proxy.rs` offers the blind
-//! carry to Anthropic requests only).
+//! wall. Codex stays off the mesh in this version, so `chatgpt.com` is absent
+//! even though the local listener can intercept marked Codex connections to it.
 //!
 //! # The splice socket, specified, because an unspecified one is a free proxy
 //! for every process on the box
@@ -111,12 +106,9 @@ use crate::peer::tunnel::{self, NoiseStream};
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
 ///
-/// Its own named constant for the deny-by-default property the module doc
-/// above argues for, but the VALUES are [`crate::mitm::ALLOWED_HOSTS`]
-/// itself, not a second literal: two arrays that merely agreed today would
-/// drift silently, and the only thing that fails when they do is this
-/// deny-by-default boundary.
-pub const PEER_EGRESS_HOSTS: &[&str] = crate::mitm::ALLOWED_HOSTS;
+/// Independent of [`crate::mitm::ALLOWED_HOSTS`]: a local interception capability
+/// must not grant a peer gateway permission to dial another origin.
+pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
 
 /// The only port those origins are carried on.
 ///

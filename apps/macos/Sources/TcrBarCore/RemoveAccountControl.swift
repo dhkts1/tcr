@@ -71,8 +71,8 @@ public enum RemoveAccountCommand {
         }
         if !anotherCodex {
             informative +=
-                "\n\nThis is your last Codex account. tcr stops intercepting chatgpt.com, and "
-                + "codex runs on its own login."
+                "\n\nThis is your last Codex account. tcr stops decrypting marked Codex "
+                + "connections to chatgpt.com, and codex runs on its own login."
         }
         return DeleteConfirmation(message: message, informative: informative)
     }

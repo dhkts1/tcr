@@ -2280,7 +2280,7 @@ fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     // matches on the name, and this file is written by the binary under test.
     std::fs::write(
         &config,
-        r#"{"accounts":[{"name":"work-fake","accessToken":"not-a-real-token"}]}"#,
+        r#"{"proxy":{"port":9},"accounts":[{"name":"work-fake","accessToken":"not-a-real-token"}]}"#,
     )
     .expect("the config fixture writes");
 
@@ -3992,33 +3992,18 @@ fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
     }
 }
 
-/// G-new-1: the peer gateway's origin allow-list must be the SAME list the
-/// local proxy enforces, `src/mitm.rs`'s `ALLOWED_HOSTS`, not a second
-/// literal that merely agrees today. The value check catches two lists that
-/// already differ; the source check catches the copy before it can drift.
-///
-/// Source text, not pointer equality: rustc merges identical constant data,
-/// so a second literal array of the same hosts can share the original's
-/// address and a pointer comparison passes it.
+/// Local interception and LAN egress have different scopes. Codex is local only;
+/// peer gateways keep the two Anthropic origins they carried before it was added.
 #[test]
-fn peer_egress_hosts_is_the_local_proxys_allow_list_not_a_second_copy() {
+fn peer_egress_keeps_anthropic_hosts_and_never_carries_chatgpt() {
     assert_eq!(
         teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
-        teamclaude_rs::mitm::ALLOWED_HOSTS,
-        "the two origin allow-lists drifted"
+        &["api.anthropic.com", "platform.claude.com"]
     );
-    let source = include_str!("../src/peer/egress.rs");
-    let definition = source
-        .lines()
-        .find(|line| line.starts_with("pub const PEER_EGRESS_HOSTS"))
-        .expect("src/peer/egress.rs defines PEER_EGRESS_HOSTS");
-    assert!(
-        definition
-            .trim_end()
-            .ends_with("= crate::mitm::ALLOWED_HOSTS;"),
-        "PEER_EGRESS_HOSTS must be defined AS mitm::ALLOWED_HOSTS, not a second literal that \
-         merely equals it today: {definition}"
-    );
+    assert!(egress::host_allowed("api.anthropic.com", 443));
+    assert!(egress::host_allowed("platform.claude.com", 443));
+    assert!(!egress::host_allowed("chatgpt.com", 443));
+    assert!(!egress::host_allowed("CHATGPT.COM", 443));
 }
 
 /// **A Codex account is never carried, pinned or not, in this version** (Codex

@@ -176,16 +176,11 @@ cannot be read prints nothing. So a proxy started from another config, or whose 
 since, can miss the warning.
 
 In see-through mode the routing environment also carries `CODEX_CA_CERTIFICATE`, naming the
-same CA as `NODE_EXTRA_CA_CERTS`. Claude Code ignores it. It is there for a `codex` that a
-Claude Code tool or plugin starts inside the session: that process inherits the proxy
-variables, and while its pool holds a Codex account, a proxy serving a leaf it minted
-terminates TLS for `chatgpt.com` too, so without the CA the nested `codex` would fail its
-handshake; with it, that `codex` is pooled. While the pool holds no Codex account, tcr tunnels
-`chatgpt.com` untouched and the nested `codex` runs on its own login. Once it holds one, adding
-`chatgpt.com` to `NO_PROXY` in the shell you start `tcr run` from keeps a nested `codex` on its
-own login: plain `tcr run` passes `NO_PROXY` through untouched. tcr's `CODEX_CA_CERTIFICATE`
-replaces any you exported, and `codex` reads `SSL_CERT_FILE` only while that variable is unset,
-so a corporate CA that a nested `codex` took from `SSL_CERT_FILE` stops applying; see
+same CA as `NODE_EXTRA_CA_CERTS`. Claude Code ignores it. A `codex` started by a Claude tool
+inherits an unmarked proxy URL and stays on its own login: tcr tunnels that `chatgpt.com`
+connection without terminating TLS. Start it with `tcr run --codex` to opt into pooling.
+tcr's `CODEX_CA_CERTIFICATE` replaces any you exported, and `codex` reads `SSL_CERT_FILE`
+only while that variable is unset; see
 [troubleshooting.md](troubleshooting.md#a-corporate-ssl_cert_file-is-ignored-under-tcr-run-and-tcr-run---codex).
 
 The launch names that CA on stderr. Once the config holds a Codex account, in any state, the line
@@ -225,7 +220,8 @@ Codex account to serve the session; add one with
 
 **See-through, or not routed at all.** tcr has no base-URL route for `codex` yet. A pooled
 launch leaves `codex` on its own backend URL, which is the real `https://chatgpt.com` for every
-login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to this proxy, and sets
+login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to
+`http://tcr-codex@127.0.0.1:<port>`, and sets
 `CODEX_CA_CERTIFICATE` to tcr's CA, `~/.config/tcr-ca.pem`: that variable is where `codex`
 takes an extra CA from, and it takes none from `NODE_EXTRA_CA_CERTS`. Of Claude's variables only
 `NODE_EXTRA_CA_CERTS` is set, to the same CA, for a `claude` started inside the session, and not
@@ -237,7 +233,7 @@ untouched, and relays a request that names such a routing on the login's own cre
 launch says so on stderr:
 
 ```
-[tcr] see-through mode: codex keeps its own backend URL, tunnelling via http://127.0.0.1:3456; a FedRAMP or residency-routed login runs on its own credential, unpooled
+[tcr] see-through mode: codex keeps its own backend URL, tunnelling via http://tcr-codex@127.0.0.1:3456; a FedRAMP or residency-routed login runs on its own credential, unpooled
 [tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem
 ```
 
@@ -259,7 +255,7 @@ When none reports one, the line ends `— none reports when it frees`.
 
 **The running proxy decides.** The launcher reads the running proxy's `/_tcr/status` document
 once, and pools the session only when that proxy reports a leaf it minted itself that intercepts
-`chatgpt.com`, lists a Codex account, and that leaf's CA file is on disk. It never decides from
+`chatgpt.com` for marked connections, lists a Codex account, and that leaf's CA file is on disk. It never decides from
 the certificate files alone: the proxy loads its leaf once, at boot, so an older proxy, or one
 whose TLS material failed to load, does not intercept what the files on disk would cover. Every
 other case launches `codex` directly, on its own login, with one line saying why:
@@ -298,13 +294,13 @@ Each reason, verbatim, and what it needs:
   TLS material` line carrying the error. A restart loads the material again, so it helps only
   once that cause is fixed.
 - `` the proxy on :<port> holds no Codex account, so it blind-tunnels chatgpt.com and codex keeps
-  its own login — add one with `tcr login --codex` ``. The proxy terminates `chatgpt.com`
+  its own login — add one with `tcr login --codex` ``. The proxy terminates marked `chatgpt.com` connections
   only while its pool holds a Codex account, in any state, disabled included, and tunnels it
   untouched otherwise, so the session would run on `codex`'s own login whatever the launch set.
   Add one with [`tcr login --codex`](#--codex-a-codex-login-of-tcrs-own):
   a running proxy takes it at once and counts its Codex accounts on every `CONNECT`, so the next
   `tcr run --codex` is pooled with no restart.
-- `no readable CA at <path>`. The proxy intercepts `chatgpt.com` with a leaf it minted, but
+- `no readable CA at <path>`. The proxy can intercept marked Codex connections with a leaf it minted, but
   `<path>`, where this launcher expects the CA that leaf chains to, holds no file, so `codex`
   cannot be told to trust it. If the file was moved, put it back. If it is gone, restart the
   proxy at a quiet moment: with the CA file missing, its next boot mints a new CA and leaf, and
@@ -539,7 +535,7 @@ $ tcr login --codex
 …  codex login's own output, passed through unchanged  …
 Saved account 'bob@example.com' to /Users/example/.config/teamclaude.json
 [tcr] 'bob@example.com' is a Codex account (ChatGPT Pro): Codex sessions started with `tcr run --codex` can use it
-[tcr] tcr intercepts chatgpt.com from now on: codex started with `tcr run --codex` is pooled; a codex that reaches this proxy some other way needs CODEX_CA_CERTIFICATE set to tcr's CA, or chatgpt.com in NO_PROXY to stay on its own login
+[tcr] tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`, or set HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port> and CODEX_CA_CERTIFICATE to tcr's CA; unmarked connections keep their own login
 [tcr] codex needs a login of its own to start, even when pooled, and none is at /Users/example/.codex/auth.json: unless codex keeps its login in the keyring, run `codex login` once
 [tcr] warning: the tcr at /usr/local/bin/tcr (0.2.44) predates Codex accounts: update it before it next starts — it would read this login as a Claude account and send its token to Anthropic
 Logged in as 'bob@example.com'.
@@ -579,8 +575,8 @@ TcrBar started from Finder has neither directory on its `PATH`.
 
 | notice | when |
 |---|---|
-| `tcr intercepts chatgpt.com from now on: …` | the config held no Codex account before this one, and the proxy will intercept `chatgpt.com`: the running proxy serves a leaf it minted that covers it, or none is running and the JS teamclaude leaf (`teamclaude-leaf.pem` and `.key` beside the config) is not on disk, so the next one mints such a leaf. The leaf files are checked for existence, never read |
-| `codex is not pooled: <reason>` | the config held no Codex account before this one, and the proxy will not intercept `chatgpt.com`. The reason is the one `tcr run --codex` prints ([the reasons](#--codex-launching-codex-through-the-pool)): what the running proxy reported, that its status could not be read, or that no proxy answered and the JS leaf on disk is what the next one will serve |
+| `tcr pools marked Codex connections to chatgpt.com: …` | the config held no Codex account before this one, and the proxy can intercept marked `chatgpt.com` connections: the running proxy serves a leaf it minted that covers it, or none is running and the JS teamclaude leaf (`teamclaude-leaf.pem` and `.key` beside the config) is not on disk, so the next one mints such a leaf. The leaf files are checked for existence, never read |
+| `codex is not pooled: <reason>` | the config held no Codex account before this one, and the proxy cannot intercept marked `chatgpt.com` connections. The reason is the one `tcr run --codex` prints ([the reasons](#--codex-launching-codex-through-the-pool)): what the running proxy reported, that its status could not be read, or that no proxy answered and the JS leaf on disk is what the next one will serve |
 | `codex needs a login of its own to start, even when pooled, and none is at <path>: …` | there is no `auth.json` under `$CODEX_HOME`, or under `~/.codex` when `CODEX_HOME` is unset. Checked for existence, never read |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it before it next starts — …` | a `tcr` at 0.2.45 or older is in reach: it would read this login as a Claude account and send its token to Anthropic |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it — until then it refuses this config, …` | a `tcr` from 0.2.46 on whose `login --help` lacks `--from-codex` is in reach: it refuses the whole config |
@@ -620,7 +616,7 @@ anything else that can read lines and open a URL. It changes four things and not
   ```
   {"event":"browser","opened":true,"url":"https://auth.openai.com/oauth/authorize?…"}
   {"event":"waiting"}
-  {"event":"notice","text":"tcr intercepts chatgpt.com from now on: …"}
+  {"event":"notice","text":"tcr pools marked Codex connections to chatgpt.com: …"}
   {"account":"bob@example.com","event":"saved","plan":"ChatGPT Pro","provider":"codex"}
   ```
 
@@ -1640,8 +1636,8 @@ it terminate TLS for, and `leaf` names the certificate it presents: `minted` (a 
 under `~/.config/tcr-ca.pem`), `js` (the JS teamclaude proxy's `teamclaude-leaf.pem`, which tcr
 takes to cover `api.anthropic.com` only) or `none` (MITM off: the TLS material failed to load,
 and every `CONNECT` is tunnelled). `chatgpt.com` in `interceptedHosts` says what the leaf allows,
-not what happens on every tunnel: the listener terminates it only while the pool holds a Codex
-account, counted again on each `CONNECT`, and tunnels it untouched otherwise. The same document's
+not what happens on every tunnel: the listener requires the Codex marker on CONNECT and a Codex
+account in the pool, counted on every connection, and tunnels it untouched otherwise. The same document's
 account rows show whether it holds one: a Codex row carries `"provider": "codex"`.
 
 ```
@@ -1821,7 +1817,7 @@ The block's keys, in order:
 | key | what it reads |
 |---|---|
 | `codexAccounts` | the Codex accounts, counted by why each is out, in the words tcr's own 429 gives `codex`: `in rotation`, `on an upstream hold`, `refused upstream (403)`, `in the 5-hour window`, `in the weekly window`, `needing re-login`, `refused by ChatGPT`, `disabled`, `unreachable in a reserved group`, `in a parked group`, in that order. An account held by an upstream hold or 403 while ChatGPT's refusal stands (its row carries `limitReachedType`) counts as `refused by ChatGPT`, since that refusal outlasts the hold; one that a full window refused keeps that window's phrase (`in the 5-hour window` or `in the weekly window`). The rows are the running proxy's, which leave out an account deleted while it runs; with no proxy answering they are the config's, which carry no gate: `2 (no proxy answered)`. `0` with none |
-| `codexIntercept` | whether the proxy terminates `chatgpt.com`: `yes` when `codex` is pooled, and when only tcr's CA file is missing; `no` when the proxy's leaf cannot cover `chatgpt.com`, it runs without MITM, or it holds no Codex account; `unknown` when no proxy answered, its status could not be read, or it is another build, one that predates the report or names a leaf this build does not know |
+| `codexIntercept` | whether the proxy can terminate marked Codex connections to `chatgpt.com`: `yes` when `codex` is pooled, and when only tcr's CA file is missing; `no` when the proxy's leaf cannot cover `chatgpt.com`, it runs without MITM, or it holds no Codex account; `unknown` when no proxy answered, its status could not be read, or it is another build, one that predates the report or names a leaf this build does not know |
 | `codexCa` | tcr's CA, `~/.config/tcr-ca.pem`, and whether it is a readable file. It is never loaded |
 | `codexUpstream` | where Codex requests go, `(default)` or `(set by codexUpstream)`: the running proxy's, or the config's when no proxy answered |
 | `codexBin` | the `codex` that `tcr run --codex` would launch and the rule that found it (`TCR_CODEX_BIN`, `CODEX_BIN`, `PATH`, `TcrBar's directories` or `npm's global prefix`), or `not found` and why, by [the one search](#--codex-a-codex-login-of-tcrs-own) |
@@ -1837,10 +1833,12 @@ counts Claude sessions only, and `codexRequests10m` Codex sessions only.
 
 A `codexProblem:` line follows for each problem, in this order:
 
-- the proxy variable `codexEnv` names points at tcr, `NO_PROXY` does not exempt `chatgpt.com`, and
-  the CA `codex` reads first (`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`) is not tcr's, so a
-  `codex` started here without `tcr run --codex` meets tcr's interception without its CA and fails
-  TLS. Left out while `codexIntercept` is `no`;
+- an unmarked proxy URL points at tcr: `chatgpt.com` is tunneled untouched, so start with
+  `tcr run --codex` or set `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>` and
+  `CODEX_CA_CERTIFICATE` to tcr's CA to join the pool;
+- a marked proxy URL points at tcr, `NO_PROXY` does not exempt `chatgpt.com`, and the CA
+  `codex` reads first (`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`) is not tcr's, so its
+  TLS handshake would fail. Left out while `codexIntercept` is `no`;
 - one line for each Codex account in a reserved group: a Codex request cannot ask for a group, so
   the account serves nothing;
 - `codex` has no login of its own, which it needs to start even when pooled: `codex login` once;

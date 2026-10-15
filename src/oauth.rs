@@ -615,15 +615,12 @@ pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
 }
 
 /// Printed once a Codex account is saved into a config that held no Codex row before, in any
-/// state, enabled, disabled or needing a re-login: the save is the moment tcr starts terminating
-/// `chatgpt.com` for every codex that reaches it, because the proxy intercepts that host exactly
-/// while its pool holds a Codex account (`mitm::handle_connect`). A codex started with
-/// `tcr run --codex` trusts tcr's CA and is pooled; any other codex sent through this proxy meets
-/// a certificate it does not trust, and needs the CA or `NO_PROXY` to keep working.
+/// state, enabled, disabled or needing a re-login. The account enables marked Codex connections
+/// to join the pool (`mitm::handle_connect`); unmarked clients keep their own TLS and login.
 pub const CODEX_FIRST_ACCOUNT_NOTICE: &str =
-    "tcr intercepts chatgpt.com from now on: codex started \
-    with `tcr run --codex` is pooled; a codex that reaches this proxy some other way needs \
-    CODEX_CA_CERTIFICATE set to tcr's CA, or chatgpt.com in NO_PROXY to stay on its own login";
+    "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`, or set \
+    HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port> and CODEX_CA_CERTIFICATE to tcr's CA; \
+    unmarked connections keep their own login";
 
 /// The warning for a `tcr` at `path`, reporting `version`, that is 0.2.45 or older: it predates
 /// the `credentialVersion` check, so it would read a Codex row as a Claude account and send its
@@ -8487,13 +8484,12 @@ mod tests {
         Path::new("/tmp/tcr-run-test/tcr-ca.pem")
     }
 
-    /// A proxy serving the JS teamclaude leaf never intercepts chatgpt.com, so the first Codex
-    /// account is told codex is not pooled, and why, never that tcr intercepts chatgpt.com from
-    /// now on. The same holds before any proxy runs when the JS leaf is on disk, because the
-    /// next boot serves it.
+    /// A proxy serving the JS teamclaude leaf cannot terminate marked Codex connections, so the
+    /// first account is told codex is not pooled, and why. The same holds before any proxy runs
+    /// when the JS leaf is on disk, because the next boot serves it.
     ///
     /// Watched red: with the first-account notice keyed on the config's count alone, the
-    /// JS-leaf proxy gets "tcr intercepts chatgpt.com from now on".
+    /// JS-leaf proxy gets a notice claiming marked Codex connections are pooled.
     #[test]
     fn a_js_leaf_proxy_gets_the_not_pooled_notice() {
         let js = live_proxy_reporting(
@@ -8532,7 +8528,7 @@ mod tests {
         );
     }
 
-    /// A proxy whose minted leaf intercepts chatgpt.com takes the first Codex account's traffic
+    /// A proxy whose minted leaf covers chatgpt.com can take marked Codex traffic
     /// from now on, though its status, read right after the save, may not list the new row yet:
     /// the notice keys on the leaf, not on the route. So does a released port with no JS leaf on
     /// disk, where the next boot mints such a leaf.

@@ -131,21 +131,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:3456   # base-URL mode
 # or
 export HTTPS_PROXY=http://127.0.0.1:3456          # forward-proxy mode
 export NODE_EXTRA_CA_CERTS=<the CA path tcr logs at boot>
-export CODEX_CA_CERTIFICATE=<the same CA path>    # for codex, once a Codex account is pooled
+export CODEX_CA_CERTIFICATE=<the same CA path>    # for an explicitly routed codex session
 ```
 
 Forward-proxy mode decrypts TLS with a locally generated certificate, so the client has to trust
 it; `tcr` prints the CA path to use when it starts, naming `NODE_EXTRA_CA_CERTS`, and
 `CODEX_CA_CERTIFICATE` too once the config holds a Codex account. With a certificate it minted
-itself (CA `~/.config/tcr-ca.pem`) it decrypts `chatgpt.com` as well, but only while the pool
-holds a Codex account. Until then it tunnels `chatgpt.com` untouched, and a `codex` behind
-`HTTPS_PROXY` runs on its own login. Once it holds one, a `codex` started in a shell that exports
-`HTTPS_PROXY` is pooled, and fails its TLS handshake unless it trusts that CA; add `chatgpt.com`
-to `NO_PROXY` to keep that `codex` on its own login instead. `codex` takes no CA from
-`NODE_EXTRA_CA_CERTS`: `CODEX_CA_CERTIFICATE` is its variable for one, `SSL_CERT_FILE` serves
-while that is unset, and a CA already in the system trust store works too. `tcr run` sets both
-`NODE_EXTRA_CA_CERTS` and `CODEX_CA_CERTIFICATE` when it launches Claude Code in forward-proxy
-mode, and `tcr run --codex` sets `CODEX_CA_CERTIFICATE`, and `NODE_EXTRA_CA_CERTS` for a `claude`
+itself (CA `~/.config/tcr-ca.pem`) it decrypts `chatgpt.com` only for a Codex connection
+that opts in with `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`, while the pool holds a
+Codex account. `tcr run --codex` sets that marker and the CA. An unmarked `HTTPS_PROXY`,
+including the one inherited from a Claude `tcr run` session, tunnels `chatgpt.com` untouched
+and leaves the client on its own login. Marked connections relay paths outside `/backend-api/`
+with the client's credential. `codex` takes no CA from `NODE_EXTRA_CA_CERTS`:
+`CODEX_CA_CERTIFICATE` is its variable for one, `SSL_CERT_FILE` serves while that is unset,
+and a CA already in the system trust store works too. `tcr run` sets both CA variables when
+it launches Claude Code in forward-proxy mode; `tcr run --codex` sets
+`CODEX_CA_CERTIFICATE`, and `NODE_EXTRA_CA_CERTS` for a `claude`
 that session starts. The config lives at `~/.config/teamclaude.json`, and `name` and
 `accessToken` are the only required keys. Every other key, its default and the file's permissions
 are in [`docs/configuration.md`](docs/configuration.md).
@@ -303,8 +304,8 @@ needs no config and contacts nothing.
 
 One TCP listener serves both modes. It peeks at the first eight bytes of each connection without
 consuming them and decides from those. A `CONNECT` to an Anthropic API host, or to `chatgpt.com`
-for Codex while the pool holds a Codex account, has its TLS terminated with a locally generated
-leaf certificate, any other `CONNECT` is copied through as raw bytes, and plain HTTP is base-URL
+on a marked Codex connection while the pool holds an account, has its TLS terminated with a locally
+generated leaf certificate, any other `CONNECT` is copied through as raw bytes, and plain HTTP is base-URL
 mode. Each request then runs a bounded rotation loop: pick an eligible account, refresh its token
 if it is about to expire, swap the client's credentials for the pooled one, send, and rotate to
 another account on a 401, 429, 529 or transport failure.
@@ -448,11 +449,12 @@ target is copied through as raw bytes and is never decrypted or filtered, which 
 unrestricted forward proxy to any host for any local process. Claude Code needs it to work that
 way, so treat it as a tunnel and not as a firewall. Which hosts are actually decrypted depends on
 the leaf certificate in use, and [`MITM-DESIGN.md`](MITM-DESIGN.md) works through that.
-`chatgpt.com` is decrypted only while the pool holds a Codex account, and tunnelled untouched
-otherwise.
+`chatgpt.com` is decrypted only on a marked Codex connection while the pool holds an account,
+and tunnelled untouched otherwise.
 
-**Credentials.** On the inference paths, Anthropic's two and Codex's
-`/backend-api/codex/responses`, `tcr` drops the client's own `authorization` and `x-api-key`
+**Credentials.** On the inference paths, Anthropic's two and Codex's `responses`,
+`images/generations`, `images/edits`, `memories/trace_summarize` and `alpha/search`
+under `/backend-api/codex/`, `tcr` drops the client's own `authorization` and `x-api-key`
 headers before adding the pooled Bearer token, so a client credential is never sent alongside
 ours. On Codex's it also replaces the client's `chatgpt-account-id` header with the serving
 account's. The one exception is a Codex request that names a workspace routing of its own

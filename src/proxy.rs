@@ -2740,11 +2740,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // on. Matching them against `path_and_query` would let a query string decide
     // routing, and a path is what these rules are actually about.
     let path = parts.uri.path().to_string();
-    // Which upstream this request belongs to, decided by its PATH (see
-    // `crate::provider`'s module doc for why not by host): anything under
-    // `/backend-api/` is Codex, everything else is Anthropic, which is what every
-    // path meant before Codex existed. Constant for the whole request.
-    let provider = crate::provider::Provider::of_path(&path);
+    // A marked ChatGPT tunnel belongs to Codex even outside its backend paths. Those
+    // paths relay on the client's credential; the path decides the provider elsewhere.
+    let codex_tunnel = parts
+        .extensions
+        .get::<InterceptedHost>()
+        .is_some_and(|host| host.0.eq_ignore_ascii_case(crate::provider::CODEX_HOST));
+    let path_provider = crate::provider::Provider::of_path(&path);
+    let provider = if codex_tunnel {
+        crate::provider::Provider::Codex
+    } else {
+        path_provider
+    };
+    let codex_passthrough = codex_tunnel && path_provider != crate::provider::Provider::Codex;
     // And the query on its own, for the one consumer that needs the two apart:
     // a request handed to a fallback provider is rebuilt on another Mac, and it
     // used to be rebuilt from the path alone. See `fallback::Ask::query`.
@@ -2853,20 +2861,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             );
         }
     }
-    // And the host a request is for must name the same provider as its path. The path decides
-    // `provider` and the upstream follows it, so without this a `chatgpt.com` request with a
-    // path outside `/backend-api/` goes to Anthropic's origin, on a relayed path with the
-    // CLIENT's bearer, which there is a ChatGPT token; and an `api.anthropic.com` or
-    // `platform.claude.com` request with a `/backend-api/` path carries a Claude token to
-    // Codex's. No client tcr serves sends either, so the disagreement is refused and nothing is
-    // forwarded. An allowlisted host that names no provider is refused too (fail closed).
-    //
-    // Inside a tunnel tcr terminated, the CONNECT host decides ([`InterceptedHost`]): a request
-    // that names no host is still a request for the tunnel's host. One that names any other host,
-    // a loopback one included, or a `Host` too garbled to read, is refused as well, because tcr
-    // serves a tunnel only for the host it was opened to. Only a base-URL request, which comes
-    // through no tunnel, is judged by the host it names, and one naming a loopback host, or none,
-    // keeps the path's provider.
+    // A decrypted request stays on its CONNECT host. Marked ChatGPT connections may
+    // relay paths outside /backend-api/ on the client's credential; they still cannot
+    // name a different Host. Other intercepted hosts retain their provider/path guard.
     let refusal = match parts.extensions.get::<InterceptedHost>() {
         Some(InterceptedHost(tunnel)) => {
             let names_another_host = match target {
@@ -2954,7 +2951,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     pooled account shares, so no pooled bearer may stand in for it.
     //     Counted when that routing is the only reason (`tcr status` reports it): a path
     //     relayed for itself would have been relayed whatever it named.
-    let relay = match relay_mode(&method, &path, client_bearer.is_some()) {
+    let path_relay = if codex_passthrough {
+        Some(RelayMode::ClientCredential)
+    } else {
+        relay_mode(&method, &path, client_bearer.is_some())
+    };
+    let relay = match path_relay {
         Some(mode) => Some(mode),
         None if provider == crate::provider::Provider::Codex
             && names_codex_routing(&req_headers) =>

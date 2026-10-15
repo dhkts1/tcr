@@ -775,8 +775,8 @@ impl CodexReport {
         )
     }
 
-    /// `codexIntercept`: whether the proxy terminates `chatgpt.com`. `yes` when codex is
-    /// pooled, and when only tcr's CA is missing (the proxy still intercepts, and a codex that
+    /// `codexIntercept`: whether the proxy can terminate marked `chatgpt.com` connections. `yes` when codex is
+    /// pooled, and when only tcr's CA is missing (a marked codex connection that
     /// does not trust the CA fails TLS). `no` when the proxy serves a leaf that cannot cover
     /// `chatgpt.com`, runs without MITM, or blind-tunnels it for want of a Codex account.
     /// `unknown` when no proxy answered, its status could not be read, it predates the report,
@@ -793,15 +793,13 @@ impl CodexReport {
         }
     }
 
-    /// The proxy variable that sends a codex started in this shell into tcr's interception
-    /// without tcr's CA, by the spelling found: it points at tcr, `NO_PROXY` does not exempt
-    /// `chatgpt.com`, and the CA codex reads first is not tcr's. Kept while the interception is
-    /// unknown, and dropped only when the proxy is known to intercept nothing of codex's.
+    /// A shell proxy URL that needs routing guidance: either it lacks Codex's marker,
+    /// or it opts into interception without trusting tcr's CA.
     fn proxy_var_at_tcr(&self) -> Option<&str> {
         let (var, value) = self.env.https_proxy.as_ref()?;
         (points_at_tcr(value, self.port)
             && !self.env.exempts_codex()
-            && !self.env.trusts(&self.ca)
+            && (!crate::mitm::codex_proxy_marked(value) || !self.env.trusts(&self.ca))
             && self.intercept() != "no")
             .then_some(var.as_str())
     }
@@ -813,12 +811,26 @@ impl CodexReport {
     pub fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
         if let Some(var) = self.proxy_var_at_tcr() {
-            problems.push(format!(
-                "{var} in this shell points at tcr, so a codex started here without `tcr run \
-                 --codex` meets tcr's interception without its CA and fails TLS: add \
-                 chatgpt.com to NO_PROXY, or export CODEX_CA_CERTIFICATE once the CA is \
-                 readable"
-            ));
+            let marked = self
+                .env
+                .https_proxy
+                .as_ref()
+                .is_some_and(|(_, value)| crate::mitm::codex_proxy_marked(value));
+            problems.push(if marked {
+                format!(
+                    "{var} in this shell points at tcr with the Codex marker but without its CA, \
+                     so codex fails TLS: use `tcr run --codex`, or export CODEX_CA_CERTIFICATE \
+                     once the CA is readable"
+                )
+            } else {
+                format!(
+                    "{var} in this shell points at tcr with an unmarked URL, so chatgpt.com is \
+                     tunneled untouched on codex's own login: use `tcr run --codex`, or set \
+                     HTTPS_PROXY=http://tcr-codex@127.0.0.1:{} and CODEX_CA_CERTIFICATE to \
+                     tcr's CA to join the pool",
+                    self.port
+                )
+            });
         }
         for row in self
             .rows
@@ -2111,13 +2123,27 @@ mod tests {
     /// reads for an `https://` URL decides, and the problem is dropped when that codex goes
     /// around tcr (`NO_PROXY`), trusts tcr's CA, or meets no interception at all.
     #[test]
+    fn an_unmarked_codex_proxy_reports_how_to_join_the_pool() {
+        let report = CodexReport {
+            env: CodexEnv {
+                https_proxy: Some(("HTTPS_PROXY".into(), "http://127.0.0.1:3999".into())),
+                ..CodexEnv::default()
+            },
+            ..codex_report(pooled())
+        };
+        let problem = &report.problems()[0];
+        assert!(problem.contains("unmarked"), "{problem}");
+        assert!(problem.contains("tcr-codex@127.0.0.1:3999"), "{problem}");
+        assert!(!problem.contains("fails TLS"), "{problem}");
+    }
+
+    #[test]
     fn a_codex_problem_names_https_proxy_pointing_at_tcr() {
-        const AT_TCR: &str = "http://127.0.0.1:3999";
+        const AT_TCR: &str = "http://tcr-codex@127.0.0.1:3999";
         const CA: &str = "/Users/example/.config/tcr-ca.pem";
-        const PROBLEM: &str = "HTTPS_PROXY in this shell points at tcr, so a codex started here \
-                               without `tcr run --codex` meets tcr's interception without its \
-                               CA and fails TLS: add chatgpt.com to NO_PROXY, or export \
-                               CODEX_CA_CERTIFICATE once the CA is readable";
+        const PROBLEM: &str = "HTTPS_PROXY in this shell points at tcr with the Codex marker \
+                               but without its CA, so codex fails TLS: use `tcr run --codex`, \
+                               or export CODEX_CA_CERTIFICATE once the CA is readable";
         let with_env = |route: CodexRoute, env: CodexEnv| CodexReport {
             env,
             ..codex_report(route)
@@ -2153,7 +2179,7 @@ mod tests {
         assert_eq!(report.problems()[0], PROBLEM);
         assert_eq!(
             env_line(&report),
-            "codexEnv: HTTPS_PROXY=http://127.0.0.1:3999 (points at tcr) · NO_PROXY unset · \
+            "codexEnv: HTTPS_PROXY=http://…@127.0.0.1:3999 (points at tcr) · NO_PROXY unset · \
              SSL_CERT_FILE unset"
         );
 
@@ -2167,7 +2193,7 @@ mod tests {
         assert!(!names_tcr(&exempt), "{:?}", exempt.problems());
         assert_eq!(
             env_line(&exempt),
-            "codexEnv: HTTPS_PROXY=http://127.0.0.1:3999 (points at tcr) · \
+            "codexEnv: HTTPS_PROXY=http://…@127.0.0.1:3999 (points at tcr) · \
              NO_PROXY=chatgpt.com (exempts chatgpt.com) · SSL_CERT_FILE unset"
         );
         for (label, env) in [

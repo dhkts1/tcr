@@ -24,7 +24,7 @@ final class LoginEventCodexTests: XCTestCase {
                 .failed(reason: try field("reason", ofLine: 4), code: "codex-identity"),
             ])
         XCTAssertTrue(
-            try field("text", ofLine: 2).hasPrefix("tcr intercepts chatgpt.com from now on: "))
+            try field("text", ofLine: 2).hasPrefix("tcr pools marked Codex connections to chatgpt.com: "))
         XCTAssertTrue(
             try field("reason", ofLine: 4).hasPrefix(
                 "the ChatGPT login that came back is carol@example.com, "))

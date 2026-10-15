@@ -261,7 +261,7 @@ unset. The rules are in [configuration.md](configuration.md#environment-override
 ```
 
 `codex` is running on its own login, around the pool: `tcr run --codex` pools a session only
-when the running proxy reports a leaf it minted that intercepts `chatgpt.com`, lists a Codex
+when the running proxy reports a leaf that covers marked `chatgpt.com` connections, lists a Codex
 account, and that leaf's CA is on disk. Each `<reason>`, verbatim, and its fix are in
 [`cli.md`](cli.md#--codex-launching-codex-through-the-pool). `tcr doctor --codex` prints the same
 reason, and checks the route, tcr's CA, this shell's proxy variables and the `codex` binary in one
@@ -293,11 +293,13 @@ means requests reached tcr from a login that names a FedRAMP or data-residency r
 own, which tcr relays on that login's credential, never pooled. Both count the last ten minutes,
 and a restart of the proxy empties them.
 
-With neither note, `codex` is not reaching tcr at all. A
+With neither note, `codex` is not reaching the pool. An unmarked connection through tcr is
+blind-tunneled and uses its own login; start with `tcr run --codex` to opt in. A
 `codex` you start yourself is pooled only when the proxy variable it reads for `https://` aims
-at this proxy (`HTTPS_PROXY`, else `ALL_PROXY`, in either case), it trusts tcr's CA (through
+at this proxy with the `tcr-codex` userinfo marker
+(`HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`), it trusts tcr's CA (through
 `CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`, or the system store), no `NO_PROXY` entry exempts
-`chatgpt.com`, and the proxy intercepts `chatgpt.com`, which it does only while its pool holds
+`chatgpt.com`, and the proxy can intercept the marked connection, which requires that its pool holds
 a Codex account; `tcr run --codex` checks and arranges all of that. `tcr doctor --codex` checks
 it for a `codex` started from the shell you run it in: the route, tcr's CA, that shell's proxy
 variables and the `codex` binary, in one go ([`cli.md`](cli.md#the-codex-block)). A login whose
@@ -316,7 +318,7 @@ session inherits it. Either way it replaces any value you exported, so a corpora
 reached `codex` through `SSL_CERT_FILE` no longer does. For `chatgpt.com`, while tcr decrypts
 it, `codex` only ever sees tcr's leaf. The hosts tcr tunnels untouched still present whatever
 certificate your network presents, `auth.openai.com` among them, where `codex` refreshes its
-own login, and `chatgpt.com` itself while the pool holds no Codex account, so behind a
+own login, and unmarked `chatgpt.com` connections (or any with no Codex account), so behind a
 TLS-inspecting proxy whose CA reaches `codex` only through `SSL_CERT_FILE` those connections
 fail. This is a known limitation of `tcr run --codex`, and of a `codex` started inside a
 `tcr run` session, and no tcr setting changes it. `codex` itself accepts a PEM file holding
@@ -371,3 +373,12 @@ reason; do not give it the release id.
 
 The app's version is derived from the repository's commit count, so a `--depth 1` clone
 cannot build it. Unshallow the clone and build again.
+
+## Claude sessions fail after upgrading an old certificate chain
+
+When tcr adds `chatgpt.com` to its generated leaf, it signs a new leaf under the persisted
+`tcr-ca.key`. Installs whose chain predates that key have no CA key to reuse, so their next
+start generates a new CA instead. Running `claude` sessions that loaded the old CA then fail
+with `CERT_SIGNATURE_FAILURE` until they restart. Restart those sessions with `tcr run` so
+they load the new CA. Plan this upgrade for a quiet moment; recent installs that already have
+`tcr-ca.key` keep their existing CA.

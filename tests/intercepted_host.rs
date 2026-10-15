@@ -1,12 +1,10 @@
-//! Inside a tunnel tcr terminates, the tunnel's own host decides which provider a request may
-//! reach. tcr routes a request by its path (`teamclaude_rs::provider`), and the host has to
-//! agree; a request that came through `CONNECT chatgpt.com:443` is a request for `chatgpt.com`,
+//! Inside a tunnel tcr terminates, the tunnel's own host fixes the upstream; a request that came through `CONNECT chatgpt.com:443` is a request for `chatgpt.com`,
 //! whatever `Host` it declares, and if it declares none. These tests open real tunnels through
 //! the real listener ([`teamclaude_rs::mitm::serve`]), over a leaf minted into a temp dir, to an
 //! Anthropic and a Codex origin on loopback, and check that:
 //!
-//! - a request whose path belongs to the other provider is answered 421 and reaches neither
-//!   origin, with no `Host` over HTTP/1.1 or HTTP/1.0, and with a loopback `Host`;
+//! - a marked ChatGPT tunnel relays other paths with the client's credential to ChatGPT;
+//! - an Anthropic tunnel carrying a backend-api path is refused with 421;
 //! - a request that names any host but the tunnel's is answered 421 as well;
 //! - a request whose path agrees with its tunnel is served, with or without a `Host`;
 //! - a base-URL request, which comes through no tunnel, still routes by its path alone.
@@ -26,7 +24,8 @@
 //! No real account or token, and no request leaves 127.0.0.1: both origins are on loopback, and
 //! every tunnel is to a host the minted leaf covers, so tcr terminates it instead of connecting
 //! out. That takes a Codex account in the fleet as well: with none, tcr blind-tunnels
-//! `chatgpt.com` to the real host, so [`start`] checks the fleet holds one. Every listener binds
+//! `chatgpt.com` to the real host, so [`start`] checks the fleet holds one and every ChatGPT
+//! CONNECT sends the Codex marker. Every listener binds
 //! `127.0.0.1:0`.
 
 use std::net::SocketAddr;
@@ -251,13 +250,19 @@ where
     (status, response)
 }
 
-/// Open `CONNECT {host}:443` through tcr, finish TLS trusting tcr's CA, send `request` inside
+/// Open a marked `CONNECT {host}:443` through tcr, finish TLS trusting tcr's CA, send `request` inside
 /// the tunnel, and return the status and the whole response.
 async fn through_tunnel(tcr: &Tcr, host: &str, request: &[u8]) -> (u16, String) {
     let mut tcp = TcpStream::connect(tcr.addr).await.expect("reach tcr");
-    tcp.write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes())
-        .await
-        .expect("send the CONNECT");
+    tcp.write_all(
+        format!(
+            "CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\nProxy-Authorization: {}\r\n\r\n",
+            teamclaude_rs::mitm::CODEX_PROXY_AUTHORIZATION
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("send the CONNECT");
     let head = read_head(&mut tcp).await;
     assert!(
         head.starts_with("HTTP/1.1 200"),
@@ -288,41 +293,48 @@ fn get(path: &str, bearer: &str, headers: &[u8]) -> Vec<u8> {
     request
 }
 
-/// **Inside a `chatgpt.com` tunnel, an Anthropic path is refused however the request names its
-/// host.** By its path alone, `/api/oauth/profile` goes to the Anthropic origin carrying the
-/// client's own bearer, which inside this tunnel is a ChatGPT token. A request naming
-/// `chatgpt.com` was refused already; one naming no host, over HTTP/1.1 or HTTP/1.0, or naming a
-/// loopback host, was routed by its path and reached the Anthropic origin with the ChatGPT
-/// bearer. The tunnel's host decides now: each is answered 421, naming the tunnel's host and the
-/// path, and neither origin sees a byte. The same tunnel still serves a Codex path with no
-/// `Host`.
+/// A marked ChatGPT tunnel fixes the origin even when the path is outside `/backend-api/`.
+/// Such paths use the client's own credential, or none, and never an Anthropic upstream.
 #[tokio::test]
-async fn a_chatgpt_com_tunnel_refuses_an_anthropic_path_whatever_host_it_names() {
+async fn a_marked_chatgpt_tunnel_relays_other_paths_on_the_clients_credential() {
     let tcr = start().await;
-    for (shape, request) in [
-        (
-            "no Host, HTTP/1.1",
-            get("/api/oauth/profile", CHATGPT_BEARER, b""),
-        ),
-        (
-            "no Host, HTTP/1.0",
-            format!("GET /api/oauth/profile HTTP/1.0\r\nauthorization: {CHATGPT_BEARER}\r\n\r\n")
-                .into_bytes(),
-        ),
-        (
-            "Host: localhost",
-            get("/api/oauth/profile", CHATGPT_BEARER, b"host: localhost\r\n"),
-        ),
-    ] {
-        let (status, response) = through_tunnel(&tcr, "chatgpt.com", &request).await;
-        assert_eq!(status, 421, "{shape}: {response}");
-        assert!(
-            response.contains("chatgpt.com") && response.contains("/api/oauth/profile"),
-            "{shape}: the refusal names the tunnel's host and the path: {response}"
-        );
+    let mut expected = Vec::new();
+    for path in ["/api/oauth/profile", "/share/example", "/v1/messages"] {
+        for (shape, request) in [
+            ("no Host, HTTP/1.1", get(path, CHATGPT_BEARER, b"")),
+            (
+                "no Host, HTTP/1.0",
+                format!("GET {path} HTTP/1.0\r\nauthorization: {CHATGPT_BEARER}\r\n\r\n")
+                    .into_bytes(),
+            ),
+            (
+                "Host: chatgpt.com",
+                get(path, CHATGPT_BEARER, b"host: chatgpt.com\r\n"),
+            ),
+        ] {
+            let (status, response) = through_tunnel(&tcr, "chatgpt.com", &request).await;
+            assert_eq!(status, 200, "{path}, {shape}: {response}");
+            expected.push(seen(path, CHATGPT_BEARER));
+        }
     }
-    assert_eq!(tcr.anthropic.seen(), [], "nothing reached Anthropic");
-    assert_eq!(tcr.codex.seen(), [], "nor Codex");
+    assert_eq!(tcr.codex.seen(), expected);
+    assert_eq!(
+        tcr.anthropic.seen(),
+        [],
+        "no ChatGPT credential reached Anthropic"
+    );
+
+    let (status, response) = through_tunnel(
+        &tcr,
+        "chatgpt.com",
+        b"GET /share/example HTTP/1.1\r\nhost: chatgpt.com\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status, 200, "an anonymous relay: {response}");
+    expected.push(Seen {
+        path: "/share/example".to_string(),
+        bearer: None,
+    });
 
     let (status, response) = through_tunnel(
         &tcr,
@@ -330,13 +342,10 @@ async fn a_chatgpt_com_tunnel_refuses_an_anthropic_path_whatever_host_it_names()
         &get("/backend-api/wham/usage", CHATGPT_BEARER, b""),
     )
     .await;
-    assert_eq!(status, 200, "a Codex path, no Host: {response}");
-    assert_eq!(
-        tcr.codex.seen(),
-        [seen("/backend-api/wham/usage", CHATGPT_BEARER)],
-        "it reached Codex with the client's own bearer"
-    );
-    assert_eq!(tcr.anthropic.seen(), [], "and never Anthropic");
+    assert_eq!(status, 200, "a backend path, no Host: {response}");
+    expected.push(seen("/backend-api/wham/usage", CHATGPT_BEARER));
+    assert_eq!(tcr.codex.seen(), expected);
+    assert_eq!(tcr.anthropic.seen(), [], "nothing reached Anthropic");
 }
 
 /// **The mirror: inside an `api.anthropic.com` tunnel, a `/backend-api/` path is refused

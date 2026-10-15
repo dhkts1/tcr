@@ -161,7 +161,7 @@ public enum CodexSignInCopy {
             return why.map { "Not pooled: \($0)" } ?? "Not pooled"
         }
         if let upstream = route.upstream, !upstream.isEmpty { return "Pooled through \(upstream)" }
-        return "Pooled: tcr intercepts chatgpt.com"
+        return "Pooled: tcr marks Codex connections to chatgpt.com"
     }
 
     /// Under Settings › Updates' command-line tcr, when that tcr cannot read a config

@@ -113,10 +113,10 @@ final class RemoveAccountCommandTests: XCTestCase {
     /// says so. A row whose delete already landed (it carries a delete notice) does
     /// not count; any other Codex row does, a disabled one included, because it is
     /// still in the config.
-    func testTheLastCodexAccountSaysTcrStopsIntercepting() throws {
+    func testTheLastCodexAccountSaysTcrStopsDecryptingMarkedCodexConnections() throws {
         let lastCodex =
             codexFirst + "\n\n" + stopsAtOnce + "\n\nThis is your last Codex account. tcr stops "
-            + "intercepting chatgpt.com, and codex runs on its own login."
+            + "decrypting marked Codex connections to chatgpt.com, and codex runs on its own login."
         let notLast = codexFirst + "\n\n" + stopsAtOnce
         func informative(_ rows: [[String: Any]], deleted: Set<String>) throws -> String {
             let fleet = try decodeFleet(rows)

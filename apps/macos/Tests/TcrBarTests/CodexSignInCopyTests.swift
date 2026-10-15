@@ -201,7 +201,7 @@ final class CodexSignInCopyTests: XCTestCase {
             CodexSignInCopy.settingsCodexValue(route: nil), "Unknown until the server answers")
         XCTAssertEqual(
             CodexSignInCopy.settingsCodexValue(route: try route(#"{"pooled":true}"#)),
-            "Pooled: tcr intercepts chatgpt.com")
+            "Pooled: tcr marks Codex connections to chatgpt.com")
         XCTAssertEqual(
             CodexSignInCopy.settingsCodexValue(
                 route: try route(#"{"pooled":true,"upstream":"https://chatgpt.example.test"}"#)),

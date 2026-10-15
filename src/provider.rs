@@ -6,18 +6,13 @@
 //! crate is an exhaustive `match`: adding a third provider is a compiler-guided walk through each
 //! of them, which is the property this crate's explicit, documented style wants.
 //!
-//! # A request's provider is decided by PATH, not by host
+//! # Request routing
 //!
-//! Every Codex request lives under `/backend-api/` (`openai/codex`,
-//! `model-provider-info/src/lib.rs:80`, `CHATGPT_CODEX_BASE_URL`), and nothing Anthropic sends
-//! does. Resolving by path works identically in MITM mode (where the CONNECT host is
-//! `chatgpt.com`) and in the origin-form requests this crate's in-process tests send, which carry
-//! no meaningful host. The host only has to agree. Inside a tunnel tcr terminated, the CONNECT
-//! host is the request's host: `proxy.rs`'s host guard refuses a request that declares any other
-//! host, a loopback one included, or a `Host` it cannot read, and one whose host and path name
-//! different providers, so `chatgpt.com` is served only under `/backend-api/` and the Anthropic
-//! hosts never are. Only a base-URL request, which comes through no tunnel, is judged by the host
-//! it names, and one naming a loopback host, or none, keeps its path's provider.
+//! Backend paths under `/backend-api/` belong to Codex; other paths default to Anthropic.
+//! A marked ChatGPT CONNECT is the exception: its authoritative tunnel host keeps every
+//! path on ChatGPT, and paths outside `/backend-api/` relay on the client's credential.
+//! The proxy refuses a request that names a different host than its tunnel, and refuses
+//! an Anthropic tunnel carrying a Codex backend path. Base-URL requests retain path routing.
 
 use serde::{Deserialize, Serialize};
 

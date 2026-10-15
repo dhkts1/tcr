@@ -352,6 +352,10 @@ run_turn() { # $1 = the turn's number
   if line="$(grep -m 1 -F "$NOT_POOLED" "$E2E_HOME/codex.err")"; then
     fail "turn $n was not pooled: $line"
   fi
+  # Both Codex transports carry the proxy URL userinfo as a CONNECT marker. This opt-in
+  # confines TLS termination to the session; an unmarked chatgpt.com connection stays blind.
+  grep -F "tunnelling via http://tcr-codex@127.0.0.1:$PORT;" "$E2E_HOME/codex.err" >/dev/null \
+    || fail "turn $n did not use the marked Codex proxy URL"
   [ "$rc" -eq 0 ] || fail "turn $n: tcr run --codex exited $rc"
   reply="$(sed -e '/^[[:space:]]*$/d' "$E2E_HOME/turn$n.out" | tail -n 1)"
   echo "$reply"

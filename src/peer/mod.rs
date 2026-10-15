@@ -3,13 +3,12 @@
 //! One operator's own Macs, over one Noise-authenticated TCP stream per
 //! purpose, moving two different scarce things that are NOT the same shape:
 //!
-//! - **egress**: reach the hosts on tcr's MITM policy list at all (Anthropic's
-//!   two and Codex's `chatgpt.com`). A peer carries it BLIND, as pure
+//! - **egress**: reach Anthropic's two hosts on the peer egress list. A peer carries it BLIND, as pure
 //!   bytes, with the requester's own credential sealed inside the requester's
 //!   own TLS. No lease, no ledger, no plaintext leaving any host. This is also
 //!   the only thing that keeps an offline machine's own tokens alive, because
 //!   `platform.claude.com` (the host Claude Code's OAuth refresh targets) is
-//!   on the same allow-list (`mitm::ALLOWED_HOSTS`). Listed is not sent: the
+//!   on the allow-list (`egress::PEER_EGRESS_HOSTS`). The
 //!   requester never sends a Codex request through a peer in this version (a
 //!   Codex account's exit pin is refused by `pinned_egress`'s Codex arm in
 //!   `src/peer/egress.rs`, and `src/proxy.rs` offers the blind carry to

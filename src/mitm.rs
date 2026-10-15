@@ -8,7 +8,7 @@
 //!   1. A client sends `CONNECT <host>:<port>`. We peek the request line.
 //!   2. `api.anthropic.com`, `platform.claude.com` (Claude Code's own OAuth
 //!      refresh host, `POST /v1/oauth/token`) and `chatgpt.com` (Codex's
-//!      inference and backend host, while the pool holds a Codex account:
+//!      inference and backend host, on a marked Codex connection while the pool holds an account:
 //!      `host_intercepted`) are MITM-terminated **only when the leaf
 //!      certificate actually loaded for this process covers that host** —
 //!      see [`host_allowed`] (policy) and
@@ -19,7 +19,7 @@
 //!      as base-URL mode — authenticate, select an account, inject the pooled
 //!      `Bearer`, forward to the real upstream.
 //!   3. Every OTHER host — and any policy-allowed host the loaded leaf does
-//!      NOT cover, and `chatgpt.com` while the pool holds no Codex account —
+//!      NOT cover, and an unmarked `chatgpt.com` connection or one with no pooled account —
 //!      is **blind-tunneled**: a raw TCP byte-pipe to
 //!      `<host>:<port>` with TLS left untouched (we never see plaintext and
 //!      inject nothing). This matches the JS proxy's open tunnel for
@@ -37,6 +37,15 @@
 //! verbatim — no proxy handler change is needed. The outbound client keeps
 //! `.no_proxy()` (set in [`crate::manager`]) so we never loop our own upstream
 //! back through an ambient `HTTPS_PROXY`.
+//!
+//! Codex connections opt in with `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>`.
+//! Codex's HTTP client passes proxy URL userinfo to reqwest; its WebSocket client enables
+//! the pinned Tungstenite forks' proxy support (`openai/codex` `http-client/src/outbound_proxy.rs`,
+//! `websocket-client/src/dialer.rs`, `Cargo.toml`). Both send that userinfo as HTTP CONNECT
+//! `Proxy-Authorization: Basic dGNyLWNvZGV4Og==`. The pinned Tungstenite `proxy.rs`
+//! parses a username without a password and builds the same Basic header as reqwest's
+//! hyper-util matcher. This permits one listener without terminating another client's
+//! `chatgpt.com` TLS. The marker selects routing; it is not an authentication secret.
 
 use std::io;
 use std::net::SocketAddr;
@@ -69,8 +78,8 @@ use crate::manager::Manager;
 ///
 /// `chatgpt.com` was added 2026-10 for Codex, whose inference and backend
 /// calls go there by default (`openai/codex` `model-provider-info/src/lib.rs:80`,
-/// `CHATGPT_CODEX_BASE_URL`). It is intercepted only while the pool holds a
-/// Codex account (`host_intercepted`), so a codex with none to serve it keeps
+/// `CHATGPT_CODEX_BASE_URL`). It is intercepted only on a marked Codex connection while the pool
+/// holds a Codex account (`host_intercepted`), so an unmarked client or a codex with none keeps
 /// its own login. A login whose workspace is routed to another backend origin
 /// sends its calls there instead, to a host not on this list; tcr pools no such
 /// workspace, and relays a request that names a routing of its own on the
@@ -81,9 +90,35 @@ use crate::manager::Manager;
 /// single-use, so a refresh tcr mishandled would cost the client its login.
 /// Off this list it is blind-tunneled.
 ///
-/// [`crate::peer::egress::PEER_EGRESS_HOSTS`] is defined AS this slice, so a
-/// host added here is also one a LAN peer gateway will carry.
+/// Peer egress has its own narrower list ([`crate::peer::egress::PEER_EGRESS_HOSTS`]);
+/// adding a local interception host grants no LAN gateway access to it.
 pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com", "chatgpt.com"];
+
+/// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
+pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
+/// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
+pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
+
+/// Does a proxy URL opt in to Codex interception? Used by the doctor without displaying userinfo.
+pub fn codex_proxy_marked(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.username() == CODEX_PROXY_USERNAME && url.password().is_none_or(str::is_empty)
+    })
+}
+
+/// Read the marker from CONNECT headers only, without exposing or forwarding proxy credentials.
+fn codex_connect_marked(head: &str) -> bool {
+    head.lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("proxy-authorization")
+                && value.trim().split_once(' ').is_some_and(|(scheme, value)| {
+                    scheme.eq_ignore_ascii_case("Basic") && value.trim() == "dGNyLWNvZGV4Og=="
+                })
+        })
+}
 
 /// SAN list for the rcgen fallback leaf (the policy allowlist + the JS test
 /// host, kept so a regenerated chain still answers the credential-free
@@ -196,9 +231,9 @@ impl TlsAssets {
     /// [`ALLOWED_HOSTS`] entry the leaf covers. That is
     /// `host_allowed && host_covered_by_loaded_leaf`, evaluated over every host
     /// the policy names, read off this value rather than the process-wide
-    /// `COVERED_HOSTS`. `handle_connect` asks one thing more of `chatgpt.com`, a
-    /// Codex account in the pool (`host_intercepted`), which is a fact about the
-    /// pool, counted on every CONNECT, and not about this leaf; so `chatgpt.com`
+    /// `COVERED_HOSTS`. `handle_connect` also requires a marker and a pooled Codex
+    /// account for `chatgpt.com` (`host_intercepted`), checked on every CONNECT
+    /// independently of this leaf; so `chatgpt.com`
     /// is listed here whether or not the pool holds one. Raw
     /// [`Self::covered_hosts`] would over-report: a minted leaf also carries
     /// `www.example.org`, which is never intercepted.
@@ -226,8 +261,8 @@ pub fn host_allowed(host: &str) -> bool {
 }
 
 /// Is `host` one [`handle_connect`] intercepts NOW, by policy? [`host_allowed`], plus one
-/// condition that belongs to `chatgpt.com` ([`crate::provider::CODEX_HOST`]) alone: it is
-/// intercepted only while the pool holds a Codex account (`codex_accounts`, which
+/// conditions that belong to `chatgpt.com` ([`crate::provider::CODEX_HOST`]) alone: the CONNECT
+/// carries the Codex marker and the pool holds a Codex account (`codex_accounts`, which
 /// [`Manager::provider_account_count`] counts in any state, leaving out a Codex account deleted
 /// while the server runs). With none, a codex that reached tcr
 /// could only be answered `no_codex_account`; blind-tunneled, it runs on its own login, as it
@@ -236,17 +271,19 @@ pub fn host_allowed(host: &str) -> bool {
 ///
 /// Coverage is the separate question [`host_covered_by_loaded_leaf`] answers. Pure, with
 /// [`host_allowed`]'s host matching — unit-tested.
-fn host_intercepted(host: &str, codex_accounts: usize) -> bool {
+fn host_intercepted(host: &str, codex_accounts: usize, codex_connection: bool) -> bool {
     host_allowed(host)
-        && (codex_accounts > 0 || !host.eq_ignore_ascii_case(crate::provider::CODEX_HOST))
+        && (!host.eq_ignore_ascii_case(crate::provider::CODEX_HOST)
+            || (codex_accounts > 0 && codex_connection))
 }
 
 /// [`host_intercepted`] against `manager`'s Codex accounts, counted on every call and never
 /// cached: [`handle_connect`] asks it once per CONNECT.
-fn intercepts_now(manager: &Manager, host: &str) -> bool {
+fn intercepts_now(manager: &Manager, host: &str, codex_connection: bool) -> bool {
     host_intercepted(
         host,
         manager.provider_account_count(crate::provider::Provider::Codex),
+        codex_connection,
     )
 }
 
@@ -933,11 +970,11 @@ async fn handle_connect(
     // tunneling it is strictly safer, and it is exactly today's behavior for
     // an uncovered host, not a new failure mode.
     //
-    // And `chatgpt.com` is blind-tunneled while the pool holds no Codex account
+    // And `chatgpt.com` is blind-tunneled without Codex's marker, or with no pooled account
     // ([`intercepts_now`]): there is no pooled account to serve a codex, and it
     // keeps its own login. Counted on every CONNECT, never cached, so an import
     // takes effect on the next tunnel.
-    if !intercepts_now(&manager, &host) {
+    if !intercepts_now(&manager, &host, codex_connect_marked(&head)) {
         return tunnel(stream, &host, port).await;
     }
     if !host_covered_by_loaded_leaf(&host) {
@@ -1352,14 +1389,56 @@ mod tests {
     /// reaches tcr runs on its own login instead of being answered `no_codex_account`; with one,
     /// it is intercepted.
     #[test]
+    fn an_unmarked_chatgpt_connect_is_tunneled_even_with_a_codex_pool() {
+        assert!(!host_intercepted("chatgpt.com", 1, false));
+    }
+
+    #[test]
+    fn only_the_codex_proxy_authorization_marks_a_connect() {
+        for header in [
+            "Proxy-Authorization: Basic dGNyLWNvZGV4Og==",
+            "proxy-authorization: basic dGNyLWNvZGV4Og==",
+        ] {
+            let head = format!("CONNECT chatgpt.com:443 HTTP/1.1\r\n{header}\r\n\r\n");
+            assert!(codex_connect_marked(&head));
+            assert!(host_intercepted(
+                "chatgpt.com",
+                1,
+                codex_connect_marked(&head)
+            ));
+        }
+        for header in [
+            "",
+            "Authorization: Basic dGNyLWNvZGV4Og==",
+            "Proxy-Authorization: Basic dGNyLWNvZGV4",
+            "Proxy-Authorization: Bearer dGNyLWNvZGV4Og==",
+        ] {
+            let head = format!("CONNECT chatgpt.com:443 HTTP/1.1\r\n{header}\r\n\r\n");
+            assert!(!codex_connect_marked(&head), "{header}");
+            assert!(!host_intercepted(
+                "chatgpt.com",
+                1,
+                codex_connect_marked(&head)
+            ));
+        }
+        assert!(codex_proxy_marked("http://tcr-codex@127.0.0.1:3999"));
+        assert!(codex_proxy_marked("http://tcr-codex:@127.0.0.1:3999"));
+        assert!(!codex_proxy_marked("http://127.0.0.1:3999"));
+        assert!(!codex_proxy_marked("http://other@127.0.0.1:3999"));
+    }
+
+    #[test]
     fn chatgpt_com_is_intercepted_only_while_the_pool_holds_a_codex_account() {
         for host in ["chatgpt.com", "CHATGPT.COM", "ChatGPT.com"] {
             assert!(
-                !host_intercepted(host, 0),
+                !host_intercepted(host, 0, true),
                 "{host}: no Codex account, so the tunnel must be blind"
             );
-            assert!(host_intercepted(host, 1), "{host}: one Codex account");
-            assert!(host_intercepted(host, 3), "{host}: three Codex accounts");
+            assert!(host_intercepted(host, 1, true), "{host}: one Codex account");
+            assert!(
+                host_intercepted(host, 3, true),
+                "{host}: three Codex accounts"
+            );
         }
     }
 
@@ -1367,10 +1446,10 @@ mod tests {
     /// the pool's Codex count, and a host off the policy list never is, whatever it is.
     #[test]
     fn only_chatgpt_com_waits_for_a_codex_account() {
-        for codex_accounts in [0, 1] {
+        for (codex_accounts, marked) in [(0, false), (0, true), (1, false), (1, true)] {
             for host in ["api.anthropic.com", "platform.claude.com"] {
                 assert!(
-                    host_intercepted(host, codex_accounts),
+                    host_intercepted(host, codex_accounts, marked),
                     "{host} with {codex_accounts} Codex account(s)"
                 );
             }
@@ -1383,7 +1462,7 @@ mod tests {
                 "",
             ] {
                 assert!(
-                    !host_intercepted(host, codex_accounts),
+                    !host_intercepted(host, codex_accounts, marked),
                     "{host:?} with {codex_accounts} Codex account(s)"
                 );
             }
@@ -1398,10 +1477,10 @@ mod tests {
     fn a_claude_only_pool_tunnels_chatgpt_com_until_a_codex_account_is_added() {
         let m = dummy_manager();
         assert!(
-            !intercepts_now(&m, "chatgpt.com"),
+            !intercepts_now(&m, "chatgpt.com", true),
             "a Claude-only pool must blind-tunnel chatgpt.com"
         );
-        assert!(intercepts_now(&m, "api.anthropic.com"));
+        assert!(intercepts_now(&m, "api.anthropic.com", true));
 
         m.add_account(crate::config::Account {
             name: "bob@example.com/codex".to_string(),
@@ -1426,7 +1505,7 @@ mod tests {
             extra: serde_json::Map::new(),
         });
         assert!(
-            intercepts_now(&m, "chatgpt.com"),
+            intercepts_now(&m, "chatgpt.com", true),
             "an import takes effect on the next CONNECT"
         );
     }

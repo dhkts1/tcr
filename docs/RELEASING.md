@@ -178,6 +178,9 @@ cut (`gh release edit vX.Y.Z --notes-file …`). Until the Release object exists
 app gets a 404, says nothing, and tries again on the next launch — it records a version as seen
 only once notes were actually shown. A fresh install records the current version silently.
 
+The [pending Codex release notes](release-notes-codex.md) include the certificate-chain
+upgrade notice. Copy them into the first release that ships Codex pooling.
+
 ## What the pipeline does
 
 1. `build-tcrbar.sh` — Swift build, bundle assembly, `tcr` bundled alongside, local signature.
