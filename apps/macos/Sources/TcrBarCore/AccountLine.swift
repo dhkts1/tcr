@@ -174,6 +174,8 @@ extension Account {
     ///    carries no countdown: the column would widen for every line in the
     ///    panel, and the hold's end is in the row's help.
     public func liveSignal(now: Date) -> AccountLineText {
+        // A wording added below for a kind the live band holds belongs in
+        // ``liveSignalWorstCases`` too.
         switch FleetTally.Kind(account: self) {
         case .ok:
             return AccountLineText("ready", .quiet)
@@ -199,6 +201,23 @@ extension Account {
             return AccountLineText("parked", .quiet)
         }
     }
+
+    /// Every text ``liveSignal(now:)`` can draw on a LIVE line, each countdown
+    /// spelled with `0` for every digit it can show at most
+    /// (``HeldWindow/duration(minutes:)``; a near window resets within seven
+    /// days, so one digit of days). The line's signal column is sized once from
+    /// the widest (``AccountLineFit/signalColumn(_:)``), so a status changing
+    /// length never moves a name or a bar.
+    ///
+    /// Only an account in the live band draws a live line (``FleetBand``): a
+    /// spent one draws a waiting line with its own `back in …`, and a parked
+    /// one a waiting line too, so `out of tokens`, `back in …` and `parked` are
+    /// not here. Counting them reserved room for text no live line can show and
+    /// left a short name 24 pt.
+    public static let liveSignalWorstCases = [
+        "ready", "near limit", "unknown", "re-login", "rejected", "unmeasured",
+        "in 0d 00h", "in 00h 00m",
+    ]
 
     /// `"in 47m"` for the first window whose OWN state is near or spent and
     /// that carries a future reset; `nil` when none does.

@@ -776,7 +776,7 @@ extension FleetSectionsTests {
             "expandedGroups.contains(section.expansionKey)",
             "onToggleGroup(section.expansionKey)",
             "section.tallyLabel(tally)",
-            "lists.flatMap(\\.sections) where !isSummarised(section)",
+            "AccountLineFit.lineNames(lists.flatMap(\\.sections))",
         ] {
             XCTAssertTrue(
                 tab.contains(squashed(anchor)), "AccountsTabV4.swift no longer contains \(anchor)")
