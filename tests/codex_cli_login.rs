@@ -514,13 +514,26 @@ fn login_codex_names_every_directory_it_searched() {
 /// help that lacks `--from-codex`.
 fn fake_tcr(dir: &Path, version: &str) {
     std::fs::create_dir_all(dir).expect("a directory for a fake tcr");
+    let binary = dir.join("tcr");
     write_script(
-        &dir.join("tcr"),
+        &binary,
         &format!(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"tcr {version}\"; else echo \
              \"Options: --from-claude-code --from-codex-home <DIR>\"; fi\n"
         ),
     );
+    // A fresh script can spend seconds in macOS's loader before its shell starts. Prepare
+    // this known fixture before exercising the production probe's five-second deadline.
+    let ready = Command::new(binary)
+        .arg("--version")
+        .env("HOME", dir)
+        .env("CODEX_HOME", dir.join("codex-home"))
+        .env("PATH", dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("preparing the fake tcr");
+    assert!(ready.status.success(), "{}", says(&ready));
+    assert_eq!(ready.stdout, format!("tcr {version}\n").as_bytes());
 }
 
 /// Each notice prints only when it holds: the first-account notice for a config with no Codex
@@ -934,7 +947,8 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
         .stderr(std::fs::File::create(&error_log).unwrap())
         .spawn()
         .unwrap();
-    let ready = within(Duration::from_secs(10), || {
+    // Allow both freshly built tcr and the fresh shell fixture to finish loader startup.
+    let ready = within(Duration::from_secs(20), || {
         std::fs::read_to_string(&scratch.log)
             .unwrap_or_default()
             .contains("ready")
