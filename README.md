@@ -78,7 +78,8 @@ To have a plain `claude` go through tcr, run `tcr setup shell` (a `claude` funct
 startup file, for terminals) or `tcr setup claude-settings` (one key in `~/.claude/settings.json`, for
 every launch, at the cost that claude cannot reach Anthropic while tcr is stopped). Both refuse
 rather than overwrite a `claude` alias, function or base URL you already have, and both take
-`--remove`. TcrBar asks once which you want. Details: [`tcr setup`](docs/cli.md#tcr-setup).
+`--remove`. TcrBar asks once which you want, on a fleet with a Claude account to serve claude.
+Details: [`tcr setup`](docs/cli.md#tcr-setup).
 
 ### Verify a download
 
