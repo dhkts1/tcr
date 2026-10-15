@@ -1448,7 +1448,7 @@ fn is_cross_site_request(headers: &HeaderMap) -> bool {
 /// A Codex path (`crate::provider::Provider::of_path`) other than the one
 /// inference path is relayed with or without a bearer: Codex has no bookkeeping
 /// call a pooled account may answer, so nothing under `/backend-api/` but
-/// `/backend-api/codex/responses` ever reaches the rotation.
+/// Codex model calls reach the rotation; its other paths retain the client credential.
 fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayMode> {
     if *method == Method::POST && path_is_under(path, CLIENT_TOKEN_REFRESH_PATH) {
         return Some(RelayMode::Raw);
@@ -1457,9 +1457,8 @@ fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayM
     if CLIENT_CREDENTIAL_PREFIXES
         .iter()
         .any(|base| path_is_under(path, base))
-        // Every Codex path but the inference one is identity-bound (usage display, memories,
-        // threads, plugins) and is relayed with the CLIENT's own bearer, never
-        // re-credentialled.
+        // Codex's model calls spend pooled quota. Its other paths (usage, threads,
+        // plugins) retain the client's identity.
         || (provider == crate::provider::Provider::Codex && !provider.is_inference_path(path))
     {
         return Some(RelayMode::ClientCredential);
@@ -13362,6 +13361,40 @@ mod tests {
     /// The classifier, in isolation. The negatives matter as much as the positives:
     /// `/v1/code/` is a prefix WITH its slash so `/v1/codex` is not a Remote Control
     /// path, and the token refresh is POST-only so a GET on it is ordinary traffic.
+    #[test]
+    fn every_codex_model_call_uses_the_pool() {
+        for path in [
+            "/backend-api/codex/responses",
+            "/backend-api/codex/images/generations",
+            "/backend-api/codex/images/edits",
+            "/backend-api/codex/memories/trace_summarize",
+            "/backend-api/codex/alpha/search",
+        ] {
+            for bearer in [false, true] {
+                assert_eq!(relay_mode(&Method::POST, path, bearer), None, "{path}");
+            }
+            assert!(
+                crate::provider::Provider::Codex.is_inference_path(path),
+                "{path}"
+            );
+            let descendant = format!("{path}/other");
+            assert_eq!(
+                relay_mode(&Method::POST, &descendant, true),
+                Some(RelayMode::ClientCredential)
+            );
+        }
+        for path in [
+            "/backend-api/wham/usage",
+            "/backend-api/codex/models",
+            "/backend-api/codex/memories",
+        ] {
+            assert_eq!(
+                relay_mode(&Method::GET, path, true),
+                Some(RelayMode::ClientCredential)
+            );
+        }
+    }
+
     #[test]
     fn relay_mode_classifies_only_the_bypass_paths() {
         for path in [

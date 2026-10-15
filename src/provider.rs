@@ -42,7 +42,7 @@ pub const CODEX_UPSTREAM: &str = "https://chatgpt.com";
 /// Every Codex request path starts here; nothing Anthropic sends does. Classify with
 /// [`Provider::of_path`]; a bare `starts_with` on this constant also matches `/backend-apix`.
 pub const CODEX_PATH_PREFIX: &str = "/backend-api";
-/// The ONE Codex path tcr re-credentials. Exact match, like `/v1/messages`
+/// The Codex Responses path tcr re-credentials. Exact match, like `/v1/messages`
 /// (`openai/codex` `codex-api/src/endpoint/responses.rs`).
 pub const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
 /// Request header naming the ChatGPT account the bearer belongs to, which codex sends as
@@ -94,7 +94,14 @@ impl Provider {
     pub fn is_inference_path(self, path: &str) -> bool {
         match self {
             Self::Anthropic => path == "/v1/messages" || path == "/v1/messages/count_tokens",
-            Self::Codex => path == CODEX_RESPONSES_PATH,
+            Self::Codex => matches!(
+                path,
+                CODEX_RESPONSES_PATH
+                    | "/backend-api/codex/images/generations"
+                    | "/backend-api/codex/images/edits"
+                    | "/backend-api/codex/memories/trace_summarize"
+                    | "/backend-api/codex/alpha/search"
+            ),
         }
     }
 
