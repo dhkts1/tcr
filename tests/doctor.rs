@@ -665,8 +665,8 @@ fn a_mixed_fleet_doctor_keeps_claudes_exit_code() {
             "codexRequests10m: 2",
             "codexRefused10m: 4",
             "codexUnpooled10m: 1",
-            "codexProblem: codex needs a login of its own to start, even when pooled: run `codex \
-             login` once",
+            "codexProblem: auth.json is absent; a keyring-backed Codex login is not checked. Run \
+             codex once to verify its own sign-in before using the pool",
             "codexProblem: the proxy on :<port> is running without MITM: its TLS material failed \
              to load at boot — see its log",
             "codexVerdict: codex is not pooled: the proxy on :<port> is running without MITM: \
