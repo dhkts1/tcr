@@ -3575,10 +3575,12 @@ fn session_cost(row: &tcr_status_wire::SessionRow) -> String {
 /// last hour.
 ///
 /// Live-only, with no offline fallback, and that is the whole design: a session
-/// is per-process state that exists nowhere on disk, so an offline rendering
-/// could only ever be an empty list dressed as a measurement. An unreachable
-/// server is an error exit instead — the same failure `status` warns about
-/// before falling back, except here there is nothing to fall back to.
+/// is the running proxy's own state, and the copy it keeps on disk
+/// ([`crate::session_wire_persist`]) is a cache read back at boot, not a record
+/// of what is live, so an offline rendering could only ever be a stale list
+/// dressed as a measurement. An unreachable server is an error exit instead —
+/// the same failure `status` warns about before falling back, except here there
+/// is nothing to fall back to.
 ///
 /// `supported` answers "did this server's payload CARRY a `sessions` key", not
 /// "is the array non-empty". [`StatusPayload::sessions`] is `#[serde(default)]`

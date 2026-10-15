@@ -82,7 +82,8 @@ pub struct ToolUseEvent {
     /// - `None` for any other tool, and for any of the above whose field is absent; the panel
     ///   falls back to the tool name.
     ///
-    /// Held in memory only — see the module doc's no-body-content-on-disk rule.
+    /// Never written to a log; it does persist in the session-wire snapshot — see the module
+    /// doc's no-body-content-on-disk rule.
     pub command_head: Option<String>,
     /// A `Bash` tool call's coarse category — see [`CommandClass`]. `None` for any other
     /// tool, or when `command_head` is `None`.

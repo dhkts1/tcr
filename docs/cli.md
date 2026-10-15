@@ -1893,9 +1893,10 @@ channel TcrBar's panel reads for its Sessions and Tools tabs: the rows live only
 `/_tcr/status` response, behind the proxy api-key, and the app may not read that key, so it shells
 out here the way it does for every other fact.
 
-Live only, with no offline fallback. A session is per-process state that exists nowhere on disk, so
-an offline rendering could only be an empty list dressed up as a measurement. With nothing listening
-the command exits non-zero and says so on stderr.
+Live only, with no offline fallback. A session is the running proxy's own state: the copy it keeps
+on disk, `~/.cache/teamclaude/session-wire.json`, is a cache it reads back at boot, not a record of
+what is live, so an offline rendering could only be a stale list dressed up as a measurement. With
+nothing listening the command exits non-zero and says so on stderr.
 
 ```
 tcr sessions --json | jq -c '{supported, n: (.sessions|length)}'
