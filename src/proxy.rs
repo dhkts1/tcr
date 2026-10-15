@@ -35,7 +35,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
@@ -2762,8 +2762,310 @@ fn codex_forbidden_is_account_error(headers: &HeaderMap, body: &[u8]) -> bool {
     account_error
 }
 
-/// The catch-all proxy handler.
+/// Whole milliseconds from `from` to `to`, zero if `to` is not later. Saturates at
+/// `u64::MAX` rather than wrapping: a duration that long is not a request.
+fn ms_between(from: Instant, to: Instant) -> u64 {
+    u64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One pooled request's clock. Its fields ride on the request's `request usage`
+/// line when it has one; otherwise they go on a DEBUG `request timing` line, and
+/// a request tcr itself held for [`SLOW_WAIT_MS`] also gets an INFO `slow request`
+/// line (see [`TimingFields`]).
+///
+/// The request path used to log no time at all, so "is tcr slow, and where" had no
+/// answer from the logs. Every field is an `Instant` or a counter, set at the point
+/// it names, and nothing here is touched per stream chunk except one `Option` check
+/// on the first chunk and one store at the end.
+///
+/// - `wait_ms`: arrival until the FINAL attempt's `send()` was called. Everything
+///   tcr did first: reading the body, choosing an account, waiting out holds,
+///   earlier failed attempts and the final attempt's own throttle wait.
+/// - `throttle_ms`: total time inside `Manager::throttle_send`, all attempts. Not
+///   the pinned-egress path's own pacing, which happens inside `peer::egress`.
+/// - `upstream_ms`: the final attempt's `send()` until its response headers.
+/// - `first_byte_ms`: arrival until the first body chunk was handed to the client
+///   side of the tee (streamed), or until the whole body was read (buffered).
+/// - `total_ms`: arrival until the stream ended, or until the response was built.
+///
+/// A field with no value (no send was ever made, say) is left out of the line.
+#[derive(Debug)]
+struct RequestTiming {
+    arrived: Instant,
+    /// False until the request is known to take the pooled path. A request
+    /// rejected or relayed before then logs no `request timing` line, and a
+    /// streamed one hands its clock to the body and disarms this copy.
+    armed: bool,
+    attempts: u32,
+    throttle: Duration,
+    send_started: Option<Instant>,
+    headers_at: Option<Instant>,
+    first_account: Option<usize>,
+    final_account: Option<usize>,
+    account: Option<String>,
+    model: Option<String>,
+    session: Option<u64>,
+    stream: bool,
+    first_byte_at: Option<Instant>,
+    ended_at: Option<Instant>,
+}
+
+impl RequestTiming {
+    fn starting_at(arrived: Instant) -> Self {
+        Self {
+            arrived,
+            armed: false,
+            attempts: 0,
+            throttle: Duration::ZERO,
+            send_started: None,
+            headers_at: None,
+            first_account: None,
+            final_account: None,
+            account: None,
+            model: None,
+            session: None,
+            stream: false,
+            first_byte_at: None,
+            ended_at: None,
+        }
+    }
+
+    /// An upstream `send()` is about to be called for account `idx`. Each call
+    /// resets the header mark, so `upstream_ms` is always the LAST attempt's.
+    fn note_send(&mut self, idx: usize, account: Option<&str>) {
+        self.attempts += 1;
+        self.first_account.get_or_insert(idx);
+        self.final_account = Some(idx);
+        self.account = account.map(str::to_owned);
+        self.headers_at = None;
+        self.send_started = Some(Instant::now());
+    }
+
+    /// Moves the clock out, leaving a disarmed copy behind, so the streamed body
+    /// owns the one line this request logs.
+    fn hand_off(&mut self) -> Self {
+        let arrived = self.arrived;
+        std::mem::replace(self, Self::starting_at(arrived))
+    }
+
+    /// Reads the clock once, at `end`, into the values every timing line logs.
+    /// Moves the account and model out: a clock is finished exactly once.
+    fn finish(&mut self, status: u16, end: Instant, completed: bool) -> TimingFields {
+        TimingFields {
+            wait_ms: self.send_started.map(|sent| ms_between(self.arrived, sent)),
+            throttle_ms: u64::try_from(self.throttle.as_millis()).unwrap_or(u64::MAX),
+            upstream_ms: match (self.send_started, self.headers_at) {
+                (Some(sent), Some(headers)) => Some(ms_between(sent, headers)),
+                _ => None,
+            },
+            first_byte_ms: self.first_byte_at.map(|at| ms_between(self.arrived, at)),
+            total_ms: ms_between(self.arrived, end),
+            attempts: self.attempts,
+            switched: matches!(
+                (self.first_account, self.final_account),
+                (Some(first), Some(last)) if first != last
+            ),
+            status,
+            stream: self.stream,
+            completed,
+            account: self.account.take(),
+            model: self.model.take(),
+            session: self.session,
+        }
+    }
+}
+
+/// A request held this long by tcr itself (`wait_ms`: selection, holds, throttle,
+/// earlier attempts) logs a `slow request` line at INFO. Everything else about a
+/// request's time rides on its `request usage` line, or on a DEBUG line, because
+/// the daily log is already tens of megabytes and one more INFO line per request
+/// is a cost every request pays.
+const SLOW_WAIT_MS: u64 = 2_000;
+
+/// One finished request's timing, as logged. See [`RequestTiming`] for what each
+/// field measures.
+#[derive(Debug)]
+struct TimingFields {
+    wait_ms: Option<u64>,
+    throttle_ms: u64,
+    upstream_ms: Option<u64>,
+    first_byte_ms: Option<u64>,
+    total_ms: u64,
+    attempts: u32,
+    switched: bool,
+    status: u16,
+    stream: bool,
+    completed: bool,
+    account: Option<String>,
+    model: Option<String>,
+    session: Option<u64>,
+}
+
+impl TimingFields {
+    /// For a request that logs no `request usage` line (an error, a forwarded
+    /// non-2xx, a 2xx that reported no usage): the timing on its own line, at
+    /// DEBUG, plus the INFO `slow request` line when tcr held it.
+    fn log_alone(&self) {
+        tracing::debug!(
+            wait_ms = self.wait_ms,
+            throttle_ms = self.throttle_ms,
+            upstream_ms = self.upstream_ms,
+            first_byte_ms = self.first_byte_ms,
+            total_ms = self.total_ms,
+            attempts = self.attempts,
+            switched = self.switched,
+            status = self.status,
+            stream = self.stream,
+            account = self.account.as_deref().unwrap_or("?"),
+            model = self.model.as_deref().unwrap_or("?"),
+            session = ?self.session,
+            completed = self.completed,
+            "request timing"
+        );
+        self.log_if_held();
+    }
+
+    /// The INFO exception: tcr itself held this request for [`SLOW_WAIT_MS`] or
+    /// more, which is the delay nobody else can see. Logged whichever line carries
+    /// the rest, so `slow request` alone finds every one of them.
+    fn log_if_held(&self) {
+        if self.wait_ms.is_some_and(|wait| wait >= SLOW_WAIT_MS) {
+            tracing::info!(
+                wait_ms = self.wait_ms,
+                throttle_ms = self.throttle_ms,
+                upstream_ms = self.upstream_ms,
+                first_byte_ms = self.first_byte_ms,
+                total_ms = self.total_ms,
+                attempts = self.attempts,
+                switched = self.switched,
+                status = self.status,
+                stream = self.stream,
+                account = self.account.as_deref().unwrap_or("?"),
+                model = self.model.as_deref().unwrap_or("?"),
+                session = ?self.session,
+                completed = self.completed,
+                "slow request"
+            );
+        }
+    }
+}
+
+/// A streamed request's clock, owned by the passthrough body. It finishes on
+/// drop, because drop is the one place every ending reaches: clean EOF, an
+/// upstream error, and the client walking away (axum drops the body mid-poll, so
+/// the stream never sees its own end). `ended_at` is set only by the first two,
+/// which is what `completed=false` reports.
+///
+/// The finished fields go to the parser task, which owns the `request usage`
+/// line. The parser's channel closes when this body drops, so it is waiting for
+/// exactly this send. If the parser is already gone, nobody else will log this
+/// request, so the fields are logged here on their own.
+struct StreamTiming {
+    timing: RequestTiming,
+    status: u16,
+    done: Option<tokio::sync::oneshot::Sender<TimingFields>>,
+}
+
+impl StreamTiming {
+    /// The upstream ended the stream (EOF or a transport error): the clock stops
+    /// here, and the drop that follows reports `completed=true`.
+    fn mark_ended(&mut self) {
+        self.timing.ended_at = Some(Instant::now());
+    }
+}
+
+impl Drop for StreamTiming {
+    fn drop(&mut self) {
+        let completed = self.timing.ended_at.is_some();
+        let end = self.timing.ended_at.unwrap_or_else(Instant::now);
+        let fields = self.timing.finish(self.status, end, completed);
+        match self.done.take() {
+            Some(done) => {
+                if let Err(fields) = done.send(fields) {
+                    fields.log_alone();
+                }
+            }
+            None => fields.log_alone(),
+        }
+    }
+}
+
+/// The relay path's clock, read by the `relay timing` line: `upstream_ms` is the
+/// relay's `send()` until headers, `total_ms` is arrival (at [`handle`]) until the
+/// body ended (streamed) or the response was built (buffered, or an error).
+struct RelayTiming {
+    arrived: Instant,
+    path: String,
+    mode: RelayMode,
+    send_started: Option<Instant>,
+    headers_at: Option<Instant>,
+    stream: bool,
+    ended_at: Option<Instant>,
+}
+
+impl RelayTiming {
+    fn emit(&self, status: u16, end: Instant, completed: bool) {
+        let upstream_ms = match (self.send_started, self.headers_at) {
+            (Some(sent), Some(headers)) => Some(ms_between(sent, headers)),
+            _ => None,
+        };
+        // DEBUG: a relay is a bookkeeping call tcr never holds, and it must not
+        // add a line per request to a log that is already tens of megabytes.
+        tracing::debug!(
+            upstream_ms,
+            total_ms = ms_between(self.arrived, end),
+            status,
+            stream = self.stream,
+            path = %self.path,
+            mode = ?self.mode,
+            completed,
+            "relay timing"
+        );
+    }
+}
+
+/// The streamed relay body's clock; logs on drop for the reason [`StreamTiming`]
+/// does.
+struct RelayStreamTiming {
+    timing: RelayTiming,
+    status: u16,
+}
+
+impl RelayStreamTiming {
+    /// See [`StreamTiming::mark_ended`].
+    fn mark_ended(&mut self) {
+        self.timing.ended_at = Some(Instant::now());
+    }
+}
+
+impl Drop for RelayStreamTiming {
+    fn drop(&mut self) {
+        let completed = self.timing.ended_at.is_some();
+        let end = self.timing.ended_at.unwrap_or_else(Instant::now);
+        self.timing.emit(self.status, end, completed);
+    }
+}
+
+/// The catch-all proxy handler. Owns the request's clock: [`handle_request`] fills
+/// it in, and a pooled request whose timing was not already logged (on its
+/// `request usage` line, or by a streamed body that took the clock) is logged
+/// here, with the status the client is about to get.
 async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let mut timing = RequestTiming::starting_at(Instant::now());
+    let response = handle_request(manager, req, &mut timing).await;
+    if timing.armed {
+        timing
+            .finish(response.status().as_u16(), Instant::now(), true)
+            .log_alone();
+    }
+    response
+}
+
+async fn handle_request(
+    manager: Arc<Manager>,
+    req: Request,
+    timing: &mut RequestTiming,
+) -> Response {
     let (parts, body) = req.into_parts();
     // A loopback peer is exempt from the api-key gate (see below). Absent the
     // extension (e.g. a direct axum test harness) we treat the client as remote
@@ -3033,9 +3335,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             &path_and_query,
             &req_headers,
             body,
+            timing.arrived,
         )
         .await;
     }
+    // From here on the request is on the pooled path, so every response it ends
+    // in (served, forwarded, or synthesized) gets a `request timing` line.
+    timing.armed = true;
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
     let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
@@ -3234,6 +3540,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         },
         None => (None, SessionKind::Fallback),
     };
+    timing.model = request_model.clone();
+    timing.session = session_key;
 
     // Whether THIS request asked Anthropic's cache for the extended 1h window,
     // as a cell that answers itself at most once — `requests_extended_ttl`
@@ -4223,11 +4531,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // retry loop back here, so every retry is paced against whichever account it
         // rotated to.
         if !already_paced {
+            let throttle_started = Instant::now();
             manager.throttle_send(&path, idx).await;
+            timing.throttle += throttle_started.elapsed();
         }
 
+        timing.note_send(idx, account_name.as_deref());
         let resp = match builder.send().await {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                timing.headers_at = Some(Instant::now());
+                resp
+            }
             Err(err) => {
                 // Transport failure is not proof of a bad credential, so nothing
                 // here ever disables an account — the three arms differ only in
@@ -5149,6 +5463,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // path of one configuration.
             let extended_ttl_for_usage = extended_ttl.get();
             let stream_path = path.clone();
+            // The request's clock moves into the passthrough body (`StreamTiming`),
+            // which finishes it when the body ends and sends the fields here, to
+            // the task that owns the `request usage` line.
+            let (timing_tx, timing_rx) = tokio::sync::oneshot::channel::<TimingFields>();
+            let stream_timing = StreamTiming {
+                timing: {
+                    let mut owned = timing.hand_off();
+                    owned.stream = true;
+                    owned
+                },
+                status: status.as_u16(),
+                done: Some(timing_tx),
+            };
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -5203,6 +5530,22 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     stream_ended,
                     &codex_tool_calls,
                 );
+                // The body's end. The parse above runs until the tee's sender
+                // drops, which is the same drop that sends this, so it is already
+                // here or about to be. A parse that stopped early on a malformed
+                // frame waits here for the stream to finish, which is when
+                // `total_ms` is known.
+                let timing = match timing_rx.await {
+                    Ok(fields) => Some(fields),
+                    Err(_) => {
+                        tracing::warn!(
+                            account_index = idx,
+                            "streamed request's timing was dropped unsent; \
+                             its request usage line carries no timing"
+                        );
+                        None
+                    }
+                };
                 if parsed.input_total > 0 || parsed.output > 0 {
                     // The REQUEST's model whenever its body named one. `response_model` is set
                     // only on a Codex stream, so an Anthropic record is exactly what it was; a
@@ -5217,7 +5560,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // One line per terminal request, never per SSE event — a
                     // per-event log here would be the same flood vector the
                     // stream-error path above is careful to avoid on a long
-                    // erroring stream.
+                    // erroring stream. It carries the request's timing too,
+                    // rather than a second INFO line per request.
+                    let t = timing.as_ref();
                     tracing::info!(
                         account = account_name_for_log.as_deref().unwrap_or("?"),
                         session = ?session_key,
@@ -5227,8 +5572,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         cache_creation_1h_tokens = record.cache_1h,
                         input_tokens = parsed.input_total,
                         output_tokens = parsed.output,
+                        wait_ms = t.and_then(|t| t.wait_ms),
+                        throttle_ms = t.map(|t| t.throttle_ms),
+                        upstream_ms = t.and_then(|t| t.upstream_ms),
+                        first_byte_ms = t.and_then(|t| t.first_byte_ms),
+                        total_ms = t.map(|t| t.total_ms),
+                        attempts = t.map(|t| t.attempts),
+                        switched = t.map(|t| t.switched),
+                        completed = t.map(|t| t.completed),
                         "request usage"
                     );
+                    if let Some(t) = t {
+                        t.log_if_held();
+                    }
                     // A Codex session also keeps the turn's reasoning tokens, and its model is
                     // the one the ledger files the turn under: the stream's, in practice, since
                     // a Codex body is usually zstd and names none tcr can read.
@@ -5259,6 +5615,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         }
                     }
                     manager_side.record_usage(idx, record);
+                } else if let Some(t) = &timing {
+                    // No usage, so no `request usage` line to ride on.
+                    t.log_alone();
                 }
                 // Sibling of the usage guard above, not nested in it: an error
                 // event with NO message_start leaves input_total == output == 0,
@@ -5334,6 +5693,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 account_index: usize,
                 account_name: Option<String>,
                 _in_flight: InFlightGuard,
+                timing: StreamTiming,
             }
             let state = TeeState {
                 inner: resp.bytes_stream(),
@@ -5346,10 +5706,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // own copy from `manager.account_name(idx)` on the next pass.
                 account_name,
                 _in_flight,
+                timing: stream_timing,
             };
             let passthrough = futures::stream::unfold(state, |mut state| async move {
                 match state.inner.next().await {
                     Some(Ok(bytes)) => {
+                        // `first_byte_ms`: taken where the chunk is handed on
+                        // toward the client, before the tee offers it to the
+                        // parser. One `Option` check per chunk, set once.
+                        if state.timing.timing.first_byte_at.is_none() {
+                            state.timing.timing.first_byte_at = Some(Instant::now());
+                        }
                         // Best-effort tee: `try_send` never blocks the
                         // passthrough. A FULL channel (slow/starved parser)
                         // drops the chunk for the PARSER only — usage counting
@@ -5391,6 +5758,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         if let Some(ended) = state.ended.take() {
                             let _ = ended.send(());
                         }
+                        state.timing.mark_ended();
                         Some((Err(err), state))
                     }
                     None => {
@@ -5403,6 +5771,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         if let Some(ended) = state.ended.take() {
                             let _ = ended.send(());
                         }
+                        // `state` drops as this arm returns, and with it
+                        // `StreamTiming`, which reads this as the end.
+                        state.timing.mark_ended();
                         None
                     }
                 }
@@ -5437,6 +5808,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 );
             }
         };
+        let buffered_at = Instant::now();
         match provider {
             Provider::Codex => {
                 if status == StatusCode::BAD_REQUEST {
@@ -5450,6 +5822,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             }
             Provider::Anthropic => {}
         }
+        // Only a forwarded body is the client's first byte. A model rejection
+        // consumed here must not timestamp a later sibling's successful stream.
+        timing.first_byte_at = Some(buffered_at);
         if status.is_success() {
             // One parse of the body for all three readings below.
             let response = parse_non_streamed_response(&bytes, provider);
@@ -5474,7 +5849,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     || extended_ttl.get(),
                 );
                 // One line per terminal (non-streamed) request — see the
-                // matching log line on the streaming arm above.
+                // matching log line on the streaming arm above. It carries the
+                // timing, so `handle` must not log it a second time: disarmed.
+                let t = timing.finish(status.as_u16(), Instant::now(), true);
+                timing.armed = false;
                 tracing::info!(
                     account = account_name.as_deref().unwrap_or("?"),
                     session = ?session_key,
@@ -5484,8 +5862,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     cache_creation_1h_tokens = record.cache_1h,
                     input_tokens = parsed.input_total,
                     output_tokens = parsed.output,
+                    wait_ms = t.wait_ms,
+                    throttle_ms = t.throttle_ms,
+                    upstream_ms = t.upstream_ms,
+                    first_byte_ms = t.first_byte_ms,
+                    total_ms = t.total_ms,
+                    attempts = t.attempts,
+                    switched = t.switched,
+                    completed = t.completed,
                     "request usage"
                 );
+                t.log_if_held();
                 // No Codex tool calls are read here: codex streams its turns, so a
                 // non-streamed Responses object comes only from a client that is not codex.
                 match provider {
@@ -6110,6 +6497,10 @@ fn relay_client() -> Option<&'static reqwest::Client> {
 /// other non-inference Codex path, and a request that names a workspace routing of
 /// its own, inference included) reaches the Codex upstream with the client's own
 /// bearer, never Anthropic's.
+/// `arrived` is [`handle`]'s clock, so the `relay timing` line's `total_ms` counts
+/// the gates the request passed before it got here. A streamed relay body takes
+/// the clock with it and logs when it ends; everything else logs here.
+#[allow(clippy::too_many_arguments)]
 async fn relay_upstream(
     manager: &Manager,
     mode: RelayMode,
@@ -6118,6 +6509,46 @@ async fn relay_upstream(
     path_and_query: &str,
     req_headers: &HeaderMap,
     body: Body,
+    arrived: Instant,
+) -> Response {
+    let mut timing = Some(RelayTiming {
+        arrived,
+        path: path_and_query.to_owned(),
+        mode,
+        send_started: None,
+        headers_at: None,
+        stream: false,
+        ended_at: None,
+    });
+    let response = relay_request(
+        manager,
+        mode,
+        provider,
+        method,
+        path_and_query,
+        req_headers,
+        body,
+        &mut timing,
+    )
+    .await;
+    if let Some(timing) = timing {
+        timing.emit(response.status().as_u16(), Instant::now(), true);
+    }
+    response
+}
+
+/// [`relay_upstream`]'s body. `timing` is taken (left `None`) by a streamed
+/// response, whose body then owns the `relay timing` line.
+#[allow(clippy::too_many_arguments)]
+async fn relay_request(
+    manager: &Manager,
+    mode: RelayMode,
+    provider: crate::provider::Provider,
+    method: Method,
+    path_and_query: &str,
+    req_headers: &HeaderMap,
+    body: Body,
+    timing: &mut Option<RelayTiming>,
 ) -> Response {
     let Some(client) = relay_client() else {
         return error_response(
@@ -6151,8 +6582,16 @@ async fn relay_upstream(
         builder = builder.body(body_bytes);
     }
 
+    if let Some(timing) = timing.as_mut() {
+        timing.send_started = Some(Instant::now());
+    }
     let resp = match builder.send().await {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            if let Some(timing) = timing.as_mut() {
+                timing.headers_at = Some(Instant::now());
+            }
+            resp
+        }
         Err(err) => {
             tracing::warn!(
                 path = %path_and_query,
@@ -6187,12 +6626,39 @@ async fn relay_upstream(
         // Both arms are served with the CALLER's own credential (or none at all),
         // so their rate-limit and org headers describe the caller — coherent, and
         // theirs to see. Only the rotated path lies; see [`ServedBy`].
-        RelayMode::ClientCredential => build_response(
-            status,
-            &up_headers,
-            Body::from_stream(resp.bytes_stream()),
-            ServedBy::Caller,
-        ),
+        RelayMode::ClientCredential => {
+            // The clock rides in the body so `total_ms` is the stream's end, not
+            // the moment its headers were forwarded. Taken, so the caller does
+            // not log this request a second time.
+            let body = match timing.take() {
+                Some(mut owned) => {
+                    owned.stream = true;
+                    let clock = RelayStreamTiming {
+                        timing: owned,
+                        status: status.as_u16(),
+                    };
+                    Body::from_stream(futures::stream::unfold(
+                        (resp.bytes_stream(), clock),
+                        |(mut inner, mut clock)| async move {
+                            match inner.next().await {
+                                Some(item) => {
+                                    if item.is_err() {
+                                        clock.mark_ended();
+                                    }
+                                    Some((item, (inner, clock)))
+                                }
+                                None => {
+                                    clock.mark_ended();
+                                    None
+                                }
+                            }
+                        },
+                    ))
+                }
+                None => Body::from_stream(resp.bytes_stream()),
+            };
+            build_response(status, &up_headers, body, ServedBy::Caller)
+        }
         RelayMode::Raw => match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
             Ok(bytes) => build_response(status, &up_headers, Body::from(bytes), ServedBy::Caller),
             Err(BodyReadError::Transport) => error_response(
@@ -17016,6 +17482,425 @@ mod tests {
         );
     }
 
+    // --- request timing -----------------------------------------------------
+
+    /// How long the fake upstreams below sit on a request before sending its
+    /// headers. Every positive control asserts this shows up in `upstream_ms`
+    /// (the send-to-headers span) and NOT in `wait_ms` (arrival to send).
+    const HEADER_DELAY_MS: u64 = 300;
+
+    /// A fake upstream that reads the request, waits [`HEADER_DELAY_MS`], then
+    /// writes `response` (status line, headers and body) and closes.
+    async fn spawn_header_delayed_upstream(response: String) -> SocketAddr {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(HEADER_DELAY_MS)).await;
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        up_addr
+    }
+
+    /// Serves `manager` on a fresh loopback port, as the usage-line tests above do.
+    async fn serve_on_loopback(manager: &Arc<Manager>) -> SocketAddr {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+        proxy_addr
+    }
+
+    /// Every line of `log` whose message is `message`.
+    fn lines_with<'a>(log: &'a str, message: &str) -> Vec<&'a str> {
+        log.lines().filter(|l| l.contains(message)).collect()
+    }
+
+    /// The value of ` name=` on `line`, up to the next space.
+    fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!(" {name}=");
+        let start = line.find(&marker)? + marker.len();
+        Some(line[start..].split(' ').next().unwrap_or(""))
+    }
+
+    fn ms_field(line: &str, name: &str) -> u64 {
+        field(line, name)
+            .unwrap_or_else(|| panic!("no {name} on: {line}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{name} is not a number ({e}) on: {line}"))
+    }
+
+    /// Polls the captured log until `message` appears, for lines written by a
+    /// spawned task (the streamed arm's parser) after the client already has
+    /// its whole body.
+    async fn wait_for_line(sink: &SharedBuf, message: &str) -> String {
+        for _ in 0..300 {
+            let log = sink.contents();
+            if log.contains(message) {
+                return log;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no {message:?} line within 3s; log: {:?}", sink.contents());
+    }
+
+    fn info_sink() -> (SharedBuf, tracing::subscriber::DefaultGuard) {
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (sink, guard)
+    }
+
+    fn debug_sink() -> (SharedBuf, tracing::subscriber::DefaultGuard) {
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (sink, guard)
+    }
+
+    /// THE BITING TEST for the streamed timing: one `request usage` line carries
+    /// every timing field, and the upstream's header delay lands in `upstream_ms`
+    /// and `first_byte_ms`, never in `wait_ms`. Captured at DEBUG, so a second
+    /// timing line for the same request (`request timing`) would be seen; and no
+    /// `slow request`, because tcr held nothing.
+    #[tokio::test]
+    async fn streamed_request_usage_line_carries_timing() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let up_addr = spawn_header_delayed_upstream(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        let proxy_addr = serve_on_loopback(&manager).await;
+        let (sink, _guard) = debug_sink();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let _ = resp.bytes().await.unwrap();
+
+        let log = wait_for_line(&sink, "request usage").await;
+        let usage = lines_with(&log, "request usage");
+        assert_eq!(usage.len(), 1, "exactly one request usage line: {log:?}");
+        let line = usage[0];
+        // Shown under `--nocapture`: the line these assertions read.
+        eprintln!("{line}");
+        for name in [
+            "wait_ms",
+            "throttle_ms",
+            "upstream_ms",
+            "first_byte_ms",
+            "total_ms",
+            "attempts",
+            "switched",
+            "completed",
+        ] {
+            assert!(field(line, name).is_some(), "{name} missing on: {line}");
+        }
+        let (wait, upstream, first_byte, total) = (
+            ms_field(line, "wait_ms"),
+            ms_field(line, "upstream_ms"),
+            ms_field(line, "first_byte_ms"),
+            ms_field(line, "total_ms"),
+        );
+        assert!(
+            upstream >= HEADER_DELAY_MS,
+            "upstream_ms {upstream}: {line}"
+        );
+        assert!(
+            wait < HEADER_DELAY_MS,
+            "wait_ms {wait} holds the upstream's delay: {line}"
+        );
+        assert!(
+            first_byte >= HEADER_DELAY_MS,
+            "first_byte_ms {first_byte}: {line}"
+        );
+        assert!(
+            total >= first_byte && total >= wait,
+            "total_ms {total}: {line}"
+        );
+        assert_eq!(field(line, "attempts"), Some("1"), "{line}");
+        assert_eq!(field(line, "switched"), Some("false"), "{line}");
+        assert_eq!(field(line, "completed"), Some("true"), "{line}");
+        assert!(lines_with(&log, "request timing").is_empty(), "{log:?}");
+        assert!(lines_with(&log, "slow request").is_empty(), "{log:?}");
+    }
+
+    /// The buffered twin: `first_byte_ms` is the whole body in hand, and the
+    /// timing again rides on the one `request usage` line, and (captured at
+    /// DEBUG) on no second line.
+    #[tokio::test]
+    async fn buffered_request_usage_line_carries_timing() {
+        let body = r#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
+        let up_addr = spawn_header_delayed_upstream(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        let proxy_addr = serve_on_loopback(&manager).await;
+        let (sink, _guard) = debug_sink();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let _ = resp.bytes().await.unwrap();
+
+        let log = sink.contents();
+        let usage = lines_with(&log, "request usage");
+        assert_eq!(usage.len(), 1, "exactly one request usage line: {log:?}");
+        let line = usage[0];
+        let (wait, upstream, first_byte, total) = (
+            ms_field(line, "wait_ms"),
+            ms_field(line, "upstream_ms"),
+            ms_field(line, "first_byte_ms"),
+            ms_field(line, "total_ms"),
+        );
+        assert!(
+            upstream >= HEADER_DELAY_MS,
+            "upstream_ms {upstream}: {line}"
+        );
+        assert!(
+            wait < HEADER_DELAY_MS,
+            "wait_ms {wait} holds the upstream's delay: {line}"
+        );
+        assert!(first_byte >= upstream, "first_byte_ms {first_byte}: {line}");
+        assert!(
+            total >= first_byte && total >= wait,
+            "total_ms {total}: {line}"
+        );
+        assert_eq!(field(line, "completed"), Some("true"), "{line}");
+        assert!(lines_with(&log, "request timing").is_empty(), "{log:?}");
+    }
+
+    /// A request with no `request usage` line (a forwarded 400) gets its timing
+    /// on the DEBUG `request timing` line, exactly once, and nothing at INFO.
+    #[tokio::test]
+    async fn request_without_usage_logs_timing_at_debug_only() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for level in [tracing::Level::DEBUG, tracing::Level::INFO] {
+            let up_addr = spawn_header_delayed_upstream(response.clone()).await;
+            let manager = Manager::with_live_refresher(
+                dummy_config(None, &format!("http://{up_addr}")),
+                None,
+            );
+            let proxy_addr = serve_on_loopback(&manager).await;
+            let (sink, _guard) = if level == tracing::Level::DEBUG {
+                debug_sink()
+            } else {
+                info_sink()
+            };
+
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let resp = client
+                .post(format!("http://{proxy_addr}/v1/messages"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 400);
+            let _ = resp.bytes().await.unwrap();
+
+            let log = sink.contents();
+            let timing = lines_with(&log, "request timing");
+            assert!(lines_with(&log, "request usage").is_empty(), "{log:?}");
+            if level == tracing::Level::INFO {
+                assert!(timing.is_empty(), "request timing must be DEBUG: {log:?}");
+                continue;
+            }
+            assert_eq!(timing.len(), 1, "exactly one request timing line: {log:?}");
+            let line = timing[0];
+            eprintln!("{line}");
+            assert!(line.contains("DEBUG"), "{line}");
+            assert_eq!(field(line, "status"), Some("400"), "{line}");
+            assert_eq!(field(line, "stream"), Some("false"), "{line}");
+            assert!(ms_field(line, "upstream_ms") >= HEADER_DELAY_MS, "{line}");
+            assert!(ms_field(line, "wait_ms") < HEADER_DELAY_MS, "{line}");
+        }
+    }
+
+    /// A client that walks away mid-stream is reported as `completed=false`, on
+    /// the same `request usage` line (the usage from `message_start` still
+    /// counts), with `total_ms` at the walk-away rather than never.
+    #[tokio::test]
+    async fn abandoned_stream_reports_completed_false() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let event = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                    );
+                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+                    let _ = sock.write_all(headers.as_bytes()).await;
+                    let _ = sock.write_all(chunk.as_bytes()).await;
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                });
+            }
+        });
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        let (sink, _guard) = info_sink();
+        // Drop the actual axum response body at the client-abandonment seam. A
+        // reqwest pool may retain its transport after its client body is dropped,
+        // so that does not deterministically drop the server's passthrough body.
+        let resp = drive_full(
+            manager,
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[],
+            "{}",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        // A transport chunk need not contain a complete SSE frame. Wait until
+        // the usage-bearing event has actually reached the client before leaving.
+        let mut received = Vec::new();
+        while !received.windows(2).any(|pair| pair == b"\n\n") {
+            let chunk = body.next().await.expect("expected message_start").unwrap();
+            received.extend_from_slice(&chunk);
+        }
+        drop(body);
+
+        let log = wait_for_line(&sink, "request usage").await;
+        let usage = lines_with(&log, "request usage");
+        assert_eq!(usage.len(), 1, "{log:?}");
+        assert_eq!(field(usage[0], "completed"), Some("false"), "{}", usage[0]);
+    }
+
+    /// The relay path's twin: one DEBUG `relay timing` line per relayed request,
+    /// streamed here (`/v1/code/` is a client-credential relay), with the
+    /// header delay in `upstream_ms`.
+    #[tokio::test]
+    async fn relayed_request_logs_relay_timing_at_debug() {
+        let body = "{}";
+        let up_addr = spawn_header_delayed_upstream(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        let proxy_addr = serve_on_loopback(&manager).await;
+        let (sink, _guard) = debug_sink();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .get(format!("http://{proxy_addr}/v1/code/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let _ = resp.bytes().await.unwrap();
+
+        let log = wait_for_line(&sink, "relay timing").await;
+        let relay = lines_with(&log, "relay timing");
+        assert_eq!(relay.len(), 1, "exactly one relay timing line: {log:?}");
+        let line = relay[0];
+        eprintln!("{line}");
+        assert!(line.contains("DEBUG"), "{line}");
+        assert_eq!(field(line, "path"), Some("/v1/code/sessions"), "{line}");
+        assert_eq!(field(line, "stream"), Some("true"), "{line}");
+        assert_eq!(field(line, "completed"), Some("true"), "{line}");
+        let upstream = ms_field(line, "upstream_ms");
+        assert!(
+            upstream >= HEADER_DELAY_MS,
+            "upstream_ms {upstream}: {line}"
+        );
+        assert!(ms_field(line, "total_ms") >= upstream, "{line}");
+        assert!(
+            lines_with(&log, "request timing").is_empty()
+                && lines_with(&log, "request usage").is_empty(),
+            "a relayed request is not a pooled one: {log:?}"
+        );
+    }
+
+    fn timing_fields_waiting(wait_ms: u64) -> TimingFields {
+        TimingFields {
+            wait_ms: Some(wait_ms),
+            throttle_ms: 0,
+            upstream_ms: Some(1),
+            first_byte_ms: Some(wait_ms + 1),
+            total_ms: wait_ms + 2,
+            attempts: 1,
+            switched: false,
+            status: 200,
+            stream: true,
+            completed: true,
+            account: Some("alice@example.com".to_string()),
+            model: None,
+            session: None,
+        }
+    }
+
+    /// The one INFO exception: tcr held the request for `SLOW_WAIT_MS` or more.
+    /// Both sides of the boundary, so a threshold off by one fails here.
+    #[test]
+    fn slow_request_line_fires_only_when_tcr_held_the_request() {
+        let (sink, _guard) = info_sink();
+        timing_fields_waiting(SLOW_WAIT_MS - 1).log_if_held();
+        assert!(sink.contents().is_empty(), "{:?}", sink.contents());
+        timing_fields_waiting(SLOW_WAIT_MS).log_if_held();
+        let log = sink.contents();
+        let slow = lines_with(&log, "slow request");
+        assert_eq!(slow.len(), 1, "{log:?}");
+        assert!(slow[0].contains(" INFO "), "{}", slow[0]);
+        assert_eq!(ms_field(slow[0], "wait_ms"), SLOW_WAIT_MS, "{}", slow[0]);
+    }
+
     /// The SECOND blind spot this bridge closes: a proxy-GENERATED refusal
     /// (never touched an upstream at all) previously left no trace carrying
     /// its own message — `grep -cE 'quota exhausted on all|accounts exhausted'`
@@ -23754,6 +24639,52 @@ mod tests {
             r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn codex_model_failover_times_the_first_byte_the_client_receives() {
+        let origin = Router::new().fallback(|headers: HeaderMap| async move {
+            if headers["authorization"] == "Bearer at-bob" {
+                return Response::builder().status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}"#)).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(HEADER_DELAY_MS)).await;
+            Response::builder().header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n")).unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
+        config.accounts[1].priority = Some(0);
+        config.accounts[2].priority = Some(1);
+        let manager = Manager::with_live_refresher(config, None);
+        let (sink, _guard) = debug_sink();
+        let response = drive_full(
+            manager,
+            Method::POST,
+            crate::provider::CODEX_RESPONSES_PATH,
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"model":"gpt-6.1-sol","input":[]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let log = wait_for_line(&sink, "request usage").await;
+        let lines = lines_with(&log, "request usage");
+        assert_eq!(lines.len(), 1, "{log}");
+        let line = lines[0];
+        assert_eq!(field(line, "attempts"), Some("2"), "{line}");
+        assert_eq!(field(line, "switched"), Some("true"), "{line}");
+        assert!(
+            ms_field(line, "first_byte_ms") >= HEADER_DELAY_MS,
+            "first byte must come from the served stream, not the rejected body: {line}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
