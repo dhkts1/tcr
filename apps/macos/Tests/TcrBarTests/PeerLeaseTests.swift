@@ -461,6 +461,15 @@ final class PeerLeaseTests: XCTestCase {
         XCTAssertEqual(grant.scopeLabel, "All accounts")
     }
 
+    func testTheLeasePickerDoesNotOfferCodexOnlyGroups() throws {
+        let mixed = try decodeFleet([
+            canonicalRow("alice@example.com", ["groups": ["shared", "claude-only"]]),
+            canonicalRow("bob@example.com/codex", ["groups": ["shared", "codex-only"]]),
+        ])
+        XCTAssertEqual(PeerLease.eligibleLendGroups(mixed.accounts), ["claude-only", "shared"])
+        XCTAssertEqual(PeerLease.eligibleLendGroups([mixed.accounts[1]]), [])
+    }
+
     /// The lease picker offers only accounts a lease can lend: the Claude ones. A
     /// Claude-only fleet's picker is every account, sorted, as today.
     func testTheLeasePickerListsClaudeAccountsOnly() throws {

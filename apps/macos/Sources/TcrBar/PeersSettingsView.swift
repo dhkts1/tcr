@@ -1450,7 +1450,7 @@ struct PeersSettingsPane: View {
         // `groups` is `nil` from a server that does not report them, which is
         // a different state from "no groups", both offer nothing to pick, so
         // both flatten away here.
-        return Array(Set(fleet.accounts.flatMap { $0.groups ?? [] })).sorted()
+        return PeerLease.eligibleLendGroups(fleet.accounts)
     }
 
     /// The accounts a lease can lend: in a fleet holding a Codex account, the Claude

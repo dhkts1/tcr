@@ -674,6 +674,12 @@ public enum PeerLease {
         accounts.filter { $0.availableActions.contains(.lend) }.map(\.name).sorted()
     }
 
+    /// The named groups the lease picker offers, sorted and deduplicated.
+    public static func eligibleLendGroups(_ accounts: [Account]) -> [String] {
+        Array(Set(accounts.filter { $0.availableActions.contains(.lend) }.flatMap { $0.groups ?? [] }))
+            .sorted()
+    }
+
     /// How close an end has to be before the meter states it instead of the
     /// percentage: inside the hour.
     ///
