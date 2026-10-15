@@ -226,8 +226,11 @@ fn isolate(command: &mut Command, home: &Path) {
     command
         .current_dir(home)
         .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_CACHE_HOME")
+        // The route line reads the shell's startup files for `tcr setup
+        // shell`'s block; keep that read inside the scratch HOME.
+        .env_remove("ZDOTDIR")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("HTTPS_PROXY")
         .env_remove("https_proxy")
         .env_remove("HTTP_PROXY")
