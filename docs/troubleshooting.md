@@ -24,12 +24,12 @@ The log level comes from `RUST_LOG` and is `info` when it is unset or does not p
 one module and leave the rest alone:
 
 ```
-RUST_LOG=info,teamclaude_rs::proxy=debug tcr server --headless
+RUST_LOG=info,tcr::proxy=debug tcr server --headless
 ```
 
-The module names are the library's paths: `teamclaude_rs::proxy` for the request path,
-`teamclaude_rs::manager` for account selection and quota (it covers every module under it),
-`teamclaude_rs::peer` for peers. A bare `RUST_LOG=debug` also turns on debug output from every
+The module names are the library's paths: `tcr::proxy` for the request path,
+`tcr::manager` for account selection and quota (it covers every module under it),
+`tcr::peer` for peers. A bare `RUST_LOG=debug` also turns on debug output from every
 dependency that logs, which is far more than you want.
 
 `RUST_LOG` is read once, when the process starts. Setting it in your shell does nothing to a

@@ -29,17 +29,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
-use teamclaude_rs::peer::config::{
-    Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore,
-};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, SessionContext};
-use teamclaude_rs::peer::noise::{self, Handshake, PeerSession};
-use teamclaude_rs::peer::probe::{
+use tcr::peer::config::{Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::noise::{self, Handshake, PeerSession};
+use tcr::peer::probe::{
     self, PathPolicy, PathStat, PathTable, PathsConfig, ProbeOutcome, ProbeStop,
 };
-use teamclaude_rs::peer::serve;
+use tcr::peer::serve;
+use tcr_peer_wire::{Control, PeerId, StreamHeader, StreamKind};
 use tokio::net::{TcpListener, TcpStream};
 
 /// A clock that is not the machine's, so a timestamp in a fixture reads the
@@ -499,7 +497,7 @@ async fn the_real_listener_echoes_a_probe_with_both_fields_untouched() {
         peers: vec![pinned(dialer_public, "studio-mac")],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&peers_path, &file).expect("write the peers file");
+    tcr::peer::config::save(&peers_path, &file).expect("write the peers file");
     let store = PeerStore::open(&peers_path).expect("open the peers file");
 
     let listening = TcpListener::bind("127.0.0.1:0")
@@ -958,8 +956,8 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
     let peer = PeerId([18_u8; 32]);
     let addr: SocketAddr = "127.0.0.1:9708".parse().expect("an addr");
 
-    let mut state = teamclaude_rs::peer::state::PeerState::default();
-    state.muted.push(teamclaude_rs::peer::state::Mute {
+    let mut state = tcr::peer::state::PeerState::default();
+    state.muted.push(tcr::peer::state::Mute {
         // Dated far ahead on purpose: `save_paths` reads the file through
         // `load` at the REAL clock, which prunes a mute whose deadline has
         // passed, so a mute dated from this file's fixed clock would be pruned
@@ -967,7 +965,7 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
         addr: "127.0.0.1".to_string(),
         until_ms: 4_102_444_800_000,
     });
-    teamclaude_rs::peer::state::save(&path, &state).expect("the first write");
+    tcr::peer::state::save(&path, &state).expect("the first write");
 
     let mut table = PathTable::default();
     for _ in 0..5 {
@@ -978,9 +976,9 @@ fn the_measured_paths_survive_a_restart_and_keep_the_rest_of_the_file() {
             FIXED_MS,
         );
     }
-    teamclaude_rs::peer::state::save_paths(&path, &table.stats).expect("the paths write");
+    tcr::peer::state::save_paths(&path, &table.stats).expect("the paths write");
 
-    let restored = teamclaude_rs::peer::state::load(&path, FIXED_MS).expect("the state reads");
+    let restored = tcr::peer::state::load(&path, FIXED_MS).expect("the state reads");
     assert_eq!(restored.paths.len(), 1, "the measured path survived");
     let stat = restored.paths.first().expect("the row");
     assert_eq!(stat.peer, peer);
@@ -1088,7 +1086,7 @@ fn a_brief_endpoint_is_dialled_after_a_paired_one() {
 /// endpoint is the newest on the row and the paired one the oldest, so an order
 /// that read recency first would be the exact reverse of the one asserted.
 ///
-/// Watched red: give [`teamclaude_rs::peer::config::EndpointSource::Drop`] the
+/// Watched red: give [`tcr::peer::config::EndpointSource::Drop`] the
 /// brief's rank (`2`) in `probe::source_rank` and the drop endpoint ties with
 /// the brief, landing at index 4 instead of 5.
 #[test]
@@ -1188,7 +1186,7 @@ async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
         peers: vec![pinned(dialer_key.id().0, "attic-nuc")],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&listener_peers_path, &listener_file)
+    tcr::peer::config::save(&listener_peers_path, &listener_file)
         .expect("write the listener's peers file");
 
     let listening = TcpListener::bind("127.0.0.1:0")
@@ -1215,7 +1213,7 @@ async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
         peers: vec![dialer_row],
         ..Default::default()
     };
-    teamclaude_rs::peer::config::save(&dialer_peers_path, &dialer_file)
+    tcr::peer::config::save(&dialer_peers_path, &dialer_file)
         .expect("write the dialer's peers file");
     let dialer_store = PeerStore::open(&dialer_peers_path).expect("open the dialer's peers file");
 
@@ -1239,7 +1237,7 @@ async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
     );
 
     let dialer_state_path = serve::peer_state_path(&dialer_peers_path);
-    let restored = teamclaude_rs::peer::state::load(&dialer_state_path, FIXED_MS)
+    let restored = tcr::peer::state::load(&dialer_state_path, FIXED_MS)
         .expect("the dialer's state file reads");
     let saved = restored
         .paths

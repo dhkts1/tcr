@@ -1,6 +1,6 @@
 //! The proxy booted as a **library**, with no `tcr` process anywhere.
 //!
-//! This is the gate for the `run_server` → [`teamclaude_rs::server::serve`]
+//! This is the gate for the `run_server` → [`tcr::server::serve`]
 //! extraction. Before it, starting the proxy required `main`: the boot path
 //! called `std::process::exit` in its middle and handed its background tasks to
 //! "the process is about to die anyway", so nothing but the binary could run one
@@ -19,13 +19,13 @@
 
 use std::time::Duration;
 
-use teamclaude_rs::config::Config;
-use teamclaude_rs::proxy::STATUS_PATH;
-use teamclaude_rs::server::{
+use tcr::config::Config;
+use tcr::proxy::STATUS_PATH;
+use tcr::server::{
     serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup, WireSessionsFlush,
 };
-use teamclaude_rs::singleton::{ProxyHost, ProxyOwner};
-use teamclaude_rs::usage::LedgerShutdown;
+use tcr::singleton::{ProxyHost, ProxyOwner};
+use tcr::usage::LedgerShutdown;
 
 /// The port `tcr` uses by default. Named here so the assertion below says what
 /// it is protecting rather than showing a bare number.
@@ -165,7 +165,7 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     // The four loops this config enables: affinity flush + bound-token flush +
     // wire-sessions flush + quota probe. The bound-token flusher joined them when
     // account-bound history (advisor ids, thinking signatures, message ids) became routing
-    // state that has to survive a restart (`teamclaude_rs::bound_tokens`); it is keyed on the
+    // state that has to survive a restart (`tcr::bound_tokens`); it is keyed on the
     // same `affinity_path` this config sets. The keep-warm loop is off, so it must NOT have
     // been spawned.
     assert_eq!(
@@ -196,7 +196,7 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     let body: serde_json::Value = response.json().await.expect("a JSON status payload");
     assert_eq!(
         body["kind"],
-        teamclaude_rs::status::STATUS_KIND,
+        tcr::status::STATUS_KIND,
         "the payload came from this proxy's own status handler: {body}"
     );
 
@@ -317,7 +317,7 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
 /// Asserted as *values*, without serving: this test may not create a proxy that
 /// could write anywhere.
 ///
-/// [the live proxy's shared pin cache]: teamclaude_rs::affinity::default_path
+/// [the live proxy's shared pin cache]: tcr::affinity::default_path
 #[test]
 fn the_convenience_constructor_touches_nothing_outside_the_process() {
     let options = ServeOptions::new(test_config());
@@ -345,7 +345,7 @@ fn the_convenience_constructor_touches_nothing_outside_the_process() {
 /// its port claim after the bind and withdraws it on shutdown.
 ///
 /// The claim is what makes a proxy identifiable when its process name is not
-/// `tcr` — `teamclaude_rs::singleton` documents the silent OAuth token loss that
+/// `tcr` — `tcr::singleton` documents the silent OAuth token loss that
 /// depends on it (`tcr login` stops refusing to run beside a live server, whose
 /// next persist writes its boot-time single-use refresh tokens back over the fresh
 /// ones). The file existing is therefore the behaviour, not an implementation
@@ -381,7 +381,7 @@ async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdow
     // reader resolves `proxy-owner-<port>.json` for the port it is asking about,
     // so a claim under any other name is consulted by nothing — silently. `serve`
     // is handed a directory and derives the name from the port it bound.
-    let owner_path = teamclaude_rs::singleton::owner_path_in(&owner_dir, addr.port());
+    let owner_path = tcr::singleton::owner_path_in(&owner_dir, addr.port());
     assert!(
         owner_path.exists(),
         "the claim must be named after the port actually bound: {}",
@@ -401,7 +401,7 @@ async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdow
         ProxyOwner {
             pid: std::process::id(),
             port: addr.port(),
-            sha: teamclaude_rs::build_info::SHA.to_string(),
+            sha: tcr::build_info::SHA.to_string(),
             host: ProxyHost::Embedded,
         },
         "the claim must name THIS process, the port actually bound, this build and \

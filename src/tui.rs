@@ -428,13 +428,13 @@ fn account_area_height(total_height: u16, n_accounts: u16) -> u16 {
 }
 
 /// The accounts panel title: honest about how many accounts are actually on
-/// screen. `" teamclaude-rs · accounts (7) "` when all fit, or
-/// `" teamclaude-rs · accounts (5/7 ▼) "` when rows are clipped.
+/// screen. `" tcr · accounts (7) "` when all fit, or
+/// `" tcr · accounts (5/7 ▼) "` when rows are clipped.
 fn accounts_title(shown: u16, total: u16) -> String {
     if shown >= total {
-        format!(" teamclaude-rs · accounts ({total}) ")
+        format!(" tcr · accounts ({total}) ")
     } else {
-        format!(" teamclaude-rs · accounts ({shown}/{total} ▼) ")
+        format!(" tcr · accounts ({shown}/{total} ▼) ")
     }
 }
 
@@ -1418,12 +1418,12 @@ mod tests {
 
     #[test]
     fn accounts_title_shows_total_when_all_visible() {
-        assert_eq!(accounts_title(7, 7), " teamclaude-rs · accounts (7) ");
+        assert_eq!(accounts_title(7, 7), " tcr · accounts (7) ");
     }
 
     #[test]
     fn accounts_title_flags_clip() {
-        assert_eq!(accounts_title(5, 7), " teamclaude-rs · accounts (5/7 ▼) ");
+        assert_eq!(accounts_title(5, 7), " tcr · accounts (5/7 ▼) ");
     }
 
     #[test]

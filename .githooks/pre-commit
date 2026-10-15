@@ -10,7 +10,7 @@ set -euo pipefail
 # world-readable once pushed.
 printf '%s\n' \
   "──────────────────────────────────────────────────────────────" \
-  "  ⚠  PUBLIC REPO — github.com/dhkts1/teamclaude-rs" \
+  "  ⚠  PUBLIC REPO — github.com/dhkts1/tcr" \
   "  Anything you push is world-readable. Do NOT commit: secrets," \
   "  tokens, real account emails/UUIDs, ~/ paths, or internal" \
   "  (Henry) scaffolding — plans, bridges, swarm state." \

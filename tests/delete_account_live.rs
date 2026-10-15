@@ -13,7 +13,7 @@
 //! # Isolation
 //!
 //! The proxy runs in THIS process ([`Manager::with_live_refresher`] behind
-//! [`teamclaude_rs::mitm::serve`]) on a kernel-assigned port, so it starts no
+//! [`tcr::mitm::serve`]) on a kernel-assigned port, so it starts no
 //! probe, warm or refresh loop and sends nothing upstream. The `tcr` binary gets
 //! a scratch `HOME`, no `XDG_CACHE_HOME`, and `TCR_CLAUDE_CODE_CREDENTIALS`
 //! pointing at a file that does not exist, so it can read neither the real
@@ -29,7 +29,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::Value;
-use teamclaude_rs::manager::Manager;
+use tcr::manager::Manager;
 use time::OffsetDateTime;
 
 /// A scratch HOME, its config, and the proxy serving it.
@@ -70,10 +70,10 @@ async fn boot_after(
     )
     .expect("write the scratch config");
     before_load(&config);
-    let loaded = teamclaude_rs::config::load(&config).expect("load the scratch config");
+    let loaded = tcr::config::load(&config).expect("load the scratch config");
     let manager = Manager::with_live_refresher(loaded, follows_file.then(|| config.clone()));
     let served = Arc::clone(&manager);
-    tokio::spawn(async move { teamclaude_rs::mitm::serve(listener, served, None).await });
+    tokio::spawn(async move { tcr::mitm::serve(listener, served, None).await });
     Fleet {
         home,
         config,
@@ -245,12 +245,12 @@ async fn quota_state_does_not_change_a_delete() {
         true,
     )
     .await;
-    let reset = teamclaude_rs::now_ms() + 3_600_000;
+    let reset = tcr::now_ms() + 3_600_000;
     for (idx, used) in [(0, 0.9), (1, 1.0)] {
         fleet.manager.apply_usage(
             idx,
-            &teamclaude_rs::probe::Usage {
-                five_hour: Some(teamclaude_rs::probe::UsageBucket {
+            &tcr::probe::Usage {
+                five_hour: Some(tcr::probe::UsageBucket {
                     utilization: Some(used),
                     reset_at_ms: Some(reset),
                 }),
@@ -296,7 +296,7 @@ async fn a_deleted_row_in_the_middle_shifts_no_other_rows_threshold() {
         2,
         OffsetDateTime::now_utc(),
         None,
-        teamclaude_rs::stats::SessionKind::Fallback,
+        tcr::stats::SessionKind::Fallback,
     );
     delete_and_expect(
         &fleet,
@@ -620,7 +620,7 @@ async fn a_login_after_a_delete_brings_the_account_back_serving() {
     )
     .await;
     delete_and_expect(&fleet, "alice@example.com", &["bob@example.com"]).await;
-    let login: teamclaude_rs::config::Account =
+    let login: tcr::config::Account =
         serde_json::from_str(&oauth("alice@example.com", "")).unwrap();
     fleet.manager.add_or_update_account(login);
     let rows = poll(&fleet).await;

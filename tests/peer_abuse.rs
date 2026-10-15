@@ -43,14 +43,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tcr::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
+use tcr::peer::discovery::{self, Discovered, FoundList};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, Admission, SessionContext};
+use tcr::peer::noise;
+use tcr::peer::pair;
+use tcr::peer::state::{self, PeerState};
 use tcr_peer_wire::{InstanceId, Knock, PeerId, INSTANCE_ID_BYTES, PROTO_VERSION};
-use teamclaude_rs::peer::config::{self, Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
-use teamclaude_rs::peer::discovery::{self, Discovered, FoundList};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, Admission, SessionContext};
-use teamclaude_rs::peer::noise;
-use teamclaude_rs::peer::pair;
-use teamclaude_rs::peer::state::{self, PeerState};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -2313,7 +2313,7 @@ async fn a_hello_arriving_while_the_peers_file_is_locked_leaves_the_runtime_free
     for _ in 0..2 {
         let store = config::PeerStore::open(&caller.peers).expect("open the store");
         hellos.push(tokio::spawn(async move {
-            teamclaude_rs::peer::serve::say_hello(&store, &target).await
+            tcr::peer::serve::say_hello(&store, &target).await
         }));
     }
 
@@ -2557,8 +2557,8 @@ fn a_fifth_headerless_session_from_one_peer_is_refused() {
 /// refusal below becomes the allowed tuple.
 #[test]
 fn a_gateway_carries_an_allow_listed_name_on_one_port_only() {
-    use teamclaude_rs::peer::egress::{PEER_EGRESS_HOSTS, PEER_EGRESS_PORT};
-    use teamclaude_rs::peer::tunnel;
+    use tcr::peer::egress::{PEER_EGRESS_HOSTS, PEER_EGRESS_PORT};
+    use tcr::peer::tunnel;
 
     let peer = PeerId([13_u8; 32]);
     let carried = tcr_peer_wire::TunnelTarget::Origin {
@@ -2696,8 +2696,8 @@ async fn a_banned_key_is_refused_on_the_enrolment_arm_too() {
 /// over-ask below comes back as a plan.
 #[test]
 fn a_forward_asking_for_more_hops_than_this_mac_grants_is_refused() {
-    use teamclaude_rs::peer::config::PeerStore;
-    use teamclaude_rs::peer::tunnel::{self, Carry, Forward, OriginRoute, TunnelBudget};
+    use tcr::peer::config::PeerStore;
+    use tcr::peer::tunnel::{self, Carry, Forward, OriginRoute, TunnelBudget};
 
     let requester = PeerId([21_u8; 32]);
     let target = PeerId([22_u8; 32]);
@@ -2746,7 +2746,7 @@ fn a_forward_asking_for_more_hops_than_this_mac_grants_is_refused() {
                 route: OriginRoute::Peer(target),
                 peer: requester,
                 target: &asked,
-                hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+                hosts: tcr::peer::egress::PEER_EGRESS_HOSTS,
                 cap_bytes: 1024 * 1024,
                 budget: &budget,
                 now_ms: 1_767_225_600_000,
@@ -2824,7 +2824,7 @@ async fn a_carried_stream_that_died_reports_it_through_finish() {
     .expect("the dialler's handshake");
     let (ours, session) = accepting.await.expect("the responder task");
 
-    let mut carried = teamclaude_rs::peer::tunnel::NoiseStream::start(ours, session);
+    let mut carried = tcr::peer::tunnel::NoiseStream::start(ours, session);
     // Not a frame this session can open: the pump breaks on it.
     noise::write_frame(&mut theirs, &[0_u8; 64])
         .await
@@ -2898,7 +2898,7 @@ async fn a_local_end_that_closes_still_gets_what_the_peer_already_sent() {
     .expect("the dialler's handshake");
     let (ours, session) = accepting.await.expect("the responder task");
 
-    let mut carried = teamclaude_rs::peer::tunnel::NoiseStream::start(ours, session);
+    let mut carried = tcr::peer::tunnel::NoiseStream::start(ours, session);
     // The local end is done talking, and is still there to be answered.
     carried.shutdown().await.expect("half-close the local end");
 

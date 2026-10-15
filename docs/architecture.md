@@ -151,7 +151,7 @@ old name are in `src/paths.rs` and `src/legacy_names.rs`.
 | `~/.config/tcr-leaf.pem`, `tcr-leaf.key`, `tcr-leaf.sans` | The leaf certificate for Anthropic's hosts, its key, and the host list it was made for | `0644`, `0600`, `0644` |
 | `~/.config/tcr-peers.json` | Peers only: your peer settings, the Macs you trust and any join secrets | `0600` |
 | `~/.config/tcr-node.key`, `tcr-node.pub` | Peers only: this Mac's peer identity key pair | `0600`, `0644` |
-| `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater | |
+| `~/.config/tcr/tcr-receipt.json` | Written by the cargo-dist installer (it does follow `XDG_CONFIG_HOME`), for its updater. An install made before the rename has `~/.config/teamclaude-rs/teamclaude-rs-receipt.json` instead | |
 | `<cache>/session-affinity.json` | Which session is pinned to which account | `0600` |
 | `<cache>/session-wire.json` | The Sessions and Tools lists, including up to 120 characters of each slow or running tool call's command | `0600` |
 | `<cache>/peer-state.json` | Peers only: what the proxy has learned about other Macs | `0600` |
@@ -171,7 +171,7 @@ login. The proxy it runs uses the same config and cache files as the CLI.
 ## Verifying a download
 
 Get `tcr` from this repository only: its
-[release page](https://github.com/dhkts1/teamclaude-rs/releases) or `install.sh` from `main`,
+[release page](https://github.com/dhkts1/tcr/releases) or `install.sh` from `main`,
 which downloads from that page. A copy repackaged anywhere else has not been checked by
 anyone here, and it is a program you are about to hand your account tokens to.
 
@@ -179,8 +179,8 @@ anyone here, and it is a program you are about to hand your account tokens to.
 `sha256.sum` lists them all. With both files in one directory:
 
 ```sh
-shasum -a 256 -c teamclaude-rs-aarch64-apple-darwin.tar.xz.sha256
-# expect: teamclaude-rs-aarch64-apple-darwin.tar.xz: OK
+shasum -a 256 -c tcr-aarch64-apple-darwin.tar.xz.sha256
+# expect: tcr-aarch64-apple-darwin.tar.xz: OK
 ```
 
 The file ends in a blank line, so `shasum` also warns that one line is improperly formatted;

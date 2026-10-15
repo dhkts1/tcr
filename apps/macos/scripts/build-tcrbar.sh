@@ -69,7 +69,7 @@ peer_url_scheme="tcr"
 # CLI-only release can no longer become the feed. raw.githubusercontent.com
 # needs no GitHub Pages configuration — it serves any branch's file content
 # directly.
-feed_url="https://raw.githubusercontent.com/dhkts1/teamclaude-rs/gh-pages/appcast.xml"
+feed_url="https://raw.githubusercontent.com/dhkts1/tcr/gh-pages/appcast.xml"
 
 # Build stamp. A missing or unreadable .git must never fail the build.
 #

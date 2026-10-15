@@ -396,13 +396,13 @@ pub fn classify_proxy_server(argv: &[String]) -> Option<ProxyKind> {
     }
     let is_node = |t: &str| t == "node" || t.ends_with("/node");
     let js_bin = crate::legacy_names::JS_PROXY_BIN;
-    let is_teamclaude =
+    let is_js_proxy =
         |t: &str| t == js_bin || t.strip_suffix(js_bin).is_some_and(|dir| dir.ends_with('/'));
     let is_tcr = |t: &str| t == "tcr" || t.ends_with("/tcr");
 
     // JS proxy: the teamclaude bin must be the executed program (argv0, or the arg
     // right after `node`) AND the subcommand must be `server`.
-    if let Some(i) = argv.iter().position(|t| is_teamclaude(t)) {
+    if let Some(i) = argv.iter().position(|t| is_js_proxy(t)) {
         let is_program = i == 0 || is_node(&argv[i - 1]);
         if is_program && argv.get(i + 1).map(String::as_str) == Some("server") {
             return Some(ProxyKind::LegacyJs);
@@ -963,7 +963,8 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
                 continue;
             }
             ProxyKind::LegacyJs => eprintln!(
-                "[tcr] replacing the legacy JS teamclaude proxy on :{port} (pid {pid}) — migrating the port to tcr; leaving it running would token-war over the same single-use refresh tokens."
+                "[tcr] replacing the legacy JS {} proxy on :{port} (pid {pid}) — migrating the port to tcr; leaving it running would token-war over the same single-use refresh tokens.",
+                crate::legacy_names::JS_PROXY_BIN
             ),
             ProxyKind::Tcr => eprintln!(
                 "[tcr] replacing existing proxy on :{port} (pid {pid}) — one proxy per port, or the two mutually invalidate each other's single-use refresh tokens (token war)."
@@ -1343,30 +1344,37 @@ mod tests {
     /// [`sysinfo::Process::cmd`] returns (pre-tokenized, no shell/whitespace
     /// splitting involved). Test-only stand-in for a real process's argv, kept
     /// tight so no test has to hand-expand every literal into a `Vec`.
+    ///
+    /// `{js}` in a part becomes [`crate::legacy_names::JS_PROXY_BIN`], so a
+    /// test can spell a JS-proxy path like `/opt/nvm/bin/{js}` without writing
+    /// the old name outside `legacy_names.rs`.
     fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+        parts
+            .iter()
+            .map(|s| s.replace("{js}", crate::legacy_names::JS_PROXY_BIN))
+            .collect()
     }
 
     #[test]
-    fn recognizes_js_teamclaude_server() {
+    fn recognizes_js_proxy_server() {
         assert!(is_proxy_server(&argv(&[
             "node",
-            "/opt/nvm/bin/teamclaude",
+            "/opt/nvm/bin/{js}",
             "server"
         ])));
         assert!(is_proxy_server(&argv(&[
             "node",
-            "/path/teamclaude",
+            "/path/{js}",
             "server",
             "-r"
         ])));
-        assert!(is_proxy_server(&argv(&["/path/teamclaude", "server"]))); // shebang exec
+        assert!(is_proxy_server(&argv(&["/path/{js}", "server"]))); // shebang exec
     }
 
     #[test]
     fn recognizes_tcr_server() {
         assert!(is_proxy_server(&argv(&[
-            "/opt/teamclaude-rs/target/release/tcr",
+            "/opt/{js}-rs/target/release/tcr",
             "server"
         ])));
         assert!(is_proxy_server(&argv(&["tcr"]))); // bare = default server
@@ -1376,14 +1384,10 @@ mod tests {
 
     #[test]
     fn rejects_non_servers() {
+        assert!(!is_proxy_server(&argv(&["node", "/path/{js}", "run"])));
         assert!(!is_proxy_server(&argv(&[
             "node",
-            "/path/teamclaude",
-            "run"
-        ])));
-        assert!(!is_proxy_server(&argv(&[
-            "node",
-            "/path/teamclaude",
+            "/path/{js}",
             "run",
             "-r"
         ])));
@@ -1396,7 +1400,7 @@ mod tests {
             "server"
         ]))); // teamclaude is a search term
         assert!(!is_proxy_server(&argv(&["rg", "tcr", "server"])));
-        assert!(!is_proxy_server(&argv(&["vim", "teamclaude-server.md"])));
+        assert!(!is_proxy_server(&argv(&["vim", "{js}-server.md"])));
         assert!(!is_proxy_server(&argv(&[])));
         assert!(!is_proxy_server(&argv(&["node", "/path/other", "server"])));
     }
@@ -1921,11 +1925,11 @@ mod tests {
     #[test]
     fn classify_names_which_proxy_it_found() {
         assert_eq!(
-            classify_proxy_server(&argv(&["node", "/opt/nvm/bin/teamclaude", "server"])),
+            classify_proxy_server(&argv(&["node", "/opt/nvm/bin/{js}", "server"])),
             Some(ProxyKind::LegacyJs)
         );
         assert_eq!(
-            classify_proxy_server(&argv(&["/opt/teamclaude-rs/target/release/tcr", "server"])),
+            classify_proxy_server(&argv(&["/opt/{js}-rs/target/release/tcr", "server"])),
             Some(ProxyKind::Tcr)
         );
         assert_eq!(classify_proxy_server(&argv(&["tcr"])), Some(ProxyKind::Tcr));
@@ -1936,7 +1940,7 @@ mod tests {
     fn replaceable_incumbents_filters_self_and_non_proxies() {
         let command = |pid: u32| -> Vec<String> {
             match pid {
-                111 => argv(&["node", "/x/teamclaude", "server"]),
+                111 => argv(&["node", "/x/{js}", "server"]),
                 222 => argv(&["/x/tcr", "server"]),
                 333 => argv(&["grep", crate::legacy_names::JS_PROXY_BIN, "server"]), // non-proxy on the port
                 444 => argv(&["/x/tcr", "run"]),

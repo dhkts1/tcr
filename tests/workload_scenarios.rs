@@ -54,12 +54,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
-use teamclaude_rs::manager::{InFlightGuard, Manager};
-use teamclaude_rs::model::is_fable_model;
-use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use teamclaude_rs::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
-use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
+use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::manager::{InFlightGuard, Manager};
+use tcr::model::is_fable_model;
+use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
+use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 use time::{Duration, OffsetDateTime};
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ fn to_ms(at: OffsetDateTime) -> i64 {
 fn account(name: &str, priority: i64) -> Account {
     Account {
         name: name.to_string(),
-        account_type: teamclaude_rs::config::AccountType::OAuth,
+        account_type: tcr::config::AccountType::OAuth,
         account_uuid: None,
         org_uuid: None,
         org_name: None,
@@ -117,7 +117,7 @@ fn account(name: &str, priority: i64) -> Account {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
-        egress: teamclaude_rs::config::Egress::Local,
+        egress: tcr::config::Egress::Local,
         egress_strict: false,
         extra: serde_json::Map::new(),
     }

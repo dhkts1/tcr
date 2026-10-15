@@ -6,17 +6,17 @@ use std::env;
 use std::sync::Arc;
 
 use proptest::prelude::*;
+use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
+use tcr::manager::Manager;
+use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};
+use tcr::peer::discovery;
+use tcr::peer::lease::schedule_refusal;
+use tcr::peer::listener::{Admission, KNOCK_BURST, KNOCK_INTERVAL_MS};
+use tcr::peer::schedule::{Hhmm, Schedule};
+use tcr::peer::serve::relay_path_is_routable;
+use tcr::probe::{ProbeError, ProbeFuture, UsageProber};
+use tcr::warmer::{AccountWarmer, WarmError, WarmFuture};
 use tcr_peer_wire::LeaseRefusal;
-use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
-use teamclaude_rs::manager::Manager;
-use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
-use teamclaude_rs::peer::discovery;
-use teamclaude_rs::peer::lease::schedule_refusal;
-use teamclaude_rs::peer::listener::{Admission, KNOCK_BURST, KNOCK_INTERVAL_MS};
-use teamclaude_rs::peer::schedule::{Hhmm, Schedule};
-use teamclaude_rs::peer::serve::relay_path_is_routable;
-use teamclaude_rs::probe::{ProbeError, ProbeFuture, UsageProber};
-use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
 
 fn cases() -> u32 {
     env::var("PROPTEST_CASES")
@@ -248,7 +248,7 @@ impl AccountWarmer for NeverWarms {
 fn fake_account(index: usize) -> Account {
     Account {
         name: format!("acct{index}@example.com"),
-        account_type: teamclaude_rs::config::AccountType::OAuth,
+        account_type: tcr::config::AccountType::OAuth,
         account_uuid: Some(format!("1111111{index}-1111-1111-1111-111111111111")),
         org_uuid: None,
         org_name: None,
@@ -266,7 +266,7 @@ fn fake_account(index: usize) -> Account {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
-        egress: teamclaude_rs::config::Egress::Local,
+        egress: tcr::config::Egress::Local,
         egress_strict: false,
         extra: serde_json::Map::new(),
     }
@@ -682,12 +682,12 @@ proptest! {
 
     #[test]
     fn a_fraction_read_off_disk_is_inside_the_ceiling(raw in -1000.0_f64..1000.0) {
-        let grant: teamclaude_rs::peer::config::LendGrant = serde_json::from_str(&format!(
+        let grant: tcr::peer::config::LendGrant = serde_json::from_str(&format!(
             r#"{{"window":"7d","fraction":{raw},"ttlS":300,"maxInflight":2}}"#
         ))
         .expect("a grant with a finite fraction parses");
         prop_assert!(
-            (0.0..=teamclaude_rs::peer::config::MAX_LEND_FRACTION).contains(&grant.fraction),
+            (0.0..=tcr::peer::config::MAX_LEND_FRACTION).contains(&grant.fraction),
             "a hand-written {raw} reached the sizing arithmetic as {}",
             grant.fraction
         );
@@ -699,13 +699,13 @@ proptest! {
 #[test]
 fn an_over_large_fraction_reads_back_at_the_ceiling() {
     let read = |raw: &str| -> f64 {
-        serde_json::from_str::<teamclaude_rs::peer::config::LendGrant>(&format!(
+        serde_json::from_str::<tcr::peer::config::LendGrant>(&format!(
             r#"{{"window":"7d","fraction":{raw},"ttlS":300,"maxInflight":2}}"#
         ))
         .expect("the grant parses")
         .fraction
     };
-    assert_eq!(read("0.9"), teamclaude_rs::peer::config::MAX_LEND_FRACTION);
+    assert_eq!(read("0.9"), tcr::peer::config::MAX_LEND_FRACTION);
     assert_eq!(read("-0.5"), 0.0);
     assert_eq!(
         read("0.2"),

@@ -1959,7 +1959,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let mut background: Vec<JoinHandle<()>> = Vec::new();
 
     // Session-affinity pins survive a restart via their own cache file (NOT the
-    // credential config — see `teamclaude_rs::affinity`). Restore before the
+    // credential config — see `tcr::affinity`). Restore before the
     // listener binds, so the first request after a bounce already routes on its
     // old pin instead of cold-starting the account's prompt cache.
     //
@@ -2028,7 +2028,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         })));
     }
 
-    // The account-bound-token map (see `teamclaude_rs::bound_tokens`) survives a restart the
+    // The account-bound-token map (see `tcr::bound_tokens`) survives a restart the
     // same way pins do, and for a sharper reason: a restart is exactly when live conversations
     // get re-keyed onto other accounts, and a conversation carrying an advisor result, a
     // thinking signature or server-side thread state is rejected outright on every remaining

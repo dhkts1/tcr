@@ -464,9 +464,9 @@ mutate 'the join key echoed to stderr on the failure path' \
 import os
 p = os.environ["MUT_FILE"]
 s = open(p).read()
-old = "            teamclaude_rs::peer::pair::join(&store, token, &label).await?;"
+old = "            tcr::peer::pair::join(&store, token, &label).await?;"
 assert old in s, "the join call moved"
-s = s.replace(old, "            eprintln!(\"peer join: dialling {}\", token.to_token());\n            teamclaude_rs::peer::pair::join(&store, token, &label).await?;")
+s = s.replace(old, "            eprintln!(\"peer join: dialling {}\", token.to_token());\n            tcr::peer::pair::join(&store, token, &label).await?;")
 open(p, "w").write(s)
 '
 

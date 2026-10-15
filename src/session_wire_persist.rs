@@ -64,7 +64,7 @@ use crate::session_wire::WireSession;
 ///   how much ADDITIONAL time — genuine proxy downtime between the last flush
 ///   and this boot — is still worth trusting.
 /// - Gil runs 11+ concurrent Claude Code sessions and updates the app several
-///   times a day (`teamclaude-rs/CLAUDE.md`). With that many sessions open at
+///   times a day (this repository's `CLAUDE.md`). With that many sessions open at
 ///   once, most of them sit idle for stretches while he works in one or two —
 ///   and an update can land in the middle of any of those stretches. A TTL of
 ///   "a few hours" easily covers a same-day gap between one update and the

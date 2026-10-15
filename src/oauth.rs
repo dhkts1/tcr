@@ -3610,7 +3610,10 @@ mod tests {
         // (as `sysinfo::Process::cmd()` returns it) so a space in an executable's
         // path can never be re-split into the wrong tokens.
         let refuses = |cmd: &[&str]| {
-            let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let argv: Vec<String> = cmd
+                .iter()
+                .map(|s| s.replace("{js}", crate::legacy_names::JS_PROXY_BIN))
+                .collect();
             let server = singleton::classify_proxy_server(&argv)
                 .map(|kind| singleton::Incumbent { pid: 4242, kind });
             assert_eq!(
@@ -3624,12 +3627,12 @@ mod tests {
             )
         };
         assert!(
-            refuses(&["/opt/teamclaude-rs/target/release/tcr", "server"]),
+            refuses(&["/opt/{js}-rs/target/release/tcr", "server"]),
             "a live tcr server must block login"
         );
         assert!(
-            refuses(&["node", "/opt/nvm/bin/teamclaude", "server"]),
-            "a live JS teamclaude server must block login"
+            refuses(&["node", "/opt/nvm/bin/{js}", "server"]),
+            "a live JS proxy server must block login"
         );
         assert!(
             !refuses(&["python3", "-m", "http.server", "3456"]),

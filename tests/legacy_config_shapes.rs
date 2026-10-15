@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use teamclaude_rs::config;
+use tcr::config;
 
 const FIXTURE_DIR: &str = "tests/fixtures/legacy_configs";
 
@@ -80,7 +80,7 @@ fn every_historical_config_shape_still_loads() {
 /// surface behind it.
 #[test]
 fn a_peers_file_with_no_dead_drop_key_reads_as_off() {
-    use teamclaude_rs::peer::config::{self as peers, DeadDropConfig};
+    use tcr::peer::config::{self as peers, DeadDropConfig};
 
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("tcr-peers.json");

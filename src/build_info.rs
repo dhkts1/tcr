@@ -416,7 +416,7 @@ fn is_comparable_sha(value: &str) -> bool {
     value.len() >= MIN_SHA_LEN && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Locate the teamclaude-rs checkout containing `start`, if any.
+/// Locate the tcr checkout containing `start`, if any.
 ///
 /// Two steps, and the second is the important one. [`crate::update::find_repo_root_from`]
 /// finds the nearest ancestor holding both `.git` and `Cargo.toml` — but

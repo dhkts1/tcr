@@ -27,13 +27,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tcr::peer::config::{self as peer_config, PeerFile, PeerRow};
+use tcr::peer::id::NodeKey;
+use tcr::peer::listener::{self, SessionContext};
+use tcr::peer::noise::{self, Handshake};
+use tcr::peer::reach;
+use tcr::peer::serve;
 use tcr_peer_wire::{Caps, Control, Hello, PeerId, StreamHeader, StreamKind};
-use teamclaude_rs::peer::config::{self as peer_config, PeerFile, PeerRow};
-use teamclaude_rs::peer::id::NodeKey;
-use teamclaude_rs::peer::listener::{self, SessionContext};
-use teamclaude_rs::peer::noise::{self, Handshake};
-use teamclaude_rs::peer::reach;
-use teamclaude_rs::peer::serve;
 
 /// A scratch directory named after this process, thread and a caller tag, so
 /// two tests in this binary never collide on one path.
