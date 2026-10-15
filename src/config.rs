@@ -2070,12 +2070,41 @@ pub fn load_or_init(path: &Path) -> Result<(Config, bool), ConfigError> {
     }
 }
 
-/// The atomic 0600 write itself, shared by [`save`], [`save_tokens`] and the
-/// session-affinity pin file ([`crate::affinity::save`]) so every path gets the
-/// same durability and permission guarantees. One implementation deliberately:
+/// How far [`write_atomic_with`] pushes a file toward the disk before it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// Flushed to the disk itself before the rename and again after it: two `F_FULLFSYNC`
+    /// on macOS. For what cannot be rebuilt: the config, rotated refresh tokens, peer state.
+    Flushed,
+    /// Atomic against this process dying, SIGKILL included, because the kernel already
+    /// holds the bytes; not against a power loss, which can leave the previous version or a
+    /// truncated file. Only for a cache the proxy rebuilds from traffic and whose loader
+    /// already reads a missing, truncated or corrupt file as empty, so the worst case is a
+    /// cold cache.
+    ///
+    /// Why it exists, measured 2026-10-15 on the live proxy: the affinity and session-wire
+    /// caches were rewritten every 5 s without a break (24 times each in 120 s), each write
+    /// paying both flushes on a runtime worker, and the flush waits were 8% and 35% of the
+    /// proxy's busy samples in two profiles.
+    Cache,
+}
+
+/// The atomic 0600 write itself with full durability ([`Durability::Flushed`]), shared by
+/// [`save`], [`save_tokens`] and every other state file that cannot be rebuilt, so every path
+/// gets the same durability and permission guarantees. One implementation deliberately:
 /// a second hand-rolled temp+rename is a second place for the ordering to be
-/// subtly wrong.
+/// subtly wrong. A rebuildable cache calls [`write_atomic_with`] and [`Durability::Cache`].
 pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
+    write_atomic_with(path, json, Durability::Flushed)
+}
+
+/// [`write_atomic`] with the durability named: the same temp file, permissions and rename,
+/// and the two disk flushes only when `durability` is [`Durability::Flushed`].
+pub(crate) fn write_atomic_with(
+    path: &Path,
+    json: &str,
+    durability: Durability,
+) -> Result<(), ConfigError> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
 
@@ -2130,8 +2159,12 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // Make the temp file's DATA durable before the rename that publishes it, so a
     // crash cannot expose the destination as empty or half-written. This is the
     // only durability guarantee that holds unconditionally here; see the
-    // directory sync below for the part that does not.
-    file.as_file().sync_all()?;
+    // directory sync below for the part that does not. A cache skips it: see
+    // `Durability::Cache` for why that is safe for exactly those files.
+    match durability {
+        Durability::Flushed => file.as_file().sync_all()?,
+        Durability::Cache => {}
+    }
 
     match file.persist(path) {
         // The returned `File` is the persisted handle; nothing here writes through
@@ -2207,17 +2240,21 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // function (5.0 → 9.5 ms/write, N=200, APFS), because a second `F_FULLFSYNC`
     // is a second barrier. That is affordable only because of the actual call
     // rates. The affinity flusher is the hot caller and is the one that would hurt
-    // — it does a blocking `std::fs` write inside async code (`src/server.rs:425`)
-    // — but it is a dirty-gated 5-second ticker whose steady state is no writes at
-    // all (`src/server.rs:670-683`), so this adds ~4.5ms to a background task at
-    // most once per 5s. The credential writers run per token rotation. If a future
-    // caller writes at request rate, revisit this line before assuming it is free.
-    if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
-        tracing::warn!(
-            dir = %dir.display(),
-            error = %e,
-            "state file renamed into place, but the parent directory could not be fsynced; the rename may not survive a power loss"
-        );
+    // — it does a blocking `std::fs` write inside async code (`src/server.rs:425`).
+    // This comment used to say its steady state is no writes at all. Measured on
+    // 2026-10-15, that was false: with a few dozen live sessions the pins change on
+    // every tick. So the affinity, session-wire and bound-token caches now write
+    // with `Durability::Cache` and skip this sync. The credential
+    // writers run per token rotation. If a future caller writes at request rate,
+    // revisit this line before assuming it is free.
+    if durability == Durability::Flushed {
+        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "state file renamed into place, but the parent directory could not be fsynced; the rename may not survive a power loss"
+            );
+        }
     }
 
     // NOT a guard against a looser pre-existing destination: `persist` is a
@@ -5986,6 +6023,66 @@ mod tests {
             "an untouched entry must be left byte-identical: {value}"
         );
         fs::remove_file(&path).ok();
+    }
+
+    // --- write_atomic's durability modes -----------------------------------
+
+    /// A cache write skips only the disk flushes: it lands the same bytes at the same 0600
+    /// mode as a flushed write, replaces the destination by rename, and leaves no temp file.
+    #[test]
+    fn a_cache_write_lands_what_a_flushed_write_lands() {
+        let dir = tmp_path("durability-cache").with_extension("d");
+        fs::create_dir_all(&dir).expect("create the test directory");
+        let flushed = dir.join("flushed.json");
+        let cache = dir.join("cache.json");
+        let json = r#"{"pins":[{"key":1}]}"#;
+        write_atomic_with(&flushed, json, Durability::Flushed).expect("flushed write");
+        write_atomic_with(&cache, "{}", Durability::Cache).expect("cache write");
+        write_atomic_with(&cache, json, Durability::Cache).expect("cache overwrite");
+
+        assert_eq!(
+            fs::read(&cache).expect("read the cache file"),
+            fs::read(&flushed).expect("read the flushed file")
+        );
+        let mode = |p: &Path| fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode(&cache), 0o600);
+        assert_eq!(mode(&flushed), 0o600);
+        let names: Vec<String> = fs::read_dir(&dir)
+            .expect("read the test directory")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file may be left behind: {names:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What the two disk flushes cost per write, which is what `Durability::Cache` saves the
+    /// caches rewritten every 5 s. A timing, not a gate, so it is ignored; run it with
+    /// `cargo test --release --lib flushed_and_cache_write_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run by hand"]
+    fn flushed_and_cache_write_costs() {
+        let dir = tmp_path("durability-bench").with_extension("d");
+        fs::create_dir_all(&dir).expect("create the test directory");
+        let path = dir.join("bench.json");
+        // About the size of the live session-affinity file on 2026-10-15.
+        let json = "x".repeat(160 * 1024);
+        let rounds: u32 = 50;
+        for durability in [Durability::Flushed, Durability::Cache] {
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                write_atomic_with(&path, &json, durability).expect("write");
+            }
+            println!(
+                "{durability:?}: {:?} per 160 KB write",
+                start.elapsed() / rounds
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     // --- write_atomic's failure path ---------------------------------------

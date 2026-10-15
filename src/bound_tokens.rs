@@ -257,7 +257,13 @@ pub fn save(
         accounts,
         tokens: stored,
     };
-    crate::config::write_atomic(path, &serde_json::to_string(&file)?)?;
+    // A cache of several megabytes, which `load` reads as empty when it is missing or damaged:
+    // atomic, but not flushed to the disk (see `Durability::Cache`).
+    crate::config::write_atomic_with(
+        path,
+        &serde_json::to_string(&file)?,
+        crate::config::Durability::Cache,
+    )?;
     Ok(count)
 }
 
