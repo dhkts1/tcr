@@ -5357,6 +5357,17 @@ async fn handle_request(
         // request once against the true serving account and log it.
         let served_at = OffsetDateTime::now_utc();
         manager.record_served(idx, served_at, session_key, session_kind);
+        // A history bound elsewhere and answered here has moved here: re-bind its tokens, or the
+        // next full-history request is held back to the old account's cold cache once it
+        // recovers (`Manager::rebind_served_history`).
+        if status.is_success() && minted.is_some_and(|(bound_idx, _)| bound_idx != idx) {
+            manager.rebind_served_history(
+                &bound.tokens,
+                idx,
+                request_model.as_deref(),
+                crate::now_ms(),
+            );
+        }
         // F1: fold this request's session id, model and tool events into the wire-session
         // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
         // `None`. Cloned, not moved: the usage-recording arms below (streamed and
@@ -15777,6 +15788,63 @@ mod tests {
             hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the sibling served it"
+        );
+    }
+
+    /// A released conversation that ran on the sibling stays there when its old account comes
+    /// back. Its later turns mint nothing the history echoes, so without a re-bind the history's
+    /// newest known token still names the old account, and the next full-history request (a
+    /// replay after a thread 404, a side request) was held back there onto a cold cache:
+    /// 2026-10-15, 7 holds wrote 2.6M cache tokens that way (`Manager::rebind_served_history`).
+    #[tokio::test]
+    async fn a_released_conversation_stays_on_the_account_that_served_it() {
+        let (upstream, _hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[true, false]), None);
+        // Not `sig_fake_1`: the upstream mints `sig_fake_<nth hit>`, and its first answer would
+        // record that name on the serving account by itself and pass this test without the fix.
+        manager.record_bound_tokens(
+            &[(
+                BoundTokenKind::ThinkingSignature,
+                "sig_fake_released".to_string(),
+            )],
+            0,
+            crate::now_ms(),
+        );
+        let turn = thinking_turn_body("sess-moved", &["sig_fake_released"]);
+
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the switch warning");
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::OK, "the retry moves");
+        assert!(
+            seen.lock().expect("recorder")[0].contains("at-bbbbbbbbbbbb"),
+            "precondition: account 1 served the released conversation"
+        );
+
+        // Account 0 comes back, and the warning has run its life, as it had in the measured
+        // case (the replay came 43 minutes after the conversation's last turn).
+        assert_eq!(
+            manager.set_disabled(0, false),
+            DisablePersist::NoConfigFile,
+            "re-enabled in memory, with no config file behind this manager to write"
+        );
+        manager.expire_switch_warnings();
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-fresh", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            seen.lock().expect("recorder")[1].contains("at-aaaaaaaaaaaa"),
+            "control: account 0 is back and serving, so only the history keeps a turn off it"
+        );
+
+        let (status, _) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            seen.lock().expect("recorder")[2].contains("at-bbbbbbbbbbbb"),
+            "the same history must stay on the account that served it, warm, not go back to the \
+             account it left: {}",
+            seen.lock().expect("recorder")[2]
         );
     }
 
