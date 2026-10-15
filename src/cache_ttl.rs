@@ -159,14 +159,16 @@ const EXTENDED_TTL: &str = "1h";
 /// How: the body is never built into a [`serde_json::Value`] tree. Every
 /// Claude Code request carries a `cache_control`, and a long conversation is
 /// megabytes, so the tree (one allocation per string, then a full
-/// re-serialisation) was paid on almost every request. Instead each level on
-/// the way down (the top-level object, the `system` / `tools` / `messages`
-/// arrays, a message, a block, the `cache_control` object) is read as borrowed
-/// [`RawValue`] spans that point into `body`, and only the few members this
-/// function needs are picked out of each. Each `ttl` to change becomes a splice
-/// at a byte offset: replace the existing `ttl` value's span with `"1h"`, or
-/// insert `"ttl":"1h"` before the object's closing brace. The body is then
-/// copied once with the splices applied.
+/// re-serialisation) was paid on almost every request. Instead ONE serde pass
+/// walks `system`, `tools` and `messages[].content` down to each block and
+/// skips every other member unparsed. Only a block's `cache_control` object,
+/// a few bytes, is kept, as a borrowed [`RawValue`] that points into `body`, so
+/// its offset is a pointer difference. Each `ttl` to change becomes a splice
+/// there: replace the existing `ttl` value's span with `"1h"`, or insert
+/// `"ttl":"1h"` before the object's closing brace. The body is then copied once
+/// with the splices applied. (Reading each level as a `RawValue` and parsing it
+/// again one level down is not the same thing: it scans the conversation once
+/// per level, and measured slower than the tree.)
 ///
 /// The structural rules are the ones the old tree walk had, and the reference
 /// copy of it in this module's tests holds this to them:
@@ -202,29 +204,16 @@ pub fn extend_all_ttls(body: &[u8]) -> Option<Vec<u8>> {
     // One UTF-8 check up front, so every span below is a `&str` into `body` and
     // a member that is skipped rather than parsed is still checked for it.
     let text = std::str::from_utf8(body).ok()?;
+    let mut splices: Vec<Splice> = Vec::new();
     let mut de = serde_json::Deserializer::from_str(text);
-    let [system, tools, messages] = de
-        .deserialize_map(PickMembers(&["system", "tools", "messages"]))
-        .ok()?;
+    // A top level that is not an object is an error here, so `None`, as before.
+    de.deserialize_map(Root(Walk {
+        body: text,
+        splices: &mut splices,
+    }))
+    .ok()?;
     // Trailing bytes after the object make the body not JSON, as before.
     de.end().ok()?;
-
-    let mut splices: Vec<Splice> = Vec::new();
-    for list in [system, tools].into_iter().flatten() {
-        for block in array_items(list)? {
-            extend_block(text, block, &mut splices)?;
-        }
-    }
-    if let Some(messages) = messages {
-        for message in array_items(messages)? {
-            let Some([Some(content)]) = members(message, &["content"]) else {
-                continue;
-            };
-            for block in array_items(content)? {
-                extend_block(text, block, &mut splices)?;
-            }
-        }
-    }
 
     if splices.is_empty() {
         return None;
@@ -254,16 +243,214 @@ struct Splice {
 /// The `ttl` value every rewritten breakpoint gets, as JSON.
 const EXTENDED_TTL_JSON: &str = "\"1h\"";
 
-/// Queue the splice that makes `block`'s `cache_control` carry `ttl: "1h"`, if
-/// `block` is an object whose `cache_control` is an object that does not
-/// already. Anything else (a block that is not an object, no `cache_control`,
-/// one that is not an object) queues nothing. `None` only when a span does not
-/// point into `body`, which serde_json's borrowed `RawValue` rules out; the
-/// caller then forwards the body unchanged rather than splice at a wild offset.
-fn extend_block(body: &str, block: &RawValue, splices: &mut Vec<Splice>) -> Option<()> {
-    let Some([Some(cache_control)]) = members(block, &["cache_control"]) else {
-        return Some(());
+/// The splices one part of the walk queues, and the body their offsets are
+/// measured from.
+struct Walk<'s, 'b> {
+    body: &'b str,
+    splices: &'s mut Vec<Splice>,
+}
+
+impl Walk<'_, '_> {
+    /// The same walk, writing into `splices` instead.
+    fn writing_to<'t>(&self, splices: &'t mut Vec<Splice>) -> Walk<'t, '_> {
+        Walk {
+            body: self.body,
+            splices,
+        }
+    }
+}
+
+/// What the elements of a [`List`] are.
+#[derive(Clone, Copy)]
+enum Element {
+    /// A `system` block, a tool definition, or a message content block: an
+    /// object whose own `cache_control` is a breakpoint.
+    Block,
+    /// A `messages` entry: an object whose `content` may be a list of blocks.
+    Message,
+}
+
+/// Every visitor below sees values of any JSON type, and the ones it does not
+/// walk into it skips.
+macro_rules! skip_scalars {
+    () => {
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+            Ok(())
+        }
     };
+}
+
+/// The top-level object: walks `system` and `tools` as lists of blocks and
+/// `messages` as a list of messages, and skips every other member.
+struct Root<'s, 'b>(Walk<'s, 'b>);
+
+impl<'de> Visitor<'de> for Root<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        // Splices per member, so a member that repeats counts as its last
+        // occurrence only, as a parsed map would hold it.
+        let mut found: [Vec<Splice>; 3] = Default::default();
+        while let Some(slot) = map.next_key_seed(MemberSlot(&["system", "tools", "messages"]))? {
+            let Some(i) = slot else {
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            };
+            let element = if i == 2 {
+                Element::Message
+            } else {
+                Element::Block
+            };
+            let splices = &mut found[i];
+            splices.clear();
+            map.next_value_seed(List(element, self.0.writing_to(splices)))?;
+        }
+        for splices in found {
+            self.0.splices.extend(splices);
+        }
+        Ok(())
+    }
+}
+
+/// A value that, when it is an array, holds [`Element`]s to walk; any other
+/// value (a string `system` or `content`) is skipped.
+struct List<'s, 'b>(Element, Walk<'s, 'b>);
+
+impl<'de> DeserializeSeed<'de> for List<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for List<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    skip_scalars!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let List(element, walk) = self;
+        while seq
+            .next_element_seed(Item(
+                element,
+                Walk {
+                    body: walk.body,
+                    splices: &mut *walk.splices,
+                },
+            ))?
+            .is_some()
+        {}
+        Ok(())
+    }
+}
+
+/// One element of a [`List`]. When it is an object: a block's `cache_control`
+/// is extended, a message's `content` is walked as a list of blocks. Any other
+/// value is skipped.
+struct Item<'s, 'b>(Element, Walk<'s, 'b>);
+
+impl<'de> DeserializeSeed<'de> for Item<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Item<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    skip_scalars!();
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let Item(element, walk) = self;
+        match element {
+            Element::Block => {
+                // The last `cache_control` is the one a parsed map holds.
+                let mut cache_control: Option<&'de RawValue> = None;
+                while let Some(slot) = map.next_key_seed(MemberSlot(&["cache_control"]))? {
+                    if slot.is_some() {
+                        cache_control = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                if let Some(cache_control) = cache_control {
+                    extend_cache_control(walk.body, cache_control, walk.splices).ok_or_else(
+                        || {
+                            <A::Error as serde::de::Error>::custom(
+                                "a cache_control span outside the body",
+                            )
+                        },
+                    )?;
+                }
+            }
+            Element::Message => {
+                // Splices of the last `content` only, as with a repeated key above.
+                let mut content: Vec<Splice> = Vec::new();
+                while let Some(slot) = map.next_key_seed(MemberSlot(&["content"]))? {
+                    if slot.is_some() {
+                        content.clear();
+                        map.next_value_seed(List(Element::Block, walk.writing_to(&mut content)))?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                walk.splices.extend(content);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Queue the splice that makes `cache_control` carry `ttl: "1h"`, if it is an
+/// object that does not already. One that is not an object (null, a string, a
+/// number) queues nothing. `None` only when a span does not point into `body`,
+/// which serde_json's borrowed `RawValue` rules out; the walk then fails and the
+/// body is forwarded unchanged rather than spliced at a wild offset.
+fn extend_cache_control(
+    body: &str,
+    cache_control: &RawValue,
+    splices: &mut Vec<Splice>,
+) -> Option<()> {
     let Some([ttl]) = members(cache_control, &["ttl"]) else {
         return Some(());
     };
@@ -312,17 +499,6 @@ fn is_extended_ttl(ttl: &RawValue) -> bool {
 fn offset_in(body: &str, part: &str) -> Option<usize> {
     let offset = (part.as_ptr() as usize).checked_sub(body.as_ptr() as usize)?;
     (offset.checked_add(part.len())? <= body.len()).then_some(offset)
-}
-
-/// The elements of `raw` as borrowed spans when it is a JSON array, and none
-/// when it is anything else (a string `system` or `content` carries no
-/// breakpoint). `None` only if a span serde_json already validated fails to
-/// re-parse, which it cannot.
-fn array_items(raw: &RawValue) -> Option<Vec<&RawValue>> {
-    if !raw.get().starts_with('[') {
-        return Some(Vec::new());
-    }
-    serde_json::from_str(raw.get()).ok()
 }
 
 /// The named members of `raw` when it is a JSON object (`None` when it is not),
@@ -527,6 +703,9 @@ mod tests {
             r#"{"system":[{"cache_control":null,"cache_control":{"type":"ephemeral"}}]}"#,
             r#"{"system":[{"cache_control":{}}],"system":"now a string"}"#,
             r#"{"system":"first a string","system":[{"cache_control":{}}]}"#,
+            r#"{"messages":[{"content":[{"cache_control":{}}],"content":"now a string"}]}"#,
+            r#"{"messages":[{"content":"first a string","content":[{"cache_control":{}}]}]}"#,
+            r#"{"messages":[],"messages":[{"content":[{"cache_control":{}}]}],"tools":[{"cache_control":{}}],"tools":null}"#,
             // An escaped member name is the same member.
             r#"{"system":[{"cache^u005fcontrol":{"type":"ephemeral"}},{"cache_control":{"ttl":"1h"}}]}"#,
             r#"{"^u0073ystem":[{"cache_control":{"^u0074tl":"5m"}}]}"#,
