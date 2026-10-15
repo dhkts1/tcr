@@ -399,11 +399,12 @@ pub struct SessionRow {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// How many of [`Self::requests`] could not be priced, because no rate is known for
-    /// the model. [`Self::cost_usd`] keeps its meaning — such a request adds `0.0` to it —
-    /// so a count here says the figure is a floor. Skipped at zero: every request priced,
-    /// or a server that does not count them, so an absent key never proves the figure
-    /// complete.
+    /// How many of [`Self::requests`] no price covers: a request whose model has no known
+    /// rate, and on a Codex session also one whose usage has not been priced because its
+    /// turn is still streaming or ended without reporting any. [`Self::cost_usd`] keeps its
+    /// meaning — such a request adds `0.0` to it — so a count here says the figure is a
+    /// floor. Skipped at zero: every request priced, or a server that does not count them,
+    /// so an absent key never proves the figure complete.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unpriced_requests: u64,
     /// The reasoning tokens this session's responses reported, a Codex response's

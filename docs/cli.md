@@ -1612,11 +1612,12 @@ a panel's fleet-wide headline never disagrees with the per-session rows by re-su
 
 A Codex session's id is the `session-id` header codex sends on every turn, and its row carries
 `provider: "codex"`, a key absent on a Claude Code session. `unpricedRequests` counts its requests
-no price covers, and `costUsd` stays the priced part (0.0 when none was priced); `reasoningTokens`
-counts its reasoning tokens, which are already inside `outputTokens`. Both keys are absent at 0.
-Its tool calls fill the same `tools` keys: each runs from the end of the response that asked for it
-until tcr serves the next request on the same session, and a running call carries `timeoutSeconds`
-when it named its own timeout. A request tcr answers itself is not counted and closes nothing. After
+no price covers, a turn still streaming or one that ended without reporting usage among them, and
+`costUsd` stays the priced part (0.0 when none was priced); `reasoningTokens` counts its reasoning
+tokens, which are already inside `outputTokens`. Both keys are absent at 0. Its tool calls fill
+the same `tools` keys: each runs from the end of the response that asked for it until tcr serves
+the next request on the same session, and a running call carries `timeoutSeconds` when it named
+its own timeout. A request tcr answers itself is not counted and closes nothing. After
 an upstream 403, tcr holds that account out for 120 seconds, and while no other Codex account can
 serve, tcr answers the session's requests itself, except that a request arriving in the hold's last
 20 seconds waits until the account frees. Either way the calls keep running, and their time

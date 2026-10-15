@@ -222,7 +222,7 @@ impl Manager {
             .snapshot(now_ms)
             .into_iter()
             .map(|(session_id, s)| {
-                let (cost_usd, unpriced) = Self::price_session(&self.usage, &s.by_model);
+                let (cost_usd, unpriced, priced) = Self::price_session(&self.usage, &s.by_model);
                 tcr_status_wire::SessionRow {
                     session_id,
                     account: s.account,
@@ -321,10 +321,17 @@ impl Manager {
                     // Codex sessions only. A Claude session on a model this build cannot price
                     // keeps the zero it has always shown and no count: changing that changes a
                     // Claude-only fleet's output.
+                    //
+                    // Counted out of `requests`, not only out of the usage records: a request
+                    // is counted when its response's headers arrive and its usage only when the
+                    // stream ends, and a turn that ends with no usage never adds one. So a turn
+                    // still streaming, or one that reported no usage, is a request no price
+                    // covers, and a session nothing was priced for always reads at least as
+                    // many unpriced requests as requests, the rule TcrBar draws no dollars by.
                     unpriced_requests: if s.provider.is_anthropic() {
                         0
                     } else {
-                        unpriced
+                        unpriced.max(s.requests.saturating_sub(priced))
                     },
                     reasoning_tokens: s.reasoning_tokens,
                 }
@@ -337,33 +344,37 @@ impl Manager {
     /// so a session that spans two models is priced correctly rather than averaged. A model
     /// this table has no entry for contributes `0.0` to the cost, the same "unpriced" outcome
     /// `crate::pricing` documents for the account-level ledger, so `SessionRow::cost_usd` stays
-    /// a plain total, never an `Option`. The second value counts the requests the cost leaves
-    /// out, from each unpriced model's tally; the projection reports it as
-    /// `SessionRow::unpriced_requests` on Codex sessions only, so a Claude session on a model
-    /// this build cannot price keeps the bare zero it has always shown.
+    /// a plain total, never an `Option`. The second value counts the usage records the cost
+    /// leaves out, from each unpriced model's tally, and the third the usage records it covers;
+    /// the projection reports the requests no price covers as `SessionRow::unpriced_requests`
+    /// on Codex sessions only, so a Claude session on a model this build cannot price keeps the
+    /// bare zero it has always shown.
     fn price_session(
         usage: &crate::usage::UsageTracker,
         by_model: &std::collections::HashMap<String, crate::session_wire::ModelTokenTally>,
-    ) -> (f64, u64) {
-        let mut unpriced = 0;
+    ) -> (f64, u64, u64) {
+        let (mut unpriced, mut priced) = (0, 0);
         let nanos: u64 = by_model
             .iter()
             .filter_map(|(model, tally)| match usage.price_for(model) {
-                Some(price) => Some(crate::pricing::cost_nanos(
-                    &price,
-                    tally.input,
-                    tally.cache_5m,
-                    tally.cache_1h,
-                    tally.cache_read,
-                    tally.output,
-                )),
+                Some(price) => {
+                    priced += tally.requests;
+                    Some(crate::pricing::cost_nanos(
+                        &price,
+                        tally.input,
+                        tally.cache_5m,
+                        tally.cache_1h,
+                        tally.cache_read,
+                        tally.output,
+                    ))
+                }
                 None => {
                     unpriced += tally.requests;
                     None
                 }
             })
             .sum();
-        (nanos as f64 / 1_000_000_000.0, unpriced)
+        (nanos as f64 / 1_000_000_000.0, unpriced, priced)
     }
 
     /// Fleet-wide tool-call totals, summed across every row `Self::wire_sessions_snapshot`
@@ -984,6 +995,92 @@ mod tests {
             row.cost_usd
         );
         assert_eq!(row.unpriced_requests, 1);
+    }
+
+    /// TcrBar's rule for a Codex session's dollars (`Session.pricedCostUsd`): none while its
+    /// unpriced requests are at least its requests. Mirrored here so the producer is checked
+    /// against the reader it feeds.
+    fn tcrbar_draws_dollars(row: &tcr_status_wire::SessionRow) -> bool {
+        !(row.provider.as_deref() == Some("codex") && row.unpriced_requests >= row.requests)
+    }
+
+    /// A Codex request no price covers counts as unpriced from the moment it is served: while
+    /// its turn streams, and for good when the turn ends with no usage (an interrupted stream,
+    /// a forwarded error). Counted from the usage records alone, a streaming turn left
+    /// `unpricedRequests` behind `requests` with a `costUsd` of 0.0, and TcrBar drew that zero
+    /// as `$0.00`. A priced session with a turn in flight keeps its dollars, and counts the one
+    /// turn they leave out.
+    ///
+    /// Watched red: counted from the usage records, the streaming session reads 0 unpriced of
+    /// 1, then 1 of 2, and the priced one 0 of 2.
+    #[test]
+    fn a_codex_request_with_no_usage_yet_counts_as_unpriced() {
+        let now = OffsetDateTime::now_utc();
+        let row = |manager: &Manager, id: &str| -> tcr_status_wire::SessionRow {
+            manager
+                .snapshot(now)
+                .wire_sessions
+                .into_iter()
+                .find(|row| row.session_id == id)
+                .expect("the session")
+        };
+
+        let manager = Manager::from_runtimes(vec![]);
+        manager.record_codex_wire_session(Some("sess-streaming"), None, now);
+        let first = row(&manager, "sess-streaming");
+        assert_eq!((first.requests, first.unpriced_requests), (1, 1));
+        assert_eq!(first.cost_usd, 0.0);
+        assert!(
+            !tcrbar_draws_dollars(&first),
+            "no $0.00 while the first turn streams"
+        );
+
+        // The first turn's usage lands; the second turn streams, or ends with no usage.
+        manager.record_codex_wire_session_usage(
+            Some("sess-streaming"),
+            Some("gpt-5.1-codex"),
+            1_000,
+            0,
+            0,
+            0,
+            10,
+            0,
+        );
+        manager.record_codex_wire_session(Some("sess-streaming"), None, now);
+        let second = row(&manager, "sess-streaming");
+        assert_eq!((second.requests, second.unpriced_requests), (2, 2));
+        assert!(
+            !tcrbar_draws_dollars(&second),
+            "no $0.00 while the second turn streams"
+        );
+
+        let config: crate::config::Config =
+            serde_json::from_str(r#"{"pricing":{"gpt-5.1-codex":{"input":1.25,"output":10}}}"#)
+                .expect("a config with one price");
+        let priced = Manager::with_live_refresher(config, None);
+        priced.record_codex_wire_session(Some("sess-priced"), None, now);
+        priced.record_codex_wire_session_usage(
+            Some("sess-priced"),
+            Some("gpt-5.1-codex"),
+            1_000_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        priced.record_codex_wire_session(Some("sess-priced"), None, now);
+        let partial = row(&priced, "sess-priced");
+        assert!(
+            (partial.cost_usd - 1.25).abs() < 1e-9,
+            "the priced turn keeps its $1.25: {}",
+            partial.cost_usd
+        );
+        assert_eq!((partial.requests, partial.unpriced_requests), (2, 1));
+        assert!(
+            tcrbar_draws_dollars(&partial),
+            "a partly priced session keeps its dollars"
+        );
     }
 
     /// The producer proof for the canonical Codex session: the row TcrBar's decoder and the
