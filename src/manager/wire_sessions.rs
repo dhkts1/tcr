@@ -170,9 +170,9 @@ impl Manager {
 
     /// Add a Codex response's usage to its wire session. The arguments are the same
     /// [`crate::usage::UsageRecord`] fields [`Self::record_wire_session_usage`] takes, plus the
-    /// turn's reasoning tokens, so the account ledger and the session never disagree about
-    /// what a response carried. Unlike its Claude twin it stamps no Anthropic cache TTL, and
-    /// the usage's model names the session — see
+    /// turn's reasoning tokens and the record's own stamp (`ts_ms`), so the account ledger and
+    /// the session never disagree about what a response carried, or when. Unlike its Claude
+    /// twin it stamps no Anthropic cache TTL, and the usage's model names the session — see
     /// [`crate::session_wire::WireSessionTracker::record_codex_usage`].
     #[allow(clippy::too_many_arguments)]
     pub fn record_codex_wire_session_usage(
@@ -185,6 +185,7 @@ impl Manager {
         cache_read_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
+        ts_ms: i64,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -202,6 +203,7 @@ impl Manager {
             cache_read_tokens,
             output_tokens,
             reasoning_tokens,
+            ts_ms,
         );
         drop(tracker);
         self.mark_wire_sessions_dirty();
@@ -931,6 +933,7 @@ mod tests {
                 0,
                 10,
                 2,
+                odt_to_ms(now),
             );
         }
         manager.record_wire_session(
@@ -986,6 +989,7 @@ mod tests {
                 0,
                 0,
                 0,
+                odt_to_ms(now),
             );
         }
         let row = priced.snapshot(now).wire_sessions.remove(0);
@@ -1045,6 +1049,7 @@ mod tests {
             0,
             10,
             0,
+            odt_to_ms(now),
         );
         manager.record_codex_wire_session(Some("sess-streaming"), None, now);
         let second = row(&manager, "sess-streaming");
@@ -1068,6 +1073,7 @@ mod tests {
             0,
             0,
             0,
+            odt_to_ms(now),
         );
         priced.record_codex_wire_session(Some("sess-priced"), None, now);
         let partial = row(&priced, "sess-priced");
@@ -1198,6 +1204,7 @@ mod tests {
                 cache_read,
                 output,
                 reasoning,
+                requested,
             );
         }
         let row = manager

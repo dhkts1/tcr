@@ -1599,7 +1599,10 @@ window survives a restart too. Fleet-wide totals are not a field — sum the row
 
 Reachable via the raw `/_tcr/status` endpoint, not the CLI's own array output: one entry per Claude
 Code or Codex session seen in the last hour, each carrying its tool-call stats (`tools.running`, the
-pending calls; `tools.slowest`, the ten slowest completed ones). `tools.running` entries for an
+pending calls; `tools.slowest`, the ten slowest completed ones). A session leaves the list an hour
+after its last request. A Codex session stays until its last usage, recorded when that turn's
+stream ended, has also left the Codex rows' `usage.lastHour`, at most two minutes past the hour
+after the stream's end, so while `lastHour` still counts a session's turn, the session is listed. `tools.running` entries for an
 `Agent` or `Task` tool call carry the subagent's description in `commandHead` (prefixed with its
 type when Claude Code sent one), and `tools.subagentsRunning` is that count precomputed, so a panel
 can show "2 subagents" without scanning the list itself.

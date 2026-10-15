@@ -1877,6 +1877,35 @@ pub struct WireSession {
     /// reasoning, already counted inside it. 0 on every Anthropic session.
     #[serde(default)]
     pub reasoning_tokens: u64,
+    /// When a Codex session's latest usage was recorded: the stamp of the usage record its
+    /// last finished turn produced, which lands when the stream ends, after `last_seen_ms`
+    /// was set by the turn's response headers. `None` on every Anthropic session, and on a
+    /// Codex session before its first usage; skipped when `None`, so a Claude-only fleet's
+    /// file keeps its shape. See [`WireSession::is_live_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage_ms: Option<i64>,
+}
+
+impl WireSession {
+    /// Whether this session is still live at `now_ms`, for a table that drops a session
+    /// `ttl_ms` after its last request: within `ttl_ms` of `last_seen_ms`, or, for a session
+    /// whose last usage was recorded later, until that usage has left a trailing `ttl_ms`
+    /// window counted by whole minutes, plus one minute.
+    ///
+    /// Why the usage: a Codex request is counted when its response's headers arrive, and its
+    /// usage only when the stream ends. The accounts' `usage.lastHour` counts that usage, and
+    /// keeps its whole minute (`usage::range`), so on the request's clock alone a Codex row
+    /// reports requests in the last hour for up to the stream's length plus a minute after its
+    /// session left the list. TcrBar reads exactly that as a proxy too old to record Codex
+    /// sessions. The extra minute is slack for the accounts and the sessions being read in two
+    /// calls. A session with no usage time, every Claude session, is dropped by its last request
+    /// alone, as before.
+    pub fn is_live_at(&self, now_ms: i64, ttl_ms: i64) -> bool {
+        now_ms.saturating_sub(self.last_seen_ms) <= ttl_ms
+            || self.last_usage_ms.is_some_and(|usage_ms| {
+                now_ms < (usage_ms.div_euclid(60_000) + 2) * 60_000 + ttl_ms
+            })
+    }
 }
 
 /// Tools whose `tool_use` block is the LAST content block of a turn, so the client never sends
@@ -2202,11 +2231,13 @@ impl WireSessionTracker {
         }
     }
 
-    /// Add one Codex response's usage. It keeps the same totals and per-model tally as
-    /// [`Self::record_usage`], with three differences. It stamps no cache TTL, because the 300 s
-    /// and 3600 s tiers are Anthropic's prompt cache. It keeps the reasoning tokens, which are
-    /// already inside `output`. And the usage's model names the session, because a Codex
-    /// request body is usually zstd, so the request named no model.
+    /// Add one Codex response's usage, recorded at `ts_ms` (its usage record's own stamp). It
+    /// keeps the same totals and per-model tally as [`Self::record_usage`], with four
+    /// differences. It stamps no cache TTL, because the 300 s and 3600 s tiers are Anthropic's
+    /// prompt cache. It keeps the reasoning tokens, which are already inside `output`. The
+    /// usage's model names the session, because a Codex request body is usually zstd, so the
+    /// request named no model. And it keeps `ts_ms` as [`WireSession::last_usage_ms`], which
+    /// keeps the session listed while the usage still counts in the last hour.
     #[allow(clippy::too_many_arguments)]
     pub fn record_codex_usage(
         &mut self,
@@ -2218,6 +2249,7 @@ impl WireSessionTracker {
         cache_read: u64,
         output: u64,
         reasoning: u64,
+        ts_ms: i64,
     ) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             Self::add_usage(
@@ -2227,6 +2259,7 @@ impl WireSessionTracker {
             if let Some(model) = model {
                 entry.model = Some(model.to_string());
             }
+            entry.last_usage_ms = Some(entry.last_usage_ms.map_or(ts_ms, |at| at.max(ts_ms)));
         }
     }
 
@@ -2287,7 +2320,7 @@ impl WireSessionTracker {
 
     fn evict_stale(&mut self, now_ms: i64) {
         self.sessions
-            .retain(|_, s| now_ms.saturating_sub(s.last_seen_ms) <= SESSION_TTL_MS);
+            .retain(|_, s| s.is_live_at(now_ms, SESSION_TTL_MS));
     }
 
     fn evict_over_cap(&mut self) {
@@ -2304,11 +2337,12 @@ impl WireSessionTracker {
     }
 
     /// Every currently-live session, unordered. `now_ms` evicts stale entries first, so a
-    /// session that crossed the one-hour idle line since its last write never surfaces.
+    /// session that crossed the one-hour idle line since its last write never surfaces; a
+    /// Codex session's line is the later one [`WireSession::is_live_at`] gives it.
     pub fn snapshot(&self, now_ms: i64) -> Vec<(String, WireSession)> {
         self.sessions
             .iter()
-            .filter(|(_, s)| now_ms.saturating_sub(s.last_seen_ms) <= SESSION_TTL_MS)
+            .filter(|(_, s)| s.is_live_at(now_ms, SESSION_TTL_MS))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
@@ -3181,6 +3215,7 @@ mod tests {
             2_000,
             40,
             12,
+            1_000,
         );
         tracker.record_request("sess-claude", None, None, 1_000, &[], &[]);
         tracker.record_usage(
@@ -3351,6 +3386,81 @@ mod tests {
             0,
             "one ms past the TTL it is gone"
         );
+    }
+
+    /// A Codex session stays listed while its last usage still counts in the accounts'
+    /// `usage.lastHour`. The session's clock is its last request, counted when the response's
+    /// headers arrive; the usage is recorded when the stream ends, and `lastHour` keeps the
+    /// record's whole minute. So for up to the stream's length plus a minute after the hour, a
+    /// Codex row reported requests in the last hour while no Codex session was listed, which is
+    /// what TcrBar reads as a proxy too old to record Codex sessions, and it told a current
+    /// proxy to restart. Here the request is at T and the stream ends 40 s later; at every
+    /// second around the line, a request `lastHour` counts has its session listed, and both are
+    /// gone two minutes past the hour.
+    ///
+    /// Watched red: on the request's clock alone, the session is gone at T + 1 h + 1 ms while
+    /// `lastHour` still counts its request.
+    #[test]
+    fn a_codex_session_stays_listed_while_its_usage_counts_in_the_last_hour() {
+        const T: i64 = 1_767_225_600_000;
+        let usage_at = T + 40_000;
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_codex_request("sess-codex", Some("bob@example.com/codex".into()), T);
+        tracker.record_codex_usage(
+            "sess-codex",
+            Some("gpt-5.1-codex"),
+            1_000,
+            0,
+            0,
+            0,
+            10,
+            0,
+            usage_at,
+        );
+        let usage = crate::usage::UsageTracker::new(1, crate::pricing::PricingTable::default());
+        usage.record(
+            0,
+            &crate::usage::UsageRecord::from_quota_input(
+                usage_at,
+                Some("gpt-5.1-codex".to_string()),
+                None,
+                1_000,
+                0,
+                0,
+                0,
+                10,
+            ),
+            "bob@example.com/codex",
+            None,
+            None,
+        );
+        let listed = |now: i64| {
+            tracker
+                .snapshot(now)
+                .iter()
+                .any(|(id, _)| id == "sess-codex")
+        };
+        let last_hour = |now: i64| usage.row(0, now, None).last_hour.requests;
+
+        let past_the_request = T + SESSION_TTL_MS + 1;
+        assert_eq!(
+            last_hour(past_the_request),
+            1,
+            "control: the usage still counts in lastHour"
+        );
+        assert!(
+            listed(past_the_request),
+            "the session is listed while lastHour counts its request"
+        );
+        for now in (T + SESSION_TTL_MS - 5_000..=T + SESSION_TTL_MS + 3 * 60_000).step_by(1_000) {
+            assert!(
+                last_hour(now) == 0 || listed(now),
+                "at {now} lastHour counts a Codex request and no Codex session is listed"
+            );
+        }
+        let gone = T + SESSION_TTL_MS + 2 * 60_000;
+        assert_eq!(last_hour(gone), 0);
+        assert!(!listed(gone), "both are gone two minutes past the hour");
     }
 
     /// A restored session comes back with its finished-call facts and an EMPTY running list.

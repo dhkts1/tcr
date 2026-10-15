@@ -4944,6 +4944,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             record.cache_read,
                             record.output,
                             parsed.reasoning,
+                            record.ts_ms,
                         );
                     } else {
                         manager_side.record_wire_session_usage(
@@ -5192,6 +5193,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         record.cache_read,
                         record.output,
                         parsed.reasoning,
+                        record.ts_ms,
                     );
                 } else {
                     manager.record_wire_session_usage(
