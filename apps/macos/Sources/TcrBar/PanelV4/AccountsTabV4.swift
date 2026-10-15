@@ -260,30 +260,17 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     }
 
     /// The name column of a live line outside a group, ONE for the whole panel
-    /// (lead ruling on H1b, 2026-10-14). Measured over the live lines that are
-    /// drawn: a group closed to its summary line has none, and counting its
-    /// members would truncate the names on screen to make room for lines that
-    /// are not.
-    ///
-    /// The signals of the same lines size the column at the right, and what a
-    /// short one leaves goes to the names (lead ruling, 2026-10-14).
+    /// (lead ruling on H1b, 2026-10-14). Measured over every row the tab can
+    /// draw as a line, whatever its band or form and whether or not its group
+    /// is collapsed, with the signal at its widest
+    /// (``AccountLineFit/signalColumn(_:)``). Measured over the lines drawn at
+    /// the moment, as it was until 2026-10-15, the column moved every bar
+    /// whenever an account ran out, a card opened, a group collapsed or a
+    /// status changed length.
     private var liveNameColumn: CGFloat {
-        var loose: [String] = []
-        var grouped: [String]?
-        var signals: [String] = []
-        for section in sections where !isSummarised(section) {
-            for row in section.rows where form(row) == .liveLine {
-                let name = AccountName.localPart(row.account.name)
-                if section.group == .ungrouped {
-                    loose.append(name)
-                } else {
-                    grouped = (grouped ?? []) + [name]
-                }
-                signals.append(row.account.liveSignal(now: now).text)
-            }
-        }
+        let names = AccountLineFit.lineNames(sections)
         return AccountLineFit.nameColumn(
-            looseNames: loose, groupedNames: grouped, signals: signals, bar: V4.lineBarWidth,
+            looseNames: names.loose, groupedNames: names.grouped, bar: V4.lineBarWidth,
             V4.lineRoom, V4.lineMetrics)
     }
 

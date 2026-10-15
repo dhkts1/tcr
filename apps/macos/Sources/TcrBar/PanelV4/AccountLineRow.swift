@@ -31,7 +31,7 @@ struct AccountLineRow<MenuItems: View>: View {
     var snapshotMode: Bool = false
     /// The name column's width: one panel-wide column, less a group's padding
     /// inside a group box, so every bar starts at the same x
-    /// (``AccountLineFit/nameColumn(looseNames:groupedNames:signals:bar:_:_:)``).
+    /// (``AccountLineFit/nameColumn(looseNames:groupedNames:bar:_:_:)``).
     var nameWidth: CGFloat = V4.liveNameWidth
     @ViewBuilder var menu: () -> MenuItems
 
