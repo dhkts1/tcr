@@ -292,4 +292,28 @@ final class PanelHeightTests: XCTestCase {
         XCTAssertEqual(out["new"], 17.5, "no previous value — published on the grid")
         XCTAssertNil(out["gone"], "absent from the measurement — dropped, not held")
     }
+
+    /// Every tab is drawn at the tallest tab's height, so a switch changes
+    /// nothing (Gil, 2026-10-16: "can you make also it to not change the
+    /// height?"). The heights are the 1.2.4 renders' 498 pt on Accounts and
+    /// 411 pt on Sessions, with Tools and Peers below both.
+    func testEveryTabTakesTheTallestTabsHeight() {
+        XCTAssertEqual(PanelHeight.sharedTabHeight([498, 411, 300, 260]), 498)
+        XCTAssertEqual(
+            PanelHeight.sharedTabHeight([411, 498]), PanelHeight.sharedTabHeight([498, 411]),
+            "the selected tab, or the order tabs are drawn in, cannot change the height")
+        XCTAssertEqual(PanelHeight.sharedTabHeight([]), 0, "no tabs, no height")
+    }
+
+    /// The tallest tab, and NOT the cap: four short tabs stay a short panel.
+    /// Pinning every tab at the cap would also hold the height still, and it is
+    /// review finding 11, a two-account fleet drawn 520 pt tall over empty fill.
+    func testShortTabsKeepAShortPanel() {
+        let budget = PanelHeight.panelMaxHeight
+        let tabs = [184, 96, 120, 150].map {
+            PanelHeight.viewportHeight(contentHeight: $0, budget: budget)
+        }
+        XCTAssertEqual(PanelHeight.sharedTabHeight(tabs), 184)
+        XCTAssertLessThan(PanelHeight.sharedTabHeight(tabs), budget)
+    }
 }

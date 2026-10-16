@@ -805,7 +805,7 @@ extension FleetSectionsTests {
         let panel = try viewCode("PanelV4/PanelV4.swift")
         let header = try XCTUnwrap(panel.range(of: squashed("PanelHeader(title:")))
         let tabs = try XCTUnwrap(panel.range(of: squashed("SegmentedTabs(")))
-        let summary = try XCTUnwrap(panel.range(of: squashed("summary()")))
+        let summary = try XCTUnwrap(panel.range(of: squashed("summary(tab)")))
         XCTAssertLessThan(header.lowerBound, tabs.lowerBound, "the tabs moved above the header")
         XCTAssertLessThan(
             tabs.lowerBound, summary.lowerBound,

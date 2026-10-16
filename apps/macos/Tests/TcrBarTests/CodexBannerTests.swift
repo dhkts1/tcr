@@ -332,7 +332,8 @@ final class CodexBannerTests: XCTestCase {
     func testThePanelDrawsTheCodexBannerUnderTheClaudeOne() throws {
         let code = try fleetViewCode()
 
-        let summary = try slice(code, from: "private var v4Summary: some View {", to: "case .sessions:")
+        let summary = try slice(
+            code, from: "private func v4Summary(_ tab: PanelTab) -> some View {", to: "case .sessions:")
         let claude = try XCTUnwrap(
             summary.range(of: squashed("noRequestsBanner(fleet)")),
             "v4Summary no longer draws noRequestsBanner(fleet) — update this test's anchors")
@@ -343,7 +344,8 @@ final class CodexBannerTests: XCTestCase {
             claude.lowerBound, codex.lowerBound, "the Codex line is drawn above the Claude one")
 
         let content = try slice(
-            code, from: "private var v4Content: some View {", to: "private func refreshLentTo()")
+            code, from: "private func v4Content(_ tab: PanelTab) -> some View {",
+            to: "private func refreshLentTo()")
         XCTAssertFalse(
             content.contains(squashed("codexBanner(")),
             "a Codex line is drawn inside the tab's content, under the tab bar")

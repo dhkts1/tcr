@@ -328,6 +328,12 @@ mark rasterises to none — the negative control, without which the first
 assertion passes on a mark that is cyan in both states. Every one of the nine was
 broken on purpose and watched go red.
 
+Assertion 11 clicks each of the panel's four tabs and requires the popover's
+`contentSize` to be the same on all of them, with the strip's own pixels as proof
+that each click selected its tab. The render-side twin is
+`swift apps/macos/scripts/check-tabs-one-height.swift <dir>` over
+`--render-states <dir> --only one-height`.
+
 What it does not cover: the window server's final composite of the menu bar, a
 real mouse click, and anything about a signed bundle. Those are still a human's
 eyes.

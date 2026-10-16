@@ -19,7 +19,7 @@ final class PanelFooterFitTests: XCTestCase {
     func testEverySessionsFooterFitsBesideTheSparklineNote() throws {
         let trailing = try XCTUnwrap(
             firstCapture(
-                of: "if visibleTab == \\.sessions \\{ return \"([^\"]+)\" \\}",
+                of: "if tab == \\.sessions \\{ return \"([^\"]+)\" \\}",
                 in: try panelSource("FleetView.swift")),
             "the Sessions footer's trailing note is no longer a literal in v4FooterTrailing")
         let glyph = try XCTUnwrap(

@@ -39,9 +39,11 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
     /// resolve `PanelDensity.auto` (Gil, 2026-09-13: "make compact the default
     /// please above 4 accounts").
     var accountCount: Int?
-    @ViewBuilder var summary: () -> Summary
-    @ViewBuilder var content: () -> Content
-    @ViewBuilder var footer: () -> Footer
+    /// Each tab's summary block, body and footer. Called for EVERY tab in
+    /// `tabs`, not only the selected one: see ``tabLayers``.
+    @ViewBuilder var summary: (PanelTab) -> Summary
+    @ViewBuilder var content: (PanelTab) -> Content
+    @ViewBuilder var footer: (PanelTab) -> Footer
 
     var body: some View {
         // Before any `V4` token in the tree below is read. A `static var`
@@ -58,9 +60,7 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
             PanelHeader(title: title, freshness: freshness, onSettings: onSettings)
             SegmentedTabs(
                 tabs: tabs, selected: selected, badges: badges, onSelect: onSelect)
-            summary()
-            content()
-            footer()
+            tabLayers
         }
         .padding(.top, V4.panelPaddingTop)
         .padding(.horizontal, V4.panelPaddingSide)
@@ -91,5 +91,76 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
                 .allowsHitTesting(false)
         }
         .clipShape(RoundedRectangle(cornerRadius: V4.panelRadius, style: .continuous))
+    }
+
+    /// Every tab, one over the other, at the tallest one's height, with only
+    /// the selected one visible (Gil, 2026-10-16: "can you make also it to not
+    /// change the height?").
+    ///
+    /// Each tab used to size the panel itself, so a switch resized the popover:
+    /// 498 pt on Accounts and 411 pt on Sessions for one fleet, measured from
+    /// the 1.2.4 renders. Now the height is the tallest tab's own, so nothing
+    /// a switch does can change it. Not the cap: each tab's list is still
+    /// clamped to the budget (`PanelHeight.listBudget`) and no further, so a
+    /// two-account fleet stays a short panel (review finding 11).
+    ///
+    /// Why every tab is drawn rather than each one's height computed: what
+    /// makes a tab tall is its summary lines, its list and its footer, and two
+    /// of those wrap by their own text. Only a layout pass knows them, and a
+    /// tab nobody draws gets no layout pass.
+    ///
+    /// The hidden tabs are drawn at zero opacity, take no clicks, leave the
+    /// accessibility tree and are disabled, so neither the pointer, VoiceOver
+    /// nor the Tab key can reach them. Their identity never changes with the
+    /// selection, so a switch fires no `onAppear`: anything a tab does when it
+    /// is looked at (the Peers tab's read, the Accounts tab's lent-to read)
+    /// keys on `selected` instead.
+    ///
+    /// The footer sits at the bottom of the shared height on every tab, after
+    /// a spacer, so Quit stays where it is too.
+    private var tabLayers: some View {
+        TallestTabLayout {
+            ForEach(tabs, id: \.self) { tab in
+                let shown = tab == selected
+                VStack(alignment: .leading, spacing: 0) {
+                    summary(tab)
+                    content(tab)
+                    Spacer(minLength: 0)
+                    footer(tab)
+                }
+                .opacity(shown ? 1 : 0)
+                .allowsHitTesting(shown)
+                .accessibilityHidden(!shown)
+                .disabled(!shown)
+            }
+        }
+    }
+}
+
+/// Lays every child at the same origin and the same size: the width it is
+/// offered and the tallest child's own height
+/// (``PanelHeight/sharedTabHeight(_:)``).
+///
+/// A `ZStack` sizes to its tallest child too, but it does not hand that height
+/// back to the shorter ones, so their footers would sit at their own height
+/// instead of the panel's bottom. Here each child is measured at its ideal
+/// height and then placed with the shared one, which its spacer fills.
+struct TallestTabLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let ideal = ProposedViewSize(width: proposal.width, height: nil)
+        let sizes = subviews.map { $0.sizeThatFits(ideal) }
+        return CGSize(
+            width: proposal.width ?? sizes.map(\.width).max() ?? 0,
+            height: PanelHeight.sharedTabHeight(sizes.map(\.height)))
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        for subview in subviews {
+            subview.place(
+                at: bounds.origin, anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
+        }
     }
 }

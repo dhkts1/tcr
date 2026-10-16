@@ -189,6 +189,17 @@ struct FleetView: View {
     /// loop with a pass budget rather than a convergence test.
     @State private var v4ContentHeight: CGFloat = 0
 
+    /// The Sessions and Tools lists' content heights, one number each, measured
+    /// and settled exactly as ``v4ContentHeight`` is.
+    ///
+    /// Both tabs used to frame their `ScrollView` at ``visibleRowsHeight(for:)``,
+    /// whose row dictionary nothing in the v4 panel fills, so both sat at the
+    /// whole budget on every fleet: review finding 11 again, on two more tabs.
+    /// That stopped being harmless when the panel took the tallest tab's height
+    /// (`PanelV4`): a list pinned at the cap would have pinned every tab there.
+    @State private var sessionsContentHeight: CGFloat = 0
+    @State private var toolsContentHeight: CGFloat = 0
+
     /// Which row's hover card is showing (option H, unit H2), by
     /// ``FleetSectionRow/id``, because an account in two groups draws two
     /// lines. The card hangs from ``v4Body``, never from the list; see
@@ -557,10 +568,16 @@ struct FleetView: View {
             onSelect: { selectedTab = $0 },
             onSettings: onSettings,
             accountCount: v4AccountCount,
-            summary: { v4Summary },
-            content: { v4Content },
-            footer: { v4Footer }
+            summary: { tab in v4Summary(tab) },
+            content: { tab in v4Content(tab) },
+            footer: { tab in v4Footer(tab) }
         )
+        // Every tab stays drawn under the selected one (`PanelV4`), so a
+        // switch fires no `onAppear`. The lent-to read the Accounts tab makes
+        // on each visit rides the selection instead.
+        .onChange(of: visibleTab) { tab in
+            if tab == .accounts { refreshLentTo() }
+        }
         // At the panel root, so the list's `ScrollView` cannot clip it and,
         // being an overlay, it cannot change the panel's size. See
         // `AccountHoverCard.swift`.
@@ -779,9 +796,9 @@ struct FleetView: View {
     }
 
     @ViewBuilder
-    private var v4Summary: some View {
+    private func v4Summary(_ tab: PanelTab) -> some View {
         if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
-            switch visibleTab {
+            switch tab {
             case .accounts:
                 if let money = SummaryLine.accounts(fleet) { money }
                 accountsProvenanceLine(fleet)
@@ -866,10 +883,10 @@ struct FleetView: View {
     }
 
     @ViewBuilder
-    private var v4Content: some View {
+    private func v4Content(_ tab: PanelTab) -> some View {
         switch poller.state {
         case .loaded(let fleet) where !fleet.accounts.isEmpty:
-            switch visibleTab {
+            switch tab {
             case .accounts:
                 // Over the list and outside its `ScrollView`, so it does not
                 // scroll; the list's own budget is unchanged and the panel
@@ -913,8 +930,12 @@ struct FleetView: View {
                 // One per panel: two would poll `tcr peer ls` twice and could
                 // show two instants of one file, which is the disagreement
                 // `PeersSnapshot`'s own header exists to prevent.
+                // `isActive`: the tab is drawn, hidden, under every other
+                // one (`PanelV4`), so its three-second read starts when it is
+                // selected rather than when it appears.
                 PeersView(
                     controller: peers, snapshotMode: snapshotMode,
+                    isActive: visibleTab == .peers,
                     onOpenSettings: onSettings,
                     // The same act the menu bar item runs, off the same
                     // `Updater` the header's own "Update…" button uses, so the
@@ -961,8 +982,11 @@ struct FleetView: View {
         accountsTabBody(fleet)
             // One read per visit to this tab, for the lent-to lines. The read
             // itself is a detached task inside ``refreshLentTo()``, so a slow
-            // `tcr` cannot hold up this draw.
-            .onAppear { refreshLentTo() }
+            // `tcr` cannot hold up this draw. The tab appears with the panel
+            // whichever tab is selected (`PanelV4` draws all of them), so this
+            // reads only when it is the one on screen; ``v4Body``'s
+            // `onChange(of: visibleTab)` covers a switch to it.
+            .onAppear { if visibleTab == .accounts { refreshLentTo() } }
     }
 
     private func accountsTabBody(_ fleet: Fleet) -> some View {
@@ -1072,14 +1096,14 @@ struct FleetView: View {
 
     /// `.foot` plus everything that has to sit above its rule: the action row,
     /// a login failure, and the not-supervised controls.
-    private var v4Footer: some View {
+    private func v4Footer(_ tab: PanelTab) -> some View {
         PanelFooter(
-            leading: v4FooterLeading,
-            leadingSystemImage: visibleTab == .sessions ? "shippingbox" : nil,
-            trailing: v4FooterTrailing
+            leading: v4FooterLeading(tab),
+            leadingSystemImage: tab == .sessions ? "shippingbox" : nil,
+            trailing: v4FooterTrailing(tab)
         ) {
             VStack(alignment: .leading, spacing: V4.buttonGap) {
-                if visibleTab == .accounts {
+                if tab == .accounts {
                     v4Actions
                 }
                 if let loginError {
@@ -1169,8 +1193,8 @@ struct FleetView: View {
     /// Sessions and Tools name codex once the loaded fleet holds a Codex
     /// account (``SessionsCodexCopy``); before a fleet loads they say what
     /// they always said.
-    private var v4FooterLeading: String {
-        switch visibleTab {
+    private func v4FooterLeading(_ tab: PanelTab) -> String {
+        switch tab {
         case .accounts: return AppBuild.label ?? "TcrBar"
         // Both Claude-only lines, here and in ``SessionsCodexCopy``, are sized
         // to fit beside their trailing fact at 372 pt: the longer "proxy +
@@ -1191,8 +1215,8 @@ struct FleetView: View {
         }
     }
 
-    private var v4FooterTrailing: String? {
-        if visibleTab == .sessions { return "sparkline: req/min, 30m" }
+    private func v4FooterTrailing(_ tab: PanelTab) -> String? {
+        if tab == .sessions { return "sparkline: req/min, 30m" }
         guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
         // With a Codex account the Tools footer's provenance sentence says
         // "request and response bodies · nothing logged", 268.8 pt, and beside
@@ -1200,7 +1224,7 @@ struct FleetView: View {
         // cut to make room for a build id the other tabs still show. The
         // sentence outranks the id (`PanelFooter`'s own rule), so here the id
         // goes.
-        if visibleTab == .tools, fleet.holdsCodex { return nil }
+        if tab == .tools, fleet.holdsCodex { return nil }
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }
 
@@ -1622,16 +1646,17 @@ struct FleetView: View {
 
     // MARK: Tabs (F2 + F3)
     //
-    // Only the Accounts tab measures its own rows (`RowHeightsKey`, above) —
-    // Sessions and Tools deliberately do not. `visibleRowsHeight(for:)` is
-    // driven entirely by `rowHeights`, which the Accounts tab keeps populated
-    // the instant it is on screen (the default tab), so switching to either
-    // new tab reuses that same number as a FIXED height budget rather than
-    // measuring its own content: each tab gets a FIXED height budget through
-    // the same functions, and no tab's height may depend on content it
-    // renders — the
-    // popover's layout-cycle crash (`ffe8a86`) is exactly what a
-    // content-dependent height on a tab switch would risk reopening.
+    // Sessions and Tools used to frame their lists at `visibleRowsHeight(for:)`
+    // as a FIXED budget, so that no tab switch could start a content-dependent
+    // resize: the popover's layout-cycle crash (`ffe8a86`) is what such a
+    // resize would risk reopening. In the v4 panel that budget was the whole
+    // cap, because nothing there fills `rowHeights`.
+    //
+    // Both lists now measure their content once, as the Accounts tab does
+    // (`sessionsContentHeight`, `toolsContentHeight`), and the switch itself
+    // no longer resizes anything: `PanelV4` draws every tab at the tallest
+    // one's height, so a measurement moves the panel only when content
+    // changes, never because a tab was selected.
 
     /// The segmented control at the top of the panel — SF Symbols
     /// `gauge`/`person.2`/`terminal`/`network`, a count badge on the two
@@ -1755,8 +1780,20 @@ struct FleetView: View {
             } else {
                 ScrollView {
                     sessionsTabBody(displayed: displayed, fold: fold, trafficNotice: trafficNotice)
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: V4ContentHeightKey.self, value: proxy.size.height)
+                            }
+                        )
                 }
-                .frame(height: visibleRowsHeight(for: fleet))
+                .frame(
+                    height: PanelHeight.viewportHeight(
+                        contentHeight: sessionsContentHeight, budget: listBudget(for: fleet))
+                )
+                .onPreferenceChange(V4ContentHeightKey.self) {
+                    sessionsContentHeight = PanelHeight.settled(sessionsContentHeight, $0)
+                }
             }
         }
     }
@@ -2148,8 +2185,22 @@ struct FleetView: View {
         } else if snapshotMode {
             toolsList(fleet)
         } else {
-            ScrollView { toolsList(fleet) }
-                .frame(height: visibleRowsHeight(for: fleet))
+            ScrollView {
+                toolsList(fleet)
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: V4ContentHeightKey.self, value: proxy.size.height)
+                        }
+                    )
+            }
+            .frame(
+                height: PanelHeight.viewportHeight(
+                    contentHeight: toolsContentHeight, budget: listBudget(for: fleet))
+            )
+            .onPreferenceChange(V4ContentHeightKey.self) {
+                toolsContentHeight = PanelHeight.settled(toolsContentHeight, $0)
+            }
         }
     }
 
@@ -4446,16 +4497,23 @@ struct PeersView: View {
     /// to the shell that owns the notifier, and `{}` is what the render
     /// harness passes.
     private let onFindingTurnedOn: () -> Void
+    /// Whether this is the selected tab. The v4 panel draws every tab and
+    /// shows one (`PanelV4`), so appearing no longer means being looked at;
+    /// the read starts and stops on this instead. `true` by default, which is
+    /// every caller that draws the tab alone.
+    private let isActive: Bool
 
     init(
         controller: PeerController? = nil,
         snapshotMode: Bool = false,
+        isActive: Bool = true,
         onOpenSettings: @escaping () -> Void = {},
         onCheckForUpdates: (() -> Void)? = nil,
         onFindingTurnedOn: @escaping () -> Void = {}
     ) {
         _controller = StateObject(wrappedValue: controller ?? PeerController())
         self.snapshotMode = snapshotMode
+        self.isActive = isActive
         self.onOpenSettings = onOpenSettings
         self.onCheckForUpdates = onCheckForUpdates
         self.onFindingTurnedOn = onFindingTurnedOn
@@ -4465,6 +4523,7 @@ struct PeersView: View {
         PeersTabV4(
             controller: controller,
             snapshotMode: snapshotMode,
+            isActive: isActive,
             onOpenSettings: onOpenSettings,
             onCheckForUpdates: onCheckForUpdates,
             onFindingTurnedOn: onFindingTurnedOn)
@@ -4538,6 +4597,8 @@ struct SnapshotSwitch: View {
     }
 }
 
+/// A list's whole content height, read by the `onPreferenceChange` on its own
+/// `ScrollView`: the Accounts, Sessions and Tools lists each publish one.
 struct V4ContentHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {

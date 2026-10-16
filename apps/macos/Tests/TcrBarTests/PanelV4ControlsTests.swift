@@ -194,14 +194,14 @@ final class PanelV4ControlsTests: XCTestCase {
     // moves to Settings
 
     /// App state, not tab state: `v4FooterAwakeQuit` sits directly after the
-    /// not-supervised line, outside the `if visibleTab == .accounts` block that
+    /// not-supervised line, outside the `if tab == .accounts` block that
     /// gates `v4Actions` — so it draws on Accounts, Sessions and Tools alike.
     func testTheFooterDrawsKeepAwakeAndQuitOnEveryTab() throws {
         let source = try panelSource("FleetView.swift")
         // Whitespace-stripped so the assertion survives re-indentation: what it
         // actually checks is ADJACENCY — `v4FooterAwakeQuit` sits right after
         // the not-supervised block's closing brace, not inside the
-        // `if visibleTab == .accounts` block that gates `v4Actions` above it.
+        // `if tab == .accounts` block that gates `v4Actions` above it.
         let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
         XCTAssertTrue(
             squashed.contains(

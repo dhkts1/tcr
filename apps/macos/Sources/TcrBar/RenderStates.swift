@@ -376,6 +376,15 @@ enum RenderStates {
             // alice's calm Bash ring and its ✕, `no Kill` in bob's slot, and the
             // Codex categories in BY TOOL. See ``toolsTabCodexFleet``.
             ("17c-tools-tab-codex", .loaded(toolsTabCodexFleet), false, nil),
+            // One fleet on every tab, so `scripts/check-tabs-one-height.swift`
+            // can hold the four to one height and a still strip (Gil,
+            // 2026-10-16: "can you make also it to not change the height?").
+            // `sessionsTabFleet` because it fills all four: accounts, live
+            // sessions, running tools.
+            ("27-one-height-accounts", .loaded(sessionsTabFleet), false, nil),
+            ("27-one-height-sessions", .loaded(sessionsTabFleet), false, nil),
+            ("27-one-height-tools", .loaded(sessionsTabFleet), false, nil),
+            ("27-one-height-peers", .loaded(sessionsTabFleet), false, nil),
         ]
     }
 
@@ -664,11 +673,15 @@ enum RenderStates {
         case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
             "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed",
             "22b-sessions-tab-real-fleet", "16b-sessions-tab-mixed",
-            "16c-sessions-tab-codex-only-empty", "16d-sessions-tab-old-server-codex":
+            "16c-sessions-tab-codex-only-empty", "16d-sessions-tab-old-server-codex",
+            "27-one-height-sessions":
             return .sessions
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
-            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex":
+            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex",
+            "27-one-height-tools":
             return .tools
+        case "27-one-height-peers":
+            return .peers
         default: return .accounts
         }
     }
@@ -2779,30 +2792,36 @@ enum RenderStates {
                 // does on the Accounts tab and these PNGs are comparable
                 // with those.
                 accountCount: 13,
-                summary: {
-                    SummaryLine(
-                        lines: [
-                            scene.dry
-                                ? [
-                                    .init(text: "13 accounts", tint: Tok.dim),
-                                    .init(text: "none with headroom", tint: Tok.near),
-                                ]
-                                : [
-                                    .init(text: "13 accounts", tint: Tok.dim),
-                                    .init(
-                                        text: "6 with headroom", tint: Tok.ok,
-                                        emphasised: true),
-                                ]
-                        ])
+                // The Peers tab alone: `PanelV4` asks every tab for its
+                // layers, and the other three have nothing to draw here.
+                summary: { tab in
+                    if tab == .peers {
+                        SummaryLine(
+                            lines: [
+                                scene.dry
+                                    ? [
+                                        .init(text: "13 accounts", tint: Tok.dim),
+                                        .init(text: "none with headroom", tint: Tok.near),
+                                    ]
+                                    : [
+                                        .init(text: "13 accounts", tint: Tok.dim),
+                                        .init(
+                                            text: "6 with headroom", tint: Tok.ok,
+                                            emphasised: true),
+                                    ]
+                            ])
+                    }
                 },
-                content: {
-                    PeersTabV4(
-                        controller: PeerController.pinned(
-                            scene.snapshot, refusal: refusal, holdsCodex: holdsCodex),
-                        snapshotMode: true,
-                        refusalDetailsOpen: detailsOpen)
+                content: { tab in
+                    if tab == .peers {
+                        PeersTabV4(
+                            controller: PeerController.pinned(
+                                scene.snapshot, refusal: refusal, holdsCodex: holdsCodex),
+                            snapshotMode: true,
+                            refusalDetailsOpen: detailsOpen)
+                    }
                 },
-                footer: { EmptyView() }
+                footer: { _ in EmptyView() }
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED size, for the reason the fleet scenes give: the
