@@ -271,12 +271,22 @@ final class PoolCapacityTests: XCTestCase {
         XCTAssertEqual(FleetTally.Kind.rejected.phrase(for: .anthropic), "rejected by Anthropic")
         XCTAssertEqual(hal.freeAtMs, 1_767_228_420_000)
 
-        let unnamed = try account(canonicalRow("hal@example.com", ["limitReachedType": NSNull()]))
-        XCTAssertTrue(unnamed.isRefusedHold, "a body-only refusal has no reached-type header")
-        XCTAssertEqual(FleetTally.Kind(account: unnamed), .rejected)
-        XCTAssertFalse(unnamed.isReady)
-        XCTAssertEqual(Fleet(accounts: [unnamed]).readyCount, 0)
-        XCTAssertEqual(PoolCapacity(provider: .codex, accounts: [unnamed], now: Date()).readyCount, 0)
+    }
+
+    /// The server arms the same `hold` gate for a plain 429 burst. Nothing names a limit, so
+    /// the row is held, not refused: its pill and the pool's count read its quota, as a held
+    /// Claude row's do, so a burst does not flap the card between OK and Refused.
+    func testAPlainRateLimitHoldIsNotRefused() throws {
+        let burst = try account(
+            canonicalRow(
+                "hal@example.com",
+                ["limitReachedType": NSNull(), "secondsUntilFree": 17, "sevenDay": 0.3]))
+        XCTAssertEqual(burst.gate, .unknown("hold"))
+        XCTAssertFalse(burst.isRefusedHold)
+        XCTAssertEqual(FleetTally.Kind(account: burst), .ok)
+        XCTAssertFalse(burst.isReady, "a held Codex row takes no request while the hold runs")
+        XCTAssertEqual(Fleet(accounts: [burst]).readyCount, 0)
+        XCTAssertEqual(PoolCapacity(provider: .codex, accounts: [burst], now: Date()).readyCount, 1)
     }
 
     /// A plan that reports no usage window has no figure to carry, so once a probe has run

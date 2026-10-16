@@ -1919,15 +1919,22 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// so no Codex request can reach this account, whatever its quota says.
     public var isUnreachable: Bool { provider == .codex && gate == .unknown("reserved") }
 
-    /// A Codex row held by the server: the `hold` gate. A body-only refusal or
-    /// ordinary rate limit may carry no ``limitReachedType`` header.
+    /// A Codex row the server holds because ChatGPT refused it: the `hold`
+    /// gate while ``limitReachedType`` names the limit.
+    ///
+    /// The `hold` gate alone is not a refusal. The server arms the same gate
+    /// for an ordinary 429 burst, a hold of 15 to 20 s, and that row reads as
+    /// a held Claude row does, never as refused. `tcr`'s own TUI and doctor
+    /// draw the same line on the same field. A refusal that ChatGPT named only
+    /// in the response body carries no ``limitReachedType`` on the wire, so
+    /// it reads as a plain hold too, until the server reports its kind.
     ///
     /// A refused Codex row has two causes, and this is one of them: a usage
     /// refusal. The other is ``isForbiddenHold``, ChatGPT answering 403. Both
     /// read as refused, and only the help sentence tells them apart. Neither
     /// is a quota window running out, which is spent.
     public var isRefusedHold: Bool {
-        provider == .codex && gate == .unknown("hold")
+        provider == .codex && gate == .unknown("hold") && limitReachedType != nil
     }
 
     /// A Codex row the server holds for a short while because ChatGPT
