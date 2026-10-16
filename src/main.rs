@@ -7444,7 +7444,10 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         config
     };
 
-    init_tracing(args.headless);
+    // Held to the end of this function, which is the end of logging: dropped on
+    // every return and on a panic that unwinds through here, and dropping it
+    // drains the queue to disk. `let _ =` would drop it on this line.
+    let file_log = init_tracing(args.headless);
 
     // A misspelled key is kept in the file and has no effect, so say so once
     // at boot. Never fatal: the file is shared with teamclaude and its
@@ -7532,7 +7535,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let handle = match server::serve(options).await? {
         server::ServeOutcome::Started(handle) => handle,
         // A binary may exit; the library returned this as a value.
-        server::ServeOutcome::StoodDown(stand_down) => stand_down_exit(&stand_down),
+        server::ServeOutcome::StoodDown(stand_down) => stand_down_exit(&stand_down, file_log),
     };
     let bound = handle.addr();
 
@@ -7708,7 +7711,11 @@ fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
 /// [`server::serve`] hands the facts back as a [`server::StandDown`] instead.
 /// The wording is a cross-language contract: TcrBar scans this stderr, and
 /// `ServerController.StandDownExit` switches on the code.
-fn stand_down_exit(stand_down: &server::StandDown) -> ! {
+///
+/// Takes the log's owner by value because `std::process::exit` runs no
+/// destructor: whatever is still in the writer's queue is closed onto disk
+/// first, or it is lost.
+fn stand_down_exit(stand_down: &server::StandDown, file_log: Option<tcr::file_log::FileLog>) -> ! {
     // Standing down is cheap and correct, but silent success here would mean
     // `cargo build && tcr` exits 0 with the OLD build still serving — say which
     // build actually holds the port before we go.
@@ -7722,6 +7729,9 @@ fn stand_down_exit(stand_down: &server::StandDown) -> ! {
              process holding :{port} did not respond, so standing down leaves NOTHING serving \
              on it. {recovery}"
         );
+    }
+    if let Some(file_log) = file_log {
+        file_log.close();
     }
     std::process::exit(stand_down_exit_code(
         &stand_down.probe.liveness,
@@ -7930,14 +7940,21 @@ fn open_log_appender(
 /// `file` is an `Option` on purpose: a logging failure must never take the proxy
 /// down, so a log that will not open degrades to stdout-only.
 ///
-/// `RollingFileAppender` is used directly as the writer, never through
-/// `tracing_appender::non_blocking()`. `non_blocking()` returns a `WorkerGuard`
-/// that must live as long as logging should happen — drop it (as this
-/// function's `()` return type would force, if it owned one) and the
-/// background writer thread shuts down with no error and no warning: every
-/// event after that silently stops reaching disk while every gate stays green.
-/// `RollingFileAppender` itself implements `Write`/`MakeWriter` synchronously,
-/// so it needs no guard and no lifetime plumbing.
+/// `file` is the queue of [`tcr::file_log`]'s writer thread, not the appender:
+/// the emitting thread formats its line and queues it, and one thread writes.
+/// The synchronous `Mutex<RollingFileAppender>` this replaced was the proxy's
+/// top frame under load (`docs/performance.md`). The queue comes with a
+/// `WorkerGuard` whose drop silently stops every later line from reaching
+/// disk, so this function never sees it: [`init_tracing`] returns it, wrapped
+/// in a [`tcr::file_log::FileLog`], for `run_server` to hold for the process's
+/// life and close on every way out. That module's doc lists each one.
+///
+/// `stdout_sink` is an `Option` because stdout is skipped when it is the null
+/// device, as TcrBar's is: formatting and writing every line a second time,
+/// under `Stdout`'s own lock, for a sink that discards it was 3 to 7% of the
+/// proxy's samples in the load test. A terminal, a pipe or a file keeps its
+/// copy, written synchronously so a human or a supervisor sees each line when
+/// it happens.
 /// `stdout_ansi` is the caller's decision, made once, because the library's
 /// own default is wrong here: `tracing_subscriber::fmt::Layer::default` turns
 /// colour on whenever `NO_COLOR` is unset and never asks whether the sink is a
@@ -7948,8 +7965,8 @@ fn open_log_appender(
 /// `\e[3mpeer_listen\e[0m\e[2m=\e[0m`.
 fn headless_subscriber<W>(
     filter: tracing_subscriber::EnvFilter,
-    file: Option<tracing_appender::rolling::RollingFileAppender>,
-    stdout_sink: W,
+    file: Option<tracing_appender::non_blocking::NonBlocking>,
+    stdout_sink: Option<W>,
     stdout_ansi: bool,
 ) -> impl tracing::Subscriber + Send + Sync
 where
@@ -7960,55 +7977,77 @@ where
     let file_layer = file.map(|file| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
+            .with_writer(file)
+    });
+    let stdout_layer = stdout_sink.map(|sink| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(stdout_ansi)
+            .with_writer(sink)
     });
     tracing_subscriber::registry()
         .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(stdout_ansi)
-                .with_writer(stdout_sink),
-        )
+        .with(stdout_layer)
         .with(file_layer)
 }
 
 /// Initialise tracing. Headless logs to stdout *and* the durable log file; the
 /// TUI logs only to the file, so events never corrupt the alternate screen.
 /// Either way, a log file that will not open is a warning, never a failure.
-fn init_tracing(headless: bool) {
+///
+/// Returns the owner of the file's writer thread, `None` when no file opened.
+/// The caller holds it for as long as anything should reach the file and
+/// closes it before any exit that runs no destructor: dropping it early stops
+/// every later line from reaching disk, silently (see [`tcr::file_log`]).
+/// The TUI writes through the same queue for the same reason as headless: its
+/// file was behind the same lock, on the same tokio workers.
+fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
     use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (log_dir, log_prefix) = log_location();
-    let file = match open_log_appender(&log_dir, log_prefix) {
-        Ok(file) => Some(file),
+    let (queue, file_log) = match open_log_appender(&log_dir, log_prefix) {
+        Ok(file) => {
+            let (queue, file_log) = tcr::file_log::start(file);
+            // Before the subscriber exists, so no line is ever queued that a
+            // panic would leave behind.
+            tcr::file_log::install_panic_flush(file_log.flusher());
+            (Some(queue), Some(file_log))
+        }
         Err(err) => {
             eprintln!(
                 "[tcr] could not open log directory {}: {err}",
                 log_dir.display()
             );
-            None
+            (None, None)
         }
     };
     if headless {
+        let stdout = std::io::stdout();
+        // A null-device stdout discards every line, so it gets no layer. With no
+        // log file it keeps one anyway: a proxy logging nowhere at all should
+        // fail where a test of stdout can see it.
+        let stdout_sink = (queue.is_none()
+            || !tcr::file_log::is_null_device(std::os::fd::AsFd::as_fd(&stdout)))
+        .then_some(std::io::stdout);
         // Colour only for a human at a terminal. Piped or redirected stdout is
         // something a program or a test will read back, and `NO_COLOR` is still
         // honoured on top: see `headless_subscriber`.
-        let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout())
+        let ansi = std::io::IsTerminal::is_terminal(&stdout)
             && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
-        headless_subscriber(filter, file, std::io::stdout, ansi).init();
-        return;
+        headless_subscriber(filter, queue, stdout_sink, ansi).init();
+        return file_log;
     }
     // No file? Already warned above. The TUI cannot fall back to stdout without
     // corrupting the alternate screen, so it runs without tracing rather than
     // refusing to start.
-    if let Some(file) = file {
+    if let Some(queue) = queue {
         tracing_subscriber::fmt()
             .with_ansi(false)
             .with_env_filter(filter)
-            .with_writer(std::sync::Mutex::new(file))
+            .with_writer(queue)
             .init();
     }
+    file_log
 }
 
 #[cfg(test)]
@@ -9829,18 +9868,25 @@ mod tests {
         let dir = unique_log_dir("headless-test");
         let prefix = tcr::paths::LOG_PREFIX;
         let appender = open_log_appender(&dir, prefix).expect("open temp log dir");
+        let (queue, file_log) = tcr::file_log::start(appender);
         let stdout = SharedBuf::default();
         let marker = format!("headless-sink-probe-{}", std::process::id());
 
         let subscriber = headless_subscriber(
             tracing_subscriber::EnvFilter::new("info"),
-            Some(appender),
-            stdout.clone(),
+            Some(queue),
+            Some(stdout.clone()),
             false,
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("{marker}");
         });
+        // The writer is still running: sync, not close, so this proves the line
+        // reached disk while logging continues.
+        assert!(
+            file_log.sync(std::time::Duration::from_secs(10)),
+            "the log writer never reached the barrier"
+        );
 
         let on_disk = read_the_one_log_file(&dir, prefix);
         std::fs::remove_dir_all(&dir).ok();
@@ -9875,7 +9921,7 @@ mod tests {
         let subscriber = headless_subscriber(
             tracing_subscriber::EnvFilter::new("info"),
             None,
-            plain.clone(),
+            Some(plain.clone()),
             false,
         );
         tracing::subscriber::with_default(subscriber, || {
@@ -9898,7 +9944,7 @@ mod tests {
         let subscriber = headless_subscriber(
             tracing_subscriber::EnvFilter::new("info"),
             None,
-            coloured.clone(),
+            Some(coloured.clone()),
             true,
         );
         tracing::subscriber::with_default(subscriber, || {
@@ -9920,7 +9966,7 @@ mod tests {
         let subscriber = headless_subscriber(
             tracing_subscriber::EnvFilter::new("info"),
             None,
-            stdout.clone(),
+            Some(stdout.clone()),
             false,
         );
         tracing::subscriber::with_default(subscriber, || {
