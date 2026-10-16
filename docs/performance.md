@@ -279,6 +279,49 @@ lines after the proxy has stopped and drained. Without that, the after runs abov
 `request usage` line per served request on both, at 0.28 (after) and 0.34 (before) CPU seconds
 per 1,000.
 
+## The bound-token map and the usage buckets
+
+With the log's locks gone, the lock waits left in `overhead` were the bound-token map's one
+mutex (`Manager::record_bound_tokens`, `Manager::bound_token_account`) and the usage tracker's
+(`UsageTracker::record`, which took a mutex over the ledger handle and one over every account's
+buckets). Since `perf/fewer-locks`:
+
+- the map is 16 parts by token hash, each with its own mutex and a sixteenth of the cap
+  (`ShardedBoundTokens` in `src/manager/bound_tokens.rs`, whose doc says what that changes in
+  eviction order and why a `DashMap` lost);
+- the usage buckets have a mutex per account, and the ledger handle a read-write lock;
+- the ledger's writer thread waits 2 ms before it blocks on an empty queue. Without that, the
+  request threads, no longer queued behind the handle's mutex, met at the channel's own waker
+  mutex instead (`SyncWaker::notify`, up to 5% of samples in a run without it).
+
+The account-choice locks under `Manager` (affinity pins, group selection, the session wire) are
+untouched: they keep a conversation on one account, which is what keeps its cache warm.
+
+Three `overhead` runs each side, alternating before and after, on 2026-10-16. Before is `ec199f65`
+(main), after is the branch rebased on it. The lock columns count samples whose leaf is a mutex
+wait, by the deepest `tcr` frame above it, out of all samples.
+
+| run | load 1m at start | served | CPU s / 1k req | added ms p99 | any lock wait | map | usage record | std channel notify |
+|---|---|---|---|---|---|---|---|---|
+| before 1 | 75 | 74,193 | 0.24 | 30.3 | 16.3% | 62 | 32 | 0 |
+| before 2 | 64 | 25,982 | 0.26 | 122.3 | 20.5% | 139 | 94 | 2 |
+| before 3 | 78 | 26,607 | 0.26 | 137.5 | 21.9% | 207 | 25 | 1 |
+| after 1 | 69 | 47,436 | 0.23 | 40.7 | 3.9% | 1 | 0 | 0 |
+| after 2 | 64 | 27,805 | 0.25 | 77.9 | 10.9% | 35 | 1 | 1 |
+| after 3 | 86 | 71,350 | 0.24 | 33.1 | 6.5% | 20 | 0 | 0 |
+
+- **Lock wait fell from 16 to 22% of samples to 4 to 11%.** The map's waits went from 62 to 207
+  samples a run to 1 to 35, and the usage tracker's from 25 to 94 to at most 1.
+- **CPU per 1,000 requests moved from a median of 0.26 to 0.24**, with the ranges touching (0.24
+  to 0.26 before, 0.23 to 0.25 after), so this is a small gain at best on a machine at load 64
+  to 86.
+- **Added p99 cannot be read from these runs**: it spread from 30 to 138 ms before and 33 to
+  78 ms after.
+- What waits now is mostly the account-choice locks left alone above, the map's own parts
+  (`ShardedBoundTokens::shard`, 20 to 35 samples in two runs), and the log queue's waker
+  (`crossbeam_channel::waker::SyncWaker::notify`, up to 33 samples), the same pattern the usage
+  ledger had.
+
 ## Toward a CI gate
 
 What three runs on a loaded machine support:

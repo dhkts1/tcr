@@ -117,8 +117,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tcr_status_wire::{UsageRow, UsageTotals, UsageWindow};
@@ -146,6 +146,11 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// traffic — enough to ride out a slow `write`, small enough that a writer stuck
 /// for good costs bounded memory.
 const LEDGER_QUEUE_DEPTH: usize = 4096;
+/// How long the ledger writer waits, once its queue is empty, before it blocks
+/// on the next line (see `ledger_writer`). A line reaches the file up to this
+/// much later; at the fleet's peak of a few dozen requests a second that is well
+/// under one line queued, against [`LEDGER_QUEUE_DEPTH`].
+const LEDGER_LINGER: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// The floor on what the writer JOIN gets in [`UsageTracker::shutdown_ledger`],
 /// measured from the moment the channel closes.
@@ -379,11 +384,31 @@ impl Default for AccountUsage {
 ///
 /// One function rather than one copy per caller, so recording and reading a row
 /// cannot drift apart on what an out-of-range index means.
-fn ensure_account(accounts: &mut Vec<AccountUsage>, idx: usize) -> Option<&mut AccountUsage> {
-    if idx >= accounts.len() {
-        accounts.resize_with(idx + 1, AccountUsage::default);
+///
+/// Runs `f` under that account's own lock, with the list's read lock held, so
+/// a request on another account neither waits for it nor is waited on. The
+/// list's write lock is taken only when `idx` is past its end.
+fn with_account<R>(
+    accounts: &RwLock<Vec<Mutex<AccountUsage>>>,
+    idx: usize,
+    f: impl FnOnce(&mut AccountUsage) -> R,
+) -> R {
+    {
+        let list = accounts.read().expect("usage list lock poisoned");
+        if let Some(account) = list.get(idx) {
+            return f(&mut account.lock().expect("usage lock poisoned"));
+        }
     }
-    accounts.get_mut(idx)
+    let mut list = accounts.write().expect("usage list lock poisoned");
+    if idx >= list.len() {
+        list.resize_with(idx + 1, Mutex::default);
+    }
+    let account = list
+        .get_mut(idx)
+        .expect("the list was just grown past idx")
+        .get_mut()
+        .expect("usage lock poisoned");
+    f(account)
 }
 
 fn add_into(map: &mut BTreeMap<String, Totals>, model: &str, totals: &Totals) {
@@ -804,8 +829,27 @@ impl Ledger {
 /// dropping the handle after a flush and then joining this thread, so the last
 /// line served is on disk; a tracker dropped in a test ends it the same way,
 /// with nobody waiting.
+///
+/// When the queue runs empty it waits [`LEDGER_LINGER`] before it blocks.
+/// A blocked receiver makes every send take the channel's waker mutex to wake
+/// it, and senders are the request path. Once the ledger handle's own lock
+/// stopped putting senders in single file, that waker mutex became the proxy's
+/// busiest lock under load (2026-10-16 profile: up to 111 of 2,219 samples in
+/// `SyncWaker::notify`). Under traffic the linger leaves lines waiting, so the
+/// next receive takes one without blocking and no send has a sleeper to wake.
 fn ledger_writer(rx: Receiver<LedgerMsg>, mut ledger: Ledger) {
-    while let Ok(msg) = rx.recv() {
+    loop {
+        let msg = match rx.try_recv() {
+            Ok(msg) => msg,
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => {
+                std::thread::sleep(LEDGER_LINGER);
+                match rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => return,
+                }
+            }
+        };
         match msg {
             LedgerMsg::Line(line) => ledger.append(&line),
             LedgerMsg::Flush(ack) => {
@@ -903,15 +947,27 @@ pub struct LedgerAccount {
 
 /// Per-account usage buckets, the pricing table, and the ledger.
 ///
-/// One of these hangs off `Manager`. Recording takes the buckets lock for an
-/// O(1) update; a snapshot takes it for a read. Neither is ever held across the
-/// manager's accounts lock — `Manager::record_usage` updates the counters,
-/// releases that lock, and only then records here.
+/// One of these hangs off `Manager`. Recording takes the serving account's own
+/// buckets lock for an O(1) update; a snapshot takes the same lock for a read.
+/// Neither is ever held across the manager's accounts lock —
+/// `Manager::record_usage` updates the counters, releases that lock, and only
+/// then records here.
+///
+/// The locks are per account, behind a read lock on the list, because one lock
+/// over every account's buckets made every served request wait on every other
+/// one (2026-10-16: the busiest lock left after the log file's). Two requests
+/// now wait on each other only when one account served both. The buckets are
+/// not plain counters: each is a minute ring, a day and a week split by model,
+/// rolled over by the record's own time, so a record stays one locked update of
+/// one account rather than a set of atomics that could be read half-applied.
+/// The list's write lock is taken only to grow it for an account added at
+/// runtime. The ledger handle is behind a read-write lock for the same reason:
+/// every record reads it, and only attaching and shutting down write it.
 #[derive(Debug)]
 pub struct UsageTracker {
-    accounts: Mutex<Vec<AccountUsage>>,
+    accounts: RwLock<Vec<Mutex<AccountUsage>>>,
     pricing: PricingTable,
-    ledger: Mutex<Option<LedgerHandle>>,
+    ledger: RwLock<Option<LedgerHandle>>,
     /// The writer thread, kept so shutdown can JOIN it. Dropping this handle
     /// instead detaches the thread, and a detached writer holding an open file
     /// is exactly how a queued line goes missing at exit.
@@ -932,11 +988,11 @@ pub struct UsageTracker {
 impl UsageTracker {
     pub fn new(account_count: usize, pricing: PricingTable) -> Self {
         let mut accounts = Vec::with_capacity(account_count);
-        accounts.resize_with(account_count, AccountUsage::default);
+        accounts.resize_with(account_count, Mutex::default);
         Self {
-            accounts: Mutex::new(accounts),
+            accounts: RwLock::new(accounts),
             pricing,
-            ledger: Mutex::new(None),
+            ledger: RwLock::new(None),
             writer: Mutex::new(None),
             attached: AtomicBool::new(false),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -1005,7 +1061,7 @@ impl UsageTracker {
     pub fn flush_ledger_within(&self, budget: std::time::Duration) -> bool {
         let tx = self
             .ledger
-            .lock()
+            .read()
             .expect("ledger lock poisoned")
             .as_ref()
             .map(|handle| handle.tx.clone());
@@ -1038,7 +1094,7 @@ impl UsageTracker {
     pub fn shutdown_ledger(&self, budget: std::time::Duration) -> LedgerShutdown {
         let flush_deadline = std::time::Instant::now() + budget;
         self.attached.store(false, Ordering::Relaxed);
-        let Some(handle) = self.ledger.lock().expect("ledger lock poisoned").take() else {
+        let Some(handle) = self.ledger.write().expect("ledger lock poisoned").take() else {
             return LedgerShutdown::NotAttached;
         };
         let flushed = handle.flush_within(flush_deadline);
@@ -1088,7 +1144,7 @@ impl UsageTracker {
     pub(crate) fn wedge_writer_for_test(&self) -> Receiver<()> {
         let (ack_tx, ack_rx) = sync_channel::<()>(0);
         self.ledger
-            .lock()
+            .read()
             .expect("ledger lock poisoned")
             .as_ref()
             .expect("a ledger is attached")
@@ -1138,62 +1194,59 @@ impl UsageTracker {
         let minute = record.ts_ms.div_euclid(60_000);
         let day = local_day(record.ts_ms);
 
-        let mut accounts = self.accounts.lock().expect("usage lock poisoned");
-        let Some(account) = ensure_account(&mut accounts, idx) else {
-            return;
-        };
-
-        // The ring. A slot holding a NEWER minute than this record's is not
-        // ours to clear — that happens when a replayed line is older than the
-        // six hours the ring covers, or when two records land out of order.
-        // Dropping the record from the ring is right there: it is genuinely
-        // outside every window the ring answers for. The day accumulator below
-        // still takes it.
-        let slot = minute.rem_euclid(RING_MINUTES) as usize;
-        if let Some(bucket) = account.ring.get_mut(slot) {
-            match bucket.minute {
-                Some(held) if held > minute => {}
-                Some(held) if held == minute => add_into(&mut bucket.models, &model, &totals),
-                _ => {
-                    bucket.minute = Some(minute);
-                    bucket.models.clear();
-                    add_into(&mut bucket.models, &model, &totals);
-                }
-            }
-        }
-
-        // The day. A record for a LATER day than the one held rolls the
-        // accumulator over; a record for an EARLIER day (replaying yesterday's
-        // file after today's, or a clock step) is not today's traffic and must
-        // not be added to it.
-        match account.day {
-            Some(held) if held == day => add_into(&mut account.today, &model, &totals),
-            Some(held) if held > day => {}
-            _ => {
-                account.day = Some(day);
-                account.today.clear();
-                add_into(&mut account.today, &model, &totals);
-            }
-        }
-
-        // The week, for a Codex record only. Pruned here, against the newest minute held, so it
-        // never holds more than a week.
-        match record.provider {
-            Provider::Anthropic => {}
-            Provider::Codex => {
-                account.week.entry(minute).or_default().add(&totals);
-                let newest = account
-                    .week
-                    .last_key_value()
-                    .map_or(minute, |(&held, _)| held);
-                while let Some(oldest) = account.week.first_entry() {
-                    if *oldest.key() >= newest - WEEK_MINUTES {
-                        break;
+        with_account(&self.accounts, idx, |account| {
+            // The ring. A slot holding a NEWER minute than this record's is not
+            // ours to clear — that happens when a replayed line is older than the
+            // six hours the ring covers, or when two records land out of order.
+            // Dropping the record from the ring is right there: it is genuinely
+            // outside every window the ring answers for. The day accumulator below
+            // still takes it.
+            let slot = minute.rem_euclid(RING_MINUTES) as usize;
+            if let Some(bucket) = account.ring.get_mut(slot) {
+                match bucket.minute {
+                    Some(held) if held > minute => {}
+                    Some(held) if held == minute => add_into(&mut bucket.models, &model, &totals),
+                    _ => {
+                        bucket.minute = Some(minute);
+                        bucket.models.clear();
+                        add_into(&mut bucket.models, &model, &totals);
                     }
-                    oldest.remove();
                 }
             }
-        }
+
+            // The day. A record for a LATER day than the one held rolls the
+            // accumulator over; a record for an EARLIER day (replaying yesterday's
+            // file after today's, or a clock step) is not today's traffic and must
+            // not be added to it.
+            match account.day {
+                Some(held) if held == day => add_into(&mut account.today, &model, &totals),
+                Some(held) if held > day => {}
+                _ => {
+                    account.day = Some(day);
+                    account.today.clear();
+                    add_into(&mut account.today, &model, &totals);
+                }
+            }
+
+            // The week, for a Codex record only. Pruned here, against the newest minute held, so it
+            // never holds more than a week.
+            match record.provider {
+                Provider::Anthropic => {}
+                Provider::Codex => {
+                    account.week.entry(minute).or_default().add(&totals);
+                    let newest = account
+                        .week
+                        .last_key_value()
+                        .map_or(minute, |(&held, _)| held);
+                    while let Some(oldest) = account.week.first_entry() {
+                        if *oldest.key() >= newest - WEEK_MINUTES {
+                            break;
+                        }
+                        oldest.remove();
+                    }
+                }
+            }
+        });
     }
 
     /// Record one served request: queue the ledger line, update the buckets.
@@ -1232,7 +1285,7 @@ impl UsageTracker {
                 o: record.output,
                 rt: record.reasoning,
             };
-            if let Some(ledger) = self.ledger.lock().expect("ledger lock poisoned").as_ref() {
+            if let Some(ledger) = self.ledger.read().expect("ledger lock poisoned").as_ref() {
                 ledger.queue(line);
             }
         }
@@ -1302,7 +1355,7 @@ impl UsageTracker {
             // so the file is closed before the process exits.
             Ok(handle) => {
                 *self.writer.lock().expect("writer lock poisoned") = Some(handle);
-                *self.ledger.lock().expect("ledger lock poisoned") = Some(LedgerHandle {
+                *self.ledger.write().expect("ledger lock poisoned") = Some(LedgerHandle {
                     tx,
                     dropped: Arc::clone(&self.dropped),
                     dropping: Arc::clone(&self.dropping),
@@ -1367,47 +1420,45 @@ impl UsageTracker {
     /// guessed span. The row never names the weekly window:
     /// [`Self::seven_day_window`] answers for that, and only Codex records reach it.
     pub fn row(&self, idx: usize, now_ms: i64, five_hour_reset_ms: Option<i64>) -> UsageRow {
-        let mut accounts = self.accounts.lock().expect("usage lock poisoned");
-        let Some(account) = ensure_account(&mut accounts, idx) else {
-            return UsageRow::default();
-        };
         let day = local_day(now_ms);
-        // A day accumulator holding some OTHER day is not today's traffic. It
-        // reads as an empty day, which is the truth after midnight on an idle
-        // proxy — not as yesterday's total wearing today's label.
-        let today_current = account.day == Some(day);
-        let today_by_model: BTreeMap<String, UsageTotals> = if today_current {
-            account
-                .today
-                .iter()
-                .map(|(model, t)| (model.clone(), t.to_wire()))
-                .collect()
-        } else {
-            BTreeMap::new()
-        };
-        // An empty day goes through `to_wire` like every other bucket, so it
-        // reports `costUsd: 0.0` — the same measured zero `lastHour` reports
-        // for the same idle account. `UsageTotals::default()` would say `null`,
-        // and `null` means "could not be priced", not "served nothing".
-        let today = if today_current {
-            sum(&account.today).to_wire()
-        } else {
-            Totals::default().to_wire()
-        };
-        let window = five_hour_reset_ms.map(|reset| {
-            let since = reset - FIVE_HOURS_MS;
-            UsageWindow {
-                since,
-                totals: range(account, since, now_ms).to_wire(),
+        with_account(&self.accounts, idx, |account| {
+            // A day accumulator holding some OTHER day is not today's traffic. It
+            // reads as an empty day, which is the truth after midnight on an idle
+            // proxy — not as yesterday's total wearing today's label.
+            let today_current = account.day == Some(day);
+            let today_by_model: BTreeMap<String, UsageTotals> = if today_current {
+                account
+                    .today
+                    .iter()
+                    .map(|(model, t)| (model.clone(), t.to_wire()))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            // An empty day goes through `to_wire` like every other bucket, so it
+            // reports `costUsd: 0.0` — the same measured zero `lastHour` reports
+            // for the same idle account. `UsageTotals::default()` would say `null`,
+            // and `null` means "could not be priced", not "served nothing".
+            let today = if today_current {
+                sum(&account.today).to_wire()
+            } else {
+                Totals::default().to_wire()
+            };
+            let window = five_hour_reset_ms.map(|reset| {
+                let since = reset - FIVE_HOURS_MS;
+                UsageWindow {
+                    since,
+                    totals: range(account, since, now_ms).to_wire(),
+                }
+            });
+            UsageRow {
+                today,
+                window,
+                last_hour: range(account, now_ms - ONE_HOUR_MS, now_ms).to_wire(),
+                today_by_model,
+                seven_day_window: None,
             }
-        });
-        UsageRow {
-            today,
-            window,
-            last_hour: range(account, now_ms - ONE_HOUR_MS, now_ms).to_wire(),
-            today_by_model,
-            seven_day_window: None,
-        }
+        })
     }
 
     /// What account `idx` spent in a weekly window that opened `length_ms` before `reset_ms`:
@@ -1426,15 +1477,15 @@ impl UsageTracker {
         if since < now_ms - WEEK_MS {
             return None;
         }
-        let mut accounts = self.accounts.lock().expect("usage lock poisoned");
-        let account = ensure_account(&mut accounts, idx)?;
         let (from, to) = (since.div_euclid(60_000), now_ms.div_euclid(60_000));
         let mut totals = Totals::default();
         // A window that has not opened yet sums nothing, and `range` must not see from > to.
         if from <= to {
-            for (_, minute_totals) in account.week.range(from..=to) {
-                totals.add(minute_totals);
-            }
+            with_account(&self.accounts, idx, |account| {
+                for (_, minute_totals) in account.week.range(from..=to) {
+                    totals.add(minute_totals);
+                }
+            });
         }
         Some(UsageWindow {
             since,
@@ -2351,7 +2402,7 @@ mod tests {
         let (ack_tx, _ack_rx) = sync_channel::<()>(0);
         tracker
             .ledger
-            .lock()
+            .read()
             .expect("ledger lock poisoned")
             .as_ref()
             .expect("a ledger is attached")
@@ -3350,5 +3401,78 @@ mod tests {
         assert_eq!(rec.input, 10, "base input is the remainder");
         assert_eq!(rec.input_total(), 100);
         assert_eq!(rec.cache_creation(), 50);
+    }
+
+    /// Eight threads record at once: four share account 0, and each of the other four has an
+    /// account of its own past the end of a two-account tracker. Those four also record into a
+    /// fresh account every tenth request, so the list keeps growing under all of them. Every
+    /// request lands exactly once: account 0 holds four threads' worth, each own account one
+    /// thread's, each fresh account one request, today and in the last hour alike. A lost update
+    /// (two records reading the same bucket and writing back one) or a grow that drops an
+    /// account another thread just added shows up as a short count.
+    ///
+    /// The grow race needs two grows to overlap, which one pass does not always produce, so the
+    /// scenario runs five times on fresh trackers (a planted shrink was caught in 4 of 6 single
+    /// passes).
+    ///
+    /// The `tsan` CI job runs every test whose name starts `concurrent_lock_stress`.
+    #[test]
+    fn concurrent_lock_stress_usage() {
+        for _ in 0..5 {
+            usage_stress_pass();
+        }
+    }
+
+    fn usage_stress_pass() {
+        const THREADS: usize = 8;
+        const PER_THREAD: u64 = 2_000;
+        const FRESH_EVERY: u64 = 10;
+        let tracker = Arc::new(tracker());
+        let now = crate::now_ms();
+        let account_of = |t: usize| if t.is_multiple_of(2) { 0 } else { t };
+        // A fresh account per (odd thread, tenth request), past every own account.
+        let fresh = |t: usize, i: u64| THREADS + 4 * (i / FRESH_EVERY) as usize + t / 2;
+        let one = move |idx: usize, tracker: &UsageTracker| {
+            tracker.record(
+                idx,
+                &record(now, "claude-opus-4-1", 3),
+                "alice@example.com",
+                None,
+                None,
+            );
+        };
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let tracker = Arc::clone(&tracker);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        one(account_of(t), &tracker);
+                        if !t.is_multiple_of(2) && i.is_multiple_of(FRESH_EVERY) {
+                            one(fresh(t, i), &tracker);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a stress thread panicked");
+        }
+        let shared = tracker.row(0, now, None);
+        assert_eq!(shared.today.requests, 4 * PER_THREAD);
+        assert_eq!(shared.today.input_tokens, 3 * 4 * PER_THREAD);
+        assert_eq!(shared.last_hour.requests, 4 * PER_THREAD);
+        for t in (1..THREADS).step_by(2) {
+            let own = tracker.row(t, now, None);
+            assert_eq!(own.today.requests, PER_THREAD, "account {t}");
+            assert_eq!(own.last_hour.input_tokens, 3 * PER_THREAD, "account {t}");
+            for i in (0..PER_THREAD).step_by(FRESH_EVERY as usize) {
+                let idx = fresh(t, i);
+                assert_eq!(
+                    tracker.row(idx, now, None).today.requests,
+                    1,
+                    "account {idx}"
+                );
+            }
+        }
     }
 }
