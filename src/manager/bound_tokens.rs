@@ -178,6 +178,16 @@ fn shard_of(hash: &str, shards: usize) -> usize {
 /// the newest 90% survives. Total entries never pass [`BOUND_TOKEN_CAP`], because the parts'
 /// caps add up to it. The TTL, too, is pruned per part, so a lookup also refuses an expired
 /// entry itself ([`Self::get`]).
+///
+/// The other design measured was a `DashMap`, which keeps no order, bounded in batches: the
+/// record that took it past the cap copied every mint time out and removed the oldest 1,024. It
+/// evicted in exact order, but that batch is the whole-map pass #497 removed, only spread out:
+/// with one thread recording it cost 7.4 to 22.5 µs a request against 3.0 µs here (three runs of
+/// `bound_token_store_designs`, 2026-10-16, before it was removed with its dependency). Under
+/// 4 to 16 threads the two were within noise of each other. 64 parts beat 16 under 8 or more
+/// threads, but evict further from exact order (the oldest mint kept was 3,876 places early
+/// against 16 parts' 1,393, of 65,536), and every part's share of the newest 90% sits closer to
+/// its cap.
 #[derive(Debug)]
 pub(super) struct ShardedBoundTokens {
     shards: Box<[Mutex<BoundTokenMap>]>,
@@ -274,127 +284,6 @@ impl ShardedBoundTokens {
         out
     }
 }
-
-/// The bound-token map as a [`dashmap::DashMap`], bounded in batches: the other design compared
-/// against [`ShardedBoundTokens`].
-///
-/// A lookup takes one internal shard's read lock and a record its write lock, so neither waits
-/// on the other unless they hit the same shard. A `DashMap` keeps no order, so #497's per-record
-/// eviction cannot pop the oldest entry. Instead the record that takes the map past the cap
-/// prunes a batch: it copies every mint time out, selects the oldest until the map is
-/// [`DASH_EVICT_BATCH`] under the cap, and removes those. That is a pass over the whole map, paid
-/// once per [`DASH_EVICT_BATCH`] records, and the order it evicts in is exact (oldest mint
-/// first, the TTL's first). The pass is behind a `try_lock`, so a record that finds one running
-/// skips it rather than waiting; the map can sit a few entries over the cap meanwhile.
-///
-/// The TTL is no longer pruned on every record, so a lookup filters an expired entry itself.
-#[derive(Debug, Default)]
-#[allow(dead_code)] // only `bound_token_store_designs` drives it
-pub(super) struct DashBoundTokens {
-    by_hash: dashmap::DashMap<Arc<str>, Minted>,
-    len: std::sync::atomic::AtomicUsize,
-    evicting: Mutex<()>,
-}
-
-/// How far under [`BOUND_TOKEN_CAP`] one eviction pass of [`DashBoundTokens`] takes the map.
-#[allow(dead_code)]
-const DASH_EVICT_BATCH: usize = BOUND_TOKEN_CAP / 64;
-
-#[allow(dead_code)]
-impl DashBoundTokens {
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn get(&self, hash: &str) -> Option<Minted> {
-        let minted = *self.by_hash.get(hash)?;
-        (crate::now_ms().saturating_sub(minted.2) <= BOUND_TOKEN_TTL_MS).then_some(minted)
-    }
-
-    fn set(&self, hash: &str, value: Minted) {
-        if self.by_hash.insert(Arc::from(hash), value).is_none() {
-            self.len.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn bound(&self, now_ms: i64) {
-        if self.len.load(Ordering::Relaxed) <= BOUND_TOKEN_CAP {
-            return;
-        }
-        let Ok(_pass) = self.evicting.try_lock() else {
-            return;
-        };
-        let mut all: Vec<(i64, Arc<str>)> = self
-            .by_hash
-            .iter()
-            .map(|entry| (entry.value().2, Arc::clone(entry.key())))
-            .collect();
-        let target = BOUND_TOKEN_CAP - DASH_EVICT_BATCH;
-        let expired = all
-            .iter()
-            .filter(|(minted, _)| now_ms.saturating_sub(*minted) > BOUND_TOKEN_TTL_MS)
-            .count();
-        let drop = all.len().saturating_sub(target).max(expired);
-        if drop == 0 {
-            return;
-        }
-        if drop < all.len() {
-            all.select_nth_unstable(drop - 1);
-        }
-        for (minted, hash) in all.into_iter().take(drop) {
-            if self
-                .by_hash
-                .remove_if(&hash, |_, &(_, _, at)| at == minted)
-                .is_some()
-            {
-                self.len.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub(super) fn record(&self, hash: &str, value: Minted, now_ms: i64) {
-        self.set(hash, value);
-        self.bound(now_ms);
-    }
-
-    pub(super) fn rebind(&self, hash: &str, from: usize, value: Minted, now_ms: i64) -> bool {
-        let moved = match self.by_hash.get_mut(hash) {
-            Some(mut entry) if entry.0 == from => {
-                *entry = value;
-                true
-            }
-            _ => false,
-        };
-        if moved {
-            self.bound(now_ms);
-        }
-        moved
-    }
-
-    pub(super) fn insert_if_absent(&self, hash: &str, value: Minted) {
-        if let dashmap::mapref::entry::Entry::Vacant(slot) = self.by_hash.entry(Arc::from(hash)) {
-            slot.insert(value);
-            self.len.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn insert_unbounded(&self, hash: &str, value: Minted) {
-        self.set(hash, value);
-    }
-
-    pub(super) fn entries(&self) -> Vec<(String, Minted)> {
-        self.by_hash
-            .iter()
-            .map(|entry| (entry.key().to_string(), *entry.value()))
-            .collect()
-    }
-}
-
-/// The store `Manager` holds. Both designs have the same methods, so the comparison swaps them
-/// here.
-pub(super) type BoundTokenStore = ShardedBoundTokens;
 
 impl Manager {
     /// Flag the bound-token map as changed since the last flush — same relaxed-atomic debounce
@@ -1610,43 +1499,13 @@ mod tests {
             .is_some());
     }
 
-    /// The two designs' shared methods, so one bench drives both.
-    trait Store: Send + Sync {
-        fn get(&self, hash: &str) -> Option<Minted>;
-        fn record(&self, hash: &str, value: Minted, now_ms: i64);
-        fn len(&self) -> usize;
-    }
-
-    impl Store for ShardedBoundTokens {
-        fn get(&self, hash: &str) -> Option<Minted> {
-            ShardedBoundTokens::get(self, hash)
-        }
-        fn record(&self, hash: &str, value: Minted, now_ms: i64) {
-            ShardedBoundTokens::record(self, hash, value, now_ms);
-        }
-        fn len(&self) -> usize {
-            ShardedBoundTokens::len(self)
-        }
-    }
-
-    impl Store for DashBoundTokens {
-        fn get(&self, hash: &str) -> Option<Minted> {
-            DashBoundTokens::get(self, hash)
-        }
-        fn record(&self, hash: &str, value: Minted, now_ms: i64) {
-            DashBoundTokens::record(self, hash, value, now_ms);
-        }
-        fn len(&self) -> usize {
-            DashBoundTokens::len(self)
-        }
-    }
-
-    /// The comparison behind the store's design: one lock (the map as it was), 16 locked parts,
-    /// 64 locked parts, and a `DashMap` bounded in batches, each filled to the cap and then
-    /// driven by `threads` threads doing what a proxy request does: look up two tokens, record
-    /// two. Prints the wall time per operation and, per design, the share of the newest
-    /// half-cap mints still held at the end and the oldest mint left, so a faster design that
-    /// evicts the wrong entries shows as such. A timing, so it is ignored; run it with
+    /// The comparison behind the store's design: one lock (the map as it was), 16 locked parts
+    /// and 64, each filled to the cap and then driven by `threads` threads doing what a proxy
+    /// request does: look up two tokens, record two. Prints the wall time per request and, per
+    /// design, the share of the newest half-cap mints still held at the end and the oldest mint
+    /// left, so a faster design that evicts the wrong entries shows as such. The `DashMap`
+    /// design [`ShardedBoundTokens`]'s doc names was measured by this bench too, in the commit
+    /// before it was removed. A timing, so it is ignored; run it with
     /// `cargo test --release --lib bound_token_store_designs -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing benchmark, run by hand"]
@@ -1656,16 +1515,10 @@ mod tests {
             .map(|n| bound_tokens::hash_token(&format!("sig_fake_{n}")))
             .collect();
         let hashes = Arc::new(hashes);
-        type Design = (&'static str, fn() -> Arc<dyn Store>);
-        let designs: Vec<Design> = vec![
-            ("one lock", || Arc::new(ShardedBoundTokens::with_shards(1))),
-            ("16 parts", || Arc::new(ShardedBoundTokens::with_shards(16))),
-            ("64 parts", || Arc::new(ShardedBoundTokens::with_shards(64))),
-            ("dashmap", || Arc::new(DashBoundTokens::default())),
-        ];
+        let designs = [("one lock", 1), ("16 parts", 16), ("64 parts", 64)];
         for threads in [1usize, 4, 8, 16] {
-            for (name, make) in &designs {
-                let store = make();
+            for (name, parts) in designs {
+                let store = Arc::new(ShardedBoundTokens::with_shards(parts));
                 let base = crate::now_ms() - 1_000_000;
                 for (n, hash) in hashes.iter().take(BOUND_TOKEN_CAP).enumerate() {
                     store.record(hash, (0, BoundTokenKind::MessageId, base + n as i64), base);

@@ -209,11 +209,6 @@ sha2 = "0.11"
 # buys nothing here, the nonce comes from the `getrandom` grant above. With it
 # off, `git diff Cargo.lock` is one line.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-# A sharded concurrent map, for the bound-token map's lookups and records on the
-# request path (`src/manager/bound_tokens.rs`), which serialized on one mutex.
-# Approved by Gil on 2026-10-16 as the one new dependency of that change; 6.1 is
-# the current stable release (7.0 is still a release candidate).
-dashmap = "6.1"
 
 [dev-dependencies]
 # Property tests over the peer-mesh wire's parse/decode boundary
