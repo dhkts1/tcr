@@ -121,6 +121,21 @@ fn connections_arriving_during_replace_are_never_refused() {
     let bound = successor.ready();
     stop.store(true, Ordering::Relaxed);
     let (attempts, errors) = clients.join().unwrap();
+    let mut health = TcpStream::connect(addr).unwrap();
+    health
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    health
+        .write_all(b"GET /_tcr/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut status_response = String::new();
+    health
+        .read_to_string(&mut status_response)
+        .expect("successor serves status requests");
+    assert!(
+        status_response.starts_with("HTTP/1.1 200"),
+        "successor status: {status_response}"
+    );
     assert_eq!(bound, addr);
     assert!(
         attempts > 1,
@@ -170,6 +185,23 @@ fn a_connect_tunnel_drains_after_the_successor_is_listening() {
 
     let mut successor = Proxy::spawn(home.path(), addr.port(), true);
     assert_eq!(successor.ready(), addr);
+    let mut health = TcpStream::connect(addr).unwrap();
+    health
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        health,
+        "GET /_tcr/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut status_response = String::new();
+    health
+        .read_to_string(&mut status_response)
+        .expect("successor serves while predecessor drains");
+    assert!(
+        status_response.starts_with("HTTP/1.1 200"),
+        "successor status: {status_response}"
+    );
     tunnel.write_all(b"after!").unwrap();
     tunnel
         .read_exact(&mut echoed)
