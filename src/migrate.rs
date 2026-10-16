@@ -3,10 +3,10 @@
 //!
 //! [`crate::paths`] already reads either name (new if it exists, else old if
 //! it exists, else new), so nothing breaks while the old names stay. This is
-//! the step that retires them. It belongs to UPDATING, never to a server
-//! start: TcrBar runs it on its first launch after a new version, before it
-//! starts its own server, and `tcr update` runs it after a successful install
-//! or rebuild ([`after_update`]).
+//! the step that retires them. It never belongs to a server start: TcrBar
+//! runs it at launch, before it starts its own server, whenever old names are
+//! still there, and `tcr update` runs it after a successful install or rebuild
+//! ([`after_update`]).
 //!
 //! **It refuses while a tcr server is running.** A server resolved its paths at
 //! boot and keeps writing to them, so moving the config under it splits the

@@ -207,12 +207,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `--headless` is the flag that matters here — without it the child dies
         // on startup trying to put a TUI on a pipe.
         //
-        // First, on the first launch of a new bundle version, move the old
-        // `teamclaude` file names to the `tcr` ones. It has to come before the
-        // server starts: a running server keeps writing the paths it resolved at
-        // boot, so `tcr migrate` refuses beside one. A refusal or failure never
-        // holds up the launch; the server reads the old names where they are.
-        if NameMigrationMarker().noteLaunch(current: AppBuild.buildNumber) {
+        // First, whenever an old `teamclaude` file name is still on disk, move
+        // it to the `tcr` one. It has to come before the server starts: a
+        // running server keeps writing the paths it resolved at boot, so
+        // `tcr migrate` refuses beside one. A refusal or failure never holds up
+        // the launch; the server reads the old names where they are, and the
+        // next launch tries again.
+        let migrationGate = NameMigrationGate.decide(
+            buildNumber: AppBuild.buildNumber,
+            oldNamesPresent: NameMigrationGate.oldNamesPresent())
+        if migrationGate == .run {
             Self.migrateNames()
         }
         if shell.preference.startServerAtLaunch {
@@ -246,8 +250,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Run `tcr migrate --json` with the same `tcr` the server is started from,
-    /// and log what it said. Blocking: it renames at most a handful of paths
-    /// and runs once per update.
+    /// and log what it said. Blocking: it renames at most a handful of paths,
+    /// and runs only while an old name is still on disk.
     private static func migrateNames() {
         switch TcrTool.resolve() {
         case .failure(let notFound):

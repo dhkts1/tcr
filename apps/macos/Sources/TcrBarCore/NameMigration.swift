@@ -5,61 +5,51 @@ import Foundation
 /// Whether this launch runs `tcr migrate --json`, the step that moves an
 /// install's `teamclaude` config file and cache directory to the `tcr` names.
 ///
-/// It runs on the first launch after the bundle's `CFBundleVersion` changed: a
-/// Sparkle update or a manual install. That moment is safe because the update
-/// quit the old app, and quitting stops the server it supervised, so nothing
-/// is writing the files. `tcr migrate` checks again and refuses if a server is
-/// still running; a refusal costs nothing, the next update tries again.
-///
-/// No stored version means RUN, unlike ``LaunchVersionMarker``'s "a fresh
-/// install is not an update". The key is new in the build that brings the
-/// migration, so every existing install upgrading to it has nothing stored,
-/// and that launch is exactly the one that has to move the files. On a truly
-/// fresh install the run finds nothing to move.
+/// It runs at launch, before TcrBar starts its server, whenever an old name is
+/// still on disk. Nothing is remembered between launches: a refused move (a
+/// server already holding the port) or a failed one is tried again at the next
+/// launch, and once both old names are gone the check finds nothing and the
+/// CLI is never started. `tcr migrate` refuses beside a running server itself,
+/// so trying costs nothing.
 public enum NameMigrationGate {
     public enum Decision: Equatable, Sendable {
         case run
         case skip
     }
 
+    /// The config file every install before the rename has, in `~/.config`.
+    public static let legacyConfigFile = ConfigFileName.legacy
+    /// The cache directory every install before the rename has, under the cache base.
+    public static let legacyCacheDir = "teamclaude"
+
     /// - Parameters:
-    ///   - lastLaunched: the `CFBundleVersion` the previous launch recorded.
-    ///   - current: `AppBuild.buildNumber`. `nil` (an unbundled `swift build`
-    ///     binary, a test host) never runs: no bundle, no update.
-    public static func decide(lastLaunched: String?, current: String?) -> Decision {
-        guard let current, !current.isEmpty else { return .skip }
-        guard let lastLaunched, !lastLaunched.isEmpty else { return .run }
-        return lastLaunched == current ? .skip : .run
-    }
-}
-
-/// Remembers the `CFBundleVersion` that last launched, for ``NameMigrationGate``.
-///
-/// Recorded on every launch, whatever the migration did: a refused or failed
-/// move must not retry on every launch until it works, it retries at the next
-/// update. The key string is load-bearing for the same reason as
-/// ``LaunchVersionMarker/lastLaunchedVersionKey``; `NameMigrationTests` pins it.
-@MainActor
-public final class NameMigrationMarker {
-    /// The `UserDefaults` key. Do not change it.
-    public nonisolated static let lastLaunchedBuildKey = "lastLaunchedBundleVersion"
-
-    private let defaults: UserDefaults?
-
-    /// `nil` defaults remember nothing and never run, for render and probe
-    /// harnesses that must not move files or write preferences.
-    public init(defaults: UserDefaults? = .standard) {
-        self.defaults = defaults
+    ///   - buildNumber: `AppBuild.buildNumber`. `nil` (an unbundled `swift build`
+    ///     binary, a test host) never runs: it has no bundled `tcr` of its own.
+    ///   - oldNamesPresent: ``oldNamesPresent(home:environment:fileExists:)``.
+    public static func decide(buildNumber: String?, oldNamesPresent: Bool) -> Decision {
+        guard let buildNumber, !buildNumber.isEmpty else { return .skip }
+        return oldNamesPresent ? .run : .skip
     }
 
-    /// Record `current` as launched and say whether this launch migrates.
-    public func noteLaunch(current: String?) -> Bool {
-        guard let defaults else { return false }
-        let previous = defaults.string(forKey: Self.lastLaunchedBuildKey)
-        if let current, !current.isEmpty {
-            defaults.set(current, forKey: Self.lastLaunchedBuildKey)
+    /// Whether `~/.config/teamclaude.json` or `<cache base>/teamclaude` exists.
+    ///
+    /// The cache base is `src/paths.rs`'s `cache_base` rule: `$XDG_CACHE_HOME`
+    /// when set and non-empty, else `$HOME/.cache`. Only asks whether a path
+    /// exists; never opens one, because the config holds live credentials.
+    public static func oldNamesPresent(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> Bool {
+        let config = home.appendingPathComponent(".config").appendingPathComponent(legacyConfigFile)
+        let cacheBase: URL
+        if let xdg = environment["XDG_CACHE_HOME"], !xdg.isEmpty {
+            cacheBase = URL(fileURLWithPath: xdg)
+        } else {
+            cacheBase = home.appendingPathComponent(".cache")
         }
-        return NameMigrationGate.decide(lastLaunched: previous, current: current) == .run
+        let cache = cacheBase.appendingPathComponent(legacyCacheDir)
+        return fileExists(config.path) || fileExists(cache.path)
     }
 }
 

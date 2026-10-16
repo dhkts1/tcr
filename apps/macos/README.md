@@ -58,8 +58,8 @@ an incumbent holds the port is reported as "already running", which is a success
 Each row has an Enable/Disable button. It shells out to `tcr enable <name>` /
 `tcr disable <name>` and nothing else — TcrBar never writes
 `~/.config/tcr.json`, because that file holds credentials and `tcr` owns it. The one file
-operation it starts is `tcr migrate --json`, on the first launch of a new version and before its
-server starts, which moves an older install's `teamclaude` config and cache to the `tcr` names.
+operation it starts is `tcr migrate --json`, at launch before its server starts and only while
+old names are still there, which moves an older install's `teamclaude` config and cache to the `tcr` names.
 
 `tcr`'s account query is an *exact* match — the configured name, else the email
 parsed out of it — and it is case-sensitive and untrimmed. It is not a substring

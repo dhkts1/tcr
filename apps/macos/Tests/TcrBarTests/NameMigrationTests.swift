@@ -8,45 +8,45 @@ import XCTest
 final class NameMigrationTests: XCTestCase {
     // MARK: gate
 
-    func testNoStoredVersionRuns() {
-        XCTAssertEqual(NameMigrationGate.decide(lastLaunched: nil, current: "1234"), .run)
-        XCTAssertEqual(NameMigrationGate.decide(lastLaunched: "", current: "1234"), .run)
+    private let home = URL(fileURLWithPath: "/Users/example")
+
+    /// `oldNamesPresent` over a fake disk holding exactly `paths`.
+    private func present(_ paths: Set<String>, environment: [String: String] = [:]) -> Bool {
+        NameMigrationGate.oldNamesPresent(
+            home: home, environment: environment, fileExists: { paths.contains($0) })
     }
 
-    func testSameVersionSkips() {
-        XCTAssertEqual(NameMigrationGate.decide(lastLaunched: "1234", current: "1234"), .skip)
+    func testOldConfigOnlyIsPresent() {
+        XCTAssertTrue(present(["/Users/example/.config/teamclaude.json"]))
     }
 
-    func testDifferentVersionRuns() {
-        XCTAssertEqual(NameMigrationGate.decide(lastLaunched: "1234", current: "1240"), .run)
+    func testOldCacheUnderHomeIsPresentWhenXdgIsUnset() {
+        XCTAssertTrue(present(["/Users/example/.cache/teamclaude"]))
+        // An empty XDG_CACHE_HOME counts as unset, as in src/paths.rs.
+        XCTAssertTrue(present(["/Users/example/.cache/teamclaude"], environment: ["XDG_CACHE_HOME": ""]))
     }
 
-    func testUnknownCurrentVersionNeverRuns() {
-        XCTAssertEqual(NameMigrationGate.decide(lastLaunched: nil, current: nil), .skip)
-        XCTAssertEqual(NameMigrationGate.decide(lastLaunched: "1234", current: ""), .skip)
+    func testOldCacheUnderXdgIsPresentWhenXdgIsSet() {
+        let xdg = ["XDG_CACHE_HOME": "/tmp/example-xdg"]
+        XCTAssertTrue(present(["/tmp/example-xdg/teamclaude"], environment: xdg))
+        // With XDG set, the HOME cache is not where tcr looks.
+        XCTAssertFalse(present(["/Users/example/.cache/teamclaude"], environment: xdg))
     }
 
-    func testTheKeyIsPinned() {
-        XCTAssertEqual(NameMigrationMarker.lastLaunchedBuildKey, "lastLaunchedBundleVersion")
+    func testNeitherIsNotPresent() {
+        XCTAssertFalse(present([]))
+        // The new names alone are not old names.
+        XCTAssertFalse(present(["/Users/example/.config/tcr.json", "/Users/example/.cache/tcr"]))
     }
 
-    /// Nothing stored runs, the same build again skips, a new build runs once.
-    @MainActor
-    func testMarkerRunsOnTheFirstLaunchOfEachBuild() {
-        let suite = "NameMigrationTests.marker.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defer { defaults.removePersistentDomain(forName: suite) }
-        XCTAssertTrue(NameMigrationMarker(defaults: defaults).noteLaunch(current: "1234"))
-        XCTAssertFalse(NameMigrationMarker(defaults: defaults).noteLaunch(current: "1234"))
-        XCTAssertTrue(NameMigrationMarker(defaults: defaults).noteLaunch(current: "1240"))
-        XCTAssertFalse(NameMigrationMarker(defaults: defaults).noteLaunch(current: "1240"))
-        XCTAssertFalse(NameMigrationMarker(defaults: defaults).noteLaunch(current: nil))
-        XCTAssertEqual(defaults.string(forKey: NameMigrationMarker.lastLaunchedBuildKey), "1240")
+    func testABundledBuildRunsExactlyWhenOldNamesArePresent() {
+        XCTAssertEqual(NameMigrationGate.decide(buildNumber: "1234", oldNamesPresent: true), .run)
+        XCTAssertEqual(NameMigrationGate.decide(buildNumber: "1234", oldNamesPresent: false), .skip)
     }
 
-    @MainActor
-    func testMarkerWithNilDefaultsNeverRuns() {
-        XCTAssertFalse(NameMigrationMarker(defaults: nil).noteLaunch(current: "1234"))
+    func testAnUnbundledBuildNeverRuns() {
+        XCTAssertEqual(NameMigrationGate.decide(buildNumber: nil, oldNamesPresent: true), .skip)
+        XCTAssertEqual(NameMigrationGate.decide(buildNumber: "", oldNamesPresent: true), .skip)
     }
 
     // MARK: parsing every outcome

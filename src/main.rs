@@ -103,7 +103,8 @@ enum Command {
     Update(UpdateArgs),
     /// Move an existing install's `teamclaude` config file and cache directory
     /// to the `tcr` names. Refuses (exit 3) while a tcr server is running.
-    /// TcrBar's first launch after an update and `tcr update` run it for you.
+    /// TcrBar runs it at launch, before it starts its server, whenever old names
+    /// are still there; `tcr update` runs it after updating.
     Migrate(MigrateArgs),
     /// Render the TUI against fake accounts (for a sanitized README screenshot).
     Demo,

@@ -2239,8 +2239,8 @@ Moves an older install's files to the `tcr` names: `~/.config/teamclaude.json` b
 `~/.config/tcr.json`, and `~/.cache/teamclaude/` becomes `~/.cache/tcr/` (under
 `$XDG_CACHE_HOME` when that is set). Inside the moved cache directory the old-prefix logs
 (`teamclaude-rs.log*`) are renamed to `tcr.log*`, so log pruning keeps covering them. You
-rarely run it yourself: TcrBar runs it on its first launch of a new version, before it starts
-its server, and `tcr update` runs it after a successful install or rebuild.
+rarely run it yourself: TcrBar runs it at launch, before it starts its server, whenever old
+names are still there, and `tcr update` runs it after a successful install or rebuild.
 
 Each of the two (the config file, and the cache directory as a whole) follows one rule:
 
