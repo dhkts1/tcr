@@ -60,6 +60,7 @@ use tower::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
 
 use crate::manager::Manager;
+use crate::request_key::{ConnectClass, ProxyCredential, Unkeyed};
 
 /// Hosts we intend to MITM-terminate + inject tokens for — a POLICY list, not
 /// a firewall (everything else on `CONNECT` is blind-tunneled, no
@@ -104,27 +105,10 @@ pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
 pub const CODEX_PROXY_AUTHORIZATION: &str = "Basic dGNyLWNvZGV4Og==";
 
 /// Does a proxy URL opt in to Codex interception? Used by the doctor without displaying userinfo.
+/// The username alone decides, as on a `CONNECT` ([`ProxyCredential::codex_marked`]): a keyed
+/// launch puts the request key in the password, and it must still read as marked.
 pub fn codex_proxy_marked(url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok_and(|url| {
-        url.username() == CODEX_PROXY_USERNAME && url.password().is_none_or(str::is_empty)
-    })
-}
-
-/// Read the marker from CONNECT headers only, without exposing or forwarding proxy credentials.
-fn codex_connect_marked(head: &str) -> bool {
-    let (expected_scheme, expected_value) = CODEX_PROXY_AUTHORIZATION
-        .split_once(' ')
-        .expect("the Codex proxy marker has a scheme and value");
-    head.lines()
-        .skip(1)
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("proxy-authorization")
-                && value.trim().split_once(' ').is_some_and(|(scheme, value)| {
-                    scheme.eq_ignore_ascii_case(expected_scheme) && value.trim() == expected_value
-                })
-        })
+    reqwest::Url::parse(url).is_ok_and(|url| url.username() == CODEX_PROXY_USERNAME)
 }
 
 /// SAN list for the rcgen fallback leaf (the policy allowlist + the JS test
@@ -1083,7 +1067,19 @@ async fn handle_connect(
     // ([`intercepts_now`]): there is no pooled account to serve a codex, and it
     // keeps its own login. Counted on every CONNECT, never cached, so an import
     // takes effect on the next tunnel.
-    let codex_marked = codex_connect_marked(&head);
+    //
+    // The head's credential is parsed ONCE, here: the Codex marker (the username)
+    // and the request key (the password). Log mode: an unkeyed CONNECT is counted
+    // and then served exactly as before, intercepted or blind.
+    let credential = ProxyCredential::from_connect_head(&head, manager.request_key());
+    if manager.request_key().is_some() && !credential.key_ok {
+        manager.unkeyed().record(
+            Unkeyed::Connect(ConnectClass::of(&host)),
+            credential.user_agent,
+            peer.port(),
+        );
+    }
+    let codex_marked = credential.codex_marked;
     let policy_intercepts = intercepts_now(&manager, &host, codex_marked);
     let leaf_covers_host = policy_intercepts && host_covered_by_loaded_leaf(&host);
     if host.eq_ignore_ascii_case(crate::provider::CODEX_HOST) {
@@ -1122,7 +1118,16 @@ async fn handle_connect(
             return Ok(());
         }
     };
-    serve_http(tls_stream, peer, manager, Some(host)).await;
+    serve_http(
+        tls_stream,
+        peer,
+        manager,
+        Some(Tunnel {
+            host,
+            keyed: credential.key_ok,
+        }),
+    )
+    .await;
     Ok(())
 }
 
@@ -1178,6 +1183,13 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// The `CONNECT` a decrypted stream came through: its host, and whether its head
+/// carried the request key.
+struct Tunnel {
+    host: String,
+    keyed: bool,
+}
+
 /// Serve HTTP over `io` through the existing axum router — same auth, rotation,
 /// injection, and streaming for both entry points.
 ///
@@ -1196,8 +1208,10 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
 /// [`handle_connect`] passes it, and base-URL mode has none. Every request on the
 /// connection carries it as a [`crate::proxy::InterceptedHost`], which no client can
 /// forge, so `proxy::handle` holds each request to the host the tunnel was opened
-/// to, not to the one the request declares.
-async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>, intercepted: Option<String>)
+/// to, not to the one the request declares. A tunnel whose `CONNECT` carried the
+/// request key also stamps [`crate::proxy::TunnelKeyed`], so its requests are not
+/// judged again on their headers.
+async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>, intercepted: Option<Tunnel>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1226,9 +1240,12 @@ where
             // loopback clients from the api-key gate (see proxy::ClientAddr).
             req.extensions_mut().insert(crate::proxy::ClientAddr(peer));
             // A request decrypted from a tunnel carries the tunnel's host (see above).
-            if let Some(host) = &intercepted {
+            if let Some(tunnel) = &intercepted {
                 req.extensions_mut()
-                    .insert(crate::proxy::InterceptedHost(host.clone()));
+                    .insert(crate::proxy::InterceptedHost(tunnel.host.clone()));
+                if tunnel.keyed {
+                    req.extensions_mut().insert(crate::proxy::TunnelKeyed);
+                }
             }
             // When affinity is on, tag every request on this connection with the
             // connection's session key so selection pins to one account.
@@ -1581,13 +1598,15 @@ mod tests {
         for header in [
             "Proxy-Authorization: Basic dGNyLWNvZGV4Og==",
             "proxy-authorization: basic dGNyLWNvZGV4Og==",
+            // `tcr-codex:k3y`: a keyed Codex launch is still marked, so still pooled.
+            "Proxy-Authorization: Basic dGNyLWNvZGV4OmszeQ==",
         ] {
             let head = format!("CONNECT chatgpt.com:443 HTTP/1.1\r\n{header}\r\n\r\n");
-            assert!(codex_connect_marked(&head));
+            assert!(ProxyCredential::from_connect_head(&head, None).codex_marked);
             assert!(host_intercepted(
                 "chatgpt.com",
                 1,
-                codex_connect_marked(&head)
+                ProxyCredential::from_connect_head(&head, None).codex_marked
             ));
         }
         for header in [
@@ -1595,17 +1614,24 @@ mod tests {
             "Authorization: Basic dGNyLWNvZGV4Og==",
             "Proxy-Authorization: Basic dGNyLWNvZGV4",
             "Proxy-Authorization: Bearer dGNyLWNvZGV4Og==",
+            // `tcr:k3y`: keyed, but not the Codex username.
+            "Proxy-Authorization: Basic dGNyOmszeQ==",
         ] {
             let head = format!("CONNECT chatgpt.com:443 HTTP/1.1\r\n{header}\r\n\r\n");
-            assert!(!codex_connect_marked(&head), "{header}");
+            assert!(
+                !ProxyCredential::from_connect_head(&head, None).codex_marked,
+                "{header}"
+            );
             assert!(!host_intercepted(
                 "chatgpt.com",
                 1,
-                codex_connect_marked(&head)
+                ProxyCredential::from_connect_head(&head, None).codex_marked
             ));
         }
         assert!(codex_proxy_marked("http://tcr-codex@127.0.0.1:3999"));
         assert!(codex_proxy_marked("http://tcr-codex:@127.0.0.1:3999"));
+        assert!(codex_proxy_marked("http://tcr-codex:k3y@127.0.0.1:3999"));
+        assert!(!codex_proxy_marked("http://tcr:k3y@127.0.0.1:3999"));
         assert!(!codex_proxy_marked("http://127.0.0.1:3999"));
         assert!(!codex_proxy_marked("http://other@127.0.0.1:3999"));
     }
@@ -2061,6 +2087,14 @@ mod tests {
     }
 
     fn dummy_manager_at(config_path: Option<std::path::PathBuf>) -> Arc<Manager> {
+        dummy_manager_keyed(config_path, None)
+    }
+
+    /// [`dummy_manager_at`], holding `request_key` as `proxy.requestKey`.
+    fn dummy_manager_keyed(
+        config_path: Option<std::path::PathBuf>,
+        request_key: Option<&str>,
+    ) -> Arc<Manager> {
         let config = crate::config::Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
@@ -2069,6 +2103,7 @@ mod tests {
             proxy: crate::config::ProxyConfig {
                 port: 0,
                 api_key: None,
+                request_key: request_key.map(str::to_string),
                 extra: serde_json::Map::new(),
             },
             upstream: "http://127.0.0.1:1".to_string(),
@@ -2149,6 +2184,75 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Log mode through the real listener: an unkeyed CONNECT is still answered 200 and
+    /// tunneled, and it bumps the unkeyed counter; a keyed one is answered the same way and
+    /// counts nothing. The connector dials a held loopback socket, never `example.com`.
+    #[tokio::test]
+    async fn an_unkeyed_connect_is_served_and_counted_and_a_keyed_one_is_not_counted() {
+        const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = upstream.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        stream.write_all(&buf[..n]).await.ok();
+                    }
+                });
+            }
+        });
+        let connector: TunnelConnector =
+            Arc::new(move |_host, _port| Box::pin(TcpStream::connect(upstream_addr)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let manager = dummy_manager_keyed(None, Some(KEY));
+        tokio::spawn(serve_with_tunnel_connector(
+            listener,
+            Arc::clone(&manager),
+            None,
+            connector,
+        ));
+
+        let connect = |auth: Option<String>| async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let auth = auth.map_or_else(String::new, |a| format!("Proxy-Authorization: {a}\r\n"));
+            let head = format!(
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\
+                 User-Agent: curl/8.7.1\r\n{auth}\r\n"
+            );
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut ok = [0u8; RESP_CONNECT_OK.len()];
+            client.read_exact(&mut ok).await.unwrap();
+            assert_eq!(&ok, RESP_CONNECT_OK, "log mode answers 200 either way");
+            client.write_all(b"ping").await.unwrap();
+            let mut back = [0u8; 4];
+            client.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"ping", "and tunnels either way");
+        };
+
+        // `tcr:<KEY>`, standard base64.
+        let keyed = "Basic dGNyOjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=";
+        connect(Some(keyed.to_string())).await;
+        assert!(
+            manager.unkeyed().snapshot().is_empty(),
+            "a keyed CONNECT counts nothing"
+        );
+
+        connect(None).await;
+        connect(Some("Basic dGNyOndyb25n".to_string())).await; // `tcr:wrong`
+        assert_eq!(
+            manager.unkeyed().snapshot(),
+            vec![crate::request_key::UnkeyedRow {
+                what: Unkeyed::Connect(ConnectClass::Other),
+                user_agent: crate::request_key::UaFamily::Curl,
+                count: 2,
+            }],
+            "a missing and a wrong key both count, once each"
+        );
     }
 
     /// Discriminating control: an ordinary h1 client must still work after the

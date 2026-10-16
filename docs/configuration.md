@@ -131,6 +131,7 @@ server says so once in its boot log.
 |---|---|---|---|---|
 | `proxy.port` | u16 | `3456` | no | port the proxy binds on loopback |
 | `proxy.apiKey` | string | absent | no | shared secret required by the local `/_tcr/` control routes; the request path exempts loopback callers, and it is never handed to `claude` |
+| `proxy.requestKey` | string | written at first boot | no | the request key: what a caller presents to say it was launched on purpose. Counted, never required, in this version. `tcr request-key` prints it |
 
 `--port` beats the file. `tcr server --port 9000` overrides `proxy.port` at runtime; the
 flag is threaded into `ServeOptions.port` and wins wherever it is `Some`.
@@ -160,6 +161,38 @@ the request path exempts loopback clients from this key, so the child was always
 anyway. When a key is configured, `tcr run` says on stderr that it is withholding it; a
 value the caller exported is inherited untouched. So the key's whole job is the `/_tcr/`
 gate above; it is not a credential anything downstream of the proxy needs.
+
+### `proxy.requestKey`: who launched this caller
+
+Binding to loopback does not keep other callers out. A container on this Mac that connects to
+`host.docker.internal` arrives at the proxy from `127.0.0.1`, so the loopback exemption above
+serves it, and a `CONNECT` through the proxy opens a tunnel for it. The request key is what will
+tell a caller tcr launched from one it did not.
+
+The server writes it. On a boot with no `proxy.requestKey` in the file, it generates 32 random
+bytes, writes them as 64 hex digits into the file, changing nothing else, and logs one line saying
+it did (never the key). Every later write the server makes keeps it. A server started with no
+config file to write (a library caller) holds no key. Delete the key and the next boot writes a
+new one; every launcher that held the old one then needs the new one.
+
+It is separate from `proxy.apiKey` on purpose: `apiKey` gates the `/_tcr/` control routes, and a
+container forwarder that holds the request key must not get control access with it.
+
+A caller presents it in any one of these places:
+
+| where | for | what |
+|---|---|---|
+| proxy URL userinfo | `HTTPS_PROXY` clients | `http://<user>:<key>@127.0.0.1:3456`, sent as `Proxy-Authorization: Basic` on every `CONNECT`. The user name still routes: `tcr-codex` selects Codex interception with or without a key, any other name means Claude |
+| `x-tcr-key: <key>` | base-URL clients | Claude Code sends it through `ANTHROPIC_CUSTOM_HEADERS` |
+| `x-api-key: <key>` | SDK clients with no login | the SDK's `ANTHROPIC_API_KEY` |
+| `Proxy-Authorization` | `HTTP_PROXY` clients | the same `Basic` value as a `CONNECT` |
+
+In this version nothing is refused. A caller without the key is counted on `GET /_tcr/status`
+(`unkeyedConnects`, `unkeyedRequests`) and served exactly as before; see
+[the request key on `GET /_tcr/status`](cli.md#the-request-key-on-get-_tcrstatus). The key is
+stripped before anything leaves the proxy: `x-tcr-key` never reaches Anthropic, a passthrough
+relay or a peer, and an `x-api-key` equal to the key is treated like one equal to `apiKey`
+(never forwarded, never used as a session identity).
 
 ## `accounts[]`
 

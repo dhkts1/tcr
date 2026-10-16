@@ -65,6 +65,10 @@ enum Command {
     /// Print an account's current access token to stdout (a secret — pipe it, do
     /// not paste it into a chat or a shell history).
     Token(TokenArgs),
+    /// Print the request key from the config to stdout, for a launcher outside tcr
+    /// (a secret, like `token`). Never writes one: the server writes it at boot,
+    /// so this and the server cannot disagree. Exits non-zero when there is none.
+    RequestKey(RequestKeyArgs),
     /// Enable an account (clears the `disabled` flag).
     Enable(EnableArgs),
     /// Disable an account (holds it out of rotation).
@@ -1082,6 +1086,13 @@ struct RemoveArgs {
 }
 
 #[derive(clap::Args)]
+struct RequestKeyArgs {
+    /// Path to the config file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
 struct TokenArgs {
     /// Path to the config file.
     #[arg(long)]
@@ -1684,6 +1695,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
         Some(Command::Token(args)) => run_token(args),
+        Some(Command::RequestKey(args)) => run_request_key(args),
         Some(Command::Priority(args)) => run_priority(args).await,
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
@@ -1733,6 +1745,13 @@ async fn run_remove(args: RemoveArgs) -> anyhow::Result<()> {
 fn run_token(args: TokenArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     cli::print_access_token(&config_path, &args.query)
+}
+
+/// `tcr request-key`: print the request key the server wrote to the config.
+fn run_request_key(args: RequestKeyArgs) -> anyhow::Result<()> {
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    println!("{}", cli::request_key(&config_path)?);
+    Ok(())
 }
 
 /// `tcr priority <query> [N|--first|--last]` — set rotation priority, in the

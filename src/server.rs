@@ -1767,6 +1767,59 @@ fn note_owner_headroom(
     }
 }
 
+/// Give the server a request key ([`crate::request_key`]) when its config has none:
+/// generate one and write it to the config file through the targeted writer
+/// ([`crate::config::save_request_key`]), then hold whatever the file now says.
+///
+/// Only with a file to write. A key the server held and the file did not would
+/// be one `tcr request-key` cannot print, so a launcher could never present it;
+/// the same reasoning keeps the server keyless when the write fails, with a
+/// warning. A library caller with no `persist_path` writes nothing, as
+/// [`ServeOptions::new`] promises, and serves as before.
+///
+/// One boot line says a key was written or adopted. It never carries the key.
+pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std::path::Path>) {
+    if config
+        .proxy
+        .request_key
+        .as_deref()
+        .is_some_and(|key| !key.is_empty())
+    {
+        return;
+    }
+    let Some(path) = persist_path else {
+        return;
+    };
+    let candidate = match crate::request_key::generate() {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(error = %err, "request key: the platform CSPRNG refused, so this server holds no key");
+            return;
+        }
+    };
+    match crate::config::save_request_key(path, &candidate) {
+        Ok(crate::config::RequestKeyWrite::Written(key)) => {
+            tracing::info!(
+                path = %path.display(),
+                "request key: generated one and saved it to the config (`tcr request-key` prints it)"
+            );
+            config.proxy.request_key = Some(key);
+        }
+        Ok(crate::config::RequestKeyWrite::AlreadyPresent(key)) => {
+            tracing::info!(
+                path = %path.display(),
+                "request key: the config gained one since it was loaded; using that"
+            );
+            config.proxy.request_key = Some(key);
+        }
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "request key: could not save a new one to the config, so this server holds no key"
+        ),
+    }
+}
+
 pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let ServeOptions {
         mut config,
@@ -1919,6 +1972,10 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             ),
         }
     }
+
+    // The request key, settled before the manager snapshots the config. After the
+    // stand-down return above, so a process that did not bind writes nothing.
+    ensure_request_key(&mut config, persist_path.as_deref());
 
     let manager = Manager::with_live_refresher(config, persist_path);
 
@@ -2496,6 +2553,83 @@ mod tests {
     fn manager_with(config: &str) -> Arc<Manager> {
         let config: Config = serde_json::from_str(config).expect("the inline test config parses");
         Manager::with_live_refresher(config, None)
+    }
+
+    fn proxy_doc(path: &std::path::Path) -> serde_json::Value {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the config reads"))
+                .expect("the config parses");
+        doc["proxy"].clone()
+    }
+
+    /// **Boot writes a request key once, and the server's later writes keep it.** A config
+    /// with none gains one, in the file and in memory; the file's other keys are untouched;
+    /// a token write (the merge path and its whole-file fallback) keeps it; a second boot
+    /// keeps the same key; and a server with no file to write holds none.
+    #[test]
+    fn boot_generates_a_request_key_that_later_writes_keep() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("tcr.json");
+        std::fs::write(
+            &path,
+            r#"{"proxy": {"port": 3456, "customFlag": true},
+                "accounts": [{"name": "alice@example.com", "accessToken": "at-fake",
+                              "refreshToken": "rt-fake", "expiresAt": 4102444800000}]}"#,
+        )
+        .expect("the temp config writes");
+
+        let mut config = crate::config::load(&path).expect("the temp config loads");
+        assert_eq!(config.proxy.request_key, None);
+        ensure_request_key(&mut config, Some(&path));
+        let key = config.proxy.request_key.clone().expect("boot holds a key");
+        assert_eq!(key.len(), 64);
+        assert_eq!(proxy_doc(&path)["requestKey"], key.as_str());
+        assert_eq!(proxy_doc(&path)["customFlag"], true, "other keys untouched");
+        assert_eq!(
+            crate::config::read_request_key(&path).expect("reads"),
+            Some(key.clone()),
+            "`tcr request-key` reads the same key"
+        );
+
+        // A later server write: the token merge, from the server's own snapshot.
+        config.accounts[0].access_token = "at-rotated".to_string();
+        crate::config::save_tokens(&path, &config).expect("token write");
+        assert_eq!(proxy_doc(&path)["requestKey"], key.as_str());
+        // Its whole-file fallback, taken when the file cannot be parsed.
+        std::fs::write(&path, "{ not json").expect("break the file");
+        crate::config::save_tokens(&path, &config).expect("fallback write");
+        assert_eq!(proxy_doc(&path)["requestKey"], key.as_str());
+
+        // A second boot keeps it rather than minting another.
+        let mut again = crate::config::load(&path).expect("reloads");
+        ensure_request_key(&mut again, Some(&path));
+        assert_eq!(again.proxy.request_key.as_deref(), Some(key.as_str()));
+        assert_eq!(proxy_doc(&path)["requestKey"], key.as_str());
+
+        // No file to write: no key, so the server never holds one no launcher can read.
+        let mut library: Config = serde_json::from_str("{}").expect("parses");
+        ensure_request_key(&mut library, None);
+        assert_eq!(library.proxy.request_key, None);
+    }
+
+    /// Another writer that put a key in the file after this process loaded it wins, so
+    /// the server and `tcr request-key` never hold two different keys.
+    #[test]
+    fn boot_adopts_a_key_written_since_the_config_was_loaded() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("tcr.json");
+        std::fs::write(&path, r#"{"accounts": []}"#).expect("writes");
+        let mut config = crate::config::load(&path).expect("loads");
+        std::fs::write(
+            &path,
+            r#"{"proxy": {"requestKey": "3333333333333333333333333333333333333333333333333333333333333333"}, "accounts": []}"#,
+        )
+        .expect("another writer");
+        ensure_request_key(&mut config, Some(&path));
+        assert_eq!(
+            config.proxy.request_key.as_deref(),
+            Some("3333333333333333333333333333333333333333333333333333333333333333")
+        );
     }
 
     /// A path under an existing REGULAR FILE, so any write to it fails. Never

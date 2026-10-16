@@ -250,6 +250,12 @@ pub struct ProxyConfig {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// The request key ([`crate::request_key`]): what a caller presents to say
+    /// it was launched on purpose. Separate from [`Self::api_key`], which gates
+    /// the `/_tcr/` control routes. The server writes one at boot when the file
+    /// has none ([`save_request_key`]); absent, behaviour is exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
     /// Any `proxy.*` keys we do not model, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -260,9 +266,73 @@ impl Default for ProxyConfig {
         Self {
             port: default_port(),
             api_key: None,
+            request_key: None,
             extra: Map::new(),
         }
     }
+}
+
+/// What [`save_request_key`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestKeyWrite {
+    /// The file had no `proxy.requestKey`; this key is now in it.
+    Written(String),
+    /// Another writer put one there after this process loaded the file. That
+    /// one is kept and returned, so the server and `tcr request-key` agree.
+    AlreadyPresent(String),
+}
+
+/// Persist `proxy.requestKey = candidate` into the file at `path`, unless the
+/// file already holds one, leaving every other key exactly as it is.
+///
+/// The same read-modify-write as every other targeted writer here
+/// ([`save_control_account`], [`save_group_membership`]): [`read_document`] then
+/// [`write_atomic`], never a whole-`Config` round trip, so nothing the server
+/// did not load is reverted. Every later server write keeps the key: the merge
+/// writers touch only their own fields, and the whole-file fallbacks serialize
+/// [`ProxyConfig::request_key`] from memory, which the server sets from this
+/// call's answer.
+pub fn save_request_key(path: &Path, candidate: &str) -> Result<RequestKeyWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let proxy = doc
+        .entry("proxy".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(proxy) = proxy else {
+        // A `proxy` that is not an object is a file `load` would already have
+        // refused, so this is unreachable from a booted server; refuse rather
+        // than overwrite it.
+        return Err(ConfigError::Parse(
+            <serde_json::Error as serde::de::Error>::custom(
+                "`proxy` in the config is not an object",
+            ),
+        ));
+    };
+    if let Some(existing) = proxy
+        .get("requestKey")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        return Ok(RequestKeyWrite::AlreadyPresent(existing.to_string()));
+    }
+    proxy.insert(
+        "requestKey".to_string(),
+        Value::String(candidate.to_string()),
+    );
+    write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    Ok(RequestKeyWrite::Written(candidate.to_string()))
+}
+
+/// The `proxy.requestKey` in the file at `path`, read without loading the rest
+/// of the config: `tcr request-key` must not run [`load`], which can rewrite
+/// the file (account renames). `Ok(None)` when the file holds none or an empty
+/// one.
+pub fn read_request_key(path: &Path) -> Result<Option<String>, ConfigError> {
+    let doc = read_document(path)?;
+    let Some(proxy) = doc.get("proxy") else {
+        return Ok(None);
+    };
+    let proxy: ProxyConfig = serde_json::from_value(proxy.clone())?;
+    Ok(proxy.request_key.filter(|key| !key.is_empty()))
 }
 
 /// Private recovery metadata stored beside a Codex account's current credentials.

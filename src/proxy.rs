@@ -667,6 +667,66 @@ pub struct SessionKey(pub u64);
 #[derive(Clone)]
 pub struct InterceptedHost(pub String);
 
+/// Stamped beside [`InterceptedHost`] when the tunnel's `CONNECT` carried the request key
+/// ([`crate::request_key::ProxyCredential`]). Like that one, no client can set it, so a request
+/// decrypted from a keyed tunnel is keyed without its headers being read again.
+#[derive(Clone, Copy)]
+pub struct TunnelKeyed;
+
+/// How one request stands against the request key, decided from what the listener stamped
+/// ([`TunnelKeyed`], [`InterceptedHost`]) before any header is read: a request decrypted from a
+/// tunnel was judged at its `CONNECT`, so only a plain request is parsed
+/// ([`crate::request_key::ProxyCredential::from_request_headers`]).
+fn request_keying(
+    extensions: &axum::http::Extensions,
+    headers: &HeaderMap,
+    request_key: Option<&str>,
+) -> crate::request_key::RequestKeying {
+    use crate::request_key::{ProxyCredential, RequestKeying};
+    if request_key.is_none() {
+        return RequestKeying::NoServerKey;
+    }
+    if extensions.get::<TunnelKeyed>().is_some() {
+        return RequestKeying::Keyed;
+    }
+    if extensions.get::<InterceptedHost>().is_some() {
+        return RequestKeying::CountedAtConnect;
+    }
+    let credential = ProxyCredential::from_request_headers(headers, request_key);
+    if credential.key_ok {
+        RequestKeying::Keyed
+    } else {
+        RequestKeying::Unkeyed(credential.user_agent)
+    }
+}
+
+/// The two proxy secrets a client may send this proxy: `proxy.apiKey` and the request key.
+/// Neither is a client identity (so [`stable_session_key`] skips an `x-api-key` equal to
+/// either) nor a credential for any other host (so [`build_passthrough_headers`] strips it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProxySecrets<'a> {
+    pub api_key: Option<&'a str>,
+    pub request_key: Option<&'a str>,
+}
+
+impl ProxySecrets<'_> {
+    /// No secret configured.
+    pub const NONE: ProxySecrets<'static> = ProxySecrets {
+        api_key: None,
+        request_key: None,
+    };
+
+    /// Is `value` one of these secrets? Constant-time per secret ([`key_matches`]); an
+    /// empty secret matches nothing.
+    pub fn contains(&self, value: Option<&str>) -> bool {
+        [self.api_key, self.request_key]
+            .into_iter()
+            .flatten()
+            .filter(|secret| !secret.is_empty())
+            .any(|secret| key_matches(value, secret))
+    }
+}
+
 /// A deterministic hash of `prefix` + `value`, used to derive a stable affinity
 /// key. What this needs to hold is DETERMINISM ACROSS PROCESSES, not just
 /// within one — pins now persist to disk and are restored at boot (see
@@ -832,7 +892,7 @@ fn codex_session_id(headers: &HeaderMap) -> Option<&str> {
 fn stable_session_key(
     headers: &HeaderMap,
     body: &[u8],
-    proxy_key: Option<&str>,
+    secrets: ProxySecrets<'_>,
     method: &Method,
     path: &str,
     client_is_loopback: bool,
@@ -855,12 +915,12 @@ fn stable_session_key(
         crate::provider::Provider::Anthropic => {}
     }
 
-    // The shared proxy secret is not a client identity — skip it so remote
-    // clients don't all collapse onto one account.
+    // A proxy secret (`proxy.apiKey` or the request key) is not a client identity —
+    // skip it so clients sharing it don't all collapse onto one account.
     let api_key = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .filter(|key| proxy_key != Some(*key))
+        .filter(|key| !secrets.contains(Some(key)))
         .map(|key| (stable_hash("key:", key), SessionKind::Stable));
 
     // A REMOTE client's key is its identity (tier 1 first). On LOOPBACK the
@@ -1813,6 +1873,14 @@ async fn status_handler(
     // not expect.
     let codex_upstream = manager.upstream_for(crate::provider::Provider::Codex);
     payload.codex_upstream = crate::config::non_default_codex_upstream(codex_upstream);
+    // Present only while the server holds a key: its presence is what a launcher
+    // reads as "this server understands keys" (see `StatusPayload::request_key_mode`).
+    if let Some(mode) = manager.request_key_mode() {
+        let (connects, requests) = manager.unkeyed().wire();
+        payload.request_key_mode = Some(mode.as_str().to_string());
+        payload.unkeyed_connects = Some(connects);
+        payload.unkeyed_requests = Some(requests);
+    }
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -3298,6 +3366,21 @@ async fn handle_request(
         }
     }
 
+    // The request key, log mode: decided once, counted when missing, never refused
+    // (`crate::request_key`). Where a later wave refuses, it refuses here.
+    if let crate::request_key::RequestKeying::Unkeyed(user_agent) =
+        request_keying(&parts.extensions, &req_headers, manager.request_key())
+    {
+        manager.unkeyed().record(
+            crate::request_key::Unkeyed::Request(crate::request_key::PathClass::of(&path)),
+            user_agent,
+            parts
+                .extensions
+                .get::<ClientAddr>()
+                .map_or(0, |addr| addr.0.port()),
+        );
+    }
+
     // 1a. Path shape. FIRST of the routing guards, because every one below it — the
     //     `/_tcr/` guard, the host guard, the relay classifier — decides on `path`,
     //     and this is the check that `path` still means upstream what it means here.
@@ -3702,7 +3785,7 @@ async fn handle_request(
         Some(_) => match stable_session_key(
             &req_headers,
             &body_bytes,
-            manager.proxy_api_key(),
+            manager.proxy_secrets(),
             &method,
             &path,
             client_is_loopback,
@@ -6141,7 +6224,7 @@ async fn handle_request(
 /// only on the *presented* key's length (attacker-controlled) and never reveals
 /// the configured key's length via timing. The length delta is folded into the
 /// accumulator so a matching-prefix but wrong-length key still compares unequal.
-fn key_matches(provided: Option<&str>, expected: &str) -> bool {
+pub(crate) fn key_matches(provided: Option<&str>, expected: &str) -> bool {
     let Some(provided) = provided else {
         return false;
     };
@@ -6246,6 +6329,8 @@ fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
         if name_str.starts_with(':')
             || is_request_hop_by_hop(name_str)
             || name_str == "x-api-key"
+            // The request key: a credential for this proxy, never for upstream.
+            || name_str == crate::request_key::HEADER
             || name_str == "authorization"
             || name_str == "accept-encoding"
             // This Mac's own routing marker, which upstream has no use for and
@@ -6585,11 +6670,12 @@ pub(crate) fn build_handed_bearer_headers(
 /// path. Contrast [`build_upstream_headers`], which strips exactly that header to
 /// make room for the pooled Bearer.
 ///
-/// The one header removed beyond that set is an `x-api-key` whose value equals the
-/// configured proxy key: that is OUR gate credential, not the client's upstream
-/// credential, and forwarding it hands the operator's secret to a third party. A
-/// client `x-api-key` that is NOT our key is the client's own and passes through.
-fn build_passthrough_headers(req_headers: &HeaderMap, proxy_key: Option<&str>) -> HeaderMap {
+/// Removed beyond that set: the request key header ([`crate::request_key::HEADER`]),
+/// and an `x-api-key` whose value equals either proxy secret ([`ProxySecrets`]).
+/// Those are OUR credentials, not the client's upstream credential, and forwarding
+/// one hands the operator's secret to a third party. A client `x-api-key` that is
+/// NOT one of ours is the client's own and passes through.
+fn build_passthrough_headers(req_headers: &HeaderMap, secrets: ProxySecrets<'_>) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in req_headers.iter() {
         // Named for what it is, not for a lowercasing this line does not do.
@@ -6598,12 +6684,11 @@ fn build_passthrough_headers(req_headers: &HeaderMap, proxy_key: Option<&str>) -
         if name_str.starts_with(':')
             || is_request_hop_by_hop(name_str)
             || name_str == "accept-encoding"
+            || name_str == crate::request_key::HEADER
         {
             continue;
         }
-        if name_str == "x-api-key"
-            && proxy_key.is_some_and(|expected| key_matches(value.to_str().ok(), expected))
-        {
+        if name_str == "x-api-key" && secrets.contains(value.to_str().ok()) {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -6759,7 +6844,7 @@ async fn relay_request(
 
     let headers = match mode {
         RelayMode::ClientCredential => {
-            build_passthrough_headers(req_headers, manager.proxy_api_key())
+            build_passthrough_headers(req_headers, manager.proxy_secrets())
         }
         RelayMode::Raw => build_raw_relay_headers(req_headers),
     };
@@ -8934,6 +9019,123 @@ mod tests {
         );
     }
 
+    const REQUEST_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// The request key is this proxy's credential: it reaches neither the pooled upstream
+    /// nor a passthrough relay, whatever value it carries. Watch it fail by dropping the
+    /// `crate::request_key::HEADER` arm from either builder.
+    #[test]
+    fn the_request_key_header_is_carried_neither_upstream_nor_through() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::request_key::HEADER,
+            HeaderValue::from_static("any-value-at-all"),
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let upstream = build_upstream_headers(&headers, "not-a-real-token");
+        let passthrough = build_passthrough_headers(
+            &headers,
+            ProxySecrets {
+                api_key: None,
+                request_key: Some(REQUEST_KEY),
+            },
+        );
+        for (out, which) in [(&upstream, "upstream"), (&passthrough, "passthrough")] {
+            assert!(
+                !out.contains_key(crate::request_key::HEADER),
+                "{which} carried the request key"
+            );
+            assert!(out.contains_key("anthropic-version"), "{which}");
+        }
+    }
+
+    /// A passthrough relay keeps the client's own `x-api-key` but drops one that IS the
+    /// request key, as it already dropped one that is `proxy.apiKey`.
+    #[test]
+    fn passthrough_drops_an_x_api_key_equal_to_the_request_key() {
+        let secrets = ProxySecrets {
+            api_key: Some("sk-proxy-secret"),
+            request_key: Some(REQUEST_KEY),
+        };
+        let carried = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", HeaderValue::from_static(value));
+            build_passthrough_headers(&headers, secrets).contains_key("x-api-key")
+        };
+        assert!(!carried(REQUEST_KEY), "the request key is ours");
+        assert!(!carried("sk-proxy-secret"), "proxy.apiKey is ours");
+        assert!(
+            carried("sk-ant-client-own-key"),
+            "the client's own key crosses"
+        );
+    }
+
+    /// An `x-api-key` that is the request key names no client, so session affinity skips it
+    /// exactly as it skips `proxy.apiKey`: a remote client keys on the body's `user_id`, or
+    /// on nothing.
+    #[test]
+    fn stable_session_key_skips_the_request_key() {
+        let secrets = ProxySecrets {
+            api_key: None,
+            request_key: Some(REQUEST_KEY),
+        };
+        let remote = |headers: &HeaderMap, body: &[u8]| {
+            stable_session_key(headers, body, secrets, &Method::POST, "/v1/messages", false)
+        };
+        assert_eq!(remote(&headers_with_api_key(REQUEST_KEY), b"{}"), None);
+        let body = br#"{"metadata":{"user_id":"user-123"}}"#;
+        assert_eq!(
+            remote(&headers_with_api_key(REQUEST_KEY), body),
+            remote(&HeaderMap::new(), body),
+        );
+        assert!(
+            remote(&headers_with_api_key("sk-team-alice"), b"{}").is_some(),
+            "any other key is still an identity"
+        );
+    }
+
+    /// One decision per request: a keyed tunnel's request is keyed without its headers, an
+    /// unkeyed tunnel's request was counted at its CONNECT, and only a plain request is read.
+    #[test]
+    fn request_keying_reads_the_tunnel_stamp_before_the_headers() {
+        use crate::request_key::{RequestKeying, UaFamily};
+        let mut curl = HeaderMap::new();
+        curl.insert("user-agent", HeaderValue::from_static("curl/8.7.1"));
+        let mut keyed = curl.clone();
+        keyed.insert(
+            crate::request_key::HEADER,
+            HeaderValue::from_static(REQUEST_KEY),
+        );
+
+        let plain = axum::http::Extensions::new();
+        let mut keyed_tunnel = axum::http::Extensions::new();
+        keyed_tunnel.insert(InterceptedHost("api.anthropic.com".to_string()));
+        keyed_tunnel.insert(TunnelKeyed);
+        let mut unkeyed_tunnel = axum::http::Extensions::new();
+        unkeyed_tunnel.insert(InterceptedHost("api.anthropic.com".to_string()));
+
+        assert_eq!(
+            request_keying(&plain, &curl, None),
+            RequestKeying::NoServerKey
+        );
+        assert_eq!(
+            request_keying(&plain, &curl, Some(REQUEST_KEY)),
+            RequestKeying::Unkeyed(UaFamily::Curl)
+        );
+        assert_eq!(
+            request_keying(&plain, &keyed, Some(REQUEST_KEY)),
+            RequestKeying::Keyed
+        );
+        assert_eq!(
+            request_keying(&keyed_tunnel, &curl, Some(REQUEST_KEY)),
+            RequestKeying::Keyed
+        );
+        assert_eq!(
+            request_keying(&unkeyed_tunnel, &curl, Some(REQUEST_KEY)),
+            RequestKeying::CountedAtConnect
+        );
+    }
+
     /// **A peer's own spelling of a hop-by-hop header does not decide whether
     /// it is stripped.**
     ///
@@ -9079,6 +9281,7 @@ mod tests {
             proxy: ProxyConfig {
                 port: 0,
                 api_key: api_key.map(str::to_string),
+                request_key: None,
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),
@@ -9144,7 +9347,10 @@ mod tests {
         stable_session_key(
             headers,
             body,
-            proxy_key,
+            ProxySecrets {
+                api_key: proxy_key,
+                request_key: None,
+            },
             &Method::POST,
             "/v1/messages",
             true,
@@ -9378,7 +9584,14 @@ mod tests {
     fn stable_session_key_prefers_api_key_over_user_id_for_a_remote_client() {
         let body = br#"{"metadata":{"user_id":"user-123"}}"#;
         let remote = |h: &HeaderMap, b: &[u8]| {
-            stable_session_key(h, b, None, &Method::POST, "/v1/messages", false)
+            stable_session_key(
+                h,
+                b,
+                ProxySecrets::NONE,
+                &Method::POST,
+                "/v1/messages",
+                false,
+            )
         };
         let with_key = remote(&headers_with_api_key("the-key"), body);
         let key_only = remote(&headers_with_api_key("the-key"), b"{}");
@@ -9609,7 +9822,7 @@ mod tests {
             stable_session_key(
                 &HeaderMap::new(),
                 PREFIX_ONLY_BODY,
-                None,
+                ProxySecrets::NONE,
                 &Method::POST,
                 "/v1/messages",
                 true,
@@ -9625,7 +9838,7 @@ mod tests {
             stable_session_key(
                 &HeaderMap::new(),
                 PREFIX_ONLY_BODY,
-                None,
+                ProxySecrets::NONE,
                 &Method::POST,
                 "/v1/messages/count_tokens",
                 true,
@@ -9641,7 +9854,7 @@ mod tests {
             stable_session_key(
                 &HeaderMap::new(),
                 PREFIX_ONLY_BODY,
-                None,
+                ProxySecrets::NONE,
                 &Method::POST,
                 "/v1/messages?beta=true",
                 true,
@@ -9657,7 +9870,7 @@ mod tests {
             stable_session_key(
                 &HeaderMap::new(),
                 PREFIX_ONLY_BODY,
-                None,
+                ProxySecrets::NONE,
                 &Method::GET,
                 "/v1/messages",
                 true,
@@ -9679,7 +9892,7 @@ mod tests {
             stable_session_key(
                 &HeaderMap::new(),
                 PREFIX_ONLY_BODY,
-                None,
+                ProxySecrets::NONE,
                 &Method::POST,
                 "/v1/messages",
                 false,
@@ -9700,7 +9913,7 @@ mod tests {
         let key = stable_session_key(
             &h,
             body,
-            None,
+            ProxySecrets::NONE,
             &Method::POST,
             "/backend-api/codex/responses",
             true,
@@ -9716,7 +9929,7 @@ mod tests {
         let again = stable_session_key(
             &h,
             b"other",
-            None,
+            ProxySecrets::NONE,
             &Method::POST,
             "/backend-api/codex/responses",
             true,
@@ -9732,7 +9945,7 @@ mod tests {
         let loopback = stable_session_key(
             &h,
             b"{}",
-            None,
+            ProxySecrets::NONE,
             &Method::POST,
             "/backend-api/codex/responses",
             true,
@@ -9740,7 +9953,7 @@ mod tests {
         let remote = stable_session_key(
             &h,
             b"{}",
-            None,
+            ProxySecrets::NONE,
             &Method::POST,
             "/backend-api/codex/responses",
             false,
@@ -9759,7 +9972,14 @@ mod tests {
     fn anthropic_requests_ignore_a_stray_session_id_header() {
         let mut h = HeaderMap::new();
         h.insert("session-id", HeaderValue::from_static("s-1"));
-        let key = stable_session_key(&h, b"{}", None, &Method::POST, "/v1/messages", true);
+        let key = stable_session_key(
+            &h,
+            b"{}",
+            ProxySecrets::NONE,
+            &Method::POST,
+            "/v1/messages",
+            true,
+        );
         assert_eq!(key, None);
     }
 
@@ -9779,7 +9999,7 @@ mod tests {
             let key = stable_session_key(
                 &h,
                 b"{}",
-                None,
+                ProxySecrets::NONE,
                 &Method::POST,
                 "/backend-api/codex/responses",
                 false,
@@ -24786,6 +25006,55 @@ mod tests {
         assert_eq!(
             raw["codex_traffic"],
             serde_json::json!({"refused10m": 0, "unpooled10m": 0})
+        );
+    }
+
+    /// **A server holding a request key says so, and counts the plain request that lacked
+    /// it**, serving it anyway (log mode). Without a key the status carries none of the three
+    /// fields, which is how a launcher tells an older server from this one.
+    #[tokio::test]
+    async fn the_status_document_reports_log_mode_and_counts_an_unkeyed_request() {
+        use tower::ServiceExt as _;
+        let plain = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+        let (_, _, body) = status_request(plain, Method::GET, Some(loopback_peer()), None).await;
+        let raw: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        for key in ["requestKeyMode", "unkeyedConnects", "unkeyedRequests"] {
+            assert!(raw.get(key).is_none(), "{key} without a key: {raw}");
+        }
+
+        let mut config = dummy_config(None, "http://127.0.0.1:1");
+        config.proxy.request_key = Some(REQUEST_KEY.to_string());
+        let manager = Manager::with_live_refresher(config, None);
+        // Refused locally by the path-shape guard, which sits after the count, so nothing
+        // goes upstream; the keyed one is the control.
+        for keyed in [false, true] {
+            let mut builder = Request::builder()
+                .method(Method::GET)
+                .uri("/v1/../models")
+                .header("user-agent", "curl/8.7.1");
+            if keyed {
+                builder = builder.header(crate::request_key::HEADER, REQUEST_KEY);
+            }
+            let mut req = builder.body(Body::empty()).expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback_peer()));
+            let response = app(Arc::clone(&manager))
+                .oneshot(req)
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let (_, _, body) = status_request(manager, Method::GET, Some(loopback_peer()), None).await;
+        let raw: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(raw["requestKeyMode"], "log", "{raw}");
+        assert_eq!(raw["unkeyedConnects"], serde_json::json!([]), "{raw}");
+        assert_eq!(
+            raw["unkeyedRequests"],
+            serde_json::json!([{"class": "v1-other", "userAgent": "curl", "count": 1}]),
+            "{raw}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains(REQUEST_KEY),
+            "the status never carries the key itself"
         );
     }
 

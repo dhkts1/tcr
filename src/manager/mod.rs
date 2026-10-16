@@ -1183,6 +1183,13 @@ pub struct Manager {
     /// through [`Self::upstream_for`]; `upstream` above stays the Anthropic origin.
     codex_upstream: String,
     proxy_api_key: Option<String>,
+    /// The request key ([`crate::request_key`]), a boot-time snapshot of
+    /// `proxy.requestKey` like `proxy_api_key` above. `None` holds no key, and then
+    /// nothing is counted and `requestKeyMode` is absent from the status.
+    request_key: Option<String>,
+    /// Callers that arrived without [`Self::request_key`]. Log mode only: counted,
+    /// never refused.
+    unkeyed: crate::request_key::UnkeyedCounters,
     global_threshold: f64,
     /// Override for the Fable weekly bucket alone — see
     /// [`crate::config::Config::fable_weekly_threshold`]. `None` means "use
@@ -1615,6 +1622,11 @@ impl Manager {
         let upstream = config.upstream.clone();
         let codex_upstream = config.codex_upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
+        let request_key = config
+            .proxy
+            .request_key
+            .clone()
+            .filter(|key| !key.is_empty());
         let global_threshold = config.switch_threshold;
         let fable_weekly_threshold = config.fable_weekly_threshold;
         let reserved_groups = config.reserved_group_names();
@@ -1728,6 +1740,8 @@ impl Manager {
             upstream,
             codex_upstream,
             proxy_api_key,
+            request_key,
+            unkeyed: crate::request_key::UnkeyedCounters::default(),
             global_threshold,
             fable_weekly_threshold,
             reserved_groups: RwLock::new(reserved_groups),

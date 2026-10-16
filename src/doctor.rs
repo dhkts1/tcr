@@ -1540,6 +1540,9 @@ mod tests {
             mitm: None,
             codex_traffic: None,
             codex_upstream: None,
+            request_key_mode: None,
+            unkeyed_connects: None,
+            unkeyed_requests: None,
         }
     }
 

@@ -587,6 +587,20 @@ fn write_priority(config_path: &Path, query: &str, value: i64) -> anyhow::Result
 /// (`Manager::persist_tokens`); the window where the two differ is the
 /// write itself. Read-only: a non-matching query errors with the file
 /// untouched, and nothing is logged — the token goes to stdout only.
+/// The request key in the config at `config_path`, for `tcr request-key`. Read
+/// only: generating one is the server's job at boot, so a launcher and the
+/// server can never hold two different keys. With none, an error that says so.
+pub fn request_key(config_path: &Path) -> anyhow::Result<String> {
+    let key = crate::config::read_request_key(config_path)
+        .with_context(|| format!("could not read {}", config_path.display()))?;
+    key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no request key in {}: the tcr server writes one there when it starts",
+            config_path.display()
+        )
+    })
+}
+
 pub fn print_access_token(config_path: &Path, query: &str) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let idx = resolve_account(&config.accounts, query)?;
@@ -4594,6 +4608,38 @@ mod tests {
     use crate::probe::{ProbeFuture, Usage, UsageBucket};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `tcr request-key` prints the key the file holds, and with none it fails with a line
+    /// that says the server writes one, and writes nothing itself.
+    #[test]
+    fn request_key_prints_the_saved_key_and_never_mints_one() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let keyed = dir.path().join("keyed.json");
+        fs::write(
+            &keyed,
+            r#"{"proxy": {"requestKey": "4444444444444444444444444444444444444444444444444444444444444444"}, "accounts": []}"#,
+        )
+        .expect("writes");
+        assert_eq!(
+            request_key(&keyed).expect("a saved key prints"),
+            "4444444444444444444444444444444444444444444444444444444444444444"
+        );
+
+        for body in [r#"{"accounts": []}"#, r#"{"proxy": {"requestKey": ""}}"#] {
+            let bare = dir.path().join("bare.json");
+            fs::write(&bare, body).expect("writes");
+            let err = request_key(&bare).expect_err("no key is an error");
+            assert!(
+                err.to_string().contains("writes one there when it starts"),
+                "{err}"
+            );
+            assert_eq!(
+                fs::read_to_string(&bare).expect("reads"),
+                body,
+                "the CLI never writes a key"
+            );
+        }
+    }
 
     /// A unique temp config path per call so parallel tests never collide.
     fn temp_config_path(tag: &str) -> std::path::PathBuf {
