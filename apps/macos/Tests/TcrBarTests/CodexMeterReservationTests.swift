@@ -3,11 +3,44 @@ import XCTest
 @testable import TcrBarCore
 
 final class CodexMeterReservationTests: XCTestCase {
-    func testMeterLabelsReserveReportedWindowsEvenWhenTheirRowsAreHidden() throws {
+    /// Every window the fleet reported is reserved, the Codex widest label included.
+    /// `panelLabels` takes no visibility input; that hidden rows still count is a fact of
+    /// its call site, which ``testTheTabSizesTheMetersFromTheWholeFleet()`` reads.
+    func testMeterLabelsReserveEveryReportedWindow() throws {
         let fleet = try fixture()
         let all = AccountLineFit.panelLabels(fleet.accounts)
-        // Visibility (spent, collapsed or kept open) is not an input to this reservation.
         XCTAssertEqual(all, ["5h", "7d", AccountLineFit.codexWidestLabel, "30d"])
+    }
+
+    /// The Accounts tab sizes its meters from every account in the fleet and its name
+    /// column from every row it can draw, never from the lines on screen: built from the
+    /// visible rows, collapsing a group, spending out a row or keeping a card open moved
+    /// every bar. The test target links TcrBarCore alone, so the tab is read as text,
+    /// comment lines dropped and whitespace removed.
+    func testTheTabSizesTheMetersFromTheWholeFleet() throws {
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // TcrBarTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // apps/macos
+            .appendingPathComponent("Sources/TcrBar/PanelV4/AccountsTabV4.swift")
+        let source = try String(contentsOf: file, encoding: .utf8)
+        let code = source.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined()
+            .components(separatedBy: .whitespacesAndNewlines).joined()
+        let start = try XCTUnwrap(
+            code.range(of: "privatevarliveLineFit:LiveLineFit{"),
+            "AccountsTabV4 has no liveLineFit — update this test's anchors")
+        let end = try XCTUnwrap(
+            code.range(of: "returnLiveLineFit(", range: start.upperBound..<code.endIndex))
+        let body = code[start.upperBound..<end.lowerBound]
+        let expected =
+            "letnames=AccountLineFit.lineNames(lists.flatMap(\\.sections))"
+            + "letlabels=AccountLineFit.panelLabels(fleet.accounts)"
+            + "letbar=V4.lineBarWidth(labels:labels)"
+        XCTAssertEqual(
+            String(body), expected,
+            "the meters or the name column are sized from something other than the whole fleet")
     }
 
     /// A Codex account's first probe can report a `30d` window while the panel
