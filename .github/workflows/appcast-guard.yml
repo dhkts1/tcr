@@ -127,7 +127,7 @@ concurrency:
 
 jobs:
   ensure-appcast:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # `workflow_run` fires on every conclusion (failure, cancelled, success); a
     # release that never finished building has no appcast to protect yet.
     #

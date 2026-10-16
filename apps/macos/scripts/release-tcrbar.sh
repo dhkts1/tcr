@@ -53,7 +53,7 @@
 #   APPLE_API_ISSUER_ID   the issuer id shown at the top of that page
 #   SPARKLE_ED_PRIVATE_KEY  Sparkle EdDSA private key (falls back to keychain)
 #   SPARKLE_SIGN_UPDATE   path to Sparkle's sign_update, if not discoverable
-#   RELEASE_REPO          owner/name for the GitHub Release (default: origin)
+#   RELEASE_REPO          owner/name for the GitHub Release (default: this checkout's origin)
 #
 # See docs/RELEASING.md for how each of those is produced.
 set -euo pipefail
@@ -524,7 +524,9 @@ main() {
   fi
 
   local repo
-  repo="${RELEASE_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)}"
+  # Resolved from this script's own checkout, never the caller's directory: `gh repo view`
+  # reads the cwd, so a release started from another repository waited on a release there.
+  repo="${RELEASE_REPO:-$(cd "$here" && gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)}"
   [ -n "$repo" ] || die "could not determine the GitHub repository; set RELEASE_REPO=owner/name."
 
   local dmg="$build_dir/$app_name-$version.dmg"

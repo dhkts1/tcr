@@ -284,7 +284,7 @@ One repository **variable** (not a secret) remains set, and should:
 
 ### The workflow still exists, and a tag run is not broken
 
-`.github/workflows/release-app.yml` runs on `macos-14` and still fires on `v*` tags. **Do not
+`.github/workflows/release-app.yml` runs on `macos-latest` and still fires on `v*` tags. **Do not
 "fix" it when a tag run shows a skipped signing job — that is the designed outcome.** A tag reaches
 a `check-signing-secrets` job, which finds all seven unset, writes a job summary saying so, and the
 signing job is **skipped** rather than failed. Setting only *some* of the seven is treated as a

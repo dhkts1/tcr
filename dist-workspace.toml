@@ -33,3 +33,13 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux
 [[dist.extra-artifacts]]
 artifacts = ["appcast.xml"]
 build = ["cp", "apps/macos/appcast.xml", "appcast.xml"]
+
+# Runner labels for the release jobs. dist's defaults pin image versions that GitHub
+# retires (macos-14, ubuntu-22.04), so name the moving labels instead. `global` is
+# the plan, global-artifacts, host and announce jobs. x86_64-apple-darwin keeps
+# dist's default Intel image, which builds it natively.
+[dist.github-custom-runners]
+global = "ubuntu-latest"
+aarch64-apple-darwin = "macos-latest"
+x86_64-unknown-linux-musl = "ubuntu-latest"
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
