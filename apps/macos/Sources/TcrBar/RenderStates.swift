@@ -466,9 +466,12 @@ enum RenderStates {
     }
 
     /// The Codex notes scenes 25d and 25f draw under a line, recorded against the rows
-    /// those scenes draw. Every other scene gets none, so a note an operator's own run
-    /// recorded never reaches a render.
-    private static func codexNotesFixture(for sceneName: String) -> CodexNotes {
+    /// those scenes draw, then opened on `fleet` as the shell opens the panel, which reads
+    /// each signed-out row's reason. Every other scene records none, so a note an
+    /// operator's own run recorded never reaches a render.
+    private static func codexNotesFixture(for sceneName: String, opening fleet: Fleet?)
+        -> CodexNotes
+    {
         var notes = CodexNotes()
         switch sceneName {
         case "25d-codex-relogin-refused":
@@ -479,6 +482,8 @@ enum RenderStates {
         default:
             break
         }
+        // Read as begun before every note was recorded, so the opening keeps them all.
+        if let fleet { notes.openedOn(fleet.accounts, pollBegan: .distantPast) }
         return notes
     }
 
@@ -1158,8 +1163,11 @@ enum RenderStates {
                 // Render mode never looks at this Mac's codex: `.absent`, except in
                 // the one scene that names a presence of its own.
                 codexPresence: seeds.presence,
-                // Empty, except in the two scenes that draw a note under a line.
-                codexNotes: CodexNoteStore(notes: codexNotesFixture(for: scene.name)),
+                // Empty, except in the two scenes that draw a note under a line,
+                // and opened on the scene's fleet, as the shell opens the panel,
+                // so a signed-out row's reason is read.
+                codexNotes: CodexNoteStore(
+                    notes: codexNotesFixture(for: scene.name, opening: scene.state.loadedFleet)),
                 codexBannerSnapshot: bannerSnapshot,
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),

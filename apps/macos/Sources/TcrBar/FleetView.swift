@@ -490,7 +490,6 @@ struct FleetView: View {
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
                 pruneKeptOpenCards()
-                reconcileCodexNotes()
             }
             syncPeersProvider()
         }
@@ -1029,7 +1028,8 @@ struct FleetView: View {
                     codexNote: account.provider == .codex
                         ? CodexCardFacts.noteLine(
                             reloginRefusal: codexNotes.notes.reloginRefusal(for: account.ref),
-                            loginError: account.loginError, codexHome: account.codexHome,
+                            loginError: codexNotes.notes.signedOutError(for: account.ref),
+                            codexHome: codexNotes.notes.signedOutCodexHome(for: account.ref),
                             groupAddWarning: codexNotes.notes.groupAddWarning(for: account.ref)
                         ).map(AccountRowNotice.init(codexNote:))
                         : nil)
@@ -2711,20 +2711,6 @@ struct FleetView: View {
         if peers.holdsCodex != holdsCodex {
             peers.holdsCodex = holdsCodex
         }
-    }
-
-    /// Drops every Codex note the poll that just landed has moved past: a refused
-    /// re-login once its row's state changes, a group add's warning once its row
-    /// leaves that group, and either once its row leaves the fleet. Only off a
-    /// loaded fleet, for the reason ``pruneKeptOpenCards()`` gives: a failed poll
-    /// says nothing about the rows, so it leaves every note as it was. With the
-    /// time that poll's read began, so a poll already under way when a group add
-    /// returned, which still lists the groups from before it, keeps that add's
-    /// warning.
-    private func reconcileCodexNotes() {
-        guard case .loaded(let fleet) = poller.state else { return }
-        let pollBegan = poller.lastPollBegan ?? .distantFuture
-        codexNotes.reconcile(with: fleet.accounts, pollBegan: pollBegan)
     }
 
     /// "Keep Card Open" / "Close Card": the line turns into the card, or the

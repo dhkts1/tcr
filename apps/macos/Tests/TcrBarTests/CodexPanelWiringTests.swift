@@ -44,6 +44,23 @@ final class CodexPanelWiringTests: XCTestCase {
         XCTAssertTrue(
             feed.contains("CodexCardFacts.noteLine("),
             "the notice feed no longer builds the Codex note from the row")
+        // Why a row is signed out comes from a poll, so the note reads what the opening
+        // read, never the row each poll brings: a poll inserted a wrapping note under an
+        // open panel's line and moved everything below it.
+        XCTAssertTrue(
+            feed.contains("loginError: codexNotes.notes.signedOutError(for: account.ref)"),
+            "the Codex note no longer reads the sign-out reason this opening read")
+        XCTAssertFalse(
+            feed.contains("account.loginError"), "the Codex note reads each poll's sign-out reason")
+        let onPoll = try slice(
+            fleetView, from: ".onChange(of: poller.lastPollAt) { _ in", to: "syncPeersProvider()")
+        XCTAssertFalse(
+            onPoll.contains("codexNotes") || onPoll.contains("reconcileCodexNotes"),
+            "a poll reconciles the Codex notes, which removes one under an open panel")
+        let shell = try source("apps/macos/Sources/TcrBar/MenuBarShell.swift")
+        let opened = try XCTUnwrap(shell.range(of: "codexNotes.openedOn(fleet,"))
+        let show = try XCTUnwrap(shell.range(of: "popover.show(relativeTo: button.bounds"))
+        XCTAssertLessThan(opened.lowerBound, show.lowerBound, "the shell decides the notes after the show")
         XCTAssertFalse(
             try source("apps/macos/Sources/TcrBar/PanelV4/AccountLineRow.swift")
                 .contains("notice.tone == .failure ?"),

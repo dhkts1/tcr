@@ -139,6 +139,44 @@ final class CodexNoteStoreTests: XCTestCase {
         XCTAssertEqual(store.notes, CodexNotes())
     }
 
+    /// Why a row is signed out comes from a poll, so it is read when the panel opens and
+    /// held for that opening: a poll that signs a row out, or signs it back in, moves no
+    /// note under its line until the next opening. On the old wiring the note was built from
+    /// each poll's row, and a wrapping note was inserted under an open panel's line.
+    func testASignedOutReasonIsReadAtOpeningAndHeldForIt() throws {
+        let signedIn = try fixtureAccount(named: "erin@example.com/codex") { $0["loginError"] = nil }
+        let signedOut = try fixtureAccount(named: "erin@example.com/codex") {
+            $0["loginError"] = "refresh_token_reused"
+        }
+        var notes = CodexNotes()
+        notes.openedOn([signedIn])
+        XCTAssertNil(notes.signedOutError(for: signedIn.ref))
+
+        // A poll signs erin out while the panel is open: nothing reads it until the opening.
+        notes.reconcile(with: [signedOut])
+        XCTAssertNil(notes.signedOutError(for: signedOut.ref))
+
+        notes.openedOn([signedOut])
+        XCTAssertEqual(notes.signedOutError(for: signedOut.ref), "refresh_token_reused")
+        XCTAssertEqual(notes.signedOutCodexHome(for: signedOut.ref), signedOut.codexHome)
+
+        // Signed back in by a poll: the note stays for this opening, and goes at the next.
+        notes.reconcile(with: [signedIn])
+        XCTAssertEqual(notes.signedOutError(for: signedIn.ref), "refresh_token_reused")
+        notes.openedOn([signedIn])
+        XCTAssertNil(notes.signedOutError(for: signedIn.ref))
+    }
+
+    /// A Claude row's refresh error is never read here: only a Codex row draws this note.
+    func testOnlyACodexRowsReasonIsRead() throws {
+        let alice = try fixtureAccount(named: "alice@example.com") {
+            $0["loginError"] = "invalid_grant"
+        }
+        var notes = CodexNotes()
+        notes.openedOn([alice])
+        XCTAssertNil(notes.signedOutError(for: alice.ref))
+    }
+
     // MARK: - Helpers
 
     /// One row of the canonical Codex fixture, decoded the way a poll is, after `edit`.

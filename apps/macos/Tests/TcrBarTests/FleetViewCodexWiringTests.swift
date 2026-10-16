@@ -122,7 +122,7 @@ final class FleetViewCodexWiringTests: XCTestCase {
     }
 
     /// A refused re-login and a group add's warning are kept under the account's line,
-    /// and each poll drops a note the fleet has moved past.
+    /// and each opening drops a note the fleet has moved past.
     func testTheCardNotesAreRecordedAndReconciled() throws {
         let source = try source(fleetView)
         XCTAssertTrue(
@@ -155,21 +155,21 @@ final class FleetViewCodexWiringTests: XCTestCase {
                 "FleetView.swift holds \(gone): a recorded note would never reach the line")
         }
 
-        let reconcile = try slice(
-            source, from: "private func reconcileCodexNotes() {", to: "private func toggleKeptOpen(")
-        for text in [
-            "guard case .loaded(let fleet) = poller.state else { return }",
-            "let pollBegan = poller.lastPollBegan",
-            "codexNotes.reconcile(with: fleet.accounts, pollBegan: pollBegan)",
-        ] {
-            XCTAssertTrue(
-                reconcile.contains(text),
-                "reconcileCodexNotes lost \(text): a failed poll would clear every note, no "
-                    + "poll would, or a poll begun before a group add would erase its warning")
-        }
+        // Reconciled at each opening, by the shell, never by a poll under an open panel:
+        // a note a poll removed moved every line below it. Off the loaded fleet only, so a
+        // failed poll clears nothing, and with the time its read began, so a read begun
+        // before a group add keeps that add's warning.
+        let shell = try self.source("apps/macos/Sources/TcrBar/MenuBarShell.swift")
+        XCTAssertTrue(
+            shell.contains("if case .loaded(let loaded) = poller.state { fleet = loaded }"),
+            "the opening no longer decides from the loaded fleet alone")
+        XCTAssertTrue(
+            shell.contains(
+                "codexNotes.openedOn(fleet, pollBegan: poller.lastPollBegan ?? .distantFuture)"),
+            "no opening reconciles the notes, or it lost the time its read began")
         let poll = try slice(
             source, from: ".onChange(of: poller.lastPollAt)", to: ".confirmationDialog(")
-        XCTAssertTrue(poll.contains("reconcileCodexNotes()"), "no poll reconciles the notes")
+        XCTAssertFalse(poll.contains("codexNotes"), "a poll reconciles the notes under an open panel")
         XCTAssertTrue(poll.contains("pruneKeptOpenCards()"))
     }
 

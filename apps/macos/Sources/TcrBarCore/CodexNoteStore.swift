@@ -7,7 +7,13 @@ import Foundation
 /// refused re-login writes nothing, so nothing that tcr reports would say why it failed:
 /// once the sheet closed, the account's line would read `re-login` with no reason. A group
 /// add's warning is stderr from a command that succeeded, which nothing else keeps either.
-/// Each note clears once the row it was about has moved on, which each poll reconciles.
+/// Each note clears once the row it was about has moved on.
+///
+/// It also says why a Codex account is signed out, from the refresh error the server
+/// reports. That one comes from a poll rather than a click, so it is read at each opening
+/// and held for it (``openedOn(_:pollBegan:)``), and the clearing is done there too: a
+/// poll that inserted or removed a wrapping note under a line moved every line and group
+/// below it while the panel was open. A click's own note still shows at once.
 public struct CodexNotes: Equatable, Sendable {
     /// A refusal, with the row's state when it came back.
     private struct Refusal: Equatable, Sendable {
@@ -23,10 +29,39 @@ public struct CodexNotes: Equatable, Sendable {
         let recordedAt: Date
     }
 
+    /// A signed-out row's refresh error and import folder, as the opening read them.
+    private struct SignedOut: Equatable, Sendable {
+        let loginError: String
+        let codexHome: String?
+    }
+
     private var refusals: [AccountRef: Refusal] = [:]
     private var warnings: [AccountRef: Warning] = [:]
+    private var signedOut: [AccountRef: SignedOut] = [:]
 
     public init() {}
+
+    /// What this opening draws: every note the fleet has moved past is dropped
+    /// (``reconcile(with:pollBegan:)``), and each Codex row's refresh error is read and held
+    /// until the next opening.
+    public mutating func openedOn(_ accounts: [Account], pollBegan: Date = .distantFuture) {
+        reconcile(with: accounts, pollBegan: pollBegan)
+        signedOut = [:]
+        for account in accounts where account.provider == .codex {
+            guard let loginError = account.loginError, !loginError.isEmpty else { continue }
+            signedOut[account.ref] = SignedOut(loginError: loginError, codexHome: account.codexHome)
+        }
+    }
+
+    /// The refresh error this opening read for the row, or `nil`.
+    public func signedOutError(for account: AccountRef) -> String? {
+        signedOut[account]?.loginError
+    }
+
+    /// The import folder this opening read beside the row's refresh error, or `nil`.
+    public func signedOutCodexHome(for account: AccountRef) -> String? {
+        signedOut[account]?.codexHome
+    }
 
     /// Keep tcr's reason for refusing this row's re-login, with the row's `status` and
     /// `loginError` as they are now: a change to either means the refusal is out of date.
@@ -90,11 +125,21 @@ public final class CodexNoteStore: ObservableObject {
         notes.recordGroupAddNotice(notice, group: group, for: account, at: recordedAt)
     }
 
-    /// Reconciled on a copy, and published only when a note went: every poll calls this,
-    /// with the time its read began (``CodexNotes/reconcile(with:pollBegan:)``).
+    /// Reconciled on a copy, and published only when a note went, with the time the read
+    /// began (``CodexNotes/reconcile(with:pollBegan:)``).
     public func reconcile(with accounts: [Account], pollBegan: Date = .distantFuture) {
         var next = notes
         next.reconcile(with: accounts, pollBegan: pollBegan)
+        if next != notes { notes = next }
+    }
+
+    /// The notes this opening draws, decided by the shell before it shows the panel
+    /// (``CodexNotes/openedOn(_:pollBegan:)``). `nil` when no fleet is loaded, which says
+    /// nothing about the rows and leaves every note as it was.
+    public func openedOn(_ fleet: Fleet?, pollBegan: Date = .distantFuture) {
+        guard let fleet else { return }
+        var next = notes
+        next.openedOn(fleet.accounts, pollBegan: pollBegan)
         if next != notes { notes = next }
     }
 }

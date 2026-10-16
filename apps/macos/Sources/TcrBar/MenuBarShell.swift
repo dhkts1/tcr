@@ -874,6 +874,10 @@ final class MenuBarShell {
         codexBannerSnapshot.decideAtOpen(
             fleet: fleet, bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,
             codexProcesses: { CodexProcesses.readLive() })
+        // The notes under Codex lines a poll decides (why a row is signed out,
+        // and which notes the fleet has moved past), for the same reason: a
+        // wrapping note a poll inserted or removed moved every line below it.
+        codexNotes.openedOn(fleet, pollBegan: poller.lastPollBegan ?? .distantFuture)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
