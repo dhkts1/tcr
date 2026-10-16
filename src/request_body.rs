@@ -414,7 +414,7 @@ impl<'de> Scan<'de> {
         let affinity_ok = meta.is_some() && !self.duplicated(&[METADATA, SYSTEM, TOOLS]);
         let affinity_user_id = affinity_ok.then(user_id).flatten();
         let affinity_prefix =
-            affinity_ok.then(|| (self.system.and_then(&span), self.tools.and_then(&span)));
+            affinity_ok.then(|| (self.system.and_then(span), self.tools.and_then(span)));
 
         // The session peek: `metadata`, `messages`, `previous_message_id`, `thread`.
         #[derive(serde::Deserialize)]
