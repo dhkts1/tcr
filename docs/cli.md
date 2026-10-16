@@ -169,18 +169,48 @@ A value **you** exported is inherited untouched: an explicit choice wins, and it
 escape hatch for a `claude` with no claude.ai login of its own, which does need some
 credential to start. The process exits with `claude`'s own exit code.
 
-**A proxy that holds no Claude account.** When the config holds a Codex account and no Claude
-account, in any state, `tcr run` asks the running proxy once which accounts it holds before it
-launches `claude`, and warns when that proxy lists Codex accounts and no Claude one, since it
-will refuse every request the session sends:
+**A proxy that holds no Claude account.** With the proxy up, `tcr run` reads its status once
+before it launches `claude` (the same read decides [the request key](#the-request-key-on-a-launch)).
+When the config holds a Codex account and no Claude account, in any state, and that proxy lists
+Codex accounts and no Claude one, it warns, since the proxy will refuse every request the session
+sends:
 
 ```
 [tcr] warning: the proxy on :3456 holds no Claude account, so it will refuse every request from this session — add one with `tcr login`
 ```
 
-A config that holds a Claude account makes no such read and prints nothing new, and a status that
-cannot be read prints nothing. So a proxy started from another config, or whose accounts changed
-since, can miss the warning.
+A config that holds a Claude account prints nothing new, and a status that cannot be read prints
+no warning. So a proxy started from another config, or whose accounts changed since, can miss it.
+
+### The request key on a launch
+
+`tcr run` presents the [request key](configuration.md#proxyrequestkey-who-launched-this-caller),
+so the proxy can tell the sessions it launched from a caller it did not. It sends the key only
+to a server whose status reports `requestKeyMode`
+([the request key on `GET /_tcr/status`](#the-request-key-on-get-_tcrstatus)). An older server
+compares the whole `Proxy-Authorization` header with the bare Codex marker, so a keyed
+`tcr-codex` URL would quietly run unpooled there.
+
+| launch | without the key | with it |
+|---|---|---|
+| Claude, see-through | `HTTPS_PROXY=http://127.0.0.1:<port>` | `HTTPS_PROXY=http://tcr:<key>@127.0.0.1:<port>` |
+| Claude, base-URL | `ANTHROPIC_CUSTOM_HEADERS` as you set it | `x-tcr-key: <key>` appended after your headers and `--group`'s |
+| `--codex` | `HTTPS_PROXY=http://tcr-codex@127.0.0.1:<port>` | `HTTPS_PROXY=http://tcr-codex:<key>@127.0.0.1:<port>` |
+| `--codex` shell tools | `http://127.0.0.1:<port>` | `http://tcr:<key>@127.0.0.1:<port>` |
+
+`https_proxy` always matches `HTTPS_PROXY`. The key comes from `proxy.requestKey` in the config
+`tcr run` reads; `tcr run` never writes one. When it launches without the key it says why, in one
+line: the config holds none, it holds a character a proxy URL cannot carry as written, the status
+could not be read, or the server does not report `requestKeyMode`:
+
+```
+[tcr] launching without the request key: the tcr on :3456 does not report requestKeyMode, so it predates request keys or holds none; a restart of it picks them up
+```
+
+No line prints the key. The banners show it as `***`
+(`tunnelling via http://tcr:***@127.0.0.1:3456`). The child's environment does hold it, as it holds
+any proxy URL, so a process of the same user can read it there. The Codex shell-tool URL also
+goes on `codex`'s command line, which any local user can read with `ps`.
 
 A Claude launch leaves `CODEX_CA_CERTIFICATE` unchanged. A `codex` started by a Claude tool
 inherits an unmarked proxy URL, keeps its CA choice and stays on its own login: tcr tunnels
@@ -219,7 +249,8 @@ Codex account to serve the session; add one with
 **See-through, or not routed at all.** tcr has no base-URL route for `codex` yet. A pooled
 launch leaves `codex` on its own backend URL, which is the real `https://chatgpt.com` for every
 login tcr pools, sets `HTTPS_PROXY` and `https_proxy` to
-`http://tcr-codex@127.0.0.1:<port>`, and sets
+`http://tcr-codex@127.0.0.1:<port>` (`http://tcr-codex:<key>@…` with
+[the request key](#the-request-key-on-a-launch)), and sets
 `CODEX_CA_CERTIFICATE` to the selected caller bundle, or tcr's CA at `~/.config/tcr-ca.pem`
 when neither extra-CA variable is set.
 The selected caller bundle (`CODEX_CA_CERTIFICATE`, else `SSL_CERT_FILE`) is preserved
@@ -240,7 +271,8 @@ launch says so on stderr:
 ```
 
 The launch also supplies `shell_environment_policy.set.HTTPS_PROXY` and
-`shell_environment_policy.set.https_proxy` overrides with the unmarked loopback URL. Ordinary
+`shell_environment_policy.set.https_proxy` overrides with the unmarked loopback URL, carrying the
+request key as the `tcr` user's password when the launch sends it. Ordinary
 Codex shell tools such as curl, Python and git then tunnel `chatgpt.com` on their own TLS and
 credentials. These two launch overrides replace any proxy values in the config file's shell
 policy while preserving other keys and filters; later explicit `-c` arguments can override
@@ -251,7 +283,9 @@ child environment and restores an allowlist. Explicit MCP `env_vars` can opt bac
 inheriting them. Codex hooks inherit its session environment, so they can also carry the
 marker. Give those helpers unmarked `HTTPS_PROXY` and `https_proxy` values, rather than
 forwarding the marked values. For a shell-based hook, prefix the command with
-`HTTPS_PROXY=http://127.0.0.1:<port> https_proxy=http://127.0.0.1:<port>`.
+`HTTPS_PROXY=http://127.0.0.1:<port> https_proxy=http://127.0.0.1:<port>`, or, so the proxy
+counts it as launched on purpose, with `http://tcr:<key>@127.0.0.1:<port>` in both, the key from
+[`tcr request-key`](#tcr-request-key).
 
 The checked Codex source is [`rmcp-client/src/utils.rs`](https://github.com/openai/codex/blob/e89b7c442c0433ad5167e72a5a25bb6d0712766a/codex-rs/rmcp-client/src/utils.rs),
 [`utils/pty/src/child_command.rs`](https://github.com/openai/codex/blob/e89b7c442c0433ad5167e72a5a25bb6d0712766a/codex-rs/utils/pty/src/child_command.rs), and
