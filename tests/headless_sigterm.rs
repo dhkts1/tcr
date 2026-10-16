@@ -125,9 +125,9 @@ fn wait_for_line(
 /// timing-sensitive path: the test waits on a channel fed by a reader thread,
 /// and a heavily loaded box can miss the window (observed once on 2026-09-13,
 /// alongside a wedged sccache and three concurrent release builds; 0/3 in
-/// isolation afterwards). The durable log is written synchronously by
-/// `RollingFileAppender` with no background worker, so it does not share that
-/// window.
+/// isolation afterwards). The durable log is read only after the process has
+/// exited, and a clean exit drains the log writer's queue to disk first
+/// (`src/file_log.rs`), so it does not share that window.
 ///
 /// This does NOT weaken the assertion. The question is "did the process log
 /// this", and the answer is yes if EITHER source has it. A line the process

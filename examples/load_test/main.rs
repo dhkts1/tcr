@@ -187,6 +187,10 @@ const MB: f64 = 1024.0 * 1024.0;
 
 /// Rest between the warm-up and a throttled phase.
 const SETTLE: Duration = Duration::from_secs(10);
+/// How long the proxy's log must go without growing before the phase's offset is read.
+const LOG_QUIET: Duration = Duration::from_millis(500);
+/// The most the harness waits for that; an idle proxy's log is quiet well inside it.
+const LOG_QUIET_LIMIT: Duration = Duration::from_secs(10);
 
 async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let name = a.phase.as_str();
@@ -257,7 +261,24 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     };
     let (cpu0, rss_boot) = refresh(&mut sys).context("the test proxy vanished before the phase")?;
     let load0 = System::load_average();
-    let log_offset = proxy.log_text()?.len();
+    // The proxy writes its log on a background thread fed by a queue (`src/file_log.rs`), so the
+    // warm-up's last `request usage` lines can land a moment after its replies. Read the offset
+    // once the file has stopped growing, or those lines are counted as the phase's (measured:
+    // up to all 16 of the `overhead` warm-up's).
+    let log_offset = {
+        let deadline = Instant::now() + LOG_QUIET_LIMIT;
+        let mut len = proxy.log_text()?.len();
+        let mut unchanged_since = Instant::now();
+        while unchanged_since.elapsed() < LOG_QUIET && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = proxy.log_text()?.len();
+            if now != len {
+                len = now;
+                unchanged_since = Instant::now();
+            }
+        }
+        len
+    };
 
     // Peak RSS, sampled every 250 ms for the life of the phase.
     let stop = Arc::new(AtomicBool::new(false));
@@ -347,14 +368,16 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
             eprintln!("[load-test] sample exited {status} for {name}");
         }
     }
+    // Read after the drain: a clean stop writes out whatever the log's queue still held, so the
+    // phase's last lines are on disk only once the proxy has exited.
+    proxy.stop()?;
     let log = proxy.log_text()?;
     let phase_log = log
         .get(log_offset..)
         .context("the proxy's log shrank during the phase")?;
     let waits = stats::throttle_waits(phase_log);
-    proxy.stop()?;
-    // The whole log beside the report, written after the drain so it ends with the shutdown.
-    std::fs::write(a.out.join(format!("{name}.proxy.log")), proxy.log_text()?)?;
+    // The whole log beside the report, ending with the shutdown.
+    std::fs::write(a.out.join(format!("{name}.proxy.log")), &log)?;
 
     let served = records.iter().filter(|r| r.ok).count();
     let mut statuses = BTreeMap::new();
