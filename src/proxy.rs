@@ -742,40 +742,16 @@ fn stable_hash(prefix: &str, value: &str) -> u64 {
     hasher.finish()
 }
 
-/// Combined single-pass peek for [`stable_session_key`]: the body's top-level
-/// `metadata.user_id` (tier 2) and its `system`/`tools` fields (tier 3's
-/// cacheable prefix), read with ONE `serde_json::from_slice` instead of one
-/// per tier — the two used to be independent structs (`MetadataPeek` /
-/// `PrefixPeek`), each parsing the same bytes again.
-///
-/// `system`/`tools` are `&RawValue`, so the returned slices borrow the
-/// VERBATIM source bytes out of `body` rather than a re-serialized copy (same
-/// technique as `account_uuid.rs`'s `BodyPeek`). That verbatim-ness is
-/// load-bearing for tier 3: see [`prefix_session_key`].
-#[derive(serde::Deserialize)]
-struct SessionKeyPeek<'a> {
-    metadata: Option<UserIdMeta>,
-    #[serde(borrow)]
-    system: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
-    tools: Option<&'a serde_json::value::RawValue>,
-}
-
-#[derive(serde::Deserialize)]
-struct UserIdMeta {
-    user_id: Option<String>,
-}
-
 /// Tier 3 of [`stable_session_key`]: derive a fallback affinity key from the
-/// request's cacheable prefix — its already-parsed `system`/`tools` fields
-/// (see [`SessionKeyPeek`]) — when the client carries no stable identity at
+/// request's cacheable prefix, the exact text of its `system` and `tools` in the
+/// forwarded body ([`crate::request_body::RequestBody::affinity_prefix`]), when the client carries no stable identity at
 /// all. Returns `None` when BOTH are absent — there is then no cacheable
 /// prefix, so a pin buys no cache win and only concentrates unrelated
 /// anonymous traffic onto one account. This is the guard that stops every
 /// trivial anonymous request (no system prompt, no tools) from piling onto a
 /// single account; do not drop it.
 ///
-/// Hashes the RAW bytes of each field via `RawValue::get()` — never
+/// Hashes the RAW bytes of each field, exactly as they sit in the body — never
 /// canonicalized — namespaced under `"pfx:"` so this input space cannot collide
 /// with the `"sid:"` / `"key:"` / `"uid:"` tiers. `system` and `tools` are hashed as
 /// `Option<&str>` (not concatenated into one string) so presence/absence of
@@ -794,18 +770,15 @@ struct UserIdMeta {
 /// wrong in the other pins traffic that was never going to hit cache. Omitted;
 /// revisit only with either a real tokenizer in this process or a measured
 /// bytes-per-token ratio from live traffic to ground the constant.
-fn prefix_session_key(
-    system: Option<&serde_json::value::RawValue>,
-    tools: Option<&serde_json::value::RawValue>,
-) -> Option<u64> {
+fn prefix_session_key(system: Option<&str>, tools: Option<&str>) -> Option<u64> {
     if system.is_none() && tools.is_none() {
         return None;
     }
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     "pfx:".hash(&mut hasher);
-    system.map(|v| v.get()).hash(&mut hasher);
-    tools.map(|v| v.get()).hash(&mut hasher);
+    system.hash(&mut hasher);
+    tools.hash(&mut hasher);
     Some(hasher.finish())
 }
 
@@ -891,7 +864,7 @@ fn codex_session_id(headers: &HeaderMap) -> Option<&str> {
 /// key — display provenance only, never a routing input.
 fn stable_session_key(
     headers: &HeaderMap,
-    body: &[u8],
+    body: &crate::request_body::RequestBody,
     secrets: ProxySecrets<'_>,
     method: &Method,
     path: &str,
@@ -938,15 +911,9 @@ fn stable_session_key(
         }
     }
 
-    // ONE parse serves both tier 2 (`metadata.user_id`) and tier 3
-    // (`system`/`tools`) — see [`SessionKeyPeek`].
-    let peek = serde_json::from_slice::<SessionKeyPeek>(body).ok();
-
-    if let Some(user_id) = peek
-        .as_ref()
-        .and_then(|p| p.metadata.as_ref())
-        .and_then(|m| m.user_id.as_deref())
-    {
+    // Tier 2 (`metadata.user_id`) and tier 3 (`system`/`tools`) read the request's
+    // one parse; see [`crate::request_body`].
+    if let Some(user_id) = body.affinity_user_id() {
         return Some((stable_hash("uid:", user_id), SessionKind::Stable));
     }
     if let Some(key) = api_key {
@@ -959,8 +926,8 @@ fn stable_session_key(
     if !client_is_loopback || *method != Method::POST || path != "/v1/messages" {
         return None;
     }
-    let peek = peek?;
-    prefix_session_key(peek.system, peek.tools).map(|key| (key, SessionKind::Prefix))
+    let (system, tools) = body.affinity_prefix()?;
+    prefix_session_key(system, tools).map(|key| (key, SessionKind::Prefix))
 }
 
 /// Path of the read-only live-status endpoint [`status_handler`] serves.
@@ -3608,119 +3575,80 @@ async fn handle_request(
         );
     };
 
-    // Every cache breakpoint asks for the 1-hour window from here on, BEFORE
-    // anything below reads the body: the pin's warm window (`note_affinity_ttl`),
-    // the ledger's 5m/1h split and the upstream request all see the body as sent.
-    // A longer body is fine: `build_upstream_headers` strips content-length.
-    // `None` means nothing to change and the client's bytes go out untouched.
+    // The body is parsed ONCE, here, into every answer the rest of the handler reads
+    // from it: the model, the wire session and its tool events, the account-bound
+    // tokens, the affinity key's inputs, the extended-cache-window answer and the
+    // account-uuid splice point. See `crate::request_body` for why one walk, and how
+    // each answer stays the one its old separate parse gave.
+    //
+    // The same walk sets every cache breakpoint to the 1-hour window, BEFORE anything
+    // below reads the body: the pin's warm window (`note_affinity_ttl`), the ledger's
+    // 5m/1h split and the upstream request all see the body as sent. A longer body is
+    // fine: `build_upstream_headers` strips content-length. With nothing to change, the
+    // client's bytes go out untouched.
     //
     // Anthropic only. The 1-hour window is an Anthropic prompt-cache fact, and a
     // Codex body is forwarded byte for byte: it is usually zstd, and an
     // uncompressed one carrying a `cache_control` key in `tools` would otherwise be
     // re-serialized here.
-    let body_bytes = match provider {
-        crate::provider::Provider::Anthropic if manager.cache_ttl_rewrite_enabled() => {
-            match crate::cache_ttl::extend_all_ttls(&body_bytes) {
-                Some(rewritten) => {
-                    tracing::debug!(
-                        before = body_bytes.len(),
-                        after = rewritten.len(),
-                        "cache-ttl: breakpoints rewritten to 1h"
-                    );
-                    bytes::Bytes::from(rewritten)
-                }
-                None => body_bytes,
-            }
-        }
-        crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => body_bytes,
+    //
+    // A body that fails to parse yields "no model, no session, no tool events" rather
+    // than rejecting the request: these are peeks, never a validation gate.
+    let rewrite_ttl = match provider {
+        crate::provider::Provider::Anthropic => manager.cache_ttl_rewrite_enabled(),
+        crate::provider::Provider::Codex => false,
     };
+    let request = crate::request_body::RequestBody::parse(body_bytes, rewrite_ttl);
+    if let Some(before) = request.rewritten_from() {
+        tracing::debug!(
+            before,
+            after = request.bytes().len(),
+            "cache-ttl: breakpoints rewritten to 1h"
+        );
+    }
+    let body_bytes = request.bytes().clone();
 
-    // Parse the request's target model ONCE — it is constant across the rotation
-    // loop, and drives per-model (Fable-aware) account selection below.
-    let request_model = crate::model::parse_request_model(&body_bytes);
+    // The request's target model: constant across the rotation loop, and drives
+    // per-model (Fable-aware) account selection below.
+    let request_model = request.model().map(str::to_string);
 
-    // F1 (`docs/design/panel-tabs.md`): the Claude Code
-    // session id embedded in `metadata.user_id`, plus any `tool_use`/`tool_result` blocks in
-    // the LAST TWO messages — parsed ONCE per request, independent of whether session
-    // affinity is on (unlike `stable_session_key`'s peek below, which only runs when the
-    // `SessionKey` extension is present). `RequestSessionPeek` borrows `messages` as a
-    // `RawValue` rather than materializing the whole conversation — see `session_wire.rs`'s
-    // module doc. A body that fails to parse here yields "no session, no tool events" rather
-    // than rejecting the request: this is an observability peek, never a validation gate.
-    // The fourth value is NOT observability: `bound` is every account-bound token this
-    // conversation carries — advisor ids, thinking signatures, redacted-thinking payloads and
-    // any thread `previous_message_id` — and it decides which account may serve this request,
-    // see `crate::bound_tokens` and the bench below. Scanned from the same borrowed `messages`
-    // in the same pass, over ALL messages rather than the tail window the tool events use,
-    // because the block that binds the conversation was minted on its FIRST turn.
+    // F1 (`docs/design/panel-tabs.md`): the Claude Code session id embedded in
+    // `metadata.user_id`, plus the `tool_use`/`tool_result` blocks of the newest turn,
+    // read independent of whether session affinity is on. The fourth value is NOT
+    // observability: `bound` is every account-bound token this conversation carries
+    // (advisor ids, thinking signatures, redacted-thinking payloads, and any thread
+    // `previous_message_id`) and it decides which account may serve this request, see
+    // `crate::bound_tokens`. It covers ALL messages rather than the tail window the tool
+    // events use, because the block that binds the conversation was minted on its FIRST
+    // turn.
+    //
+    // `diagnostics.previous_message_id` is deliberately NOT read. Claude Code sends it
+    // when it has just given up on a thread and is replaying the full history as a new
+    // one (`thread: {type: "create"}`), so it names no state the request depends on, and
+    // binding on it pins the RECOVERY request to the account that just failed it. Zero
+    // upstream rejections named it over 2026-09-19..22.
     let (wire_session_id, wire_tool_uses, wire_tool_results, bound) = {
-        #[derive(serde::Deserialize)]
-        struct RequestSessionPeek<'a> {
-            metadata: Option<RequestSessionMeta>,
-            #[serde(borrow)]
-            messages: Option<&'a serde_json::value::RawValue>,
-            /// Server-side thread state, named at the top level…
-            previous_message_id: Option<String>,
-            /// …or under `thread`, which is where Claude Code sends it: `thread: {type:
-            /// "continue", previous_message_id}` with only the new messages. The first sighting
-            /// of each path is logged (see `note_previous_message_id_path`).
-            ///
-            /// `diagnostics.previous_message_id` is deliberately NOT read. Claude Code sends it
-            /// when it has just given up on a thread and is replaying the full history as a new
-            /// one (`thread: {type: "create"}`), so it names no state the request depends on,
-            /// and binding on it pins the RECOVERY request to the account that just failed it.
-            /// Zero upstream rejections named it over 2026-09-19..22.
-            thread: Option<PreviousMessagePeek>,
-        }
-        #[derive(serde::Deserialize)]
-        struct RequestSessionMeta {
-            user_id: Option<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct PreviousMessagePeek {
-            previous_message_id: Option<String>,
-        }
-        match serde_json::from_slice::<RequestSessionPeek>(&body_bytes) {
-            Ok(peek) => {
-                let session_id = peek
-                    .metadata
-                    .and_then(|m| m.user_id)
-                    .and_then(|blob| crate::session_wire::extract_session_id(&blob));
-                let (uses, results) = peek
-                    .messages
-                    .map(crate::session_wire::extract_tool_events)
-                    .unwrap_or_default();
-                let mut bound = peek
-                    .messages
-                    .map(crate::session_wire::extract_bound_tokens)
-                    .unwrap_or_default();
-                for (path, id) in [
-                    ("previous_message_id", peek.previous_message_id),
-                    (
-                        "thread.previous_message_id",
-                        peek.thread.and_then(|t| t.previous_message_id),
-                    ),
-                ] {
-                    let Some(id) = id else {
-                        continue;
-                    };
-                    note_previous_message_id_path(path);
-                    // Thread state is bound exactly as a signature is, and it binds even when
-                    // this process never saw the response that created it.
-                    bound.carries_bound_history = true;
-                    if !bound.tokens.contains(&id) {
-                        bound.tokens.push(id);
-                    }
-                }
-                (session_id, uses, results, bound)
+        let wire = request.wire();
+        let mut bound = wire.bound.clone();
+        // Server-side thread state, named at the top level or under `thread`, which is
+        // where Claude Code sends it: `thread: {type: "continue", previous_message_id}`
+        // with only the new messages. The first sighting of each path is logged (see
+        // `note_previous_message_id_path`).
+        for (path, id) in &wire.previous_message_ids {
+            note_previous_message_id_path(path);
+            // Thread state is bound exactly as a signature is, and it binds even when
+            // this process never saw the response that created it.
+            bound.carries_bound_history = true;
+            if !bound.tokens.contains(id) {
+                bound.tokens.push(id.clone());
             }
-            Err(_) => (
-                None,
-                Vec::new(),
-                Vec::new(),
-                crate::session_wire::BoundHistory::default(),
-            ),
         }
+        (
+            wire.session_id.clone(),
+            wire.tool_uses.clone(),
+            wire.tool_results.clone(),
+            bound,
+        )
     };
     // A Codex request names its conversation in the `session-id` header, the key affinity
     // already pins on. Its body is usually zstd, so the peek above read nothing from it, and
@@ -3784,7 +3712,7 @@ async fn handle_request(
     let (session_key, session_kind) = match parts.extensions.get::<SessionKey>() {
         Some(_) => match stable_session_key(
             &req_headers,
-            &body_bytes,
+            &request,
             manager.proxy_secrets(),
             &method,
             &path,
@@ -3798,26 +3726,17 @@ async fn handle_request(
     timing.model = request_model.clone();
     timing.session = session_key;
 
-    // Whether THIS request asked Anthropic's cache for the extended 1h window,
-    // as a cell that answers itself at most once — `requests_extended_ttl`
-    // deserializes the whole body and materializes every system/tools/messages
-    // content block, and this value has two consumers: the persisted pin's TTL
-    // just below, and the usage ledger's fallback when the response reported no
-    // split of its own. Constructing the cell parses nothing; nothing at all is
-    // parsed for a request neither consumer asks about (`count_tokens`,
-    // anything unkeyed with no cache creation).
-    // NOT an `Arc`: nothing may carry this cell past the end of the handler.
-    // The one consumer that outlives it — the spawned SSE task — takes the
-    // `bool` instead, and a plain cell is what makes that a compile error rather
-    // than a review note.
-    let extended_ttl = ExtendedTtlOnce::new(body_bytes.clone());
+    // Whether THIS request asked Anthropic's cache for the extended 1h window, read
+    // off the one parse above. Two consumers: the persisted pin's TTL just below, and
+    // the usage ledger's fallback when the response reported no split of its own. A
+    // `bool`, so the spawned SSE task carries one rather than the conversation.
+    let extended_ttl = request.extended_ttl();
 
     // The pin's TTL drives nothing on the routing path, only what TTL this
-    // session's persisted pin gets at the next restart. Deliberately still
-    // inside the session-key branch: with `"sessionAffinity": false` there is no
-    // pin to give a TTL to, and this must not be what forces the parse.
+    // session's persisted pin gets at the next restart. With
+    // `"sessionAffinity": false` there is no pin to give a TTL to.
     if let Some(key) = session_key {
-        manager.note_affinity_ttl(key, extended_ttl.get());
+        manager.note_affinity_ttl(key, extended_ttl);
     }
 
     // 3. Selection + rotation loop.
@@ -4757,12 +4676,8 @@ async fn handle_request(
             let out_body: bytes::Bytes = match provider {
                 // Anthropic: the existing metadata.user_id.account_uuid splice, unchanged.
                 crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
-                    Some(uuid) if uuid.len() == 36 => {
-                        match crate::account_uuid::patch_account_uuid(&body_bytes, &uuid) {
-                            std::borrow::Cow::Owned(v) => v.into(),
-                            std::borrow::Cow::Borrowed(_) => body_bytes.clone(),
-                        }
-                    }
+                    // The splice point was found by the one parse; nothing re-reads the body.
+                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
                     _ => body_bytes.clone(),
                 },
                 // Codex: the identity is the header set above; the body is opaque (usually zstd).
@@ -4893,17 +4808,7 @@ async fn handle_request(
                     let carried_body =
                         (method != Method::GET && method != Method::HEAD).then(|| {
                             match manager.account_uuid(idx) {
-                                Some(uuid) if uuid.len() == 36 => {
-                                    match crate::account_uuid::patch_account_uuid(
-                                        &body_bytes,
-                                        &uuid,
-                                    ) {
-                                        std::borrow::Cow::Owned(patched) => {
-                                            bytes::Bytes::from(patched)
-                                        }
-                                        std::borrow::Cow::Borrowed(_) => body_bytes.clone(),
-                                    }
-                                }
+                                Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
                                 _ => body_bytes.clone(),
                             }
                         });
@@ -5713,21 +5618,8 @@ async fn handle_request(
             // Same reasoning, for F1's wire-session token counts: the spawned parser task
             // outlives this iteration, so it needs its own clone of the session id.
             let wire_session_id_for_usage = wire_session_id.clone();
-            // The ANSWER, not the cell and not the body. Resolving it here costs
-            // one structural deserialize per streamed request — the same one the
-            // pin's TTL above already pays whenever session affinity is on,
-            // which is the default — and it releases the conversation now, with
-            // the handler.
-            //
-            // Handing the task the cell instead only looks cheaper. It asks
-            // through `usage_record`, which asks only when the response reported
-            // no 1h split AND wrote cache — so an ordinary cache-read turn never
-            // asks at all, and with `"sessionAffinity": false` nothing else has
-            // asked either: the body then stays resident for the whole life of
-            // the stream, minutes, times every concurrent session. That is the
-            // retention this was supposed to remove, still there on the common
-            // path of one configuration.
-            let extended_ttl_for_usage = extended_ttl.get();
+            // The answer, a `bool`: the spawned task never holds the body.
+            let extended_ttl_for_usage = extended_ttl;
             let stream_path = path.clone();
             // The request's clock moves into the passthrough body (`StreamTiming`),
             // which finishes it when the body ends and sends the fields here, to
@@ -6112,7 +6004,7 @@ async fn handle_request(
                     &parsed,
                     request_model.clone().or(response_model),
                     session_key,
-                    || extended_ttl.get(),
+                    || extended_ttl,
                 );
                 // One line per terminal (non-streamed) request — see the
                 // matching log line on the streaming arm above. It carries the
@@ -7186,7 +7078,7 @@ struct ParsedUsage {
 /// (no nested object, or no such field in it). A reported `0` comes back as
 /// `Some(0)`: it is a first-hand statement that nothing was written at 1h, and
 /// the caller must not treat it as missing data and fall back to the REQUEST's
-/// `cache_control` ttl ([`crate::cache_ttl::requests_extended_ttl`]), which is
+/// `cache_control` ttl ([`crate::request_body::RequestBody::extended_ttl`]), which is
 /// only evidence of what was ASKED for.
 fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -7212,72 +7104,6 @@ fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
     )
 }
 
-/// "Did THIS request ask Anthropic's cache for the extended 1-hour window?",
-/// answered at most once per request and then remembered.
-///
-/// Two consumers want that answer — the persisted session pin's TTL, at the top
-/// of `handle`, and the usage ledger's fallback when the response reported no
-/// split of its own — and each one answering it separately means deserializing
-/// a whole conversation twice on the request path
-/// ([`crate::cache_ttl::requests_extended_ttl`] materializes every
-/// system/tools/messages content block). Whichever asks first pays; the other
-/// reads the cell.
-///
-/// The body is released when the answer is COMPUTED, and nothing may hold this
-/// cell past the end of the handler — which is why it is not shared and not
-/// `Arc`ed. `Bytes` is refcounted, so a cell carried into the spawned SSE task
-/// keeps the whole conversation resident for as long as the stream runs —
-/// minutes, times every concurrent session — whenever nobody asks it the
-/// question, and on the common path nobody does: `usage_record` asks only for a
-/// turn that wrote cache and got no 1h split back, and with
-/// `"sessionAffinity": false` the pin's TTL never asks either. So the streamed
-/// arm resolves the answer before it spawns and hands over the `bool`; the
-/// non-streamed arm asks lazily and dies with the handler.
-#[derive(Debug)]
-struct ExtendedTtlOnce {
-    answer: std::sync::OnceLock<bool>,
-    /// The request body, until the answer is computed from it. `None`
-    /// afterwards — that is the point.
-    body: std::sync::Mutex<Option<Bytes>>,
-}
-
-impl ExtendedTtlOnce {
-    fn new(body: Bytes) -> Self {
-        Self {
-            answer: std::sync::OnceLock::new(),
-            body: std::sync::Mutex::new(Some(body)),
-        }
-    }
-
-    fn get(&self) -> bool {
-        if let Some(answer) = self.answer.get() {
-            return *answer;
-        }
-        // Held across the parse so two callers cannot both take the body and
-        // race; contended only on the first ask, and only by the at most two
-        // consumers above.
-        let mut body = self.body.lock().expect("extended-ttl body lock poisoned");
-        if let Some(answer) = self.answer.get() {
-            return *answer;
-        }
-        let answer = body
-            .take()
-            .is_some_and(|body| crate::cache_ttl::requests_extended_ttl(body.as_ref()));
-        let _ = self.answer.set(answer);
-        answer
-    }
-
-    /// Whether the request body is still held. Test-only: it is the observable
-    /// half of "the answer is memoized and the conversation is not retained".
-    #[cfg(test)]
-    fn retains_body(&self) -> bool {
-        self.body
-            .lock()
-            .expect("extended-ttl body lock poisoned")
-            .is_some()
-    }
-}
-
 /// Build the ledger record for one served request from its parsed response
 /// usage, the model the REQUEST named, and whether the request asked for the
 /// extended cache window.
@@ -7285,7 +7111,7 @@ impl ExtendedTtlOnce {
 /// Two things happen here that neither caller should duplicate.
 ///
 /// **The model comes from the REQUEST, not the response.** It is parsed once per
-/// request (`parse_request_model`) and is the same on both arms; the response's
+/// request ([`crate::request_body::RequestBody::model`]) and is the same on both arms; the response's
 /// own `model` field can differ from what was asked for, and the ask is what the
 /// operator reasons about. One exception, and only when the request named no model: a
 /// Codex body is usually zstd and then does not parse, so each arm passes the model its
@@ -7303,13 +7129,10 @@ impl ExtendedTtlOnce {
 /// ttl is `"1h"` wrote its cache under that window. Silence in both places means
 /// 5 minutes, which is the API's own default.
 ///
-/// `extended_ttl` is a CLOSURE because answering it means deserializing the
-/// whole request body (`crate::cache_ttl::requests_extended_ttl` materializes
-/// every system/tools/messages content block), and on the path that matters —
-/// a Messages response that reported its own split — the answer is never
-/// needed. Lazy, so a multi-megabyte conversation pays for that parse only when
-/// it is the only evidence left — which means a response that reported its own
-/// split, AND a response that wrote no cache at all, both leave it uncalled.
+/// `extended_ttl` is a closure so that it is asked only when it is the only
+/// evidence left: a response that reported its own split, and a response that
+/// wrote no cache at all, both leave it uncalled. The handler's answer comes
+/// from the request's one parse ([`crate::request_body::RequestBody::extended_ttl`]).
 fn usage_record(
     parsed: &ParsedUsage,
     model: Option<String>,
@@ -9339,6 +9162,21 @@ mod tests {
     /// tiers call `stable_session_key` through this helper rather than
     /// re-stating the tier-3 gate at every call site; tests of the gate itself
     /// call `stable_session_key` directly with a different method/path/loopback.
+    /// [`super::stable_session_key`] on raw body bytes, parsed the way the handler parses
+    /// them (without the ttl rewrite, which these bodies never trigger), so the tier tests
+    /// below state their bodies as bytes.
+    fn stable_session_key(
+        headers: &HeaderMap,
+        body: &[u8],
+        secrets: ProxySecrets<'_>,
+        method: &Method,
+        path: &str,
+        client_is_loopback: bool,
+    ) -> Option<(u64, SessionKind)> {
+        let parsed = crate::request_body::RequestBody::parse(Bytes::copy_from_slice(body), false);
+        super::stable_session_key(headers, &parsed, secrets, method, path, client_is_loopback)
+    }
+
     fn messages_key(
         headers: &HeaderMap,
         body: &[u8],
@@ -11603,38 +11441,6 @@ mod tests {
         assert_eq!(record.cache_1h, 200_000);
     }
 
-    /// FINDINGS 5, 6 and 7 (round 2). The cache-TTL answer is computed AT MOST
-    /// ONCE per request, and the conversation it was computed from is released
-    /// the instant it exists.
-    ///
-    /// Both consumers parsing independently meant a session-keyed request
-    /// deserialized its whole conversation twice on the request path, in a
-    /// change whose purpose is taking work off it; and the SSE arm's clone of
-    /// `body_bytes` kept every in-flight conversation resident for the life of
-    /// its stream to carry one `bool`.
-    #[test]
-    fn the_cache_ttl_answer_is_computed_once_and_releases_the_body() {
-        let body = Bytes::from_static(
-            br#"{"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
-        );
-        let once = ExtendedTtlOnce::new(body);
-        assert!(once.retains_body(), "control: nothing parsed yet");
-        assert!(once.get(), "this body pins its system prompt at 1h");
-        assert!(
-            !once.retains_body(),
-            "the conversation is dropped the moment the answer exists — the SSE task \
-             carries a bool, not a body"
-        );
-        assert!(
-            once.get(),
-            "and the second ask reads the cell, parsing nothing"
-        );
-
-        let plain = ExtendedTtlOnce::new(Bytes::from_static(br#"{"messages":[]}"#));
-        assert!(!plain.get(), "no 1h cache_control anywhere");
-        assert!(!plain.retains_body());
-    }
-
     /// FINDING 6 (round 2). With nothing written to the cache, both arms of the
     /// split produce 0 — so asking the request's `cache_control` question
     /// cannot change the record, and asking it costs a full body deserialize
@@ -11671,12 +11477,10 @@ mod tests {
         assert_eq!(record.cache_1h, 900);
     }
 
-    /// FINDING 10. `requests_extended_ttl` deserializes the entire request body
-    /// and materializes every system/tools/messages content block. On the path
-    /// that matters — a response that reported its own 1h split — its answer is
-    /// never used, so it must never be computed. The closure PANICS here: if
-    /// the evaluation is eager again, this test says so instead of the cost
-    /// showing up as per-request latency on a multi-megabyte conversation.
+    /// FINDING 10. The request side of the split is evidence of what was ASKED
+    /// for, not what was written. On the path that matters, a response that
+    /// reported its own 1h split, it must never be consulted. The closure PANICS
+    /// here, so a fallback that runs eagerly again says so.
     #[test]
     fn the_request_body_is_not_reparsed_when_the_response_reported_its_split() {
         let parsed = ParsedUsage {

@@ -114,6 +114,8 @@ struct TtlPeek {
 /// a malformed or merely lookalike body: the only path to `true` is a real
 /// `cache_control` object, in one of the three legal positions, whose own
 /// `ttl` is exactly `"1h"`.
+/// The request path reads this answer through [`crate::request_body::RequestBody`], which
+/// finds it in its one walk; this is the definition that walk is tested against.
 pub fn requests_extended_ttl(body: &[u8]) -> bool {
     let Ok(peek) = serde_json::from_slice::<TtlPeek>(body) else {
         return false;
@@ -139,7 +141,7 @@ pub fn requests_extended_ttl(body: &[u8]) -> bool {
 }
 
 /// The extended window every rewritten breakpoint is set to.
-const EXTENDED_TTL: &str = "1h";
+pub(crate) const EXTENDED_TTL: &str = "1h";
 
 /// Set `"ttl":"1h"` on every `cache_control` object in the three legal
 /// positions (a `system` block, a tool definition, a message content block) that
@@ -234,10 +236,10 @@ pub fn extend_all_ttls(body: &[u8]) -> Option<Vec<u8>> {
 
 /// One edit to the body: replace `body[start..end]` with `text` (`start == end`
 /// is an insert).
-struct Splice {
-    start: usize,
-    end: usize,
-    text: &'static str,
+pub(crate) struct Splice {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) text: &'static str,
 }
 
 /// The `ttl` value every rewritten breakpoint gets, as JSON.
@@ -446,7 +448,7 @@ impl<'de> Visitor<'de> for Item<'_, '_> {
 /// number) queues nothing. `None` only when a span does not point into `body`,
 /// which serde_json's borrowed `RawValue` rules out; the walk then fails and the
 /// body is forwarded unchanged rather than spliced at a wild offset.
-fn extend_cache_control(
+pub(crate) fn extend_cache_control(
     body: &str,
     cache_control: &RawValue,
     splices: &mut Vec<Splice>,
@@ -486,7 +488,7 @@ fn extend_cache_control(
 
 /// `true` iff the JSON value `ttl` is the string `1h`, compared after
 /// unescaping. The common spelling is checked without allocating.
-fn is_extended_ttl(ttl: &RawValue) -> bool {
+pub(crate) fn is_extended_ttl(ttl: &RawValue) -> bool {
     ttl.get() == EXTENDED_TTL_JSON
         || (ttl.get().starts_with('"')
             && serde_json::from_str::<String>(ttl.get()).is_ok_and(|s| s == EXTENDED_TTL))
@@ -496,7 +498,7 @@ fn is_extended_ttl(ttl: &RawValue) -> bool {
 /// of `body`, so pointer distance is the offset; the range check means a span
 /// that somehow did not come from `body` is a miss, never a wild splice (the
 /// same guard as `crate::account_uuid::locate`).
-fn offset_in(body: &str, part: &str) -> Option<usize> {
+pub(crate) fn offset_in(body: &str, part: &str) -> Option<usize> {
     let offset = (part.as_ptr() as usize).checked_sub(body.as_ptr() as usize)?;
     (offset.checked_add(part.len())? <= body.len()).then_some(offset)
 }

@@ -86,11 +86,18 @@ fn locate(body: &[u8]) -> Option<usize> {
         return None;
     }
 
-    let pos = raw
+    Some(offset + value_start_in(raw)?)
+}
+
+/// Offset, inside `metadata.user_id`'s raw text, of the byte right after its escaped
+/// `account_uuid\":\"` prefix: where the value to overwrite starts. Shared by [`locate`] and
+/// [`crate::request_body`], which finds the raw text in its own single walk.
+pub(crate) fn value_start_in(user_id_raw: &str) -> Option<usize> {
+    let pos = user_id_raw
         .as_bytes()
         .windows(PREFIX.len())
         .position(|w| w == PREFIX)?;
-    Some(offset + pos + PREFIX.len())
+    Some(pos + PREFIX.len())
 }
 
 /// The superseded hand-rolled locator, retained **test-only** as the differential
@@ -320,7 +327,7 @@ pub fn patch_account_uuid<'a>(body: &'a [u8], new_uuid: &str) -> Cow<'a, [u8]> {
 /// The validate-and-overwrite half, split from the locator so the migration gate
 /// in `tests` can drive the SAME validator from the superseded hand-rolled
 /// locator and compare observable output rather than internal offsets.
-fn patch_at<'a>(body: &'a [u8], new_uuid: &str, start: Option<usize>) -> Cow<'a, [u8]> {
+pub(crate) fn patch_at<'a>(body: &'a [u8], new_uuid: &str, start: Option<usize>) -> Cow<'a, [u8]> {
     let new_uuid = new_uuid.as_bytes();
     if new_uuid.len() != 36 {
         return Cow::Borrowed(body);

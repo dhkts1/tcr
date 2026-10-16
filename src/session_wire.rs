@@ -1196,7 +1196,7 @@ const COMMAND_HEAD_MAX: usize = 120;
 /// messages, e.g a system-reminder sent as its own message) while keeping the parse cost
 /// small and fixed even for a turn with no tool_use at all, where the walk never finds an
 /// `assistant` message and runs all the way to the cap.
-const TAIL_SCAN_CAP: usize = 20;
+pub(crate) const TAIL_SCAN_CAP: usize = 20;
 
 /// Parse `metadata.user_id`'s stringified JSON blob for its `session_id` — see
 /// `src/proxy.rs`'s `stable_session_key` doc-comment for the blob's shape and lineage
@@ -1243,7 +1243,7 @@ struct BlockPeek {
     content: Option<Value>,
 }
 
-fn content_mentions_timeout(content: &Option<Value>) -> bool {
+pub(crate) fn content_mentions_timeout(content: &Option<Value>) -> bool {
     match content {
         Some(Value::String(s)) => s.to_lowercase().contains("timed out"),
         Some(Value::Array(items)) => items.iter().any(|item| {
@@ -1256,10 +1256,12 @@ fn content_mentions_timeout(content: &Option<Value>) -> bool {
 }
 
 /// Extract `tool_use` / `tool_result` blocks from the LAST TWO elements of a request's
-/// `messages` array, given as a borrowed [`RawValue`] (see [`crate::proxy::SessionKeyPeek`]-
-/// style peeks for the same borrowing technique). A body with no `messages`, a non-array
+/// `messages` array, given as a borrowed [`RawValue`] (see `account_uuid.rs`'s `BodyPeek`
+/// for the same borrowing technique). A body with no `messages`, a non-array
 /// `messages`, or malformed elements yields two empty vectors rather than an error — this is
 /// a best-effort observability peek, never a request-rejection path.
+/// The request path reads this answer through [`crate::request_body::RequestBody`], which
+/// finds it in its one walk; this is the definition that walk is tested against.
 pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolResultEvent>) {
     let mut tool_uses = Vec::new();
     let mut tool_results = Vec::new();
@@ -1361,6 +1363,8 @@ pub struct BoundHistory {
 /// an `assistant` message; requiring the role would add a way for a body shaped slightly
 /// differently to lose its pin, and a client gains nothing by claiming one — the worst a forged
 /// token does is bench the fleet down to the account that minted it.
+/// The request path reads this answer through [`crate::request_body::RequestBody`], which
+/// finds it in its one walk; this is the definition that walk is tested against.
 pub fn extract_bound_tokens(messages: &RawValue) -> BoundHistory {
     /// One content block, read for the type and the four fields any bound shape uses.
     #[derive(serde::Deserialize)]

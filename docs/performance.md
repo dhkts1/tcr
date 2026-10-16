@@ -8,7 +8,7 @@ show how far the numbers move on their own (see [Toward a CI gate](#toward-a-ci-
 ## Running it
 
 ```
-scripts/load-test.sh                    # all four phases, about four minutes
+scripts/load-test.sh                    # all six phases, about five minutes
 scripts/load-test.sh --phases overhead  # one phase
 scripts/load-test.sh --help             # every flag
 ```
@@ -56,6 +56,14 @@ on its next turn, so each `/v1/messages` request looks the map up and its reply 
 | `steady` | 75 s | Poisson arrivals at 1.5 a second over 18 sessions: the fleet's five-day average | defaults | 300 ms |
 | `peak` | 30 s | the steady stream, plus a burst of 36 sends inside one second every 5 s over 48 sessions: the fleet's busiest second | defaults | 300 ms |
 | `runaway` | 20 s | 30 a second over 64 sessions, three times the fleet ceiling's 10 | defaults | 300 ms |
+| `big1m`, `big4m` | 20 s each (`--big`) | as `overhead`, over 4 sessions, each request a generated long conversation of about 1 MiB or 4 MiB | off | at once |
+
+The big-body phases send what a long Claude Code session sends (`examples/load_test/conversation.rs`):
+a system prompt with a cache breakpoint, 24 tools, then hundreds of turns of signed thinking, a
+`Bash` tool call and about 4 KiB of tool output full of escaped quotes, backslashes and newlines,
+ending in a user message with a cache breakpoint. Every word is generated. A breakpoint carries no
+`ttl`, as Claude Code sends it, so the proxy's `ttl: 1h` rewrite changes every request, as it does
+live. Real requests are this size: the live log's median prompt is about 365,000 tokens.
 
 The rates come from the replay described in `src/config.rs` (`default_account_throttle`,
 `default_fleet_throttle`). `steady` runs 75 s so it spans fifteen of the 5 s cache saves and one
@@ -321,6 +329,77 @@ wait, by the deepest `tcr` frame above it, out of all samples.
   (`ShardedBoundTokens::shard`, 20 to 35 samples in two runs), and the log queue's waker
   (`crossbeam_channel::waker::SyncWaker::notify`, up to 33 samples), the same pattern the usage
   ledger had.
+
+## One parse per request body
+
+Since `perf/parse-once`, a `/v1/messages` body is read once (`src/request_body.rs`). Before it,
+seven places read it on their own, and at a multi-megabyte conversation those passes were most of
+what tcr spent on a request.
+
+What one Claude Code request with a cache breakpoint (the rewrite changes it) cost in passes over
+the whole body, counted from the code; "parse" is a `serde_json` walk, "scan" a plain byte loop,
+"copy" a new buffer the size of the body:
+
+| reader | before | after |
+|---|---|---|
+| collect the body (`to_bytes`) | 1 copy | 1 copy |
+| `ttl: 1h` rewrite (`cache_ttl::extend_all_ttls`) | 2 scans (the `"cache_control"` pre-check, UTF-8), 1 parse, 1 copy | in the one walk; 1 UTF-8 scan, 1 copy |
+| model (`model::parse_request_model`) | 1 parse | in the one walk |
+| session peek (`metadata`, thread ids) | 1 parse | in the one walk |
+| tool events (`session_wire::extract_tool_events`) | 1 parse of `messages` | in the one walk |
+| bound tokens (`session_wire::extract_bound_tokens`) | 3 parses of `messages` | in the one walk |
+| affinity key (`stable_session_key`) | 1 parse | in the one walk |
+| extended-window answer (`cache_ttl::requests_extended_ttl`) | 1 parse that buffered every message's content into serde's untagged-enum tree: a second copy, in pieces | in the one walk |
+| account-uuid patch, per attempt (`account_uuid::patch_account_uuid`) | 1 parse, 1 copy when the uuid differs | the offset from the walk; 1 copy when the uuid differs |
+| total | 11 parses or scans, 4 copies | 1 parse, 1 UTF-8 scan, 3 copies |
+
+`system` and `tools` are read twice in the one walk (borrowed, then walked for breakpoints); they
+are a few percent of a long conversation. A body the rewrite does not change is never copied after
+it is collected. The pinned-exit carry in `src/peer/egress.rs` still patches the uuid with its own
+parse; it runs only for an account locked to one Mac.
+
+Each answer is the one its old parse gave, including when that parse failed, on the body as
+forwarded: `request_body`'s tests run the old functions beside the walk on a Claude Code shaped
+conversation and 61 edge cases, rewrite off and on. The two shapes where it differs, a top-level
+JSON array and a body that is not UTF-8, are both bodies Anthropic rejects; the module doc names
+them.
+
+Three runs each side, alternating, `--phases overhead,big1m,big4m --overhead 20 --big 20`, on
+2026-10-16 at a 1-minute load of 66 to 147 on 14 cores. Before is `fcac23b9` (main) with the
+big-body phases added, after is the branch; both built with the script's flags, driven by one
+driver binary.
+
+| phase | | CPU ms / request | added ms p50 | added ms p99 | peak footprint MB | served in 20 s |
+|---|---|---|---|---|---|---|
+| `big1m` | before | 6.61 / 6.62 / 6.64 | 24.4 / 28.7 / 32.5 | 241 / 275 / 407 | 85.6 / 90.5 / 92.6 | 1,200 / 1,499 / 1,647 |
+| `big1m` | after | 1.55 / 1.57 / 1.57 | 8.9 / 9.9 / 11.1 | 104 / 108 / 216 | 77.3 / 81.3 / 87.8 | 3,139 / 4,405 / 4,521 |
+| `big4m` | before | 25.12 / 25.80 / 25.93 | 123 / 155 / 169 | 529 / 582 / 713 | 108.4 / 115.3 / 125.4 | 389 / 404 / 492 |
+| `big4m` | after | 4.95 / 4.96 / 5.03 | 22.2 / 27.8 / 29.1 | 175 / 213 / 260 | 103.1 / 106.5 / 116.0 | 1,447 / 1,746 / 1,991 |
+| `overhead` | before | 0.25 / 0.25 / 0.25 | 3.5 / 5.4 / 6.1 | 69 / 100 / 144 | 55.4 / 56.5 / 57.2 | 24,089 / 29,705 / 35,224 |
+| `overhead` | after | 0.23 / 0.23 / 0.24 | 2.7 / 3.6 / 7.1 | 75 / 85 / 119 | 55.5 / 56.2 / 56.4 | 26,361 / 37,848 / 37,872 |
+
+Each cell is min / median / max across the three runs.
+
+- **CPU per request fell by about three quarters at 1 MiB and four fifths at 4 MiB**, and the
+  before and after ranges are far apart. It still grows with the body, at about 1.2 ms per MiB
+  against about 6.3 before: the walk, the UTF-8 check and the copies that remain.
+- **The time tcr adds fell from about 29 to 10 ms at the median at 1 MiB, and from about 155 to
+  28 ms at 4 MiB.** The added time includes moving the body twice over loopback, client to tcr and
+  tcr to the stub.
+- **Memory did not grow**: the peak footprint is a few MB lower at both sizes while tcr served
+  three to four times as many requests in the same 20 s.
+- **The 32 KiB `overhead` phase moved within its noise** (0.25 to 0.23 to 0.24).
+- **The profile agrees with the count.** In `big4m` before, the stacks under the old readers held
+  `requests_extended_ttl` 19 to 30% of samples, `extract_bound_tokens` 16 to 19%,
+  `extend_all_ttls` 8 to 9%, and the rest 2 to 4% each, with `serde_json` under 60 to 67% of all
+  samples. After, none of them appears, `request_body` holds 28 to 36%, and `serde_json` 18 to 27%.
+
+What this predicts for the live log's slowest row (prompts of 700,000 tokens and more, a hold
+`wait_ms` of 22 ms at p90 and 90 ms at p99 on 2026-10-16): at roughly 4 bytes a token those bodies
+are about 3 MiB, where the CPU cost falls from about 19 ms to about 4 ms. The p90 hold should fall
+to about a quarter of what it is, a few milliseconds; the p99 depends on how many such requests
+arrive at once. It cannot be measured until a release carries the change, and the bytes-per-token
+figure is an assumption, not a measurement.
 
 ## Toward a CI gate
 

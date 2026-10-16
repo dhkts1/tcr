@@ -144,3 +144,105 @@ async fn rewrite_off_forwards_the_body_byte_for_byte() {
         "with the rewrite off, upstream sees the client's own bytes"
     );
 }
+
+async fn send_body(proxy: &str, body: Vec<u8>) -> u16 {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("the local client builds");
+    client
+        .post(format!("{proxy}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("the proxy answered")
+        .status()
+        .as_u16()
+}
+
+/// A long Claude Code shaped body of about `target` bytes: `metadata.user_id` naming
+/// `account_uuid`, written LAST so every breakpoint splice lands before it, and every
+/// breakpoint spelled `ttl` (`None` leaves it to the default window).
+fn long_body(target: usize, account_uuid: &str, ttl: Option<&str>) -> Vec<u8> {
+    let cache_control = match ttl {
+        Some(ttl) => format!(r#"{{"type":"ephemeral","ttl":"{ttl}"}}"#),
+        None => r#"{"type":"ephemeral"}"#.to_string(),
+    };
+    let user_id = serde_json::to_string(&format!(
+        r#"{{"device_id":"d1","account_uuid":"{account_uuid}","session_id":"33333333-3333-3333-3333-333333333333"}}"#
+    ))
+    .expect("a JSON string");
+    let mut messages = Vec::new();
+    let mut size = 0usize;
+    let mut n = 0usize;
+    while size < target {
+        let turn = format!(
+            r#"{{"role":"assistant","content":[{{"type":"thinking","thinking":"step {n}","signature":"sig-{n}"}},{{"type":"tool_use","id":"toolu_{n}","name":"Bash","input":{{"command":"ls"}}}}]}},{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_{n}","content":"{}","cache_control":{cache_control}}}]}}"#,
+            "out \\\"put\\\"\\n".repeat(200)
+        );
+        size += turn.len();
+        messages.push(turn);
+        n += 1;
+    }
+    format!(
+        r#"{{"model":"claude-opus-5-5","max_tokens":1,"system":[{{"type":"text","text":"sys","cache_control":{cache_control}}}],"tools":[{{"name":"t","input_schema":{{"type":"object"}},"cache_control":{cache_control}}}],"messages":[{}],"metadata":{{"user_id":{user_id}}}}}"#,
+        messages.join(",")
+    )
+    .into_bytes()
+}
+
+/// The configured account's uuid in [`manager`].
+const SERVING_UUID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// With the rewrite on (the default) and nothing for it or the uuid patch to change, a
+/// multi-megabyte body reaches upstream as the client's own bytes.
+///
+/// Watched red with a one-byte splice planted into every body: upstream saw one byte more.
+#[tokio::test]
+async fn an_unchanged_long_body_reaches_upstream_byte_for_byte() {
+    let seen: Bodies = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_upstream_recording(Arc::clone(&seen)).await;
+    let proxy = spawn_proxy(manager(&upstream, "")).await;
+    let body = long_body(2 * 1024 * 1024, SERVING_UUID, Some("1h"));
+    assert!(body.len() > 2 * 1024 * 1024);
+
+    assert_eq!(send_body(&proxy, body.clone()).await, 200);
+
+    let bodies = seen.lock().expect("the body log is never poisoned");
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0] == body,
+        "upstream saw {} bytes, the client sent {}",
+        bodies[0].len(),
+        body.len()
+    );
+}
+
+/// When the rewrite DOES change the body, the uuid patch still lands on `metadata.user_id`
+/// after every splice before it: upstream sees exactly what the two separate steps
+/// produced, rewrite then patch.
+///
+/// Watched red with the offset left in the client's coordinates (`moved_by` returning its
+/// input): the patch fell outside `user_id`, failed its own check, and the old uuid went out.
+#[tokio::test]
+async fn a_rewritten_long_body_gets_its_uuid_patched_after_the_splices() {
+    let seen: Bodies = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_upstream_recording(Arc::clone(&seen)).await;
+    let proxy = spawn_proxy(manager(&upstream, "")).await;
+    let body = long_body(1024 * 1024, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", None);
+    let rewritten = tcr::cache_ttl::extend_all_ttls(&body).expect("breakpoints to extend");
+    let expected = tcr::account_uuid::patch_account_uuid(&rewritten, SERVING_UUID).into_owned();
+    assert_ne!(expected, rewritten, "control: the patch changes something");
+
+    assert_eq!(send_body(&proxy, body).await, 200);
+
+    let bodies = seen.lock().expect("the body log is never poisoned");
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0] == expected,
+        "upstream saw {} bytes, expected {}",
+        bodies[0].len(),
+        expected.len()
+    );
+}
