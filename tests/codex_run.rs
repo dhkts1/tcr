@@ -199,7 +199,7 @@ fn the_codex_status_stub_accepts_delayed_request_headers() {
 }
 
 #[test]
-fn a_pooled_codex_launch_gives_shell_tools_unmarked_proxy_defaults() {
+fn a_pooled_codex_launch_gives_shell_tools_direct_defaults() {
     let fixture = Fixture::new(true);
     let codex = fixture.home.path().join("fake-codex");
     std::fs::write(&codex, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
@@ -222,15 +222,17 @@ fn a_pooled_codex_launch_gives_shell_tools_unmarked_proxy_defaults() {
         actual,
         [
             "-c".to_string(),
-            format!(
-                "shell_environment_policy.set.HTTPS_PROXY=\"http://127.0.0.1:{}\"",
-                fixture.port
-            ),
+            "shell_environment_policy.set.HTTPS_PROXY=\"\"".to_string(),
             "-c".to_string(),
-            format!(
-                "shell_environment_policy.set.https_proxy=\"http://127.0.0.1:{}\"",
-                fixture.port
-            ),
+            "shell_environment_policy.set.https_proxy=\"\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.set.HTTP_PROXY=\"\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.set.http_proxy=\"\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.set.ALL_PROXY=\"\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.set.all_proxy=\"\"".to_string(),
             "exec".to_string(),
             "--json".to_string(),
             "-c".to_string(),
