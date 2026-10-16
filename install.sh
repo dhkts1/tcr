@@ -17,7 +17,7 @@
 # look like it failed.
 set -u
 
-DIST_INSTALLER_URL="https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh"
+DIST_INSTALLER_URL="${TCR_DIST_INSTALLER_URL:-https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh}"
 LATEST_RELEASE_URL="${TCR_LATEST_RELEASE_URL:-https://github.com/dhkts1/tcr/releases/latest}"
 LATEST_RELEASE_API_URL="${TCR_LATEST_RELEASE_API_URL:-https://api.github.com/repos/dhkts1/tcr/releases/latest}"
 DMG_URL_BASE="${TCR_DMG_URL_BASE:-https://github.com/dhkts1/tcr/releases/download}"
@@ -33,6 +33,9 @@ Env:
   TCR_SKIP_UI=1   Skip the TcrBar install step entirely (CLI only, all
                   platforms). Also honoured non-interactively so CI and
                   containers never try to touch /Applications.
+  TCR_NO_LAUNCH=1 Install TcrBar but do not open it afterwards. It is also not
+                  opened when CI is set, in an SSH session, or with no GUI
+                  login session.
   TCR_APPLICATIONS_DIR
                   Where TcrBar.app is installed and looked for (default
                   /Applications). Test-only — a real machine has exactly one.
@@ -44,6 +47,9 @@ Env:
                   Where to fetch scripts/install-tcrbar-from-dmg.sh from when
                   this script has no local checkout to find it in, which is
                   every `curl | sh` run. Defaults to the raw file on main.
+  TCR_DIST_INSTALLER_URL
+                  Where the cargo-dist installer is downloaded from, without
+                  the https-only curl flags. Test-only.
   TCR_SKIP_CLI=1  Skip the tcr CLI install step (step 1). Test-only — lets
                   the TcrBar half of this script be exercised without a real
                   network round trip through the cargo-dist installer.
@@ -69,12 +75,17 @@ if [ "${TCR_SKIP_CLI:-0}" = "1" ]; then
   echo "==> TCR_SKIP_CLI=1 — skipping the tcr CLI install (test-only)."
 else
   echo "==> Installing the tcr CLI…"
-  if ! curl --proto '=https' --tlsv1.2 -LsSf -o "$tmp_dir/tcr-installer.sh" "$DIST_INSTALLER_URL"; then
+  # The https-only flags stay on unless the test-only override points elsewhere.
+  dist_curl_flags="--proto =https --tlsv1.2"
+  [ -n "${TCR_DIST_INSTALLER_URL:-}" ] && dist_curl_flags=""
+  # shellcheck disable=SC2086 # word-splitting the flag list is the point
+  if ! curl $dist_curl_flags -LsSf -o "$tmp_dir/tcr-installer.sh" "$DIST_INSTALLER_URL"; then
     echo "could not download $DIST_INSTALLER_URL" >&2
     exit 1
   fi
-  if ! sh "$tmp_dir/tcr-installer.sh"; then
-    dist_rc=$?
+  sh "$tmp_dir/tcr-installer.sh"
+  dist_rc=$?
+  if [ "$dist_rc" -ne 0 ]; then
     echo "tcr CLI install failed (exit $dist_rc)" >&2
     exit "$dist_rc"
   fi
@@ -166,9 +177,38 @@ if [ ! -f "$dmg_install_script" ]; then
   chmod +x "$dmg_install_script"
 fi
 TCR_APPLICATIONS_DIR="$APPLICATIONS_DIR" "$dmg_install_script" "$dmg_path"
+app_rc=$?
+if [ "$app_rc" -ne 0 ]; then
+  echo "" >&2
+  echo "${APP_NAME} install failed (exit $app_rc). The tcr CLI above did install; only the app step failed." >&2
+  exit "$app_rc"
+fi
 
 echo ""
 echo "Installed: ${APPLICATIONS_DIR}/${APP_NAME}.app"
+
+# Open the app so the user does not have to find it: Spotlight takes a while
+# to index a fresh install, and TcrBar has no Dock icon. Each skip below says
+# why in one line. A failed `open` is a warning, never a failed install.
+launch_skip_reason=""
+if [ "${TCR_NO_LAUNCH:-0}" = "1" ]; then
+  launch_skip_reason="TCR_NO_LAUNCH=1"
+elif [ -n "${CI:-}" ]; then
+  launch_skip_reason="CI is set"
+elif [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_TTY:-}" ]; then
+  launch_skip_reason="this is an SSH session"
+elif [ "$(launchctl managername 2>/dev/null)" != "Aqua" ]; then
+  launch_skip_reason="there is no GUI login session"
+fi
+
+if [ -n "$launch_skip_reason" ]; then
+  echo "==> Not opening ${APP_NAME}: ${launch_skip_reason}. Open it from ${APPLICATIONS_DIR}."
+elif open "${APPLICATIONS_DIR}/${APP_NAME}.app"; then
+  echo "==> Opened ${APP_NAME}. It is a menu-bar app: look for its icon at the top right of the screen."
+else
+  echo "warning: could not open ${APP_NAME}; open it from ${APPLICATIONS_DIR}." >&2
+fi
+
 echo "NOTE: ${APP_NAME} bundles its own tcr and prefers it over PATH, so"
 echo "      \`tcr status --json\` run from the app may report a different"
 echo "      build than \`which tcr\`."

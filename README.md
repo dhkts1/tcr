@@ -49,7 +49,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/t
 
 This installs the `tcr` CLI. On macOS it also installs TcrBar from the `.dmg` on the
 [release page](https://github.com/dhkts1/tcr/releases/latest); set `TCR_SKIP_UI=1` to skip
-that step. To install only the `tcr` CLI, on any platform, use the cargo-dist installer directly:
+that step. The installer then opens TcrBar, a menu-bar app, so look for its icon at the top right of
+the screen; set `TCR_NO_LAUNCH=1` to stop that (it is also skipped under CI and SSH). To install only the `tcr` CLI, on any platform, use the cargo-dist installer directly:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh | sh
