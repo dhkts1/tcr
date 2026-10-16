@@ -17,7 +17,7 @@
 # look like it failed.
 set -u
 
-DIST_INSTALLER_URL="https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh"
+DIST_INSTALLER_URL="${TCR_DIST_INSTALLER_URL:-https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh}"
 LATEST_RELEASE_URL="${TCR_LATEST_RELEASE_URL:-https://github.com/dhkts1/tcr/releases/latest}"
 LATEST_RELEASE_API_URL="${TCR_LATEST_RELEASE_API_URL:-https://api.github.com/repos/dhkts1/tcr/releases/latest}"
 DMG_URL_BASE="${TCR_DMG_URL_BASE:-https://github.com/dhkts1/tcr/releases/download}"
@@ -47,6 +47,9 @@ Env:
                   Where to fetch scripts/install-tcrbar-from-dmg.sh from when
                   this script has no local checkout to find it in, which is
                   every `curl | sh` run. Defaults to the raw file on main.
+  TCR_DIST_INSTALLER_URL
+                  Where the cargo-dist installer is downloaded from, without
+                  the https-only curl flags. Test-only.
   TCR_SKIP_CLI=1  Skip the tcr CLI install step (step 1). Test-only — lets
                   the TcrBar half of this script be exercised without a real
                   network round trip through the cargo-dist installer.
@@ -72,12 +75,17 @@ if [ "${TCR_SKIP_CLI:-0}" = "1" ]; then
   echo "==> TCR_SKIP_CLI=1 — skipping the tcr CLI install (test-only)."
 else
   echo "==> Installing the tcr CLI…"
-  if ! curl --proto '=https' --tlsv1.2 -LsSf -o "$tmp_dir/tcr-installer.sh" "$DIST_INSTALLER_URL"; then
+  # The https-only flags stay on unless the test-only override points elsewhere.
+  dist_curl_flags="--proto =https --tlsv1.2"
+  [ -n "${TCR_DIST_INSTALLER_URL:-}" ] && dist_curl_flags=""
+  # shellcheck disable=SC2086 # word-splitting the flag list is the point
+  if ! curl $dist_curl_flags -LsSf -o "$tmp_dir/tcr-installer.sh" "$DIST_INSTALLER_URL"; then
     echo "could not download $DIST_INSTALLER_URL" >&2
     exit 1
   fi
-  if ! sh "$tmp_dir/tcr-installer.sh"; then
-    dist_rc=$?
+  sh "$tmp_dir/tcr-installer.sh"
+  dist_rc=$?
+  if [ "$dist_rc" -ne 0 ]; then
     echo "tcr CLI install failed (exit $dist_rc)" >&2
     exit "$dist_rc"
   fi

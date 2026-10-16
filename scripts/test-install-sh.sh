@@ -205,6 +205,19 @@ check "failing step: no Installed line" "$(echo "$OUT" | grep -q '^Installed:'; 
 check "failing step: says it failed" "$(echo "$OUT" | grep -q 'install failed'; echo $?)" "no message"
 check "failing step: open not called" "$([ -z "$OPENS" ]; echo $?)" "open ran: $OPENS"
 
+# The CLI step (TCR_SKIP_CLI off): a fake cargo-dist installer served locally.
+printf '#!/bin/sh\nexit 3\n' > "$SERVER_ROOT/cli-fail.sh"
+printf '#!/bin/sh\necho fake-dist-ok\nexit 0\n' > "$SERVER_ROOT/cli-ok.sh"
+
+run_case "CLI installer exits 3" "$GOOD_URL" TCR_SKIP_CLI=0 TCR_DIST_INSTALLER_URL="http://127.0.0.1:${PORT}/cli-fail.sh"
+check "CLI failure: exit is exactly 3" "$([ "$RC" -eq 3 ]; echo $?)" "rc=$RC"
+check "CLI failure: says exit 3" "$(echo "$OUT" | grep -q 'tcr CLI install failed (exit 3)'; echo $?)" "no message"
+check "CLI failure: app step not reached" "$([ ! -d "$WANT_APP" ] && [ -z "$OPENS" ]; echo $?)" "app step ran"
+
+run_case "CLI installer exits 0" "$GOOD_URL" TCR_SKIP_CLI=0 TCR_DIST_INSTALLER_URL="http://127.0.0.1:${PORT}/cli-ok.sh"
+check "CLI ok: dist installer ran" "$(echo "$OUT" | grep -q fake-dist-ok; echo $?)" "fake did not run"
+check "CLI ok: exit 0 and app installed" "$([ "$RC" -eq 0 ] && [ -d "$WANT_APP" ]; echo $?)" "rc=$RC"
+
 if [ "$FAILS" -ne 0 ]; then
   echo "$FAILS check(s) failed" >&2
   exit 1
