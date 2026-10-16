@@ -46,6 +46,49 @@ final class CodexPresenceControllerTests: XCTestCase {
         XCTAssertTrue(controller.presence.isPresent)
     }
 
+    /// Only an empty fleet's first frame reads presence, so only that opening waits for the
+    /// scan. A fleet with accounts opens at once, however long the scan takes.
+    @MainActor
+    func testOnlyAnEmptyFleetsOpeningWaitsForPresence() throws {
+        let unresolved = CodexPresenceController(resolver: { (.absent, nil) })
+        XCTAssertFalse(unresolved.openingWaits(for: try claudeOnlyFleet()))
+        XCTAssertFalse(unresolved.openingWaits(for: nil), "no fleet yet: the panel draws its wait")
+        XCTAssertTrue(unresolved.openingWaits(for: Fleet(accounts: [])), "positive control")
+        let resolved = CodexPresenceController(initialPresence: .absent, resolver: { (.absent, nil) })
+        XCTAssertFalse(resolved.openingWaits(for: Fleet(accounts: [])))
+    }
+
+    /// An opening re-reads this Mac's codex only when it may have something to say: a
+    /// Claude-only fleet on a Mac where the last read found no codex pays for no scan.
+    @MainActor
+    func testAClaudeOnlyOpeningPaysForNoCodexScan() {
+        let absent = CodexPresenceController(initialPresence: .absent, resolver: { (.absent, nil) })
+        XCTAssertFalse(absent.rescansAtOpen(fleetHoldsCodex: false))
+        XCTAssertTrue(absent.rescansAtOpen(fleetHoldsCodex: true))
+        let present = CodexPresenceController(
+            initialPresence: CodexPresence(codexExecutable: "/opt/example/codex"),
+            resolver: { (.absent, nil) })
+        XCTAssertTrue(present.rescansAtOpen(fleetHoldsCodex: false))
+        XCTAssertTrue(
+            CodexPresenceController(resolver: { (.absent, nil) }).rescansAtOpen(fleetHoldsCodex: false))
+    }
+
+    /// Codex installed after the last read is found by an Add account click, which reads an
+    /// absent answer again without waiting on it: the click goes on with the answer it had.
+    @MainActor
+    func testAnAddAccountClickReadsAnAbsentAnswerAgainWithoutWaiting() async {
+        let gate = PresenceResolutionGate(present: true)
+        let controller = CodexPresenceController(initialPresence: .absent, resolver: { gate.resolve() })
+        let presence = await controller.resolvedForLogin(fleetHoldsCodex: false)
+        XCTAssertFalse(presence.isPresent, "this click keeps the answer it had")
+        await waitForResolver(gate)
+        gate.release()
+        for _ in 0..<100 where !controller.presence.isPresent {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(controller.presence.isPresent, "the next click is offered codex")
+    }
+
     @MainActor
     private func waitForResolver(_ gate: PresenceResolutionGate) async {
         for _ in 0..<100 where gate.calls == 0 {
@@ -73,4 +116,16 @@ private final class PresenceResolutionGate: @unchecked Sendable {
     func release() {
         for _ in 0..<4 { ready.signal() }
     }
+}
+
+/// alice, the one Claude row of apps/macos/Tests/Fixtures/codex-status.json, alone.
+private func claudeOnlyFleet() throws -> Fleet {
+    let url = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // TcrBarTests
+        .deletingLastPathComponent()  // Tests
+        .appendingPathComponent("Fixtures/codex-status.json")
+    let rows = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+    let alice = try XCTUnwrap(rows.first { $0["name"] as? String == "alice@example.com" })
+    return try Fleet.decode(JSONSerialization.data(withJSONObject: [alice]))
 }
