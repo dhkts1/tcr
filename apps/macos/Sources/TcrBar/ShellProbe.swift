@@ -27,7 +27,10 @@ import TcrBarCore
 ///    treatment — happens past this measurement.
 ///  - It clicks nothing with a real mouse. It calls `openPanel()` — the same
 ///    method the button's action calls — which is not the same as proving the
-///    target/action wiring survives a real click.
+///    target/action wiring survives a real click. Assertion 11 does click the
+///    panel's tabs, with mouse events it builds and hands to the popover
+///    window's `sendEvent`: AppKit's dispatch and SwiftUI's hit test, but not
+///    the window server's.
 ///  - It says nothing about a *bundled* run: no `LSUIElement`, no code signature,
 ///    no login item. `scripts/build-tcrbar.sh` and a human's eyes still own that.
 ///  - It does not exercise the **animated** dismissal. The probe sets
@@ -223,6 +226,19 @@ enum ShellProbe {
                 detail: "isShown=\(shell.popover.isShown) timedOut=\(!opened) "
                     + "contentSize=\(Int(size.width))x\(Int(size.height))"))
 
+        // 11 — switching tabs never changes the panel's size (Gil, 2026-10-16:
+        //      "can you make also it to not change the height?"). Each tab is
+        //      selected through its own button in the strip, pressed through
+        //      accessibility the way VoiceOver presses it, and the popover's
+        //      `contentSize` is read once it stops moving. All four must be
+        //      equal to the point, at the panel's width.
+        //
+        //      The positive control is the selection itself: a press that
+        //      selected nothing would leave the panel where it was and pass
+        //      for the wrong reason, so each tab's button must report itself
+        //      selected after its press.
+        checks.append(await tabSwitchCheck(shell))
+
         // 6 — and it closes again.
         //
         //     `animates = false` first, and this is a substitution in the probe
@@ -369,6 +385,196 @@ enum ShellProbe {
             waited += step
         }
         return condition()
+    }
+
+    // MARK: - Assertion 11
+
+    /// Sessions first, so the first press moves off whichever tab the panel
+    /// opened on, and Accounts last, so every tab is measured after a press.
+    private static let tabSwitchOrder: [PanelTab] = [.sessions, .tools, .peers, .accounts]
+
+    /// Selects each tab with a click on its button and reads the popover's
+    /// `contentSize` once it holds still.
+    ///
+    /// The click is a mouse-down and mouse-up built here and handed to the
+    /// popover window's `sendEvent`, so it goes through AppKit's dispatch and
+    /// SwiftUI's own hit test to the strip's `Button`. Pressing the button
+    /// through accessibility was tried first and cannot work in this process:
+    /// `NSHostingView` reported no accessibility children at all, ten times
+    /// over three seconds, because SwiftUI builds that tree only for an
+    /// attached assistive client.
+    ///
+    /// A `.transient` popover closes when another app takes focus, and on a
+    /// desktop someone is using that happens mid-run (seen 2026-10-16:
+    /// `isShown=false appActive=false` on 2 of 6 runs). A click on a closed
+    /// panel lands nowhere, and an opening can change what the panel holds
+    /// (the claude-route prompt is decided per opening; one reopen measured
+    /// 868 pt before it and 928 pt on every tab after it). So a pass that
+    /// loses the panel is thrown away, the panel is opened again through the
+    /// same `openPanel()`, and all four tabs are measured afresh, up to three
+    /// passes. The reading says how many it took.
+    @MainActor
+    private static func tabSwitchCheck(_ shell: MenuBarShell) async -> Check {
+        let name = "switching tabs keeps one contentSize: equal heights, \(Int(Tok.panelWidth))pt wide"
+        var pass = TabSwitchPass()
+        for attempt in 1...3 {
+            if !shell.popover.isShown {
+                shell.openPanel()
+                _ = await waitUntil { shell.popover.isShown }
+                await settle()
+            }
+            guard let view = shell.popover.contentViewController?.view, let window = view.window
+            else {
+                return Check(11, name, passed: false, detail: "the panel has no view in a window")
+            }
+            pass = await tabSwitchPass(shell, view: view, window: window)
+            pass.attempt = attempt
+            if !pass.lostThePanel { break }
+        }
+        let oneHeight = Set(pass.sizes.map(\.height)).count == 1
+        let width = pass.sizes.allSatisfy { abs($0.width - Tok.panelWidth) < 1 }
+        return Check(
+            11, name,
+            passed: !pass.lostThePanel && pass.everyClickSelected && oneHeight && width,
+            detail: pass.readings.joined(separator: " ")
+                + (pass.attempt > 1 ? " (pass \(pass.attempt): the panel lost focus before)" : "")
+                + (pass.lostThePanel ? " (the panel closed during every pass)" : ""))
+    }
+
+    private struct TabSwitchPass {
+        var readings: [String] = []
+        var sizes: [CGSize] = []
+        var everyClickSelected = true
+        var lostThePanel = false
+        var attempt = 0
+    }
+
+    /// One click on each tab in ``tabSwitchOrder``, and the size after each.
+    /// Stops early, marked `lostThePanel`, if the popover closes.
+    @MainActor
+    private static func tabSwitchPass(
+        _ shell: MenuBarShell, view: NSView, window: NSWindow
+    ) async -> TabSwitchPass {
+        var pass = TabSwitchPass()
+        var previousStrip = stripPixels(of: view)
+        for tab in tabSwitchOrder {
+            // The positive control: the selected pill moved, so the strip's
+            // pixels changed. Every press selects a tab other than the last
+            // one, so a strip that never changes is a click that selected
+            // nothing. Each click is given a second to show, and a missed one
+            // is repeated, up to three.
+            var clicks = 0
+            var strip = previousStrip
+            while clicks < 3 && (strip == nil || strip == previousStrip) && shell.popover.isShown {
+                await click(tabCentre(tab, in: view), in: view, window: window)
+                clicks += 1
+                strip = await changedStrip(of: view, from: previousStrip)
+            }
+            let moved = strip != nil && strip != previousStrip
+            previousStrip = strip
+            let size = await steadyContentSize(shell)
+            guard shell.popover.isShown else {
+                pass.lostThePanel = true
+                return pass
+            }
+            pass.everyClickSelected = pass.everyClickSelected && moved
+            pass.sizes.append(size)
+            pass.readings.append(
+                "\(tab.title)=\(fmt(size.width))x\(fmt(size.height))"
+                    + (clicks > 1 ? " (\(clicks) clicks)" : "")
+                    + (moved ? "" : " (the strip did not change: the clicks selected nothing)"))
+        }
+        return pass
+    }
+
+    private static func fmt(_ value: CGFloat) -> String { String(format: "%.2f", value) }
+
+    /// The popover's size once it has held still for half a second, or after
+    /// four seconds if it never does. A size read straight after the click
+    /// could still be the old tab's, which would make a moving panel look still.
+    @MainActor
+    private static func steadyContentSize(_ shell: MenuBarShell) async -> CGSize {
+        var last = shell.popover.contentSize
+        var still = 0
+        var waited = 0.0
+        while still < 5 && waited < 4 {
+            await settle(0.1)
+            waited += 0.1
+            let now = shell.popover.contentSize
+            still = now == last ? still + 1 : 0
+            last = now
+        }
+        return last
+    }
+
+    /// The vertical middle of the tab strip, from the panel's top edge: the
+    /// panel's top padding, the header row (the gear is its tallest item) and
+    /// its padding, then the strip's own padding and half a tab.
+    @MainActor
+    private static var stripMiddle: CGFloat {
+        V4.panelPaddingTop + V4.headerPaddingTop + max(V4.gearSize, V4.lineHeight(V4.titleSize))
+            + V4.headerPaddingBottom + V4.segPadding + V4.tabMinHeight / 2
+    }
+
+    /// The centre of `tab`'s button, in `view`'s coordinates. The strip is
+    /// laid out as equal quarters whenever every label fits one
+    /// (``TabStripFit``), and a tab that needs more is wider, so the middle of
+    /// a quarter is inside its tab either way.
+    @MainActor
+    private static func tabCentre(_ tab: PanelTab, in view: NSView) -> NSPoint {
+        let tabs = PanelTab.allCases
+        let index = CGFloat(tabs.firstIndex(of: tab) ?? 0)
+        let inner = V4.panelWidth - 2 * V4.panelPaddingSide - 2 * V4.segPadding
+        let width = (inner - V4.segGap * CGFloat(tabs.count - 1)) / CGFloat(tabs.count)
+        let x = V4.panelPaddingSide + V4.segPadding + index * (width + V4.segGap) + width / 2
+        let y = view.isFlipped ? stripMiddle : view.bounds.height - stripMiddle
+        return NSPoint(x: x, y: y)
+    }
+
+    /// A mouse-down, a run-loop turn, then a mouse-up, as a hand would.
+    @MainActor
+    private static func click(_ point: NSPoint, in view: NSView, window: NSWindow) async {
+        let location = view.convert(point, to: nil)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            guard
+                let event = NSEvent.mouseEvent(
+                    with: type, location: location, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                    clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)
+            else { continue }
+            window.sendEvent(event)
+            await settle(0.05)
+        }
+    }
+
+    /// The strip's pixels once they differ from `previous`, read every tenth
+    /// of a second for a second; the last read if they never do.
+    @MainActor
+    private static func changedStrip(of view: NSView, from previous: Data?) async -> Data? {
+        var strip = stripPixels(of: view)
+        var waited = 0.0
+        while (strip == nil || strip == previous) && waited < 1 {
+            await settle(0.1)
+            waited += 0.1
+            strip = stripPixels(of: view)
+        }
+        return strip
+    }
+
+    /// The tab strip's pixels, and nothing above it: the header's "updated Ns
+    /// ago" ticks on its own and would count as a change.
+    @MainActor
+    private static func stripPixels(of view: NSView) -> Data? {
+        let height = V4.tabMinHeight + 2 * V4.segPadding
+        let top = stripMiddle - height / 2
+        let y = view.isFlipped ? top : view.bounds.height - top - height
+        let rect = NSRect(x: 0, y: y, width: view.bounds.width, height: height)
+        guard rect.width > 0, let rep = view.bitmapImageRepForCachingDisplay(in: rect) else {
+            return nil
+        }
+        view.cacheDisplay(in: rect, to: rep)
+        return rep.tiffRepresentation
     }
 
     // MARK: - Assertion 7

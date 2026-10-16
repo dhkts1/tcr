@@ -1375,6 +1375,10 @@ struct PeersTabV4: View {
     /// poll. `--render-states` only, the same switch `FleetView` and
     /// ``LoginSheet`` already thread for the same `ImageRenderer` reason.
     var snapshotMode: Bool = false
+    /// Whether this tab is the selected one. The panel draws every tab and
+    /// shows one (`PanelV4`), so the three-second read keys on this rather than
+    /// on appearing: a panel sitting on Accounts still runs no peer read.
+    var isActive: Bool = true
     var onOpenSettings: () -> Void = {}
     /// Run the app's own update check, the one the menu bar item runs.
     ///
@@ -1547,7 +1551,11 @@ struct PeersTabV4: View {
         // A new refusal is a new sentence: the raw line of the last one closes
         // rather than standing under somebody else's headline.
         .onChange(of: controller.refusal.message) { _ in refusalDetails = false }
-        .onAppear { if !snapshotMode { controller.start() } }
+        .onAppear { if !snapshotMode && isActive { controller.start() } }
+        .onChange(of: isActive) { active in
+            guard !snapshotMode else { return }
+            if active { controller.start() } else { controller.stop() }
+        }
         .onDisappear { controller.stop() }
         .sheet(item: $trusting) { row in
             // The run is what the sheet draws, so there is nothing to draw

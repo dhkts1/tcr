@@ -81,7 +81,7 @@ enum TcrBarEntry {
             // AppKit needs to exist before anything can be rasterised, but the
             // app is never activated and no window or status item is created.
             _ = NSApplication.shared
-            RenderStates.run(into: directory)  // exits
+            RenderStates.run(into: directory, only: RenderStates.requestedFilter())  // exits
         }
         if let directory = RenderSettings.requestedDirectory() {
             _ = NSApplication.shared

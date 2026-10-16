@@ -302,6 +302,19 @@ regression if it is dropped: the popover is told the panel's preferred size, the
 login-item bit is re-read on every open rather than only on the first, and the
 app is activated before the panel is shown so text selection works.
 
+### Rendering the panel's states
+
+```sh
+BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
+"$BIN" --render-states /tmp/tcrbar-states                 # every scene, both appearances
+"$BIN" --render-states /tmp/tcrbar-states --only 70-tab-strip  # only scenes whose name contains it
+```
+
+It draws each scene into a PNG in-process and exits: no menu-bar item, no `tcr`
+subprocess, no server. The whole set is several hundred images; `--only` renders
+the scenes whose name contains its argument and prints how many matched, and a
+substring that matches nothing exits 1 instead of passing with nothing drawn.
+
 ### Proving the shell, without a screenshot
 
 ```sh
@@ -314,6 +327,12 @@ ON mark rasterises to cyan pixels off the real status button **and** that the OF
 mark rasterises to none — the negative control, without which the first
 assertion passes on a mark that is cyan in both states. Every one of the nine was
 broken on purpose and watched go red.
+
+Assertion 11 clicks each of the panel's four tabs and requires the popover's
+`contentSize` to be the same on all of them, with the strip's own pixels as proof
+that each click selected its tab. The render-side twin is
+`swift apps/macos/scripts/check-tabs-one-height.swift <dir>` over
+`--render-states <dir> --only one-height`.
 
 What it does not cover: the window server's final composite of the menu bar, a
 real mouse click, and anything about a signed bundle. Those are still a human's

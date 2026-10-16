@@ -28,13 +28,46 @@ import TcrBarCore
 ///
 /// Writes one PNG per state and exits without ever showing a menu-bar item,
 /// polling `tcr`, or touching a server.
+///
+///     TcrBar.app/Contents/MacOS/TcrBar --render-states <output-directory> --only <substring>
+///
+/// Renders only the scenes whose name contains `<substring>`, in every scene
+/// list below, and prints how many matched. The whole set is several hundred
+/// PNGs, too slow for a check that needs four of them. A substring nothing
+/// matches exits 1, so a typo cannot pass as an empty, successful render.
 enum RenderStates {
     static let flag = "--render-states"
+    static let onlyFlag = "--only"
 
     /// Returns the output directory when the process was launched to render.
     static func requestedDirectory(_ arguments: [String] = CommandLine.arguments) -> URL? {
         guard let i = arguments.firstIndex(of: flag), i + 1 < arguments.count else { return nil }
         return URL(fileURLWithPath: arguments[i + 1])
+    }
+
+    /// What `--only` asked for: `.all` without the flag, `.matching` with a
+    /// substring, and `.missingValue` for a flag with nothing after it, which
+    /// is refused rather than read as "everything".
+    enum SceneFilter: Equatable {
+        case all
+        case matching(String)
+        case missingValue
+
+        func admits(_ name: String) -> Bool {
+            switch self {
+            case .all: return true
+            case .matching(let part): return name.contains(part)
+            case .missingValue: return false
+            }
+        }
+    }
+
+    static func requestedFilter(_ arguments: [String] = CommandLine.arguments) -> SceneFilter {
+        guard let i = arguments.firstIndex(of: onlyFlag) else { return .all }
+        guard i + 1 < arguments.count, !arguments[i + 1].isEmpty,
+            !arguments[i + 1].hasPrefix("--")
+        else { return .missingValue }
+        return .matching(arguments[i + 1])
     }
 
     /// Every state worth looking at, with the name its PNG gets.
@@ -343,6 +376,15 @@ enum RenderStates {
             // alice's calm Bash ring and its ✕, `no Kill` in bob's slot, and the
             // Codex categories in BY TOOL. See ``toolsTabCodexFleet``.
             ("17c-tools-tab-codex", .loaded(toolsTabCodexFleet), false, nil),
+            // One fleet on every tab, so `scripts/check-tabs-one-height.swift`
+            // can hold the four to one height and a still strip (Gil,
+            // 2026-10-16: "can you make also it to not change the height?").
+            // `sessionsTabFleet` because it fills all four: accounts, live
+            // sessions, running tools.
+            ("27-one-height-accounts", .loaded(sessionsTabFleet), false, nil),
+            ("27-one-height-sessions", .loaded(sessionsTabFleet), false, nil),
+            ("27-one-height-tools", .loaded(sessionsTabFleet), false, nil),
+            ("27-one-height-peers", .loaded(sessionsTabFleet), false, nil),
         ]
     }
 
@@ -631,11 +673,15 @@ enum RenderStates {
         case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
             "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed",
             "22b-sessions-tab-real-fleet", "16b-sessions-tab-mixed",
-            "16c-sessions-tab-codex-only-empty", "16d-sessions-tab-old-server-codex":
+            "16c-sessions-tab-codex-only-empty", "16d-sessions-tab-old-server-codex",
+            "27-one-height-sessions":
             return .sessions
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
-            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex":
+            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet", "17c-tools-tab-codex",
+            "27-one-height-tools":
             return .tools
+        case "27-one-height-peers":
+            return .peers
         default: return .accounts
         }
     }
@@ -802,7 +848,12 @@ enum RenderStates {
     }
 
     @MainActor
-    static func run(into directory: URL) -> Never {
+    static func run(into directory: URL, only filter: SceneFilter = .all) -> Never {
+        if filter == .missingValue {
+            FileHandle.standardError.write(
+                Data("\(onlyFlag) needs a substring of a scene name\n".utf8))
+            exit(1)
+        }
         // A Codex row's note shortens its codex home against the home folder, and
         // the fixtures' homes are `/Users/example`: so every scene reads the same
         // on every Mac, and none names this one's user.
@@ -818,7 +869,9 @@ enum RenderStates {
 
         var written = 0
         var attempted = 0
-        for scene in scenes {
+        var matched = 0
+        for scene in scenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if render(scene, appearance: appearance, density: .auto, into: directory) {
@@ -846,14 +899,16 @@ enum RenderStates {
                 }
             }
         }
-        for scene in sheetScenes {
+        for scene in sheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
         // The Codex sheets, the same way, each with what it says beyond its phase.
-        for scene in codexSheetScenes {
+        for scene in codexSheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderSheet(
@@ -864,14 +919,16 @@ enum RenderStates {
                 }
             }
         }
-        for scene in peerSceneList {
+        for scene in peerSceneList where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeer(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
         // The same peers, with a Codex account in the fleet.
-        for scene in mixedPeerScenes {
+        for scene in mixedPeerScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeer(scene, appearance: appearance, holdsCodex: true, into: directory) {
@@ -879,14 +936,16 @@ enum RenderStates {
                 }
             }
         }
-        for scene in peerSheetScenes {
+        for scene in peerSheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
         // Two of those sheets again, with a Codex account in the fleet.
-        for scene in mixedPeerSheetScenes {
+        for scene in mixedPeerSheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerSheet(
@@ -896,7 +955,8 @@ enum RenderStates {
                 }
             }
         }
-        for scene in peerMovedSheetScenes {
+        for scene in peerMovedSheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerMovedSheet(scene, appearance: appearance, into: directory) {
@@ -904,7 +964,8 @@ enum RenderStates {
                 }
             }
         }
-        for scene in peerInviteSheetScenes {
+        for scene in peerInviteSheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerInviteSheet(scene, appearance: appearance, into: directory) {
@@ -912,7 +973,8 @@ enum RenderStates {
                 }
             }
         }
-        for scene in peerSealedSheetScenes {
+        for scene in peerSealedSheetScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeerSealedSheet(scene, appearance: appearance, into: directory) {
@@ -920,19 +982,29 @@ enum RenderStates {
                 }
             }
         }
-        for scene in controlScenes {
+        for scene in controlScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderControl(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
-        for scene in tabStripScenes {
+        for scene in tabStripScenes where filter.admits(scene.name) {
+            matched += 1
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderTabStrip(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
 
+        if case .matching(let part) = filter {
+            print("\n\(onlyFlag) \(part): \(matched) scenes matched")
+            if matched == 0 {
+                FileHandle.standardError.write(
+                    Data("\(onlyFlag) \(part) matched no scene: nothing rendered\n".utf8))
+                exit(1)
+            }
+        }
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
     }
@@ -2720,30 +2792,36 @@ enum RenderStates {
                 // does on the Accounts tab and these PNGs are comparable
                 // with those.
                 accountCount: 13,
-                summary: {
-                    SummaryLine(
-                        lines: [
-                            scene.dry
-                                ? [
-                                    .init(text: "13 accounts", tint: Tok.dim),
-                                    .init(text: "none with headroom", tint: Tok.near),
-                                ]
-                                : [
-                                    .init(text: "13 accounts", tint: Tok.dim),
-                                    .init(
-                                        text: "6 with headroom", tint: Tok.ok,
-                                        emphasised: true),
-                                ]
-                        ])
+                // The Peers tab alone: `PanelV4` asks every tab for its
+                // layers, and the other three have nothing to draw here.
+                summary: { tab in
+                    if tab == .peers {
+                        SummaryLine(
+                            lines: [
+                                scene.dry
+                                    ? [
+                                        .init(text: "13 accounts", tint: Tok.dim),
+                                        .init(text: "none with headroom", tint: Tok.near),
+                                    ]
+                                    : [
+                                        .init(text: "13 accounts", tint: Tok.dim),
+                                        .init(
+                                            text: "6 with headroom", tint: Tok.ok,
+                                            emphasised: true),
+                                    ]
+                            ])
+                    }
                 },
-                content: {
-                    PeersTabV4(
-                        controller: PeerController.pinned(
-                            scene.snapshot, refusal: refusal, holdsCodex: holdsCodex),
-                        snapshotMode: true,
-                        refusalDetailsOpen: detailsOpen)
+                content: { tab in
+                    if tab == .peers {
+                        PeersTabV4(
+                            controller: PeerController.pinned(
+                                scene.snapshot, refusal: refusal, holdsCodex: holdsCodex),
+                            snapshotMode: true,
+                            refusalDetailsOpen: detailsOpen)
+                    }
                 },
-                footer: { EmptyView() }
+                footer: { _ in EmptyView() }
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED size, for the reason the fleet scenes give: the

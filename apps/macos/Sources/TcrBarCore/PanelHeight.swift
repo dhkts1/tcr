@@ -152,6 +152,18 @@ public enum PanelHeight {
         return min(contentHeight, budget)
     }
 
+    /// The height every tab of the panel is drawn at: the tallest tab's own
+    /// height, so switching tabs never resizes the panel (Gil, 2026-10-16).
+    ///
+    /// Each height is a tab as it lays itself out, its list already clamped by
+    /// ``viewportHeight(contentHeight:budget:)``, so the result is clamped
+    /// exactly as far as the tallest tab is and no further. It is NOT the cap:
+    /// a short fleet keeps a short panel, which is review finding 11's rule.
+    /// No tabs is no height.
+    public static func sharedTabHeight(_ tabHeights: [CGFloat]) -> CGFloat {
+        tabHeights.max() ?? 0
+    }
+
     /// The grain every `GeometryReader` measurement this panel feeds into a
     /// `PreferenceKey` is snapped to before it is published.
     ///
