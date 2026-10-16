@@ -45,23 +45,29 @@ can name it in a script or a launch agent.
 | `--port <u16>` | number | config's `proxy.port` | bind port, overriding the config |
 | `--config <path>` | path | `~/.config/tcr.json` | which config to load |
 | `--headless` | bool | `false` | run without the TUI |
-| `--replace` | bool | `false` | kill a proxy already on the port and take it |
+| `--replace` | bool | `false` | inherit the listener and let the previous server drain |
 | `--no-replace` | bool | `false` | **deprecated no-op** |
 
 ### Taking over the port
 
 By default, starting a second `tcr` while one is already serving does **not** disturb the
-incumbent: the new process stands down and exits. That is the safe direction, because replacing a
-live proxy wipes its session-to-account pin map and cold-starts every live session's prompt
-cache, which is the most expensive event in this system. `--replace` opts into doing it
-anyway.
+incumbent: the new process stands down and exits. With `--replace`, a current standalone
+`tcr` hands its listening socket to the new process. The port stays bound, new connections
+queue until the successor is ready, and the predecessor stays alive until its accepted
+connections finish. It flushes pins and tokens before handing over, and the successor reads
+the final config before booting.
+
+Both processes must run as the same local user. An older server without the handoff endpoint,
+a legacy JS proxy, or an unresponsive handoff is left running and reported as an error: there
+is no kill-and-bind fallback. Stop such a server explicitly once to upgrade. An embedded
+proxy remains under its host application's control.
 
 The stand-down carries information in its exit code. `0` means a peer proxy holds the port
 and is serving code you have no reason to doubt. `3` means the incumbent is serving a
 *different commit* than the binary you just ran, so `cargo build && tcr` stops instead of
 proceeding as though your new build were live. `4` means the incumbent holds the listening
-socket and never answered the liveness probe, which is the wedged shape and the case where
-`--replace` is a recovery rather than an upgrade.
+socket and never answered the liveness probe. `--replace` can recover it only if its handoff
+endpoint still responds; otherwise an explicit stop is needed.
 
 ### `--no-replace` is a deprecated no-op
 
@@ -182,13 +188,45 @@ A config that holds a Claude account makes no such read and prints nothing new, 
 cannot be read prints nothing. So a proxy started from another config, or whose accounts changed
 since, can miss the warning.
 
-A Claude launch leaves `CODEX_CA_CERTIFICATE` unchanged. A `codex` started by a Claude tool
-inherits an unmarked proxy URL, keeps its CA choice and stays on its own login: tcr tunnels
-that `chatgpt.com` connection without terminating TLS. Start it with `tcr run --codex` to opt
-into pooling. The Claude launch names only its own CA variable on stderr:
+A Claude launch keeps its unmarked proxy URL and leaves `CODEX_CA_CERTIFICATE` unchanged.
+Nested `codex` commands on PATH use `tcr run --codex`, which checks the running proxy and
+CA trust before opting into pooling. Explicit caller CA bundles retain the same handling
+as a top-level Codex launch. The Claude launch names its own CA variable on stderr:
 
 ```
 [tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS=/Users/example/.config/tcr-ca.pem
+```
+
+**Shell tools connect directly.** In see-through mode, `tcr run` clears both spellings of
+`HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` from Claude's shell tools. `tcr run --codex`
+sets those six variables to empty strings in Codex's shell environment policy. This covers
+commands such as `git`, `gh`, `curl` and package managers without maintaining a host list.
+It also clears any proxy the caller exported for those tools. The agents themselves keep
+their proxy, first-party backend URL and CA trust; their own auxiliary HTTP traffic still
+uses tcr. This is a process boundary, not a filter for model request URLs.
+
+tcr prepends a private helper directory with `claude` and `codex` launchers to PATH. Claude
+regains the session's proxy and CA; Codex uses the current launch checks through `tcr run --codex`. Explicit executable paths, a
+replaced PATH, or client configuration that overrides these settings can bypass the launchers;
+use `tcr run` / `tcr run --codex` for explicit nested launches in that case. Claude's existing
+`CLAUDE_CODE_SHELL_PREFIX` and `CLAUDE_ENV_FILE` still run. Codex's unrelated shell policy
+settings are preserved. Helpers live in the private `tool-env` cache directory and remain
+available to background shells after the foreground agent exits. No shell startup file or
+client config is changed.
+
+This is verified with Claude Code 2.1.294 and Codex 0.162.1. Claude's Bash tool and shell-form
+hooks/MCP launchers use its shell prefix; exec-form hooks, PowerShell and Codex MCP processes
+are outside the shell-tool boundary. Remote Control keeps its first-party URL requirement;
+authenticated Remote Control is not exercised by the synthetic test.
+
+The manual real-client regression uses an isolated HOME, synthetic account credentials and
+local model/HTTPS fixtures. Pass actual client executable paths, not aliases:
+
+```sh
+python3 scripts/test-agent-proxy-isolation.py claude baseline --nested \
+  --tcr /path/to/built/tcr --claude-bin /path/to/claude --codex-bin /path/to/codex
+python3 scripts/test-agent-proxy-isolation.py codex baseline --policy legacy \
+  --tcr /path/to/built/tcr --claude-bin /path/to/claude --codex-bin /path/to/codex
 ```
 
 Every child also gets `TCR_RUN_ACTIVE=1`, on every path, the proxy-down passthrough and
@@ -239,12 +277,10 @@ launch says so on stderr:
 [tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE=/Users/example/.config/tcr-ca.pem
 ```
 
-The launch also supplies `shell_environment_policy.set.HTTPS_PROXY` and
-`shell_environment_policy.set.https_proxy` overrides with the unmarked loopback URL. Ordinary
-Codex shell tools such as curl, Python and git then tunnel `chatgpt.com` on their own TLS and
-credentials. These two launch overrides replace any proxy values in the config file's shell
-policy while preserving other keys and filters; later explicit `-c` arguments can override
-them. No Codex config file is written.
+The launch sets all six proxy variables to empty strings through
+`shell_environment_policy.set` overrides, so ordinary shell tools connect directly.
+These scalar overrides preserve unrelated policy keys and filters; later explicit `-c`
+arguments can override them. No Codex config file is written.
 
 Codex's default stdio MCP environment omits proxy variables: its MCP launcher clears the
 child environment and restores an allowlist. Explicit MCP `env_vars` can opt back into
@@ -414,7 +450,7 @@ The request path in full is in [architecture.md](architecture.md#codex-requests)
 **`claude` inside a `tcr run --codex` session.** A pooled session gives `codex`
 `TCR_RUN_ACTIVE=1` like every `tcr run` child, `HTTPS_PROXY` aimed at tcr, and
 `NODE_EXTRA_CA_CERTS` naming tcr's CA. A `claude` started inside the session, by a codex tool
-for instance, inherits all three, so it trusts the leaf tcr presents for `api.anthropic.com`,
+for instance, regains the proxy through the PATH launcher, so it trusts the leaf tcr presents for `api.anthropic.com`,
 even when a wrapper that honours the marker hands the call straight to the real `claude`. A
 `NODE_EXTRA_CA_CERTS` you exported is passed through untouched instead; a nested `claude` then
 trusts tcr's leaf only if that file holds tcr's CA.

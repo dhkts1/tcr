@@ -52,6 +52,7 @@ pub mod provider;
 pub mod provider_guard;
 pub mod proxy;
 pub mod quota;
+pub mod restart;
 pub mod schedule;
 pub mod server;
 pub mod session_wire;
