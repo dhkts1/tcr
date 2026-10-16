@@ -22,10 +22,12 @@ impl Manager {
             if let Some(account) = accounts.get_mut(idx) {
                 account.requests += 1;
                 account.last_used_ms = Some(odt_to_ms(now));
-                // One line per forwarded request naming the account that served it,
-                // so the load spread is observable in the headless log (and auditable
-                // against the reported "everything piles onto one account" symptom).
-                tracing::info!(account = %account.name, index = idx, session = sid, "serving request");
+                // One line per forwarded request naming the account that served it. At
+                // DEBUG: the INFO record of a served request is its `request usage` line
+                // (`src/proxy.rs`), which names the same account, index and session, so
+                // the load spread stays observable in the default log without a second
+                // INFO line per request.
+                tracing::debug!(account = %account.name, index = idx, session = sid, "serving request");
             }
         }
         // Upsert per-session stats (only when a session key exists) so a session

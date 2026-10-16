@@ -290,6 +290,13 @@ impl Manager {
     /// contract as [`Self::mark_affinity_dirty`].
     pub fn mark_bound_tokens_dirty(&self) {
         self.bound_tokens_dirty.store(true, Ordering::Relaxed);
+        self.bound_tokens_wake.notify_one();
+    }
+
+    /// Resolves once the bound-token map has changed since the last time this resolved: the
+    /// bound-token flusher's wake-up, as [`Self::affinity_changed`] is the pins'.
+    pub async fn bound_tokens_changed(&self) {
+        self.bound_tokens_wake.notified().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
@@ -709,7 +716,29 @@ impl Manager {
     /// traffic exactly as it did before the file existed, and pays the rejected turns it was
     /// buying back.
     pub fn flush_bound_tokens(&self, path: &Path) -> Result<usize, ConfigError> {
-        bound_tokens::save(path, self.bound_token_snapshot(), crate::now_ms())
+        let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
+        let content = prepared.content_hash()?;
+        let count = prepared.write(path, crate::now_ms())?;
+        self.bound_tokens_save
+            .wrote(content, content, std::time::Instant::now());
+        Ok(count)
+    }
+
+    /// The flusher's save: [`Self::flush_bound_tokens`] unless the map is what the last write
+    /// put on disk. Every change here is one a restart needs, so nothing is deferred.
+    pub fn flush_bound_tokens_if_changed(
+        &self,
+        path: &Path,
+    ) -> Result<crate::save_gate::SaveOutcome, ConfigError> {
+        let prepared = bound_tokens::prepare(self.bound_token_snapshot())?;
+        let content = prepared.content_hash()?;
+        let now = std::time::Instant::now();
+        if let Some(skipped) = self.bound_tokens_save.skip(content, content, now) {
+            return Ok(skipped);
+        }
+        let count = prepared.write(path, crate::now_ms())?;
+        self.bound_tokens_save.wrote(content, content, now);
+        Ok(crate::save_gate::SaveOutcome::Wrote(count))
     }
 
     /// Restore the map from `path`, resolving each stored identity against the accounts loaded
@@ -791,6 +820,36 @@ mod tests {
 
     fn tokens(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The flusher's save writes nothing when the map is what it last wrote. The file is
+    /// removed between the saves, so a write of any kind would bring it back. A new token is
+    /// written.
+    #[test]
+    fn a_second_bound_token_save_with_no_change_writes_nothing() {
+        use crate::save_gate::SaveOutcome;
+        let path = tmp("unchanged");
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let now = crate::now_ms();
+        manager.record_bound_tokens(&sig("sig_fake_first"), 0, now);
+        assert_eq!(
+            manager.flush_bound_tokens_if_changed(&path).expect("save"),
+            SaveOutcome::Wrote(1)
+        );
+        std::fs::remove_file(&path).expect("remove the bound-token file");
+
+        assert_eq!(
+            manager.flush_bound_tokens_if_changed(&path).expect("save"),
+            SaveOutcome::Unchanged
+        );
+        assert!(!path.exists(), "an unchanged save wrote the file");
+
+        manager.record_bound_tokens(&sig("sig_fake_second"), 0, now);
+        assert_eq!(
+            manager.flush_bound_tokens_if_changed(&path).expect("save"),
+            SaveOutcome::Wrote(2)
+        );
+        assert!(path.exists());
     }
 
     /// The whole claim of the map, at its own layer, for every kind.

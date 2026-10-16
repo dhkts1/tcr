@@ -274,6 +274,56 @@ impl Snapshot {
 /// token per four lines roughly triples it for a file no one reads by eye. Returns how many
 /// tokens landed. The caller decides what a failure means; it is never fatal here.
 pub fn save(path: &Path, snapshot: Snapshot, now_ms: i64) -> Result<usize, ConfigError> {
+    prepare(snapshot)?.write(path, now_ms)
+}
+
+/// What [`save`] writes, before the write: the kept tokens in hash order and the account table
+/// they name. Split from the write so a periodic save can hash it first and write nothing when
+/// it is what the last write put on disk ([`crate::save_gate`]).
+#[derive(Debug)]
+pub struct Prepared {
+    accounts: Vec<StoredAccount>,
+    tokens: Vec<StoredBoundToken>,
+}
+
+impl Prepared {
+    /// The hash of everything [`Self::write`] puts in the file but its `savedAtMs`.
+    pub fn content_hash(&self) -> Result<u64, serde_json::Error> {
+        crate::save_gate::content_hash(&(&self.accounts, &self.tokens))
+    }
+
+    /// How many tokens the file will hold.
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether the file will hold no token.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Write the file to `path`, stamped `now_ms`. Returns how many tokens landed.
+    pub fn write(self, path: &Path, now_ms: i64) -> Result<usize, ConfigError> {
+        let count = self.tokens.len();
+        let file = BoundTokenFile {
+            version: FORMAT_VERSION,
+            saved_at_ms: now_ms,
+            accounts: self.accounts,
+            tokens: self.tokens,
+        };
+        // A cache of several megabytes, which `load` reads as empty when it is missing or
+        // damaged: atomic, but not flushed to the disk (see `Durability::Cache`).
+        crate::config::write_atomic_with(
+            path,
+            &serde_json::to_string(&file)?,
+            crate::config::Durability::Cache,
+        )?;
+        Ok(count)
+    }
+}
+
+/// Cap and order `snapshot` as [`save`] writes it. See [`save`] for the rules.
+pub fn prepare(snapshot: Snapshot) -> Result<Prepared, ConfigError> {
     let Snapshot {
         accounts,
         mut tokens,
@@ -308,21 +358,10 @@ pub fn save(path: &Path, snapshot: Snapshot, now_ms: i64) -> Result<usize, Confi
         };
         token.account = to;
     }
-    let count = tokens.len();
-    let file = BoundTokenFile {
-        version: FORMAT_VERSION,
-        saved_at_ms: now_ms,
+    Ok(Prepared {
         accounts: table,
         tokens,
-    };
-    // A cache of several megabytes, which `load` reads as empty when it is missing or damaged:
-    // atomic, but not flushed to the disk (see `Durability::Cache`).
-    crate::config::write_atomic_with(
-        path,
-        &serde_json::to_string(&file)?,
-        crate::config::Durability::Cache,
-    )?;
-    Ok(count)
+    })
 }
 
 /// Read `path` and resolve each token's account against `accounts`, dropping anything stale or

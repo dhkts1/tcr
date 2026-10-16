@@ -112,6 +112,21 @@
 //! File names are UTC dates; "today" is a LOCAL day computed from the record
 //! timestamps inside the files. The two deliberately need not agree — the file
 //! name is a shard key, not a claim about anyone's calendar.
+//!
+//! # Closed days are gzipped
+//!
+//! A day of ledger is about 20 MB on a busy fleet and is kept for
+//! `usageRetentionDays` (90 by default), so plain files head for gigabytes. The
+//! writer thread gzips every day older than yesterday into `<date>.jsonl.gz`
+//! ([`compress_closed_days`]), when it starts and each time a new day opens;
+//! JSON lines this repetitive compress to a small fraction of their size. Today's
+//! file stays plain because it is being appended to, and yesterday's for one
+//! more day so a late line and boot's replay both meet a plain file.
+//!
+//! Every reader goes through [`read_ledger_day`], which reads either form and
+//! both at once, so nothing that reads the ledger needs to know which days are
+//! compressed: boot's replay, `tcr wrap`, and the scripts that read these files
+//! by hand (`scripts/fit-quota-weights.py`) read both.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -475,7 +490,7 @@ pub(crate) fn date_string(date: Date) -> String {
 /// One ledger line. Short keys are deliberate — see the module docs on size.
 ///
 /// `pub(crate)`, fields included, so `tcr wrap` (`src/wrap.rs`) reads the exact
-/// shape [`parse_ledger_file`] parses rather than a second struct that could
+/// shape [`parse_ledger_day`] parses rather than a second struct that could
 /// drift from it field by field.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct LedgerLine {
@@ -542,18 +557,17 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// Parse one day's ledger file into its lines, skipping blank lines and
-/// counting (never failing on) malformed ones.
+/// Parse one day's ledger into its lines, skipping blank lines and counting
+/// (never failing on) malformed ones. The day is read in whichever form it is
+/// on disk ([`read_ledger_day`]).
 ///
-/// `pub(crate)` and the ONLY place either [`UsageTracker::replay_file`] or
-/// `tcr wrap` reads a ledger file off disk, so "a malformed line is counted,
+/// `pub(crate)` and the ONLY place either [`UsageTracker::replay_day`] or
+/// `tcr wrap` reads a ledger day off disk, so "a malformed line is counted,
 /// not fatal" is one piece of behaviour instead of two copies that could drift.
-/// A missing file is the ordinary case (no traffic that day) and returns
-/// nothing, the same as [`UsageTracker::replay_file`] always has.
-pub(crate) fn parse_ledger_file(path: &Path) -> (Vec<LedgerLine>, usize) {
-    let Ok(data) = std::fs::read_to_string(path) else {
-        return (Vec::new(), 0);
-    };
+/// A missing day is the ordinary case (no traffic that day) and returns
+/// nothing, the same as replay always has.
+pub(crate) fn parse_ledger_day(dir: &Path, date: Date) -> (Vec<LedgerLine>, usize) {
+    let data = read_ledger_day(dir, date);
     let mut lines = Vec::new();
     let mut malformed = 0;
     for raw in data.lines() {
@@ -566,6 +580,217 @@ pub(crate) fn parse_ledger_file(path: &Path) -> (Vec<LedgerLine>, usize) {
         }
     }
     (lines, malformed)
+}
+
+/// The plain file a day's lines are appended to: `<UTC date>.jsonl`.
+fn plain_day_path(dir: &Path, date: Date) -> PathBuf {
+    dir.join(format!("{}.jsonl", date_string(date)))
+}
+
+/// The file a closed day is compressed into: `<UTC date>.jsonl.gz`.
+fn gz_day_path(dir: &Path, date: Date) -> PathBuf {
+    dir.join(format!("{}.jsonl.gz", date_string(date)))
+}
+
+/// Where [`compress_day`] writes before it renames into place. Dot-led, so no reader's
+/// `<date>.jsonl` or `<date>.jsonl.gz` name ever matches it.
+fn gz_day_temp_path(dir: &Path, date: Date) -> PathBuf {
+    dir.join(format!(".{}.jsonl.gz.tmp", date_string(date)))
+}
+
+/// Every byte of `path` decompressed, or `None` when it cannot be read. Multi-member, so a
+/// file that is several gzip streams back to back reads as all of them.
+fn read_gz(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file))
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// One day's ledger text, in whichever form it is on disk.
+///
+/// A day is plain (`<date>.jsonl`) while it is written and gzipped (`<date>.jsonl.gz`) once
+/// closed ([`compress_closed_days`]). Both can exist at once, for two reasons, and this is the
+/// one place that tells them apart:
+///
+/// - a compression stopped between renaming the `.gz` into place and removing the plain file:
+///   the `.gz` already ends with every byte of the plain file, so the plain file is a leftover
+///   and is not read a second time;
+/// - a line arrived for a day after it was compressed, which reopens its plain file: the plain
+///   file then holds only lines the `.gz` does not, and they are read after it.
+///
+/// An unreadable file reads as absent, as a missing one always has.
+pub(crate) fn read_ledger_day(dir: &Path, date: Date) -> String {
+    let plain = std::fs::read(plain_day_path(dir, date)).ok();
+    let gz = read_gz(&gz_day_path(dir, date));
+    let bytes = match (gz, plain) {
+        (None, None) => return String::new(),
+        (Some(gz), None) => gz,
+        (None, Some(plain)) => plain,
+        (Some(gz), Some(plain)) if gz.ends_with(&plain) => gz,
+        (Some(mut gz), Some(plain)) => {
+            gz.extend_from_slice(&plain);
+            gz
+        }
+    };
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What one pass of [`compress_closed_days`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompressReport {
+    /// Days whose plain file was compressed (or folded into an existing `.gz`) and removed.
+    pub days: usize,
+    /// The plain files' bytes before.
+    pub plain_bytes: u64,
+    /// The `.gz` files' bytes after.
+    pub gz_bytes: u64,
+    /// Days left plain because a step failed; each is retried on the next pass.
+    pub failed: usize,
+}
+
+/// Gzip every closed day in `dir` that is still plain: every `<date>.jsonl` dated before
+/// yesterday (`today` is a UTC date, as the file names are). Today's file is being written,
+/// and yesterday's is left plain for a day so a late line (a request that began before
+/// midnight) appends to a plain file, and boot's replay of yesterday reads it without
+/// decompressing.
+///
+/// Each day is compressed safely ([`compress_day`]): the plain file is removed only after its
+/// `.gz` has been read back and found identical. `between` runs after each day, so the ledger
+/// writer, which runs this, answers its queue between files rather than once at the end.
+pub(crate) fn compress_closed_days(
+    dir: &Path,
+    today: Date,
+    mut between: impl FnMut(),
+) -> CompressReport {
+    let mut report = CompressReport::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return report;
+    };
+    let cutoff = today - time::Duration::days(1);
+    let mut days: Vec<Date> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let stem = name.to_str()?.strip_suffix(".jsonl")?;
+            parse_day(stem)
+        })
+        .filter(|date| *date < cutoff)
+        .collect();
+    days.sort();
+    for date in days {
+        match compress_day(dir, date) {
+            Ok(Some((plain, gz))) => {
+                report.days += 1;
+                report.plain_bytes += plain;
+                report.gz_bytes += gz;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                report.failed += 1;
+                tracing::warn!(
+                    dir = %dir.display(),
+                    date = %date_string(date),
+                    error = %err,
+                    "could not compress a closed usage-ledger day; it stays plain and is retried"
+                );
+            }
+        }
+        between();
+    }
+    report
+}
+
+/// A ledger file's date stem (`2026-10-16`) as a date.
+fn parse_day(stem: &str) -> Option<Date> {
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    Date::parse(stem, &format).ok()
+}
+
+/// Compress one closed day: `<date>.jsonl` becomes `<date>.jsonl.gz`, folded after the lines
+/// of an existing `.gz` when there is one. Returns the plain bytes and the `.gz` bytes, or
+/// `None` when there was no plain file.
+///
+/// The order is what makes it safe to interrupt anywhere: write the `.gz` beside under a
+/// temporary name, sync it, read it back and compare it with what it must hold, rename it into
+/// place, and only then remove the plain file. A failure before the rename leaves the day as
+/// it was. A stop after the rename leaves both files, the `.gz` ending with the plain file's
+/// bytes, which [`read_ledger_day`] reads once and the next pass finishes removing.
+fn compress_day(dir: &Path, date: Date) -> std::io::Result<Option<(u64, u64)>> {
+    let plain_path = plain_day_path(dir, date);
+    let plain = match std::fs::read(&plain_path) {
+        Ok(plain) => plain,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let gz_path = gz_day_path(dir, date);
+    let mut content = match std::fs::metadata(&gz_path) {
+        Ok(_) => read_gz(&gz_path).ok_or_else(|| {
+            std::io::Error::other(format!("{} exists and does not read", gz_path.display()))
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    if !content.is_empty() && content.ends_with(&plain) {
+        // A pass that stopped after its rename: the `.gz` already holds these lines.
+        std::fs::remove_file(plain_path)?;
+        return Ok(Some((
+            plain.len() as u64,
+            std::fs::metadata(gz_path)?.len(),
+        )));
+    }
+    content.extend_from_slice(&plain);
+
+    let temp = gz_day_temp_path(dir, date);
+    let written = write_gz(&temp, &content).and_then(|()| {
+        if read_gz(&temp).as_deref() == Some(content.as_slice()) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "{} did not read back identical",
+                temp.display()
+            )))
+        }
+    });
+    if let Err(err) = written.and_then(|()| std::fs::rename(&temp, &gz_path)) {
+        if let Err(cleanup) = std::fs::remove_file(&temp) {
+            if cleanup.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %temp.display(), error = %cleanup, "could not remove a temporary usage-ledger file");
+            }
+        }
+        return Err(err);
+    }
+    std::fs::remove_file(plain_path)?;
+    Ok(Some((
+        plain.len() as u64,
+        std::fs::metadata(gz_path)?.len(),
+    )))
+}
+
+/// Write `content` gzipped to a new file at `path`, `0600` like the day files, synced to the
+/// disk before it returns: the plain file it replaces is deleted on the strength of it.
+fn write_gz(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::io::BufWriter::new(file),
+        flate2::Compression::default(),
+    );
+    encoder.write_all(content)?;
+    let file = encoder
+        .finish()?
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)?;
+    file.sync_all()
 }
 
 /// The provider a ledger line belongs to: the one its `p` names, when this build knows it;
@@ -740,6 +965,27 @@ struct Ledger {
 }
 
 impl Ledger {
+    /// Write a line, or answer a flush once every line before it is written.
+    fn handle(&mut self, msg: LedgerMsg) {
+        match msg {
+            LedgerMsg::Line(line) => self.append(&line),
+            LedgerMsg::Flush(ack) => {
+                // The only error here is a flusher that timed out and dropped
+                // its receiver, and it has already stopped waiting.
+                if ack.send(()).is_err() {
+                    tracing::debug!(
+                        "a usage-ledger flush was abandoned before the writer answered"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The UTC date of the day file open for appending, if one is.
+    fn open_date(&self) -> Option<Date> {
+        self.open.as_ref().map(|(date, _)| *date)
+    }
+
     fn append(&mut self, line: &LedgerLine) {
         match self.try_append(line) {
             // Report every TRANSITION, in both directions. Warning once and
@@ -837,7 +1083,14 @@ impl Ledger {
 /// busiest lock under load (2026-10-16 profile: up to 111 of 2,219 samples in
 /// `SyncWaker::notify`). Under traffic the linger leaves lines waiting, so the
 /// next receive takes one without blocking and no send has a sleeper to wake.
+///
+/// It also compresses closed days ([`compress_closed_days`]): once when it starts, and again
+/// each time a line opens a new day's file, which is when one more day closes. Doing it here
+/// rather than on a thread of its own costs no thread and no timer, and the queue is answered
+/// between files.
 fn ledger_writer(rx: Receiver<LedgerMsg>, mut ledger: Ledger) {
+    let mut compressed_for = ledger_date(crate::now_ms());
+    compress_ledger(&rx, &mut ledger, compressed_for);
     loop {
         let msg = match rx.try_recv() {
             Ok(msg) => msg,
@@ -850,18 +1103,34 @@ fn ledger_writer(rx: Receiver<LedgerMsg>, mut ledger: Ledger) {
                 }
             }
         };
-        match msg {
-            LedgerMsg::Line(line) => ledger.append(&line),
-            LedgerMsg::Flush(ack) => {
-                // The only error here is a flusher that timed out and dropped
-                // its receiver, and it has already stopped waiting.
-                if ack.send(()).is_err() {
-                    tracing::debug!(
-                        "a usage-ledger flush was abandoned before the writer answered"
-                    );
-                }
+        ledger.handle(msg);
+        if let Some(open) = ledger.open_date() {
+            if open > compressed_for {
+                compressed_for = open;
+                compress_ledger(&rx, &mut ledger, open);
             }
         }
+    }
+}
+
+/// One pass of [`compress_closed_days`] over the ledger's directory, answering whatever the
+/// queue holds between files, and one INFO line when it compressed anything.
+fn compress_ledger(rx: &Receiver<LedgerMsg>, ledger: &mut Ledger, today: Date) {
+    let dir = ledger.dir.clone();
+    let report = compress_closed_days(&dir, today, || {
+        while let Ok(msg) = rx.try_recv() {
+            ledger.handle(msg);
+        }
+    });
+    if report.days > 0 {
+        tracing::info!(
+            dir = %dir.display(),
+            days = report.days,
+            plain_bytes = report.plain_bytes,
+            gz_bytes = report.gz_bytes,
+            failed = report.failed,
+            "usage ledger: closed days compressed"
+        );
     }
 }
 
@@ -1320,11 +1589,7 @@ impl UsageTracker {
         let days_back: i64 = if holds_codex { 7 } else { 1 };
         for back in (0..=days_back).rev() {
             let date = ledger_date(now_ms - back * 86_400_000);
-            self.replay_file(
-                &dir.join(format!("{}.jsonl", date_string(date))),
-                accounts,
-                &mut report,
-            );
+            self.replay_day(&dir, date, accounts, &mut report);
         }
         let keep_days = if holds_codex {
             retention_days.max(7)
@@ -1376,8 +1641,14 @@ impl UsageTracker {
         report
     }
 
-    fn replay_file(&self, path: &Path, accounts: &[LedgerAccount], report: &mut ReplayReport) {
-        let (lines, malformed) = parse_ledger_file(path);
+    fn replay_day(
+        &self,
+        dir: &Path,
+        date: Date,
+        accounts: &[LedgerAccount],
+        report: &mut ReplayReport,
+    ) {
+        let (lines, malformed) = parse_ledger_day(dir, date);
         report.malformed += malformed;
         for line in lines {
             let Some(idx) = resolve_account(accounts, &line) else {
@@ -1615,11 +1886,15 @@ fn prune(dir: &Path, today: Date, retention_days: u32) -> usize {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(stem) = name.strip_suffix(".jsonl") else {
+        // A closed day is gzipped, today's and yesterday's are plain, and either
+        // form ages out the same way.
+        let Some(stem) = name
+            .strip_suffix(".jsonl.gz")
+            .or_else(|| name.strip_suffix(".jsonl"))
+        else {
             continue;
         };
-        let format = time::macros::format_description!("[year]-[month]-[day]");
-        let Ok(date) = Date::parse(stem, &format) else {
+        let Some(date) = parse_day(stem) else {
             continue;
         };
         if date < cutoff && std::fs::remove_file(entry.path()).is_ok() {
@@ -1867,7 +2142,7 @@ mod tests {
         )
         .expect("write the ledger line");
 
-        let (lines, malformed) = parse_ledger_file(&path);
+        let (lines, malformed) = parse_ledger_day(&dir, time::macros::date!(2026 - 01 - 01));
         assert_eq!(
             malformed, 0,
             "an unknown key does not make a line malformed"
@@ -1951,7 +2226,7 @@ mod tests {
             ),
         )
         .expect("write a day file");
-        let (lines, malformed) = parse_ledger_file(&path);
+        let (lines, malformed) = parse_ledger_day(&dir, time::macros::date!(2026 - 01 - 01));
         assert_eq!((lines.len(), malformed), (2, 0));
         assert_eq!((lines[0].p.as_deref(), lines[0].rt), (None, 0));
         assert_eq!(
@@ -3388,6 +3663,174 @@ mod tests {
         assert!(
             dir.join("notes.txt").exists(),
             "unrelated files are untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compressed day ages out like a plain one.
+    #[test]
+    fn prune_deletes_old_compressed_days_too() {
+        let dir = scratch("prune-gz");
+        ensure_dir(&dir).expect("temp dir");
+        let today = ledger_date(crate::now_ms());
+        let old = today - time::Duration::days(100);
+        let recent = today - time::Duration::days(2);
+        for date in [old, recent] {
+            write_gz(&gz_day_path(&dir, date), b"").expect("write");
+        }
+        assert_eq!(prune(&dir, today, 90), 1);
+        assert!(!gz_day_path(&dir, old).exists());
+        assert!(gz_day_path(&dir, recent).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One fake ledger line, in the shape the writer serializes.
+    fn fake_line(t: i64, n: u64) -> String {
+        let line = LedgerLine {
+            t,
+            a: format!("user{}@example.com", n % 18),
+            u: Some(format!("{:08}-1111-4111-8111-111111111111", n % 18)),
+            g: Some(format!("{:08}-2222-4222-8222-222222222222", n % 18)),
+            p: None,
+            m: Some(
+                if n.is_multiple_of(3) {
+                    "claude-opus-4-1"
+                } else {
+                    "claude-sonnet-4-5"
+                }
+                .to_string(),
+            ),
+            s: Some(n.wrapping_mul(0x9e37_79b9_7f4a_7c15) % 4_000),
+            i: n % 7,
+            c5: (n * 131) % 9_000,
+            c1: (n * 17) % 40_000,
+            r: 150_000 + (n * 7_919) % 200_000,
+            o: (n * 37) % 3_000,
+            rt: 0,
+        };
+        let mut text = serde_json::to_string(&line).expect("serialize");
+        text.push('\n');
+        text
+    }
+
+    /// The closed-day compression: every day before yesterday becomes a `.gz` holding exactly
+    /// its bytes, today's and yesterday's stay plain, and every reader reads the same lines
+    /// either way. The two two-file states are covered: a leftover plain file (the `.gz`
+    /// already ends with it) is removed and read once, and a plain file of late lines is
+    /// folded in after the `.gz`.
+    #[test]
+    fn closed_days_are_gzipped_and_read_back_identical() {
+        let dir = scratch("compress");
+        ensure_dir(&dir).expect("temp dir");
+        let today = ledger_date(crate::now_ms());
+        let day = |back: i64| today - time::Duration::days(back);
+        let text = |back: i64, lines: u64| -> String {
+            (0..lines)
+                .map(|n| fake_line(1_700_000_000_000 + back * 1_000 + n as i64, n))
+                .collect()
+        };
+        for back in [0, 1, 2, 5] {
+            std::fs::write(plain_day_path(&dir, day(back)), text(back, 50)).expect("write");
+        }
+        // Six days back: compressed earlier, then two late lines reopened its plain file.
+        write_gz(&gz_day_path(&dir, day(6)), text(6, 30).as_bytes()).expect("write gz");
+        std::fs::write(
+            plain_day_path(&dir, day(6)),
+            fake_line(1, 1) + &fake_line(2, 2),
+        )
+        .expect("write late lines");
+        // Seven days back: a pass that stopped between its rename and its remove.
+        write_gz(&gz_day_path(&dir, day(7)), text(7, 30).as_bytes()).expect("write gz");
+        let tail: String = text(7, 30)
+            .lines()
+            .skip(20)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(plain_day_path(&dir, day(7)), tail).expect("write leftover");
+
+        let before: Vec<String> = [0, 1, 2, 5, 6, 7]
+            .iter()
+            .map(|&back| read_ledger_day(&dir, day(back)))
+            .collect();
+        assert_eq!(before[5], text(7, 30), "a leftover is read once");
+        assert_eq!(
+            before[4],
+            text(6, 30) + &fake_line(1, 1) + &fake_line(2, 2),
+            "late lines are read after the compressed day"
+        );
+
+        let mut between = 0;
+        let report = compress_closed_days(&dir, today, || between += 1);
+        assert_eq!(report.days, 4, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert_eq!(between, 4, "the queue is answered after every day");
+        for back in [0, 1] {
+            assert!(
+                plain_day_path(&dir, day(back)).exists(),
+                "day -{back} stays plain"
+            );
+            assert!(
+                !gz_day_path(&dir, day(back)).exists(),
+                "day -{back} is not compressed"
+            );
+        }
+        for back in [2, 5, 6, 7] {
+            assert!(
+                !plain_day_path(&dir, day(back)).exists(),
+                "day -{back} plain removed"
+            );
+            assert!(
+                gz_day_path(&dir, day(back)).exists(),
+                "day -{back} compressed"
+            );
+        }
+        let after: Vec<String> = [0, 1, 2, 5, 6, 7]
+            .iter()
+            .map(|&back| read_ledger_day(&dir, day(back)))
+            .collect();
+        assert_eq!(before, after, "every day reads back identical");
+        let (lines, malformed) = parse_ledger_day(&dir, day(5));
+        assert_eq!((lines.len(), malformed), (50, 0));
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("list")
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+            "no temporary file is left behind"
+        );
+
+        // A second pass finds nothing left to do.
+        assert_eq!(compress_closed_days(&dir, today, || {}).days, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The size a compressed day saves, on a generated day of ledger lines in the writer's
+    /// own shape at about a busy day's count. Ignored by default (it writes about 30 MB);
+    /// `cargo test --lib -- --ignored --nocapture ledger_day_compression` prints the sizes.
+    #[test]
+    #[ignore = "writes a full-size day to measure the compression"]
+    fn ledger_day_compression_on_a_generated_day() {
+        let dir = scratch("compress-size");
+        ensure_dir(&dir).expect("temp dir");
+        let today = ledger_date(crate::now_ms());
+        let day = today - time::Duration::days(3);
+        let start = 1_700_000_000_000_i64;
+        let lines: u64 = 180_000;
+        let mut text = String::new();
+        for n in 0..lines {
+            text.push_str(&fake_line(start + (n as i64) * 480, n));
+        }
+        std::fs::write(plain_day_path(&dir, day), &text).expect("write");
+        let started = std::time::Instant::now();
+        let report = compress_closed_days(&dir, today, || {});
+        let took = started.elapsed();
+        assert_eq!(report.days, 1);
+        assert_eq!(read_ledger_day(&dir, day), text);
+        eprintln!(
+            "ledger day: {lines} lines, plain {} bytes, gz {} bytes ({:.1}%), compressed in {took:?}",
+            report.plain_bytes,
+            report.gz_bytes,
+            report.gz_bytes as f64 / report.plain_bytes as f64 * 100.0
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

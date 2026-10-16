@@ -57,6 +57,7 @@ pub mod proxy;
 pub mod quota;
 pub mod request_body;
 pub mod request_key;
+pub mod save_gate;
 pub mod schedule;
 pub mod server;
 pub mod session_wire;

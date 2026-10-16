@@ -8,7 +8,7 @@ show how far the numbers move on their own (see [Toward a CI gate](#toward-a-ci-
 ## Running it
 
 ```
-scripts/load-test.sh                    # all six phases, about five minutes
+scripts/load-test.sh                    # all seven phases, about seven minutes
 scripts/load-test.sh --phases overhead  # one phase
 scripts/load-test.sh --help             # every flag
 ```
@@ -57,6 +57,7 @@ on its next turn, so each `/v1/messages` request looks the map up and its reply 
 | `peak` | 30 s | the steady stream, plus a burst of 36 sends inside one second every 5 s over 48 sessions: the fleet's busiest second | defaults | 300 ms |
 | `runaway` | 20 s | 30 a second over 64 sessions, three times the fleet ceiling's 10 | defaults | 300 ms |
 | `big1m`, `big4m` | 20 s each (`--big`) | as `overhead`, over 4 sessions, each request a generated long conversation of about 1 MiB or 4 MiB | off | at once |
+| `idle` | 60 s (`--idle`) | the `steady` sessions' warm-up, then nothing: what an idle minute costs | defaults | 300 ms |
 
 The big-body phases send what a long Claude Code session sends (`examples/load_test/conversation.rs`):
 a system prompt with a cache breakpoint, 24 tools, then hundreds of turns of signed thinking, a
@@ -66,8 +67,10 @@ ending in a user message with a cache breakpoint. Every word is generated. A bre
 live. Real requests are this size: the live log's median prompt is about 365,000 tokens.
 
 The rates come from the replay described in `src/config.rs` (`default_account_throttle`,
-`default_fleet_throttle`). `steady` runs 75 s so it spans fifteen of the 5 s cache saves and one
-60 s rewrite of the bound-token file at its cap. Requests are 85% streamed `/v1/messages`, 5%
+`default_fleet_throttle`). `steady` runs 75 s, which before `perf/idle-cost` spanned fifteen of
+the 5 s cache saves and one 60 s rewrite of the bound-token file at its cap; since then a cache is
+saved only when its content changed, and the bound-token file every ten minutes (see
+[Threads, wake-ups and disk](#threads-wake-ups-and-disk)). Requests are 85% streamed `/v1/messages`, 5%
 buffered, 10% `count_tokens`, each with a 32 KiB system prompt (`--body-kb`) and a Claude Code
 shaped `metadata.user_id`.
 
@@ -84,9 +87,15 @@ change to the proxy would; CPU time per request moved 10% across the three runs 
 
 Read it beside **CPU % of a core** (CPU seconds over the phase's wall time). In `overhead` the
 proxy is busy and the per-request figure is its cost per request. In `steady` and `peak` it
-serves one or a few requests a second and spends most of its CPU on timers (the 5 s cache saves,
-the 60 s bound-token rewrite), so CPU per request there is mostly the fixed cost spread over few
-requests; the share of a core is the figure to watch.
+serves one or a few requests a second, so CPU per request there includes the fixed cost of its
+cache saves and log writes spread over few requests; the share of a core is the figure to watch.
+
+**CPU s / min**, **disk MB written**, **threads** and **INFO lines / req** are what the proxy
+costs beside its CPU per request: CPU seconds per minute of wall time (in `idle`, the cost of an
+idle minute), the bytes it wrote to disk over the phase (`proc_pid_rusage`'s count, through
+`sysinfo`: its log, its ledger and its cache saves, before the shutdown write), its thread count
+at the phase's end (`ps -M`), and the lines its log took at the default INFO filter per served
+request, with each phase's detail listing them by message.
 
 **added ms** is what the proxy adds to a request: the client's whole request time minus the
 stub's own time for the same request. The driver tags each request with a header, the stub
@@ -400,6 +409,101 @@ are about 3 MiB, where the CPU cost falls from about 19 ms to about 4 ms. The p9
 to about a quarter of what it is, a few milliseconds; the p99 depends on how many such requests
 arrive at once. It cannot be measured until a release carries the change, and the bytes-per-token
 figure is an assumption, not a measurement.
+
+## Threads, wake-ups and disk
+
+What the proxy costs when it is barely used, which is most of its life: at the fleet's rates it
+serves a request a second or two, and between sessions nothing at all. Since `perf/idle-cost`:
+
+- **One INFO line per served request.** `serving request` and a 2xx `upstream response` or
+  `relayed response` are DEBUG; `request usage` carries the account's index, the path and the
+  status they named. A non-2xx answer keeps its `upstream response` or `relayed response` line at
+  INFO, which is what finds a 401 storm or a 429. On the live proxy the four lines were about
+  4.5 a request and 75 to 93 MB of log a day.
+- **A cache is saved only when its content changed** (`src/save_gate.rs`). The pins and the
+  Sessions/Tools table are saved 5 s after a change that adds, removes or moves an entry, and
+  within a minute of a change to anything else (a pin's touch time, a session's counters), which
+  moves on every request. The bound-token file, about 8 MB at its cap, is saved ten minutes after
+  a change and at shutdown, where it was every minute. A crash or SIGKILL loses at most that
+  window of new tokens; a clean shutdown loses none.
+- **No timer runs while nothing changes.** Each cache's saver sleeps until a request changes it,
+  where three timers woke every 5 s (one every 60 s) to look at a flag.
+- **Four tokio worker threads by default**, or the machine's cores when fewer, where tokio's
+  default is one per core. `TOKIO_WORKER_THREADS` sets the count (`tcr::server::worker_threads`).
+- **A closed day of the usage ledger is gzipped** (`src/usage.rs`, "Closed days are gzipped"):
+  every day older than yesterday, once when the ledger's writer starts and again each day. Every
+  reader reads both forms.
+
+Three runs each side of `steady` and `peak`, and of a 60 s `idle` phase, `--no-profile`,
+alternating before and after, on 2026-10-16 at a 1-minute load of 40 to 192 on 14 cores. Before
+is `eb67eb7b`, after is the branch with tokio's one worker per core (the worker count was
+measured on its own, below). Both ran under the same driver binary. Each cell is min / median /
+max across the three runs.
+
+| phase | | CPU s / 1k req | CPU s / min | disk MB written | INFO lines / req | threads | peak footprint MB |
+|---|---|---|---|---|---|---|---|
+| `steady` | before | 2.08 / 2.22 / 2.29 | 0.17 / 0.19 / 0.19 | 7.97 | 3.09 | 17 | 49.5 / 51.3 / 52.2 |
+| `steady` | after | 1.70 / 1.80 / 1.84 | 0.14 / 0.15 / 0.15 | 0.04 | 1.09 | 17 | 50.3 / 51.5 / 51.9 |
+| `peak` | before | 1.18 / 1.20 / 1.30 | 0.60 / 0.62 / 0.67 | 0.47 | 3.10 | 17 | 54.9 / 56.0 / 56.2 |
+| `peak` | after | 1.12 / 1.13 / 1.35 | 0.58 / 0.58 / 0.69 | 0.02 | 1.09 / 1.10 / 1.11 | 17 | 54.5 / 55.7 / 56.5 |
+| `idle` | before | | 0.03 / 0.03 / 0.03 | 7.51 | | 17 | 49.2 / 49.5 / 60.6 |
+| `idle` | after | | 0.00 | 0.00 | | 17 | 49.2 / 49.6 / 50.1 |
+
+- **CPU per request in `steady` fell by about a fifth**, and the ranges do not overlap. Most of
+  the difference is the bound-token file: before, the 60 s save rewrote all 8 MB of it once in
+  every `steady` phase, which is the 7.97 MB written. `peak` moved within its noise; at 30 s it
+  never reached a 60 s save.
+- **INFO lines per served request fell from 3.09 to 1.09.** The one line is `request usage`, one per
+  served `/v1/messages`; `count_tokens` (10% of requests) logs none, and the rest are the shutdown
+  lines and the routing events (`affinity: divert`, `bound token pins request ...`) that fire on a
+  few requests in a hundred at these rates.
+- **The idle minute's 7.5 MB and its CPU are one save**, the bound-token file written the minute
+  after the warm-up minted tokens into it. The after build writes the same file ten minutes later
+  instead, outside the minute. So in an idle phase the difference is when, not whether; the
+  reduction is in a busy hour, where the file was rewritten once or twice a minute and is now
+  rewritten six times.
+- **The timers themselves** were measured apart from any save: from 90 s after boot, past every
+  save either build makes, two 55 s windows each side read the proxy's interrupt wake-ups and CPU
+  from `proc_pid_rusage` (a loop of 50 ms sleeps, as a control, read 92 wake-ups in 5 s). Before:
+  56 and 57 wake-ups, 1.5 and 2.3 ms of CPU. After: 0 and 0 wake-ups.
+- **Memory did not move.**
+
+### Worker threads
+
+The after build on its own, with `TOKIO_WORKER_THREADS` set through the driver (the harness passes
+that one variable to the proxy), at the same flags. `steady` and `peak` three runs at 2 workers
+against the three after runs at tokio's default of 14 above; `overhead` and `big4m` one run each.
+
+| phase | workers | threads | CPU s / 1k req | added ms p50 | added ms p99 | served |
+|---|---|---|---|---|---|---|
+| `steady` | 14 | 17 | 1.70 / 1.80 / 1.84 | 2.8 / 7.1 / 9.1 | 20.5 / 20.6 / 40.3 | 105 |
+| `steady` | 2 | 5 | 1.57 / 1.62 / 1.78 | 2.8 / 2.9 / 3.2 | 12.5 / 14.2 / 15.6 | 105 |
+| `peak` | 14 | 17 | 1.12 / 1.13 / 1.35 | 3.9 / 7.6 / 9.3 | 25.2 / 32.0 / 32.4 | 257 |
+| `peak` | 2 | 5 | 1.07 / 1.07 / 1.18 | 2.5 / 4.4 / 4.7 | 16.1 / 18.6 / 18.6 | 257 |
+| `overhead` | 14 | 17 | 0.22 | 3.5 | 81.6 | 37,197 |
+| `overhead` | 4 | 7 | 0.21 | 3.2 | 65.4 | 44,501 |
+| `overhead` | 2 | 5 | 0.19 | 4.1 | 60.2 | 35,652 |
+| `big4m` | 14 | 17 | 4.95 | 24.1 | 131.5 | 1,993 |
+| `big4m` | 4 | 7 | 4.78 | 18.5 | 151.3 | 2,526 |
+| `big4m` | 2 | 5 | 4.70 | 21.6 | 151.0 | 2,234 |
+
+Fewer workers cost nothing these runs can see: CPU per request is the same or lower, and the
+added time is no worse (the 2-worker `steady` and `peak` runs met a lower load, 38 to 54 against
+40 to 188, so their lower latency is the machine's, not the workers'). Even the saturating phases
+served as much at 4 workers as at 14. The default is 4 rather than 2 because the cache saves
+write synchronously on a worker, and two workers would leave one while the other writes. The
+branch's own build, with that default, ran one `steady` and `peak` pass at 7 threads (4 workers,
+the main thread, the log writer and the ledger writer) where tokio's default had 17: 1.72 and
+1.11 CPU s per 1,000 requests, 0.04 and 0.02 MB written, 1.09 and 1.10 INFO lines per request.
+
+### The usage ledger's closed days
+
+A generated day in the ledger's own line shape (`usage::tests::ledger_day_compression_on_a_generated_day`,
+180,000 lines, the shape the writer serializes, with fake identities and varied counts): 37.6 MB
+plain, 4.2 MB gzipped at flate2's default level, 11.2% of its size. Compressing it took 21.8 s in a
+debug build; a release build was not timed. The live ledger is about 20 MB a day, so its 90 days
+of retention would hold about 200 MB instead of 1.8 GB, if real lines compress as the generated
+ones do, which is not measured.
 
 ## Toward a CI gate
 

@@ -11,7 +11,7 @@
 //! this reads them directly, offline, whether or not a proxy is running.
 //!
 //! # Reuse, not a second parser
-//! [`crate::usage::parse_ledger_file`] and the `LedgerLine` shape are shared
+//! [`crate::usage::parse_ledger_day`] and the `LedgerLine` shape are shared
 //! with [`crate::usage::UsageTracker`]'s own boot-time replay — this module
 //! never re-implements the line format. Pricing is [`crate::pricing`], the
 //! exact table and formula the live proxy uses.
@@ -257,7 +257,7 @@ pub struct WrapReport {
     pub comparison: Comparison,
     /// Lines that were not parseable JSON of the expected shape, over the
     /// current period's files. Counted, never fatal — see
-    /// [`crate::usage::parse_ledger_file`].
+    /// [`crate::usage::parse_ledger_day`].
     pub malformed_lines: usize,
     /// Current-period lines with no provider that their model id filed under Codex, which
     /// are lines written before the ledger recorded one. Said in the text's `note:` line
@@ -294,8 +294,8 @@ fn accumulate(
 ) -> usize {
     let mut malformed = 0;
     for date in dates {
-        let path = dir.join(format!("{}.jsonl", usage::date_string(*date)));
-        let (lines, bad) = usage::parse_ledger_file(&path);
+        // Plain or gzipped: a closed day is compressed (`usage::read_ledger_day`).
+        let (lines, bad) = usage::parse_ledger_day(dir, *date);
         malformed += bad;
         for line in &lines {
             total.add(pricing, line);
@@ -814,7 +814,7 @@ mod tests {
     }
 
     /// A malformed line is counted, not fatal — matches what
-    /// `UsageTracker::replay_file` already does with the same file.
+    /// `UsageTracker::replay_day` already does with the same file.
     #[test]
     fn a_malformed_line_is_counted_not_fatal() {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -145,6 +145,33 @@ pub fn default_path() -> PathBuf {
     crate::paths::cache_dir().session_wire_file()
 }
 
+/// The sessions [`save`] writes, in the order it writes them: at most [`PERSIST_CAP`], the
+/// most recently seen, keyed in sorted order.
+fn written_sessions(
+    sessions: &HashMap<String, WireSession>,
+) -> std::collections::BTreeMap<&str, &WireSession> {
+    let mut rows: Vec<(&String, &WireSession)> = sessions.iter().collect();
+    if rows.len() > PERSIST_CAP {
+        rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.last_seen_ms));
+        rows.truncate(PERSIST_CAP);
+    }
+    rows.into_iter().map(|(k, s)| (k.as_str(), s)).collect()
+}
+
+/// The two hashes [`crate::save_gate::SaveGate`] compares for a save of `sessions`: the shape
+/// (which sessions the file holds) and the content (everything [`save`] writes but its
+/// `savedAtMs`).
+pub fn save_hashes(
+    sessions: &HashMap<String, WireSession>,
+) -> Result<(u64, u64), serde_json::Error> {
+    let sessions = written_sessions(sessions);
+    let ids: Vec<&str> = sessions.keys().copied().collect();
+    Ok((
+        crate::save_gate::content_hash(&ids)?,
+        crate::save_gate::content_hash(&sessions)?,
+    ))
+}
+
 /// Write `sessions` to `path` atomically at `0600` (`crate::config::write_atomic`
 /// sets the mode — see its own doc for why: a symlink-safe, fsynced temp file
 /// plus rename, so a crash mid-write leaves the previous file intact), keeping
@@ -159,13 +186,7 @@ pub fn save(
     sessions: &HashMap<String, WireSession>,
     now_ms: i64,
 ) -> Result<usize, ConfigError> {
-    let mut rows: Vec<(&String, &WireSession)> = sessions.iter().collect();
-    if rows.len() > PERSIST_CAP {
-        rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.last_seen_ms));
-        rows.truncate(PERSIST_CAP);
-    }
-    let sessions: std::collections::BTreeMap<&str, &WireSession> =
-        rows.into_iter().map(|(k, s)| (k.as_str(), s)).collect();
+    let sessions = written_sessions(sessions);
     let count = sessions.len();
     let file = WireSessionsFileRef {
         version: FORMAT_VERSION,

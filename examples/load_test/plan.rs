@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::stats::Rng;
 
-/// The four phases, in the order a full run takes them.
+/// The phases, in the order a full run takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -21,16 +21,20 @@ pub enum Phase {
     Big1m,
     /// As `overhead`, with each request a generated long conversation of about 4 MiB.
     Big4m,
+    /// The steady phase's sessions warm up, then nothing is sent: what the proxy costs, in
+    /// CPU, wake-ups and disk writes, while nobody is using it.
+    Idle,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 6] = [
+    pub const ALL: [Phase; 7] = [
         Self::Overhead,
         Self::Steady,
         Self::Peak,
         Self::Runaway,
         Self::Big1m,
         Self::Big4m,
+        Self::Idle,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +45,7 @@ impl Phase {
             Self::Runaway => "runaway",
             Self::Big1m => "big1m",
             Self::Big4m => "big4m",
+            Self::Idle => "idle",
         }
     }
 
@@ -66,7 +71,7 @@ impl Phase {
         match self {
             Self::Big1m => Some(1024 * 1024),
             Self::Big4m => Some(4 * 1024 * 1024),
-            Self::Overhead | Self::Steady | Self::Peak | Self::Runaway => None,
+            Self::Overhead | Self::Steady | Self::Peak | Self::Runaway | Self::Idle => None,
         }
     }
 }
@@ -118,7 +123,8 @@ pub const RUNAWAY_RATE: f64 = 30.0;
 pub fn sessions(phase: Phase) -> usize {
     match phase {
         Phase::Overhead => 16,
-        Phase::Steady => 18,
+        // Idle warms up the steady phase's sessions, so the caches it saves hold them.
+        Phase::Steady | Phase::Idle => 18,
         Phase::Peak => 48,
         Phase::Runaway => 64,
         // A few long sessions at once, as one developer's machine runs them.
@@ -134,7 +140,7 @@ pub fn schedule(phase: Phase, duration_s: f64, seed: u64) -> Vec<Planned> {
     let n = sessions(phase);
     let mut out = Vec::new();
     match phase {
-        Phase::Overhead | Phase::Big1m | Phase::Big4m => {}
+        Phase::Overhead | Phase::Big1m | Phase::Big4m | Phase::Idle => {}
         Phase::Steady => poisson(&mut out, &mut rng, STEADY_RATE, end, n),
         Phase::Peak => {
             poisson(&mut out, &mut rng, STEADY_RATE, end, n);

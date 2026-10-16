@@ -78,9 +78,39 @@ pub struct PhaseResult {
     /// The size each request was generated to in a big-body phase.
     #[serde(default)]
     pub big_body_bytes: Option<usize>,
+    /// Bytes the proxy wrote to disk over the phase (`proc_pid_rusage`, through `sysinfo`):
+    /// its log, its ledger and its cache saves.
+    #[serde(default)]
+    pub disk_written_bytes: Option<u64>,
+    /// The proxy's thread count at the phase's end (`ps -M`).
+    #[serde(default)]
+    pub threads: Option<usize>,
+    /// Lines the proxy logged at INFO during the phase.
+    #[serde(default)]
+    pub info_lines: Option<usize>,
+    /// Those lines by message.
+    #[serde(default)]
+    pub info_messages: BTreeMap<String, usize>,
 }
 
 impl PhaseResult {
+    /// CPU seconds per minute of wall time: in the idle phase, what an idle minute costs.
+    pub fn cpu_s_per_minute(&self) -> Option<f64> {
+        (self.wall_s > 0.0).then(|| self.cpu_seconds / self.wall_s * 60.0)
+    }
+
+    /// Megabytes the proxy wrote to disk over the phase.
+    pub fn disk_written_mb(&self) -> Option<f64> {
+        self.disk_written_bytes
+            .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
+    }
+
+    /// INFO lines logged per served request.
+    pub fn info_lines_per_request(&self) -> Option<f64> {
+        let lines = self.info_lines?;
+        (self.served > 0).then(|| lines as f64 / self.served as f64)
+    }
+
     /// Every reason this phase's numbers cannot be trusted, or the fence was crossed.
     pub fn failures(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -111,7 +141,10 @@ impl PhaseResult {
                 self.bound_tokens_restored
             ));
         }
-        if self.served == 0 {
+        // The idle phase sends nothing after its warm-up, so it serves nothing and logs no
+        // usage line by design.
+        let sends = self.phase != Phase::Idle;
+        if sends && self.served == 0 {
             out.push("nothing was served".into());
         }
         if let Some(ceiling) = self.fleet_ceiling_per_s {
@@ -122,7 +155,7 @@ impl PhaseResult {
                 ));
             }
         }
-        if self.usage_lines == 0 {
+        if sends && self.usage_lines == 0 {
             out.push(
                 "the proxy logged no `request usage` line, so it never parsed a stub reply".into(),
             );
@@ -219,18 +252,28 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
     out!(md, "# tcr load test\n\n{meta}\n");
     out!(
         md,
-        "| phase | sent | served | errors | CPU s / 1k req | added ms p50 / p95 / p99 / max | throttle ms p50 / p95 / p99 / max | peak footprint MB | upstream max/s | load 1m start → end |"
+        "| phase | sent | served | errors | CPU s / 1k req | CPU s / min | disk MB written | threads | INFO lines / req | added ms p50 / p95 / p99 / max | throttle ms p50 / p95 / p99 / max | peak footprint MB | upstream max/s | load 1m start → end |"
     );
-    out!(md, "|---|---:|---:|---:|---:|---|---|---:|---:|---|");
+    out!(
+        md,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---|"
+    );
     for r in results {
         out!(
             md,
-            "| {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} → {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} → {} |",
             r.phase.as_str(),
             r.sent,
             r.served,
             r.errors + r.unfinished,
             r.cpu_s_per_1k.map_or("n/a".into(), |v| format!("{v:.2}")),
+            r.cpu_s_per_minute()
+                .map_or("n/a".into(), |v| format!("{v:.3}")),
+            r.disk_written_mb()
+                .map_or("n/a".into(), |v| format!("{v:.2}")),
+            r.threads.map_or("n/a".into(), |v| v.to_string()),
+            r.info_lines_per_request()
+                .map_or("n/a".into(), |v| format!("{v:.2}")),
             fmt_summary(r.added_ms.as_ref()),
             if r.throttles_off {
                 "off".into()
@@ -285,6 +328,15 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
             r.wall_s,
             if r.wall_s > 0.0 { r.cpu_seconds / r.wall_s * 100.0 } else { 0.0 },
             r.cpu_s_per_1k.map_or("n/a".into(), |v| format!("{v:.2}")),
+        );
+        out!(
+            md,
+            "- disk written {} MB; {} threads at the end; INFO lines {} ({:?})",
+            r.disk_written_mb()
+                .map_or("n/a".into(), |v| format!("{v:.2}")),
+            r.threads.map_or("n/a".into(), |v| v.to_string()),
+            r.info_lines.map_or("n/a".into(), |v| v.to_string()),
+            r.info_messages
         );
         out!(
             md,
@@ -431,7 +483,22 @@ mod tests {
             live_path_mentions: vec![],
             profile_interval_ms: None,
             big_body_bytes: None,
+            disk_written_bytes: None,
+            threads: None,
+            info_lines: None,
+            info_messages: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn an_idle_phase_that_served_nothing_has_not_failed() {
+        let mut r = clean();
+        r.phase = Phase::Idle;
+        r.served = 0;
+        r.usage_lines = 0;
+        assert!(r.failures().is_empty(), "{:?}", r.failures());
+        r.phase = Phase::Steady;
+        assert_eq!(r.failures().len(), 2, "{:?}", r.failures());
     }
 
     #[test]

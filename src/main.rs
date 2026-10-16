@@ -1684,8 +1684,20 @@ fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
         .unwrap_or_else(|err| err.format(&mut cmd).exit())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The runtime is built here rather than by `#[tokio::main]`, whose default is one worker
+/// thread per core: see `tcr::server::worker_threads` for the count and why.
+fn main() -> anyhow::Result<()> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let workers =
+        tcr::server::worker_threads(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref(), cores);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(run_main())
+}
+
+async fn run_main() -> anyhow::Result<()> {
     let cli = parse_cli(effective_argv(std::env::args_os().collect()));
     match cli.command {
         Some(Command::Server(args)) => run_server(args).await,

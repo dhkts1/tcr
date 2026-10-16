@@ -4987,13 +4987,29 @@ async fn handle_request(
         // 401 storm. The path is here because without it a status is undiagnosable:
         // the only other record of which path produced a 404 is the in-memory TUI
         // ring (`push_log` below), which is lost on every restart.
-        tracing::info!(
-            account_index = idx,
-            account = account_name.as_deref().unwrap_or("?"),
-            path = %path_and_query,
-            status = status.as_u16(),
-            "upstream response"
-        );
+        //
+        // INFO only when the answer was not a success. A 2xx is the common case, and
+        // a served one is already on its `request usage` line with the same account,
+        // path and status; an INFO line for it too would be a second line per request
+        // in a log that runs to tens of megabytes a day. The statuses that diagnose
+        // something (a 401 storm, a 429, a 404 on an unknown path) stay at INFO.
+        if status.is_success() {
+            tracing::debug!(
+                account_index = idx,
+                account = account_name.as_deref().unwrap_or("?"),
+                path = %path_and_query,
+                status = status.as_u16(),
+                "upstream response"
+            );
+        } else {
+            tracing::info!(
+                account_index = idx,
+                account = account_name.as_deref().unwrap_or("?"),
+                path = %path_and_query,
+                status = status.as_u16(),
+                "upstream response"
+            );
+        }
         let up_headers = resp.headers().clone();
         let rejections = quota_rejections(&up_headers);
         match provider {
@@ -5721,8 +5737,14 @@ async fn handle_request(
                     // erroring stream. It carries the request's timing too,
                     // rather than a second INFO line per request.
                     let t = timing.as_ref();
+                    // `account_index`, `path` and `status` are the fields the DEBUG
+                    // `serving request` and `upstream response` lines carry, so this one
+                    // line is a served request's whole INFO record.
                     tracing::info!(
                         account = account_name_for_log.as_deref().unwrap_or("?"),
+                        account_index = idx,
+                        path = %stream_path,
+                        status = status.as_u16(),
                         session = ?session_key,
                         model = record.model.as_deref().unwrap_or("?"),
                         cache_read_tokens = parsed.cache_read,
@@ -6013,6 +6035,9 @@ async fn handle_request(
                 timing.armed = false;
                 tracing::info!(
                     account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    path = %path,
+                    status = status.as_u16(),
                     session = ?session_key,
                     model = record.model.as_deref().unwrap_or("?"),
                     cache_read_tokens = parsed.cache_read,
@@ -6796,14 +6821,26 @@ async fn relay_request(
     let status = resp.status();
     let up_headers = resp.headers().clone();
     // The relay's twin of the "upstream response" line. These requests are invisible
-    // to the per-account log by construction (they serve no account), so this line is
-    // the ONLY record that one happened and what it answered.
-    tracing::info!(
-        path = %path_and_query,
-        mode = ?mode,
-        status = status.as_u16(),
-        "relayed response"
-    );
+    // to the per-account log by construction (they serve no account), so this line and
+    // the DEBUG `relay timing` line are the only record that one happened and what it
+    // answered. Same rule as the pooled line: INFO when the answer was not a success,
+    // DEBUG otherwise, because relayed bookkeeping calls are most of a client's requests
+    // and one INFO line each was nearly a quarter of the log's per-request lines.
+    if status.is_success() {
+        tracing::debug!(
+            path = %path_and_query,
+            mode = ?mode,
+            status = status.as_u16(),
+            "relayed response"
+        );
+    } else {
+        tracing::info!(
+            path = %path_and_query,
+            mode = ?mode,
+            status = status.as_u16(),
+            "relayed response"
+        );
+    }
 
     match mode {
         // Both arms are served with the CALLER's own credential (or none at all),
@@ -18062,6 +18099,122 @@ mod tests {
         );
         assert_eq!(field(line, "completed"), Some("true"), "{line}");
         assert!(lines_with(&log, "request timing").is_empty(), "{log:?}");
+    }
+
+    /// Every line `log` holds at INFO.
+    fn info_lines(log: &str) -> Vec<&str> {
+        log.lines().filter(|l| l.contains(" INFO ")).collect()
+    }
+
+    /// A served request writes ONE line at INFO, its `request usage` line, and that line
+    /// carries what the DEBUG `serving request` and `upstream response` lines name: the
+    /// account's index, the path and the status. Streamed and buffered, captured at INFO
+    /// as the default filter is.
+    #[tokio::test]
+    async fn a_served_request_is_one_info_line() {
+        let stream_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let buffered_body = r#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
+        for (content_type, body) in [
+            ("text/event-stream", stream_body),
+            ("application/json", buffered_body),
+        ] {
+            let up_addr = spawn_header_delayed_upstream(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+            .await;
+            let manager = Manager::with_live_refresher(
+                dummy_config(None, &format!("http://{up_addr}")),
+                None,
+            );
+            let proxy_addr = serve_on_loopback(&manager).await;
+            let (sink, _guard) = info_sink();
+
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let resp = client
+                .post(format!("http://{proxy_addr}/v1/messages"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            let _ = resp.bytes().await.unwrap();
+
+            let log = wait_for_line(&sink, "request usage").await;
+            let info = info_lines(&log);
+            assert_eq!(info.len(), 1, "{content_type}: one INFO line: {log:?}");
+            let line = info[0];
+            assert!(line.contains("request usage"), "{line}");
+            assert_eq!(field(line, "account_index"), Some("0"), "{line}");
+            assert_eq!(field(line, "path"), Some("/v1/messages"), "{line}");
+            assert_eq!(field(line, "status"), Some("200"), "{line}");
+        }
+    }
+
+    /// The INFO exceptions to the rule above: an upstream answer that is not a success
+    /// keeps its `upstream response` line at INFO, and a relayed request is at INFO only
+    /// when its answer is not a success either.
+    #[tokio::test]
+    async fn only_an_unsuccessful_answer_logs_its_response_line_at_info() {
+        let error = r#"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#;
+        for (path, status_line, body, message, want_info) in [
+            (
+                "/v1/messages",
+                "400 Bad Request",
+                error,
+                "upstream response",
+                true,
+            ),
+            (
+                "/v1/code/sessions",
+                "200 OK",
+                "{}",
+                "relayed response",
+                false,
+            ),
+            (
+                "/v1/code/sessions",
+                "404 Not Found",
+                "{}",
+                "relayed response",
+                true,
+            ),
+        ] {
+            let up_addr = spawn_header_delayed_upstream(format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+            .await;
+            let manager = Manager::with_live_refresher(
+                dummy_config(None, &format!("http://{up_addr}")),
+                None,
+            );
+            let proxy_addr = serve_on_loopback(&manager).await;
+            let (sink, _guard) = info_sink();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let request = if path == "/v1/messages" {
+                client.post(format!("http://{proxy_addr}{path}")).body("{}")
+            } else {
+                client.get(format!("http://{proxy_addr}{path}"))
+            };
+            let resp = request.send().await.unwrap();
+            let _ = resp.bytes().await.unwrap();
+            // The relayed body logs its timing on drop; give that a moment to land.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let log = sink.contents();
+            let lines = lines_with(&log, message);
+            if want_info {
+                assert_eq!(lines.len(), 1, "{path} {status_line}: {log:?}");
+                assert!(lines[0].contains(" INFO "), "{}", lines[0]);
+            } else {
+                assert!(info_lines(&log).is_empty(), "{path} {status_line}: {log:?}");
+            }
+        }
     }
 
     /// A request with no `request usage` line (a forwarded 400) gets its timing
