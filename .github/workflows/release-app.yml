@@ -119,7 +119,7 @@ jobs:
   release-app:
     needs: check-signing-secrets
     if: needs.check-signing-secrets.outputs.have-secrets == 'true'
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
