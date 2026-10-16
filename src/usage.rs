@@ -117,7 +117,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,11 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// traffic — enough to ride out a slow `write`, small enough that a writer stuck
 /// for good costs bounded memory.
 const LEDGER_QUEUE_DEPTH: usize = 4096;
+/// How long the ledger writer waits, once its queue is empty, before it blocks
+/// on the next line (see `ledger_writer`). A line reaches the file up to this
+/// much later; at the fleet's peak of a few dozen requests a second that is well
+/// under one line queued, against [`LEDGER_QUEUE_DEPTH`].
+const LEDGER_LINGER: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// The floor on what the writer JOIN gets in [`UsageTracker::shutdown_ledger`],
 /// measured from the moment the channel closes.
@@ -824,8 +829,27 @@ impl Ledger {
 /// dropping the handle after a flush and then joining this thread, so the last
 /// line served is on disk; a tracker dropped in a test ends it the same way,
 /// with nobody waiting.
+///
+/// When the queue runs empty it waits [`LEDGER_LINGER`] before it blocks.
+/// A blocked receiver makes every send take the channel's waker mutex to wake
+/// it, and senders are the request path. Once the ledger handle's own lock
+/// stopped putting senders in single file, that waker mutex became the proxy's
+/// busiest lock under load (2026-10-16 profile: up to 111 of 2,219 samples in
+/// `SyncWaker::notify`). Under traffic the linger leaves lines waiting, so the
+/// next receive takes one without blocking and no send has a sleeper to wake.
 fn ledger_writer(rx: Receiver<LedgerMsg>, mut ledger: Ledger) {
-    while let Ok(msg) = rx.recv() {
+    loop {
+        let msg = match rx.try_recv() {
+            Ok(msg) => msg,
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => {
+                std::thread::sleep(LEDGER_LINGER);
+                match rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => return,
+                }
+            }
+        };
         match msg {
             LedgerMsg::Line(line) => ledger.append(&line),
             LedgerMsg::Flush(ack) => {
