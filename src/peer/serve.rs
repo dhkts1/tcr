@@ -1486,7 +1486,16 @@ where
         .unwrap_or_default();
 
     let started = Instant::now();
-    let served = serve_on_own_account(upstream, &request, body, &restriction).await;
+    // The request key of THIS process, which is the proxy the relay goes into:
+    // in-process, so no status read decides it.
+    let served = serve_on_own_account(
+        upstream,
+        &request,
+        body,
+        &restriction,
+        serving.manager.request_key(),
+    )
+    .await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // The same windows, after. `utilization_rise` is what turns the pair into
@@ -1672,6 +1681,7 @@ async fn serve_on_own_account(
     request: &ServeRequest,
     body: Vec<u8>,
     restriction: &ScopeRestriction,
+    request_key: Option<&str>,
 ) -> Result<ServedResponse> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1766,6 +1776,12 @@ async fn serve_on_own_account(
         // before a byte is sent. Matched rather than `_` so a fifth arm added
         // later cannot silently fall through to an unrestricted serve.
         ScopeRestriction::Unrestricted | ScopeRestriction::Unenforceable => {}
+    }
+    // THIS proxy's request key, so its own relay is not counted as an unkeyed
+    // caller. The only copy on the request: `LENDER_FORWARDED_HEADERS` does not
+    // carry the name, so a borrower's own `x-tcr-key` never reaches the loop.
+    if let Some(key) = request_key {
+        send = send.header(crate::request_key::HEADER, key);
     }
     let response = send
         .send()
@@ -3456,6 +3472,72 @@ mod tests {
         assert_eq!(scrub_client_credentials(&mut headers), 1);
         assert!(headers.get(crate::request_key::HEADER).is_none());
         assert!(headers.get("content-type").is_some());
+    }
+
+    /// The head of the one request `serve_on_own_account` sends to a stand-in for
+    /// this Mac's own proxy, which answers `200 {}`.
+    async fn own_proxy_request_head(request_key: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stand-in proxy");
+        let base = format!("http://{}", listener.local_addr().expect("its address"));
+        let accepted = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("one request");
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("read the head");
+                assert!(read > 0, "the request ended before its head did");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .await
+                .expect("answer");
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let request = ServeRequest {
+            lease_id: 1,
+            request_id: 2,
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            query: None,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body_bytes: 2,
+            proto: PROTO_VERSION,
+            flow: SERVE_FLOW,
+        };
+        let served = serve_on_own_account(
+            &base,
+            &request,
+            b"{}".to_vec(),
+            &ScopeRestriction::Unrestricted,
+            request_key,
+        )
+        .await
+        .expect("served");
+        assert_eq!(served.status, 200);
+        accepted.await.expect("the stand-in finished")
+    }
+
+    /// (h): the lender's relay into its OWN proxy carries that proxy's request
+    /// key on `x-tcr-key`, so it is not counted as an unkeyed caller; a proxy
+    /// that holds no key gets no header.
+    #[tokio::test]
+    async fn the_lenders_own_proxy_request_carries_the_request_key() {
+        let key = "not-a-real-request-key";
+        let head = own_proxy_request_head(Some(key)).await.to_ascii_lowercase();
+        assert!(
+            head.contains(&format!("\r\n{}: {key}\r\n", crate::request_key::HEADER)),
+            "{head}"
+        );
+        let head = own_proxy_request_head(None).await.to_ascii_lowercase();
+        assert!(
+            head.starts_with("post /v1/messages "),
+            "control: the stand-in read the relay's head: {head}"
+        );
+        assert!(!head.contains(crate::request_key::HEADER), "{head}");
     }
 
     /// A live lease this Mac has granted, with room for one relay.

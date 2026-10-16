@@ -6467,7 +6467,12 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
                 eprintln!("{line}");
             }
         }
-        apply_codex_launch(&mut cmd, port, &launch);
+        // The same read decides the request key: sent only to a server that
+        // reports `requestKeyMode`.
+        let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
+        for line in apply_codex_launch(&mut cmd, port, &launch, &launch_key) {
+            eprintln!("{line}");
+        }
         // Generated shell-tool defaults precede explicit caller overrides.
         cmd.args(&args.args);
         let status = cmd
@@ -6523,16 +6528,18 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
     }
 
     if cli::proxy_is_up(port) {
-        // A config that holds Codex accounts and no Claude one may be a proxy that refuses this
-        // whole session: read its accounts, once, only then. A Claude-only or mixed config pays
-        // no read and prints nothing new.
+        // ONE read of the running proxy's status per launch. It decides the request key (sent
+        // only to a server that reports `requestKeyMode`), and, for a config that holds Codex
+        // accounts and no Claude one, whether the proxy will refuse this whole session.
+        let live = cli::fetch_live_status(&config).await;
         if holds_only_codex(&config) {
-            if let Ok(payload) = cli::fetch_live_status(&config).await {
-                if let Some(warning) = no_claude_account_warning(port, &payload) {
+            if let Ok(payload) = &live {
+                if let Some(warning) = no_claude_account_warning(port, payload) {
                     eprintln!("{warning}");
                 }
             }
         }
+        let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
         if let Some(notice) = withheld_api_key_notice(
             config.proxy.api_key.is_some(),
             std::env::var_os("ANTHROPIC_API_KEY").is_some(),
@@ -6543,9 +6550,13 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // Claude Code — see `apply_see_through_env` for why we prefer the first.
         // Anything missing from the MITM material lands us in base-URL mode, which
         // always works; there is no half-applied third state.
-        match see_through_ca() {
-            Some(ca) => apply_see_through_env(&mut cmd, port, &ca),
-            None => apply_base_url_env(&mut cmd, port),
+        let mut lines = match see_through_ca() {
+            Some(ca) => apply_see_through_env(&mut cmd, port, &ca, &launch_key),
+            None => apply_base_url_env(&mut cmd, port, &launch_key),
+        };
+        lines.extend(launch_key.notice(port));
+        for line in lines {
+            eprintln!("{line}");
         }
     } else {
         eprintln!("[tcr] proxy not listening on :{port} — launching claude directly");
@@ -6775,25 +6786,41 @@ fn no_claude_account_warning(port: u16, payload: &status::StatusPayload) -> Opti
     )
 }
 
-/// Carry out [`codex_launch`]'s decision on `cmd`, and print its notices.
-fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &CodexLaunch) {
+/// Carry out [`codex_launch`]'s decision on `cmd`, and return its stderr lines
+/// for the caller to print. `key` applies to a see-through launch only: a direct
+/// one never reaches tcr.
+#[must_use]
+fn apply_codex_launch(
+    cmd: &mut std::process::Command,
+    port: u16,
+    launch: &CodexLaunch,
+    key: &LaunchKey,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     match launch {
         CodexLaunch::SeeThrough { ca, no_proxy } => {
-            apply_codex_see_through_env(
+            lines.extend(apply_codex_see_through_env(
                 cmd,
                 port,
                 ca,
                 std::env::var_os("CODEX_CA_CERTIFICATE").is_some_and(|value| !value.is_empty()),
-            );
+                key,
+            ));
             apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
             // This affects shell-like tools, not Codex's own HTTP/WebSocket clients.
             // Scalar overrides preserve the caller's other policy entries and filters.
+            // Unmarked, so a shell tool keeps its own ChatGPT login; keyed like
+            // a Claude launch, so the server does not count it as a stranger.
+            let shell =
+                loopback_proxy_url(key.key().map(|_| PLAIN_PROXY_USERNAME), key.key(), port);
             for var in ["HTTPS_PROXY", "https_proxy"] {
                 cmd.arg("-c").arg(format!(
-                    "shell_environment_policy.set.{var}=\"http://127.0.0.1:{port}\""
+                    "shell_environment_policy.set.{var}=\"{}\"",
+                    shell.env
                 ));
             }
-            eprintln!("[tcr] shell tools use an unmarked proxy and keep their own ChatGPT login. Other helpers can inherit Codex's marker; use unmarked HTTPS_PROXY and https_proxy for those commands.");
+            lines.push(shell_tools_notice(port, key.key().is_some()));
+            lines.extend(key.notice(port));
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
             }
@@ -6804,8 +6831,24 @@ fn apply_codex_launch(cmd: &mut std::process::Command, port: u16, launch: &Codex
             }
         }
     }
-    for line in launch.notices(port) {
-        eprintln!("{line}");
+    lines.extend(launch.notices(port));
+    lines
+}
+
+/// What a pooled codex launch says about its shell tools' proxy. Keyed, a
+/// helper the user points at tcr by hand needs the key too, so the line says
+/// where to get it, and never prints it.
+fn shell_tools_notice(port: u16, keyed: bool) -> String {
+    if keyed {
+        format!(
+            "[tcr] shell tools use an unmarked, keyed proxy and keep their own ChatGPT login. \
+             Other helpers can inherit Codex's marker; for those commands set HTTPS_PROXY and \
+             https_proxy to http://tcr:<key>@127.0.0.1:{port}, the key from `tcr request-key`."
+        )
+    } else {
+        "[tcr] shell tools use an unmarked proxy and keep their own ChatGPT login. Other helpers \
+         can inherit Codex's marker; use unmarked HTTPS_PROXY and https_proxy for those commands."
+            .to_string()
     }
 }
 
@@ -7009,15 +7052,24 @@ fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
 /// Pure — takes the inherited value and the group name, returns the new
 /// value — so all of the above is testable without spawning a process.
 fn compose_group_header(inherited: Option<&str>, group: &str) -> String {
-    let ours = format!("{GROUP_HEADER_NAME}: {group}");
+    compose_custom_header(inherited, GROUP_HEADER_NAME, group)
+}
+
+/// [`compose_group_header`]'s rule for any one header `name`: `inherited` with
+/// every `name` line (case-insensitive) removed, the others kept in order, and
+/// `name: value` appended last. The request key's header goes through it too
+/// ([`apply_base_url_env`]), so a nested `tcr run` replaces the outer key line
+/// rather than sending two.
+fn compose_custom_header(inherited: Option<&str>, name: &str, value: &str) -> String {
+    let ours = format!("{name}: {value}");
     let Some(inherited) = inherited.filter(|s| !s.is_empty()) else {
         return ours;
     };
     let mut lines: Vec<&str> = inherited
         .lines()
         .filter(|line| {
-            let name = line.split(':').next().unwrap_or(line).trim();
-            !name.eq_ignore_ascii_case(GROUP_HEADER_NAME)
+            let line_name = line.split(':').next().unwrap_or(line).trim();
+            !line_name.eq_ignore_ascii_case(name)
         })
         .collect();
     lines.push(&ours);
@@ -7115,6 +7167,143 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
     )
 }
 
+/// A request key ([`tcr::request_key`]) that `tcr run` can write as it is into a
+/// proxy URL's password and into an `ANTHROPIC_CUSTOM_HEADERS` line: letters,
+/// digits, `-`, `.`, `_` and `~` only, the characters a URL's userinfo carries
+/// unescaped. The server's own keys are hex. Built only by [`LaunchKey::decide`],
+/// and its `Debug` never prints the value, so a `{:?}` cannot leak it.
+#[derive(Clone, PartialEq, Eq)]
+struct LaunchRequestKey(String);
+
+impl std::fmt::Debug for LaunchRequestKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchRequestKey(***)")
+    }
+}
+
+impl LaunchRequestKey {
+    /// `None` for an empty key, or one holding any other character.
+    fn parse(raw: &str) -> Option<Self> {
+        (!raw.is_empty()
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')))
+        .then(|| Self(raw.to_string()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Whether this launch carries the request key: decided ONCE per launch, from the
+/// config's `proxy.requestKey` and one read of the running server's status, and
+/// read by every env writer ([`apply_see_through_env`],
+/// [`apply_codex_see_through_env`], [`apply_codex_launch`], [`apply_base_url_env`]).
+///
+/// The key is sent only to a server whose status reports `requestKeyMode`. An
+/// older server compares the WHOLE `Proxy-Authorization` header against the bare
+/// Codex marker, so a keyed `tcr-codex:<key>` URL would silently run unpooled
+/// there. Every other case launches exactly as before keys existed, and
+/// [`Self::notice`] says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchKey {
+    /// Send this key.
+    Send(LaunchRequestKey),
+    /// The config holds no `proxy.requestKey` (the server writes one at boot).
+    NoKeyInConfig,
+    /// The config's key holds a character a proxy URL cannot carry as written.
+    KeyNotUrlSafe,
+    /// The running server's status could not be read; the reason.
+    StatusUnread(String),
+    /// The running server answered without `requestKeyMode`: it predates
+    /// request keys, or holds none.
+    ServerPredatesKeys,
+}
+
+impl LaunchKey {
+    /// `config_key` is the loaded config's `proxy.requestKey`; `status` is the
+    /// launch's one read of the running server ([`cli::fetch_live_status`]).
+    /// `tcr run` never writes a key: only the server generates one.
+    fn decide(
+        config_key: Option<&str>,
+        status: &Result<status::StatusPayload, cli::LiveStatusError>,
+    ) -> Self {
+        let Some(raw) = config_key.filter(|key| !key.is_empty()) else {
+            return Self::NoKeyInConfig;
+        };
+        let Some(key) = LaunchRequestKey::parse(raw) else {
+            return Self::KeyNotUrlSafe;
+        };
+        match status {
+            Err(err) => Self::StatusUnread(err.why()),
+            Ok(payload) if payload.request_key_mode.is_none() => Self::ServerPredatesKeys,
+            Ok(_) => Self::Send(key),
+        }
+    }
+
+    /// The key to send, when this launch sends one.
+    fn key(&self) -> Option<&LaunchRequestKey> {
+        match self {
+            Self::Send(key) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The one stderr line an unkeyed launch prints, saying why. Never the key.
+    fn notice(&self, port: u16) -> Option<String> {
+        let why = match self {
+            Self::Send(_) => return None,
+            Self::NoKeyInConfig => {
+                "the config holds no proxy.requestKey (the server writes one when it boots)"
+                    .to_string()
+            }
+            Self::KeyNotUrlSafe => "proxy.requestKey in the config holds a character other \
+                                    than a letter, digit, '-', '.', '_' or '~', which a proxy \
+                                    URL cannot carry as written"
+                .to_string(),
+            Self::StatusUnread(why) => {
+                format!("the status of the tcr on :{port} could not be read ({why})")
+            }
+            Self::ServerPredatesKeys => format!(
+                "the tcr on :{port} does not report requestKeyMode, so it predates request \
+                 keys or holds none; a restart of it picks them up"
+            ),
+        };
+        Some(format!("[tcr] launching without the request key: {why}"))
+    }
+}
+
+/// The username a keyed proxy URL carries when it marks nothing. Any name but
+/// [`tcr::mitm::CODEX_PROXY_USERNAME`] means Claude to the server.
+const PLAIN_PROXY_USERNAME: &str = "tcr";
+
+/// A loopback proxy URL for `port`, as the child's environment gets it (`env`)
+/// and as a stderr line may show it (`shown`, the key as `***`).
+struct ProxyUrl {
+    env: String,
+    shown: String,
+}
+
+/// `http://[<marker or tcr>[:<key>]@]127.0.0.1:<port>`. With no key, exactly
+/// the URL each launcher set before request keys: the marker alone, or nothing.
+fn loopback_proxy_url(marker: Option<&str>, key: Option<&LaunchRequestKey>, port: u16) -> ProxyUrl {
+    let url = |password: Option<&str>| {
+        let userinfo = match (marker, password) {
+            (user, Some(password)) => {
+                format!("{}:{password}@", user.unwrap_or(PLAIN_PROXY_USERNAME))
+            }
+            (Some(user), None) => format!("{user}@"),
+            (None, None) => String::new(),
+        };
+        format!("http://{userinfo}127.0.0.1:{port}")
+    };
+    ProxyUrl {
+        env: url(key.map(LaunchRequestKey::as_str)),
+        shown: url(key.map(|_| "***")),
+    }
+}
+
 /// SEE-THROUGH mode — the preferred route. `claude` keeps the REAL first-party
 /// base URL and reaches us as a CONNECT proxy instead, so we still see (and
 /// rotate) every request while Claude Code's first-party check keeps passing.
@@ -7132,19 +7321,33 @@ fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'stati
 ///
 /// A nested codex inherits an unmarked proxy and keeps its own login, so it
 /// never needs tcr's CA. Preserve its inherited CA settings unchanged.
-fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
-    let proxy = format!("http://127.0.0.1:{port}");
+///
+/// With [`LaunchKey::Send`] both URLs carry the request key as the password of
+/// the plain `tcr` username, which Claude Code sends as `Proxy-Authorization` on
+/// every `CONNECT`. Returns the stderr lines for the caller to print; they show
+/// the URL with the key as `***`.
+#[must_use]
+fn apply_see_through_env(
+    cmd: &mut std::process::Command,
+    port: u16,
+    ca: &Path,
+    key: &LaunchKey,
+) -> Vec<String> {
+    let proxy = loopback_proxy_url(key.key().map(|_| PLAIN_PROXY_USERNAME), key.key(), port);
     cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
-    cmd.env("HTTPS_PROXY", &proxy);
-    cmd.env("https_proxy", &proxy);
+    cmd.env("HTTPS_PROXY", &proxy.env);
+    cmd.env("https_proxy", &proxy.env);
     cmd.env("NODE_EXTRA_CA_CERTS", ca);
     // Unnecessary here — we ARE first-party in this mode, so nothing gates them
     // off — but harmless, and they keep the session whole if it ever falls back.
     apply_capability_defaults(cmd);
-    eprintln!(
-        "[tcr] see-through mode: claude keeps https://api.anthropic.com, tunnelling via {proxy}"
-    );
-    eprintln!("{}", see_through_ca_notice(ca));
+    vec![
+        format!(
+            "[tcr] see-through mode: claude keeps https://api.anthropic.com, tunnelling via {}",
+            proxy.shown
+        ),
+        see_through_ca_notice(ca),
+    ]
 }
 
 /// The CA a see-through Claude session trusts; Codex's trust settings are untouched.
@@ -7167,35 +7370,43 @@ fn see_through_ca_notice(ca: &Path) -> String {
 /// `ANTHROPIC_BASE_URL`, no `NODE_EXTRA_CA_CERTS`, no capability defaults. A
 /// pooled launch adds `NODE_EXTRA_CA_CERTS` on its own, for a `claude` the
 /// session starts ([`apply_nested_claude_ca`]).
+///
+/// With [`LaunchKey::Send`] the request key is the URL's password and the
+/// `tcr-codex` username stays: a server that reports `requestKeyMode` reads the
+/// marker from the username alone. Returns the stderr lines, the key as `***`.
+#[must_use]
 fn apply_codex_see_through_env(
     cmd: &mut std::process::Command,
     port: u16,
     ca: &Path,
     caller_ca_exported: bool,
-) {
-    let proxy = format!(
-        "http://{}@127.0.0.1:{port}",
-        tcr::mitm::CODEX_PROXY_USERNAME
-    );
-    cmd.env("HTTPS_PROXY", &proxy);
-    cmd.env("https_proxy", &proxy);
+    key: &LaunchKey,
+) -> Vec<String> {
+    let proxy = loopback_proxy_url(Some(tcr::mitm::CODEX_PROXY_USERNAME), key.key(), port);
+    cmd.env("HTTPS_PROXY", &proxy.env);
+    cmd.env("https_proxy", &proxy.env);
     // Codex reads its extra CA from this variable (`openai/codex` http-client/src/custom_ca.rs:61);
     // NODE_EXTRA_CA_CERTS means nothing to it.
     if !caller_ca_exported {
         cmd.env("CODEX_CA_CERTIFICATE", ca);
     }
-    eprintln!(
-        "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {proxy}; a \
-         FedRAMP or residency-routed login runs on its own credential, unpooled"
-    );
-    if caller_ca_exported {
-        eprintln!("[tcr] keeping the caller's CODEX_CA_CERTIFICATE; its CA bundle must include tcr's CA for pooled TLS");
-    } else {
-        eprintln!(
-            "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
-            ca.display()
-        );
-    }
+    vec![
+        format!(
+            "[tcr] see-through mode: codex keeps its own backend URL, tunnelling via {}; a \
+             FedRAMP or residency-routed login runs on its own credential, unpooled",
+            proxy.shown
+        ),
+        if caller_ca_exported {
+            "[tcr] keeping the caller's CODEX_CA_CERTIFICATE; its CA bundle must include tcr's \
+             CA for pooled TLS"
+                .to_string()
+        } else {
+            format!(
+                "[tcr] trusting our MITM leaf via CODEX_CA_CERTIFICATE={}",
+                ca.display()
+            )
+        },
+    ]
 }
 
 /// Let a `claude` started inside a pooled codex session trust tcr's leaf: set
@@ -7222,8 +7433,20 @@ fn mitm_codex_host() -> &'static str {
 /// BASE-URL mode — the fallback, used when see-through material is unavailable.
 /// `claude` talks plain HTTP to us on loopback, which costs first-party status
 /// and everything gated on it (hence [`apply_capability_defaults`]).
-fn apply_base_url_env(cmd: &mut std::process::Command, port: u16) {
+///
+/// With [`LaunchKey::Send`] the request key goes on [`tcr::request_key::HEADER`]
+/// in `ANTHROPIC_CUSTOM_HEADERS`, appended after whatever the caller (or
+/// `--group`) set there ([`compose_custom_header`]). Returns the stderr lines.
+#[must_use]
+fn apply_base_url_env(cmd: &mut std::process::Command, port: u16, key: &LaunchKey) -> Vec<String> {
     cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"));
+    if let Some(key) = key.key() {
+        let current = custom_headers_for(cmd);
+        cmd.env(
+            "ANTHROPIC_CUSTOM_HEADERS",
+            compose_custom_header(current.as_deref(), tcr::request_key::HEADER, key.as_str()),
+        );
+    }
     // Here we speak plain HTTP on loopback and present NO leaf. An ambient
     // HTTPS_PROXY (e.g. the JS teamclaude on :3456) would hijack claude's traffic
     // away from us, and its NODE_EXTRA_CA_CERTS would be verifying a cert we never
@@ -7240,7 +7463,21 @@ fn apply_base_url_env(cmd: &mut std::process::Command, port: u16) {
         cmd.env_remove(var);
     }
     apply_capability_defaults(cmd);
-    eprintln!("[tcr] base-URL mode: routing claude through http://127.0.0.1:{port}");
+    vec![format!(
+        "[tcr] base-URL mode: routing claude through http://127.0.0.1:{port}"
+    )]
+}
+
+/// The `ANTHROPIC_CUSTOM_HEADERS` the child would get so far: the value already
+/// set on `cmd` (by `--group`), none when `cmd` removes it, else this process's.
+fn custom_headers_for(cmd: &std::process::Command) -> Option<String> {
+    match cmd
+        .get_envs()
+        .find(|(name, _)| *name == "ANTHROPIC_CUSTOM_HEADERS")
+    {
+        Some((_, value)) => value.map(|v| v.to_string_lossy().into_owned()),
+        None => std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok(),
+    }
 }
 
 /// Re-enable the capabilities a non-first-party `ANTHROPIC_BASE_URL` silently
@@ -8160,7 +8397,12 @@ mod tests {
     #[test]
     fn claude_see_through_env_preserves_a_nested_codex_ca_choice() {
         let mut cmd = std::process::Command::new("true");
-        apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"));
+        let _lines = apply_see_through_env(
+            &mut cmd,
+            3999,
+            Path::new("/tmp/ca.pem"),
+            &LaunchKey::NoKeyInConfig,
+        );
         let set = |name: &str| {
             cmd.get_envs()
                 .find_map(|(k, v)| (k == name).then(|| v.map(|v| v.to_string_lossy().into_owned())))
@@ -8189,12 +8431,15 @@ mod tests {
             (
                 "see-through",
                 &(|cmd: &mut std::process::Command| {
-                    apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"))
+                    let _lines =
+                        apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"), &sent(KEY));
                 }) as &dyn Fn(&mut std::process::Command),
             ),
             (
                 "base-URL",
-                &(|cmd: &mut std::process::Command| apply_base_url_env(cmd, 3456)),
+                &(|cmd: &mut std::process::Command| {
+                    let _lines = apply_base_url_env(cmd, 3456, &sent(KEY));
+                }),
             ),
         ] {
             let mut cmd = claude_command();
@@ -8215,7 +8460,13 @@ mod tests {
     #[test]
     fn codex_see_through_env_sets_proxy_and_ca_and_nothing_anthropic() {
         let mut cmd = std::process::Command::new("true");
-        apply_codex_see_through_env(&mut cmd, 3999, std::path::Path::new("/tmp/ca.pem"), false);
+        let _lines = apply_codex_see_through_env(
+            &mut cmd,
+            3999,
+            std::path::Path::new("/tmp/ca.pem"),
+            false,
+            &LaunchKey::ServerPredatesKeys,
+        );
         let env: std::collections::HashMap<_, _> = cmd
             .get_envs()
             .filter_map(|(k, v)| {
@@ -8247,7 +8498,13 @@ mod tests {
     fn codex_see_through_env_respects_the_callers_ca() {
         let mut cmd = std::process::Command::new("true");
         cmd.env("CODEX_CA_CERTIFICATE", "/tmp/corporate-ca.pem");
-        apply_codex_see_through_env(&mut cmd, 3999, Path::new("/tmp/tcr-ca.pem"), true);
+        let _lines = apply_codex_see_through_env(
+            &mut cmd,
+            3999,
+            Path::new("/tmp/tcr-ca.pem"),
+            true,
+            &LaunchKey::NoKeyInConfig,
+        );
         assert_eq!(
             cmd.get_envs().find_map(|(key, value)| {
                 (key == "CODEX_CA_CERTIFICATE").then_some(value.unwrap())
@@ -8255,6 +8512,309 @@ mod tests {
             Some(std::ffi::OsStr::new("/tmp/corporate-ca.pem")),
             "an explicit caller CA must not be replaced"
         );
+    }
+
+    /// A fake request key, hex like the ones the server writes.
+    const KEY: &str = "0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff";
+
+    /// The launch decision that sends `key`.
+    fn sent(key: &str) -> LaunchKey {
+        LaunchKey::Send(LaunchRequestKey::parse(key).expect("a URL-safe key"))
+    }
+
+    /// A running server's status read, parsed from the wire, with `requestKeyMode`
+    /// set to `mode` or left out, as a server older than request keys leaves it.
+    fn status_reporting(mode: Option<&str>) -> Result<status::StatusPayload, cli::LiveStatusError> {
+        let mut wire = serde_json::json!({
+            "kind": status::STATUS_KIND,
+            "accounts": [],
+            "build": {"sha": "abc1234"},
+        });
+        if let Some(mode) = mode {
+            wire["requestKeyMode"] = mode.into();
+        }
+        Ok(serde_json::from_value(wire).expect("a status payload"))
+    }
+
+    /// Every decision that launches unkeyed, one of each.
+    fn unkeyed_decisions() -> [LaunchKey; 4] {
+        [
+            LaunchKey::NoKeyInConfig,
+            LaunchKey::KeyNotUrlSafe,
+            LaunchKey::StatusUnread("nothing is listening".to_string()),
+            LaunchKey::ServerPredatesKeys,
+        ]
+    }
+
+    /// The gate: the key goes only to a server whose status carries
+    /// `requestKeyMode`, whatever its value, and only when the config holds a key a
+    /// URL can carry. Every other case is unkeyed with one notice that says why and
+    /// never carries the key.
+    #[test]
+    fn the_request_key_is_sent_only_to_a_server_that_reports_request_key_mode() {
+        let log = status_reporting(Some("log"));
+        assert_eq!(LaunchKey::decide(Some(KEY), &log), sent(KEY));
+        assert_eq!(
+            LaunchKey::decide(Some(KEY), &status_reporting(Some("enforce"))),
+            sent(KEY),
+            "presence is the contract, not the value"
+        );
+        assert_eq!(
+            LaunchKey::decide(Some(KEY), &status_reporting(None)),
+            LaunchKey::ServerPredatesKeys,
+            "an older server compares the whole Codex header: a keyed URL would run unpooled"
+        );
+        assert_eq!(
+            LaunchKey::decide(Some(KEY), &Err(cli::LiveStatusError::NoServer)),
+            LaunchKey::StatusUnread("nothing is listening".to_string())
+        );
+        assert_eq!(
+            LaunchKey::decide(
+                Some(KEY),
+                &Err(cli::LiveStatusError::Unusable("HTTP 401".to_string()))
+            ),
+            LaunchKey::StatusUnread("HTTP 401".to_string())
+        );
+        assert_eq!(LaunchKey::decide(None, &log), LaunchKey::NoKeyInConfig);
+        assert_eq!(LaunchKey::decide(Some(""), &log), LaunchKey::NoKeyInConfig);
+        assert_eq!(
+            LaunchKey::decide(Some("not a:url@key"), &log),
+            LaunchKey::KeyNotUrlSafe
+        );
+
+        assert_eq!(sent(KEY).key().map(LaunchRequestKey::as_str), Some(KEY));
+        assert_eq!(
+            sent(KEY).notice(3999),
+            None,
+            "a keyed launch says nothing more"
+        );
+        for decision in unkeyed_decisions() {
+            assert_eq!(decision.key(), None, "{decision:?}");
+            let notice = decision
+                .notice(3999)
+                .unwrap_or_else(|| panic!("{decision:?} launches unkeyed and must say why"));
+            assert!(
+                notice.starts_with("[tcr] launching without the request key: "),
+                "{notice}"
+            );
+        }
+        assert!(
+            !format!("{:?}", sent(KEY)).contains(KEY),
+            "Debug must not print the key"
+        );
+    }
+
+    /// (a): keyed, both proxy spellings carry the key as the plain `tcr` user's
+    /// password; unkeyed, exactly the URL `tcr run` set before keys.
+    #[test]
+    fn a_keyed_see_through_launch_puts_the_key_in_both_proxy_urls() {
+        let keyed = format!("http://tcr:{KEY}@127.0.0.1:3999");
+        let mut cmd = std::process::Command::new("true");
+        let _lines = apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"), &sent(KEY));
+        let env = env_changes(&cmd);
+        assert_eq!(env.get("HTTPS_PROXY"), Some(&Some(keyed.clone())));
+        assert_eq!(env.get("https_proxy"), Some(&Some(keyed)));
+
+        for decision in unkeyed_decisions() {
+            let mut cmd = std::process::Command::new("true");
+            let _lines = apply_see_through_env(&mut cmd, 3999, Path::new("/tmp/ca.pem"), &decision);
+            let env = env_changes(&cmd);
+            for var in ["HTTPS_PROXY", "https_proxy"] {
+                assert_eq!(
+                    env.get(var),
+                    Some(&Some("http://127.0.0.1:3999".to_string())),
+                    "{decision:?}: {var}"
+                );
+            }
+        }
+    }
+
+    /// The `Proxy-Authorization` a client builds from `url` for an https request,
+    /// by the matcher codex's HTTP stack runs, read back by the server's own parse.
+    fn server_reads(url: &str) -> tcr::request_key::ProxyCredential {
+        use hyper_util::client::proxy::matcher::Matcher;
+        let target: hyper::Uri = "https://chatgpt.com/backend-api/codex/responses"
+            .parse()
+            .expect("a uri");
+        let intercept = Matcher::builder()
+            .https(url)
+            .build()
+            .intercept(&target)
+            .expect("proxied");
+        let auth = intercept
+            .basic_auth()
+            .map(|value| value.to_str().expect("ascii").to_string())
+            .unwrap_or_default();
+        tcr::request_key::ProxyCredential::from_connect_head(
+            &format!("CONNECT chatgpt.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n"),
+            Some(KEY),
+        )
+    }
+
+    /// (b) and (c): keyed, codex keeps the `tcr-codex` marker with the key as its
+    /// password, and its shell tools get the unmarked `tcr` user with the key. The
+    /// server's own parse reads the first as marked and keyed, the second as keyed
+    /// only. Unkeyed, both are today's URLs. A direct launch never reaches tcr and
+    /// gets neither.
+    #[test]
+    fn a_keyed_codex_launch_keeps_the_marker_and_keys_its_shell_tools() {
+        let pooled = CodexLaunch::SeeThrough {
+            ca: PathBuf::from("/tmp/ca.pem"),
+            no_proxy: Vec::new(),
+        };
+        let shell_args = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .filter(|arg| arg.starts_with("shell_environment_policy.set."))
+                .collect()
+        };
+
+        let mut cmd = std::process::Command::new("true");
+        let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &sent(KEY));
+        let codex_url = format!("http://tcr-codex:{KEY}@127.0.0.1:3999");
+        let shell_url = format!("http://tcr:{KEY}@127.0.0.1:3999");
+        let env = env_changes(&cmd);
+        assert_eq!(env.get("HTTPS_PROXY"), Some(&Some(codex_url.clone())));
+        assert_eq!(env.get("https_proxy"), Some(&Some(codex_url.clone())));
+        assert_eq!(
+            shell_args(&cmd),
+            [
+                format!("shell_environment_policy.set.HTTPS_PROXY=\"{shell_url}\""),
+                format!("shell_environment_policy.set.https_proxy=\"{shell_url}\""),
+            ]
+        );
+        let codex = server_reads(&codex_url);
+        assert!(codex.codex_marked && codex.key_ok, "{codex:?}");
+        let shell = server_reads(&shell_url);
+        assert!(!shell.codex_marked && shell.key_ok, "{shell:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("tcr request-key")),
+            "the shell-tool line says where a hand-set helper gets the key: {lines:?}"
+        );
+
+        for decision in unkeyed_decisions() {
+            let mut cmd = std::process::Command::new("true");
+            let lines = apply_codex_launch(&mut cmd, 3999, &pooled, &decision);
+            let env = env_changes(&cmd);
+            assert_eq!(
+                env.get("HTTPS_PROXY"),
+                Some(&Some("http://tcr-codex@127.0.0.1:3999".to_string())),
+                "{decision:?}"
+            );
+            assert_eq!(
+                shell_args(&cmd),
+                [
+                    "shell_environment_policy.set.HTTPS_PROXY=\"http://127.0.0.1:3999\"",
+                    "shell_environment_policy.set.https_proxy=\"http://127.0.0.1:3999\"",
+                ],
+                "{decision:?}"
+            );
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains("without the request key"))
+                    .count(),
+                1,
+                "{decision:?}: one notice says why: {lines:?}"
+            );
+        }
+
+        let mut cmd = std::process::Command::new("true");
+        let lines = apply_codex_launch(
+            &mut cmd,
+            3999,
+            &CodexLaunch::Direct {
+                reason: "no proxy answered on 127.0.0.1:3999".to_string(),
+                unset: Vec::new(),
+            },
+            &sent(KEY),
+        );
+        assert!(env_changes(&cmd).is_empty(), "a direct launch sets nothing");
+        assert!(shell_args(&cmd).is_empty());
+        assert!(
+            !lines.iter().any(|line| line.contains("request key")),
+            "{lines:?}"
+        );
+    }
+
+    /// (d): keyed, `x-tcr-key` is appended after the caller's and `--group`'s
+    /// headers, replacing an outer `tcr run`'s key line; unkeyed, the caller's
+    /// value is untouched.
+    #[test]
+    fn a_keyed_base_url_launch_appends_the_key_after_the_callers_headers() {
+        let headers = |inherited: Option<&str>, key: &LaunchKey| {
+            let mut cmd = std::process::Command::new("true");
+            match inherited {
+                Some(value) => cmd.env("ANTHROPIC_CUSTOM_HEADERS", value),
+                None => cmd.env_remove("ANTHROPIC_CUSTOM_HEADERS"),
+            };
+            let _lines = apply_base_url_env(&mut cmd, 3999, key);
+            env_changes(&cmd)
+                .get("ANTHROPIC_CUSTOM_HEADERS")
+                .cloned()
+                .flatten()
+        };
+        let line = format!("x-tcr-key: {KEY}");
+        assert_eq!(
+            headers(Some("x-user: 1\nx-tcr-group: g"), &sent(KEY)),
+            Some(format!("x-user: 1\nx-tcr-group: g\n{line}"))
+        );
+        assert_eq!(
+            headers(Some("X-TCR-KEY: outer\nx-user: 1"), &sent(KEY)),
+            Some(format!("x-user: 1\n{line}")),
+            "a nested launch replaces the outer key line"
+        );
+        assert_eq!(headers(None, &sent(KEY)), Some(line));
+        for decision in unkeyed_decisions() {
+            assert_eq!(
+                headers(Some("x-user: 1"), &decision),
+                Some("x-user: 1".to_string()),
+                "{decision:?}"
+            );
+            assert_eq!(headers(None, &decision), None, "{decision:?}");
+        }
+    }
+
+    /// No stderr line a launch prints carries the key: the banners show the URL
+    /// with the key as `***`, and the notices name `tcr request-key` instead.
+    #[test]
+    fn no_launch_line_carries_the_request_key() {
+        let key = sent(KEY);
+        let ca = Path::new("/tmp/ca.pem");
+        let mut lines = Vec::new();
+        let mut cmd = std::process::Command::new("true");
+        lines.extend(apply_see_through_env(&mut cmd, 3999, ca, &key));
+        lines.extend(apply_base_url_env(&mut cmd, 3999, &key));
+        for caller_ca in [false, true] {
+            lines.extend(apply_codex_see_through_env(
+                &mut cmd, 3999, ca, caller_ca, &key,
+            ));
+        }
+        lines.extend(apply_codex_launch(
+            &mut cmd,
+            3999,
+            &CodexLaunch::SeeThrough {
+                ca: ca.to_path_buf(),
+                no_proxy: Vec::new(),
+            },
+            &key,
+        ));
+        lines.extend(unkeyed_decisions().iter().filter_map(|d| d.notice(3999)));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("via http://tcr:***@127.0.0.1:3999")),
+            "control: the see-through banner names the redacted URL: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("via http://tcr-codex:***@127.0.0.1:3999")),
+            "control: the codex banner names the redacted URL: {lines:?}"
+        );
+        for line in &lines {
+            assert!(!line.contains(KEY), "a stderr line carries the key: {line}");
+        }
     }
 
     /// The re-entry marker must reach the child, and must not be named such that
@@ -9187,7 +9747,7 @@ mod tests {
         )
         .expect("a direct launch");
         let mut cmd = std::process::Command::new("true");
-        apply_codex_launch(&mut cmd, 3999, &launch);
+        let _lines = apply_codex_launch(&mut cmd, 3999, &launch, &LaunchKey::NoKeyInConfig);
         assert_eq!(
             env_changes(&cmd),
             [
@@ -9276,7 +9836,7 @@ mod tests {
         );
 
         let mut cmd = std::process::Command::new("true");
-        apply_codex_launch(&mut cmd, 3999, &launch);
+        let _lines = apply_codex_launch(&mut cmd, 3999, &launch, &LaunchKey::NoKeyInConfig);
         let env = env_changes(&cmd);
         assert_eq!(
             env.get("NO_PROXY"),
@@ -10785,13 +11345,14 @@ mod tests {
         );
 
         let mut cmd = std::process::Command::new("true");
-        apply_codex_launch(
+        let _lines = apply_codex_launch(
             &mut cmd,
             3999,
             &CodexLaunch::SeeThrough {
                 ca: ca.to_path_buf(),
                 no_proxy: Vec::new(),
             },
+            &LaunchKey::NoKeyInConfig,
         );
         let expected = match std::env::var_os("NODE_EXTRA_CA_CERTS") {
             None => Some(Some("/tmp/ca.pem".to_string())),
@@ -10804,13 +11365,14 @@ mod tests {
         );
 
         let mut cmd = std::process::Command::new("true");
-        apply_codex_launch(
+        let _lines = apply_codex_launch(
             &mut cmd,
             3999,
             &CodexLaunch::Direct {
                 reason: "no proxy answered on 127.0.0.1:3999".to_string(),
                 unset: Vec::new(),
             },
+            &LaunchKey::NoKeyInConfig,
         );
         assert_eq!(env_changes(&cmd).get("NODE_EXTRA_CA_CERTS"), None);
     }

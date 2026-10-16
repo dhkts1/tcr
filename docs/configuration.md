@@ -187,6 +187,10 @@ A caller presents it in any one of these places:
 | `x-api-key: <key>` | SDK clients with no login | the SDK's `ANTHROPIC_API_KEY` |
 | `Proxy-Authorization` | `HTTP_PROXY` clients | the same `Basic` value as a `CONNECT` |
 
+`tcr run` presents it for you, on a server that reports it understands keys, and the peer
+lender presents it on its relay into its own proxy; see
+[the request key on a launch](cli.md#the-request-key-on-a-launch).
+
 In this version nothing is refused. A caller without the key is counted on `GET /_tcr/status`
 (`unkeyedConnects`, `unkeyedRequests`) and served exactly as before; see
 [the request key on `GET /_tcr/status`](cli.md#the-request-key-on-get-_tcrstatus). The key is
