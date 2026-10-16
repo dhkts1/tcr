@@ -764,6 +764,116 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// The three caches a restart reads back, each saved by [`save_on_change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedCache {
+    /// `session-affinity.json`: see [`crate::affinity`].
+    Affinity,
+    /// `server-tool-pins.json`: see [`crate::bound_tokens`].
+    BoundTokens,
+    /// `session-wire.json`: see [`crate::session_wire_persist`].
+    WireSessions,
+}
+
+impl SavedCache {
+    /// How long after a change the save runs, so a burst of changes is one write.
+    fn delay(self) -> Duration {
+        match self {
+            Self::Affinity => crate::manager::AFFINITY_SAVE_DELAY,
+            Self::BoundTokens => crate::manager::BOUND_TOKENS_SAVE_DELAY,
+            Self::WireSessions => crate::manager::WIRE_SESSIONS_SAVE_DELAY,
+        }
+    }
+
+    /// Resolves once this cache has changed since the last time it resolved.
+    async fn changed(self, manager: &Manager) {
+        match self {
+            Self::Affinity => manager.affinity_changed().await,
+            Self::BoundTokens => manager.bound_tokens_changed().await,
+            Self::WireSessions => manager.wire_sessions_changed().await,
+        }
+    }
+
+    /// Clear the dirty flag, then save if the content differs from the file.
+    fn save(
+        self,
+        manager: &Manager,
+        path: &std::path::Path,
+    ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
+        match self {
+            Self::Affinity => {
+                manager.take_affinity_dirty();
+                manager.flush_affinity_if_changed(path)
+            }
+            Self::BoundTokens => {
+                manager.take_bound_tokens_dirty();
+                manager.flush_bound_tokens_if_changed(path)
+            }
+            Self::WireSessions => {
+                manager.take_wire_sessions_dirty();
+                manager.flush_wire_sessions_if_changed(path)
+            }
+        }
+    }
+
+    /// The warning a failed save logs, naming what the failure costs.
+    fn warn(self, path: &std::path::Path, err: &crate::config::ConfigError) {
+        match self {
+            Self::Affinity => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not write the session-affinity pin file; pins will not survive this restart"
+            ),
+            Self::BoundTokens => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not write the bound-token file; conversations bound this boot may be re-keyed after a restart"
+            ),
+            Self::WireSessions => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not write the Sessions/Tools cache; the panel will start empty next restart"
+            ),
+        }
+    }
+}
+
+/// Save `cache` to `path` for as long as the future runs: wait for a change, let
+/// [`SavedCache::delay`] pass so a burst of changes is one write, then save if the content
+/// differs from the file. A proxy with no traffic never wakes this.
+///
+/// It replaced a timer that woke every 5 s (60 s for the bound tokens) to look at a dirty flag,
+/// which kept an idle proxy waking twelve times a minute per cache for nothing. A save its gate
+/// defers ([`crate::save_gate::SaveOutcome::Deferred`]) is retried at the instant the gate
+/// names even with no further change, so a deferred field still reaches the disk within the
+/// gate's refresh period.
+///
+/// Never returns; the caller races it against the shutdown signal. The write is synchronous,
+/// so cancelling the future can never tear a file half-written.
+async fn save_on_change(cache: SavedCache, manager: &Manager, path: &std::path::Path) {
+    let mut due: Option<std::time::Instant> = None;
+    loop {
+        match due {
+            Some(at) => {
+                tokio::select! {
+                    () = cache.changed(manager) => {}
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
+                }
+            }
+            None => cache.changed(manager).await,
+        }
+        tokio::time::sleep(cache.delay()).await;
+        due = match cache.save(manager, path) {
+            Ok(crate::save_gate::SaveOutcome::Deferred(at)) => Some(at),
+            Ok(_) => None,
+            Err(err) => {
+                cache.warn(path, &err);
+                None
+            }
+        };
+    }
+}
+
 /// Supervise a background loop: log (via `tracing::error!`) if it ends by
 /// panicking, and otherwise do nothing else — it is NOT restarted. This repo's
 /// three background loops (affinity flusher, quota prober, keep-warm) run
@@ -1820,6 +1930,35 @@ pub(crate) fn ensure_request_key(config: &mut Config, persist_path: Option<&std:
     }
 }
 
+/// The most tokio worker threads the binary starts by default. tokio's own default is one per
+/// core, 14 on the machine this was measured on, for a proxy that serves a few requests a
+/// second. The load test (`docs/performance.md`, "Threads, wake-ups and disk") found 2 workers
+/// cost nothing measurable in CPU or added time at the fleet's steady and peak rates, and 4
+/// served the saturating phases as well as 14. Four rather than two leaves room for the cache
+/// saves, which write synchronously on a worker.
+pub const DEFAULT_WORKER_THREADS: usize = 4;
+
+/// How many tokio worker threads the binary runs: `TOKIO_WORKER_THREADS` when it holds a
+/// positive number (tokio's own name for the setting, so an operator who knows tokio finds it),
+/// else [`DEFAULT_WORKER_THREADS`] or the machine's cores, whichever is fewer. `env` is the
+/// variable's value and `cores` the machine's parallelism, passed in so the rule is testable.
+///
+/// An unusable value is reported on stderr, where it is seen before the log exists, and the
+/// default is used rather than refusing to start.
+pub fn worker_threads(env: Option<&str>, cores: usize) -> usize {
+    let cores = cores.max(1);
+    if let Some(raw) = env {
+        match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => return n,
+            _ => eprintln!(
+                "tcr: TOKIO_WORKER_THREADS={raw:?} is not a positive number; using {} worker threads",
+                DEFAULT_WORKER_THREADS.min(cores)
+            ),
+        }
+    }
+    DEFAULT_WORKER_THREADS.min(cores)
+}
+
 pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let ServeOptions {
         mut config,
@@ -2050,31 +2189,16 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
         // Debounced incremental flush. Shutdown-only would miss the case this
         // exists to survive: `--replace` follows SIGTERM with SIGKILL, and a
-        // SIGKILL runs no shutdown path at all. A 5-second timer that writes only
-        // when the map actually changed bounds the loss to one interval while
-        // keeping a busy proxy to at most one small atomic write per interval;
-        // pins settle early in a session, so steady state is no writes.
+        // SIGKILL runs no shutdown path at all. The flusher sleeps until the map
+        // changes, then writes `AFFINITY_SAVE_DELAY` later, so the loss is bounded
+        // by that delay while an idle proxy wakes for nothing. The write is gated
+        // on content (`flush_affinity_if_changed`): a new or moved pin is written
+        // at once, a touch time within `AFFINITY_TOUCH_REFRESH`.
         let flusher = manager.clone();
         let flush_path = affinity_path.clone();
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("affinity-flusher", async move {
-            let flush = async {
-                let mut ticker = tokio::time::interval(Duration::from_secs(5));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    ticker.tick().await;
-                    if !flusher.take_affinity_dirty() {
-                        continue;
-                    }
-                    if let Err(err) = flusher.flush_affinity(&flush_path) {
-                        tracing::warn!(
-                            path = %flush_path.display(),
-                            error = %err,
-                            "could not write the session-affinity pin file; pins will not survive this restart"
-                        );
-                    }
-                }
-            };
+            let flush = save_on_change(SavedCache::Affinity, &flusher, &flush_path);
             // The write itself is synchronous, so cancelling here can never tear
             // a half-written pin file; the loss is at most one interval, which
             // `ServerHandle::shutdown`'s final flush then recovers.
@@ -2122,12 +2246,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             );
         }
 
-        // Debounced like the affinity pins above, but on a MINUTE rather than five seconds.
-        // The affinity map settles early in a session and then stops changing; this one gains
-        // an entry on nearly every assistant turn, and at `BOUND_TOKEN_CAP` the file is
-        // megabytes — a 5-second timer would rewrite all of it twelve times a minute, forever.
-        // The cost of the wider window is what a SIGKILL inside it loses: up to a minute of
-        // newly minted tokens, whose conversations then route as they did before this feature.
+        // Saved like the affinity pins above, but as a checkpoint every
+        // `BOUND_TOKENS_SAVE_DELAY` (ten minutes) rather than five seconds after a change. This
+        // map gains an entry on nearly every assistant turn, and at `BOUND_TOKEN_CAP` the file is
+        // megabytes, so any short cadence rewrites all of it, again and again, for as long as
+        // anyone works. The cost of the wide window is what a crash or SIGKILL inside it loses:
+        // up to that long of newly minted tokens, whose conversations then route as they did
+        // before this feature (the constant's doc says so too).
         // A CLEAN shutdown loses none of them: on the shutdown signal the map is written one
         // last time if it changed. Before that, every restart (a TcrBar update is one) dropped
         // the last minute of mints, which are the live conversations' newest tokens; the first
@@ -2141,33 +2266,20 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         let flush_path = bound_token_path.clone();
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(supervise("bound-token-flusher", async move {
-            let write_if_dirty = || {
-                if !flusher.take_bound_tokens_dirty() {
-                    return;
+            {
+                let flush = save_on_change(SavedCache::BoundTokens, &flusher, &flush_path);
+                tokio::select! {
+                    _ = flush => {}
+                    _ = stop.changed() => {}
                 }
-                if let Err(err) = flusher.flush_bound_tokens(&flush_path) {
-                    tracing::warn!(
-                        path = %flush_path.display(),
-                        error = %err,
-                        "could not write the bound-token file; conversations bound this boot may be re-keyed after a restart"
-                    );
-                }
-            };
-            let flush = async {
-                let mut ticker = tokio::time::interval(Duration::from_secs(60));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    ticker.tick().await;
-                    write_if_dirty();
-                }
-            };
-            tokio::select! {
-                _ = flush => {}
-                _ = stop.changed() => {}
             }
-            // The timer loop never ends, so reaching here means the shutdown signal (or the
-            // sender's drop) arrived: write whatever changed since the last tick.
-            write_if_dirty();
+            // The save loop never ends, so reaching here means the shutdown signal (or the
+            // sender's drop) arrived: write whatever changed since the last save.
+            if flusher.take_bound_tokens_dirty() {
+                if let Err(err) = flusher.flush_bound_tokens(&flush_path) {
+                    SavedCache::BoundTokens.warn(&flush_path, &err);
+                }
+            }
         })));
     }
 
@@ -2200,38 +2312,27 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             );
         }
 
-        // Debounced incremental flush — same 5-second, dirty-flag-gated contract
-        // as the affinity flusher just above, for the same reason: a SIGKILL runs
-        // no shutdown path at all, so only a periodic write can survive one.
+        // Saved on change, the affinity flusher's contract just above, for the same
+        // reason: a SIGKILL runs no shutdown path at all, so only a periodic write can
+        // survive one. A new or departed session is written `WIRE_SESSIONS_SAVE_DELAY`
+        // after it appears; the counters of sessions already on disk within
+        // `WIRE_SESSIONS_REFRESH`.
         let flusher = manager.clone();
         let flush_path = wire_sessions_path.clone();
         let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(supervise("wire-sessions-flusher", async move {
-            let flush = async {
-                let mut ticker = tokio::time::interval(Duration::from_secs(5));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    ticker.tick().await;
-                    if !flusher.take_wire_sessions_dirty() {
-                        continue;
-                    }
-                    if let Err(err) = flusher.flush_wire_sessions(&flush_path) {
-                        tracing::warn!(
-                            path = %flush_path.display(),
-                            error = %err,
-                            "could not write the Sessions/Tools cache; the panel will start empty next restart"
-                        );
-                    }
+        background.push(tokio::spawn(supervise(
+            "wire-sessions-flusher",
+            async move {
+                let flush = save_on_change(SavedCache::WireSessions, &flusher, &flush_path);
+                // The write itself is synchronous, so cancelling here can never tear
+                // a half-written file; the loss is at most one interval, which
+                // `ServerHandle::shutdown`'s final flush then recovers.
+                tokio::select! {
+                    _ = flush => {}
+                    _ = stop.changed() => {}
                 }
-            };
-            // The write itself is synchronous, so cancelling here can never tear
-            // a half-written file; the loss is at most one interval, which
-            // `ServerHandle::shutdown`'s final flush then recovers.
-            tokio::select! {
-                _ = flush => {}
-                _ = stop.changed() => {}
-            }
-        })));
+            },
+        )));
     }
 
     // Background probe: refresh every account's quota around the configured
@@ -2543,6 +2644,25 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_threads_default_to_four_or_the_cores_and_honour_the_override() {
+        assert_eq!(worker_threads(None, 14), DEFAULT_WORKER_THREADS);
+        assert_eq!(worker_threads(None, 2), 2, "never more than the cores");
+        assert_eq!(
+            worker_threads(None, 0),
+            1,
+            "a machine reporting no cores still runs one"
+        );
+        assert_eq!(worker_threads(Some("2"), 14), 2);
+        assert_eq!(
+            worker_threads(Some(" 16 "), 14),
+            16,
+            "an explicit count is honoured"
+        );
+        assert_eq!(worker_threads(Some("0"), 14), DEFAULT_WORKER_THREADS);
+        assert_eq!(worker_threads(Some("many"), 14), DEFAULT_WORKER_THREADS);
+    }
 
     /// A manager with no accounts: nothing to probe, refresh or warm, and
     /// `config_path: None` so no file can be written.

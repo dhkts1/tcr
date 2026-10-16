@@ -76,6 +76,36 @@ mod wire_sessions;
 // the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
 pub use select::{divert_verdict, effective_fable_threshold, DivertVerdict};
 
+/// How long the session-affinity flusher waits after a change before it saves, so a burst of
+/// changes is one write. It is also the most of a new or moved pin a SIGKILL can lose: a
+/// clean shutdown writes the pins whatever happened before it.
+pub const AFFINITY_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest a pin's touch time waits to be written when nothing else about the pins moved.
+/// Every request moves its pin's touch time, so writing on each one rewrote the whole file
+/// every [`AFFINITY_SAVE_DELAY`] for as long as any session was busy. A touch time is read at
+/// boot only to expire a pin older than `affinity::PIN_TTL_MS` (15 minutes), so one up to a
+/// minute stale expires a pin at most a minute early, for a session that had already been
+/// quiet for fourteen.
+pub const AFFINITY_TOUCH_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// As [`AFFINITY_SAVE_DELAY`], for the Sessions/Tools cache: how soon a new session reaches it.
+pub const WIRE_SESSIONS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// As [`AFFINITY_TOUCH_REFRESH`], for the Sessions/Tools cache: how stale a session's
+/// counters, times and tool calls can be on disk. The cache only fills the panel after a
+/// restart, so what a SIGKILL loses is at most this much of its history.
+pub const WIRE_SESSIONS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the bound-token flusher waits after a change before it saves: a checkpoint, not a
+/// debounce. The file holds up to `BOUND_TOKEN_CAP` tokens, several megabytes, and gains one on
+/// nearly every assistant turn, so a minute's cadence rewrote all of it once or twice a minute
+/// for as long as anyone was working: about 8 MB each time on a live proxy. A clean shutdown
+/// writes the map whatever the cadence; what this bounds is a crash or SIGKILL, which loses at
+/// most this long of newly minted tokens, whose conversations then route as they did before
+/// this map existed.
+pub const BOUND_TOKENS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 const REQUEST_LOG_CAPACITY: usize = 200;
 
 /// Upper bound on a single rate-limit hold. A 429 `retry-after` larger than this
@@ -1366,6 +1396,14 @@ pub struct Manager {
     /// only ordering that matters is "a change eventually causes a write", and a
     /// tick that observes the flag late simply writes on the next one.
     affinity_dirty: AtomicBool,
+    /// Woken by every change to `affinity`, so its flusher sleeps while nothing changes rather
+    /// than polling the flag on a timer. A permit is stored when nobody waits, so a change
+    /// made between two waits is never missed.
+    affinity_wake: Notify,
+    /// The last pin-file write, so a save whose pins are what is already on disk writes
+    /// nothing. Shape: which session is pinned to which account; the touch times are written
+    /// at most once per [`AFFINITY_TOUCH_REFRESH`]. See [`crate::save_gate`].
+    affinity_save: crate::save_gate::SaveGate,
     /// Hashed account-bound token → (account index, kind, mint ms): who minted each advisor id,
     /// thinking signature, redacted-thinking payload and message id the fleet has served. See
     /// [`crate::bound_tokens`] for the rule — a conversation carrying one of these is served by
@@ -1385,6 +1423,11 @@ pub struct Manager {
     /// Set whenever [`Self::bound_tokens`] is mutated, cleared by the flusher task that writes
     /// it to disk — same debounce contract as [`Self::affinity_dirty`].
     bound_tokens_dirty: AtomicBool,
+    /// Woken by every change to [`Self::bound_tokens`], as [`Self::affinity_wake`] is.
+    bound_tokens_wake: Notify,
+    /// The last bound-token file write. Every change is shape here (a new token is what a
+    /// restart needs), so the gate only skips a save whose map is already on disk.
+    bound_tokens_save: crate::save_gate::SaveGate,
     /// Session keys already logged as held to their pin by bound history, so a long
     /// conversation costs one line and not one per turn. Diagnostic only: nothing routes on it.
     bound_history_logged: Mutex<HashSet<u64>>,
@@ -1411,6 +1454,11 @@ pub struct Manager {
     /// reader is a slow timer, and the only ordering that matters is "a change
     /// eventually causes a write".
     wire_sessions_dirty: AtomicBool,
+    /// Woken by every change to [`Self::wire_sessions`], as [`Self::affinity_wake`] is.
+    wire_sessions_wake: Notify,
+    /// The last Sessions/Tools cache write. Shape: which sessions the table holds; their
+    /// counters and times are written at most once per [`WIRE_SESSIONS_REFRESH`].
+    wire_sessions_save: crate::save_gate::SaveGate,
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
@@ -1767,13 +1815,19 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
             affinity_dirty: AtomicBool::new(false),
+            affinity_wake: Notify::new(),
+            affinity_save: crate::save_gate::SaveGate::new(AFFINITY_TOUCH_REFRESH),
             bound_tokens: bound_tokens::ShardedBoundTokens::default(),
             bound_tokens_dirty: AtomicBool::new(false),
+            bound_tokens_wake: Notify::new(),
+            bound_tokens_save: crate::save_gate::SaveGate::new(std::time::Duration::ZERO),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             wire_sessions_dirty: AtomicBool::new(false),
+            wire_sessions_wake: Notify::new(),
+            wire_sessions_save: crate::save_gate::SaveGate::new(WIRE_SESSIONS_REFRESH),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),

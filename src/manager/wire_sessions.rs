@@ -426,6 +426,13 @@ impl Manager {
     /// actual write done off it by a debounced flusher.
     pub fn mark_wire_sessions_dirty(&self) {
         self.wire_sessions_dirty.store(true, Ordering::Relaxed);
+        self.wire_sessions_wake.notify_one();
+    }
+
+    /// Resolves once the wire-session table has changed since the last time this resolved:
+    /// the Sessions/Tools flusher's wake-up, as [`Self::affinity_changed`] is the pins'.
+    pub async fn wire_sessions_changed(&self) {
+        self.wire_sessions_wake.notified().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
@@ -440,14 +447,45 @@ impl Manager {
     /// write this cache still serves traffic exactly as it did before this file existed.
     pub fn flush_wire_sessions(&self, path: &Path) -> Result<usize, crate::config::ConfigError> {
         let now_ms = crate::now_ms();
-        let sessions: std::collections::HashMap<String, crate::session_wire::WireSession> = {
-            let tracker = self
-                .wire_sessions
-                .lock()
-                .expect("wire sessions lock poisoned");
-            tracker.snapshot(now_ms).into_iter().collect()
-        };
-        session_wire_persist::save(path, &sessions, now_ms)
+        let sessions = self.wire_sessions_to_save(now_ms);
+        let count = session_wire_persist::save(path, &sessions, now_ms)?;
+        let (shape, content) = session_wire_persist::save_hashes(&sessions)?;
+        self.wire_sessions_save
+            .wrote(shape, content, std::time::Instant::now());
+        Ok(count)
+    }
+
+    /// The flusher's save: [`Self::flush_wire_sessions`] when the table differs from what the
+    /// last write put on disk, by the rule [`crate::save_gate`] states. A new or departed
+    /// session is written at once; a change to the sessions already on disk waits until
+    /// [`super::WIRE_SESSIONS_REFRESH`] has passed since the last write.
+    pub fn flush_wire_sessions_if_changed(
+        &self,
+        path: &Path,
+    ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
+        let now_ms = crate::now_ms();
+        let sessions = self.wire_sessions_to_save(now_ms);
+        let (shape, content) = session_wire_persist::save_hashes(&sessions)?;
+        let now = std::time::Instant::now();
+        if let Some(skipped) = self.wire_sessions_save.skip(shape, content, now) {
+            return Ok(skipped);
+        }
+        let count = session_wire_persist::save(path, &sessions, now_ms)?;
+        self.wire_sessions_save.wrote(shape, content, now);
+        Ok(crate::save_gate::SaveOutcome::Wrote(count))
+    }
+
+    /// The live table as the cache file holds it: a copy taken under the lock, written
+    /// after it is released.
+    fn wire_sessions_to_save(
+        &self,
+        now_ms: i64,
+    ) -> std::collections::HashMap<String, crate::session_wire::WireSession> {
+        let tracker = self
+            .wire_sessions
+            .lock()
+            .expect("wire sessions lock poisoned");
+        tracker.snapshot(now_ms).into_iter().collect()
     }
 
     /// Restore wire sessions from `path` into the live table, dropping anything stale
@@ -941,6 +979,45 @@ mod tests {
             snap.wire_sessions[0].account.as_deref(),
             Some("bob@example.com"),
             "the in-memory value, fresher than the file, must survive the restore"
+        );
+    }
+
+    /// The flusher's save writes nothing when the table is what it last wrote. The file is
+    /// removed between the saves, so a write of any kind would bring it back. A session's
+    /// counters moving waits for `WIRE_SESSIONS_REFRESH`; a new session is written at once.
+    #[test]
+    fn a_second_wire_session_save_with_no_change_writes_nothing() {
+        use crate::save_gate::SaveOutcome;
+        let path = tmp_wire_sessions_path("unchanged");
+        let manager = Manager::from_runtimes(vec![]);
+        let now = OffsetDateTime::now_utc();
+        manager.record_wire_session(Some("sess-a"), None, None, now, &[], &[]);
+        assert_eq!(
+            manager.flush_wire_sessions_if_changed(&path).expect("save"),
+            SaveOutcome::Wrote(1)
+        );
+        std::fs::remove_file(&path).expect("remove the cache file");
+
+        assert_eq!(
+            manager.flush_wire_sessions_if_changed(&path).expect("save"),
+            SaveOutcome::Unchanged
+        );
+        assert!(!path.exists(), "an unchanged save wrote the file");
+
+        manager.record_wire_session_usage(Some("sess-a"), None, 10, 0, 0, 0, 20);
+        assert!(matches!(
+            manager.flush_wire_sessions_if_changed(&path).expect("save"),
+            SaveOutcome::Deferred(_)
+        ));
+        assert!(
+            !path.exists(),
+            "a counters-only change wrote before its refresh"
+        );
+
+        manager.record_wire_session(Some("sess-b"), None, None, now, &[], &[]);
+        assert_eq!(
+            manager.flush_wire_sessions_if_changed(&path).expect("save"),
+            SaveOutcome::Wrote(2)
         );
     }
 

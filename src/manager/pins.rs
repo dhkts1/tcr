@@ -17,19 +17,29 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::affinity::{self, LoadReport, StoredPin};
 use crate::config::ConfigError;
 use crate::identity;
+use crate::save_gate::SaveOutcome;
 
 use super::{Manager, WarmWindow};
 
 impl Manager {
-    /// Flag the pin map as changed since the last flush. Called from the
-    /// selection path, so it is a single relaxed store and nothing more — the
+    /// Flag the pin map as changed since the last flush, and wake the flusher.
+    /// Called from the selection path, so it is a relaxed store and a notify,
+    /// which is one atomic operation when the flusher is not waiting: the
     /// actual write is done off the request path by the flusher task.
     pub fn mark_affinity_dirty(&self) {
         self.affinity_dirty.store(true, Ordering::Relaxed);
+        self.affinity_wake.notify_one();
+    }
+
+    /// Resolves once the pin map has changed since the last time this resolved: the
+    /// affinity flusher's wake-up, so it sleeps while nothing changes.
+    pub async fn affinity_changed(&self) {
+        self.affinity_wake.notified().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
@@ -151,7 +161,27 @@ impl Manager {
     /// The caller logs the failure and carries on; a proxy that cannot write its
     /// pin cache still serves traffic exactly as it did before this file existed.
     pub fn flush_affinity(&self, path: &Path) -> Result<usize, ConfigError> {
-        affinity::save(path, &self.affinity_pin_snapshot(), crate::now_ms())
+        let pins = self.affinity_pin_snapshot();
+        let count = affinity::save(path, &pins, crate::now_ms())?;
+        let (shape, content) = affinity::save_hashes(&pins)?;
+        self.affinity_save.wrote(shape, content, Instant::now());
+        Ok(count)
+    }
+
+    /// The flusher's save: [`Self::flush_affinity`] when the pins differ from what the last
+    /// write put on disk, by the rule [`crate::save_gate`] states. A save that would write the
+    /// same pins writes nothing, and one that would only move touch times waits until
+    /// [`super::AFFINITY_TOUCH_REFRESH`] has passed since the last write.
+    pub fn flush_affinity_if_changed(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
+        let pins = self.affinity_pin_snapshot();
+        let (shape, content) = affinity::save_hashes(&pins)?;
+        let now = Instant::now();
+        if let Some(skipped) = self.affinity_save.skip(shape, content, now) {
+            return Ok(skipped);
+        }
+        let count = affinity::save(path, &pins, crate::now_ms())?;
+        self.affinity_save.wrote(shape, content, now);
+        Ok(SaveOutcome::Wrote(count))
     }
 
     /// Restore pins from `path` into the live map, resolving each stored identity
@@ -496,6 +526,51 @@ mod tests {
             !manager.take_affinity_dirty(),
             "and consumed by that observation"
         );
+    }
+
+    /// The flusher's save writes nothing when the pins are what it last wrote. The file is
+    /// removed between the saves, so a write of any kind would bring it back. A new pin is
+    /// written at once; a touch-time change waits for `AFFINITY_TOUCH_REFRESH`.
+    #[test]
+    fn a_second_pin_save_with_no_change_writes_nothing() {
+        let path = tmp("unchanged");
+        let manager = manager_over(&[
+            account("a@example.com", "uuid-a"),
+            account("b@example.com", "uuid-b"),
+        ]);
+        let now = crate::now_ms();
+        seed_pins(&manager, &[(11, 0, now)]);
+        assert_eq!(
+            manager.flush_affinity_if_changed(&path).expect("save"),
+            SaveOutcome::Wrote(1)
+        );
+        std::fs::remove_file(&path).expect("remove the pin file");
+
+        assert_eq!(
+            manager.flush_affinity_if_changed(&path).expect("save"),
+            SaveOutcome::Unchanged
+        );
+        assert!(!path.exists(), "an unchanged save wrote the file");
+
+        // Only the touch time moved: deferred, still nothing written.
+        seed_pins(&manager, &[(11, 0, now + 1_000)]);
+        assert!(matches!(
+            manager.flush_affinity_if_changed(&path).expect("save"),
+            SaveOutcome::Deferred(_)
+        ));
+        assert!(
+            !path.exists(),
+            "a touch-only change wrote before its refresh"
+        );
+
+        // A new pin is shape: written at once, touch time and all.
+        seed_pins(&manager, &[(22, 1, now)]);
+        assert_eq!(
+            manager.flush_affinity_if_changed(&path).expect("save"),
+            SaveOutcome::Wrote(2)
+        );
+        let raw = std::fs::read_to_string(path).expect("read pin file");
+        assert!(raw.contains(&format!("{}", now + 1_000)), "{raw}");
     }
 
     /// A pin whose index names no account is skipped rather than written against

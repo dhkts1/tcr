@@ -122,7 +122,7 @@ TURN2_TEXT="Turn 2: reply with the single word DONE."
 BODY1="$(build_body "$TURN1_TEXT")"
 BODY2="$(build_body "$TURN2_TEXT")"
 
-LOG_HINT="grep 'serving request' ~/.cache/tcr/logs/tcr.log.* | tail   (before the move: ~/.cache/teamclaude/logs/teamclaude-rs.log.*)"
+LOG_HINT="grep 'request usage' ~/.cache/tcr/logs/tcr.log.* | tail   (before the move: ~/.cache/teamclaude/logs/teamclaude-rs.log.*)"
 
 # ---- dry-run path -----------------------------------------------------------
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -148,9 +148,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "$LOG_HINT"
   echo "  -> the two most-recent lines for this run must name the SAME session=<id>"
   echo "     AND the SAME account=<name>. Same session + same account = the pin held."
-  echo "     'serving request' (snapshot.rs:28) carries session+account and logs before"
-  echo "     the upstream outcome; 'upstream response' (proxy.rs:419) carries account+status"
-  echo "     but no session, so it cannot distinguish concurrent sessions — we use the former."
+  echo "     'request usage' (src/proxy.rs) is the one INFO line per served request and"
+  echo "     carries session, account and status; 'serving request' and a 2xx"
+  echo "     'upstream response' are DEBUG lines, absent unless RUST_LOG asks for debug."
   echo
   echo "=== END DRY RUN — no requests sent, no quota spent ==="
   exit 0

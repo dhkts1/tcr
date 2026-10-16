@@ -207,12 +207,9 @@ pub fn default_path() -> PathBuf {
     crate::paths::cache_dir().affinity_file()
 }
 
-/// Write `pins` to `path` atomically at `0600`, keeping at most [`PIN_CAP`] of
-/// them (freshest first).
-///
-/// Returns how many were written. The caller decides what a failure means; it is
-/// never fatal here.
-pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, ConfigError> {
+/// The pins [`save`] writes, in the order it writes them: at most [`PIN_CAP`], the freshest,
+/// sorted by key.
+fn written_pins(pins: &[StoredPin]) -> Vec<&StoredPin> {
     let mut pins: Vec<&StoredPin> = pins.iter().collect();
     if pins.len() > PIN_CAP {
         pins.sort_by_key(|p| std::cmp::Reverse(p.touched_at_ms));
@@ -221,6 +218,52 @@ pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, Confi
     // Stable order keeps the file diff-friendly and the write byte-identical when
     // nothing changed.
     pins.sort_by_key(|p| p.key);
+    pins
+}
+
+/// The two hashes [`crate::save_gate::SaveGate`] compares for a save of `pins`: the shape
+/// (each session's account and cache window, everything but the touch time) and the content
+/// (everything [`save`] writes but its `savedAtMs`).
+pub fn save_hashes(pins: &[StoredPin]) -> Result<(u64, u64), serde_json::Error> {
+    let pins = written_pins(pins);
+    let shape: Vec<PinShape<'_>> = pins
+        .iter()
+        .map(|p| PinShape {
+            key: p.key,
+            name: &p.name,
+            account_uuid: p.account_uuid.as_deref(),
+            org_uuid: p.org_uuid.as_deref(),
+            org_name: p.org_name.as_deref(),
+            extended_ttl: p.extended_ttl,
+            provider: p.provider,
+        })
+        .collect();
+    Ok((
+        crate::save_gate::content_hash(&shape)?,
+        crate::save_gate::content_hash(&pins)?,
+    ))
+}
+
+/// A [`StoredPin`] without its touch time: what [`save_hashes`] calls the shape. A field added
+/// to the pin and not here is still written, within `AFFINITY_TOUCH_REFRESH` of its change.
+#[derive(Serialize)]
+struct PinShape<'a> {
+    key: u64,
+    name: &'a str,
+    account_uuid: Option<&'a str>,
+    org_uuid: Option<&'a str>,
+    org_name: Option<&'a str>,
+    extended_ttl: bool,
+    provider: Provider,
+}
+
+/// Write `pins` to `path` atomically at `0600`, keeping at most [`PIN_CAP`] of
+/// them (freshest first).
+///
+/// Returns how many were written. The caller decides what a failure means; it is
+/// never fatal here.
+pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, ConfigError> {
+    let pins = written_pins(pins);
     let count = pins.len();
     let file = PinFileRef {
         version: FORMAT_VERSION,
