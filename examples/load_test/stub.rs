@@ -88,7 +88,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub async fn start(stub: Arc<Stub>) -> anyhow::Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let app = Router::new().fallback(handle).with_state(stub);
+    // axum refuses a body over 2 MB by default; the big-body phases send 4 MiB.
+    let app = Router::new()
+        .fallback(handle)
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .with_state(stub);
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             eprintln!("[load-test] stub stopped: {err}");
