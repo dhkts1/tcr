@@ -16,7 +16,7 @@ requires that key, and being on loopback is no exemption from it
 route answers any loopback caller — but a GUI cannot assume the operator's
 install, and on the ones that do set a key using the route would mean a GUI
 process holding that secret. `tcr status --json` authenticates itself, so TcrBar
-never reads `~/.config/teamclaude.json`, never handles a token and never sends an
+never reads `~/.config/tcr.json`, never handles a token and never sends an
 `Authorization` header.
 
 ## The one safety property
@@ -57,7 +57,9 @@ an incumbent holds the port is reported as "already running", which is a success
 
 Each row has an Enable/Disable button. It shells out to `tcr enable <name>` /
 `tcr disable <name>` and nothing else — TcrBar never writes
-`~/.config/teamclaude.json`, because that file holds credentials and `tcr` owns it.
+`~/.config/tcr.json`, because that file holds credentials and `tcr` owns it. The one file
+operation it starts is `tcr migrate --json`, at launch before its server starts and only while
+old names are still there, which moves an older install's `teamclaude` config and cache to the `tcr` names.
 
 `tcr`'s account query is an *exact* match — the configured name, else the email
 parsed out of it — and it is case-sensitive and untrimmed. It is not a substring

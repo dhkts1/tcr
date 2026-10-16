@@ -12,9 +12,9 @@ and each one was derived from the source, so start from `src/main.rs` to check a
 
 ## Conventions
 
-`--config <path>` appears on every subcommand except `update`, `demo` and `ui`. Unset, it
-resolves to `~/.config/tcr.json`, or to `~/.config/teamclaude.json` on an install that has only
-that file. The tables below write the default as `~/.config/tcr.json` and mean this rule.
+`--config <path>` appears on every subcommand except `update`, `migrate`, `demo` and `ui`. Unset,
+it resolves to `~/.config/tcr.json`, or to `~/.config/teamclaude.json` on an install that has
+only that file, which the update moves to the new name ([`tcr migrate`](#tcr-migrate)). The tables below write the default as `~/.config/tcr.json` and mean this rule.
 
 Cache paths below use `~/.cache/tcr/` for a fresh install. If only the older
 `~/.cache/teamclaude/` exists, tcr keeps using it; when both exist, `tcr/` wins. Usage,
@@ -2226,6 +2226,44 @@ manual instructions when that handoff cannot be made.
 Updating the binary does not update a running proxy. The process that is serving traffic
 keeps its own image until it is restarted, and `tcr status --json` reports the running
 build's SHA if you need to know which one is live.
+
+After a successful install or rebuild it runs [`tcr migrate`](#tcr-migrate). When a tcr
+server is running it moves nothing and prints one line saying the files move at the next
+update, or now with `tcr migrate` once the proxy is stopped. It never stops the proxy.
+
+---
+
+## `tcr migrate`
+
+Moves an older install's files to the `tcr` names: `~/.config/teamclaude.json` becomes
+`~/.config/tcr.json`, and `~/.cache/teamclaude/` becomes `~/.cache/tcr/` (under
+`$XDG_CACHE_HOME` when that is set). Inside the moved cache directory the old-prefix logs
+(`teamclaude-rs.log*`) are renamed to `tcr.log*`, so log pruning keeps covering them. You
+rarely run it yourself: TcrBar runs it at launch, before it starts its server, whenever old
+names are still there, and `tcr update` runs it after a successful install or rebuild.
+
+Each of the two (the config file, and the cache directory as a whole) follows one rule:
+
+| On disk | What happens |
+|---|---|
+| Only the old name | Renamed to the new name, one `rename(2)` in the same directory |
+| Both names | Nothing moves; a warning names both paths. The new one is the one in use |
+| Only the new name, or neither | Nothing |
+| The rename fails | An error names both paths and the OS error. The old one stays and is still read |
+
+Nothing is copied, and the certificate files are not touched. A second run moves nothing and
+says so.
+
+It refuses, with exit code 3 and one line, while a tcr server is running on the port the
+config names, because that server resolved its paths at boot and would keep writing the old
+file. The check is the one `tcr login` uses. A server started with `--port` on another port is
+not seen, so stop it first.
+
+`--json` prints one object instead of lines, always with the same four keys: `outcome`
+(`moved`, `nothing_to_move`, `failed` or `refused`), `refusal` (`port`, `pid`, `message`, or
+`null`), `units` (one entry per unit: `unit`, `result`, and the paths that apply) and `logs`
+(one entry per renamed log). Exit codes: 0 when nothing failed, 1 when a rename failed, 3 when
+it refused.
 
 ---
 

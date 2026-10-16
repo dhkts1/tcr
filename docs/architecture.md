@@ -333,8 +333,12 @@ for it. The cache directory is `$XDG_CACHE_HOME/tcr` when that variable is set, 
 The project used to be called teamclaude, and an install from then keeps its old names: the
 config `~/.config/teamclaude.json` and the cache directory `teamclaude/`, whose logs are
 `teamclaude-rs.log.<date>`. `tcr` uses the new name when it exists, else the old one when that
-exists, else the new one, and it never moves, copies or links an old file. The rule and every
-old name are in `src/paths.rs` and `src/legacy_names.rs`.
+exists, else the new one. A server never moves anything. TcrBar at launch, before it starts its
+server and whenever old names are still there, and `tcr update` after a successful install or
+rebuild, run `tcr migrate`,
+which renames the old config and cache directory (and the old-prefix logs inside it) to the new
+names, and refuses while a tcr server is running. Nothing is copied or linked. The rule and every
+old name are in `src/paths.rs` and `src/legacy_names.rs`; the move is `src/migrate.rs`.
 
 | Path | What it holds | Mode |
 |---|---|---|

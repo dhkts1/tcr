@@ -17,7 +17,8 @@ branch, and every fork and clone keeps its own copy regardless. So: no OAuth acc
 tokens, no proxy API key, no real account emails, no organization or account UUIDs, no real workspace
 names. None of it belongs in code, in fixtures, in tests, in commit messages, or in PR titles or
 bodies. Use obviously-fake values (`alice@example.com`, `11111111-1111-...`); the existing tests
-already do, so follow them. The live config at `~/.config/teamclaude.json` holds working credentials
+already do, so follow them. The live config at `~/.config/tcr.json` (`~/.config/teamclaude.json` on an
+install no update has moved yet) holds working credentials
 for real accounts: never copy it into the repo, never paste its contents anywhere, and never point a
 test at it. Tests write their own temp-file configs.
 

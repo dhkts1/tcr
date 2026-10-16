@@ -3,8 +3,9 @@
 //!
 //! A fresh install gets `~/.config/tcr.json` and `<cache base>/tcr/`. An install
 //! from before the rename keeps the `teamclaude` names it already has
-//! ([`crate::legacy_names`]), read and written where they are. Nothing is
-//! moved, copied or symlinked; that module's doc says why.
+//! ([`crate::legacy_names`]), read and written where they are, until an update
+//! renames them with `tcr migrate` ([`crate::migrate`]). Resolving a path never
+//! moves, copies or symlinks anything.
 //!
 //! **The rule, decided per unit:** use the new path if it exists, else the old
 //! path if it exists, else the new path. The units are the config file and the
