@@ -89,6 +89,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     override func showWindow(_ sender: Any?) {
+        // Before the window shows: its panes read the fleet, and with no
+        // viewer on screen the poller tells no view of a poll.
+        dependencies.poller.setViewer(.settings, isLooking: true)
         super.showWindow(sender)
         AppActivationPolicy.enter()
         window?.makeKeyAndOrderFront(nil)
@@ -97,6 +100,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         AppActivationPolicy.leave()
+        dependencies.poller.setViewer(.settings, isLooking: false)
     }
 }
 

@@ -225,9 +225,12 @@ enum MeasureOpen {
         shell.closePanel()
         _ = await waitUntil { !shell.popover.isShown }
         let lastTick = shell.poller.lastPollAt
-        _ = await waitUntil { shell.poller.lastPollAt != lastTick }
+        _ = await waitUntil(shell.poller.currentInterval + 5) {
+            shell.poller.lastPollAt != lastTick
+        }
+        // The shut panel's pace, which is the one an open interrupts.
         try? await Task.sleep(
-            nanoseconds: UInt64(StatusPoller.defaultInterval / 2 * 1_000_000_000))
+            nanoseconds: UInt64(shell.poller.currentInterval / 2 * 1_000_000_000))
         let anchor = shell.poller.lastPollAt
         let fresh = await seconds(of: {
             shell.openPanel()

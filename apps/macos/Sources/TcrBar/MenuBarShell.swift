@@ -324,6 +324,29 @@ final class MenuBarShell {
         // Escape without `closePanel()` ever running. `PeerPollGate` carries
         // what was measured with the panel shut before it existed.
         PeerPollGate.panelIsOnScreen = { [weak self] in self?.popover.isShown ?? false }
+
+        // The poll's pace and whether the panel's views hear of it follow the
+        // popover itself, not `openPanel()` and `closePanel()`: a `.transient`
+        // popover is dismissed by a click outside or by Escape without
+        // `closePanel()` ever running, and a panel left marked open would keep
+        // the fast cadence and the redraws forever. `openPanel()` also says it
+        // before the show, so the first frame is drawn from current state.
+        NotificationCenter.default
+            .publisher(for: NSPopover.willShowNotification, object: popover)
+            .sink { [weak self] _ in self?.panelIsShown(true) }
+            .store(in: &marks)
+        NotificationCenter.default
+            .publisher(for: NSPopover.didCloseNotification, object: popover)
+            .sink { [weak self] _ in self?.panelIsShown(false) }
+            .store(in: &marks)
+    }
+
+    /// With the panel shut, the poll runs at its slow pace and the panel's view
+    /// tree hears of none of it (``StatusPoller/setViewer(_:isLooking:)``); the
+    /// knock read slows the same way. Opening reads both at once.
+    private func panelIsShown(_ shown: Bool) {
+        poller.setViewer(.panel, isLooking: shown)
+        knocks.setPanelOpen(shown)
     }
 
     /// The panel's hosting controller, configured the one way it may be.
@@ -878,6 +901,11 @@ final class MenuBarShell {
         // and which notes the fleet has moved past), for the same reason: a
         // wrapping note a poll inserted or removed moved every line below it.
         codexNotes.openedOn(fleet, pollBegan: poller.lastPollBegan ?? .distantFuture)
+        // The views have heard of no poll since the panel last closed. Telling
+        // them before the show is what puts the current state in the first
+        // frame rather than in the one after it. It also reads the fleet and
+        // the knocks at once, and keeps both at the open pace until the close.
+        panelIsShown(true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
@@ -905,18 +933,11 @@ final class MenuBarShell {
         // this view. `control` is `@Published`, so a stale in-flight open still
         // redraws once this completes.
         Task { await control.refresh() }
-        // The fleet, on the same terms, and this one is what the panel is
-        // mostly made of.
-        //
-        // The poll runs on a 3s timer and an open used to take whatever the
-        // last tick left, so the figures a person reads after clicking were up
-        // to one whole interval old and the fresh ones arrived up to 3000ms
-        // later, with nothing on screen saying so. One poll costs a fraction of
-        // that: measured on one machine, 229ms, 288ms and 249ms before the two
-        // halves were made to run at once. So the open asks for a read of its
-        // own rather than waiting for the timer, and the panel it is drawing
-        // meanwhile is the same panel it always drew.
-        Task { await poller.pollOnce() }
+        // The fleet is read at once by `panelIsShown(true)` above, which
+        // restarts the poll loop on its open pace with a read first. An open
+        // used to take whatever the last tick left, so the figures a person
+        // read after clicking were up to one whole interval old; with the shut
+        // panel's interval now 20 s that would be most of a minute.
         // This Mac's codex evidence, for Add account… and the sign-in sheet,
         // resolved off the main thread after the show: it only checks where codex
         // lives, and never runs it or opens a file of its. Not on an opening whose
