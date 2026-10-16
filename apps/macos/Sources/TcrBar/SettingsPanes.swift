@@ -243,29 +243,36 @@ struct GeneralSettingsPane: View {
         }
     }
 
-    /// Same cost statement `CLAUDE.md` gives, and the same confirm-before-act
-    /// shape `FleetView.confirmTakeover()` already uses for its own
-    /// most-expensive action.
-    ///
-    /// The words come from ``RestartAlertCopy``, read against the fleet of the
-    /// last poll: once it holds a Codex account, the alert names Codex sessions as
-    /// well as Claude Code ones.
     private func confirmRestart() {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Restart the proxy?"
-        let holdsCodex = poller.state.loadedFleet?.holdsCodex == true
-        alert.informativeText = RestartAlertCopy.restartInformative(holdsCodex: holdsCodex)
-        let restart = alert.addButton(withTitle: "Restart")
-        restart.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        restart.keyEquivalent = ""
-        alert.buttons.last?.keyEquivalent = "\r"
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        server.stop()
-        server.start()
+        confirmProxyRestart(
+            server: server, holdsCodex: poller.state.loadedFleet?.holdsCodex == true)
     }
 
+}
+
+/// Restart the proxy TcrBar supervises, after a confirmation that names the
+/// cost: General's Restart… and Groups & Rotation's "Restart proxy" both come
+/// here, so the two cannot drift on the words or on Cancel being the default.
+///
+/// Same cost statement `CLAUDE.md` gives, and the same confirm-before-act shape
+/// `FleetView.confirmTakeover()` already uses for its own most-expensive action.
+/// The words come from ``RestartAlertCopy``, read against the fleet of the last
+/// poll: once it holds a Codex account, the alert names Codex sessions as well as
+/// Claude Code ones.
+@MainActor
+private func confirmProxyRestart(server: ServerController, holdsCodex: Bool) {
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "Restart the proxy?"
+    alert.informativeText = RestartAlertCopy.restartInformative(holdsCodex: holdsCodex)
+    let restart = alert.addButton(withTitle: "Restart")
+    restart.hasDestructiveAction = true
+    alert.addButton(withTitle: "Cancel")
+    restart.keyEquivalent = ""
+    alert.buttons.last?.keyEquivalent = "\r"
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+    server.stop()
+    server.start()
 }
 
 // MARK: - Menu Bar
@@ -445,60 +452,126 @@ struct GroupsRotationSettingsPane: View {
             }
 
             Section {
-                readOnlyRow(
+                editableRow(
                     "Switch threshold",
                     "Prefer another account once this share of quota is used.",
-                    key: SettingsRowBadge.switchThreshold, sectionTiming: rotationSectionTiming)
-                readOnlyRow(
+                    key: SettingsRowBadge.switchThreshold
+                ) { s in
+                    SettingNumberField(
+                        label: "Switch threshold",
+                        saved: ConfigSettingsFormat.percentField(s.switchThreshold),
+                        step: 1, bounds: 1...100, unit: "%"
+                    ) { await save(SettingsRowBadge.switchThreshold, ["\($0)%"]) }
+                }
+                editableRow(
                     "Control reserve",
                     "The control account is picked below threshold minus reserve.",
-                    key: SettingsRowBadge.controlReserve, sectionTiming: rotationSectionTiming,
-                    scope: claudeOnlyScope)
-                readOnlyRow(
-                    "Fable weekly threshold", "The separate ceiling for the weekly window.",
-                    key: SettingsRowBadge.fableWeeklyThreshold,
-                    sectionTiming: rotationSectionTiming, scope: claudeOnlyScope)
-                readOnlyRow(
+                    key: SettingsRowBadge.controlReserve, scope: claudeOnlyScope
+                ) { s in
+                    SettingNumberField(
+                        label: "Control reserve", saved: ConfigSettingsFormat.percentField(s.controlReserve),
+                        step: 1, bounds: 0...50, unit: "%"
+                    ) { await save(SettingsRowBadge.controlReserve, ["\($0)%"]) }
+                }
+                editableRow(
+                    "Fable weekly threshold",
+                    "The separate ceiling for the weekly window. Empty follows the switch threshold.",
+                    key: SettingsRowBadge.fableWeeklyThreshold, lines: 3, scope: claudeOnlyScope
+                ) { s in
+                    SettingNumberField(
+                        label: "Fable weekly threshold",
+                        // Following: empty, with the switch threshold as its dimmed
+                        // placeholder, which is what "Empty follows" says.
+                        saved: s.fableWeeklyThresholdFollows
+                            ? "" : ConfigSettingsFormat.percentField(s.fableWeeklyThreshold),
+                        placeholder: ConfigSettingsFormat.percentField(s.switchThreshold),
+                        step: 1, bounds: 1...100, unit: "%"
+                    ) { value in
+                        await save(
+                            SettingsRowBadge.fableWeeklyThreshold, [value.isEmpty ? "default" : "\(value)%"])
+                    }
+                }
+                editableRow(
                     "Reset urgency tier",
                     "Weekly resets this close together count as equally soon.",
-                    key: SettingsRowBadge.resetUrgencyTier, sectionTiming: rotationSectionTiming)
-                readOnlyRow(
+                    key: SettingsRowBadge.resetUrgencyTier
+                ) { s in
+                    menu(
+                        "Reset urgency tier", selection: s.resetUrgencyTierHours,
+                        choices: ConfigSettingsFormat.urgencyTierChoices(including: s.resetUrgencyTierHours),
+                        title: { $0 == 0 ? "Off" : "\($0) hours" }
+                    ) { await save(SettingsRowBadge.resetUrgencyTier, [String($0)]) }
+                }
+                editableRow(
                     "Session affinity",
                     "Pin a session to one account so its prompt cache survives.",
-                    key: SettingsRowBadge.sessionAffinity, sectionTiming: rotationSectionTiming)
-                readOnlyRow(
-                    "Control account", nil,
-                    key: SettingsRowBadge.controlAccount,
-                    sectionTiming: rotationSectionTiming, scope: claudeOnlyScope)
-                readOnlyRow(
+                    key: SettingsRowBadge.sessionAffinity
+                ) { s in
+                    toggle("Session affinity", isOn: s.sessionAffinity, key: SettingsRowBadge.sessionAffinity)
+                }
+                editableRow(
+                    "Control account", "Claude accounts only.",
+                    key: SettingsRowBadge.controlAccount, lines: 1
+                ) { s in
+                    controlAccountMenu(saved: s.controlAccount)
+                }
+                editableRow(
                     "Pooled control", "Let the control account serve ordinary traffic too.",
-                    key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming,
-                    scope: claudeOnlyScope)
+                    key: SettingsRowBadge.controlPooled, scope: claudeOnlyScope
+                ) { s in
+                    toggle("Pooled control", isOn: s.controlPooled, key: SettingsRowBadge.controlPooled)
+                }
             } header: {
-                SectionHeader(title: "Rotation", timing: rotationSectionTiming, hint: readOnlyHint)
+                SectionHeader(title: "Rotation", timing: rotationSectionTiming)
             }
 
             Section {
-                readOnlyRow(
+                editableRow(
                     "Per-account throttle", "Requests sent to one organization.",
                     key: SettingsRowBadge.accountThrottle,
-                    sectionTiming: limitsSectionTiming)
-                readOnlyRow(
+                    controlHeight: SettingsControlMetrics.pairHeight
+                ) { s in
+                    SettingThrottlePair(label: "Per-account throttle", saved: s.accountThrottle) {
+                        await save(SettingsRowBadge.accountThrottle, $0)
+                    }
+                }
+                editableRow(
                     "Fleet throttle", "Requests sent across all accounts.",
                     key: SettingsRowBadge.fleetThrottle,
-                    sectionTiming: limitsSectionTiming)
-                readOnlyRow(
-                    "Pacing", "Skip an account that is already busy.",
-                    key: SettingsRowBadge.pacing, sectionTiming: limitsSectionTiming)
-                readOnlyRow(
+                    controlHeight: SettingsControlMetrics.pairHeight
+                ) { s in
+                    SettingThrottlePair(label: "Fleet throttle", saved: s.fleetThrottle) {
+                        await save(SettingsRowBadge.fleetThrottle, $0)
+                    }
+                }
+                editableRow(
+                    "Pacing", "Skip an account that already has this many requests in flight.",
+                    key: SettingsRowBadge.pacing
+                ) { s in
+                    pacingControl(saved: s.pacing)
+                }
+                editableRow(
                     "Keep the usage ledger for", nil,
-                    key: SettingsRowBadge.usageRetentionDays,
-                    sectionTiming: limitsSectionTiming)
-                readOnlyRow(
+                    key: SettingsRowBadge.usageRetentionDays
+                ) { s in
+                    menu(
+                        "Keep the usage ledger for", selection: s.usageRetentionDays,
+                        choices: ConfigSettingsFormat.retentionChoices(including: s.usageRetentionDays),
+                        title: { ConfigSettingsFormat.days($0) }
+                    ) { await save(SettingsRowBadge.usageRetentionDays, [String($0)]) }
+                }
+                editableRow(
                     "HTTP/1.1 only upstream", "Off means HTTP/2, the faster default.",
-                    key: SettingsRowBadge.http1Only, sectionTiming: limitsSectionTiming)
+                    key: SettingsRowBadge.http1Only
+                ) { s in
+                    toggle("HTTP/1.1 only upstream", isOn: s.http1Only, key: SettingsRowBadge.http1Only)
+                }
             } header: {
-                SectionHeader(title: "Limits", timing: limitsSectionTiming, hint: readOnlyHint)
+                SectionHeader(title: "Limits", timing: limitsSectionTiming)
+            }
+
+            Section {
+                waitingLine
             }
         }
         .formStyle(.grouped)
@@ -579,44 +652,178 @@ struct GroupsRotationSettingsPane: View {
         .padding(.vertical, 4)
     }
 
-    /// The value comes from `tcr config show --json` through
-    /// ``ConfigSettingsFormat/row(for:reading:hint:)``, keyed by `key`: the
-    /// file's effective value, or `—` with the reason in the tooltip while the
-    /// read runs or when it failed. This app never reads the config file
-    /// itself (`CLAUDE.md`: it holds credentials).
+    /// The saved settings, or `nil` while the first read runs or when it
+    /// failed. Every control is drawn from this; this app never reads the
+    /// config file itself (`CLAUDE.md`: it holds credentials).
+    private var saved: ConfigSettings? {
+        guard case .settings(let settings) = configSettings.reading else { return nil }
+        return settings
+    }
+
+    /// One editable row (`docs/design/settings-editable-mockup.html`): the
+    /// label on the left, the control in a fixed column on the right. With no
+    /// reading the column shows `—` with the reason as its tooltip, in the
+    /// same fixed frame, so the first read landing moves nothing.
     /// - Parameter scope: one more caption under the detail, naming which
     ///   accounts the row applies to, or `nil` for none.
     @ViewBuilder
-    private func readOnlyRow(
-        _ title: String, _ detail: String?, key: String,
-        sectionTiming: SettingsRowTiming, scope: String? = nil
+    private func editableRow<Control: View>(
+        _ title: String, _ detail: String?, key: String, lines: Int = 2,
+        scope: String? = nil, controlHeight: CGFloat = SettingsControlMetrics.controlHeight,
+        @ViewBuilder control: (ConfigSettings) -> Control
     ) -> some View {
-        let shown = ConfigSettingsFormat.row(
-            for: key, reading: configSettings.reading, hint: readOnlyHint)
         LabeledContent {
-            HStack(spacing: 6) {
-                Text(shown.value).monospacedDigit()
-                rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
+            Group {
+                if let saved {
+                    control(saved)
+                } else {
+                    let shown = ConfigSettingsFormat.row(
+                        for: key, reading: configSettings.reading, hint: "")
+                    Text(shown.value).foregroundStyle(Tok.inkDim).help(shown.help)
+                }
             }
+            .frame(
+                width: SettingsControlMetrics.columnWidth, height: controlHeight,
+                alignment: .trailing)
         } label: {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                if let detail {
-                    Text(detail).font(.caption).foregroundStyle(Tok.inkDim)
-                }
-                if let scope {
-                    Text(scope).font(.caption).foregroundStyle(Tok.inkDim)
-                }
+            SettingRowLabel(
+                title: title, detail: detail, refusal: configSettings.refusals[key],
+                waiting: saved?.waitingKeys.contains(key) == true, lines: lines, scope: scope)
+        }
+    }
+
+    /// Save `values` for the row `key` through `tcr config set`.
+    private func save(_ key: String, _ values: [String]) async -> Bool {
+        await configSettings.save(rowKey: key, values: values)
+    }
+
+    /// An on/off row, saved the moment it flips.
+    private func toggle(_ label: String, isOn: Bool, key: String) -> some View {
+        Toggle(
+            label,
+            isOn: Binding(
+                get: { isOn },
+                set: { on in Task { await save(key, [on ? "on" : "off"]) } })
+        )
+        .labelsHidden()
+        .toggleStyle(.switch)
+    }
+
+    /// A menu row, saved the moment a choice is picked.
+    private func menu(
+        _ label: String, selection: Int, choices: [Int], title: @escaping (Int) -> String,
+        commit: @escaping (Int) async -> Bool
+    ) -> some View {
+        Picker(
+            label,
+            selection: Binding(
+                get: { selection },
+                set: { picked in Task { await commit(picked) } })
+        ) {
+            ForEach(choices, id: \.self) { Text(title($0)).tag($0) }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: SettingsControlMetrics.menuWidth)
+    }
+
+    /// The Claude accounts of the last poll, plus the saved control account
+    /// when the poll does not list it, so the menu always shows what is saved.
+    private func controlAccountChoices(saved: String?) -> [String] {
+        let names = (poller.state.loadedFleet?.accounts ?? [])
+            .filter { $0.provider == .anthropic }
+            .map(\.name)
+        guard let saved, !names.contains(saved) else { return names }
+        return names + [saved]
+    }
+
+    /// The control account: a menu of Claude accounts and None, saved through
+    /// `tcr control`, which applies it to the running proxy at once.
+    private func controlAccountMenu(saved: String?) -> some View {
+        Picker(
+            "Control account",
+            selection: Binding<String?>(
+                get: { saved },
+                set: { picked in Task { await configSettings.saveControlAccount(picked) } })
+        ) {
+            Text("None").tag(String?.none)
+            ForEach(controlAccountChoices(saved: saved), id: \.self) { name in
+                Text(name).tag(String?.some(name))
             }
         }
-        // Was a repeated `Text(readOnlyHint)` under every value (review #53):
-        // four copies of one
-        // sentence out-inked the four numbers they annotated and doubled
-        // each row's height on the value side. The section header now
-        // states it once (`SectionHeader(hint:)`); `.help` keeps it
-        // reachable per row, the same way the hand-written "Reserved" row
-        // beside this one already carries it. Without a value, it says why.
-        .help(shown.help)
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: SettingsControlMetrics.menuWidth)
+    }
+
+    /// Pacing: the in-flight cap with its stepper, and the switch. Switching
+    /// on saves the cap in the field, or 4 when it is empty; the field saves
+    /// on its own while pacing is on.
+    private func pacingControl(saved pacing: ConfigPacing?) -> some View {
+        let cap = pacing?.maxInFlightPerAccount.map(String.init) ?? ""
+        return HStack(spacing: 8) {
+            SettingNumberField(
+                label: "Pacing, requests in flight per account", saved: cap, placeholder: "4",
+                step: 1, bounds: 1...999
+            ) { await save(SettingsRowBadge.pacing, [$0.isEmpty ? "off" : $0]) }
+            .disabled(pacing == nil)
+            Toggle(
+                "Pacing",
+                isOn: Binding(
+                    get: { pacing != nil },
+                    set: { on in
+                        Task { await save(SettingsRowBadge.pacing, [on ? (cap.isEmpty ? "4" : cap) : "off"]) }
+                    })
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+        }
+    }
+
+    /// Three lines of `.callout` with room to spare: the longest sentence the
+    /// line says wraps to three at the shipped window width.
+    private static let waitingLineHeight: CGFloat = 50
+
+    /// The keys waiting for a restart that the operator answered "Later" to.
+    /// The buttons come back when the set changes.
+    @State private var deferredWaiting: [String]?
+
+    /// The fixed line under Limits: how many saved changes wait for a restart,
+    /// with "Later" and "Restart proxy". Always present and one height, so a
+    /// change appearing or clearing moves nothing; with nothing waiting the
+    /// buttons keep their place, hidden.
+    private var waitingLine: some View {
+        let waiting = saved?.waitingKeys ?? []
+        let showButtons = !waiting.isEmpty && deferredWaiting != waiting
+        let text =
+            saved.map {
+                ConfigSettingsFormat.waitingLine(waiting: waiting.count, proxyAnswered: $0.running != nil)
+            } ?? ConfigSettingsFormat.missing
+        return HStack(spacing: 10) {
+            // A fixed frame, not `lineLimit(3, reservesSpace: true)` alone: measured
+            // in `--render-settings`, three wrapped lines came out half a point
+            // taller than the three reserved, so the pane grew by 0.5 pt the moment
+            // a change started waiting.
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(waiting.isEmpty ? Tok.inkDim : Tok.near)
+                .lineLimit(3)
+                .frame(
+                    maxWidth: .infinity, minHeight: Self.waitingLineHeight,
+                    maxHeight: Self.waitingLineHeight, alignment: .leading)
+            Button("Later") { deferredWaiting = waiting }
+                .opacity(showButtons ? 1 : 0)
+                .disabled(!showButtons)
+            Button("Restart proxy") {
+                confirmProxyRestart(
+                    server: dependencies.server,
+                    holdsCodex: poller.state.loadedFleet?.holdsCodex == true)
+            }
+            .buttonStyle(.borderedProminent)
+            .opacity(showButtons ? 1 : 0)
+            .disabled(!showButtons)
+        }
+        .controlSize(.small)
     }
 }
 

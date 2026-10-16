@@ -1282,17 +1282,139 @@ pub fn list_groups(config_path: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 /// `tcr config show [--json]`: the rotation and limit settings this file
-/// gives a server, defaults applied. Offline, through the same loader as
-/// [`list_groups`]; see [`crate::config_show`].
-pub fn show_config(config_path: &Path, json: bool) -> anyhow::Result<()> {
-    let config = load_config(config_path)?;
-    let settings = crate::config_show::ConfigSettings::from_config(&config, config_path);
+/// gives a server, defaults applied, through the same loader as
+/// [`list_groups`]; and beside them, when a proxy answers on the file's port,
+/// the settings it is running. See [`crate::config_show`].
+pub async fn show_config(config_path: &Path, json: bool) -> anyhow::Result<()> {
+    let document = config_show_document(config_path).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&settings)?);
+        println!("{}", serde_json::to_string_pretty(&document)?);
     } else {
-        print!("{}", settings.render_text());
+        print!("{}", document.render_text());
     }
     Ok(())
+}
+
+/// The [`crate::config_show::ConfigShow`] `tcr config show` prints.
+///
+/// `running` is set only from a proxy that ANSWERED the route. Every other
+/// outcome leaves it absent, and every outcome but "nothing is listening" says
+/// why on stderr, because a proxy that is up but unreadable is not the same
+/// fact as no proxy, and TcrBar reads stdout only.
+pub async fn config_show_document(
+    config_path: &Path,
+) -> anyhow::Result<crate::config_show::ConfigShow> {
+    let config = load_config(config_path)?;
+    let saved = crate::config_show::ConfigSettings::from_config(&config, config_path);
+    let running = match fetch_running_settings(&config).await {
+        Ok(running) => Some(running),
+        Err(LiveControlError::NoServer) => None,
+        Err(LiveControlError::NoRoute) => {
+            eprintln!(
+                "[tcr] the proxy on :{} is too old to report its settings (no {} route), so nothing is shown as waiting for a restart.",
+                config.proxy.port,
+                crate::proxy::CONFIG_PATH
+            );
+            None
+        }
+        Err(other) => {
+            eprintln!(
+                "[tcr] could not read the running proxy's settings on :{} ({}), so nothing is shown as waiting for a restart.",
+                config.proxy.port,
+                other.why()
+            );
+            None
+        }
+    };
+    Ok(crate::config_show::ConfigShow { saved, running })
+}
+
+/// `tcr config set <key> <value>`: save one rotation or limit setting.
+///
+/// Parsed first ([`crate::config_set::Setting::parse`]): a refused value
+/// writes nothing anywhere. Then the running proxy first, the same posture and
+/// the same arms as [`set_control`], because the proxy owns the file while it
+/// runs (see [`crate::proxy::CONFIG_PATH`]): it writes the key under its own
+/// lock. With nothing listening the file is written here, through the same
+/// [`crate::config_set::save_setting`]. A refused api-key or a refusal from
+/// the route writes nothing; a proxy too old for the route, or one that
+/// answered something unusable, gets the file written here with a warning.
+///
+/// Either way the running proxy keeps the value it booted with until it
+/// restarts, so the line printed says so when one is running.
+pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+    let setting = crate::config_set::Setting::parse(key, value).map_err(anyhow::Error::msg)?;
+    let saved_line = |changed: bool| {
+        if changed {
+            format!("Saved {} = {}.", setting.key(), setting.value_words())
+        } else {
+            format!(
+                "{} is already {}; nothing changed.",
+                setting.key(),
+                setting.value_words()
+            )
+        }
+    };
+
+    if let Ok(config) = config::load(config_path) {
+        match post_set_config(&config, &setting).await {
+            Ok(applied) => {
+                println!(
+                    "{} The proxy on :{} keeps its current value until it restarts.",
+                    saved_line(applied.changed),
+                    config.proxy.port
+                );
+                return Ok(());
+            }
+            Err(LiveControlError::NoServer) => {}
+            Err(LiveControlError::Unauthorized) => bail!(
+                "the proxy on :{} rejected the api-key in {}, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
+                config.proxy.port,
+                config_path.display()
+            ),
+            Err(LiveControlError::Rejected(message)) => bail!(
+                "the proxy running on :{} refused this: {message}",
+                config.proxy.port
+            ),
+            Err(LiveControlError::NoRoute) => {
+                let write = write_setting(config_path, &setting)?;
+                eprintln!(
+                    "[tcr] WARNING: the proxy running on :{} is too old to save settings itself (no {} route), so this process wrote the file beside it. {}",
+                    config.proxy.port,
+                    crate::proxy::CONFIG_PATH,
+                    RESTART_HINT,
+                );
+                println!("{}", saved_line(write == crate::config_set::SettingWrite::Updated));
+                return Ok(());
+            }
+            Err(other) => {
+                let write = write_setting(config_path, &setting)?;
+                eprintln!(
+                    "[tcr] WARNING: could not hand this to the proxy running on :{} ({}), so this process wrote the file beside it.",
+                    config.proxy.port,
+                    other.why(),
+                );
+                println!("{}", saved_line(write == crate::config_set::SettingWrite::Updated));
+                return Ok(());
+            }
+        }
+    }
+
+    let write = write_setting(config_path, &setting)?;
+    println!(
+        "{} The next proxy start uses it.",
+        saved_line(write == crate::config_set::SettingWrite::Updated)
+    );
+    Ok(())
+}
+
+/// The file half of `tcr config set`.
+fn write_setting(
+    config_path: &Path,
+    setting: &crate::config_set::Setting,
+) -> anyhow::Result<crate::config_set::SettingWrite> {
+    crate::config_set::save_setting(config_path, setting)
+        .with_context(|| format!("save config at {}", config_path.display()))
 }
 
 /// Group name -> the (in-order) names of every account carrying that label,
@@ -2000,6 +2122,105 @@ async fn post_set_priority(
         ));
     }
     Err(LiveControlError::Unusable(format!("HTTP {status}")))
+}
+
+/// The client every call to [`crate::proxy::CONFIG_PATH`] uses: the same
+/// `no_proxy()` client and timeouts as [`post_set_disabled`].
+fn config_route_client() -> Result<reqwest::Client, LiveControlError> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))
+}
+
+/// Send one request to [`crate::proxy::CONFIG_PATH`] and sort the answer the
+/// way [`post_set_priority`] does: `is_timeout()` before `is_connect()`, and
+/// "the route answered" decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
+/// [`crate::proxy::CONFIG_ENDPOINT`]. A stamped 400 or 409 is the route
+/// refusing; the 200 body is parsed as `T`.
+async fn config_route_call<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    request: reqwest::RequestBuilder,
+) -> Result<T, LiveControlError> {
+    let mut request = request;
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return Err(LiveControlError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
+    };
+    let status = response.status();
+    let from_route = response
+        .headers()
+        .get(crate::proxy::ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(crate::proxy::CONFIG_ENDPOINT);
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LiveControlError::Unusable(format!("reading the answer: {e}")))?;
+    if status.is_success() && from_route {
+        return serde_json::from_str(&body).map_err(|e| {
+            LiveControlError::Unusable(format!("the response was not a tcr settings payload ({e})"))
+        });
+    }
+    if status.as_u16() == 401 {
+        return Err(LiveControlError::Unauthorized);
+    }
+    if !from_route && matches!(status.as_u16(), 404 | 405) {
+        return Err(LiveControlError::NoRoute);
+    }
+    if from_route && matches!(status.as_u16(), 400 | 409) {
+        return Err(LiveControlError::Rejected(
+            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    Err(LiveControlError::Unusable(format!(
+        "HTTP {status}{}",
+        error_message_of(&body)
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default()
+    )))
+}
+
+/// Hand one setting to the running proxy, which writes it to its config file.
+async fn post_set_config(
+    config: &Config,
+    setting: &crate::config_set::Setting,
+) -> Result<crate::proxy::SetConfigResponse, LiveControlError> {
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::CONFIG_PATH
+    );
+    let request = config_route_client()?.post(&url).json(&serde_json::json!({
+        "key": setting.key().as_str(),
+        "value": setting.value_text(),
+    }));
+    config_route_call(config, request).await
+}
+
+/// The settings the running proxy is using: its `GET` on
+/// [`crate::proxy::CONFIG_PATH`].
+async fn fetch_running_settings(
+    config: &Config,
+) -> Result<crate::config_show::ConfigSettings, LiveControlError> {
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::CONFIG_PATH
+    );
+    let request = config_route_client()?.get(&url);
+    config_route_call(config, request).await
 }
 
 /// The file half of `tcr control`: resolve OFFLINE (when `query` is `Some`) →
@@ -4835,6 +5056,170 @@ mod tests {
             .expect_err("an ambiguous live query must not be applied");
         assert!(err.to_string().contains("ambiguous"), "{err}");
         assert_eq!(before, fs::read_to_string(&path).unwrap());
+        fs::remove_file(&path).ok();
+    }
+
+    // --- config set / config show running -----------------------------------
+    //
+    // Every test dials a port it bound itself (a scratch proxy) or one nothing
+    // listens on (`config_on_a_dead_port`): never 3456, the live proxy.
+
+    /// A fixture whose port is a scratch listener's, bound here and handed back
+    /// for the test to serve on.
+    async fn config_on_a_scratch_port(tag: &str) -> (std::path::PathBuf, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port(tag).await;
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        (path, listener)
+    }
+
+    fn file_value(path: &Path, key: &str) -> serde_json::Value {
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        doc.get(key).cloned().unwrap_or(serde_json::Value::Null)
+    }
+
+    /// With a proxy running, `config set` goes THROUGH it: the proxy writes the
+    /// key into its own config file, the running value stays the boot one, and
+    /// the proxy's next write of its own (a `tcr disable` through its route)
+    /// keeps the key.
+    ///
+    /// The proxy serves a SECOND copy of the file (`served`), so a direct write
+    /// by the CLI would land in `cli_path` and leave `served` alone: the value
+    /// appearing in `served` and nowhere else is the proof the route did it.
+    #[tokio::test]
+    async fn config_set_goes_through_a_running_proxy_and_survives_its_next_write() {
+        let (cli_path, listener) = config_on_a_scratch_port("config-set-live").await;
+        let served = cli_path.with_extension("served.json");
+        fs::copy(&cli_path, &served).unwrap();
+        let cli_before = fs::read_to_string(&cli_path).unwrap();
+        let manager = Manager::with_live_refresher(load(&served), Some(served.clone()));
+        let serving = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
+
+        set_config(&cli_path, "switchThreshold", "90%")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_value(&served, "switchThreshold"),
+            serde_json::json!(0.9)
+        );
+        assert_eq!(
+            fs::read_to_string(&cli_path).unwrap(),
+            cli_before,
+            "the CLI wrote nothing itself"
+        );
+        assert_eq!(
+            manager.running_settings().switch_threshold,
+            0.95,
+            "the running proxy keeps its boot value"
+        );
+
+        // The proxy's own next write: park bob through its route.
+        set_enabled(&served, "bob@example.com", true).await.unwrap();
+        assert_eq!(
+            file_value(&served, "switchThreshold"),
+            serde_json::json!(0.9),
+            "the proxy's own write kept the saved setting"
+        );
+        assert_eq!(
+            file_value(&served, "accounts")[1]["disabled"],
+            serde_json::json!(true),
+            "and that write did happen"
+        );
+        fs::remove_file(&cli_path).ok();
+        fs::remove_file(&served).ok();
+    }
+
+    /// With nothing listening, `config set` writes the file itself.
+    #[tokio::test]
+    async fn config_set_without_a_proxy_writes_the_file() {
+        let path = config_on_a_dead_port("config-set-offline").await;
+        set_config(&path, "accountThrottle", "200 8").await.unwrap();
+        set_config(&path, "pacing", "4").await.unwrap();
+        assert_eq!(
+            file_value(&path, "accountThrottle"),
+            serde_json::json!({"minSpacingMs": 200, "burst": 8})
+        );
+        assert_eq!(
+            file_value(&path, "pacing"),
+            serde_json::json!({"maxInFlightPerAccount": 4})
+        );
+        assert_eq!(
+            file_value(&path, "quotaProbeSeconds"),
+            serde_json::json!(120)
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A refused value writes nothing, with or without a proxy, and a refusal
+    /// from the proxy's route (here: a proxy with no config file to save to)
+    /// does not fall back to writing the file.
+    #[tokio::test]
+    async fn each_refused_config_value_writes_nothing() {
+        let offline = config_on_a_dead_port("config-set-refused").await;
+        let (live, listener) = config_on_a_scratch_port("config-set-refused-live").await;
+        // A proxy with no config file behind it: its route refuses every set.
+        let manager = Manager::with_live_refresher(load(&live), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        for path in [&offline, &live] {
+            let before = fs::read_to_string(path).unwrap();
+            for (key, value) in [
+                ("switchThreshold", "0"),
+                ("controlReserve", "0.6"),
+                ("accountThrottle", "350 0"),
+                ("pacing", "0"),
+                ("http1Only", "maybe"),
+                ("controlAccount", "alice@example.com"),
+            ] {
+                let err = set_config(path, key, value)
+                    .await
+                    .expect_err(&format!("{key} {value} is refused"));
+                assert!(err.to_string().contains("not"), "{key} {value}: {err}");
+                assert_eq!(before, fs::read_to_string(path).unwrap(), "{key} {value}");
+            }
+        }
+
+        let before = fs::read_to_string(&live).unwrap();
+        let err = set_config(&live, "switchThreshold", "0.9")
+            .await
+            .expect_err("the route refused it");
+        assert!(err.to_string().contains("without a config file"), "{err}");
+        assert_eq!(before, fs::read_to_string(&live).unwrap());
+        fs::remove_file(&offline).ok();
+        fs::remove_file(&live).ok();
+    }
+
+    /// `running` is absent with no proxy; with one, it is the proxy's boot
+    /// value even after a set, and the set key is the one waiting.
+    #[tokio::test]
+    async fn config_show_reports_running_only_with_a_proxy() {
+        let offline = config_on_a_dead_port("config-show-offline").await;
+        let shown = config_show_document(&offline).await.unwrap();
+        assert!(shown.running.is_none());
+        assert!(shown.waiting().is_empty());
+
+        let (path, listener) = config_on_a_scratch_port("config-show-live").await;
+        let manager = Manager::with_live_refresher(load(&path), Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+        let shown = config_show_document(&path).await.unwrap();
+        assert_eq!(shown.waiting(), Vec::<&str>::new(), "nothing waits at boot");
+
+        set_config(&path, "switchThreshold", "0.9").await.unwrap();
+        set_config(&path, "http1Only", "on").await.unwrap();
+        let shown = config_show_document(&path).await.unwrap();
+        assert_eq!(shown.saved.switch_threshold, 0.9);
+        let running = shown.running.as_ref().expect("a proxy answered");
+        assert_eq!(running.switch_threshold, 0.95, "the boot value");
+        assert!(!running.http1_only);
+        assert_eq!(shown.waiting(), ["switchThreshold", "http1Only"]);
+        fs::remove_file(&offline).ok();
         fs::remove_file(&path).ok();
     }
 

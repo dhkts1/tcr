@@ -1147,8 +1147,8 @@ struct ControlArgs {
     show: bool,
 }
 
-/// `tcr config show`. A group of its own so a later `set` has a home. TcrBar's
-/// Settings window runs `config show --json`, so that argv is a contract.
+/// `tcr config show|set`. TcrBar's Settings window runs `config show --json`
+/// and `config set <key> <value>...`, so both argvs are a contract.
 #[derive(clap::Args)]
 struct ConfigArgs {
     #[command(subcommand)]
@@ -1161,6 +1161,31 @@ enum ConfigAction {
     /// on this file uses, every default applied. Offline; a running proxy
     /// keeps the values it booted with until it restarts.
     Show(ConfigShowArgs),
+    /// Save one rotation or limit setting. With a proxy running it saves it
+    /// itself; either way it keeps its current value until it restarts.
+    ///
+    /// Keys and values: switchThreshold, controlReserve and
+    /// fableWeeklyThreshold take a share (90% or 0.9; fableWeeklyThreshold
+    /// also `default`); resetUrgencyTierHours and usageRetentionDays a whole
+    /// number; sessionAffinity, controlPooled and http1Only on or off;
+    /// accountThrottle and fleetThrottle `off` or two numbers, the
+    /// milliseconds between sends and the burst; pacing `off` or a count.
+    Set(ConfigSetArgs),
+}
+
+#[derive(clap::Args)]
+struct ConfigSetArgs {
+    /// Path to the config file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The key as the config file spells it, e.g. switchThreshold.
+    key: String,
+    /// The value; a throttle takes two words, `350 24`.
+    /// Negative numbers allowed so `-1` reaches the parser and its refusal,
+    /// rather than clap's "unexpected argument". Not every hyphen value: that
+    /// would take a trailing `--config` as the second value of `pacing 4`.
+    #[arg(required = true, num_args = 1..=2, allow_negative_numbers = true)]
+    value: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -1664,7 +1689,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Control(args)) => run_control(args).await,
         Some(Command::Group(args)) => run_group(args),
-        Some(Command::Config(args)) => run_config(args),
+        Some(Command::Config(args)) => run_config(args).await,
         Some(Command::Peer(args)) => run_peer(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Sessions(args)) => run_sessions(args).await,
@@ -5976,12 +6001,16 @@ mod peer_grant_tests {
     }
 }
 
-/// `tcr config show [--json]`: the effective rotation and limit settings.
-fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
+/// `tcr config show [--json]` and `tcr config set <key> <value>`.
+async fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
     match args.action {
         ConfigAction::Show(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::show_config(&config_path, a.json)
+            cli::show_config(&config_path, a.json).await
+        }
+        ConfigAction::Set(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::set_config(&config_path, &a.key, &a.value.join(" ")).await
         }
     }
 }

@@ -1,15 +1,16 @@
 //! `tcr config show`: the rotation and limit settings a server started on this
 //! config file would use, with every default applied.
 //!
-//! Offline: it reads the file and never asks a running proxy. That is the
-//! point, and also its limit. Every value here except group settings is a
-//! boot-time snapshot in the server (`CLAUDE.md`, "`tcr status` reports the
-//! RUNNING process's view"), so a file edited since the proxy started shows
-//! the value the NEXT start will use, which is what the Settings window's
-//! "restart to apply" badge already says.
+//! The saved values come from the file: what the NEXT start will use. Every
+//! value here except the control account is a boot-time snapshot in the
+//! server (`CLAUDE.md`, "`tcr status` reports the RUNNING process's view"), so
+//! when a proxy answers on the config's port its own values are reported
+//! beside them as `running` ([`ConfigShow`]), read from `GET /_tcr/config`.
+//! A key whose saved and running values differ is waiting for a restart.
 //!
 //! TcrBar's Settings > Groups & Rotation reads `--json` (`ConfigSettings.swift`
-//! in TcrBarCore decodes it), so the JSON keys are a contract with the panel.
+//! in TcrBarCore decodes it), so the JSON keys, `running` included, are a
+//! contract with the panel.
 //!
 //! Each value is read through the same function the manager reads it through
 //! (`Config::session_affinity_enabled`, `Config::effective_control_reserve`,
@@ -19,13 +20,13 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, PacingConfig, ThrottleConfig};
 
 /// One GCRA bucket as the send path runs it: `burst` sends at once after an
 /// idle spell, then one per `min_spacing_ms`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThrottleSetting {
     pub min_spacing_ms: u64,
@@ -45,7 +46,7 @@ impl ThrottleSetting {
 
 /// Per-account pacing as selection applies it. Either knob may be absent on
 /// its own; both absent is pacing off, which is `None` one level up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PacingSetting {
     pub max_in_flight_per_account: Option<u32>,
@@ -65,13 +66,16 @@ impl PacingSetting {
 
 /// The `tcr config show --json` document. Fractions stay fractions (`0.95`),
 /// as the file writes them; the reader formats.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigSettings {
     pub config_path: PathBuf,
     pub switch_threshold: f64,
     pub control_reserve: f64,
     pub fable_weekly_threshold: f64,
+    /// `true` when the file sets no Fable override, so the value above is the
+    /// switch threshold's. Only an override can wait for a restart on its own.
+    pub fable_weekly_threshold_follows: bool,
     pub reset_urgency_tier_hours: u32,
     pub session_affinity: bool,
     /// The control account's name, or `null` when none is set.
@@ -95,6 +99,7 @@ impl ConfigSettings {
             switch_threshold: config.switch_threshold,
             control_reserve: config.effective_control_reserve(),
             fable_weekly_threshold: config.effective_fable_weekly_threshold(),
+            fable_weekly_threshold_follows: config.fable_weekly_threshold.is_none(),
             reset_urgency_tier_hours: config.reset_urgency_tier_hours,
             session_affinity: config.session_affinity_enabled(),
             control_account: config
@@ -140,6 +145,101 @@ impl ConfigSettings {
         rows.iter()
             .map(|(key, value)| format!("{key:<width$}  {value}\n"))
             .collect()
+    }
+}
+
+/// What `tcr config show` prints: the saved settings, and beside them, when a
+/// proxy on the config's port answered, the settings that proxy is running.
+///
+/// `running` is absent, never `null` and never a copy of the saved values,
+/// when no proxy answered: "nothing is running" and "everything running
+/// matches" are different facts, and only the second may clear a row's
+/// waiting mark.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigShow {
+    #[serde(flatten)]
+    pub saved: ConfigSettings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running: Option<ConfigSettings>,
+}
+
+impl ConfigShow {
+    /// The config keys whose saved value the running proxy is not using yet,
+    /// in print order. Empty with no proxy. `controlAccount` never waits:
+    /// `tcr control` applies it to the running proxy at once.
+    pub fn waiting(&self) -> Vec<&'static str> {
+        let Some(running) = &self.running else {
+            return Vec::new();
+        };
+        let saved = &self.saved;
+        let differs = [
+            (
+                "switchThreshold",
+                saved.switch_threshold != running.switch_threshold,
+            ),
+            (
+                "controlReserve",
+                saved.control_reserve != running.control_reserve,
+            ),
+            // While both follow the switch threshold, a change of it is the
+            // switch threshold's row waiting, not a second change here.
+            (
+                "fableWeeklyThreshold",
+                saved.fable_weekly_threshold_follows != running.fable_weekly_threshold_follows
+                    || (!saved.fable_weekly_threshold_follows
+                        && saved.fable_weekly_threshold != running.fable_weekly_threshold),
+            ),
+            (
+                "resetUrgencyTierHours",
+                saved.reset_urgency_tier_hours != running.reset_urgency_tier_hours,
+            ),
+            (
+                "sessionAffinity",
+                saved.session_affinity != running.session_affinity,
+            ),
+            (
+                "controlPooled",
+                saved.control_pooled != running.control_pooled,
+            ),
+            (
+                "accountThrottle",
+                saved.account_throttle != running.account_throttle,
+            ),
+            (
+                "fleetThrottle",
+                saved.fleet_throttle != running.fleet_throttle,
+            ),
+            ("pacing", saved.pacing != running.pacing),
+            (
+                "usageRetentionDays",
+                saved.usage_retention_days != running.usage_retention_days,
+            ),
+            ("http1Only", saved.http1_only != running.http1_only),
+        ];
+        differs
+            .into_iter()
+            .filter_map(|(key, differs)| differs.then_some(key))
+            .collect()
+    }
+
+    /// The saved table, then one line on what the running proxy is doing
+    /// about it.
+    pub fn render_text(&self) -> String {
+        let mut text = self.saved.render_text();
+        match (&self.running, self.waiting()) {
+            (None, _) => {
+                text.push_str("\nNo proxy answered on this config's port, so nothing is waiting.\n")
+            }
+            (Some(_), waiting) if waiting.is_empty() => {
+                text.push_str("\nThe running proxy uses every value above.\n")
+            }
+            (Some(_), waiting) => text.push_str(&format!(
+                "\nWaiting for a proxy restart: {}.\n",
+                waiting.join(", ")
+            )),
+        }
+        text
     }
 }
 
@@ -299,6 +399,7 @@ mod tests {
                 "controlPooled",
                 "controlReserve",
                 "fableWeeklyThreshold",
+                "fableWeeklyThresholdFollows",
                 "fleetThrottle",
                 "http1Only",
                 "pacing",
@@ -313,6 +414,52 @@ mod tests {
         assert_eq!(
             object["accountThrottle"],
             serde_json::json!({"minSpacingMs": 350, "burst": 24})
+        );
+    }
+
+    /// `running` is absent with no proxy, and a key waits exactly when its
+    /// saved and running values differ.
+    #[test]
+    fn running_is_absent_without_a_proxy_and_names_what_waits() {
+        let saved = settings(r#"{"switchThreshold": 0.9, "pacing": {"maxInFlightPerAccount": 4}}"#);
+        let offline = ConfigShow {
+            saved: saved.clone(),
+            running: None,
+        };
+        let value = serde_json::to_value(&offline).expect("serializes");
+        assert!(value.get("running").is_none(), "{value}");
+        assert_eq!(
+            value["switchThreshold"],
+            serde_json::json!(0.9),
+            "saved stays flat"
+        );
+        assert!(offline.waiting().is_empty());
+
+        let live = ConfigShow {
+            saved,
+            running: Some(settings("{}")),
+        };
+        assert_eq!(
+            live.waiting(),
+            ["switchThreshold", "pacing"],
+            "Fable follows on both sides, so the switch edit counts once"
+        );
+        let fable_set = ConfigShow {
+            saved: settings(r#"{"fableWeeklyThreshold": 0.95}"#),
+            running: Some(settings("{}")),
+        };
+        assert_eq!(
+            fable_set.waiting(),
+            ["fableWeeklyThreshold"],
+            "an override of the same number still waits: it stops following"
+        );
+        let value = serde_json::to_value(&live).expect("serializes");
+        assert_eq!(value["running"]["switchThreshold"], serde_json::json!(0.95));
+        assert!(
+            live.render_text()
+                .contains("Waiting for a proxy restart: switchThreshold, pacing.\n"),
+            "{}",
+            live.render_text()
         );
     }
 

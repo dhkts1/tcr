@@ -1944,8 +1944,10 @@ and nothing else would say why. They never change an exit code.
 ## `tcr config show [--json]`
 
 Prints the rotation and limit settings a server started on this config file would use, with
-every default applied. It reads the file and never asks a running proxy, so after an edit it
-shows the value the next start uses; the running process keeps what it booted with.
+every default applied: the saved values, which the next start uses. When a proxy answers on the
+config's port it also asks it, through `GET /_tcr/config`, which values it is running. Every key
+here except `controlAccount` is read when the proxy starts, so a saved value it is not running yet
+is waiting for a restart, and the last line names those keys.
 
 ```
 $ tcr config show
@@ -1962,16 +1964,75 @@ fleetThrottle          1 per 100 ms, bursts of 32
 pacing                 off
 usageRetentionDays     90 days
 http1Only              off
+
+Waiting for a proxy restart: switchThreshold.
 ```
 
+With no proxy on the port the last line says nothing is waiting. A proxy too old to report its
+settings, or one that cannot be read, gets a line on stderr and is treated as no proxy.
+
 `--json` prints one object with the same settings as values: `configPath`, `switchThreshold`,
-`controlReserve` and `fableWeeklyThreshold` as fractions (`0.95`), `resetUrgencyTierHours`,
+`controlReserve` and `fableWeeklyThreshold` as fractions (`0.95`), `fableWeeklyThresholdFollows`
+(`true` when the file sets no Fable override, so the value is the switch threshold's), `resetUrgencyTierHours`,
 `sessionAffinity`, `controlAccount` (the name, or `null`), `controlPooled`, `accountThrottle` and
 `fleetThrottle` (`{minSpacingMs, burst}`, or `null` when off), `pacing`
 (`{maxInFlightPerAccount, minSpacingMs}`, either `null`, or the whole key `null` when off),
 `usageRetentionDays` and `http1Only`. Each value is the one the server applies: `controlReserve`
 clamped to `[0, 0.5]`, `fableWeeklyThreshold` falling back to `switchThreshold`, a throttle with
 no spacing reported as off, an absent `burst` as `1`. TcrBar's Settings window reads this object.
+
+When a proxy answered, the object also carries `running`: an object of the same keys holding the
+values that proxy booted with. It is absent, not `null`, when no proxy answered, because "nothing
+is running" and "the running proxy matches" are different facts. A key is waiting when its saved
+and running values differ; `fableWeeklyThreshold` waits only when its own override changed, since
+while it follows `switchThreshold` a switch-threshold change is that row's.
+
+```
+tcr config show --json | jq -c '{saved: .switchThreshold, running: .running.switchThreshold}'
+```
+
+---
+
+## `tcr config set <key> <value>`
+
+Saves one rotation or limit setting, under its config-file name:
+
+| key | value |
+|---|---|
+| `switchThreshold` | a share above 0 and at most 100%: `90%` or `0.9` |
+| `controlReserve` | a share from 0 to 50%: `5%` or `0.05` |
+| `fableWeeklyThreshold` | a share like `switchThreshold`, or `default` to follow `switchThreshold` again |
+| `resetUrgencyTierHours` | whole hours; `0` turns the tier off |
+| `sessionAffinity`, `controlPooled`, `http1Only` | `on` or `off` |
+| `accountThrottle`, `fleetThrottle` | two whole numbers of at least 1, the milliseconds between sends and the burst (`350 24`), or `off` |
+| `pacing` | the most requests one account may have in flight, at least 1, or `off` |
+| `usageRetentionDays` | whole days |
+
+The control account is not here; it has its own verb, `tcr control <account>`.
+
+```
+$ tcr config set switchThreshold 90%
+Saved switchThreshold = 90%. The proxy on :3456 keeps its current value until it restarts.
+$ tcr config set controlReserve 0.6
+Error: controlReserve takes a share of quota from 0 to 50%, as 5% or 0.05, not '0.6'. Nothing was changed.
+```
+
+A value the server would quietly reinterpret is refused rather than saved: a reserve outside
+`[0, 0.5]` (the server clamps it), a throttle spacing or burst of `0` (the server reads them as off
+and `1`), a pacing cap of `0` (no cap). Only the named key changes in the file; every other key,
+and every key tcr does not know, is left as it was. `pacing` keeps a `minSpacingMs` already in the
+file; `off` removes the `pacing` key, which is its default.
+
+**Who writes the file.** With a proxy on the config's port, `config set` hands the setting to it
+(`POST /_tcr/config`, behind the same api-key and loopback check as `tcr control`), and the proxy
+writes the key under the lock its own token and `tcr disable` writes hold, so neither can drop the
+other's change. With nothing listening, `config set` writes the file itself. A rejected api-key,
+or a refusal from the proxy, changes nothing; a proxy too old for the route, or one that answers
+something unusable, gets the file written beside it with a warning on stderr.
+
+Either way the running proxy keeps the value it booted with until it restarts, which is what
+`running` in `tcr config show --json` reports. TcrBar's Settings window saves each edit through this
+verb and counts the waiting keys.
 
 ---
 
