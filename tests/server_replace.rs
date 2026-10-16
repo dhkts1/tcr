@@ -229,3 +229,41 @@ fn a_connect_tunnel_drains_after_the_successor_is_listening() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
+    use std::os::unix::net::UnixStream;
+    let home = scratch_home();
+    let mut old = Proxy::spawn(home.path(), 0, false);
+    let addr = old.ready();
+    let endpoint = home
+        .path()
+        .join(".cache")
+        .join(tcr::paths::CACHE_DIR)
+        .join(format!("restart-{}.sock", old.child.id()));
+    let mut peer = UnixStream::connect(endpoint).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.write_all(b"tcr-replace/1\n").unwrap();
+    // Deliberately leave the descriptor queued. A sendmsg return is not proof
+    // that recvmsg installed it in the successor's descriptor table.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        old.child.try_wait().unwrap().is_none(),
+        "the predecessor exited before the receiver acknowledged the listener"
+    );
+    let listener = tcr_fdpass::recv_listener(&peer).unwrap();
+    assert_eq!(listener.local_addr().unwrap(), addr);
+    peer.write_all(b"listener-received\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = old.child.try_wait().unwrap() {
+            assert!(status.success(), "predecessor exit: {status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "predecessor did not finish the acknowledged handoff"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
