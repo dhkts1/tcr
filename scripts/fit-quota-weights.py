@@ -3,8 +3,9 @@
 
 Joins the proxy log's `quota-sample` lines (one per successful usage probe,
 written by Manager::apply_usage) with the usage ledger
-(~/.cache/tcr/usage/*.jsonl, or ~/.cache/teamclaude/usage/ on an install that has
-not moved yet: t, a, i, c5, c1, r, o). For every pair of
+(~/.cache/tcr/usage/*.jsonl and, for a closed day, *.jsonl.gz, or
+~/.cache/teamclaude/usage/ on an install that has not moved yet: t, a, i, c5, c1,
+r, o). For every pair of
 consecutive samples of one account inside one 5h window (same reset instant)
 whose utilization ROSE, the rise is the dependent variable and the ledger tokens
 served on that account between the two samples are the regressors:
@@ -23,6 +24,7 @@ thin. Nothing here spends quota.
 usage: python3 -I scripts/fit-quota-weights.py <proxy.log>... --ledger <jsonl>...
 """
 
+import gzip
 import json
 import re
 import sys
@@ -70,7 +72,9 @@ def read_samples(paths):
 def read_ledger(paths):
     rows = []
     for path in paths:
-        with open(path) as f:
+        # A closed day is gzipped (`<date>.jsonl.gz`); today and yesterday are plain.
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt") as f:
             for line in f:
                 row = json.loads(line)
                 rows.append(row)
