@@ -2,10 +2,10 @@ import Foundation
 
 /// The one Codex line the Accounts tab may draw under the summary, beside the Claude one.
 ///
-/// This is the pure half, as ``NoRequestsBanner`` is for Claude: given what the panel already
-/// measured (the fleet, the codex processes running, how long the Codex accounts have been
-/// quiet, whether this Mac shares its accounts), which line shows and what it says. Reading
-/// those facts is the view's job.
+/// This is the pure half, as ``NoRequestsBanner`` is for Claude: given what was measured (the
+/// fleet, the codex processes running, how long the Codex request count has stood still,
+/// whether this Mac shares its accounts), which line shows and what it says. The shell reads
+/// those facts at each opening (``CodexBannerSnapshot``).
 ///
 /// Only one Codex line shows, so the panel never stacks four amber sentences above its tabs,
 /// and the precedence is the order an operator can act on: a route that is not pooled explains
@@ -30,9 +30,10 @@ public enum CodexBanner: Equatable, Sendable {
     case unpooled(count: Int)
     /// codex is running and no Codex request has reached tcr for ``quietWindow``.
     ///
-    /// Every input must be measured: the process count, how long the Codex accounts have been
-    /// at zero requests, a pooled route and an empty unpooled count. A reading that is missing
-    /// draws nothing; a miss means no line, never a false one.
+    /// Every input must be measured: the process count, how long the Codex accounts' request
+    /// count has stood still (``CodexQuietClock``), a pooled route and an empty unpooled
+    /// count. A reading that is missing draws nothing; a miss means no line, never a false
+    /// one.
     case noRequests(processes: Int, bundledTcrWithoutCLI: String?)
 
     /// What the last refusal told codex, from its error type.
@@ -66,7 +67,8 @@ public enum CodexBanner: Equatable, Sendable {
         case dim
     }
 
-    /// How long the Codex accounts must have been at zero requests: the Claude line's window.
+    /// How long the Codex accounts' request count must have stood still: the Claude line's
+    /// window.
     public static let quietWindow = NoRequestsBanner.quietWindow
 
     public var tint: Tint {
@@ -150,14 +152,18 @@ public enum CodexBanner: Equatable, Sendable {
     ///
     /// Every Codex row carries the same route and traffic (the server sends one reading,
     /// copied onto each), so the first Codex row's reading speaks for all. `codexProcesses` is
-    /// the running codex sessions, `codexQuietFor` how long the serving Codex accounts have
-    /// been at zero requests, and `bundledTcrWithoutCLI` the tcr inside TcrBar when this Mac
-    /// has no other; each is `nil` while unknown.
+    /// the running codex sessions, `codexQuietFor` how long the serving Codex accounts' request
+    /// count has stood still (``CodexQuietClock``), and `bundledTcrWithoutCLI` the tcr inside
+    /// TcrBar when this Mac has no other; each is `nil` while unknown.
+    ///
+    /// `codexProcesses` is read only once every other input holds for the last line, because
+    /// it is a walk of the process table: an opening that draws another line, or no line for
+    /// another reason, never walks it.
     public static func current(
-        fleet: Fleet, codexProcesses: Int?, codexQuietFor: TimeInterval?, peerSharing: Bool,
-        bundledTcrWithoutCLI: String? = nil
+        fleet: Fleet, codexProcesses: @autoclosure () -> Int?, codexQuietFor: TimeInterval?,
+        peerSharing: Bool, bundledTcrWithoutCLI: String? = nil
     ) -> CodexBanner? {
-        guard let requests = codexRequests(fleet) else { return nil }
+        guard codexRequests(fleet) != nil else { return nil }
         let codex = fleet.accounts.filter { $0.provider == .codex }
 
         // A route with neither words nor a code says nothing an operator can act on, so the
@@ -178,14 +184,46 @@ public enum CodexBanner: Equatable, Sendable {
             return .unpooled(count: traffic.unpooled10m)
         }
 
-        if let processes = codexProcesses, processes > 0,
-            let quietFor = codexQuietFor, quietFor >= quietWindow,
-            requests == 0,
+        if let quietFor = codexQuietFor, quietFor >= quietWindow,
             codex.first?.codexRoute?.pooled == true,
-            traffic?.unpooled10m == 0
+            traffic?.unpooled10m == 0,
+            let processes = codexProcesses(), processes > 0
         {
             return .noRequests(processes: processes, bundledTcrWithoutCLI: bundledTcrWithoutCLI)
         }
         return nil
+    }
+}
+
+/// How long the Codex accounts' request count has stood still, for the line that says no
+/// Codex request has reached tcr in five minutes.
+///
+/// Each row's `requests` counts from the proxy's start, so "the count is 0" means "none since
+/// the proxy started": after one pooled turn in the morning it is never 0 again, and a codex
+/// started later on its own login would never be named. The line claims the last five
+/// minutes, so the clock restarts whenever the summed count moves (a proxy restart's drop
+/// included) and stops on a read that is not live or holds no Codex account that can serve.
+public struct CodexQuietClock: Equatable, Sendable {
+    /// The summed count the clock last saw, `nil` while stopped.
+    public private(set) var requests: Int?
+    /// When that count was first seen, `nil` while stopped.
+    public private(set) var since: Date?
+
+    public init() {}
+
+    /// Advance the clock off the poll that just landed; `nil` is a poll that loaded no fleet.
+    public mutating func advance(_ fleet: Fleet?, now: Date) {
+        guard let fleet, let total = CodexBanner.codexRequests(fleet) else {
+            self = CodexQuietClock()
+            return
+        }
+        guard total != requests else { return }
+        requests = total
+        since = now
+    }
+
+    /// How long the count has stood still at `now`, or `nil` while stopped.
+    public func quietFor(now: Date) -> TimeInterval? {
+        since.map { now.timeIntervalSince($0) }
     }
 }

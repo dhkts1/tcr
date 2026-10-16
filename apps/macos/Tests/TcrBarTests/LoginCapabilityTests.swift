@@ -61,8 +61,59 @@ final class LoginCapabilityTests: XCTestCase {
         let codex = await LoginCapability.probeCodex(executable: executable, readHelp: read)
         let path = await LoginCapability.readCodexPath(executable: executable, readHelp: read)
         XCTAssertTrue(nonInteractive)
-        XCTAssertTrue(codex)
+        XCTAssertEqual(codex, true)
         XCTAssertEqual(path, .inSheet)
+    }
+
+    /// One failed `tcr login --help` says nothing about the tcr: the help reads as before
+    /// any probe, and the next probe asks again rather than repeating "predates Codex
+    /// sign-in" for the rest of the app's run.
+    @MainActor
+    func testAFailedCodexProbeIsForgottenAndAskedAgain() async {
+        struct TimedOut: Error {}
+        let executable = URL(fileURLWithPath: "/opt/example/tcr-busy-mac")
+        let attempts = HelpAttempts(failFirst: 1)
+        let read: @Sendable (URL) throws -> String = { _ in try attempts.read() }
+        let fixed: (URL) -> String? = { _ in "1@1" }
+
+        let first = await LoginCapability.probeCodex(
+            executable: executable, readHelp: read, fileIdentity: fixed)
+        XCTAssertNil(first)
+        XCTAssertNil(LoginCapability.knownCodexSupport(executable: executable))
+
+        let second = await LoginCapability.probeCodex(
+            executable: executable, readHelp: read, fileIdentity: fixed)
+        XCTAssertEqual(second, true)
+        XCTAssertEqual(LoginCapability.knownCodexSupport(executable: executable), true)
+        XCTAssertEqual(attempts.count, 2)
+
+        let failedClick = await LoginCapability.readCodexPath(
+            executable: executable, readHelp: { _ in throw TimedOut() }, fileIdentity: fixed)
+        XCTAssertEqual(failedClick, .probeFailed)
+        XCTAssertNil(
+            LoginCapability.knownCodexSupport(executable: executable),
+            "a failed click forgets the answer rather than recording false")
+    }
+
+    /// A tcr updated in place keeps its path and changes its file, so its answer is asked
+    /// again; the same file is answered from memory.
+    @MainActor
+    func testATcrUpdatedInPlaceIsAskedAgain() async {
+        let executable = URL(fileURLWithPath: "/opt/example/tcr-updated-in-place")
+        let attempts = HelpAttempts(failFirst: 0, help: Self.helpBeforeCodexSignIn)
+        let read: @Sendable (URL) throws -> String = { _ in try attempts.read() }
+        let old = await LoginCapability.probeCodex(
+            executable: executable, readHelp: read, fileIdentity: { _ in "1@1" })
+        XCTAssertEqual(old, false)
+        _ = await LoginCapability.probeCodex(
+            executable: executable, readHelp: read, fileIdentity: { _ in "1@1" })
+        XCTAssertEqual(attempts.count, 1, "the same file is answered from memory")
+
+        attempts.help = "      --codex  Sign in a Codex account\n"
+        let updated = await LoginCapability.probeCodex(
+            executable: executable, readHelp: read, fileIdentity: { _ in "2@2" })
+        XCTAssertEqual(updated, true)
+        XCTAssertEqual(attempts.count, 2)
     }
 
     /// `--codex` as a whole token is the in-app sign-in, wherever it sits on its line.
@@ -103,5 +154,36 @@ final class LoginCapabilityTests: XCTestCase {
             LoginCapability.codexPath(
                 help: "      --codex  Sign in a Codex account\n      --from-codex  Import the login\n"),
             .inSheet)
+    }
+}
+
+/// A stand-in `tcr login --help`: fails its first `failFirst` runs, then prints `help`.
+private final class HelpAttempts: @unchecked Sendable {
+    struct TimedOut: Error {}
+    private let lock = NSLock()
+    private var runs = 0
+    private var failures: Int
+    private var text: String
+
+    init(failFirst: Int, help: String = "      --codex  Sign in a Codex account\n") {
+        failures = failFirst
+        text = help
+    }
+
+    var count: Int { lock.withLock { runs } }
+    var help: String {
+        get { lock.withLock { text } }
+        set { lock.withLock { text = newValue } }
+    }
+
+    func read() throws -> String {
+        try lock.withLock {
+            runs += 1
+            if failures > 0 {
+                failures -= 1
+                throw TimedOut()
+            }
+            return text
+        }
     }
 }

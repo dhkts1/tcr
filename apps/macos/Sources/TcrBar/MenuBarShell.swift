@@ -296,6 +296,16 @@ final class MenuBarShell {
             }
             .store(in: &marks)
 
+        // The Codex line's quiet clock, off every poll, the panel open or not: a
+        // clock the panel's view advanced stood still while the panel was shut,
+        // so the line said nothing for the five minutes after each opening.
+        // Arithmetic on the fleet this poll already read; nothing is walked.
+        self.poller.$state
+            .sink { [weak self] state in
+                self?.codexBannerSnapshot.observePoll(state.loadedFleet)
+            }
+            .store(in: &marks)
+
         // Built here, after the popover exists, because it asks the popover
         // whether the panel is open before it posts anything. It constructs no
         // `UNUserNotificationCenter`: that happens on the first read that has
@@ -806,9 +816,13 @@ final class MenuBarShell {
 
     func openPanel() {
         guard let button = statusItem.button else { return }
-        // The first frame and an immediate Add account click need resolved absence,
-        // not the controller's initial placeholder. This stat-only read is off main.
-        guard codexPresence.isResolved else {
+        // An empty fleet's first frame draws a codex hint from this Mac's codex
+        // evidence, so that opening waits for the read rather than inserting the
+        // hint under an open panel. No other frame reads it except in help text,
+        // so every other fleet opens at once: a PATH entry on a stalled mount must
+        // not hold the panel shut for a fleet with no Codex account. An Add
+        // account click waits for the read itself (`resolvedForLogin`).
+        guard !codexPresence.openingWaits(for: poller.state.loadedFleet) else {
             guard !openingWhenPresenceResolves else { return }
             openingWhenPresenceResolves = true
             Task {
@@ -854,7 +868,16 @@ final class MenuBarShell {
         var fleet: Fleet?
         if case .loaded(let loaded) = poller.state { fleet = loaded }
         claudeRoute.decideAtOpen(fleet: fleet)
-        codexBannerSnapshot.decideAtOpen()
+        // The Codex lines too, from the same read, so the first opening after
+        // launch draws them: the panel's view does not exist until this show.
+        // The process walk runs only when the last line's other inputs all hold.
+        codexBannerSnapshot.decideAtOpen(
+            fleet: fleet, bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,
+            codexProcesses: { CodexProcesses.readLive() })
+        // The notes under Codex lines a poll decides (why a row is signed out,
+        // and which notes the fleet has moved past), for the same reason: a
+        // wrapping note a poll inserted or removed moved every line below it.
+        codexNotes.openedOn(fleet, pollBegan: poller.lastPollBegan ?? .distantFuture)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
@@ -895,18 +918,22 @@ final class MenuBarShell {
         // meanwhile is the same panel it always drew.
         Task { await poller.pollOnce() }
         // This Mac's codex evidence, for Add account… and the sign-in sheet,
-        // resolved off the main thread once per open: it only checks where codex
-        // lives, and never runs it or opens a file of its. With evidence, or a
-        // Codex row in the fleet, this tcr is asked once whether it has
+        // resolved off the main thread after the show: it only checks where codex
+        // lives, and never runs it or opens a file of its. Not on an opening whose
+        // last read found no codex beside a fleet with no Codex account: a
+        // Claude-only user pays for no Codex scan (`rescansAtOpen`). With evidence,
+        // or a Codex row in the fleet, this tcr is asked once whether it has
         // `tcr login --codex`, so the chooser and a Codex row's Re-login can word
         // their help without starting a process on a click.
-        Task {
-            let fleetHoldsCodex = poller.state.loadedFleet?.holdsCodex == true
-            await codexPresence.refresh(fleetHoldsCodex: fleetHoldsCodex)
-            if codexPresence.presence.isPresent || fleetHoldsCodex,
-                case .success(let tcr) = TcrTool.resolve()
-            {
-                _ = await LoginCapability.probeCodex(executable: tcr)
+        let fleetHoldsCodex = poller.state.loadedFleet?.holdsCodex == true
+        if codexPresence.rescansAtOpen(fleetHoldsCodex: fleetHoldsCodex) {
+            Task {
+                await codexPresence.refresh(fleetHoldsCodex: fleetHoldsCodex)
+                if codexPresence.presence.isPresent || fleetHoldsCodex,
+                    case .success(let tcr) = TcrTool.resolve()
+                {
+                    _ = await LoginCapability.probeCodex(executable: tcr)
+                }
             }
         }
     }

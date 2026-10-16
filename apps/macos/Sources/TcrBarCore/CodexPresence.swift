@@ -189,8 +189,9 @@ public struct CodexPresence: Equatable, Sendable {
     }
 }
 
-/// This Mac's codex evidence for the panel, resolved off the main thread each time the
-/// panel opens, and the `tcr` inside TcrBar when this Mac has no other.
+/// This Mac's codex evidence for the panel, resolved off the main thread at launch and
+/// after an opening that may need it again (``rescansAtOpen(fleetHoldsCodex:)``), and the
+/// `tcr` inside TcrBar when this Mac has no other.
 ///
 /// The render harness never builds one: a render must not see this Mac's codex, so it
 /// passes ``CodexPresence/absent`` instead.
@@ -235,10 +236,38 @@ public final class CodexPresenceController: ObservableObject {
     }
 
     /// An Add account click needs resolved absence before it can bypass the chooser.
+    ///
+    /// An absent answer is also read again, without waiting, because an opening does not
+    /// re-read it (``rescansAtOpen(fleetHoldsCodex:)``): codex installed since the last read
+    /// is offered from the next click on, and this click never waits on a second scan.
     public func resolvedForLogin(fleetHoldsCodex: Bool) async -> CodexPresence {
-        if !isResolved { await refresh(fleetHoldsCodex: fleetHoldsCodex) }
+        if !isResolved {
+            await refresh(fleetHoldsCodex: fleetHoldsCodex)
+        } else if !presence.isPresent {
+            Task { await refresh(fleetHoldsCodex: fleetHoldsCodex) }
+        }
         var result = presence
         result.fleetHoldsCodex = fleetHoldsCodex
         return result
+    }
+
+    /// Whether an opening must wait for this read before the panel shows.
+    ///
+    /// Only an empty fleet's first frame reads presence, for its codex hint
+    /// (``CodexPresence/emptyFleetHint(home:)``); every other frame reads it in help text
+    /// alone, which may change under an open panel without moving anything. So any other
+    /// fleet opens at once, and a PATH entry on a stalled mount cannot hold the panel shut
+    /// for a fleet with no Codex account.
+    public func openingWaits(for fleet: Fleet?) -> Bool {
+        !isResolved && fleet?.accounts.isEmpty == true
+    }
+
+    /// Whether an opening reads this Mac's codex evidence again, after the show.
+    ///
+    /// Not when the last read found no codex and the fleet holds no Codex account: a
+    /// Claude-only user pays for no Codex scan on an opening. The Add account click reads
+    /// it again (``resolvedForLogin(fleetHoldsCodex:)``).
+    public func rescansAtOpen(fleetHoldsCodex: Bool) -> Bool {
+        !isResolved || presence.isPresent || fleetHoldsCodex
     }
 }

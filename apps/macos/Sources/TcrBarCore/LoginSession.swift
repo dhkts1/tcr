@@ -696,30 +696,61 @@ public enum LoginCapability {
     /// Whether this help offers `tcr login --codex`, the in-app Codex sign-in.
     public static func supportsCodex(help: String) -> Bool { helpTokens(help).contains("--codex") }
 
-    private static var codexCached: [String: Bool] = [:]
+    /// One binary's answer, with the file it came from: an answer belongs to that file,
+    /// and a `tcr` updated in place at the same path is a different one.
+    private struct CodexAnswer {
+        let supported: Bool
+        let file: String?
+    }
 
-    /// Ask a binary once whether it has `tcr login --codex`, and remember, the way
-    /// ``probe(executable:)`` asks about `--non-interactive`. A failed probe answers
-    /// `false` as a conservative presentation hint. A sign-in click reads the path
-    /// afresh through ``readCodexPath(executable:readHelp:)``; a failed read launches nothing.
+    private static var codexCached: [String: CodexAnswer] = [:]
+
+    /// The executable's size and modification time, which change when it is replaced in
+    /// place; `nil` when it cannot be read.
+    public nonisolated static func fileIdentity(_ executable: URL) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path),
+            let size = attributes[.size] as? NSNumber,
+            let modified = attributes[.modificationDate] as? Date
+        else { return nil }
+        return "\(size.int64Value)@\(modified.timeIntervalSince1970)"
+    }
+
+    /// Ask a binary whether it has `tcr login --codex`, and remember the answer for that
+    /// file, the way ``probe(executable:)`` asks about `--non-interactive`. Asked again
+    /// once the file at that path changes.
+    ///
+    /// A failed run answers `nil` and remembers nothing, so the help reads as it does
+    /// before any probe and the next opening asks again. Remembering `false` made one
+    /// slow run on a busy Mac say, for the rest of the app's run, that this tcr predates
+    /// Codex sign-in, while the click itself opened the sign-in sheet. A sign-in click
+    /// reads the path afresh through ``readCodexPath(executable:readHelp:fileIdentity:)``;
+    /// a failed read launches nothing.
     @MainActor
+    @discardableResult
     public static func probeCodex(
         executable: URL,
-        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) }
-    ) async -> Bool {
-        if let known = codexCached[executable.path] { return known }
-        let answer =
-            (try? await Task.detached(priority: .utility) { try readHelp(executable) }.value).map(
-                supportsCodex(help:)) ?? false
-        codexCached[executable.path] = answer
+        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) },
+        fileIdentity: (URL) -> String? = { LoginCapability.fileIdentity($0) }
+    ) async -> Bool? {
+        let file = fileIdentity(executable)
+        if let known = codexCached[executable.path], known.file == file { return known.supported }
+        guard
+            let help = try? await Task.detached(priority: .utility) { try readHelp(executable) }.value
+        else {
+            codexCached[executable.path] = nil
+            return nil
+        }
+        let answer = supportsCodex(help: help)
+        codexCached[executable.path] = CodexAnswer(supported: answer, file: file)
         return answer
     }
 
-    /// The answer a probe already gave for this binary, or `nil` when none has run.
-    /// Runs nothing: it words a menu item's help, which must not start a process.
+    /// The answer a probe already gave for this binary, or `nil` when none has, or the
+    /// last one failed. Runs nothing: it words a menu item's help, which must not start a
+    /// process.
     @MainActor
     public static func knownCodexSupport(executable: URL) -> Bool? {
-        codexCached[executable.path]
+        codexCached[executable.path]?.supported
     }
 
     /// Where a Codex sign-in or import runs for one `tcr`.
@@ -751,19 +782,22 @@ public enum LoginCapability {
     /// Terminal script are not interchangeable, and a stale answer would pick the
     /// wrong one. It refreshes the cache ``knownCodexSupport(executable:)`` reads. A
     /// failed run answers `.probeFailed`: no temporary Terminal login is started
-    /// when the selected tcr's capabilities are unknown.
+    /// when the selected tcr's capabilities are unknown, and the cache forgets this
+    /// binary rather than recording that it lacks the flag.
     @MainActor
     public static func readCodexPath(
         executable: URL,
-        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) }
+        readHelp: @escaping @Sendable (URL) throws -> String = { try LoginCapability.readLoginHelp($0) },
+        fileIdentity: (URL) -> String? = { LoginCapability.fileIdentity($0) }
     ) async -> CodexLoginPath {
+        let file = fileIdentity(executable)
         let help = try? await Task.detached(priority: .utility) { try readHelp(executable) }.value
         guard let help else {
-            codexCached[executable.path] = false
+            codexCached[executable.path] = nil
             return .probeFailed
         }
         let path = codexPath(help: help)
-        codexCached[executable.path] = path == .inSheet
+        codexCached[executable.path] = CodexAnswer(supported: path == .inSheet, file: file)
         return path
     }
 

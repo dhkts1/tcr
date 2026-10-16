@@ -352,10 +352,134 @@ enum ShellProbe {
                 detail: "notifier=\(notifier == nil ? "nil" : "built") "
                     + "bundleIdentifier=\(bundleId ?? "nil") builtCentre=\(builtCentre)"))
 
+        checks.append(await firstOpeningCodexLineCheck())
+        checks.append(await claudeOnlyOpeningCheck())
+
         report(
             checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
             notes: notes)
         exit(checks.allSatisfy(\.passed) ? 0 : 1)
+    }
+
+    // MARK: - Assertion 12
+
+    /// The first opening of a fresh shell draws the Codex line its fleet calls for.
+    ///
+    /// The panel's view does not exist until that opening shows it, so a line the
+    /// view recorded reached only the opening after: the first click after launch
+    /// drew no Codex line however many requests tcr had refused. A second shell,
+    /// because the first has opened already; the line it must show is a refusal,
+    /// which needs no process walk and so says nothing about this Mac's codex.
+    @MainActor
+    private static func firstOpeningCodexLineCheck() async -> Check {
+        let name = "first opening: the Codex line is decided from the shell's own fleet"
+        guard let fleet = codexProbeFleet() else {
+            return Check(12, name, passed: false, detail: "the Codex probe fleet did not decode")
+        }
+        let shell = MenuBarShell(
+            poller: StatusPoller(pinnedState: .loaded(fleet)),
+            awake: AwakeController.harness(),
+            updater: Updater(startingUpdater: false),
+            codexPresence: CodexPresenceController(initialPresence: .absent, resolver: { (.absent, nil) }),
+            whatsNew: WhatsNewController(
+                store: WhatsNewStore(defaults: nil), fetcher: NeverFetches(),
+                location: nil, currentVersion: nil))
+        shell.popover.animates = false
+        shell.openPanel()
+        let shown = shell.codexBannerSnapshot.shown
+        shell.closePanel()
+        _ = await waitUntil { !shell.popover.isShown }
+        let expected = CodexBanner.refused(count: 4, last: .usageLimit, peerSharing: false)
+        return Check(
+            12, name, passed: shown == expected,
+            detail: "shown=\(shown.map { String(describing: $0) } ?? "nil")")
+    }
+
+    // MARK: - Assertion 13
+
+    /// A Claude-only fleet's opening neither waits on nor pays for the codex scan.
+    ///
+    /// Two shells over the Claude-only probe fleet. The first one's scan never
+    /// returns, as a PATH entry on a stalled mount would leave it, and its panel
+    /// must open anyway. The second one's last scan found no codex, and its
+    /// opening must start no new one. Both are what an opening cost before the
+    /// Codex work, and both failed after it: the first panel never opened, and
+    /// the second scanned on every opening.
+    @MainActor
+    private static func claudeOnlyOpeningCheck() async -> Check {
+        let name = "Claude-only opening: shows with the codex scan stalled, and starts no scan"
+        let stalled = DispatchSemaphore(value: 0)
+        let stalledShell = MenuBarShell(
+            poller: StatusPoller(pinnedState: .loaded(probeFleet())),
+            awake: AwakeController.harness(),
+            updater: Updater(startingUpdater: false),
+            codexPresence: CodexPresenceController(resolver: {
+                stalled.wait()
+                return (.absent, nil)
+            }),
+            whatsNew: WhatsNewController(
+                store: WhatsNewStore(defaults: nil), fetcher: NeverFetches(),
+                location: nil, currentVersion: nil))
+        stalledShell.popover.animates = false
+        // A status item lays its button out a pass after it is made, and a
+        // popover shown from an unlaid button does not show.
+        await settle()
+        stalledShell.openPanel()
+        let opened = await waitUntil { stalledShell.popover.isShown }
+        stalledShell.closePanel()
+        _ = await waitUntil { !stalledShell.popover.isShown }
+        stalled.signal()
+
+        let scans = ScanCounter()
+        let absentShell = MenuBarShell(
+            poller: StatusPoller(pinnedState: .loaded(probeFleet())),
+            awake: AwakeController.harness(),
+            updater: Updater(startingUpdater: false),
+            codexPresence: CodexPresenceController(
+                initialPresence: .absent,
+                resolver: {
+                    scans.add()
+                    return (.absent, nil)
+                }),
+            whatsNew: WhatsNewController(
+                store: WhatsNewStore(defaults: nil), fetcher: NeverFetches(),
+                location: nil, currentVersion: nil))
+        absentShell.popover.animates = false
+        await settle()
+        absentShell.openPanel()
+        let absentOpened = await waitUntil { absentShell.popover.isShown }
+        await settle(0.5)
+        let scanned = scans.value
+        absentShell.closePanel()
+        _ = await waitUntil { !absentShell.popover.isShown }
+        return Check(
+            13, name, passed: opened && absentOpened && scanned == 0,
+            detail: "stalled scan: opened=\(opened) · last scan absent: opened=\(absentOpened) "
+                + "scans at opening=\(scanned)")
+    }
+
+    /// A count the scan's own thread adds to.
+    private final class ScanCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int { lock.withLock { count } }
+        func add() { lock.withLock { count += 1 } }
+    }
+
+    /// One pooled Codex row whose traffic holds four refusals in the last ten minutes.
+    private static func codexProbeFleet() -> Fleet? {
+        let json = """
+            [{"name":"probe-codex@example.com","provider":"codex","priority":0,
+              "status":"active","disabled":false,"quota":0.3,"quotaState":"ok",
+              "sevenDay":0.3,"quotaWindows":["sevenDay"],"held":[],"requests":3,
+              "inputTokens":1,"outputTokens":1,"cacheReadTokens":1,"cacheCreationTokens":0,
+              "probeStatus":"ok","probeError":null,"lastStreamError":null,
+              "streamErrorCount":0,"source":"live","gate":"ok",
+              "codexRoute":{"pooled":true},
+              "codexTraffic":{"refused10m":4,"lastRefusal":"usage_limit_reached",
+                "unpooled10m":0}}]
+            """
+        return try? Fleet.decode(Data(json.utf8))
     }
 
     /// Let the run loop lay out what was just changed. A status item is

@@ -257,9 +257,6 @@ final class CodexBannerTests: XCTestCase {
         XCTAssertNil(call(idle, processes: nil, quietFor: 600))
         XCTAssertNil(call(idle, processes: 2, quietFor: 299))
         XCTAssertNil(call(idle, processes: 2, quietFor: nil))
-        XCTAssertNil(
-            call(try codexFleet(bobAndDana, traffic: quiet), processes: 2, quietFor: 600),
-            "bob and dana served requests, whatever the quiet clock last read")
 
         let routeDown = try codexFleet(
             bobAndDana, route: notPooled, traffic: quiet, extra: ["requests": 0])
@@ -274,6 +271,72 @@ final class CodexBannerTests: XCTestCase {
                     $0, ["codexRoute": NSNull(), "codexTraffic": NSNull(), "requests": 0])
             })
         XCTAssertNil(call(unread, processes: 2, quietFor: 600))
+    }
+
+    /// The line claims the last five minutes, not the proxy's whole run. Requests pooled
+    /// earlier in the day keep each row's count above zero, and a codex started later on its
+    /// own login is still named once that count has stood still for five minutes.
+    func testRequestsPooledEarlierDoNotSilenceTheNoRequestsLine() throws {
+        let servedThisMorning = try codexFleet(bobAndDana, traffic: quiet)
+        XCTAssertEqual(CodexBanner.codexRequests(servedThisMorning), 138)
+        var clock = CodexQuietClock()
+        let morning = Date(timeIntervalSince1970: 1_767_225_600)
+        clock.advance(servedThisMorning, now: morning)
+        let later = morning.addingTimeInterval(400)
+        clock.advance(servedThisMorning, now: later)
+        XCTAssertEqual(clock.quietFor(now: later), 400)
+        XCTAssertEqual(
+            call(servedThisMorning, processes: 1, quietFor: clock.quietFor(now: later)),
+            .noRequests(processes: 1, bundledTcrWithoutCLI: nil))
+    }
+
+    /// The clock restarts when the summed count moves, either way, and stops on a read that
+    /// is not live or holds no Codex account that can serve.
+    func testTheQuietClockRestartsWhenTheCountMoves() throws {
+        let start = Date(timeIntervalSince1970: 1_767_225_600)
+        let at42 = try codexFleet(bobAndDana, traffic: quiet, extra: ["requests": 42])
+        let at43 = try codexFleet(bobAndDana, traffic: quiet, extra: ["requests": 43])
+        let restarted = try codexFleet(bobAndDana, traffic: quiet, extra: ["requests": 0])
+        var clock = CodexQuietClock()
+        XCTAssertNil(clock.quietFor(now: start))
+        clock.advance(at42, now: start)
+        clock.advance(at42, now: start.addingTimeInterval(200))
+        XCTAssertEqual(clock.quietFor(now: start.addingTimeInterval(200)), 200)
+        clock.advance(at43, now: start.addingTimeInterval(250))
+        XCTAssertEqual(clock.quietFor(now: start.addingTimeInterval(300)), 50, "a request landed")
+        clock.advance(restarted, now: start.addingTimeInterval(310))
+        XCTAssertEqual(clock.quietFor(now: start.addingTimeInterval(320)), 10, "the proxy restarted")
+        clock.advance(nil, now: start.addingTimeInterval(330))
+        XCTAssertNil(clock.quietFor(now: start.addingTimeInterval(330)), "a poll that loaded nothing")
+        clock.advance(at42, now: start.addingTimeInterval(340))
+        let offline = try decodeFleet(bobAndDana.map { try canonicalRow($0, ["source": "offline"]) })
+        clock.advance(offline, now: start.addingTimeInterval(350))
+        XCTAssertNil(clock.quietFor(now: start.addingTimeInterval(350)), "an offline read")
+    }
+
+    /// The process count is a walk of the process table, so it is read only when it decides
+    /// the line: never for a refusal, a route that is not pooled, or a clock still short.
+    func testTheProcessWalkRunsOnlyWhenItDecidesTheLine() throws {
+        var walks = 0
+        func count() -> Int? {
+            walks += 1
+            return 2
+        }
+        _ = CodexBanner.current(
+            fleet: try codexFleet(bobAndDana, traffic: refusing), codexProcesses: count(),
+            codexQuietFor: 600, peerSharing: false)
+        _ = CodexBanner.current(
+            fleet: try codexFleet(bobAndDana, traffic: quiet), codexProcesses: count(),
+            codexQuietFor: 299, peerSharing: false)
+        _ = CodexBanner.current(
+            fleet: try decodeFleet([try canonicalRow("alice@example.com")]),
+            codexProcesses: count(), codexQuietFor: 600, peerSharing: false)
+        XCTAssertEqual(walks, 0)
+        XCTAssertNotNil(
+            CodexBanner.current(
+                fleet: try codexFleet(bobAndDana, traffic: quiet), codexProcesses: count(),
+                codexQuietFor: 600, peerSharing: false))
+        XCTAssertEqual(walks, 1, "positive control: the line that needs the count reads it")
     }
 
     /// The quiet clock runs on the requests of the Codex accounts that can serve, on a live
@@ -352,9 +415,7 @@ final class CodexBannerTests: XCTestCase {
 
         for anchor in [
             "CodexBanner.current(",
-            "CodexProcesses.readLive()",
-            "CodexBanner.codexRequests(",
-            "fleet.holdsCodex else",
+            "codexBannerSnapshot.peerSharing = sharing",
             "!fleet.holdsCodex || NoRequestsBanner.totalRequests(fleet) != nil",
             "namesClaude: fleet.holdsCodex",
             "bundledTcrWithoutCLI:",
