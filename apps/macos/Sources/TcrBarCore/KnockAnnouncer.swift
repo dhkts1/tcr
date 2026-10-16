@@ -23,7 +23,7 @@ import Foundation
 /// unconditional.
 ///
 /// **One notification per read, however many arrived in it.** Two Macs
-/// knocking inside one three-second window are one banner naming both, not
+/// knocking between two reads (10 s apart with the panel shut) are one banner naming both, not
 /// two banners racing each other on screen.
 ///
 /// **Nothing while the panel is open.** The mark follows the STATE and the
@@ -67,7 +67,7 @@ public struct KnockAnnouncer: Equatable, Sendable {
         let present = Set(addresses)
         // Forgetting comes FIRST: an address that left the list is forgotten
         // in the same read that a new one arrives, so a Mac which was ignored
-        // and asks again in the next three seconds is a new arrival.
+        // and asks again by the next read is a new arrival.
         announced.formIntersection(present)
 
         let fresh = knocks.filter { !announced.contains($0.addr) }

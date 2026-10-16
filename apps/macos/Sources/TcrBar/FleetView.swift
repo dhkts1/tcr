@@ -452,6 +452,7 @@ struct FleetView: View {
     }
 
     var body: some View {
+        let _ = PanelDrawCount.body()
         Group {
             if Self.drawsLegacyPanel {
                 legacyBody
