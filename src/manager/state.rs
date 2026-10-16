@@ -334,6 +334,32 @@ impl Manager {
         self.proxy_api_key.as_deref()
     }
 
+    /// The request key this server holds, if any ([`crate::request_key`]).
+    pub fn request_key(&self) -> Option<&str> {
+        self.request_key.as_deref()
+    }
+
+    /// The two proxy secrets a client may present, neither of which is a client
+    /// identity or a credential for any host but this one.
+    pub fn proxy_secrets(&self) -> crate::proxy::ProxySecrets<'_> {
+        crate::proxy::ProxySecrets {
+            api_key: self.proxy_api_key(),
+            request_key: self.request_key(),
+        }
+    }
+
+    /// `Some(Log)` whenever the server holds a key: this wave refuses nothing.
+    pub fn request_key_mode(&self) -> Option<crate::request_key::RequestKeyMode> {
+        self.request_key
+            .as_ref()
+            .map(|_| crate::request_key::RequestKeyMode::Log)
+    }
+
+    /// The unkeyed-caller counters `GET /_tcr/status` reports.
+    pub fn unkeyed(&self) -> &crate::request_key::UnkeyedCounters {
+        &self.unkeyed
+    }
+
     /// Account `idx`'s OWN upstream-forwarding client — see
     /// [`AccountRuntime::http`] for why every account carries its own. `None`
     /// only if `idx` is stale (accounts are appended, never removed, so this is

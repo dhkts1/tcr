@@ -330,11 +330,14 @@ pub fn scrub_client_credentials(headers: &mut HeaderMap) -> usize {
 ///   belt and braces rather than a duplicate: it must not survive either check.
 /// - `cookie` because a session cookie is a bearer credential in every way that
 ///   matters and nothing upstream of a lease needs one.
-pub const CLIENT_CREDENTIAL_HEADERS: [&str; 4] = [
+/// - `x-tcr-key` ([`crate::request_key::HEADER`]) because it is this proxy's
+///   request key, a credential for THIS hop only, like `proxy-authorization`.
+pub const CLIENT_CREDENTIAL_HEADERS: [&str; 5] = [
     "authorization",
     "x-api-key",
     "proxy-authorization",
     "cookie",
+    crate::request_key::HEADER,
 ];
 
 /// The header names the LENDER copies from a relayed request onto the request
@@ -3435,6 +3438,25 @@ async fn exchange_addresses(row: &PeerRow, store: &PeerStore, borrow_timeout_ms:
 mod tests {
     use super::*;
     use tcr_peer_wire::{Lease, LeaseUnit};
+
+    /// The request key is a credential for this proxy alone, so the borrower's scrub removes
+    /// it before a frame leaves for another Mac. Watch it fail by dropping it from
+    /// `CLIENT_CREDENTIAL_HEADERS`.
+    #[test]
+    fn the_scrub_removes_the_request_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::request_key::HEADER,
+            axum::http::HeaderValue::from_static("not-a-real-request-key"),
+        );
+        headers.insert(
+            "content-type",
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(scrub_client_credentials(&mut headers), 1);
+        assert!(headers.get(crate::request_key::HEADER).is_none());
+        assert!(headers.get("content-type").is_some());
+    }
 
     /// A live lease this Mac has granted, with room for one relay.
     fn lent(ledger: &mut Ledger, lease_id: u128, grantee: PeerId) {

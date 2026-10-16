@@ -258,6 +258,53 @@ pub struct StatusPayload {
     /// client reading an OLD server reads `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_upstream: Option<String>,
+    /// How the serving process treats a caller without its request key
+    /// ([`crate::request_key::RequestKeyMode`]): `"log"` whenever it holds a
+    /// key, which a server writes at boot. Its PRESENCE is the contract a
+    /// launcher reads before it adds the key to a launch ("this server
+    /// understands keys"), so the name is fixed. `None` is a server that holds
+    /// no key or predates them.
+    ///
+    /// A string rather than the enum, for the reason [`MitmStatus::leaf`] gives:
+    /// a value added later must not fail an older client's whole parse.
+    #[serde(
+        rename = "requestKeyMode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_key_mode: Option<String>,
+    /// `CONNECT`s that arrived without the request key, by host class and
+    /// user-agent family. Sent beside [`Self::request_key_mode`] and only with it.
+    #[serde(
+        rename = "unkeyedConnects",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unkeyed_connects: Option<Vec<UnkeyedCount>>,
+    /// Plain requests that arrived without the request key, by path class and
+    /// user-agent family. A request decrypted from a tunnel is not here: its
+    /// `CONNECT` was counted.
+    #[serde(
+        rename = "unkeyedRequests",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unkeyed_requests: Option<Vec<UnkeyedCount>>,
+}
+
+/// One row of [`StatusPayload::unkeyed_connects`] or
+/// [`StatusPayload::unkeyed_requests`]. `class` and `user_agent` come from closed
+/// enums in [`crate::request_key`], carried as strings for the same forward
+/// compatibility as [`StatusPayload::request_key_mode`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnkeyedCount {
+    /// The `CONNECT` host class (`api.anthropic.com`, `other`, ...) or the
+    /// request path class (`messages`, `api`, ...).
+    pub class: String,
+    /// The user-agent family (`claude-cli`, `curl`, `none`, ...).
+    pub user_agent: String,
+    pub count: u64,
 }
 
 /// What a running proxy's MITM listener can intercept, by its policy and loaded
@@ -646,6 +693,10 @@ impl StatusPayload {
             // assigns both after this call.
             codex_traffic: None,
             codex_upstream: None,
+            // The request key is the serving process's boot state too.
+            request_key_mode: None,
+            unkeyed_connects: None,
+            unkeyed_requests: None,
         }
     }
 

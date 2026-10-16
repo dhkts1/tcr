@@ -1873,6 +1873,7 @@ mod fleet {
             proxy: ProxyConfig {
                 port: 0,
                 api_key: None,
+                request_key: None,
                 extra: serde_json::Map::new(),
             },
             upstream: upstream.to_string(),

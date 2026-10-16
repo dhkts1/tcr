@@ -1213,6 +1213,26 @@ right-click **Copy Access Token** runs exactly this and puts stdout on the paste
 
 ---
 
+## `tcr request-key`
+
+Prints the request key ([`proxy.requestKey`](configuration.md#proxyrequestkey-who-launched-this-caller))
+to stdout, one line and nothing else, for a launcher outside tcr that needs to present it: a
+container forwarder, or a script that sets `HTTPS_PROXY=http://tcr:<key>@127.0.0.1:3456`.
+Flags: `--config`.
+
+It never writes a key. The server writes one into the config the first time it starts without
+one, so the key this prints and the key the server holds are always the same. With no key in
+the file it exits 1 and says so:
+
+```
+Error: no request key in /Users/example/.config/tcr.json: the tcr server writes one there when it starts
+```
+
+It reads the config file without loading the rest of it, and changes nothing. The key is a
+secret, like a `tcr token`: pipe it, do not paste it anywhere it is kept.
+
+---
+
 ## `tcr mint`
 
 Mints a long-lived (365-day) token for an existing Claude account, or for every account
@@ -1709,6 +1729,40 @@ account rows show whether it holds one: a Codex row carries `"provider": "codex"
 A server that has the key always sends it, MITM off included, and a server built before it leaves
 it out. That difference is how `tcr run --codex` tells an older proxy from one running without
 MITM.
+
+### The request key on `GET /_tcr/status`
+
+Also on the raw `/_tcr/status` document only, like `mitm`: whether the serving process holds a
+request key ([`proxy.requestKey`](configuration.md#proxyrequestkey-who-launched-this-caller)), and
+who has reached it without one.
+
+```
+"requestKeyMode": "log",
+"unkeyedConnects": [{"class": "other", "userAgent": "curl", "count": 3}],
+"unkeyedRequests": [{"class": "api", "userAgent": "bun", "count": 1}]
+```
+
+`requestKeyMode` is present whenever the server holds a key, which it does after its first boot on
+this version, and absent on a server that holds none or predates keys. Its presence is what a
+launcher reads before it adds the key to a launch. `log` is the only mode: a caller without the
+key is counted and served exactly as before, and nothing is refused.
+
+`unkeyedConnects` counts `CONNECT` tunnels that carried no key, by host (`api.anthropic.com`,
+`platform.claude.com`, `chatgpt.com`, or `other` for a blind tunnel) and user-agent family
+(`claude-cli`, `codex`, `bun`, `curl`, `python`, `node`, `other`, or `none` when the caller sent
+no `User-Agent`). `unkeyedRequests` counts plain requests the same way, by path: `messages`
+(`/v1/messages` and below), `v1-other`, `codex`, `api` (where Claude Code's `HEAD /api/hello`
+lands) or `other`. A request decrypted from a tunnel is not counted again; its `CONNECT` was.
+The counts reset when the server restarts.
+
+The first unkeyed caller of each kind also gets one INFO line in the server log, with its source
+port, so `lsof -nP -iTCP:<port>` can name the process while it is still connected:
+
+```
+INFO request key: first unkeyed caller of this kind (log mode, nothing refused) kind="connect" class="other" user_agent="curl" peer_port=50123
+```
+
+There is no line per request. The key itself never appears in the document or the log.
 
 ### `GET /_tcr/quota`, the light read for a status line
 
