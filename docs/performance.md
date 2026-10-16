@@ -30,8 +30,9 @@ paths.
 |---|---|
 | `report.md`, `report.json` | the run's figures, per phase |
 | `<phase>.json` | one phase's figures, as `report` and `spread` read them |
-| `<phase>.svg` | the flame graph |
-| `<phase>.folded` | the folded stacks behind it, demangled |
+| `<phase>.svg` | the flame graph, one tower per kind of thread (`tokio-rt-worker`, `tcr-usage-ledger`) |
+| `<phase>.folded` | the folded stacks behind it, demangled and merged by thread name |
+| `<phase>.threads.folded` | the same stacks before merging, one root per thread; `--per-thread-svg` also draws them as `<phase>.threads.svg` |
 | `<phase>.sample.txt` | `sample`'s own output |
 | `<phase>.proxy.log` | the test proxy's whole log |
 | `<phase>.lsof.txt` | the proxy's sockets, halfway through the phase |
@@ -85,6 +86,14 @@ records when it began and finished that request, and both run in one process on 
 the throttled phases it includes throttle waits, which **throttle ms** reports on their own (the
 `throttle_ms` field of the proxy's `request usage` lines for the phase).
 
+The proxy writes one `request usage` line per served `/v1/messages` request and none for
+`count_tokens`, so the throttle line's count is the served `/v1/messages` requests, not
+`served`; the report prints both. In `overhead` a handful of lines still show a few ms of
+`throttle_ms` (8 of 58,315 in run 3 below, at most 8 ms; 3 of 79,667 in a later pass, at most
+6 ms). Nothing is throttled there: with both buckets off, `Manager::throttle_send` takes no lock
+and never sleeps (`src/manager/throttle.rs`), but `src/proxy.rs` still times the call, so on a
+machine at load 100 and more a task descheduled inside it shows up as a millisecond or two.
+
 **peak footprint** is the proxy's lifetime peak physical footprint, from `vmmap --summary` at
 the end of the phase: the memory macOS charges the process for, compressed pages included. Each
 phase has its own process, so it covers boot (loading 65,536 bound tokens) and the phase.
@@ -101,7 +110,8 @@ the stub saw more than the ceiling plus 2, the allowance for arrivals bunching o
 **Top frames** are two lists per phase, from the folded stacks. *By self time* is the leaf of
 each sampled stack, which is often a system call (`write`, `__psynch_mutexwait`). *`tcr` frames*
 credits each sample to its deepest frame in the `tcr` binary, which names the code that made
-that call.
+that call. Both read the stacks merged by thread name; merging only renames each stack's root
+frame, so the lists match what the per-thread stacks give (checked on a 20 s `overhead` pass).
 
 ### What profiling costs
 

@@ -29,6 +29,7 @@ const MAX_IN_FLIGHT: usize = 512;
 pub struct Record {
     /// What went wrong below HTTP: a refused connection, a reset, a cut stream.
     pub error: Option<String>,
+    pub kind: Kind,
     pub status: Option<u16>,
     pub ok: bool,
     pub ttfb_ms: Option<f64>,
@@ -146,6 +147,7 @@ impl Driver {
             Err(err) => {
                 return Record {
                     error: Some(format!("send: {err}")),
+                    kind,
                     status: None,
                     ok: false,
                     ttfb_ms: None,
@@ -187,6 +189,7 @@ impl Driver {
             .map(|span| ms(total.saturating_sub(span.end.saturating_duration_since(span.start))));
         Record {
             error: read_error,
+            kind,
             status: Some(status),
             ok,
             ttfb_ms: ttfb,

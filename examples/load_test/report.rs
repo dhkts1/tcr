@@ -41,8 +41,16 @@ pub struct PhaseResult {
     pub total_ms: Option<Summary>,
     /// `throttle_ms` from the proxy's `request usage` lines in this phase.
     pub throttle_ms: Option<Summary>,
+    /// `request usage` lines with `throttle_ms` above 0.
     pub throttled_requests: usize,
+    /// `request usage` lines in the phase: one per served `/v1/messages` request.
     pub usage_lines: usize,
+    /// Served `/v1/messages` requests, streamed and buffered.
+    #[serde(default)]
+    pub served_messages: usize,
+    /// Served `count_tokens` requests, which log no `request usage` line.
+    #[serde(default)]
+    pub served_count_tokens: usize,
     pub cpu_seconds: f64,
     /// Wall time the CPU figure was taken over: the phase plus its drain.
     pub wall_s: f64,
@@ -149,6 +157,45 @@ fn fmt_load(l: [f64; 3]) -> String {
     format!("{:.1}", l[0])
 }
 
+/// The phase's throttle line, with its denominator named. `throttle_ms` comes from the proxy's
+/// `request usage` lines, one per served `/v1/messages` request; `count_tokens` logs none, so
+/// the count is smaller than `served`. With the throttles off, `throttle_send` takes no lock
+/// and never sleeps (`src/manager/throttle.rs`), yet `src/proxy.rs` still times the call, so a
+/// nonzero value there is the call itself being descheduled, not a wait.
+pub fn throttle_line(r: &PhaseResult) -> String {
+    let nonzero = r.throttled_requests;
+    let lines = r.usage_lines;
+    let max = r.throttle_ms.map_or(0.0, |s| s.max);
+    let mut line = if r.throttles_off {
+        if nonzero == 0 {
+            format!("- throttle: off; `throttle_ms` was 0 on all {lines} `request usage` lines")
+        } else {
+            format!(
+                "- throttle: off. {nonzero} of {lines} `request usage` lines still show \
+                 `throttle_ms` above 0 (at most {max:.0} ms): with both buckets off the throttle \
+                 call takes no lock and never sleeps, so this is the call itself being \
+                 descheduled on a loaded machine, not a wait"
+            )
+        }
+    } else {
+        format!(
+            "- throttle: {nonzero} of {lines} `request usage` lines waited (`throttle_ms` above 0)"
+        )
+    };
+    line.push_str(&format!(
+        "; there is one such line per served `/v1/messages` request ({} served, plus {} \
+         `count_tokens`, which log none)",
+        r.served_messages, r.served_count_tokens
+    ));
+    if lines != r.served_messages {
+        line.push_str(&format!(
+            "; {} more served than logged, so some lines are missing",
+            r.served_messages as i64 - lines as i64
+        ));
+    }
+    line
+}
+
 /// What one phase's flame graph says, in two lists: the leaf frames (often a system call) and
 /// the proxy code nearest them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,12 +282,7 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
             fmt_summary(r.ttfb_ms.as_ref()),
             fmt_summary(r.total_ms.as_ref())
         );
-        out!(
-            md,
-            "- throttle: {} of {} served requests waited",
-            r.throttled_requests,
-            r.usage_lines
-        );
+        out!(md, "{}", throttle_line(r));
         out!(
             md,
             "- upstream: {} requests, busiest second {}{}",
@@ -320,6 +362,7 @@ pub fn spread(values: &[f64]) -> Option<(f64, f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::summarize;
 
     #[test]
     fn spread_is_min_median_max() {
@@ -346,6 +389,8 @@ mod tests {
             throttle_ms: None,
             throttled_requests: 0,
             usage_lines: 1,
+            served_messages: 1,
+            served_count_tokens: 0,
             cpu_seconds: 0.0,
             wall_s: 1.0,
             cpu_s_per_1k: None,
@@ -393,5 +438,37 @@ mod tests {
         assert!(r.failures()[0].contains("did not hold"));
         r.fleet_ceiling_per_s = None;
         assert!(r.failures().is_empty(), "no ceiling with throttles off");
+    }
+
+    #[test]
+    fn the_throttle_line_names_its_denominator_and_what_off_means() {
+        // run 3's overhead phase: throttles off, 8 nonzero values, the largest 8 ms.
+        let mut r = clean();
+        r.throttles_off = true;
+        r.served = 64_712;
+        r.served_messages = 58_315;
+        r.served_count_tokens = 6_397;
+        r.usage_lines = 58_315;
+        r.throttled_requests = 8;
+        r.throttle_ms = summarize(&[0.0, 8.0]);
+        let line = throttle_line(&r);
+        assert!(line.contains("off. 8 of 58315"), "{line}");
+        assert!(line.contains("at most 8 ms"), "{line}");
+        assert!(line.contains("not a wait"), "{line}");
+        assert!(
+            line.contains("58315 served, plus 6397 `count_tokens`"),
+            "{line}"
+        );
+        assert!(!line.contains("missing"), "{line}");
+
+        r.throttles_off = false;
+        let line = throttle_line(&r);
+        assert!(
+            line.starts_with("- throttle: 8 of 58315 `request usage` lines waited"),
+            "{line}"
+        );
+
+        r.usage_lines = 58_300;
+        assert!(throttle_line(&r).contains("15 more served than logged"));
     }
 }

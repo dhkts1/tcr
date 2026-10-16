@@ -121,6 +121,62 @@ pub fn top_module_frames(folded: &str, module: &str, n: usize) -> Vec<Frame> {
     rank(by_frame, total, n)
 }
 
+/// The folded stacks with each root frame rewritten from `sample`'s per-thread label
+/// (`Thread_395926894: tokio-rt-worker`) to the thread's NAME, and equal stacks summed, so the
+/// flame graph draws one tower per kind of thread instead of one per thread. Only the root
+/// frame changes, so every leaf and every `tcr` frame keeps its samples. A thread with no name
+/// becomes `unnamed thread`; the main thread's queue label is kept, whitespace collapsed.
+pub fn merge_threads(folded: &str) -> String {
+    let mut merged: Vec<(String, u64)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for line in folded.lines() {
+        let Some((stack, count)) = line.trim_end().rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u64>() else {
+            continue;
+        };
+        let (root, rest) = match stack.split_once(';') {
+            Some((root, rest)) => (root, Some(rest)),
+            None => (stack, None),
+        };
+        let name = thread_name(root);
+        let key = match rest {
+            Some(rest) => format!("{name};{rest}"),
+            None => name,
+        };
+        match index.get(&key) {
+            Some(&i) => merged[i].1 += count,
+            None => {
+                index.insert(key.clone(), merged.len());
+                merged.push((key, count));
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(stack, count)| format!("{stack} {count}\n"))
+        .collect()
+}
+
+/// `Thread_123: tokio-rt-worker` → `tokio-rt-worker`; any other root is returned unchanged.
+fn thread_name(root: &str) -> String {
+    let Some(after) = root.strip_prefix("Thread_") else {
+        return root.to_string();
+    };
+    let label = after.trim_start_matches(|c: char| c.is_ascii_digit());
+    if label.len() == after.len() {
+        return root.to_string();
+    }
+    let label = label.trim_start_matches(':');
+    let words: Vec<&str> = label.split_whitespace().collect();
+    if words.is_empty() {
+        "unnamed thread".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
 /// Every sample in a folded-stack file.
 pub fn total_samples(folded: &str) -> u64 {
     folded
@@ -271,6 +327,41 @@ mod tests {
         assert_eq!(top[1].name, "tcr`route");
         assert_eq!(top.len(), 2, "a stack with no own frame credits nothing");
         assert_eq!(total_samples(folded), 100);
+    }
+
+    #[test]
+    fn threads_merge_by_name_and_keep_every_frame_count() {
+        let folded = concat!(
+            "Thread_395926894: tokio-rt-worker;tcr`serve;libc`write 30\n",
+            "Thread_395926895: tokio-rt-worker;tcr`serve;libc`write 12\n",
+            "Thread_395926896: tokio-rt-worker;tcr`route 5\n",
+            "Thread_395926908: tcr-usage-ledger;tcr`ledger 8\n",
+            "Thread_385554252   DispatchQueue_1: com.apple.main-thread  (serial);main 2\n",
+            "Thread_42;tcr`anon 1\n",
+        );
+        let merged = merge_threads(folded);
+        assert_eq!(
+            merged,
+            concat!(
+                "tokio-rt-worker;tcr`serve;libc`write 42\n",
+                "tokio-rt-worker;tcr`route 5\n",
+                "tcr-usage-ledger;tcr`ledger 8\n",
+                "DispatchQueue_1: com.apple.main-thread (serial);main 2\n",
+                "unnamed thread;tcr`anon 1\n",
+            )
+        );
+        // A stack that is only its thread label is renamed too.
+        assert_eq!(
+            merge_threads("Thread_43: tokio-rt-worker 3\n"),
+            "tokio-rt-worker 3\n"
+        );
+        // Renaming roots moves no sample between frames.
+        assert_eq!(total_samples(&merged), total_samples(folded));
+        assert_eq!(top_self_frames(&merged, 5), top_self_frames(folded, 5));
+        assert_eq!(
+            top_module_frames(&merged, "tcr", 5),
+            top_module_frames(folded, "tcr", 5)
+        );
     }
 
     #[test]

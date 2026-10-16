@@ -89,6 +89,9 @@ enum Cmd {
     },
     /// Min, median and max of the headline figures across run directories.
     Spread { runs: Vec<PathBuf> },
+    /// Rewrite folded stacks rooted at `Thread_<id>: <name>` to root at the thread's name,
+    /// so one flame graph tower covers every thread of a kind.
+    MergeThreads { input: PathBuf, output: PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -153,6 +156,12 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Report { out, meta } => write_report(&out, &meta),
+        Cmd::MergeThreads { input, output } => {
+            let folded = std::fs::read_to_string(&input)
+                .with_context(|| format!("reading {}", input.display()))?;
+            std::fs::write(&output, stats::merge_threads(&folded))?;
+            Ok(())
+        }
         Cmd::Spread { runs } => {
             print!("{}", spread_table(&runs)?);
             Ok(())
@@ -396,6 +405,14 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
         throttle_ms: stats::summarize(&waits.iter().map(|&w| w as f64).collect::<Vec<_>>()),
         throttled_requests: waits.iter().filter(|&&w| w > 0).count(),
         usage_lines: waits.len(),
+        served_messages: records
+            .iter()
+            .filter(|r| r.ok && r.kind != plan::Kind::CountTokens)
+            .count(),
+        served_count_tokens: records
+            .iter()
+            .filter(|r| r.ok && r.kind == plan::Kind::CountTokens)
+            .count(),
         cpu_seconds: cpu_ms as f64 / 1_000.0,
         wall_s: elapsed.as_secs_f64(),
         cpu_s_per_1k: stats::cpu_seconds_per_thousand(cpu_ms, served),

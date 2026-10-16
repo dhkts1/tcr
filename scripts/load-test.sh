@@ -14,6 +14,8 @@
 #   --profile-ms MS     `sample` interval for the flame graphs (default 10; 1 ms costs the
 #                       proxy enough time to halve the overhead phase's throughput)
 #   --no-profile        skip `sample` and the flame graphs
+#   --per-thread-svg    also draw <phase>.threads.svg, one tower per thread rather than
+#                       per kind of thread (the default <phase>.svg)
 #   --skip-build        reuse the binaries already in the target directory
 #   --out DIR           where the run's files go (default: a new temp directory)
 #
@@ -31,6 +33,7 @@ reply_ms=300
 body_kb=32
 profile=1
 profile_ms=10
+per_thread_svg=0
 build=1
 out=""
 
@@ -45,9 +48,10 @@ while [ $# -gt 0 ]; do
     --body-kb) body_kb="$2"; shift 2 ;;
     --profile-ms) profile_ms="$2"; shift 2 ;;
     --no-profile) profile=0; shift ;;
+    --per-thread-svg) per_thread_svg=1; shift ;;
     --skip-build) build=0; shift ;;
     --out) out="$2"; shift 2 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "load-test: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -125,8 +129,16 @@ for phase in "${phase_list[@]}"; do
     # Rust's v0 symbols (`_RNv...`) are unreadable; Xcode's c++filt (LLVM) demangles them.
     # A demangled array type carries "; " (`[u8; 32]`), which the folded format would read
     # as a frame boundary, so it becomes a full-width semicolon.
-    inferno-collapse-sample "$out/$phase.sample.txt" | c++filt | sed 's/; /； /g' > "$out/$phase.folded"
+    inferno-collapse-sample "$out/$phase.sample.txt" | c++filt | sed 's/; /； /g' > "$out/$phase.threads.folded"
+    # `sample` roots every stack at its thread (`Thread_395926894: tokio-rt-worker`), which
+    # draws one narrow tower per thread. Rooting at the thread's name merges them; the report's
+    # top-frame lists read this merged file.
+    "$driver" merge-threads "$out/$phase.threads.folded" "$out/$phase.folded"
     inferno-flamegraph --title "tcr load test: $phase" < "$out/$phase.folded" > "$out/$phase.svg"
+    if [ "$per_thread_svg" = 1 ]; then
+      inferno-flamegraph --title "tcr load test: $phase, per thread" \
+        < "$out/$phase.threads.folded" > "$out/$phase.threads.svg"
+    fi
   fi
 done
 
