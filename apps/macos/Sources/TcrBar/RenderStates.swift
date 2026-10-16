@@ -270,6 +270,10 @@ enum RenderStates {
             // strip counts each pool on its own row, and the money line adds
             // the Codex tokens. See ``mixedFleetJSON``.
             ("24-mixed-fleet", .loaded(fleet(mixedFleetJSON)), false, nil),
+            // The same fleet once a Claude request on an unpriced model lands: the money
+            // line's every clause at once, which must not wrap to a second line. See
+            // ``mixedFleetUnpricedJSON``.
+            ("24e-mixed-fleet-unpriced", .loaded(fleet(mixedFleetUnpricedJSON)), false, nil),
             // A Codex account's card in its states, kept open so each draws as a
             // card: a Pro plan's one weekly row (bob), spent on its week with
             // credits (carol), both windows (dana), and refused (gil). See
@@ -4653,6 +4657,26 @@ extension RenderStates {
         let bob = codexRow(.bob, now: now, extra: ["codexTraffic": quietCodexTraffic])
         let carol = codexRow(.carol, now: now, extra: ["codexTraffic": quietCodexTraffic])
         return "[\((mixedClaudeRows(now: now) + [bob, carol]).joined(separator: ","))]"
+    }
+
+    /// Scene `24e-mixed-fleet-unpriced`: scene `24-mixed-fleet` with three of alice's Claude
+    /// requests today on a model the config has no price for, so the money line carries
+    /// the unpriced clause beside the Codex one.
+    private static var mixedFleetUnpricedJSON: String {
+        let now = Date()
+        let rows = mixedClaudeRows(now: now)
+        guard
+            let alice = try? JSONSerialization.jsonObject(with: Data(rows[0].utf8))
+                as? [String: Any],
+            var usage = alice["usage"] as? [String: Any],
+            var today = usage["today"] as? [String: Any]
+        else { preconditionFailure("canonical alice carries no usage today") }
+        today["unpricedRequests"] = 3
+        usage["today"] = today
+        let unpriced = jsonText(alice, laying: ["usage": usage])
+        let bob = codexRow(.bob, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        let carol = codexRow(.carol, now: now, extra: ["codexTraffic": quietCodexTraffic])
+        return "[\(([unpriced, rows[1], bob, carol]).joined(separator: ","))]"
     }
 
     /// Scene `24-mixed-fleet`'s two Claude accounts, both out of tokens, which scene

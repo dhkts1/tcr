@@ -217,9 +217,10 @@ final class PoolCapacityTests: XCTestCase {
         // bob's 22,000 and carol's 61,000 output tokens.
         let mixed = try decodeFleet(sceneTwentyFourRows())
         let line = try XCTUnwrap(AccountsSummary.lines(mixed))
-        XCTAssertEqual(line.count, 1)
-        XCTAssertEqual(text(line[0]), "$28.3 today · cache 75% · Codex 83k tokens")
-        XCTAssertEqual(line[0].map(\.role), [.dim, .dim, .dim])
+        XCTAssertEqual(line.count, 2)
+        XCTAssertEqual(text(line[0]), "$28.3 today · cache 75%")
+        XCTAssertEqual(text(line[1]), "Codex 83k tokens")
+        XCTAssertEqual(line.flatMap { $0 }.map(\.role), [.dim, .dim, .dim])
         XCTAssertEqual(
             AccountsSummary.usageHelp(mixed),
             "Codex: 83k output tokens today, unpriced: a ChatGPT plan is not billed per request.")
@@ -230,7 +231,8 @@ final class PoolCapacityTests: XCTestCase {
             try pricedToday(canonicalRow("carol@example.com"), cost: 3.4),
         ])
         let pricedLine = try XCTUnwrap(AccountsSummary.lines(priced))
-        XCTAssertEqual(text(pricedLine[0]), "$28.3 today · cache 75% · Codex $4.60")
+        XCTAssertEqual(text(pricedLine[0]), "$28.3 today · cache 75%")
+        XCTAssertEqual(text(pricedLine[1]), "Codex $4.60")
         XCTAssertEqual(
             AccountsSummary.usageHelp(priced), "Codex: $4.60 today, at the prices in your config.")
 
@@ -247,6 +249,59 @@ final class PoolCapacityTests: XCTestCase {
                 try canonicalRow($0, ["usage": NSNull()])
             })
         XCTAssertNil(AccountsSummary.lines(unmeasured))
+    }
+
+    /// In a fleet holding both providers the money line keeps its two lines whichever
+    /// clauses a poll adds or drops: Claude's first unpriced request, Codex's first request
+    /// of the day, or midnight clearing either. On one line, the unpriced clause landing
+    /// beside the Codex one wrapped it onto a second and moved everything under it.
+    func testTheMixedMoneyLineKeepsItsLinesWhenAClauseComesOrGoes() throws {
+        func unpriced(_ row: [String: Any], _ count: Int) throws -> [String: Any] {
+            var row = row
+            var usage = try XCTUnwrap(row["usage"] as? [String: Any])
+            var today = try XCTUnwrap(usage["today"] as? [String: Any])
+            today["unpricedRequests"] = count
+            usage["today"] = today
+            row["usage"] = usage
+            return row
+        }
+        let codexIdle: [String: Any] = ["usage": NSNull()]
+        let states: [(String, [[String: Any]])] = [
+            ("both clauses", try sceneTwentyFourRows()),
+            (
+                "unpriced beside Codex",
+                [
+                    try unpriced(try alice(spentOn5h), 3), try frank(),
+                    try canonicalRow("bob@example.com/codex"), try canonicalRow("carol@example.com"),
+                ]
+            ),
+            (
+                "no Codex request today",
+                [
+                    try alice(spentOn5h), try frank(),
+                    try canonicalRow("bob@example.com/codex", codexIdle),
+                    try canonicalRow("carol@example.com", codexIdle),
+                ]
+            ),
+            (
+                "no Claude request today",
+                [
+                    try alice(["usage": NSNull()]),
+                    try aliceCopy("frank@example.com", 0, ["usage": NSNull()]),
+                    try canonicalRow("bob@example.com/codex"), try canonicalRow("carol@example.com"),
+                ]
+            ),
+        ]
+        for (name, rows) in states {
+            let lines = try XCTUnwrap(AccountsSummary.lines(try decodeFleet(rows)), name)
+            XCTAssertEqual(lines.count, 2, name)
+            XCTAssertFalse(
+                lines[0].contains { $0.text.hasPrefix("Codex") }, "\(name): a Codex clause on Claude's line")
+        }
+        let withUnpriced = try XCTUnwrap(AccountsSummary.lines(try decodeFleet(states[1].1)))
+        XCTAssertEqual(
+            withUnpriced[0].map(\.text), ["$28.3 today", "cache 75%", "3 unpriced today"],
+            "positive control: the unpriced clause is drawn")
     }
 
     // MARK: - What a Codex row's state is

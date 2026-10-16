@@ -91,14 +91,15 @@ extension SummaryLine {
     /// A fleet holding Codex accounts reads every figure per provider
     /// (``AccountsSummary/lines(_:)``): the fleet-wide figures below would
     /// fold Codex's tokens into Claude's cache ratio and its requests into
-    /// Claude's unpriced count. The Codex clause joins the same line, and the
-    /// line's tooltip says what the Codex figure is.
+    /// Claude's unpriced count. In a fleet holding both, the Codex clause has
+    /// a line of its own, always drawn, and that line's tooltip says what the
+    /// Codex figure is.
     static func accounts(_ fleet: Fleet) -> SummaryLine? {
         if fleet.holdsCodex {
             guard let lines = AccountsSummary.lines(fleet) else { return nil }
             return SummaryLine(
                 lines: lines.map { $0.map { Run($0) } },
-                lineHelp: [AccountsSummary.usageHelp(fleet)])
+                lineHelp: lines.count == 2 ? [nil, AccountsSummary.usageHelp(fleet)] : [])
         }
         var second: [Run] = []
         if fleet.hasUsage {

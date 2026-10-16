@@ -231,33 +231,37 @@ public enum AccountsSummary {
     /// `nil` for a fleet with no Codex account, which keeps today's line, and for a fleet
     /// holding Codex accounts with nothing measured to say.
     ///
-    /// - Both providers: `$28.3 today · cache 75%`, then `· N unpriced today` in mute when
-    ///   Claude has unpriced requests, then `· Codex 83k tokens`, or `· Codex $4.60` when
-    ///   the Codex day is fully priced. Each clause is there only when its rows were
-    ///   measured.
+    /// - Both providers: two lines, always both, so no clause a poll adds or drops can wrap
+    ///   the line or add one. The first is Claude's: `$28.3 today · cache 75%`, then
+    ///   `· N unpriced today` in mute when Claude has unpriced requests. The second is
+    ///   Codex's: `Codex 83k tokens`, or `Codex $4.60` when the Codex day is fully priced.
+    ///   A line whose rows were not measured today is drawn empty, at its height. On one
+    ///   line, the unpriced clause landing beside the Codex one wrapped it onto a second.
     /// - Codex only: `343k tokens today · cache 87%`, or `$4.60 today · cache 87%` when
     ///   fully priced.
     public static func lines(_ fleet: Fleet) -> [[SummaryRun]]? {
         guard fleet.holdsCodex else { return nil }
         var runs: [SummaryRun] = []
         if fleet.holdsAnthropic {
+            var claude: [SummaryRun] = []
             if fleet.hasUsage(of: .anthropic) {
-                runs.append(
+                claude.append(
                     SummaryRun(
                         text: "\(QuotaFormat.usd(fleet.todayCost(of: .anthropic))) today",
                         role: .dim))
-                runs.append(
+                claude.append(
                     SummaryRun(
                         text:
                             "cache \(QuotaFormat.percent(fleet.todayCacheHitRatio(of: .anthropic)))",
                         role: .dim))
                 if let unpriced = fleet.todayUnpricedRequests(of: .anthropic), unpriced > 0 {
-                    runs.append(SummaryRun(text: "\(unpriced) unpriced today", role: .mute))
+                    claude.append(SummaryRun(text: "\(unpriced) unpriced today", role: .mute))
                 }
             }
-            if fleet.hasUsage(of: .codex) {
-                runs.append(SummaryRun(text: "Codex \(codexFigure(fleet))", role: .dim))
-            }
+            let codex =
+                fleet.hasUsage(of: .codex)
+                ? [SummaryRun(text: "Codex \(codexFigure(fleet))", role: .dim)] : []
+            return claude.isEmpty && codex.isEmpty ? nil : [claude, codex]
         } else if fleet.hasUsage(of: .codex) {
             runs.append(SummaryRun(text: "\(codexFigure(fleet)) today", role: .dim))
             runs.append(
