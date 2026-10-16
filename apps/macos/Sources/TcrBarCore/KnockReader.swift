@@ -16,8 +16,9 @@ import Foundation
 /// `onAppear` and stops on its `onDisappear`, which is precisely the case this
 /// is for.
 ///
-/// So: one more subprocess every three seconds, owned by the shell beside the
-/// poller and alive for the same span.
+/// So: one more subprocess, every ``closedInterval`` with the panel shut and
+/// every ``interval`` while it is open, owned by the shell beside the poller
+/// and alive for the same span.
 ///
 /// # Why `peer pending` and not `peer status`
 ///
@@ -47,11 +48,24 @@ public final class KnockReader: ObservableObject {
     /// nothing has run yet" must not be mistaken for that first read.
     @Published public private(set) var hasRead = false
 
+    /// The pace while the panel is open.
     public let interval: TimeInterval
-    private var task: Task<Void, Never>?
+    /// The pace while it is shut.
+    public let closedInterval: TimeInterval
+    private var cadence: PollCadence?
+    private var panelIsOpen = false
 
-    public init(interval: TimeInterval = StatusPoller.defaultInterval) {
+    /// 10 s with the panel shut, half the fleet poll's 20: a knock is a person
+    /// at another Mac waiting on an answer, and the mark is how this Mac learns
+    /// of them, so it is read twice as often as capacity, which waits on nobody.
+    public nonisolated static let defaultClosedInterval: TimeInterval = 10
+
+    public init(
+        interval: TimeInterval = StatusPoller.defaultInterval,
+        closedInterval: TimeInterval = KnockReader.defaultClosedInterval
+    ) {
         self.interval = interval
+        self.closedInterval = closedInterval
     }
 
     /// A reader pinned to a set of knocks, for deterministic rendering and for
@@ -59,26 +73,33 @@ public final class KnockReader: ObservableObject {
     /// ``StatusPoller/init(pinnedState:lastPollAt:)`` gives the panel.
     public init(pinnedKnocks: [PeerKnock]) {
         self.interval = StatusPoller.defaultInterval
+        self.closedInterval = Self.defaultClosedInterval
         self.knocks = pinnedKnocks
         self.hasRead = true
     }
 
-    deinit { task?.cancel() }
-
     public func start() {
-        guard task == nil else { return }
-        task = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                await self.readOnce()
-                try? await Task.sleep(nanoseconds: UInt64(self.interval * 1_000_000_000))
+        if cadence == nil {
+            cadence = PollCadence(open: interval, closed: closedInterval) { [weak self] in
+                await self?.readOnce()
             }
         }
+        cadence?.setWatched(panelIsOpen)
+        cadence?.start()
     }
 
     public func stop() {
-        task?.cancel()
-        task = nil
+        cadence?.stop()
+    }
+
+    /// The pace the running loop is on now.
+    public var currentInterval: TimeInterval { panelIsOpen ? interval : closedInterval }
+
+    /// Says whether the panel is open: reads at once and keeps ``interval``
+    /// while it is, ``closedInterval`` while it is not.
+    public func setPanelOpen(_ open: Bool) {
+        panelIsOpen = open
+        cadence?.setWatched(open)
     }
 
     /// One read, published. Returns what it published so a caller that reads

@@ -163,7 +163,10 @@ struct GeneralSettingsPane: View {
                     }
                 }
                 LabeledContent("Read the server every") {
-                    Text("\(Int(poller.interval)) s")
+                    // Both paces: this window is open, so the one it would
+                    // otherwise show is the fast one, which is not what the
+                    // menu bar runs at the rest of the time.
+                    Text("\(Int(poller.interval)) s open · \(Int(poller.closedInterval)) s closed")
                         .foregroundStyle(Tok.inkDim)
                         .monospacedDigit()
                 }

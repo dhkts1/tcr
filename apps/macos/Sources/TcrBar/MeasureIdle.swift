@@ -7,10 +7,11 @@ import TcrBarCore
 ///
 /// ## The question
 ///
-/// Two reads run on a three second cadence: the poller, which is meant to run
-/// whether or not anything is on screen, and the Peers tab's own, which is
-/// meant to live and die with the tab. A tab whose poll outlived its view would
-/// charge every closed panel two subprocesses every three seconds, forever, and
+/// Three reads run with the panel open: the poller and the knock read, which
+/// keep running when it shuts at a slower pace (20 s and 10 s), and the Peers
+/// tab's own, which is meant to live and die with the tab. A tab whose poll
+/// outlived its view would charge every closed panel two subprocesses every
+/// three seconds, forever, and
 /// reading the source cannot settle it: a SwiftUI view's teardown is the
 /// framework's business, not the call site's.
 ///

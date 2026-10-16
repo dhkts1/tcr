@@ -174,7 +174,8 @@ public struct RecordedVerdict: Equatable, Sendable {
 /// is not tested.
 public enum ToggleReadback {
     /// How long a confirmation may sit on screen: two poll intervals
-    /// (``StatusPoller`` polls every 3s), so a confirmation always survives at
+    /// (``StatusPoller`` polls every 3s while the panel the toggle sits in is
+    /// open), so a confirmation always survives at
     /// least one full refresh and then goes away on its own.
     public static let confirmationLifetime: TimeInterval = 6
 

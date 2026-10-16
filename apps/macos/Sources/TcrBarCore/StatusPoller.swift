@@ -329,12 +329,44 @@ public enum PollState: Equatable {
     }
 }
 
+/// Who can be looking at what the poller publishes.
+public enum PollViewer: Hashable, Sendable {
+    /// The menu bar panel.
+    case panel
+    /// The Settings window, whose panes read the fleet too.
+    case settings
+}
+
 /// Runs `tcr status --json` on a timer and publishes the result.
+///
+/// ## Two audiences
+///
+/// The menu bar mark subscribes to ``$state`` and is redrawn on every poll,
+/// panel open or shut. Views subscribe through ``objectWillChange``, and that
+/// is sent only while a ``PollViewer`` is looking: with the panel shut, a view
+/// tree re-evaluated and measured on every poll was most of what a closed
+/// TcrBar cost, for frames nobody could see. When a viewer arrives the views
+/// are told once, so they read the current state before they draw.
+///
+/// It is a plain subject and not the `ObservableObjectPublisher` Combine
+/// synthesizes, on purpose: `@Published` sends to the synthesized publisher
+/// on every write and to any other type never, which is what makes the gate
+/// here the only way a view hears of a poll.
 @MainActor
 public final class StatusPoller: ObservableObject {
     /// 3s: fast enough that a quota flip is visible while watching, slow enough
     /// that the CLI's own work stays in the noise.
     public nonisolated static let defaultInterval: TimeInterval = 3
+
+    /// 20 s, with nothing on screen but the menu bar mark. What the mark shows,
+    /// the cup's fill, near, failed, moves with the proxy's quota probe (300 s
+    /// by default) and with requests spending accounts, so a mark at most 20 s
+    /// behind is the same mark; a dead proxy turns the cup red within 20 s.
+    public nonisolated static let defaultClosedInterval: TimeInterval = 20
+
+    /// `nonisolated` because the protocol requirement is: a subscriber may
+    /// attach from anywhere. Sends happen only on the main actor, in this file.
+    public nonisolated let objectWillChange = PassthroughSubject<Void, Never>()
 
     @Published public private(set) var state: PollState = .pending
     @Published public private(set) var lastPollAt: Date?
@@ -344,11 +376,29 @@ public final class StatusPoller: ObservableObject {
     /// ``lastPollAt`` changes, and changes with it.
     public private(set) var lastPollBegan: Date?
 
+    /// The pace while a viewer is looking.
     public let interval: TimeInterval
-    private var task: Task<Void, Never>?
+    /// The pace while nothing but the menu bar mark is.
+    public let closedInterval: TimeInterval
+    public private(set) var viewers: Set<PollViewer> = []
+    private var cadence: PollCadence?
+    /// What one poll runs: ``fetch()``, or a test's stand-in so that no `tcr` runs.
+    private let read: () async -> PollState
 
-    public init(interval: TimeInterval = StatusPoller.defaultInterval) {
+    public convenience init(
+        interval: TimeInterval = StatusPoller.defaultInterval,
+        closedInterval: TimeInterval = StatusPoller.defaultClosedInterval
+    ) {
+        self.init(interval: interval, closedInterval: closedInterval, read: { await Self.fetch() })
+    }
+
+    init(
+        interval: TimeInterval, closedInterval: TimeInterval,
+        read: @escaping () async -> PollState
+    ) {
         self.interval = interval
+        self.closedInterval = closedInterval
+        self.read = read
     }
 
     /// A poller pinned to one state, for deterministic rendering.
@@ -361,26 +411,49 @@ public final class StatusPoller: ObservableObject {
     /// It never calls `start()`, so no timer exists and nothing is executed.
     public init(pinnedState: PollState, lastPollAt: Date? = nil) {
         self.interval = Self.defaultInterval
+        self.closedInterval = Self.defaultClosedInterval
+        self.read = { await Self.fetch() }
         self.state = pinnedState
         self.lastPollAt = lastPollAt
     }
 
-    deinit { task?.cancel() }
-
+    /// Polls at once, then every ``closedInterval``, or every ``interval``
+    /// while a viewer is looking.
     public func start() {
-        guard task == nil else { return }
-        task = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                await self.pollOnce()
-                try? await Task.sleep(nanoseconds: UInt64(self.interval * 1_000_000_000))
+        if cadence == nil {
+            cadence = PollCadence(open: interval, closed: closedInterval) { [weak self] in
+                await self?.pollOnce()
             }
         }
+        cadence?.setWatched(!viewers.isEmpty)
+        cadence?.start()
     }
 
     public func stop() {
-        task?.cancel()
-        task = nil
+        cadence?.stop()
+    }
+
+    /// The pace the running loop is on now.
+    public var currentInterval: TimeInterval { viewers.isEmpty ? closedInterval : interval }
+
+    /// Says whether `viewer` is on screen.
+    ///
+    /// The first viewer to arrive tells every view to read the current state,
+    /// before this returns, and polls at once on a running loop, then every
+    /// ``interval``. The last to leave stops the views hearing of polls and
+    /// slows the loop to ``closedInterval``. Saying the same thing twice does
+    /// nothing, so a caller can say it from more than one place.
+    public func setViewer(_ viewer: PollViewer, isLooking: Bool) {
+        let wasWatched = !viewers.isEmpty
+        if isLooking {
+            viewers.insert(viewer)
+        } else {
+            viewers.remove(viewer)
+        }
+        let watched = !viewers.isEmpty
+        guard watched != wasWatched else { return }
+        if watched { objectWillChange.send() }
+        cadence?.setWatched(watched)
     }
 
     /// Returns the state it just published, so a caller that polls *in order to
@@ -391,7 +464,7 @@ public final class StatusPoller: ObservableObject {
     /// depends on that.
     @discardableResult
     public func pollOnce() async -> PollState {
-        await pollOnce(through: Self.fetch)
+        await pollOnce(through: read)
     }
 
     /// ``pollOnce()`` through `fetch`, which a test hands a stand-in read so that no `tcr`
@@ -400,6 +473,7 @@ public final class StatusPoller: ObservableObject {
     func pollOnce(through fetch: () async -> PollState) async -> PollState {
         let began = Date()
         let next = await fetch()
+        if !viewers.isEmpty { objectWillChange.send() }
         state = next
         lastPollBegan = began
         lastPollAt = Date()
