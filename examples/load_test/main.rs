@@ -9,6 +9,7 @@
 //! - `report`: turn a run's phase files and folded stacks into `report.md` and `report.json`.
 //! - `spread`: min, median and max of the headline figures across several runs.
 
+mod conversation;
 mod driver;
 mod harness;
 mod plan;
@@ -238,7 +239,13 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let bound_tokens_restored = harness::restored_bound_tokens(&boot_log);
 
     let sessions = plan::sessions(a.phase);
-    let driver = driver::Driver::new(port, stub.clone(), sessions, a.body_kb)?;
+    let driver = driver::Driver::new(
+        port,
+        stub.clone(),
+        sessions,
+        a.body_kb,
+        a.phase.big_body_bytes(),
+    )?;
     driver.warm_up(sessions).await;
     // The warm-up sends one request per session at once, which empties the fleet bucket
     // (burst 32). Rest long enough for both buckets to refill (per-org: 24 x 350 ms = 8.4 s),
@@ -336,18 +343,15 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     };
 
     let started = Instant::now();
-    let (records, unfinished) = match a.phase {
-        Phase::Overhead => {
-            driver
-                .run_closed(sessions, Duration::from_secs_f64(a.duration), a.seed)
-                .await
-        }
-        _ => {
-            let schedule = plan::schedule(a.phase, a.duration, a.seed);
-            driver
-                .run_schedule(&schedule, Duration::from_secs_f64(a.drain))
-                .await
-        }
+    let (records, unfinished) = if a.phase.closed_loop() {
+        driver
+            .run_closed(sessions, Duration::from_secs_f64(a.duration), a.seed)
+            .await
+    } else {
+        let schedule = plan::schedule(a.phase, a.duration, a.seed);
+        driver
+            .run_schedule(&schedule, Duration::from_secs_f64(a.drain))
+            .await
     };
     let elapsed = started.elapsed();
 
@@ -455,6 +459,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
         boot_path_lines,
         live_path_mentions,
         profile_interval_ms: a.profile,
+        big_body_bytes: a.phase.big_body_bytes(),
     })
 }
 

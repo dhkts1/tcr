@@ -75,6 +75,9 @@ pub struct PhaseResult {
     pub live_path_mentions: Vec<String>,
     /// The `sample` interval when the phase was profiled; the profile costs the proxy time.
     pub profile_interval_ms: Option<u64>,
+    /// The size each request was generated to in a big-body phase.
+    #[serde(default)]
+    pub big_body_bytes: Option<usize>,
 }
 
 impl PhaseResult {
@@ -257,6 +260,15 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
                 ", profiled with `sample` every {ms} ms"
             ))
         );
+        if let Some(bytes) = r.big_body_bytes {
+            out!(
+                md,
+                "- each request a generated long conversation of about {:.1} MiB; CPU per request {}",
+                bytes as f64 / (1024.0 * 1024.0),
+                r.cpu_s_per_1k
+                    .map_or("n/a".into(), |v| format!("{v:.2} ms"))
+            );
+        }
         out!(
             md,
             "- sent {}, served {}, errors {}, unfinished at drain {}, statuses {:?}",
@@ -418,6 +430,7 @@ mod tests {
             boot_path_lines: vec![],
             live_path_mentions: vec![],
             profile_interval_ms: None,
+            big_body_bytes: None,
         }
     }
 

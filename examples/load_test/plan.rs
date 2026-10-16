@@ -17,10 +17,21 @@ pub enum Phase {
     Peak,
     /// Offered well past the fleet ceiling, to watch the throttles hold.
     Runaway,
+    /// As `overhead`, with each request a generated long conversation of about 1 MiB.
+    Big1m,
+    /// As `overhead`, with each request a generated long conversation of about 4 MiB.
+    Big4m,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 4] = [Self::Overhead, Self::Steady, Self::Peak, Self::Runaway];
+    pub const ALL: [Phase; 6] = [
+        Self::Overhead,
+        Self::Steady,
+        Self::Peak,
+        Self::Runaway,
+        Self::Big1m,
+        Self::Big4m,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -28,6 +39,8 @@ impl Phase {
             Self::Steady => "steady",
             Self::Peak => "peak",
             Self::Runaway => "runaway",
+            Self::Big1m => "big1m",
+            Self::Big4m => "big4m",
         }
     }
 
@@ -35,9 +48,26 @@ impl Phase {
         Self::ALL.into_iter().find(|p| p.as_str() == raw)
     }
 
-    /// Whether the proxy boots with its throttles switched off for this phase.
+    /// Whether the proxy boots with its throttles switched off for this phase: the phases
+    /// that measure the proxy's own cost per request.
     pub fn throttles_off(self) -> bool {
-        self == Self::Overhead
+        self.closed_loop()
+    }
+
+    /// Whether each session sends its next request the moment its last reply ends, rather
+    /// than on a schedule.
+    pub fn closed_loop(self) -> bool {
+        matches!(self, Self::Overhead | Self::Big1m | Self::Big4m)
+    }
+
+    /// The size each request is generated to, for the big-body phases. The others send a
+    /// short conversation behind a `--body-kb` system prompt.
+    pub fn big_body_bytes(self) -> Option<usize> {
+        match self {
+            Self::Big1m => Some(1024 * 1024),
+            Self::Big4m => Some(4 * 1024 * 1024),
+            Self::Overhead | Self::Steady | Self::Peak | Self::Runaway => None,
+        }
     }
 }
 
@@ -91,6 +121,8 @@ pub fn sessions(phase: Phase) -> usize {
         Phase::Steady => 18,
         Phase::Peak => 48,
         Phase::Runaway => 64,
+        // A few long sessions at once, as one developer's machine runs them.
+        Phase::Big1m | Phase::Big4m => 4,
     }
 }
 
@@ -102,7 +134,7 @@ pub fn schedule(phase: Phase, duration_s: f64, seed: u64) -> Vec<Planned> {
     let n = sessions(phase);
     let mut out = Vec::new();
     match phase {
-        Phase::Overhead => {}
+        Phase::Overhead | Phase::Big1m | Phase::Big4m => {}
         Phase::Steady => poisson(&mut out, &mut rng, STEADY_RATE, end, n),
         Phase::Peak => {
             poisson(&mut out, &mut rng, STEADY_RATE, end, n);
@@ -193,13 +225,19 @@ mod tests {
     }
 
     #[test]
-    fn overhead_is_closed_loop_and_the_only_unthrottled_phase() {
-        assert!(schedule(Phase::Overhead, 20.0, 1).is_empty());
+    fn the_closed_loop_phases_are_the_unthrottled_ones() {
         let off: Vec<Phase> = Phase::ALL
             .into_iter()
             .filter(|p| p.throttles_off())
             .collect();
-        assert_eq!(off, vec![Phase::Overhead]);
+        assert_eq!(off, vec![Phase::Overhead, Phase::Big1m, Phase::Big4m]);
+        for phase in off {
+            assert!(phase.closed_loop());
+            assert!(schedule(phase, 20.0, 1).is_empty());
+        }
+        assert_eq!(Phase::Big4m.big_body_bytes(), Some(4 * 1024 * 1024));
+        assert_eq!(Phase::Overhead.big_body_bytes(), None);
+        assert_eq!(Phase::parse("big1m"), Some(Phase::Big1m));
     }
 
     #[test]
