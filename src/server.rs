@@ -516,7 +516,9 @@ impl ServerHandle {
             listener,
             peer,
         )?;
+        crate::restart::wait_for_listener_receipt(peer).await?;
         self.listener.take();
+        crate::restart::confirm_listener_released(peer)?;
         Ok(())
     }
 
