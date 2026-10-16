@@ -12,7 +12,9 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::singleton::{self, ProxyKind};
 
-const REQUEST: &[u8] = b"tcr-replace/1\n";
+const REQUEST: &[u8] = b"tcr-replace/2\n";
+const RECEIPT: &[u8] = b"listener-received\n";
+const RELEASED: &[u8] = b"listener-released\n";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 fn socket_path(pid: u32) -> PathBuf {
@@ -83,6 +85,37 @@ impl Drop for Endpoint {
     }
 }
 
+/// Sending SCM_RIGHTS is not confirmation that recvmsg installed the descriptor.
+/// Keep the sender's copy alive until the receiver explicitly acknowledges it.
+pub(crate) async fn wait_for_listener_receipt(
+    peer: &std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let mut peer = peer.try_clone()?;
+    peer.set_read_timeout(Some(TIMEOUT))?;
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut receipt = [0; RECEIPT.len()];
+        peer.read_exact(&mut receipt)?;
+        if receipt != RECEIPT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid listener receipt",
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Keep the handoff channel open until the sender has completed its send and
+/// released the listener. The receiver waits for this before starting up.
+pub(crate) fn confirm_listener_released(peer: &std::os::unix::net::UnixStream) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut peer = peer;
+    peer.write_all(RELEASED)
+}
+
 /// Request a socket only from a recognized standalone proxy on this port.
 /// Failure leaves the incumbent alone: a kill-and-bind fallback would recreate
 /// the refusal window this protocol exists to remove. Old binaries need one
@@ -107,13 +140,30 @@ pub async fn request_listener(port: u16) -> anyhow::Result<Option<std::net::TcpL
     let peer = peer.into_std()?;
     peer.set_nonblocking(false)?;
     peer.set_read_timeout(Some(TIMEOUT))?;
-    let listener = tokio::task::spawn_blocking(move || tcr_fdpass::recv_listener(&peer))
-        .await
-        .context("restart receiver task failed")?
-        .context("the incumbent did not hand over its listener; no process was signalled")?;
-    anyhow::ensure!(
-        listener.local_addr()? == std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        "the incumbent handed over a listener for a different address"
-    );
+    peer.set_write_timeout(Some(TIMEOUT))?;
+    let listener = tokio::task::spawn_blocking(move || {
+        use std::io::{Read as _, Write as _};
+        let listener = tcr_fdpass::recv_listener(&peer)?;
+        if listener.local_addr()? != std::net::SocketAddr::from(([127, 0, 0, 1], port)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incumbent handed over a different listener",
+            ));
+        }
+        let mut peer = peer;
+        peer.write_all(RECEIPT)?;
+        let mut released = [0; RELEASED.len()];
+        peer.read_exact(&mut released)?;
+        if released != RELEASED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid listener release confirmation",
+            ));
+        }
+        Ok(listener)
+    })
+    .await
+    .context("restart receiver task failed")?
+    .context("the incumbent did not hand over its listener; no process was signalled")?;
     Ok(Some(listener))
 }

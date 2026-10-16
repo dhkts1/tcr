@@ -243,7 +243,7 @@ fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
         .join(format!("restart-{}.sock", old.child.id()));
     let mut peer = UnixStream::connect(endpoint).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    peer.write_all(b"tcr-replace/1\n").unwrap();
+    peer.write_all(b"tcr-replace/2\n").unwrap();
     // Deliberately leave the descriptor queued. A sendmsg return is not proof
     // that recvmsg installed it in the successor's descriptor table.
     std::thread::sleep(Duration::from_secs(2));
@@ -254,6 +254,9 @@ fn predecessor_retains_its_listener_until_the_receiver_acknowledges_it() {
     let listener = tcr_fdpass::recv_listener(&peer).unwrap();
     assert_eq!(listener.local_addr().unwrap(), addr);
     peer.write_all(b"listener-received\n").unwrap();
+    let mut released = [0; b"listener-released\n".len()];
+    peer.read_exact(&mut released).unwrap();
+    assert_eq!(&released, b"listener-released\n");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = old.child.try_wait().unwrap() {
