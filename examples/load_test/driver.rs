@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::conversation::History;
 use crate::plan::{Kind, Planned};
 use crate::stub::{Stub, TAG_HEADER};
 
@@ -41,6 +42,8 @@ pub struct Record {
 pub struct Session {
     user_id: String,
     last: Mutex<Option<(String, String)>>,
+    /// The long conversation this session sends in a big-body phase, serialized once.
+    history: Option<History>,
 }
 
 pub struct Driver {
@@ -59,6 +62,7 @@ impl Driver {
         stub: Arc<Stub>,
         sessions: usize,
         body_kb: usize,
+        big_body_bytes: Option<usize>,
     ) -> anyhow::Result<Arc<Self>> {
         let client = reqwest::Client::builder()
             // The driver talks to the proxy on loopback and nowhere else; an inherited
@@ -68,14 +72,19 @@ impl Driver {
             .timeout(Duration::from_secs(300))
             .build()?;
         let sessions = (0..sessions)
-            .map(|i| Session {
-                user_id: json!({
+            .map(|i| {
+                let user_id = json!({
                     "device_id": format!("{:064x}", 0xdead_beef_u64 + i as u64),
                     "account_uuid": "11111111-1111-1111-1111-111111111111",
                     "session_id": format!("33333333-3333-3333-3333-{:012}", i),
                 })
-                .to_string(),
-                last: Mutex::new(None),
+                .to_string();
+                Session {
+                    history: big_body_bytes
+                        .map(|bytes| History::generate(bytes, 1_000 + i as u64, &user_id)),
+                    user_id,
+                    last: Mutex::new(None),
+                }
             })
             .collect();
         Ok(Arc::new(Self {
@@ -128,7 +137,24 @@ impl Driver {
             Kind::CountTokens => "/v1/messages/count_tokens?beta=true",
             Kind::Streamed | Kind::Buffered => "/v1/messages?beta=true",
         };
-        let body = self.body(session, kind);
+        // Serialized before the clock starts, so the driver's own work is not the proxy's.
+        let body: Vec<u8> = match &session.history {
+            Some(history) => {
+                let last = session
+                    .last
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                history
+                    .body(
+                        last.as_ref().map(|(_id, signature)| signature.as_str()),
+                        kind == Kind::Streamed,
+                        kind == Kind::CountTokens,
+                    )
+                    .into_bytes()
+            }
+            None => self.body(session, kind).to_string().into_bytes(),
+        };
         let started = Instant::now();
         let sent = self
             .client
@@ -138,8 +164,9 @@ impl Driver {
             .header("anthropic-beta", BETAS.join(","))
             .header("user-agent", "claude-cli/2.1.300 (external, cli)")
             .header("x-app", "cli")
+            .header("content-type", "application/json")
             .header(TAG_HEADER, tag.to_string())
-            .json(&body)
+            .body(body)
             .send()
             .await;
         let mut response = match sent {

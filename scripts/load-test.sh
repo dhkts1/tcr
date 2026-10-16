@@ -3,12 +3,14 @@
 #
 # Usage: scripts/load-test.sh [options]
 #
-#   --phases LIST       comma-separated, from overhead,steady,peak,runaway (default: all four)
+#   --phases LIST       comma-separated, from overhead,steady,peak,runaway,big1m,big4m
+#                       (default: all six)
 #   --overhead S        seconds of the overhead phase (default 20)
 #   --steady S          seconds of the steady phase (default 75: covers fifteen 5 s cache
 #                       saves and one 60 s bound-token save)
 #   --peak S            seconds of the peak phase (default 30: six bursts)
 #   --runaway S         seconds of the runaway phase (default 20)
+#   --big S             seconds of each big-body phase, big1m and big4m (default 20)
 #   --reply-ms MS       the stub's reply time in the throttled phases (default 300)
 #   --body-kb KB        each request's system prompt size (default 32)
 #   --profile-ms MS     `sample` interval for the flame graphs (default 10; 1 ms costs the
@@ -24,11 +26,12 @@
 # connect guard (tests/support/connect_guard.c).
 set -euo pipefail
 
-phases="overhead,steady,peak,runaway"
+phases="overhead,steady,peak,runaway,big1m,big4m"
 overhead_s=20
 steady_s=75
 peak_s=30
 runaway_s=20
+big_s=20
 reply_ms=300
 body_kb=32
 profile=1
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
     --steady) steady_s="$2"; shift 2 ;;
     --peak) peak_s="$2"; shift 2 ;;
     --runaway) runaway_s="$2"; shift 2 ;;
+    --big) big_s="$2"; shift 2 ;;
     --reply-ms) reply_ms="$2"; shift 2 ;;
     --body-kb) body_kb="$2"; shift 2 ;;
     --profile-ms) profile_ms="$2"; shift 2 ;;
@@ -51,7 +55,7 @@ while [ $# -gt 0 ]; do
     --per-thread-svg) per_thread_svg=1; shift ;;
     --skip-build) build=0; shift ;;
     --out) out="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "load-test: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -110,6 +114,7 @@ duration_of() {
     steady) echo "$steady_s" ;;
     peak) echo "$peak_s" ;;
     runaway) echo "$runaway_s" ;;
+    big1m|big4m) echo "$big_s" ;;
     *) echo "load-test: unknown phase $1" >&2; exit 2 ;;
   esac
 }
@@ -117,9 +122,9 @@ duration_of() {
 IFS=',' read -r -a phase_list <<< "$phases"
 for phase in "${phase_list[@]}"; do
   duration="$(duration_of "$phase")"
-  # The overhead phase measures the proxy alone, so its stub answers at once.
+  # The closed-loop phases measure the proxy alone, so their stub answers at once.
   phase_reply=$reply_ms
-  [ "$phase" = overhead ] && phase_reply=0
+  case "$phase" in overhead|big1m|big4m) phase_reply=0 ;; esac
   args=(phase --phase "$phase" --tcr "$tcr" --guard "$guard" --scratch "$scratch/$phase"
         --out "$out" --duration "$duration" --reply-ms "$phase_reply" --body-kb "$body_kb")
   [ "$profile" = 1 ] && args+=(--profile-ms "$profile_ms")
@@ -143,6 +148,6 @@ for phase in "${phase_list[@]}"; do
 done
 
 sha="$(git -C "$repo" rev-parse --short HEAD)"
-meta="tcr ${sha}, $(date -u +%Y-%m-%dT%H:%M:%SZ), $(sysctl -n hw.ncpu) cores, $(sysctl -n hw.model); phases ${phases}; durations overhead ${overhead_s}s steady ${steady_s}s peak ${peak_s}s runaway ${runaway_s}s; stub reply ${reply_ms} ms; body ${body_kb} KiB; sample every $([ "$profile" = 1 ] && echo "${profile_ms} ms" || echo "never")"
+meta="tcr ${sha}, $(date -u +%Y-%m-%dT%H:%M:%SZ), $(sysctl -n hw.ncpu) cores, $(sysctl -n hw.model); phases ${phases}; durations overhead ${overhead_s}s steady ${steady_s}s peak ${peak_s}s runaway ${runaway_s}s big ${big_s}s; stub reply ${reply_ms} ms; body ${body_kb} KiB; sample every $([ "$profile" = 1 ] && echo "${profile_ms} ms" || echo "never")"
 "$driver" report --out "$out" --meta "$meta"
 echo "load-test: done, $out/report.md" >&2

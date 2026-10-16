@@ -114,9 +114,15 @@ async fn handle(
     match (method.as_str(), path) {
         ("POST", "/v1/messages") => {
             note_arrival(&stub, tag, start);
-            let streamed = serde_json::from_slice::<Value>(&body)
+            // A peek at `stream` alone: a multi-MB body built into a `Value` tree would cost
+            // the driver's process tens of milliseconds a request in the big-body phases.
+            #[derive(serde::Deserialize)]
+            struct StreamPeek {
+                stream: Option<bool>,
+            }
+            let streamed = serde_json::from_slice::<StreamPeek>(&body)
                 .ok()
-                .and_then(|v| v.get("stream").and_then(Value::as_bool))
+                .and_then(|p| p.stream)
                 .unwrap_or(false);
             if streamed {
                 streamed_reply(stub, tag, start, n)
