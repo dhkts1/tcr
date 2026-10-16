@@ -170,6 +170,11 @@ fn scratch_env(
         .env("TCR_TEST_DENIED_PORT", denied_port.to_string())
         .env("TCR_TEST_CONNECT_LOG", attempts)
         .current_dir(home);
+    // The one setting passed through from the operator's environment: how many tokio worker
+    // threads the proxy runs, so a run can compare worker counts on one binary.
+    if let Ok(workers) = std::env::var("TOKIO_WORKER_THREADS") {
+        command.env("TOKIO_WORKER_THREADS", workers);
+    }
 }
 
 /// Prove the connect guard interposes on THIS binary before trusting it: run `tcr status`
@@ -444,6 +449,22 @@ pub fn peak_footprint_mb(pid: u32) -> anyhow::Result<f64> {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// How many threads the process has now, from `ps -M` (one line per thread under a header).
+pub fn thread_count(pid: u32) -> anyhow::Result<usize> {
+    let output = Command::new("/bin/ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .context("running ps -M")?;
+    if !output.status.success() {
+        bail!("ps -M -p {pid} exited {}", output.status);
+    }
+    let lines = String::from_utf8_lossy(&output.stdout).lines().count();
+    lines
+        .checked_sub(1)
+        .filter(|n| *n > 0)
+        .with_context(|| format!("ps -M -p {pid} listed no thread"))
 }
 
 /// `Physical footprint (peak):  49.1M` in MiB.

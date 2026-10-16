@@ -261,12 +261,21 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[spid]),
             true,
-            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_disk_usage(),
         );
-        sys.process(spid)
-            .map(|p| (p.accumulated_cpu_time(), p.memory()))
+        sys.process(spid).map(|p| {
+            (
+                p.accumulated_cpu_time(),
+                p.memory(),
+                p.disk_usage().total_written_bytes,
+            )
+        })
     };
-    let (cpu0, rss_boot) = refresh(&mut sys).context("the test proxy vanished before the phase")?;
+    let (cpu0, rss_boot, disk0) =
+        refresh(&mut sys).context("the test proxy vanished before the phase")?;
     let load0 = System::load_average();
     // The proxy writes its log on a background thread fed by a queue (`src/file_log.rs`), so the
     // warm-up's last `request usage` lines can land a moment after its replies. Read the offset
@@ -343,7 +352,11 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     };
 
     let started = Instant::now();
-    let (records, unfinished) = if a.phase.closed_loop() {
+    let (records, unfinished) = if a.phase == Phase::Idle {
+        // Nothing is sent: the proxy's own timers are all that run.
+        tokio::time::sleep(Duration::from_secs_f64(a.duration)).await;
+        (Vec::new(), 0)
+    } else if a.phase.closed_loop() {
         driver
             .run_closed(sessions, Duration::from_secs_f64(a.duration), a.seed)
             .await
@@ -355,8 +368,9 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     };
     let elapsed = started.elapsed();
 
-    let (cpu1, _) = refresh(&mut sys).context("the test proxy vanished during the phase")?;
+    let (cpu1, _, disk1) = refresh(&mut sys).context("the test proxy vanished during the phase")?;
     let load1 = System::load_average();
+    let threads = tokio::task::spawn_blocking(move || harness::thread_count(pid)).await??;
     stop.store(true, Ordering::Relaxed);
     if sampler.join().is_err() {
         bail!("the RSS sampler panicked");
@@ -380,6 +394,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
         .get(log_offset..)
         .context("the proxy's log shrank during the phase")?;
     let waits = stats::throttle_waits(phase_log);
+    let info_messages = stats::info_messages(phase_log);
     // The whole log beside the report, ending with the shutdown.
     std::fs::write(a.out.join(format!("{name}.proxy.log")), &log)?;
 
@@ -460,6 +475,10 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
         live_path_mentions,
         profile_interval_ms: a.profile,
         big_body_bytes: a.phase.big_body_bytes(),
+        disk_written_bytes: Some(disk1.saturating_sub(disk0)),
+        threads: Some(threads),
+        info_lines: Some(info_messages.values().sum()),
+        info_messages,
     })
 }
 
@@ -507,7 +526,7 @@ fn write_report(out: &Path, meta: &str) -> anyhow::Result<()> {
 
 fn spread_table(runs: &[PathBuf]) -> anyhow::Result<String> {
     let mut md = String::from(
-        "Each cell is min / median / max across the runs.\n\n| phase | served | CPU s / 1k req | CPU % of a core | added ms p50 | added ms p99 | peak footprint MB | load 1m at start |\n|---|---|---|---|---|---|---|---|\n",
+        "Each cell is min / median / max across the runs.\n\n| phase | served | CPU s / 1k req | CPU % of a core | CPU s / min | disk MB written | threads | INFO lines / req | added ms p50 | added ms p99 | peak footprint MB | load 1m at start |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for phase in Phase::ALL {
         let mut rows = Vec::new();
@@ -533,11 +552,15 @@ fn spread_table(runs: &[PathBuf]) -> anyhow::Result<String> {
             })
         };
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             phase.as_str(),
             fig(&|r| Some(r.served as f64)),
             fig(&|r| r.cpu_s_per_1k),
             fig(&|r| (r.wall_s > 0.0).then(|| r.cpu_seconds / r.wall_s * 100.0)),
+            fig(&|r| r.cpu_s_per_minute()),
+            fig(&|r| r.disk_written_mb()),
+            fig(&|r| r.threads.map(|t| t as f64)),
+            fig(&|r| r.info_lines_per_request()),
             fig(&|r| r.added_ms.map(|s| s.p50)),
             fig(&|r| r.added_ms.map(|s| s.p99)),
             fig(&|r| Some(r.peak_footprint_mb)),

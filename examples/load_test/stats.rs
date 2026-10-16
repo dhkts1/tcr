@@ -1,6 +1,6 @@
 //! The arithmetic the report rests on, kept apart from the I/O so each piece has a test.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -213,6 +213,26 @@ pub fn throttle_waits(log: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The INFO lines in `log`, counted by message: the words after the target up to the first
+/// `key=value` field. What the default log filter writes, line for line.
+pub fn info_messages(log: &str) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for line in log.lines() {
+        let Some((_, rest)) = line.split_once(" INFO ") else {
+            continue;
+        };
+        let Some((_, rest)) = rest.split_once(": ") else {
+            continue;
+        };
+        let message: Vec<&str> = rest
+            .split(' ')
+            .take_while(|word| !word.contains('='))
+            .collect();
+        *out.entry(message.join(" ")).or_insert(0) += 1;
+    }
+    out
+}
+
 /// The unsigned value of `key=` in one `tracing` fmt line.
 fn field(line: &str, key: &str) -> Option<u64> {
     let marker = format!(" {key}=");
@@ -372,6 +392,20 @@ mod tests {
             "2026-10-16T10:00:01Z  INFO tcr::proxy: request usage account=b throttle_ms=0 upstream_ms=2\n",
         );
         assert_eq!(throttle_waits(log), vec![120, 0]);
+    }
+
+    #[test]
+    fn info_messages_count_info_lines_by_message() {
+        let log = concat!(
+            "2026-10-16T10:00:00Z  INFO tcr::proxy: request usage account=a throttle_ms=0\n",
+            "2026-10-16T10:00:00Z DEBUG tcr::manager::snapshot: serving request account=a\n",
+            "2026-10-16T10:00:01Z  INFO tcr::proxy: request usage account=b throttle_ms=0\n",
+            "2026-10-16T10:00:01Z  INFO tcr::proxy: upstream response account_index=0 status=429\n",
+        );
+        let counts = info_messages(log);
+        assert_eq!(counts.get("request usage"), Some(&2));
+        assert_eq!(counts.get("upstream response"), Some(&1));
+        assert_eq!(counts.values().sum::<usize>(), 3, "{counts:?}");
     }
 
     #[test]
