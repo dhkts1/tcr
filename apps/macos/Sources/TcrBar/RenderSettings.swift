@@ -175,6 +175,30 @@ enum RenderSettings {
             }
         }
 
+        // The editable Rotation and Limits rows in their two states, nothing
+        // waiting and two changes waiting, over a fleet with no groups so the
+        // Rotation section starts near the top. Each is captured at the top
+        // (Rotation) and scrolled to the bottom (Limits and the waiting line);
+        // the printed document heights of the two states are the "nothing
+        // moves" check.
+        for (state, settings) in [
+            ("none-waiting", nothingWaitingConfigSettings), ("two-waiting", twoWaitingConfigSettings),
+        ] {
+            for bottom in [false, true] {
+                for appearance in Appearance.allCases {
+                    attempted += 1
+                    if render(
+                        .groupsRotation, appearance: appearance, fleet: Fleet(accounts: []),
+                        config: .settings(settings),
+                        nameSuffix: "-settings-\(state)-\(bottom ? "bottom" : "top")",
+                        scrollToBottom: bottom, into: directory)
+                    {
+                        written += 1
+                    }
+                }
+            }
+        }
+
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
     }
@@ -190,6 +214,45 @@ enum RenderSettings {
         accountThrottle: ConfigThrottle(minSpacingMs: 350, burst: 24),
         fleetThrottle: ConfigThrottle(minSpacingMs: 100, burst: 32), pacing: nil,
         usageRetentionDays: 30, http1Only: false)
+
+    /// The mockup's values: the shipped defaults with two edits saved
+    /// (switch threshold 95% to 90%, pacing on at 4), and a running proxy
+    /// still on the defaults, so two rows wait and the line counts two.
+    static let twoWaitingConfigSettings = ConfigSettings(
+        configPath: "/Users/alice/.config/tcr.json", switchThreshold: 0.9,
+        controlReserve: 0.05, fableWeeklyThreshold: 0.9, fableWeeklyThresholdFollows: true,
+        resetUrgencyTierHours: 24, sessionAffinity: true, controlAccount: "alice@example.com",
+        controlPooled: false, accountThrottle: ConfigThrottle(minSpacingMs: 350, burst: 24),
+        fleetThrottle: ConfigThrottle(minSpacingMs: 100, burst: 32),
+        pacing: ConfigPacing(maxInFlightPerAccount: 4, minSpacingMs: nil),
+        usageRetentionDays: 90, http1Only: false, running: shippedDefaults)
+
+    /// The same saved values with a running proxy that already uses them.
+    static let nothingWaitingConfigSettings = ConfigSettings(
+        configPath: "/Users/alice/.config/tcr.json", switchThreshold: 0.9,
+        controlReserve: 0.05, fableWeeklyThreshold: 0.9, fableWeeklyThresholdFollows: true,
+        resetUrgencyTierHours: 24, sessionAffinity: true, controlAccount: "alice@example.com",
+        controlPooled: false, accountThrottle: ConfigThrottle(minSpacingMs: 350, burst: 24),
+        fleetThrottle: ConfigThrottle(minSpacingMs: 100, burst: 32),
+        pacing: ConfigPacing(maxInFlightPerAccount: 4, minSpacingMs: nil),
+        usageRetentionDays: 90, http1Only: false,
+        running: ConfigSettings(
+            configPath: "/Users/alice/.config/tcr.json", switchThreshold: 0.9,
+            controlReserve: 0.05, fableWeeklyThreshold: 0.9, fableWeeklyThresholdFollows: true,
+            resetUrgencyTierHours: 24, sessionAffinity: true, controlAccount: "alice@example.com",
+            controlPooled: false, accountThrottle: ConfigThrottle(minSpacingMs: 350, burst: 24),
+            fleetThrottle: ConfigThrottle(minSpacingMs: 100, burst: 32),
+            pacing: ConfigPacing(maxInFlightPerAccount: 4, minSpacingMs: nil),
+            usageRetentionDays: 90, http1Only: false))
+
+    /// What `tcr config show --json` reports for an empty file.
+    private static let shippedDefaults = ConfigSettings(
+        configPath: "/Users/alice/.config/tcr.json", switchThreshold: 0.95,
+        controlReserve: 0.05, fableWeeklyThreshold: 0.95, fableWeeklyThresholdFollows: true,
+        resetUrgencyTierHours: 24, sessionAffinity: true, controlAccount: "alice@example.com",
+        controlPooled: false, accountThrottle: ConfigThrottle(minSpacingMs: 350, burst: 24),
+        fleetThrottle: ConfigThrottle(minSpacingMs: 100, burst: 32), pacing: nil,
+        usageRetentionDays: 90, http1Only: false)
 
     /// Two groups — one parked, one not — so the Groups & Rotation pane shows
     /// both a real member count and a real parked toggle state, the same way
@@ -260,7 +323,8 @@ enum RenderSettings {
     /// The Advanced disclosure is closed in this scene (it is `@State` and no
     /// render run opens it), so nothing below the fold is lost by not growing:
     /// what the grown window used to reveal was the pane's own overflow.
-    private static func windowSize(for tab: SettingsTab, sheet: SheetScene?) -> NSSize {        // A SHEET capture is not the fit claim. The mockup measures scene 63's
+    private static func windowSize(for tab: SettingsTab, sheet: SheetScene?) -> NSSize {
+        // A SHEET capture is not the fit claim. The mockup measures scene 63's
         // card at 844.61 pt and says the window grows to hold it, which is
         // what a macOS sheet does; capturing it in the 540 pt pane window
         // would clip the bottom of the sheet and the PNG would be a picture of
@@ -352,7 +416,7 @@ enum RenderSettings {
     private static func render(
         _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil, fleet: Fleet,
         config: ConfigSettingsCommand.Reading = .settings(fixtureConfigSettings),
-        nameSuffix: String = "", into directory: URL
+        nameSuffix: String = "", scrollToBottom: Bool = false, into directory: URL
     ) -> Bool {
         // Two appearances, two mechanisms: `NSApp.appearance` is what the window
         // and its title bar adopt, and the DRAWING appearance is what every
@@ -370,7 +434,7 @@ enum RenderSettings {
         return withDrawingAppearance(appearance.nsAppearance) {
             renderUnderCurrentAppearance(
                 tab, appearance: appearance, sheet: sheet, fleet: fleet, config: config,
-                nameSuffix: nameSuffix, into: directory)
+                nameSuffix: nameSuffix, scrollToBottom: scrollToBottom, into: directory)
         }
     }
 
@@ -384,7 +448,8 @@ enum RenderSettings {
     @MainActor
     private static func renderUnderCurrentAppearance(
         _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, fleet: Fleet,
-        config: ConfigSettingsCommand.Reading, nameSuffix: String, into directory: URL
+        config: ConfigSettingsCommand.Reading, nameSuffix: String, scrollToBottom: Bool,
+        into directory: URL
     ) -> Bool {
         let dependencies = SettingsDependencies(
             poller: StatusPoller(pinnedState: .loaded(fleet), lastPollAt: Date()),
@@ -510,6 +575,32 @@ enum RenderSettings {
             for _ in 0..<3 {
                 RunLoop.current.run(until: Date().addingTimeInterval(0.05))
             }
+        }
+
+        // The editable-settings captures: scrolled to the document's bottom, so
+        // Limits and the waiting line are in frame. The document height is
+        // printed for EVERY such capture, top and bottom, because the two
+        // states printing one height is the check that nothing moved.
+        if nameSuffix.hasPrefix("-settings-"), let contentView = window.contentView,
+            let scroll = paneScrollView(in: contentView)
+        {
+            let documentHeight = scroll.documentView?.frame.height ?? 0
+            let restingY = scroll.contentView.bounds.origin.y
+            let viewportHeight = scroll.contentView.frame.height + restingY
+            let offset = scrollToBottom ? max(0, documentHeight - viewportHeight) : 0
+            if scrollToBottom {
+                scroll.contentView.scroll(
+                    to: NSPoint(
+                        x: 0, y: RenderScrollTarget.clipOrigin(restingY: restingY, offset: offset)))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                for _ in 0..<3 {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                }
+            }
+            print(
+                "  \(tab.rawValue)\(nameSuffix)-\(appearance.rawValue): document "
+                    + "\(String(format: "%.1f", documentHeight)) pt, viewport \(Int(viewportHeight)) pt, "
+                    + "scrolled to \(String(format: "%.1f", offset)) pt")
         }
 
         // A sheet scene is named for the SHEET, not for the pane behind it.

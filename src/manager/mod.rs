@@ -974,6 +974,16 @@ impl ControlPersist {
     }
 }
 
+/// Why [`Manager::persist_setting`] saved nothing. Both arms mean the setting
+/// is nowhere: unlike a disable, there is no in-memory half that took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingPersistError {
+    /// No config file behind this manager (`tcr demo`, tests).
+    NoConfigFile,
+    /// Reading or writing the file failed; the error, in words.
+    WriteFailed(String),
+}
+
 /// What [`Manager::add_or_update_account`] achieved about DURABILITY. Same role
 /// as [`DisablePersist`], deliberately simpler: an upsert either lands or it does
 /// not, and there is no "no such account" / "no config entry" arm here — a MISS
@@ -3408,6 +3418,51 @@ impl Manager {
             name: Some(name),
             persist: self.set_control(Some(idx)),
         }
+    }
+
+    /// Persist one `tcr config set` setting to the config file, for the
+    /// [`crate::proxy::CONFIG_PATH`] route.
+    ///
+    /// The FILE only, never `self.config`: see [`crate::config_set`] for why
+    /// changing the in-memory copy would switch three of these keys on halfway.
+    /// What this process runs keeps being what it booted with, which is what
+    /// [`Self::running_settings`] reports, and the difference is what TcrBar
+    /// counts as waiting for a restart.
+    ///
+    /// Under `config_write`, the lock every other writer of this file in this
+    /// process holds across its whole read-modify-rename (INV1 on
+    /// [`Self::persist_control`]), so a token rotation landing at the same
+    /// moment cannot drop this key, nor this write drop its token.
+    pub fn persist_setting(
+        &self,
+        setting: &crate::config_set::Setting,
+    ) -> Result<crate::config_set::SettingWrite, SettingPersistError> {
+        let Some(path) = &self.config_path else {
+            return Err(SettingPersistError::NoConfigFile);
+        };
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        crate::config_set::save_setting(path, setting).map_err(|err| {
+            tracing::error!(
+                error = %err,
+                key = %setting.key(),
+                path = %path.display(),
+                "failed to persist a config setting"
+            );
+            SettingPersistError::WriteFailed(err.to_string())
+        })
+    }
+
+    /// The rotation and limit settings this process is running: its boot-time
+    /// snapshot, read through the same [`crate::config_show::ConfigSettings`]
+    /// constructor `tcr config show` reads the file with, so a key compares
+    /// equal on both sides exactly when the running value is the saved one.
+    pub fn running_settings(&self) -> crate::config_show::ConfigSettings {
+        let path = self.config_path.clone().unwrap_or_default();
+        let config = self.config.lock().expect("config lock poisoned");
+        crate::config_show::ConfigSettings::from_config(&config, &path)
     }
 
     /// Record which account actually served the most recent request, and that it is now the

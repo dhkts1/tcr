@@ -2822,7 +2822,7 @@ pub fn save_tokens_for(
 /// `Value`) is deliberate: a file that is valid JSON but not an object — `[]`,
 /// `null`, a half-written fragment — must take the malformed fallback rather
 /// than be written back verbatim with the fresh tokens silently dropped.
-fn read_document(path: &Path) -> Result<Map<String, Value>, ConfigError> {
+pub(crate) fn read_document(path: &Path) -> Result<Map<String, Value>, ConfigError> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 

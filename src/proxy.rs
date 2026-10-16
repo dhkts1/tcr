@@ -1048,6 +1048,26 @@ pub const PRIORITY_PATH: &str = "/_tcr/accounts/priority";
 /// can tell which mutating route answered.
 pub const PRIORITY_ENDPOINT: &str = "accounts-priority";
 
+/// Path of the settings endpoint behind `tcr config`: `GET` reports the
+/// rotation and limit settings this process is running ([`config_get_handler`]),
+/// `POST` saves one to the config file ([`config_set_handler`]).
+///
+/// The `POST` exists because a running proxy owns its config file: its token
+/// rotations and `tcr disable` writes are read-modify-writes under a lock in
+/// this process, and a second process writing the same file outside that lock
+/// can lose a change to an interleaved write. So `tcr config set` hands the
+/// setting here when a proxy answers, the same posture as `tcr disable` and
+/// `tcr control`.
+///
+/// Same shape as [`DISABLED_PATH`] and for the same reasons: registered as a
+/// real route so axum matches it exactly and BEFORE the catch-all, and gated by
+/// [`local_endpoint_gate`] plus, for the `POST`, the `application/json`
+/// requirement.
+pub const CONFIG_PATH: &str = "/_tcr/config";
+
+/// The [`ENDPOINT_HEADER`] value both halves of [`CONFIG_PATH`] stamp.
+pub const CONFIG_ENDPOINT: &str = "config";
+
 /// Body cap for the local control route: a JSON object with three short fields.
 /// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
 /// route buffers into memory in a credential-holding process, and nothing
@@ -1604,6 +1624,12 @@ pub fn app(manager: Arc<Manager>) -> Router {
         .route(
             PRIORITY_PATH,
             axum::routing::post(set_priority_handler).fallback(priority_method_not_allowed),
+        )
+        .route(
+            CONFIG_PATH,
+            axum::routing::get(config_get_handler)
+                .post(config_set_handler)
+                .fallback(config_method_not_allowed),
         )
         .fallback(handle)
         .with_state(manager)
@@ -2232,6 +2258,152 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             headers.insert("cache-control", HeaderValue::from_static("no-store"));
             stamp_priority_endpoint(response)
+        }
+    }
+}
+
+/// The request body of a `POST` to [`CONFIG_PATH`]: the key as the file spells
+/// it and the value in the words `tcr config set` takes
+/// ([`crate::config_set::Setting::parse`]).
+#[derive(serde::Deserialize)]
+struct SetConfigRequest {
+    key: Option<String>,
+    value: Option<String>,
+}
+
+/// The 200 body of a `POST` to [`CONFIG_PATH`]. Deserializable too, because
+/// `tcr config set` reads it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SetConfigResponse {
+    /// The key as the file spells it.
+    pub key: String,
+    /// The value saved, in [`crate::config_set::Setting::value_text`]'s words.
+    pub value: String,
+    /// Whether the file changed; `false` when it already said this.
+    pub changed: bool,
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the settings route produced.
+fn stamp_config_endpoint(response: Response) -> Response {
+    stamp_endpoint_as(response, CONFIG_ENDPOINT)
+}
+
+/// A method other than `GET` or `POST` on [`CONFIG_PATH`]: a local 405.
+async fn config_method_not_allowed() -> Response {
+    stamp_config_endpoint(error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr settings endpoint takes GET or POST.",
+        None,
+    ))
+}
+
+/// A JSON 200, stamped as the settings route's.
+fn config_json_response<T: serde::Serialize>(payload: &T) -> Response {
+    let Ok(body) = serde_json::to_string(payload) else {
+        return stamp_config_endpoint(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "Could not serialize the settings result.",
+            None,
+        ));
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    stamp_config_endpoint(response)
+}
+
+/// `GET /_tcr/config`: the settings this process is running
+/// ([`Manager::running_settings`]), the `running` half of `tcr config show`.
+/// A read, gated like [`quota_handler`]; the refusal is not stamped, so a
+/// caller that failed the gate learns nothing about the route.
+async fn config_get_handler(
+    State(manager): State<Arc<Manager>>,
+    parts: axum::http::request::Parts,
+) -> Response {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "config") {
+        return refusal;
+    }
+    config_json_response(&manager.running_settings())
+}
+
+/// `POST /_tcr/config`: save one setting to the config file, for `tcr config
+/// set`. Cloned from [`set_priority_handler`]'s gate order. The value is parsed
+/// here again by the same [`crate::config_set::Setting::parse`] the CLI ran,
+/// so this route refuses what the CLI refuses, in the same words, whoever
+/// calls it. The work is [`Manager::persist_setting`], which writes the file
+/// and leaves what this process runs alone.
+///
+/// Every refusal is a stamped 400 or 409, which `tcr config set` reads as
+/// "the proxy said no" and writes nothing.
+async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "config") {
+        // NOT stamped: see `set_disabled_handler`'s identical comment.
+        return refusal;
+    }
+    if !is_json_content_type(&parts.headers) {
+        return stamp_config_endpoint(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "The tcr settings endpoint requires Content-Type: application/json.",
+            None,
+        ));
+    }
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return stamp_config_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+            None,
+        ));
+    };
+    let Some(SetConfigRequest {
+        key: Some(key),
+        value: Some(value),
+    }) = parse_object::<SetConfigRequest>(&bytes)
+    else {
+        return stamp_config_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object: {\"key\": \"switchThreshold\", \"value\": \"0.9\"}.",
+            None,
+        ));
+    };
+    let setting = match crate::config_set::Setting::parse(&key, &value) {
+        Ok(setting) => setting,
+        Err(refusal) => {
+            return stamp_config_endpoint(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &refusal.to_string(),
+                None,
+            ))
+        }
+    };
+    match manager.persist_setting(&setting) {
+        Ok(write) => config_json_response(&SetConfigResponse {
+            key: setting.key().as_str().to_string(),
+            value: setting.value_text(),
+            changed: write == crate::config_set::SettingWrite::Updated,
+        }),
+        Err(crate::manager::SettingPersistError::NoConfigFile) => {
+            stamp_config_endpoint(error_response(
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "This proxy was started without a config file, so it has nowhere to save a setting. Nothing was changed.",
+                None,
+            ))
+        }
+        Err(crate::manager::SettingPersistError::WriteFailed(why)) => {
+            stamp_config_endpoint(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                &format!("The proxy could not write its config file: {why}"),
+                None,
+            ))
         }
     }
 }
@@ -15394,6 +15566,9 @@ mod tests {
             // its near-misses stay here.
             (Method::POST, "/_tcr/accounts/priorities"),
             (Method::POST, "/_tcr/accounts/priority/extra"),
+            // `/_tcr/config` is a route (CONFIG_PATH); its near-misses stay here.
+            (Method::POST, "/_tcr/configs"),
+            (Method::POST, "/_tcr/config/extra"),
             // The bare path IS registered (ADD_ACCOUNT_PATH) — a `GET` on it
             // gets a local 405, not a 404 like every other row here — but it
             // belongs in this table anyway for the assertion this table makes
@@ -15444,6 +15619,69 @@ mod tests {
             0,
             "no `/_tcr/…` request may ever reach an upstream"
         );
+    }
+
+    /// `/_tcr/config` answers locally on every verb: a `GET` with the settings
+    /// this process runs, stamped as the route; a refused value with a stamped
+    /// 400 naming the key; a `PUT` with a stamped 405. None of them reaches the
+    /// upstream, and a refused value writes nothing (there is no file here).
+    #[tokio::test]
+    async fn the_config_route_answers_locally_and_stamps_every_answer() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::GET,
+            CONFIG_PATH,
+            Some(loopback_peer()),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(CONFIG_ENDPOINT)
+        );
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        let running: crate::config_show::ConfigSettings =
+            serde_json::from_slice(&body).expect("the running settings");
+        assert_eq!(running, manager.running_settings());
+
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            CONFIG_PATH,
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"key": "controlReserve", "value": "0.9"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(ENDPOINT_HEADER).is_some());
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("controlReserve takes"), "{text}");
+
+        let (status, _) = drive(
+            Arc::clone(&manager),
+            Method::PUT,
+            CONFIG_PATH,
+            Some(loopback_peer()),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// The traversal table, end to end, against the fake upstream that reports what
