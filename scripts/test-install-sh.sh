@@ -141,16 +141,72 @@ export TCR_DMG_URL_BASE="http://127.0.0.1:${PORT}/releases/download"
 export TCR_DMG_INSTALL_SCRIPT_URL="http://127.0.0.1:${PORT}/install-tcrbar-from-dmg.sh"
 export PATH="$FAKEBIN:$PATH"
 
-echo "==> running install.sh piped through sh, from an empty directory ($RUN_DIR)…"
-cd "$RUN_DIR" || exit 1
-cat "$INSTALL_SH" | "${TCR_TEST_SHELL:-sh}"
-install_rc=$?
-echo "install.sh exit: $install_rc"
+# A fake `open` records its argv and a fake `launchctl` answers managername.
+# Both sit first on PATH, so the real TcrBar is never launched: every case
+# also asserts the recorded call came from THIS fake, via the marker file.
+cat > "$FAKEBIN/open" <<'EOF2'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_OPEN_LOG"
+exit "${FAKE_OPEN_RC:-0}"
+EOF2
+cat > "$FAKEBIN/launchctl" <<'EOF2'
+#!/bin/sh
+[ "$1" = "managername" ] && echo "${FAKE_MANAGER:-Aqua}"
+exit 0
+EOF2
+chmod +x "$FAKEBIN/open" "$FAKEBIN/launchctl"
+export FAKE_OPEN_LOG="$WORKDIR/open.log"
 
-if [ -d "${APPLICATIONS_DIR}/${APP_NAME}.app" ]; then
-  echo "PASS: ${APPLICATIONS_DIR}/${APP_NAME}.app exists"
-  exit 0
-else
-  echo "FAIL: ${APPLICATIONS_DIR}/${APP_NAME}.app was not created" >&2
+# A dmg-install script that always fails, for the failing-app-step case.
+printf '#!/bin/sh\nexit 1\n' > "$SERVER_ROOT/failing-install.sh"
+
+FAILS=0
+check() { # name, ok(0/1), detail
+  if [ "$2" -eq 0 ]; then echo "PASS: $1"; else echo "FAIL: $1 ($3)" >&2; FAILS=$((FAILS + 1)); fi
+}
+
+# run_case <name> <script-url> [VAR=value ...]; leaves OUT, RC, OPENS set.
+run_case() {
+  name="$1"; script_url="$2"; shift 2
+  rm -rf "$APPLICATIONS_DIR/${APP_NAME}.app" "$FAKE_OPEN_LOG"
+  : > "$FAKE_OPEN_LOG"
+  echo "==> case: $name"
+  OUT="$(cd "$RUN_DIR" && env -u CI -u SSH_CONNECTION -u SSH_TTY -u TCR_NO_LAUNCH \
+    TCR_DMG_INSTALL_SCRIPT_URL="$script_url" "$@" "${TCR_TEST_SHELL:-sh}" < "$INSTALL_SH" 2>&1)"
+  RC=$?
+  OPENS="$(cat "$FAKE_OPEN_LOG")"
+  echo "$OUT" | sed 's/^/    | /'
+}
+
+GOOD_URL="$TCR_DMG_INSTALL_SCRIPT_URL"
+FAIL_URL="http://127.0.0.1:${PORT}/failing-install.sh"
+WANT_APP="$APPLICATIONS_DIR/${APP_NAME}.app"
+
+run_case "success opens the app" "$GOOD_URL"
+check "installs the app" "$([ -d "$WANT_APP" ]; echo $?)" "no $WANT_APP"
+check "exit 0" "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+check "fake open called with exactly the app path" "$([ "$OPENS" = "$WANT_APP" ]; echo $?)" "got '$OPENS'"
+check "says look for the menu-bar icon" "$(echo "$OUT" | grep -q 'icon at the top right'; echo $?)" "no hint"
+
+for skip in "TCR_NO_LAUNCH=1" "CI=true" "SSH_CONNECTION=1.2.3.4" "SSH_TTY=/dev/ttys000" "FAKE_MANAGER=Background"; do
+  run_case "skip on $skip" "$GOOD_URL" "$skip"
+  check "$skip: app still installed" "$([ -d "$WANT_APP" ]; echo $?)" "no app"
+  check "$skip: open not called" "$([ -z "$OPENS" ]; echo $?)" "open ran: $OPENS"
+  check "$skip: says Not opening" "$(echo "$OUT" | grep -q 'Not opening'; echo $?)" "no skip line"
+done
+
+run_case "failed open is a warning" "$GOOD_URL" FAKE_OPEN_RC=1
+check "failed open: exit 0" "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+check "failed open: warns" "$(echo "$OUT" | grep -q 'could not open'; echo $?)" "no warning"
+
+run_case "failing app step" "$FAIL_URL"
+check "failing step: nonzero exit" "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
+check "failing step: no Installed line" "$(echo "$OUT" | grep -q '^Installed:'; [ $? -ne 0 ]; echo $?)" "printed Installed"
+check "failing step: says it failed" "$(echo "$OUT" | grep -q 'install failed'; echo $?)" "no message"
+check "failing step: open not called" "$([ -z "$OPENS" ]; echo $?)" "open ran: $OPENS"
+
+if [ "$FAILS" -ne 0 ]; then
+  echo "$FAILS check(s) failed" >&2
   exit 1
 fi
+echo "all checks passed"

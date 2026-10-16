@@ -33,6 +33,9 @@ Env:
   TCR_SKIP_UI=1   Skip the TcrBar install step entirely (CLI only, all
                   platforms). Also honoured non-interactively so CI and
                   containers never try to touch /Applications.
+  TCR_NO_LAUNCH=1 Install TcrBar but do not open it afterwards. It is also not
+                  opened when CI is set, in an SSH session, or with no GUI
+                  login session.
   TCR_APPLICATIONS_DIR
                   Where TcrBar.app is installed and looked for (default
                   /Applications). Test-only — a real machine has exactly one.
@@ -166,9 +169,38 @@ if [ ! -f "$dmg_install_script" ]; then
   chmod +x "$dmg_install_script"
 fi
 TCR_APPLICATIONS_DIR="$APPLICATIONS_DIR" "$dmg_install_script" "$dmg_path"
+app_rc=$?
+if [ "$app_rc" -ne 0 ]; then
+  echo "" >&2
+  echo "${APP_NAME} install failed (exit $app_rc). The tcr CLI above did install; only the app step failed." >&2
+  exit "$app_rc"
+fi
 
 echo ""
 echo "Installed: ${APPLICATIONS_DIR}/${APP_NAME}.app"
+
+# Open the app so the user does not have to find it: Spotlight takes a while
+# to index a fresh install, and TcrBar has no Dock icon. Each skip below says
+# why in one line. A failed `open` is a warning, never a failed install.
+launch_skip_reason=""
+if [ "${TCR_NO_LAUNCH:-0}" = "1" ]; then
+  launch_skip_reason="TCR_NO_LAUNCH=1"
+elif [ -n "${CI:-}" ]; then
+  launch_skip_reason="CI is set"
+elif [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_TTY:-}" ]; then
+  launch_skip_reason="this is an SSH session"
+elif [ "$(launchctl managername 2>/dev/null)" != "Aqua" ]; then
+  launch_skip_reason="there is no GUI login session"
+fi
+
+if [ -n "$launch_skip_reason" ]; then
+  echo "==> Not opening ${APP_NAME}: ${launch_skip_reason}. Open it from ${APPLICATIONS_DIR}."
+elif open "${APPLICATIONS_DIR}/${APP_NAME}.app"; then
+  echo "==> Opened ${APP_NAME}. It is a menu-bar app: look for its icon at the top right of the screen."
+else
+  echo "warning: could not open ${APP_NAME}; open it from ${APPLICATIONS_DIR}." >&2
+fi
+
 echo "NOTE: ${APP_NAME} bundles its own tcr and prefers it over PATH, so"
 echo "      \`tcr status --json\` run from the app may report a different"
 echo "      build than \`which tcr\`."
