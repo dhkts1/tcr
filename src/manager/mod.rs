@@ -1371,9 +1371,10 @@ pub struct Manager {
     /// Positional like [`Self::affinity`], and for the same reason: the response path learns an
     /// index, and the request path needs an index to bench the rest of the fleet. The file half
     /// stores identities. Written from the response path, read from the request path; a plain
-    /// `std::sync::Mutex`, **never** held while the accounts lock is taken. The map keeps its own
-    /// mint order ([`bound_tokens::BoundTokenMap`]), so holding it full costs nothing per record.
-    bound_tokens: Mutex<bound_tokens::BoundTokenMap>,
+    /// set of independently locked parts ([`bound_tokens::BoundTokenStore`]), none of them **ever**
+    /// held while the accounts lock is taken. Each part keeps its own mint order
+    /// ([`bound_tokens::BoundTokenMap`]), so holding it full costs nothing per record.
+    bound_tokens: bound_tokens::BoundTokenStore,
     /// Set whenever [`Self::bound_tokens`] is mutated, cleared by the flusher task that writes
     /// it to disk — same debounce contract as [`Self::affinity_dirty`].
     bound_tokens_dirty: AtomicBool,
@@ -1752,7 +1753,7 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
             affinity_dirty: AtomicBool::new(false),
-            bound_tokens: Mutex::new(bound_tokens::BoundTokenMap::default()),
+            bound_tokens: bound_tokens::BoundTokenStore::default(),
             bound_tokens_dirty: AtomicBool::new(false),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),

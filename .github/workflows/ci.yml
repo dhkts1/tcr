@@ -415,7 +415,7 @@ jobs:
           RUSTDOCFLAGS: "-Zsanitizer=thread"
         run: |
           cargo +nightly test -Z build-std --target x86_64-unknown-linux-gnu \
-            concurrent_pacing_stress -- --test-threads=1 --nocapture
+            concurrent_pacing_stress -- concurrent_lock_stress --test-threads=1 --nocapture
 
   # miri (UB detection), best-effort/informational. Scoped to pure leaf modules
   # (no network/fs) since miri can't execute real I/O. continue-on-error keeps a

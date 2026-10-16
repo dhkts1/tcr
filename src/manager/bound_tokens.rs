@@ -43,7 +43,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use time::OffsetDateTime;
 
@@ -139,6 +139,263 @@ impl BoundTokenMap {
     }
 }
 
+/// How many independently locked parts [`ShardedBoundTokens`] splits the map into.
+pub(super) const BOUND_TOKEN_SHARDS: usize = 16;
+
+/// The shard a token hash lives in: the hash's first 32 bits when it is the hex digest
+/// [`bound_tokens::hash_token`] makes (uniform, so the shards fill evenly), and std's hasher
+/// over the whole string for anything else a restored file might hold.
+fn shard_of(hash: &str, shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let bits = hash
+        .get(..8)
+        .and_then(|head| u32::from_str_radix(head, 16).ok())
+        .map_or_else(
+            || {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                hash.hash(&mut hasher);
+                hasher.finish()
+            },
+            u64::from,
+        );
+    (bits % shards as u64) as usize
+}
+
+/// The bound-token map split into [`BOUND_TOKEN_SHARDS`] parts by token hash, each a
+/// [`BoundTokenMap`] behind its own mutex and bounded at its share of the cap.
+///
+/// The map used to sit behind one mutex, which every request's lookup and every response's
+/// record took: under load it was the proxy's largest lock wait once the log file's lock was
+/// gone (2026-10-16, 74 of 1,954 profile samples). A lookup or a record now locks only the part
+/// its token hashes to, so two requests wait on each other only when their tokens land in the
+/// same part.
+///
+/// Each part keeps #497's mint order, so bounding still costs the entries dropped and not a pass
+/// over the rest. What changes is WHICH entry goes at the cap: the oldest in the part the new
+/// token landed in, not the oldest in the whole map. The hash is uniform, so a part holds a
+/// near-even slice of every age: at the cap the entry dropped is among the oldest few percent
+/// of the map, and `eviction_at_the_cap_keeps_the_newest_nine_tenths` pins that every one of
+/// the newest 90% survives. Total entries never pass [`BOUND_TOKEN_CAP`], because the parts'
+/// caps add up to it. The TTL, too, is pruned per part, so a lookup also refuses an expired
+/// entry itself ([`Self::get`]).
+#[derive(Debug)]
+pub(super) struct ShardedBoundTokens {
+    shards: Box<[Mutex<BoundTokenMap>]>,
+    shard_cap: usize,
+}
+
+impl Default for ShardedBoundTokens {
+    fn default() -> Self {
+        Self::with_shards(BOUND_TOKEN_SHARDS)
+    }
+}
+
+impl ShardedBoundTokens {
+    /// `shards` parts sharing [`BOUND_TOKEN_CAP`]. One part is the single-lock map this
+    /// replaced, which is what the comparison bench runs it as.
+    pub(super) fn with_shards(shards: usize) -> Self {
+        let shards = shards.max(1);
+        Self {
+            shards: (0..shards).map(|_| Mutex::default()).collect(),
+            shard_cap: BOUND_TOKEN_CAP / shards,
+        }
+    }
+
+    fn shard(&self, hash: &str) -> std::sync::MutexGuard<'_, BoundTokenMap> {
+        self.shards[shard_of(hash, self.shards.len())]
+            .lock()
+            .expect("bound tokens shard lock poisoned")
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .expect("bound tokens shard lock poisoned")
+                    .len()
+            })
+            .sum()
+    }
+
+    /// `hash`'s entry, unless it is past the TTL. A record prunes only its own part, so an
+    /// expired entry can sit in a part no record has reached since; it is never honoured.
+    pub(super) fn get(&self, hash: &str) -> Option<Minted> {
+        let minted = self.shard(hash).get(hash)?;
+        (crate::now_ms().saturating_sub(minted.2) <= BOUND_TOKEN_TTL_MS).then_some(minted)
+    }
+
+    /// Set `hash`'s entry and bound its part: anything past the TTL, then the oldest past the
+    /// part's cap.
+    pub(super) fn record(&self, hash: &str, value: Minted, now_ms: i64) {
+        let mut shard = self.shard(hash);
+        shard.insert(hash, value);
+        shard.prune(now_ms, BOUND_TOKEN_TTL_MS, self.shard_cap);
+    }
+
+    /// Move `hash` to `value` only while it still names account `from`, checked and set under
+    /// one lock: a mint that landed since the caller read the entry is fresher than this.
+    pub(super) fn rebind(&self, hash: &str, from: usize, value: Minted, now_ms: i64) -> bool {
+        let mut shard = self.shard(hash);
+        if !shard.get(hash).is_some_and(|(idx, _, _)| idx == from) {
+            return false;
+        }
+        shard.insert(hash, value);
+        shard.prune(now_ms, BOUND_TOKEN_TTL_MS, self.shard_cap);
+        true
+    }
+
+    /// Set `hash`'s entry only when it has none, without bounding: restore's path, whose
+    /// entries were bounded when they were written.
+    pub(super) fn insert_if_absent(&self, hash: &str, value: Minted) {
+        self.shard(hash).insert_if_absent(hash, value);
+    }
+
+    /// Set `hash`'s entry without bounding, for a test that needs an entry the record path
+    /// would drop.
+    #[cfg(test)]
+    pub(super) fn insert_unbounded(&self, hash: &str, value: Minted) {
+        self.shard(hash).insert(hash, value);
+    }
+
+    /// Every entry, one part locked at a time: a save's copy, not a single instant's.
+    pub(super) fn entries(&self) -> Vec<(String, Minted)> {
+        let mut out = Vec::new();
+        for shard in &*self.shards {
+            let shard = shard.lock().expect("bound tokens shard lock poisoned");
+            out.extend(
+                shard
+                    .iter()
+                    .map(|(hash, minted)| (hash.to_string(), minted)),
+            );
+        }
+        out
+    }
+}
+
+/// The bound-token map as a [`dashmap::DashMap`], bounded in batches: the other design compared
+/// against [`ShardedBoundTokens`].
+///
+/// A lookup takes one internal shard's read lock and a record its write lock, so neither waits
+/// on the other unless they hit the same shard. A `DashMap` keeps no order, so #497's per-record
+/// eviction cannot pop the oldest entry. Instead the record that takes the map past the cap
+/// prunes a batch: it copies every mint time out, selects the oldest until the map is
+/// [`DASH_EVICT_BATCH`] under the cap, and removes those. That is a pass over the whole map, paid
+/// once per [`DASH_EVICT_BATCH`] records, and the order it evicts in is exact (oldest mint
+/// first, the TTL's first). The pass is behind a `try_lock`, so a record that finds one running
+/// skips it rather than waiting; the map can sit a few entries over the cap meanwhile.
+///
+/// The TTL is no longer pruned on every record, so a lookup filters an expired entry itself.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // only `bound_token_store_designs` drives it
+pub(super) struct DashBoundTokens {
+    by_hash: dashmap::DashMap<Arc<str>, Minted>,
+    len: std::sync::atomic::AtomicUsize,
+    evicting: Mutex<()>,
+}
+
+/// How far under [`BOUND_TOKEN_CAP`] one eviction pass of [`DashBoundTokens`] takes the map.
+#[allow(dead_code)]
+const DASH_EVICT_BATCH: usize = BOUND_TOKEN_CAP / 64;
+
+#[allow(dead_code)]
+impl DashBoundTokens {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn get(&self, hash: &str) -> Option<Minted> {
+        let minted = *self.by_hash.get(hash)?;
+        (crate::now_ms().saturating_sub(minted.2) <= BOUND_TOKEN_TTL_MS).then_some(minted)
+    }
+
+    fn set(&self, hash: &str, value: Minted) {
+        if self.by_hash.insert(Arc::from(hash), value).is_none() {
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn bound(&self, now_ms: i64) {
+        if self.len.load(Ordering::Relaxed) <= BOUND_TOKEN_CAP {
+            return;
+        }
+        let Ok(_pass) = self.evicting.try_lock() else {
+            return;
+        };
+        let mut all: Vec<(i64, Arc<str>)> = self
+            .by_hash
+            .iter()
+            .map(|entry| (entry.value().2, Arc::clone(entry.key())))
+            .collect();
+        let target = BOUND_TOKEN_CAP - DASH_EVICT_BATCH;
+        let expired = all
+            .iter()
+            .filter(|(minted, _)| now_ms.saturating_sub(*minted) > BOUND_TOKEN_TTL_MS)
+            .count();
+        let drop = all.len().saturating_sub(target).max(expired);
+        if drop == 0 {
+            return;
+        }
+        if drop < all.len() {
+            all.select_nth_unstable(drop - 1);
+        }
+        for (minted, hash) in all.into_iter().take(drop) {
+            if self
+                .by_hash
+                .remove_if(&hash, |_, &(_, _, at)| at == minted)
+                .is_some()
+            {
+                self.len.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn record(&self, hash: &str, value: Minted, now_ms: i64) {
+        self.set(hash, value);
+        self.bound(now_ms);
+    }
+
+    pub(super) fn rebind(&self, hash: &str, from: usize, value: Minted, now_ms: i64) -> bool {
+        let moved = match self.by_hash.get_mut(hash) {
+            Some(mut entry) if entry.0 == from => {
+                *entry = value;
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            self.bound(now_ms);
+        }
+        moved
+    }
+
+    pub(super) fn insert_if_absent(&self, hash: &str, value: Minted) {
+        if let dashmap::mapref::entry::Entry::Vacant(slot) = self.by_hash.entry(Arc::from(hash)) {
+            slot.insert(value);
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_unbounded(&self, hash: &str, value: Minted) {
+        self.set(hash, value);
+    }
+
+    pub(super) fn entries(&self) -> Vec<(String, Minted)> {
+        self.by_hash
+            .iter()
+            .map(|entry| (entry.key().to_string(), *entry.value()))
+            .collect()
+    }
+}
+
+/// The store `Manager` holds. Both designs have the same methods, so the comparison swaps them
+/// here.
+pub(super) type BoundTokenStore = ShardedBoundTokens;
+
 impl Manager {
     /// Flag the bound-token map as changed since the last flush — same relaxed-atomic debounce
     /// contract as [`Self::mark_affinity_dirty`].
@@ -167,18 +424,13 @@ impl Manager {
         if tokens.is_empty() {
             return;
         }
-        let mut map = self
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned");
         for (kind, token) in tokens {
-            map.insert(
+            self.bound_tokens.record(
                 &bound_tokens::hash_token(token),
                 (account_idx, *kind, now_ms),
+                now_ms,
             );
         }
-        map.prune(now_ms, BOUND_TOKEN_TTL_MS, BOUND_TOKEN_CAP);
-        drop(map);
         self.mark_bound_tokens_dirty();
     }
 
@@ -210,18 +462,12 @@ impl Manager {
         let hashes: Vec<String> = tokens.iter().map(|t| bound_tokens::hash_token(t)).collect();
         // Map lock first, copied out and dropped: the organization check below takes the
         // accounts lock, and the two are never held together (this module's doc).
-        let elsewhere: Vec<(usize, Minted)> = {
-            let map = self
-                .bound_tokens
-                .lock()
-                .expect("bound tokens lock poisoned");
-            hashes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, hash)| map.get(hash).map(|minted| (i, minted)))
-                .filter(|&(_, (idx, _, _))| idx != served_idx)
-                .collect()
-        };
+        let elsewhere: Vec<(usize, Minted)> = hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, hash)| self.bound_tokens.get(hash).map(|minted| (i, minted)))
+            .filter(|&(_, (idx, _, _))| idx != served_idx)
+            .collect();
         if elsewhere.is_empty() {
             return 0;
         }
@@ -247,21 +493,17 @@ impl Manager {
         if moves.is_empty() {
             return 0;
         }
-        let mut map = self
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned");
         let mut moved = 0;
         for (i, (from, kind, _)) in moves {
-            let hash = &hashes[i];
-            // Only the entry read above: a mint that landed in between is fresher than this.
-            if map.get(hash).is_some_and(|(idx, _, _)| idx == from) {
-                map.insert(hash, (served_idx, kind, now_ms));
+            // Only the entry read above: a mint that landed in between is fresher than this,
+            // and the store checks and sets under one lock.
+            if self
+                .bound_tokens
+                .rebind(&hashes[i], from, (served_idx, kind, now_ms), now_ms)
+            {
                 moved += 1;
             }
         }
-        map.prune(now_ms, BOUND_TOKEN_TTL_MS, BOUND_TOKEN_CAP);
-        drop(map);
         if moved > 0 {
             self.mark_bound_tokens_dirty();
             tracing::debug!(
@@ -286,13 +528,9 @@ impl Manager {
         if tokens.is_empty() {
             return None;
         }
-        let map = self
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned");
         tokens
             .iter()
-            .filter_map(|token| map.get(&bound_tokens::hash_token(token)))
+            .filter_map(|token| self.bound_tokens.get(&bound_tokens::hash_token(token)))
             .max_by_key(|&(_, _, minted)| minted)
             .map(|(index, kind, _)| (index, kind))
     }
@@ -450,13 +688,10 @@ impl Manager {
     /// Whether `tokens` name more than one distinct account — the disagreement
     /// [`Self::bound_token_account`] resolves by taking the newest.
     pub fn bound_tokens_disagree(&self, tokens: &[String]) -> bool {
-        let map = self
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned");
         let mut seen: Option<usize> = None;
         for token in tokens {
-            let Some((index, _, _)) = map.get(&bound_tokens::hash_token(token)) else {
+            let Some((index, _, _)) = self.bound_tokens.get(&bound_tokens::hash_token(token))
+            else {
                 continue;
             };
             match seen {
@@ -549,15 +784,12 @@ impl Manager {
     /// An entry whose index names no account is skipped rather than written: writing a
     /// placeholder identity is precisely the mis-resolution this design exists to prevent.
     pub fn bound_token_snapshot(&self) -> bound_tokens::Snapshot {
-        let entries: Vec<(String, usize, BoundTokenKind, i64)> = {
-            let map = self
-                .bound_tokens
-                .lock()
-                .expect("bound tokens lock poisoned");
-            map.iter()
-                .map(|(hash, (index, kind, minted))| (hash.to_string(), index, kind, minted))
-                .collect()
-        };
+        let entries: Vec<(String, usize, BoundTokenKind, i64)> = self
+            .bound_tokens
+            .entries()
+            .into_iter()
+            .map(|(hash, (index, kind, minted))| (hash, index, kind, minted))
+            .collect();
         let mut snapshot = bound_tokens::Snapshot::default();
         if entries.is_empty() {
             return snapshot;
@@ -613,12 +845,8 @@ impl Manager {
                 .collect()
         };
         let report = bound_tokens::load(path, &candidates, crate::now_ms(), ttl_ms);
-        let mut map = self
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned");
         for (hash, &value) in &report.tokens {
-            map.insert_if_absent(hash, value);
+            self.bound_tokens.insert_if_absent(hash, value);
         }
         report
     }
@@ -734,34 +962,137 @@ mod tests {
     }
 
     /// The map is bounded in memory at the raised cap, and it is the OLDEST mints that go.
+    ///
+    /// Twice the cap is recorded, oldest first, so every part of the map has had to evict. The
+    /// map then holds exactly the cap, the oldest mint is gone, and every one of the newest 90%
+    /// is still there: a part evicts its own oldest, not the map's, and this is the bound on
+    /// what that costs (see [`ShardedBoundTokens`]).
     #[test]
-    fn the_map_caps_by_evicting_the_oldest_mints() {
+    fn eviction_at_the_cap_keeps_the_newest_nine_tenths() {
         let manager = manager_over(&[account("a@example.com", "uuid-a")]);
         let now = crate::now_ms();
-        for n in 0..(BOUND_TOKEN_CAP + 10) {
+        let total = 2 * BOUND_TOKEN_CAP;
+        for n in 0..total {
             manager.record_bound_tokens(
                 &sig(&format!("sig_fake_{n}")),
                 0,
-                now - (BOUND_TOKEN_CAP + 10 - n) as i64,
+                now - (total - n) as i64,
             );
         }
-        let held = manager
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned")
-            .len();
-        assert_eq!(held, BOUND_TOKEN_CAP);
+        assert_eq!(manager.bound_tokens.len(), BOUND_TOKEN_CAP);
         assert_eq!(
             manager.bound_token_account(&tokens(&["sig_fake_0"])),
             None,
-            "the oldest mint is the one evicted"
+            "the oldest mint is evicted"
         );
-        let newest = format!("sig_fake_{}", BOUND_TOKEN_CAP + 9);
+        let keep_from = total - BOUND_TOKEN_CAP * 9 / 10;
+        let lost: Vec<usize> = (keep_from..total)
+            .filter(|n| {
+                manager
+                    .bound_token_account(&tokens(&[&format!("sig_fake_{n}")]))
+                    .is_none()
+            })
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} of the newest 90% were evicted, first {:?}",
+            lost.len(),
+            lost.first()
+        );
+    }
+
+    /// Eight threads record and look up at once, each its own tokens on its own account index
+    /// plus one token set every thread records: each thread reads its own token back the moment
+    /// it is recorded, and at the end the map holds exactly one entry per distinct token, each
+    /// naming the thread that wrote it. A lost update (a record whose write is overwritten by a
+    /// concurrent one) or a double count shows up as a missing token or a wrong total.
+    ///
+    /// The `tsan` CI job runs every test whose name starts `concurrent_lock_stress`.
+    #[test]
+    fn concurrent_lock_stress_bound_tokens() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 2_000;
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let now = crate::now_ms();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let own = format!("sig_fake_{t}_{i}");
+                        manager.record_bound_tokens(&sig(&own), t, now);
+                        manager.record_bound_tokens(&sig(&format!("sig_fake_shared_{i}")), t, now);
+                        assert_eq!(
+                            manager.bound_token_account(&[own]),
+                            Some((t, BoundTokenKind::ThinkingSignature)),
+                            "thread {t} lost its own record {i}"
+                        );
+                        let other = format!("sig_fake_{}_{i}", (t + 1) % THREADS);
+                        if let Some((idx, _)) = manager.bound_token_account(&[other]) {
+                            assert_eq!(idx, (t + 1) % THREADS);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a stress thread panicked");
+        }
         assert_eq!(
-            manager.bound_token_account(std::slice::from_ref(&newest)),
-            Some((0, BoundTokenKind::ThinkingSignature)),
-            "the newest mint must survive its own insertion"
+            manager.bound_tokens.len(),
+            THREADS * PER_THREAD + PER_THREAD
         );
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                assert_eq!(
+                    manager.bound_token_account(&tokens(&[&format!("sig_fake_{t}_{i}")])),
+                    Some((t, BoundTokenKind::ThinkingSignature)),
+                    "token {t}_{i} is missing or names the wrong account"
+                );
+            }
+        }
+        for i in 0..PER_THREAD {
+            let shared = manager.bound_token_account(&tokens(&[&format!("sig_fake_shared_{i}")]));
+            assert!(shared.is_some_and(|(idx, _)| idx < THREADS));
+        }
+    }
+
+    /// The same eight threads on a map already at its cap with older mints: every record
+    /// evicts, and at the end the map holds exactly the cap and every token the threads wrote,
+    /// because each is newer than everything it could have pushed out.
+    #[test]
+    fn concurrent_lock_stress_bound_tokens_at_the_cap() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 1_000;
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let now = crate::now_ms();
+        let fill: Vec<MintedToken> = (0..BOUND_TOKEN_CAP)
+            .map(|n| (BoundTokenKind::MessageId, format!("msg_fake_old_{n}")))
+            .collect();
+        manager.record_bound_tokens(&fill, 0, now - 60_000);
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        manager.record_bound_tokens(&sig(&format!("sig_fake_{t}_{i}")), 1, now);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a stress thread panicked");
+        }
+        assert_eq!(manager.bound_tokens.len(), BOUND_TOKEN_CAP);
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                assert_eq!(
+                    manager.bound_token_account(&tokens(&[&format!("sig_fake_{t}_{i}")])),
+                    Some((1, BoundTokenKind::ThinkingSignature)),
+                    "a fresh mint {t}_{i} was evicted ahead of an older one"
+                );
+            }
+        }
     }
 
     #[test]
@@ -883,18 +1214,14 @@ mod tests {
         first.record_bound_tokens(&sig("sig_fake_fresh"), 0, now - 60_000);
         // Seeded straight into the map: `record_bound_tokens` prunes anything already past the
         // TTL, and this test is about what LOAD does with a file that holds one.
-        first
-            .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned")
-            .insert(
-                &bound_tokens::hash_token("sig_fake_stale"),
-                (
-                    0,
-                    BoundTokenKind::ThinkingSignature,
-                    now - BOUND_TOKEN_TTL_MS - 60_000,
-                ),
-            );
+        first.bound_tokens.insert_unbounded(
+            &bound_tokens::hash_token("sig_fake_stale"),
+            (
+                0,
+                BoundTokenKind::ThinkingSignature,
+                now - BOUND_TOKEN_TTL_MS - 60_000,
+            ),
+        );
         assert_eq!(first.flush_bound_tokens(&path).expect("flush"), 2);
 
         let second = manager_over(&accounts);
@@ -1072,8 +1399,6 @@ mod tests {
         );
         let minted_at = manager
             .bound_tokens
-            .lock()
-            .expect("bound tokens lock poisoned")
             .get(&bound_tokens::hash_token("sig_fake_1"))
             .map(|(_, _, ms)| ms);
         assert_eq!(minted_at, Some(now - 60_000));
@@ -1278,18 +1603,124 @@ mod tests {
         println!(
             "record_bound_tokens at the cap ({BOUND_TOKEN_CAP} entries): {per_call:?} per call"
         );
-        assert_eq!(
-            manager
-                .bound_tokens
-                .lock()
-                .expect("bound tokens lock poisoned")
-                .len(),
-            BOUND_TOKEN_CAP
-        );
+        assert_eq!(manager.bound_tokens.len(), BOUND_TOKEN_CAP);
         let newest = format!("sig_fake_bench_{}", rounds - 1);
         assert!(manager
             .bound_token_account(std::slice::from_ref(&newest))
             .is_some());
+    }
+
+    /// The two designs' shared methods, so one bench drives both.
+    trait Store: Send + Sync {
+        fn get(&self, hash: &str) -> Option<Minted>;
+        fn record(&self, hash: &str, value: Minted, now_ms: i64);
+        fn len(&self) -> usize;
+    }
+
+    impl Store for ShardedBoundTokens {
+        fn get(&self, hash: &str) -> Option<Minted> {
+            ShardedBoundTokens::get(self, hash)
+        }
+        fn record(&self, hash: &str, value: Minted, now_ms: i64) {
+            ShardedBoundTokens::record(self, hash, value, now_ms);
+        }
+        fn len(&self) -> usize {
+            ShardedBoundTokens::len(self)
+        }
+    }
+
+    impl Store for DashBoundTokens {
+        fn get(&self, hash: &str) -> Option<Minted> {
+            DashBoundTokens::get(self, hash)
+        }
+        fn record(&self, hash: &str, value: Minted, now_ms: i64) {
+            DashBoundTokens::record(self, hash, value, now_ms);
+        }
+        fn len(&self) -> usize {
+            DashBoundTokens::len(self)
+        }
+    }
+
+    /// The comparison behind the store's design: one lock (the map as it was), 16 locked parts,
+    /// 64 locked parts, and a `DashMap` bounded in batches, each filled to the cap and then
+    /// driven by `threads` threads doing what a proxy request does: look up two tokens, record
+    /// two. Prints the wall time per operation and, per design, the share of the newest
+    /// half-cap mints still held at the end and the oldest mint left, so a faster design that
+    /// evicts the wrong entries shows as such. A timing, so it is ignored; run it with
+    /// `cargo test --release --lib bound_token_store_designs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run by hand"]
+    fn bound_token_store_designs() {
+        const ROUNDS: usize = 200_000;
+        let hashes: Vec<String> = (0..BOUND_TOKEN_CAP * 2)
+            .map(|n| bound_tokens::hash_token(&format!("sig_fake_{n}")))
+            .collect();
+        let hashes = Arc::new(hashes);
+        type Design = (&'static str, fn() -> Arc<dyn Store>);
+        let designs: Vec<Design> = vec![
+            ("one lock", || Arc::new(ShardedBoundTokens::with_shards(1))),
+            ("16 parts", || Arc::new(ShardedBoundTokens::with_shards(16))),
+            ("64 parts", || Arc::new(ShardedBoundTokens::with_shards(64))),
+            ("dashmap", || Arc::new(DashBoundTokens::default())),
+        ];
+        for threads in [1usize, 4, 8, 16] {
+            for (name, make) in &designs {
+                let store = make();
+                let base = crate::now_ms() - 1_000_000;
+                for (n, hash) in hashes.iter().take(BOUND_TOKEN_CAP).enumerate() {
+                    store.record(hash, (0, BoundTokenKind::MessageId, base + n as i64), base);
+                }
+                let next = Arc::new(std::sync::atomic::AtomicUsize::new(BOUND_TOKEN_CAP));
+                let start = std::time::Instant::now();
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let (store, hashes, next) =
+                            (Arc::clone(&store), Arc::clone(&hashes), Arc::clone(&next));
+                        std::thread::spawn(move || {
+                            let mut seed = 0x9e37_79b9_u64 + t as u64;
+                            for _ in 0..ROUNDS / threads {
+                                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                                let probe = (seed >> 33) as usize % hashes.len();
+                                std::hint::black_box(store.get(&hashes[probe]));
+                                std::hint::black_box(
+                                    store.get(&hashes[(probe + 7) % hashes.len()]),
+                                );
+                                for _ in 0..2 {
+                                    let n = next.fetch_add(1, Ordering::Relaxed);
+                                    let at = base + n as i64;
+                                    store.record(
+                                        &hashes[n % hashes.len()],
+                                        (1, BoundTokenKind::MessageId, at),
+                                        at,
+                                    );
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().expect("bench thread panicked");
+                }
+                let elapsed = start.elapsed();
+                let written = next.load(Ordering::Relaxed);
+                let newest_half = (written - BOUND_TOKEN_CAP / 2..written)
+                    .filter(|&n| store.get(&hashes[n % hashes.len()]).is_some())
+                    .count();
+                let oldest_left = (0..written)
+                    .find(|&n| {
+                        store
+                            .get(&hashes[n % hashes.len()])
+                            .is_some_and(|(_, _, at)| at == base + n as i64)
+                    })
+                    .unwrap_or(written);
+                println!(
+                    "{threads:>2} threads  {name:<9} {:>7.0} ns/request  held {:>6}  newest half kept {:>5.1}%  oldest left #{oldest_left} of {written}",
+                    elapsed.as_nanos() as f64 / ROUNDS as f64,
+                    store.len(),
+                    100.0 * newest_half as f64 / (BOUND_TOKEN_CAP / 2) as f64,
+                );
+            }
+        }
     }
 
     /// What one flush of a full map costs: the snapshot, the file build, the serialization and

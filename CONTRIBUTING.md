@@ -205,7 +205,7 @@ tags alone and can never be reached from a pull request.
 | `ci` **(required)** | ubuntu | `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all --locked`, `cargo build --release --locked` |
 | `audit` **(required)** | ubuntu | `cargo audit` against `Cargo.lock`: fails on real RustSec advisories, warns on unmaintained deps |
 | `macos` **(required)** | macOS | `cargo test --all --locked` again (different code paths: `src/singleton.rs` shells out to BSD `ps`/`lsof`, install placement relies on `rename(2)`, `$TMPDIR` is a sandbox path), plus `swift-format lint --strict`, `swift build` and `swift test` for the TcrBar app |
-| `tsan` | ubuntu | ThreadSanitizer over the `concurrent_pacing_stress` harness on nightly |
+| `tsan` | ubuntu | ThreadSanitizer on nightly over the `concurrent_pacing_stress` harness and every `concurrent_lock_stress` test (the bound-token map and the usage buckets) |
 | `miri` | ubuntu | UB detection over the pure leaf modules (`model::`, `account_uuid::`, `quota::`). `continue-on-error`, so it is informational rather than a gate |
 
 `--locked` everywhere is deliberate: CI must fail rather than silently rewrite `Cargo.lock`, because
