@@ -6,6 +6,15 @@
     <language>en</language>
     <!-- release-tcrbar.sh inserts new items directly below this line -->
     <item>
+      <title>TcrBar 1.2.5</title>
+      <link>https://github.com/dhkts1/tcr/releases/tag/v1.2.5</link>
+      <sparkle:version>788</sparkle:version>
+      <sparkle:shortVersionString>1.2.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 16 Oct 2026 10:00:02 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/tcr/releases/download/v1.2.5/TcrBar-1.2.5.dmg" type="application/octet-stream" sparkle:edSignature="pRQ6p/JB/HnUDhTaPcajcQypUnYlmqT09YtXWMWfL3VmGVOQOzc9/ie3jj4uyuAsS6SIERke6zppPD3TBe8pAA==" length="13227282" />
+    </item>
+    <item>
       <title>TcrBar 1.2.4</title>
       <link>https://github.com/dhkts1/tcr/releases/tag/v1.2.4</link>
       <sparkle:version>786</sparkle:version>
