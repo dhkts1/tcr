@@ -30,6 +30,14 @@ dist = true
 name = "tcr"
 path = "src/main.rs"
 
+# The load-test driver behind `scripts/load-test.sh` (docs/performance.md). `test = true` so
+# `cargo test --all` runs its unit tests (stub reply shapes, report arithmetic); an example's
+# tests are otherwise built and never run.
+[[example]]
+name = "load_test"
+path = "examples/load_test/main.rs"
+test = true
+
 [dependencies]
 # The shared `tcr status --json` wire type (`AccountStatusRow`), consumed by
 # `render_accounts_json` in `src/cli.rs`.
