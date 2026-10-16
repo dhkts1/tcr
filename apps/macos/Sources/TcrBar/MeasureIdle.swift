@@ -127,7 +127,19 @@ enum MeasureIdle {
         _ = await waitUntil(20) { shell.poller.state.isHealthyRead }
         print("measure-idle: fleet · \(shell.poller.state.summary)")
 
+        // Whether the view tree was evaluated INSIDE the open call, before the
+        // run loop could composite a frame: the panel's first frame is then
+        // drawn from the state it was told of, not from the last one it saw.
+        //
+        // `.applicationDefined` for the open window: `.transient` closes the
+        // panel the moment anything else on the machine takes focus, and an
+        // open window that is mostly shut measures neither state. Measured: two
+        // runs on a Mac in use lost the panel after 3 s and 12 s of a 30 s
+        // window. The close below still goes through `closePanel()`.
+        shell.popover.behavior = .applicationDefined
+        let beforeOpen = PanelDrawCount.now.bodies
         shell.openPanel(on: .peers)
+        print("measure-idle: bodies inside the open call=\(PanelDrawCount.now.bodies - beforeOpen)")
         _ = await waitUntil(20) { shell.popover.isShown }
         let openedAt = log.mark()
         let openStart = Window.Start.now()
@@ -164,6 +176,22 @@ enum MeasureIdle {
         let closedCost = closedStart.end()
         report("panel closed", seconds: seconds, of: log.entries(after: closedAt))
         report("panel closed", closedCost)
+
+        // The reopen a click makes, on the view tree that was kept while shut.
+        // A body inside the call is the tree catching up on what it was not
+        // told while shut, before the run loop composites a frame.
+        let beforeReopen = PanelDrawCount.now.bodies
+        let reopenSpawns = log.mark()
+        shell.openPanel()
+        print(
+            "measure-idle: reopen · bodies inside the open call=\(PanelDrawCount.now.bodies - beforeReopen)"
+        )
+        _ = await waitUntil(5) { log.mark() > reopenSpawns }
+        print(
+            "measure-idle: reopen · isShown=\(shell.popover.isShown) · spawns within 5s=\(log.argvLines(after: reopenSpawns))"
+        )
+        shell.closePanel()
+        _ = await waitUntil(5) { !shell.popover.isShown }
 
         shell.poller.stop()
         shell.knocks.stop()
