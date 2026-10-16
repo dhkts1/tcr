@@ -240,12 +240,18 @@ is absent. And when you claim something about how the code behaves, cite `file:l
 documents *why* things are the way they are in module doc-comments, and several of them name the
 specific bug they exist to prevent. Read the doc-comment before "fixing" what it describes.
 
+For a change on the request path, `scripts/load-test.sh` runs the real binary against a fake
+Anthropic and reports CPU per request, added latency and a flame graph per phase, without
+touching a live proxy. [`docs/performance.md`](docs/performance.md) explains the numbers and
+lists the figures from earlier runs to compare against.
+
 ## Where things are
 
 | Path | What |
 | --- | --- |
 | `src/` | The `tcr` proxy, TUI and CLI |
 | `tests/` | Integration tests and fixtures |
+| `examples/load_test/` | The load-test driver and fake Anthropic behind `scripts/load-test.sh` |
 | `apps/macos/` | TcrBar, the SwiftUI menu-bar app, and its build/release scripts |
 | `scripts/` | `install-cli.sh`, the palette generator, and assorted analysis tools |
 | `.githooks/` | `pre-commit`, `pre-merge-commit` and `pre-push`, enabled via `core.hooksPath` |
