@@ -49,17 +49,30 @@ enum MeasureIdle {
 
     static let defaultSeconds: Double = 30
 
+    static let openFlag = "--open-seconds"
+
     /// How long the panel is left open before it is closed. Long enough for
     /// the Peers tab's first read and at least one repeat, so a run that
     /// counted nothing afterwards is known to have been counting something that
-    /// was live.
-    private static let openSeconds: Double = 8
+    /// was live. `--open-seconds <n>` lengthens it, so the CPU an open panel
+    /// costs can be read over a window as long as the closed one.
+    static func requestedOpenSeconds(_ arguments: [String] = CommandLine.arguments) -> Double {
+        guard let at = arguments.firstIndex(of: openFlag) else { return defaultOpenSeconds }
+        let next = arguments.index(after: at)
+        guard next < arguments.endIndex, let seconds = Double(arguments[next]), seconds > 0 else {
+            return defaultOpenSeconds
+        }
+        return seconds
+    }
+
+    static let defaultOpenSeconds: Double = 8
 
     @MainActor
     static func run(seconds: Double) -> Never {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
+        let openSeconds = requestedOpenSeconds()
         let deadline = seconds + openSeconds + 60
         DispatchQueue.main.asyncAfter(deadline: .now() + deadline) {
             FileHandle.standardError.write(
@@ -68,14 +81,14 @@ enum MeasureIdle {
         }
 
         Task { @MainActor in
-            await measure(seconds: seconds)  // exits
+            await measure(seconds: seconds, openSeconds: openSeconds)  // exits
         }
         app.run()
         exit(2)
     }
 
     @MainActor
-    private static func measure(seconds: Double) async -> Never {
+    private static func measure(seconds: Double, openSeconds: Double) async -> Never {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("tcrbar-measure-idle-\(ProcessInfo.processInfo.processIdentifier)")
         guard let log = try? SpawnLog(directory: directory) else {
@@ -117,12 +130,24 @@ enum MeasureIdle {
         shell.openPanel(on: .peers)
         _ = await waitUntil(20) { shell.popover.isShown }
         let openedAt = log.mark()
+        let openStart = Window.Start.now()
         // Sampled, not assumed. This popover is `.transient`, so anything that
         // takes focus on the machine running the measurement dismisses it, and
         // a window that reports itself as open while the panel had gone would
         // turn a correct result into a puzzling one.
         await tick(openSeconds, label: "open") { "isShown=\(shell.popover.isShown)" }
+        let open = openStart.end()
         report("panel open on the Peers tab", seconds: openSeconds, of: log.entries(after: openedAt))
+        report("panel open on the Peers tab", open)
+        // The positive control for the cost lines. A closed window that drew
+        // nothing proves something only if the same counters counted the
+        // panel while it was open; a run where they did not is wired to
+        // nothing and would report every panel as idle.
+        guard open.bodies > 0 else {
+            print("measure-idle: the open panel drew no body, the draw counters are wired to nothing")
+            fflush(stdout)
+            exit(1)
+        }
 
         // `animates = false` before the close, the substitution every harness
         // here makes: an animated dismissal never completes when nothing is
@@ -134,8 +159,11 @@ enum MeasureIdle {
         print("measure-idle: panel closed, isShown=\(shell.popover.isShown) settled=\(closed)")
 
         let closedAt = log.mark()
+        let closedStart = Window.Start.now()
         await tick(seconds, label: "closed") { "isShown=\(shell.popover.isShown)" }
+        let closedCost = closedStart.end()
         report("panel closed", seconds: seconds, of: log.entries(after: closedAt))
+        report("panel closed", closedCost)
 
         shell.poller.stop()
         shell.knocks.stop()
@@ -170,6 +198,52 @@ enum MeasureIdle {
         for entry in entries {
             print("measure-idle: \(window) · at=\(entry.at - first)s · \(entry.argv)")
         }
+        fflush(stdout)
+    }
+
+    /// What one window cost this process: CPU, memory at its end, and how many
+    /// times the panel's view tree was evaluated and laid out inside it.
+    struct Window {
+        let seconds: Double
+        let cpuSeconds: Double
+        let residentBytes: UInt64?
+        let bodies: Int
+        let layouts: Int
+
+        struct Start {
+            let at: Date
+            let cost: SelfCost
+            let draws: (bodies: Int, layouts: Int)
+
+            static func now() -> Start {
+                Start(at: Date(), cost: SelfCost.read(), draws: PanelDrawCount.now)
+            }
+
+            func end() -> Window {
+                let cost = SelfCost.read()
+                let draws = PanelDrawCount.now
+                return Window(
+                    seconds: Date().timeIntervalSince(at),
+                    cpuSeconds: cost.cpuSeconds - self.cost.cpuSeconds,
+                    residentBytes: cost.residentBytes,
+                    bodies: draws.bodies - self.draws.bodies,
+                    layouts: draws.layouts - self.draws.layouts)
+            }
+        }
+    }
+
+    /// One line per window: CPU seconds and the share of one core they work
+    /// out at, resident memory at the window's end, and the panel's body and
+    /// layout counts. The same counter `ps -o time=` reads, taken in-process so
+    /// the window is exactly the one the spawn count covers.
+    private static func report(_ window: String, _ cost: Window) {
+        let rss = cost.residentBytes.map { String($0 / 1024) } ?? "unknown"
+        print(
+            String(
+                format:
+                    "measure-idle: %@ · cost · cpu=%.3fs over %.1fs · %.2f%% of one core · rss=%@KB · bodies=%d · layouts=%d",
+                window, cost.cpuSeconds, cost.seconds, 100 * cost.cpuSeconds / cost.seconds, rss,
+                cost.bodies, cost.layouts))
         fflush(stdout)
     }
 

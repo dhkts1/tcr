@@ -147,6 +147,7 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
 /// height and then placed with the shared one, which its spacer fills.
 struct TallestTabLayout: Layout {
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        PanelDrawCount.layout()
         let ideal = ProposedViewSize(width: proposal.width, height: nil)
         let sizes = subviews.map { $0.sizeThatFits(ideal) }
         return CGSize(
