@@ -98,7 +98,7 @@ pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com",
 
 /// Proxy URL userinfo set by `tcr run --codex`, selecting Codex interception on CONNECT.
 /// This is a route marker, not process authentication. The launch makes shell-tool
-/// proxies unmarked through Codex's shell policy; explicit MCP proxy env and other
+/// proxies empty through Codex's shell policy; explicit MCP proxy env and other
 /// helper processes can still inherit the marker and must opt out when needed.
 pub const CODEX_PROXY_USERNAME: &str = "tcr-codex";
 /// Basic encoding of `tcr-codex:` sent by both Codex transports, including an empty password.
@@ -865,6 +865,46 @@ async fn serve_with_shutdown_using_connector(
     shutdown: impl Future<Output = ()>,
     connector: TunnelConnector,
 ) {
+    let (connections, _drain) = tokio::sync::mpsc::channel(1);
+    serve_tracked_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        shutdown,
+        connector,
+        connections,
+    )
+    .await;
+}
+
+/// Each accepted connection holds a sender until it finishes. Once acceptance
+/// stops, receiver closure proves all accepted connections have drained.
+pub(crate) async fn serve_tracked_with_shutdown(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl std::future::Future<Output = ()>,
+    connections: tokio::sync::mpsc::Sender<()>,
+) {
+    serve_tracked_with_shutdown_using_connector(
+        listener,
+        manager,
+        tls,
+        shutdown,
+        direct_tunnel_connector(),
+        connections,
+    )
+    .await;
+}
+
+async fn serve_tracked_with_shutdown_using_connector(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl std::future::Future<Output = ()>,
+    connector: TunnelConnector,
+    connections: tokio::sync::mpsc::Sender<()>,
+) {
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
         let accepted = tokio::select! {
@@ -887,8 +927,10 @@ async fn serve_with_shutdown_using_connector(
         let manager = Arc::clone(&manager);
         let tls = tls.clone();
         let connector = Arc::clone(&connector);
+        let connection = connections.clone();
         tokio::spawn(
             async move {
+                let _connection = connection;
                 if let Err(err) = handle_conn(stream, peer, manager, tls, connector).await {
                     tracing::debug!(error = %err, "connection ended with error");
                 }

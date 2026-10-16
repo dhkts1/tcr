@@ -17,6 +17,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
+mod tool_env;
+
 use tcr::cli::{self, PriorityArg, validate_group_label_chars};
 use tcr::config::{self, Config, ConfigError};
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
@@ -1598,10 +1600,9 @@ struct ServerArgs {
     /// Run without the TUI, logging to stdout.
     #[arg(long)]
     headless: bool,
-    /// Take over the port: kill a proxy already listening on it, then bind. The
-    /// default is to leave a healthy incumbent alone and exit — replacing it wipes
-    /// its session→account pin map and cold-starts every live session's prompt
-    /// cache, which is the most expensive event in this system.
+    /// Take over the listening socket without unbinding the port. The old server
+    /// drains its accepted connections. An older server without handoff support
+    /// is left running and must be stopped explicitly once to upgrade.
     #[arg(long)]
     replace: bool,
     /// DEPRECATED and now a no-op: this is the default. Kept accepted so existing
@@ -6416,9 +6417,8 @@ fn claude_command() -> std::process::Command {
 /// [`claude_command`]'s twin, resolved by `codex_local::find_codex`, the rule `tcr login
 /// --codex` and the doctor use too. `TCR_CODEX_BIN`, then `CODEX_BIN`, always decide when set;
 /// otherwise `PATH`, TcrBar's directories and npm's global prefix. A miss is the search's own
-/// sentence, so nothing has been printed or read yet when it bails. The child keeps the shell's
-/// `PATH` as it is: every command the agent runs inherits that `PATH`, so tcr must not reorder
-/// it.
+/// sentence, so nothing has been printed or read yet when it bails. Resolve before
+/// adding the nested-agent launchers to PATH, so they cannot resolve to themselves.
 fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
     let codex =
         tcr::codex_local::find_codex().map_err(|miss| anyhow::anyhow!("{}", miss.sentence()))?;
@@ -6465,6 +6465,9 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
         for line in apply_codex_launch(&mut cmd, port, &launch, &launch_key) {
             eprintln!("{line}");
+        }
+        if matches!(launch, CodexLaunch::SeeThrough { .. }) {
+            tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
         }
         // Generated shell-tool defaults precede explicit caller overrides.
         cmd.args(&args.args);
@@ -6543,7 +6546,11 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // Anything missing from the MITM material lands us in base-URL mode, which
         // always works; there is no half-applied third state.
         let mut lines = match see_through_ca() {
-            Some(ca) => apply_see_through_env(&mut cmd, port, &ca, &launch_key),
+            Some(ca) => {
+                let lines = apply_see_through_env(&mut cmd, port, &ca, &launch_key);
+                tool_env::apply(&mut cmd, Path::new(&claude_bin()), &config_path)?;
+                lines
+            }
             None => apply_base_url_env(&mut cmd, port, &launch_key),
         };
         lines.extend(launch_key.notice(port));
@@ -6798,19 +6805,7 @@ fn apply_codex_launch(
                 key,
             ));
             apply_nested_claude_ca(cmd, ca, std::env::var_os("NODE_EXTRA_CA_CERTS").is_some());
-            // This affects shell-like tools, not Codex's own HTTP/WebSocket clients.
-            // Scalar overrides preserve the caller's other policy entries and filters.
-            // Unmarked, so a shell tool keeps its own ChatGPT login; keyed like
-            // a Claude launch, so the server does not count it as a stranger.
-            let shell =
-                loopback_proxy_url(key.key().map(|_| PLAIN_PROXY_USERNAME), key.key(), port);
-            for var in ["HTTPS_PROXY", "https_proxy"] {
-                cmd.arg("-c").arg(format!(
-                    "shell_environment_policy.set.{var}=\"{}\"",
-                    shell.env
-                ));
-            }
-            lines.push(shell_tools_notice(port, key.key().is_some()));
+            tool_env::apply_codex_shell_policy(cmd);
             lines.extend(key.notice(port));
             for rewrite in no_proxy {
                 cmd.env(rewrite.var, &rewrite.kept);
@@ -7404,8 +7399,8 @@ fn apply_codex_see_through_env(
 /// `NODE_EXTRA_CA_CERTS` to tcr's CA on the codex child, unless the caller
 /// exported one (`caller_exported`), which the child then inherits untouched.
 ///
-/// The codex child carries `HTTPS_PROXY` aimed at tcr, and so does everything it
-/// starts. A `claude` among them meets tcr's leaf for `api.anthropic.com`, and
+/// The codex child carries `HTTPS_PROXY` aimed at tcr. The nested-agent launcher
+/// restores it for a `claude` started by a shell tool. It meets tcr's leaf for `api.anthropic.com`, and
 /// node trusts that leaf only through this variable; without it the nested
 /// session fails TLS. codex itself reads only `CODEX_CA_CERTIFICATE`, so this
 /// changes nothing for codex. Silent, as the rest of the launch's defaults are.
@@ -7675,6 +7670,20 @@ const fn stand_down_exit_code(
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.path();
     let (config, persist_path) = load_config(&config_path)?;
+    let restart_endpoint =
+        tcr::restart::Endpoint::bind().context("could not open the CLI restart endpoint")?;
+    let inherited_listener = if args.replace {
+        tcr::restart::request_listener(args.port.unwrap_or(config.proxy.port)).await?
+    } else {
+        None
+    };
+    // The predecessor's final token flush precedes sending the socket. Read it
+    // now, not from the snapshot taken before asking the predecessor to stop.
+    let (config, persist_path) = if inherited_listener.is_some() {
+        load_config(&config_path)?
+    } else {
+        (config, persist_path)
+    };
 
     // A first boot with an empty fleet imports this machine's Claude Code
     // login, if it has one — here, BEFORE the manager and the fleet are built
@@ -7750,7 +7759,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         persist_path,
         port: args.port,
         incumbent: if args.replace {
-            server::IncumbentPolicy::kill_the_incumbent_proxy()
+            server::IncumbentPolicy::never_signal()
         } else {
             server::IncumbentPolicy::report_and_stand_down()
         },
@@ -7777,19 +7786,21 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `serve`, and the two silently disagreeing means a claim named for a port
         // this process never bound — which every reader looks straight past.
         owner_dir: Some(singleton::default_owner_dir()),
-        // The binary always binds for itself. A handed-over socket arrives
-        // through the handoff path, which constructs its own options.
-        inherited_listener: None,
+        inherited_listener,
     };
 
     let handle = match server::serve(options).await? {
         server::ServeOutcome::Started(handle) => handle,
         // A binary may exit; the library returned this as a value.
-        server::ServeOutcome::StoodDown(stand_down) => stand_down_exit(&stand_down, file_log),
+        server::ServeOutcome::StoodDown(stand_down) => {
+            drop(restart_endpoint);
+            stand_down_exit(&stand_down, file_log)
+        }
     };
     let bound = handle.addr();
 
     let mut handle = handle;
+    let mut successor = None;
     if args.headless {
         // Installed BEFORE the "listening" line below, not after: that line is
         // what a caller (or `tests/headless_sigterm.rs`) waits on before it
@@ -7834,6 +7845,10 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                 }
             } => ShutdownTrigger::Sigterm,
             () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
+            peer = restart_endpoint.accept() => {
+                successor = Some(peer?);
+                ShutdownTrigger::Replaced
+            },
         };
         tracing::info!("{}", trigger.shutdown_line());
     } else {
@@ -7853,6 +7868,10 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         let tui_fut = tui::run(Arc::clone(handle.manager()));
         tokio::pin!(tui_fut);
         tokio::select! {
+            peer = restart_endpoint.accept() => {
+                successor = Some(peer?);
+            }
+
             res = &mut tui_fut => {
                 if let Err(err) = res {
                     tracing::error!(error = %err, "tui error");
@@ -7869,6 +7888,15 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
                 tracing::info!("SIGTERM received; restoring terminal and shutting down");
             }
         }
+    }
+
+    if let Some(peer) = successor {
+        handle.handoff(&peer).await?;
+        drop(peer);
+        drop(restart_endpoint);
+        tracing::info!("listener handed over; draining accepted connections");
+        handle.drain_connections().await;
+        tracing::info!("accepted connections drained");
     }
 
     // Stop serving, then flush the config and the affinity pins. The whole
@@ -7906,6 +7934,7 @@ enum ShutdownTrigger {
     CtrlC,
     Sigterm,
     ServingStopped,
+    Replaced,
 }
 
 impl ShutdownTrigger {
@@ -7927,6 +7956,7 @@ impl ShutdownTrigger {
             Self::CtrlC => "shutdown signal received",
             Self::Sigterm => "SIGTERM received; shutting down",
             Self::ServingStopped => "serving stopped on its own; shutting down",
+            Self::Replaced => "replacement requested; handing over the listener",
         }
     }
 }
@@ -11077,6 +11107,7 @@ mod tests {
             ShutdownTrigger::CtrlC,
             ShutdownTrigger::Sigterm,
             ShutdownTrigger::ServingStopped,
+            ShutdownTrigger::Replaced,
         ];
         let mut seen: Vec<&str> = Vec::new();
         for trigger in triggers {

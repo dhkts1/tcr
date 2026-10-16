@@ -107,13 +107,13 @@ impl IncumbentPolicy {
         Self(Signal::Report)
     }
 
-    /// `tcr server --replace`: **SIGTERM, then SIGKILL after 800ms**, whichever
+    /// Legacy explicit takeover: **SIGTERM, then SIGKILL after 800ms**, whichever
     /// recognized proxy holds the port — including a live `tcr` serving real
-    /// traffic. That wipes its in-memory session→account pin map and every live
-    /// session then pays a full cold prompt-cache prefix.
+    /// traffic. This cuts its live connections. The CLI's `--replace` now uses
+    /// listener handoff instead, leaving accepted connections to drain.
     ///
-    /// Reserve this for an operator who typed `--replace`. Nothing in a test or
-    /// an embedder should call it.
+    /// Reserve this for an operator who explicitly requested a destructive
+    /// takeover. An embedder should use `never_signal`.
     pub const fn kill_the_incumbent_proxy() -> Self {
         Self(Signal::Recognized)
     }
@@ -154,7 +154,8 @@ pub struct ServeOptions {
     /// contending for the configured one.
     pub port: Option<u16>,
     /// What to do about a recognized proxy already holding the port. Defaults to
-    /// [`IncumbentPolicy::never_signal`]; the binary maps `--replace` onto it.
+    /// [`IncumbentPolicy::never_signal`]. The CLI's `--replace` supplies an
+    /// inherited listener and uses this default rather than signalling its peer.
     pub incumbent: IncumbentPolicy,
     /// The session-affinity pin cache, or `None` to keep pins **in memory only**
     /// — nothing is read at boot and nothing is written at shutdown.
@@ -390,6 +391,9 @@ pub struct ShutdownReport {
 /// aborts them and [`shutdown`](Self::shutdown) stops them in order and gives
 /// the affinity map its final write.
 pub struct ServerHandle {
+    /// A second descriptor keeps the accept queue bound through a handoff.
+    listener: Option<std::net::TcpListener>,
+    connections: Option<tokio::sync::mpsc::Receiver<()>>,
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     manager: Arc<Manager>,
@@ -470,6 +474,70 @@ impl ServerHandle {
         }
     }
 
+    /// Stop acceptance and background mutation, flush the predecessor, then
+    /// transfer the still-bound listener. The receiver starts only after the
+    /// existing handoff ownership gate has been released.
+    pub async fn handoff(&mut self, peer: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
+        let _ = self.shutdown.send(true);
+        self.stop_tasks(tokio::time::Instant::now() + DEFAULT_SHUTDOWN_GRACE)
+            .await;
+        self.flush_cache_finally(SavedCache::WireSessions);
+        let listener = self.listener.as_ref().context("no listener to hand over")?;
+        crate::handoff::complete_handoff(
+            &self.manager,
+            self.affinity_path.as_deref(),
+            listener,
+            peer,
+        )?;
+        self.listener.take();
+        Ok(())
+    }
+
+    /// Keep the runtime alive while accepted tunnels finish. This is separate
+    /// from ordinary bounded shutdown: replacement has a successor serving new
+    /// traffic, and a long-lived CONNECT must not be cut at an arbitrary deadline.
+    pub async fn drain_connections(&mut self) {
+        if let Some(connections) = self.connections.as_mut() {
+            let _ = connections.recv().await;
+        }
+        self.connections.take();
+    }
+
+    async fn stop_tasks(&mut self, deadline: tokio::time::Instant) {
+        if let Some(server) = self.server.as_mut() {
+            // `&mut JoinHandle` polls the join without consuming it: losing the
+            // race to the caller's own timeout leaves the task owned here.
+            let stopped = self.server_finished
+                || match tokio::time::timeout_at(deadline, &mut *server).await {
+                    Ok(_) => true,
+                    Err(_) => {
+                        // NOT awaited after the abort: a task wedged in a
+                        // synchronous write never reaches a cancellation point,
+                        // so awaiting it back would reintroduce the hang.
+                        server.abort();
+                        false
+                    }
+                };
+            self.server = None;
+            if stopped {
+                self.server_finished = true;
+                self.tasks_joined += 1;
+            } else {
+                self.tasks_aborted += 1;
+            }
+        }
+        while let Some(task) = self.background.last_mut() {
+            match tokio::time::timeout_at(deadline, &mut *task).await {
+                Ok(_) => self.tasks_joined += 1,
+                Err(_) => {
+                    task.abort();
+                    self.tasks_aborted += 1;
+                }
+            }
+            self.background.pop();
+        }
+    }
+
     /// Stop serving, then flush.
     ///
     /// The order is `run_server`'s: stop the accept loop, persist the config
@@ -513,45 +581,11 @@ impl ServerHandle {
     /// (so `Drop` still aborts them), and may simply call it again — the counters
     /// carry over and the flushes are idempotent.
     pub async fn shutdown_within(&mut self, grace: Duration) -> ShutdownReport {
-        crate::log_err::LogErr::log_debug(
-            self.shutdown.send(true),
-            "signalling shutdown to a stopped server",
-        );
+        self.listener.take();
+        let _ = self.shutdown.send(true);
         let deadline = tokio::time::Instant::now() + grace;
 
-        if let Some(server) = self.server.as_mut() {
-            // `&mut JoinHandle` polls the join without consuming it: losing the
-            // race to the caller's own timeout leaves the task owned here.
-            let stopped = self.server_finished
-                || if tokio::time::timeout_at(deadline, &mut *server)
-                    .await
-                    .is_ok()
-                {
-                    true
-                } else {
-                    // NOT awaited after the abort: a task wedged in a
-                    // synchronous write never reaches a cancellation point,
-                    // so awaiting it back would reintroduce the hang.
-                    server.abort();
-                    false
-                };
-            self.server = None;
-            if stopped {
-                self.server_finished = true;
-                self.tasks_joined += 1;
-            } else {
-                self.tasks_aborted += 1;
-            }
-        }
-        while let Some(task) = self.background.last_mut() {
-            if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
-                self.tasks_joined += 1;
-            } else {
-                task.abort();
-                self.tasks_aborted += 1;
-            }
-            self.background.pop();
-        }
+        self.stop_tasks(deadline).await;
 
         // Withdraw the port claim once the accept loop is done, so the next `tcr`
         // does not read a claim for a proxy that has stopped listening. Ordered
@@ -659,6 +693,9 @@ impl ServerHandle {
     /// The shutdown write of one cache file, as a value. Logs for the binary's operator, and
     /// returns the same fact for a caller with no subscriber.
     fn flush_cache_finally(&self, cache: SavedCache) -> CacheFlush {
+        if self.manager.mutation_is_released() {
+            return CacheFlush::Disabled;
+        }
         let Some(path) = cache.path(
             self.affinity_path.as_deref(),
             self.wire_sessions_path.as_deref(),
@@ -2012,9 +2049,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
     // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
     // so our own startup can never token-war with the incumbent. Only a
-    // command-verified `tcr` server on THIS port is ever signalled, and only
-    // under `--replace`. `--no-replace` is the default now, and clap rejects it
-    // alongside `--replace`.
+    // command-verified `tcr` server on THIS port can be signalled only under
+    // the caller's explicit policy. The CLI uses listener handoff.
     //
     // Which of those a caller gets is [`IncumbentPolicy`], and the default sends
     // no signal at all: it uses `live_proxy_server`, the detection-only half of
@@ -2431,6 +2467,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?,
     };
     let bound = listener.local_addr()?;
+    let std_listener = listener.into_std()?;
+    let handoff_listener = std_listener.try_clone()?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
     // The boot marker. The durable log at `~/.cache/tcr/logs/` rotates
     // daily (5 files kept) rather than growing forever, but within one day's
@@ -2589,19 +2628,25 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         None => None,
     };
 
-    let serve_manager = Arc::clone(&manager);
+    let (connections, drain) = tokio::sync::mpsc::channel(1);
+    let serve_manager = manager.clone();
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        mitm::serve_with_shutdown(listener, serve_manager, tls, async move {
-            crate::log_err::LogErr::log_debug(
-                stop.changed().await,
-                "waiting for the shutdown signal",
-            );
-        })
+        mitm::serve_tracked_with_shutdown(
+            listener,
+            serve_manager,
+            tls,
+            async move {
+                let _ = stop.changed().await;
+            },
+            connections,
+        )
         .await;
     });
 
     Ok(ServeOutcome::Started(ServerHandle {
+        listener: Some(handoff_listener),
+        connections: Some(drain),
         addr: bound,
         shutdown: shutdown_tx,
         manager,
@@ -2774,6 +2819,8 @@ mod tests {
         affinity_path: Option<PathBuf>,
     ) -> ServerHandle {
         ServerHandle {
+            listener: None,
+            connections: None,
             addr: "127.0.0.1:0"
                 .parse()
                 .expect("a literal loopback addr parses"),
