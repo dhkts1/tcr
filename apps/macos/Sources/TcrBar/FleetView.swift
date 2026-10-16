@@ -273,14 +273,13 @@ struct FleetView: View {
     /// so `body` never touches disk. See ``ClaudeRouteRead``.
     @State private var claudeRoute: ClaudeRouteRead.Route?
 
-    /// The running codex sessions (``CodexProcesses``), read only while the
-    /// fleet holds a Codex account, so a Claude-only fleet never pays for the
-    /// walk. `nil` before the first read, and whenever the fleet holds none.
+    /// The running codex sessions the render harness names for the Codex line.
+    /// The live panel never reads it: the shell decides that line at each
+    /// opening (``CodexBannerSnapshot``).
     @State private var codexCount: Int?
 
-    /// When this app first saw the Codex accounts that can serve at zero
-    /// requests, on a live read, in a row: ``zeroRequestsSince``'s clock for the
-    /// Codex line (``CodexBanner/codexRequests(_:)``).
+    /// When the Codex request count stopped moving, as the render harness names
+    /// it. The live clock is the shell's (``CodexQuietClock``).
     @State private var codexZeroRequestsSince: Date?
 
     /// Whether this Mac shares its accounts with trusted Macs, for the Codex
@@ -464,35 +463,32 @@ struct FleetView: View {
         // ids are fixture strings that join to nothing real, so the read
         // would only ever populate an unused dictionary — see
         // `RenderStates.swift`'s sessions-tab fixtures.
+        //
+        // The Codex lines are not read here: the shell decides them at each
+        // opening from its own poll (`CodexBannerSnapshot`), because this view
+        // does not exist yet when the first opening is decided. The one fact
+        // only this view has, whether this Mac shares its accounts, is handed
+        // to it.
         .onAppear {
             if !snapshotMode {
-                codexBannerSnapshot.observe(codexBannerCandidate)
-                codexBannerSnapshot.observeSessionsLine(codexSessionsNoticeCandidate)
+                codexBannerSnapshot.peerSharing = peers.snapshot.sharing
                 refreshSessionFiles()
                 machine = MachineStats.read()
                 refreshClaudeCount()
                 claudeRoute = ClaudeRouteRead.current()
-                refreshCodexCount()
             }
             syncPeersProvider()
         }
-        .onChange(of: codexSessionsNoticeCandidate) { line in
-            if !snapshotMode { codexBannerSnapshot.observeSessionsLine(line) }
-        }
-        .onChange(of: codexBannerCandidate) { candidate in
-            if !snapshotMode { codexBannerSnapshot.observe(candidate) }
+        .onChange(of: peers.snapshot.sharing) { sharing in
+            if !snapshotMode { codexBannerSnapshot.peerSharing = sharing }
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
-                codexBannerSnapshot.observe(codexBannerCandidate)
-                codexBannerSnapshot.observeSessionsLine(codexSessionsNoticeCandidate)
                 refreshSessionFiles()
                 machine = MachineStats.read()
                 refreshClaudeCount()
                 refreshZeroRequestsSince()
                 claudeRoute = ClaudeRouteRead.current()
-                refreshCodexCount()
-                refreshCodexZeroRequestsSince()
                 pruneKeptOpenCards()
                 reconcileCodexNotes()
             }
@@ -675,22 +671,14 @@ struct FleetView: View {
     }
 
     /// The one Codex line, under the Claude one and built the same way: amber
-    /// when it asks for action, dim when it only reports. Every input is what
-    /// this panel measured or the harness seeded. See ``CodexBanner``. Its
+    /// when it asks for action, dim when it only reports. The live panel draws
+    /// what the shell decided at this opening; a render the harness has not
+    /// opened builds it from the harness's seeds. See ``CodexBanner``. Its
     /// commands are drawn as ``CommandProseText``: without their backticks,
     /// never broken inside a path or a flag, and copied from the line's menu.
-    private var codexSessionsNoticeCandidate: String? {
-        poller.state.loadedFleet.flatMap(SessionsCodexCopy.trafficWithoutSessionsLine)
-    }
-
     private func codexSessionsNotice(_ fleet: Fleet) -> String? {
         snapshotMode && !codexBannerSnapshot.hasOpened
             ? SessionsCodexCopy.trafficWithoutSessionsLine(fleet) : codexBannerSnapshot.sessionsLine
-    }
-
-    private var codexBannerCandidate: CodexBanner? {
-        guard let fleet = poller.state.loadedFleet else { return nil }
-        return currentCodexBanner(fleet)
     }
 
     private func currentCodexBanner(_ fleet: Fleet) -> CodexBanner? {
@@ -2700,17 +2688,6 @@ struct FleetView: View {
         claudeCount = ProcessTable.read().filter { $0.name == "claude" }.count
     }
 
-    /// The running codex sessions, off one more walk of the process table, and
-    /// only while the fleet holds a Codex account: a Claude-only fleet never
-    /// pays for it. See ``CodexBanner``.
-    private func refreshCodexCount() {
-        guard case .loaded(let fleet) = poller.state, fleet.holdsCodex else {
-            codexCount = nil
-            return
-        }
-        codexCount = CodexProcesses.readLive()
-    }
-
     /// Drops every kept-open account the poll that just landed no longer
     /// lists, so a card never stays open as a ghost of an account that left.
     /// Only off a loaded fleet: an unreachable proxy says nothing about which
@@ -2771,23 +2748,6 @@ struct FleetView: View {
             zeroRequestsSince = nil
         } else if zeroRequestsSince == nil {
             zeroRequestsSince = Date()
-        }
-    }
-
-    /// ``refreshZeroRequestsSince()`` for the Codex line: advances or clears
-    /// ``codexZeroRequestsSince`` off the poll that just landed. The pure check
-    /// is ``CodexBanner/codexRequests(_:)``.
-    private func refreshCodexZeroRequestsSince() {
-        guard case .loaded(let fleet) = poller.state,
-            let total = CodexBanner.codexRequests(fleet)
-        else {
-            codexZeroRequestsSince = nil
-            return
-        }
-        if total > 0 {
-            codexZeroRequestsSince = nil
-        } else if codexZeroRequestsSince == nil {
-            codexZeroRequestsSince = Date()
         }
     }
 

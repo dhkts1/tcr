@@ -352,10 +352,62 @@ enum ShellProbe {
                 detail: "notifier=\(notifier == nil ? "nil" : "built") "
                     + "bundleIdentifier=\(bundleId ?? "nil") builtCentre=\(builtCentre)"))
 
+        checks.append(await firstOpeningCodexLineCheck())
+
         report(
             checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
             notes: notes)
         exit(checks.allSatisfy(\.passed) ? 0 : 1)
+    }
+
+    // MARK: - Assertion 12
+
+    /// The first opening of a fresh shell draws the Codex line its fleet calls for.
+    ///
+    /// The panel's view does not exist until that opening shows it, so a line the
+    /// view recorded reached only the opening after: the first click after launch
+    /// drew no Codex line however many requests tcr had refused. A second shell,
+    /// because the first has opened already; the line it must show is a refusal,
+    /// which needs no process walk and so says nothing about this Mac's codex.
+    @MainActor
+    private static func firstOpeningCodexLineCheck() async -> Check {
+        let name = "first opening: the Codex line is decided from the shell's own fleet"
+        guard let fleet = codexProbeFleet() else {
+            return Check(12, name, passed: false, detail: "the Codex probe fleet did not decode")
+        }
+        let shell = MenuBarShell(
+            poller: StatusPoller(pinnedState: .loaded(fleet)),
+            awake: AwakeController.harness(),
+            updater: Updater(startingUpdater: false),
+            codexPresence: CodexPresenceController(initialPresence: .absent, resolver: { (.absent, nil) }),
+            whatsNew: WhatsNewController(
+                store: WhatsNewStore(defaults: nil), fetcher: NeverFetches(),
+                location: nil, currentVersion: nil))
+        shell.popover.animates = false
+        shell.openPanel()
+        let shown = shell.codexBannerSnapshot.shown
+        shell.closePanel()
+        _ = await waitUntil { !shell.popover.isShown }
+        let expected = CodexBanner.refused(count: 4, last: .usageLimit, peerSharing: false)
+        return Check(
+            12, name, passed: shown == expected,
+            detail: "shown=\(shown.map { String(describing: $0) } ?? "nil")")
+    }
+
+    /// One pooled Codex row whose traffic holds four refusals in the last ten minutes.
+    private static func codexProbeFleet() -> Fleet? {
+        let json = """
+            [{"name":"probe-codex@example.com","provider":"codex","priority":0,
+              "status":"active","disabled":false,"quota":0.3,"quotaState":"ok",
+              "sevenDay":0.3,"quotaWindows":["sevenDay"],"held":[],"requests":3,
+              "inputTokens":1,"outputTokens":1,"cacheReadTokens":1,"cacheCreationTokens":0,
+              "probeStatus":"ok","probeError":null,"lastStreamError":null,
+              "streamErrorCount":0,"source":"live","gate":"ok",
+              "codexRoute":{"pooled":true},
+              "codexTraffic":{"refused10m":4,"lastRefusal":"usage_limit_reached",
+                "unpooled10m":0}}]
+            """
+        return try? Fleet.decode(Data(json.utf8))
     }
 
     /// Let the run loop lay out what was just changed. A status item is

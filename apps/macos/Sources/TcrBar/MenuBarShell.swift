@@ -296,6 +296,16 @@ final class MenuBarShell {
             }
             .store(in: &marks)
 
+        // The Codex line's quiet clock, off every poll, the panel open or not: a
+        // clock the panel's view advanced stood still while the panel was shut,
+        // so the line said nothing for the five minutes after each opening.
+        // Arithmetic on the fleet this poll already read; nothing is walked.
+        self.poller.$state
+            .sink { [weak self] state in
+                self?.codexBannerSnapshot.observePoll(state.loadedFleet)
+            }
+            .store(in: &marks)
+
         // Built here, after the popover exists, because it asks the popover
         // whether the panel is open before it posts anything. It constructs no
         // `UNUserNotificationCenter`: that happens on the first read that has
@@ -854,7 +864,12 @@ final class MenuBarShell {
         var fleet: Fleet?
         if case .loaded(let loaded) = poller.state { fleet = loaded }
         claudeRoute.decideAtOpen(fleet: fleet)
-        codexBannerSnapshot.decideAtOpen()
+        // The Codex lines too, from the same read, so the first opening after
+        // launch draws them: the panel's view does not exist until this show.
+        // The process walk runs only when the last line's other inputs all hold.
+        codexBannerSnapshot.decideAtOpen(
+            fleet: fleet, bundledTcrWithoutCLI: codexPresence.bundledTcrWithoutCLI,
+            codexProcesses: { CodexProcesses.readLive() })
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // For the NEXT opening; the one on screen keeps what it decided.
         Task { await claudeRoute.refresh() }
