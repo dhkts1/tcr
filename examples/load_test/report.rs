@@ -187,10 +187,15 @@ pub fn throttle_line(r: &PhaseResult) -> String {
          `count_tokens`, which log none)",
         r.served_messages, r.served_count_tokens
     ));
-    if lines != r.served_messages {
+    if lines < r.served_messages {
         line.push_str(&format!(
             "; {} more served than logged, so some lines are missing",
-            r.served_messages as i64 - lines as i64
+            r.served_messages - lines
+        ));
+    } else if lines > r.served_messages {
+        line.push_str(&format!(
+            "; {} more logged than served, so lines from outside the phase were counted",
+            lines - r.served_messages
         ));
     }
     line
@@ -470,5 +475,11 @@ mod tests {
 
         r.usage_lines = 58_300;
         assert!(throttle_line(&r).contains("15 more served than logged"));
+
+        // The other sign used to print "-16 more served than logged".
+        r.usage_lines = 58_331;
+        let line = throttle_line(&r);
+        assert!(line.contains("16 more logged than served"), "{line}");
+        assert!(!line.contains("missing"), "{line}");
     }
 }

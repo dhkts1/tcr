@@ -30,7 +30,7 @@ paths.
 |---|---|
 | `report.md`, `report.json` | the run's figures, per phase |
 | `<phase>.json` | one phase's figures, as `report` and `spread` read them |
-| `<phase>.svg` | the flame graph, one tower per kind of thread (`tokio-rt-worker`, `tcr-usage-ledger`) |
+| `<phase>.svg` | the flame graph, one tower per kind of thread (`tokio-rt-worker`, `tcr-usage-ledger`, `tcr-log-writer`) |
 | `<phase>.folded` | the folded stacks behind it, demangled and merged by thread name |
 | `<phase>.threads.folded` | the same stacks before merging, one root per thread; `--per-thread-svg` also draws them as `<phase>.threads.svg` |
 | `<phase>.sample.txt` | `sample`'s own output |
@@ -229,6 +229,55 @@ The harness sends the proxy's stdout to `/dev/null`, as TcrBar does (`ServerCont
 so the durable log is the only file each line is written to. In early runs that captured stdout
 to a file as well, `Stdout::lock` was the top `tcr` frame in `overhead`, so a proxy whose stdout
 goes to a file or a slow terminal pays more than these figures.
+
+The figures above predate the log writer queue below, which removed the first finding.
+
+## The log writer queue
+
+Since `perf/log-writer-queue`, the log file is written by one thread, `tcr-log-writer`, fed by a
+queue (`src/file_log.rs`): a tokio worker formats its line and queues it, and takes no lock on
+the file. A headless proxy whose stdout is the null device no longer formats or writes a stdout
+copy at all; a terminal, a pipe or a file still gets one.
+
+Three `overhead` runs each side, `--phases overhead`, alternating before and after, on
+2026-10-16: before is `bf610b31` (main), after is the branch. Both binaries were built in one
+target directory with the script's own flags. The frame shares come from each run's
+`overhead.folded`: *mutex wait* is the share of samples whose leaf is `__psynch_mutexwait`, and
+*log writing* the share of samples with a frame from the log's writer on the stack
+(`tracing_appender`, `RollingFileAppender`, `Stdout`, `tcr::file_log`, or the `tcr-log-writer`
+thread).
+
+| run | load 1m at start | served | CPU s / 1k req | added ms p99 | mutex wait | log writing |
+|---|---|---|---|---|---|---|
+| before 1 | 57 | 102,867 | 0.32 | 15.5 | 16.5% | 21.7% |
+| before 2 | 51 | 76,262 | 0.35 | 23.5 | 20.0% | 23.5% |
+| before 3 | 45 | 39,688 | 0.34 | 80.6 | 24.5% | 25.2% |
+| after 1 | 47 | 65,523 | 0.26 | 43.6 | 11.9% | 7.0% |
+| after 2 | 48 | 76,267 | 0.28 | 32.7 | 11.0% | 7.2% |
+| after 3 | 46 | 55,596 | 0.28 | 58.5 | 13.1% | 6.2% |
+
+- **CPU per 1,000 requests fell from 0.32 to 0.35 to 0.26 to 0.28**, median 0.34 to 0.28, about
+  18% less; the two ranges do not overlap.
+- **The log's locks are gone from the profile.** Before, the waits under
+  `Mutex<RollingFileAppender>::make_writer_for` (6.6 to 10.5% of samples) and `Stdout::lock`
+  (3.0 to 3.5%) led every run. After, neither appears; what mutex wait remains is under the
+  bound-token map (`Manager::bound_token_account`, `Manager::record_bound_tokens`) and
+  `UsageTracker::record`, as before, plus 0.8% at most in the queue's own wake-up
+  (`crossbeam_channel::waker::SyncWaker::notify`). The writer thread itself is 3.4 to 3.8% of
+  samples.
+- **Added p99 did not measurably change.** The before runs spread from 15.5 to 80.6 ms and the
+  after runs from 32.7 to 58.5 ms; three runs a side on a shared machine cannot separate them,
+  which is the reason [Toward a CI gate](#toward-a-ci-gate) says not to gate on latency.
+
+The queue holds 16,384 lines and the writer is not lossy: a full queue makes the emitter wait
+rather than drop a line. The queue's owner lives as long as the server and drains to disk on
+every way out, a panic included; why that matters, and what each exit does, is the module doc of
+`src/file_log.rs`. Because a line now reaches the file a moment after it is logged, the driver
+reads a phase's starting offset only once the log has been quiet for 500 ms, and reads its
+lines after the proxy has stopped and drained. Without that, the after runs above counted up to
+16 warm-up lines as the phase's. A fourth run each side with the fixed driver counted exactly one
+`request usage` line per served request on both, at 0.28 (after) and 0.34 (before) CPU seconds
+per 1,000.
 
 ## Toward a CI gate
 
