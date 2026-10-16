@@ -56,11 +56,20 @@ pub const WRITER_THREAD: &str = "tcr-log-writer";
 /// which a working disk writes well inside this; a stalled one must not turn a panic into a hang.
 pub const PANIC_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many sync barriers the writer thread has passed, and the condition a waiter sleeps on.
+/// How many sync barriers the writer thread has passed, whether the [`FileLog`] has closed, and
+/// the condition a waiter sleeps on.
 #[derive(Default)]
 struct Passed {
-    count: Mutex<u64>,
+    state: Mutex<Barriers>,
     advanced: Condvar,
+}
+
+/// What a waiter reads under [`Passed`]'s lock. `closed` sits under the same lock as `count` so a
+/// close cannot slip between a waiter's check and its wait.
+#[derive(Default)]
+struct Barriers {
+    count: u64,
+    closed: bool,
 }
 
 /// The writer thread's end of the queue: the file, behind a buffer, and the barrier count.
@@ -89,12 +98,12 @@ impl<W: Write> Write for Sink<W> {
         let flushed = self.file.flush();
         // Counted even when the flush failed: a waiter must be released either way, and the
         // failure is the same one every later line would meet.
-        let mut count = self
+        let mut state = self
             .passed
-            .count
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *count += 1;
+        state.count += 1;
         self.passed.advanced.notify_all();
         flushed
     }
@@ -108,6 +117,12 @@ impl<W: Write> Write for Sink<W> {
 ///
 /// Cloned into the panic hook. It holds no [`WorkerGuard`], so keeping one alive does not keep
 /// the writer alive; once the [`FileLog`] is gone, [`Flusher::sync`] returns `false` at once.
+///
+/// That rests on the closed flag the [`FileLog`] sets once its guard has dropped, not on the
+/// queue: the guard's drop waits at most about a second for the writer and then returns while the
+/// writer thread, and with it the queue's receiver, can live on (`tracing_appender`'s
+/// `WorkerGuard::drop` and `worker.rs`). A barrier sent then is accepted into a queue nobody will
+/// read again.
 #[derive(Clone)]
 pub struct Flusher {
     queue: NonBlocking,
@@ -123,7 +138,13 @@ impl Flusher {
     /// have passed. Barriers holding the earlier tickets number one fewer than this caller's
     /// ticket, so once the count reaches it, a barrier queued after this call has passed, and the
     /// queue is first in, first out: so has every line queued before it.
+    ///
+    /// Returns `false` at once when the [`FileLog`] has closed, and a sync already waiting returns
+    /// `false` when it closes.
     pub fn sync(&self, timeout: Duration) -> bool {
+        if self.lock_state().closed {
+            return false;
+        }
         let ticket = self.requested.fetch_add(1, Ordering::SeqCst) + 1;
         // `NonBlocking::write_all` sends the empty line as one message; with lossy off it waits for
         // room, and it errs only when the writer thread has gone.
@@ -131,24 +152,36 @@ impl Flusher {
             return false;
         }
         let deadline = Instant::now() + timeout;
-        let mut count = self
-            .passed
-            .count
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while *count < ticket {
+        let mut state = self.lock_state();
+        while state.count < ticket {
+            if state.closed {
+                return false;
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return false;
             }
-            count = self
+            state = self
                 .passed
                 .advanced
-                .wait_timeout(count, left)
+                .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
         true
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, Barriers> {
+        self.passed
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Mark the log closed and wake every waiter, under the lock a waiter checks it with.
+    fn mark_closed(&self) {
+        self.lock_state().closed = true;
+        self.passed.advanced.notify_all();
     }
 }
 
@@ -157,9 +190,8 @@ impl Flusher {
 #[must_use = "dropping the FileLog stops the log writer thread: every later line is lost"]
 pub struct FileLog {
     flusher: Flusher,
-    // Field order is drop order: the flusher's queue handle goes first, then the guard drains and
-    // joins. Either order is correct; this one is stated so nobody has to check.
-    _guard: WorkerGuard,
+    /// Always `Some` until [`Drop`] takes it, so the drop can order the guard before the flag.
+    guard: Option<WorkerGuard>,
 }
 
 impl FileLog {
@@ -177,6 +209,16 @@ impl FileLog {
     /// (`std::process::exit`); dropping the value does the same.
     pub fn close(self) {
         drop(self);
+    }
+}
+
+impl Drop for FileLog {
+    /// Drop the guard first: it drains the queue, so a sync whose barrier the drain passes still
+    /// returns `true`. Then mark the flushers closed, which wakes a sync whose barrier the drain
+    /// never reached (the guard gave up on a stuck writer) and answers every later sync at once.
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.flusher.mark_closed();
     }
 }
 
@@ -202,7 +244,7 @@ pub fn start<W: Write + Send + 'static>(file: W) -> (NonBlocking, FileLog) {
         queue,
         FileLog {
             flusher,
-            _guard: guard,
+            guard: Some(guard),
         },
     )
 }
@@ -255,6 +297,7 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd as _;
     use std::process::Command;
+    use std::sync::mpsc;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     const CHILD_ENV: &str = "TCR_FILE_LOG_TEST_CHILD";
@@ -355,21 +398,114 @@ mod tests {
         });
     }
 
-    /// Once the `FileLog` is gone the writer has stopped, and a sync says so at once rather than
-    /// waiting out its timeout.
+    /// A file whose first `write` or `flush` parks the writer thread until the test releases it,
+    /// so the thread is certainly still alive, and certainly not reading the queue, while the test
+    /// closes the `FileLog` around it. Closing then gives up on its one-second drain and returns
+    /// with the thread alive and its queue still open: the state a slow-exiting thread leaves.
+    struct HeldFile {
+        hold: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl HeldFile {
+        fn park(&mut self) {
+            if let Some((entered, release)) = self.hold.take() {
+                entered
+                    .send(())
+                    .expect("tell the test the writer is parked");
+                release.recv().expect("the test releases the writer");
+            }
+        }
+    }
+
+    impl Write for HeldFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.park();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.park();
+            Ok(())
+        }
+    }
+
+    /// A [`HeldFile`], the receiver that hears the writer park in it, and the sender that frees it.
+    fn held_file() -> (HeldFile, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let file = HeldFile {
+            hold: Some((entered_tx, release_rx)),
+        };
+        (file, entered_rx, release_tx)
+    }
+
+    /// The writer thread outlives the close, so the barrier a later sync queues would be accepted
+    /// and never read. The sync must still answer at once.
     #[test]
-    fn a_sync_after_close_returns_false_without_waiting() {
-        let (_dir, path) = scratch_file("closed.log");
-        let (_queue, file_log) = start(std::fs::File::create(&path).expect("create the log"));
+    fn a_sync_after_close_returns_false_while_the_writer_is_still_alive() {
+        let (file, entered, release) = held_file();
+        let (queue, file_log) = start(file);
+        queue
+            .clone()
+            .write_all(b"held line\n")
+            .expect("queue a line");
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer reached the file");
         let flusher = file_log.flusher();
         file_log.close();
         let began = Instant::now();
-        assert!(!flusher.sync(Duration::from_secs(30)));
+        let synced = flusher.sync(Duration::from_secs(10));
+        let took = began.elapsed();
+        release.send(()).expect("release the writer");
+        assert!(!synced, "a sync after close reported the queue synced");
+        assert!(took < Duration::from_secs(2), "took {took:?}");
+    }
+
+    /// A sync whose barrier the close's drain does pass returns true: closing does not cut short
+    /// a sync it was about to satisfy.
+    #[test]
+    fn a_sync_begun_before_close_returns_true_once_the_drain_passes_its_barrier() {
+        let (file, entered, release) = held_file();
+        let (_queue, file_log) = start(file);
+        let flusher = file_log.flusher();
+        let syncer = std::thread::spawn(move || flusher.sync(Duration::from_secs(10)));
+        // The writer parks in the flush the sync's own barrier asks for, so the barrier is already
+        // off the queue and the close's shutdown message is queued behind it.
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer reached the barrier");
+        let closer = std::thread::spawn(move || file_log.close());
+        // Inside the close's one-second drain, so the barrier passes while the close is waiting.
+        std::thread::sleep(Duration::from_millis(200));
+        release.send(()).expect("release the writer");
         assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "took {:?}",
-            began.elapsed()
+            syncer.join().expect("the syncer"),
+            "the drain passed the barrier but the sync said it did not"
         );
+        closer.join().expect("the closer");
+    }
+
+    /// A sync already waiting when the close gives up on the writer returns false as the close
+    /// finishes, rather than waiting out its own timeout for a barrier nobody will pass.
+    #[test]
+    fn a_sync_waiting_when_the_close_gives_up_returns_false_once_it_closes() {
+        let (file, entered, release) = held_file();
+        let (_queue, file_log) = start(file);
+        let flusher = file_log.flusher();
+        let began = Instant::now();
+        let syncer = std::thread::spawn(move || flusher.sync(Duration::from_secs(30)));
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer reached the barrier");
+        file_log.close();
+        let synced = syncer.join().expect("the syncer");
+        let took = began.elapsed();
+        release.send(()).expect("release the writer");
+        assert!(
+            !synced,
+            "the writer never passed the barrier, yet the sync said it did"
+        );
+        assert!(took < Duration::from_secs(5), "took {took:?}");
     }
 
     #[test]
