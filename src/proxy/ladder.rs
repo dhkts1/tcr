@@ -219,7 +219,7 @@ pub(super) enum Step {
 /// missing.
 #[derive(Default)]
 pub(super) struct Ladder {
-    /// The accounts select() may not return for this request.
+    /// The accounts `select()` may not return for this request.
     tried: HashSet<usize>,
     /// The accounts the bound-history hold benched, and only those, so a release
     /// mid-request can re-admit them without re-admitting what another rule benched: `tried`
@@ -227,13 +227,13 @@ pub(super) struct Ladder {
     /// lease's only enforcement on this path. Clearing `tried` wholesale served a lease scoped
     /// to one account on another (found in review, 2026-09-24).
     benched_for_hold: Vec<usize>,
-    /// The account the NEXT iteration must use, bypassing select(). Three producers:
+    /// The account the NEXT iteration must use, bypassing `select()`. Three producers:
     ///
     ///  - A genuine SAME-account retry (401 force-refresh, transient-429 inline wait, 529
-    ///    in-place backoff, a transport retry, an offline wait), which select() would
+    ///    in-place backoff, a transport retry, an offline wait), which `select()` would
     ///    otherwise rotate AWAY from the very account the retry means to keep.
     ///  - The 529 FAILOVER, which parks the DIFFERENT account its availability probe already
-    ///    chose. That probe IS this iteration's selection: re-running select() next iteration
+    ///    chose. That probe IS this iteration's selection: re-running `select()` next iteration
     ///    would double its side effects (LRU stamp, divert log) and could race to a `None`
     ///    after we already benched the 529'd account in `tried`, turning a forwardable 529
     ///    into a synthesized 429.
@@ -307,11 +307,11 @@ pub(super) struct Ladder {
 }
 
 impl Ladder {
-    pub(super) fn tried(&self) -> &HashSet<usize> {
+    pub(super) const fn tried(&self) -> &HashSet<usize> {
         &self.tried
     }
 
-    pub(super) fn tally(&self) -> &Tally {
+    pub(super) const fn tally(&self) -> &Tally {
         &self.tally
     }
 
@@ -363,17 +363,17 @@ impl Ladder {
     }
 
     /// The next attempt uses `idx` again.
-    pub(super) fn retry_same(&mut self, idx: usize) {
+    pub(super) const fn retry_same(&mut self, idx: usize) {
         self.next_idx = Some(idx);
     }
 
     /// The next attempt uses `next`, already selected, or selects afresh when `None`.
-    pub(super) fn set_next(&mut self, next: Option<usize>) {
+    pub(super) const fn set_next(&mut self, next: Option<usize>) {
         self.next_idx = next;
     }
 
     /// The account the next attempt must use, if a move named one.
-    pub(super) fn take_next(&mut self) -> Option<usize> {
+    pub(super) const fn take_next(&mut self) -> Option<usize> {
         self.next_idx.take()
     }
 
@@ -403,7 +403,7 @@ impl Ladder {
         *retried
     }
 
-    pub(super) fn failovers_529(&self) -> u32 {
+    pub(super) const fn failovers_529(&self) -> u32 {
         self.failovers_529
     }
 
@@ -440,42 +440,42 @@ impl Ladder {
         })
     }
 
-    pub(super) fn peer_egress_tried(&self) -> bool {
+    pub(super) const fn peer_egress_tried(&self) -> bool {
         self.peer_egress_tried
     }
 
-    pub(super) fn spend_peer_egress(&mut self) {
+    pub(super) const fn spend_peer_egress(&mut self) {
         self.peer_egress_tried = true;
     }
 
-    pub(super) fn soft_waited_exhaustion(&self) -> bool {
+    pub(super) const fn soft_waited_exhaustion(&self) -> bool {
         self.soft_waited_exhaustion
     }
 
-    pub(super) fn spend_soft_wait(&mut self) {
+    pub(super) const fn spend_soft_wait(&mut self) {
         self.soft_waited_exhaustion = true;
     }
 
-    pub(super) fn transport_failed(&mut self) {
+    pub(super) const fn transport_failed(&mut self) {
         self.tally.transport_failures += 1;
     }
 
-    pub(super) fn upstream_answered(&mut self) {
+    pub(super) const fn upstream_answered(&mut self) {
         self.tally.upstream_responses += 1;
     }
 
     /// A transport failure past the connect phase: its outcome upstream is unknown.
-    pub(super) fn unknown_outcome(&mut self) {
+    pub(super) const fn unknown_outcome(&mut self) {
         self.tally.unknown_outcome_transport_failure = true;
     }
 
     /// A name-resolution failure; returns how many this request has seen.
-    pub(super) fn offline_failed(&mut self) -> usize {
+    pub(super) const fn offline_failed(&mut self) -> usize {
         self.tally.offline_failures += 1;
         self.tally.offline_failures
     }
 
-    pub(super) fn codex_access_unread(&mut self) {
+    pub(super) const fn codex_access_unread(&mut self) {
         self.tally.codex_access_read_failures += 1;
     }
 

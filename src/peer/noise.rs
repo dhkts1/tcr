@@ -348,7 +348,7 @@ impl Handshake {
     }
 
     /// The `snow` pattern string.
-    pub fn pattern(self) -> &'static str {
+    pub const fn pattern(self) -> &'static str {
         match self {
             Self::Pair => PATTERN_PAIR,
             Self::Return => PATTERN_RETURN,
@@ -373,7 +373,7 @@ impl Handshake {
     /// build is read far enough to be told which version it speaks rather than
     /// refused as noise. The refusal itself is [`Message1::instance_id`]'s, and
     /// it still happens before a single byte is written back.
-    pub fn from_message_1_len(len: usize) -> Option<Self> {
+    pub const fn from_message_1_len(len: usize) -> Option<Self> {
         match len {
             KNOCK_MESSAGE_1_LEN => Some(Self::Knock),
             XX_MESSAGE_1_LEN | XX_MESSAGE_1_LEN_V1 => Some(Self::Pair),
@@ -389,7 +389,7 @@ impl Handshake {
     /// Only [`Self::Pair`] has two answers, and only so the older payload gets
     /// a refusal that names the version. Every other pattern has exactly one
     /// length, which is what [`Self::message_1_len`] returns.
-    pub fn accepts_message_1_len(self, len: usize) -> bool {
+    pub const fn accepts_message_1_len(self, len: usize) -> bool {
         match self {
             Self::Pair => len == XX_MESSAGE_1_LEN || len == XX_MESSAGE_1_LEN_V1,
             other => len == other.message_1_len(),
@@ -402,7 +402,7 @@ impl Handshake {
     /// Per PATTERN and not the fleet-wide [`MAX_MESSAGE_1_BYTES`], because the
     /// pattern is already known where this is asked: an `XX` responder has no
     /// reason to size a buffer for the 96 bytes an `IK` message 1 has.
-    pub fn max_message_1_len(self) -> usize {
+    pub const fn max_message_1_len(self) -> usize {
         match self {
             Self::Pair => {
                 if XX_MESSAGE_1_LEN > XX_MESSAGE_1_LEN_V1 {
@@ -418,7 +418,7 @@ impl Handshake {
     /// How long this pattern's message 1 is, with the payload this design
     /// requires of it, empty everywhere except [`Self::Pair`], which carries
     /// the instance id (see [`XX_MESSAGE_1_LEN`]).
-    pub fn message_1_len(self) -> usize {
+    pub const fn message_1_len(self) -> usize {
         match self {
             Self::Pair => XX_MESSAGE_1_LEN,
             Self::Return | Self::Enrol => IK_MESSAGE_1_LEN,
@@ -435,7 +435,7 @@ impl Handshake {
     /// [`Self::Pair`]: `XX` learns a static key eventually, in message 3, while
     /// `NN` never learns one at all. [`Self::learns_a_static_key`] is the
     /// question that separates them.
-    pub fn pins_before_answering(self) -> bool {
+    pub const fn pins_before_answering(self) -> bool {
         match self {
             Self::Pair | Self::Knock | Self::KnockPsk => false,
             Self::Return | Self::Enrol => true,
@@ -449,12 +449,12 @@ impl Handshake {
     /// `XX` answers `false` there and `true` here, and a caller that conflated
     /// the two would either look for a key `NN` will never produce or skip the
     /// key `XX` carries in message 3.
-    pub fn learns_a_static_key(self) -> bool {
+    pub const fn learns_a_static_key(self) -> bool {
         !matches!(self, Self::Knock | Self::KnockPsk)
     }
 
     /// Whether a PSK is mixed in, and at which position.
-    fn psk_position(self) -> Option<u8> {
+    const fn psk_position(self) -> Option<u8> {
         match self {
             Self::Enrol => Some(PSK_POSITION_ONE),
             Self::KnockPsk => Some(PSK_POSITION_ZERO),
@@ -1626,9 +1626,8 @@ where
         .context("peer knock: the answer did not decrypt under the knock session key")?;
     if plaintext[..len] != [tcr_peer_wire::KNOCK_ACK] {
         bail!(
-            "peer knock: that Mac answered {} bytes instead of the one-byte receipt a knock \
-             earns; treating it as a refusal",
-            len
+            "peer knock: that Mac answered {len} bytes instead of the one-byte receipt a knock \
+             earns; treating it as a refusal"
         );
     }
     Ok(())

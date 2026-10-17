@@ -443,11 +443,8 @@ mod tests {
     #[test]
     fn a_sync_after_close_returns_false_while_the_writer_is_still_alive() {
         let (file, entered, release) = held_file();
-        let (queue, file_log) = start(file);
-        queue
-            .clone()
-            .write_all(b"held line\n")
-            .expect("queue a line");
+        let (mut queue, file_log) = start(file);
+        queue.write_all(b"held line\n").expect("queue a line");
         entered
             .recv_timeout(Duration::from_secs(10))
             .expect("the writer reached the file");
@@ -518,7 +515,7 @@ mod tests {
         let (_dir, path) = scratch_file("not-null");
         let file = std::fs::File::create(&path).expect("create a file");
         assert!(!is_null_device(file.as_fd()));
-        let (reader, _writer) = std::io::pipe().expect("a pipe");
+        let (reader, _writer) = io::pipe().expect("a pipe");
         assert!(!is_null_device(reader.as_fd()));
     }
 

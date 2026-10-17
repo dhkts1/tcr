@@ -42,14 +42,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Is `addr` the kind of address a real, up, non-loopback interface holds?
 /// The one rule [`network_present`] runs, named so it can be driven directly
 /// from a hand-built list in a test.
-pub fn is_usable(addr: IpAddr) -> bool {
+pub const fn is_usable(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => is_usable_v4(v4),
         IpAddr::V6(v6) => is_usable_v6(v6),
     }
 }
 
-fn is_usable_v4(addr: Ipv4Addr) -> bool {
+const fn is_usable_v4(addr: Ipv4Addr) -> bool {
     if addr.is_unspecified() || addr.is_loopback() || addr.is_multicast() {
         return false;
     }
@@ -62,7 +62,7 @@ fn is_usable_v4(addr: Ipv4Addr) -> bool {
     true
 }
 
-fn is_usable_v6(addr: Ipv6Addr) -> bool {
+const fn is_usable_v6(addr: Ipv6Addr) -> bool {
     if addr.is_unspecified() || addr.is_loopback() || addr.is_multicast() {
         return false;
     }

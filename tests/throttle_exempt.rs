@@ -101,13 +101,13 @@ impl AccountWarmer for NeverWarms {
 const POOL: usize = 13;
 
 fn fake_uuid(i: usize) -> String {
-    format!("{:08}-1111-1111-1111-111111111111", i)
+    format!("{i:08}-1111-1111-1111-111111111111")
 }
 
 /// Distinct from [`fake_uuid`] so a bucket key built from the wrong field is
 /// visible rather than silently plausible.
 fn fake_org_uuid(i: usize) -> String {
-    format!("{:08}-2222-2222-2222-222222222222", i)
+    format!("{i:08}-2222-2222-2222-222222222222")
 }
 
 /// One account per org, EXCEPT account 0 which deliberately has no org at all.
@@ -191,7 +191,7 @@ fn manager(
 /// `BURST` (8) on a single org produces the same `(8-4)*350 = 1400ms` closed form
 /// the floor/ceiling constants below were derived from. Testing the *mechanism*,
 /// not the shipped tuning.
-fn account_throttle_tight() -> ThrottleConfig {
+const fn account_throttle_tight() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(350),
         burst: Some(4),
@@ -201,7 +201,7 @@ fn account_throttle_tight() -> ThrottleConfig {
 /// A fleet ceiling loose enough that it never binds in these tests, so a timing
 /// assertion attributes cleanly to the per-org bucket. `burst: 1024` swallows any
 /// burst these tests fire.
-fn fleet_throttle_loose() -> ThrottleConfig {
+const fn fleet_throttle_loose() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(1),
         burst: Some(1024),
@@ -248,11 +248,11 @@ async fn spawn_json_upstream() -> (String, Arc<AtomicUsize>) {
 async fn spawn_json_upstream_recording() -> (String, Arc<AtomicUsize>, ServedBy) {
     let hits = Arc::new(AtomicUsize::new(0));
     let served: ServedBy = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let counter = hits.clone();
-    let recorder = served.clone();
+    let counter = Arc::clone(&hits);
+    let recorder = Arc::clone(&served);
     let app = Router::new().fallback(any(move |req: axum::extract::Request| {
-        let counter = counter.clone();
-        let recorder = recorder.clone();
+        let counter = Arc::clone(&counter);
+        let recorder = Arc::clone(&recorder);
         async move {
             let token = req
                 .headers()

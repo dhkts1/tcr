@@ -100,7 +100,7 @@ impl Provider {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
@@ -112,7 +112,7 @@ impl Provider {
     /// Anthropic windows, and the carry path builds an Anthropic URL and splices an Anthropic
     /// body. The one spelling of the rule: a provider added later answers here, and letting Codex
     /// onto the mesh is a one-line change.
-    pub fn on_peer_mesh(self) -> bool {
+    pub const fn on_peer_mesh(self) -> bool {
         match self {
             Self::Anthropic => true,
             Self::Codex => false,
@@ -121,7 +121,7 @@ impl Provider {
 
     /// Does this provider have a Fable weekly quota bucket? It is an Anthropic fact: a Codex
     /// request whose model id merely contains "fable" never consults the bucket.
-    pub fn has_fable_bucket(self) -> bool {
+    pub const fn has_fable_bucket(self) -> bool {
         match self {
             Self::Anthropic => true,
             Self::Codex => false,
@@ -131,7 +131,7 @@ impl Provider {
     /// May tcr rewrite this provider's `cache_control` breakpoints to the 1h TTL
     /// (`cacheTtlRewrite`)? The breakpoints are Anthropic's request shape; a Codex body has
     /// none, so it is never re-serialized for them.
-    pub fn rewrites_cache_ttl(self) -> bool {
+    pub const fn rewrites_cache_ttl(self) -> bool {
         match self {
             Self::Anthropic => true,
             Self::Codex => false,
@@ -140,7 +140,7 @@ impl Provider {
 
     /// For `#[serde(skip_serializing_if)]` on `config::Account::provider`: an Anthropic row writes
     /// no key, so an upgraded Anthropic-only config re-saves without a `provider` key.
-    pub fn is_anthropic(&self) -> bool {
+    pub const fn is_anthropic(&self) -> bool {
         match self {
             Self::Anthropic => true,
             Self::Codex => false,
@@ -252,7 +252,7 @@ mod tests {
         }
 
         let recorder = Recorder(std::cell::Cell::new(&[]));
-        assert!(<Provider as serde::Deserialize>::deserialize(&recorder).is_err());
+        assert!(<Provider as Deserialize>::deserialize(&recorder).is_err());
         recorder.0.get()
     }
 

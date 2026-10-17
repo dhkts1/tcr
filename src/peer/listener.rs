@@ -391,7 +391,7 @@ pub const LEDGER_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 /// counters a panicking relay left behind are still the best record of what
 /// was spent, and the alternative is a lender that silently stops persisting
 /// for the rest of the process's life.
-async fn flush_ledger_periodically(ledger: std::sync::Arc<std::sync::Mutex<Ledger>>) {
+async fn flush_ledger_periodically(ledger: Arc<Mutex<Ledger>>) {
     let mut ticker = tokio::time::interval(LEDGER_FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -546,7 +546,7 @@ struct ConnectionFailure {
 
 impl ConnectionFailure {
     /// A refusal from before the handshake completed.
-    fn unauthenticated(error: anyhow::Error) -> Self {
+    const fn unauthenticated(error: anyhow::Error) -> Self {
         Self {
             authenticated: false,
             error,
@@ -554,7 +554,7 @@ impl ConnectionFailure {
     }
 
     /// A failure on a session that had already proved who it was.
-    fn authenticated(error: anyhow::Error) -> Self {
+    const fn authenticated(error: anyhow::Error) -> Self {
         Self {
             authenticated: true,
             error,
@@ -731,7 +731,7 @@ impl Admission {
     }
 
     /// How many connections across all addresses have not authenticated yet.
-    pub fn live_unauthenticated_total(&self) -> usize {
+    pub const fn live_unauthenticated_total(&self) -> usize {
         self.live_total
     }
 
@@ -982,14 +982,14 @@ fn lock_admission(admission: &Arc<Mutex<Admission>>) -> std::sync::MutexGuard<'_
 pub struct LeaseServing {
     /// The lender's ledger, shared with whatever else reads it (`tcr peer ls`,
     /// the panel row).
-    pub ledger: std::sync::Arc<std::sync::Mutex<Ledger>>,
+    pub ledger: Arc<Mutex<Ledger>>,
     /// This node's own proxy base, e.g. `http://127.0.0.1:3456`.
     pub upstream: String,
     /// This node's own quota, read either side of the relay.
-    pub utilization: std::sync::Arc<dyn WindowUtilization>,
+    pub utilization: Arc<dyn WindowUtilization>,
     /// The owner's manager, for `handoff_bearer`. A hand-mode grant is the one
     /// path on which the lender reads its own access token for another Mac.
-    pub manager: std::sync::Arc<crate::manager::Manager>,
+    pub manager: Arc<crate::manager::Manager>,
 }
 
 /// What one connection needs from this node, owned so the task can outlive the
@@ -1055,14 +1055,14 @@ impl SessionContext {
     }
 
     /// This node's per-boot instance id, what it announces and knocks under.
-    pub fn instance_id(&self) -> InstanceId {
+    pub const fn instance_id(&self) -> InstanceId {
         self.instance_id
     }
 
     /// The shared caps, so a gate can read a token count or a live-socket
     /// count off the same state the accept loop decides on. Reading a copy
     /// would prove nothing about what the listener did.
-    pub fn admission(&self) -> &Arc<Mutex<Admission>> {
+    pub const fn admission(&self) -> &Arc<Mutex<Admission>> {
         &self.admission
     }
 
@@ -1070,8 +1070,10 @@ impl SessionContext {
     ///
     /// For [`flush_ledger_periodically`], which needs the `Arc` and nothing
     /// else out of [`LeaseServing`].
-    fn lease_ledger(&self) -> Option<std::sync::Arc<std::sync::Mutex<Ledger>>> {
-        self.serving.as_ref().map(|serving| serving.ledger.clone())
+    fn lease_ledger(&self) -> Option<Arc<Mutex<Ledger>>> {
+        self.serving
+            .as_ref()
+            .map(|serving| Arc::clone(&serving.ledger))
     }
 }
 
@@ -1171,7 +1173,7 @@ pub fn is_carrier_grade_nat(addr: Ipv4Addr) -> bool {
 }
 
 /// The IPv6 half of [`is_lan_scope`].
-fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
+const fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     if addr.is_loopback() {
         return true;
     }
@@ -1288,7 +1290,7 @@ pub fn internet_admission(
 /// IPv4-mapped form is unwrapped first, because a dual-stack listener reports
 /// `::ffff:127.0.0.1` for a socket bound to `127.0.0.1` and reading that as a
 /// global address would refuse the machine's own traffic.
-fn is_loopback_bind(bind: IpAddr) -> bool {
+const fn is_loopback_bind(bind: IpAddr) -> bool {
     match bind {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -1638,11 +1640,11 @@ where
 /// standard shape for recursive async and the only reason this function is not
 /// one line at the call site.
 fn serve_punched(
-    stream: crate::peer::serve::PeerStream,
+    stream: serve::PeerStream,
     context: SessionContext,
     from: SocketAddr,
     bind: SocketAddr,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move { serve_accepted(stream, &context, &from, bind).await })
 }
 
@@ -1786,7 +1788,7 @@ where
             let state_path = context.state_path.clone();
             let addr = addr.to_string();
             move || {
-                let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
+                let _lock = config::FileLock::acquire(&state_path)?;
                 let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
                 let created = match peer_state.reserve_knock_slot(&addr, now_ms) {
                     Ok(created) => created,
@@ -1888,7 +1890,7 @@ where
             let wire_version = knock.wire_version;
             let listen_port = knock.listen_port;
             move || {
-                let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
+                let _lock = config::FileLock::acquire(&state_path)?;
                 let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
                 peer_state
                     .record_knock(
@@ -1966,7 +1968,7 @@ async fn finish_knock_handshake<S>(
     // message 1 produced" unit intact rather than splitting it at a signature.
     read: noise::Message1,
     pattern: Handshake,
-) -> Result<(noise::PeerSession, tcr_peer_wire::Knock)>
+) -> Result<(PeerSession, tcr_peer_wire::Knock)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1994,7 +1996,7 @@ async fn release_reserved_knock_slot(context: &SessionContext, addr: &str, reser
         let state_path = context.state_path.clone();
         let addr = addr.to_string();
         move || {
-            let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
+            let _lock = config::FileLock::acquire(&state_path)?;
             let mut peer_state = crate::peer::state::load(&state_path, reserved_at_ms)?;
             peer_state.release_knock_reservation(&addr, reserved_at_ms);
             crate::peer::state::save(&state_path, &peer_state)?;
@@ -2024,7 +2026,7 @@ async fn record_pairing_key(
         let state_path = context.state_path.clone();
         let addr = addr.to_string();
         move || {
-            let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
+            let _lock = config::FileLock::acquire(&state_path)?;
             let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
             let mut touched = false;
             for window in &mut peer_state.accepted {
@@ -2054,7 +2056,7 @@ struct HelloWrites {
     briefs: Option<Result<usize>>,
     /// The endpoints this peer says it listens on, plus the host it was seen
     /// from on the port it announced.
-    endpoints: Result<crate::peer::config::Observed>,
+    endpoints: Result<config::Observed>,
     /// The address this peer says it sees us at, when it named one that parses.
     sees_us_at: Option<Result<bool>>,
 }
@@ -2217,9 +2219,8 @@ where
                 "peer listener: a first pairing arrived from {addr} as instance {instance_id} \
                  and no window is open for it, so nothing was answered. A window exists only \
                  after the operator accepts a pairing request on THIS Mac \
-                 (`tcr peer pending`, then `tcr peer accept <instance|addr>`), it lasts {} \
-                 seconds, and it admits that one instance at that one address",
-                ACCEPTED_WINDOW_SECS
+                 (`tcr peer pending`, then `tcr peer accept <instance|addr>`), it lasts {ACCEPTED_WINDOW_SECS} \
+                 seconds, and it admits that one instance at that one address"
             );
         }
         let session = noise::finish_responder(stream, claimed.state, Handshake::Pair, |_| {
@@ -2403,39 +2404,39 @@ impl StreamOrigin {
     /// Built once per stream, from the accepted socket and the header's
     /// `via`: non-empty means the frame's own origin stamped a carrier in, so
     /// nothing after this point may treat `from` as the peer's address.
-    fn from_header(from: SocketAddr, via: &[PeerId]) -> Self {
+    const fn from_header(from: SocketAddr, via: &[PeerId]) -> Self {
         match via.first() {
-            Some(&carrier) => StreamOrigin::Carried {
+            Some(&carrier) => Self::Carried {
                 socket: from,
                 carrier,
             },
-            None => StreamOrigin::Direct(from),
+            None => Self::Direct(from),
         }
     }
 
     /// The socket to treat as evidence about the peer: `Some` only when this
     /// stream's own transport connection is the peer's, never a carrier's.
-    fn observed_socket(&self) -> Option<SocketAddr> {
+    const fn observed_socket(&self) -> Option<SocketAddr> {
         match self {
-            StreamOrigin::Direct(addr) => Some(*addr),
-            StreamOrigin::Carried { .. } => None,
+            Self::Direct(addr) => Some(*addr),
+            Self::Carried { .. } => None,
         }
     }
 
     /// The raw transport socket, for a log line that wants to say which
     /// connection the bytes arrived on, whichever kind it is.
-    fn socket(&self) -> SocketAddr {
+    const fn socket(&self) -> SocketAddr {
         match self {
-            StreamOrigin::Direct(addr) => *addr,
-            StreamOrigin::Carried { socket, .. } => *socket,
+            Self::Direct(addr) => *addr,
+            Self::Carried { socket, .. } => *socket,
         }
     }
 
     /// The carrier's id, for a log line; `None` for a direct arrival.
-    fn carrier(&self) -> Option<PeerId> {
+    const fn carrier(&self) -> Option<PeerId> {
         match self {
-            StreamOrigin::Direct(_) => None,
-            StreamOrigin::Carried { carrier, .. } => Some(*carrier),
+            Self::Direct(_) => None,
+            Self::Carried { carrier, .. } => Some(*carrier),
         }
     }
 }
@@ -2664,14 +2665,13 @@ where
                 .row(&accepted_peer)
                 .and_then(|row| row.locator_from(from))
             {
-                match crate::peer::tunnel::path_meter().lock() {
-                    Ok(mut meter) => {
-                        meter.charge_bytes(&accepted_peer, path, up + down, now_ms());
-                    }
-                    Err(_) => tracing::warn!(
+                if let Ok(mut meter) = crate::peer::tunnel::path_meter().lock() {
+                    meter.charge_bytes(&accepted_peer, path, up + down, now_ms());
+                } else {
+                    tracing::warn!(
                         peer = %accepted_peer.display(),
                         "peer stream: the path meter's lock is poisoned, so this carry is                          not on any path's hour"
-                    ),
+                    );
                 }
             }
             tracing::debug!(
@@ -2815,7 +2815,7 @@ where
 /// to honour would elapse between wakes; and it has to be long enough that an
 /// idle session is not a busy loop. One second on a per-connection timer that
 /// does nothing but compare two integers when nothing is handed.
-const HANDOFF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Push a fresh `Handoff` for every hand-mode lease on this session whose
 /// bearer is close to expiring.
@@ -2834,7 +2834,7 @@ async fn push_due_handoffs<S>(
     session: &mut PeerSession,
     context: &SessionContext,
     store: &PeerStore,
-    handed: &mut std::collections::HashMap<u128, crate::peer::lease::HandedBearer>,
+    handed: &mut HashMap<u128, crate::peer::lease::HandedBearer>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2913,12 +2913,12 @@ where
             u64::try_from(now / 1_000).unwrap_or_default(),
             &|scope| {
                 serving.utilization.scope_restriction(scope)
-                    != crate::peer::serve::ScopeRestriction::Unenforceable
+                    != serve::ScopeRestriction::Unenforceable
             },
         ) else {
             continue;
         };
-        if grant.mode != crate::peer::config::LendMode::Hand {
+        if grant.mode != config::LendMode::Hand {
             continue;
         }
         let scope = match serving.ledger.lock() {
@@ -2959,7 +2959,7 @@ where
         noise::send_encrypted(stream, &mut session.transport, &bytes).await?;
         tracing::debug!(
             peer = %session.peer.display(),
-            lease = %crate::peer::config::lease_id_string(lease.lease_id),
+            lease = %config::lease_id_string(lease.lease_id),
             "peer control: pushed a fresh bearer before the last one expires"
         );
     }
@@ -2980,8 +2980,7 @@ where
     // whether a fresh bearer is due. Per SESSION and not global: a Handoff can
     // only travel on the `IK`-authenticated stream to its own grantee, so the
     // one that would send it is the one that has to remember.
-    let mut handed: std::collections::HashMap<u128, crate::peer::lease::HandedBearer> =
-        std::collections::HashMap::new();
+    let mut handed: HashMap<u128, crate::peer::lease::HandedBearer> = HashMap::new();
 
     // The frame reader lives as long as the session, and that is the whole
     // point of it. The timeout below cancels the read once a second on every
@@ -3054,21 +3053,16 @@ where
                 // A carried Hello has no connection worth pairing: the socket
                 // is the carrier's, so only what the Hello itself claims is
                 // used, through [`config::endpoints_from_hello`].
-                let learned = match origin.observed_socket() {
-                    Some(socket) => config::endpoints_and_connection_from_hello(
-                        &incoming.addrs,
-                        socket,
-                        now_ms(),
-                    ),
-                    None => {
-                        tracing::debug!(
-                            peer = %session.peer.display(),
-                            carrier = ?origin.carrier().map(|carrier| carrier.display()),
-                            "peer control: this Hello arrived through a carrier; only the \
-                             addresses it claims are used, never the carrier's own socket"
-                        );
-                        config::endpoints_from_hello(&incoming.addrs, now_ms())
-                    }
+                let learned = if let Some(socket) = origin.observed_socket() {
+                    config::endpoints_and_connection_from_hello(&incoming.addrs, socket, now_ms())
+                } else {
+                    tracing::debug!(
+                        peer = %session.peer.display(),
+                        carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                        "peer control: this Hello arrived through a carrier; only the \
+                         addresses it claims are used, never the carrier's own socket"
+                    );
+                    config::endpoints_from_hello(&incoming.addrs, now_ms())
                 };
                 // The two reflexive halves of this frame, recorded in memory
                 // and never onto the row: the socket whole is the address a
@@ -3076,16 +3070,15 @@ where
                 // advice for a punch and never an endpoint to dial. A carried
                 // Hello teaches nothing here either: the socket belongs to the
                 // carrier, not the peer.
-                match origin.observed_socket() {
-                    Some(socket) => {
-                        crate::peer::reach::remember_observed_peer(session.peer, socket)
-                    }
-                    None => tracing::debug!(
+                if let Some(socket) = origin.observed_socket() {
+                    crate::peer::reach::remember_observed_peer(session.peer, socket);
+                } else {
+                    tracing::debug!(
                         peer = %session.peer.display(),
                         carrier = ?origin.carrier().map(|carrier| carrier.display()),
                         "peer control: not recording an observed address for a peer reached \
                          through a carrier"
-                    ),
+                    );
                 }
                 let sees_us_at = match incoming.observed_you_at.as_deref() {
                     None => None,
@@ -3137,7 +3130,7 @@ where
                             // `tests/peer_lease.rs`), and a Hello is the
                             // exchange that exists to answer "where and how do
                             // we meet next time".
-                            rendezvous: crate::peer::config::observe_rendezvous_secret(
+                            rendezvous: config::observe_rendezvous_secret(
                                 &peers_path,
                                 &peer,
                                 secret,
@@ -3160,7 +3153,7 @@ where
                             // And onto the row, so a restart still knows where
                             // this Mac is seen.
                             sees_us_at: sees_us_at.map(|addr| {
-                                crate::peer::config::observe_seen_address(
+                                config::observe_seen_address(
                                     &peers_path,
                                     &peer,
                                     addr,
@@ -3397,9 +3390,7 @@ where
                 // pattern that ran is a property of this session and of
                 // nothing the lease knows.
                 if let Some(minted) = minted {
-                    if mode == crate::peer::config::LendMode::Hand
-                        && !handoff_is_permitted(session.handshake)
-                    {
+                    if mode == config::LendMode::Hand && !handoff_is_permitted(session.handshake) {
                         // Asked BEFORE the manager is, so a session that may
                         // not receive the bearer never causes it to be read
                         // out of the config at all. The lease itself stands:
@@ -3498,22 +3489,23 @@ where
                         hint.node.display()
                     );
                 }
-                match crate::peer::reach::learn_from_hint(&session.peer, &hint) {
-                    Some(addr) => tracing::info!(
+                if let Some(addr) = crate::peer::reach::learn_from_hint(&session.peer, &hint) {
+                    tracing::info!(
                         peer = %session.peer.display(),
                         addr = %addr,
                         carried_on = %origin.socket(),
                         carrier = ?origin.carrier().map(|carrier| carrier.display()),
                         "peer control: this peer named where it is now, so a punch has \
                          somewhere to aim"
-                    ),
-                    None => tracing::debug!(
+                    );
+                } else {
+                    tracing::debug!(
                         peer = %session.peer.display(),
                         carried_on = %origin.socket(),
                         carrier = ?origin.carrier().map(|carrier| carrier.display()),
                         "peer control: nothing this peer named is an address anything can \
                          dial, so it stays reachable at whatever was already recorded"
-                    ),
+                    );
                 }
                 // Answered whether anything was learned or not: the asker
                 // needs this Mac's addresses to aim at, and a peer whose own
@@ -3553,7 +3545,7 @@ where
 /// That is exactly why the rule is written as a value a test can ask about:
 /// the day a pattern is added, or one of those early returns becomes a
 /// fall-through, this answers the same way it does today.
-pub fn handoff_is_permitted(handshake: Handshake) -> bool {
+pub const fn handoff_is_permitted(handshake: Handshake) -> bool {
     match handshake {
         Handshake::Return => true,
         Handshake::Pair | Handshake::Enrol | Handshake::Knock | Handshake::KnockPsk => false,
@@ -3604,7 +3596,7 @@ pub fn peer_stream_gate(
 
 /// Checks 1 to 3 against the pinned row itself: `None` is an unpinned peer,
 /// which is the same answer as "not authorized for anything".
-pub fn peer_stream_gate_rows(
+pub const fn peer_stream_gate_rows(
     header: &StreamHeader,
     row: Option<&PeerRow>,
 ) -> Result<(), StreamRefusal> {
@@ -3700,7 +3692,7 @@ pub struct RequestDedup {
 
 impl RequestDedup {
     /// An empty cache.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             seen: VecDeque::new(),
         }
@@ -3770,7 +3762,7 @@ pub struct NodeFacts {
     /// [`tcr_peer_wire::Hello::observed_you_at`] answerable, and it is per
     /// peer, so it is set by the caller that knows which peer this Hello is
     /// for rather than read from a register inside the assembly.
-    pub observed_peer_at: Option<std::net::SocketAddr>,
+    pub observed_peer_at: Option<SocketAddr>,
 }
 
 impl NodeFacts {
@@ -3812,7 +3804,7 @@ impl NodeFacts {
     /// acts on. Both are sockets a peer can dial. Reflexive discovery, meaning
     /// what a peer SEES this node as from the far side of a NAT it did not map
     /// itself, is still a different mechanism and is not here.
-    pub fn listening(node: PeerId, listen: Option<std::net::SocketAddr>) -> Self {
+    pub fn listening(node: PeerId, listen: Option<SocketAddr>) -> Self {
         let mut facts = Self::minimal(node);
         facts.addrs = listen
             .map(|addr| vec![addr.to_string()])

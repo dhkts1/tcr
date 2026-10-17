@@ -95,7 +95,7 @@ pub enum MapProtocol {
 
 impl MapProtocol {
     /// The request opcode for this protocol.
-    fn request_opcode(self) -> u8 {
+    const fn request_opcode(self) -> u8 {
         match self {
             Self::Udp => OP_MAP_UDP,
             Self::Tcp => OP_MAP_TCP,
@@ -103,7 +103,7 @@ impl MapProtocol {
     }
 
     /// The name used in output a human reads.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
@@ -137,7 +137,7 @@ pub enum ResultCode {
 
 impl ResultCode {
     /// Read a result code off the wire.
-    fn from_wire(code: u16) -> Self {
+    const fn from_wire(code: u16) -> Self {
         match code {
             0 => Self::Success,
             1 => Self::UnsupportedVersion,
@@ -230,7 +230,7 @@ impl ReachError {
     /// sites are the UPnP fallback and the retry ladder, and a router the
     /// fallback treats as mapless while the ladder treats it as broken is a
     /// router asked over UPnP every five seconds forever.
-    pub fn no_natpmp_service(&self) -> bool {
+    pub const fn no_natpmp_service(&self) -> bool {
         matches!(self, Self::Silent { .. } | Self::NoNatPmp { .. })
     }
 }
@@ -282,7 +282,7 @@ pub struct NatPmp {
 impl NatPmp {
     /// Point a client at a gateway address, for a test's fake responder or an
     /// operator who knows better than the route table.
-    pub fn at(gateway: SocketAddr) -> Self {
+    pub const fn at(gateway: SocketAddr) -> Self {
         Self { gateway }
     }
 
@@ -304,7 +304,7 @@ impl NatPmp {
     /// the packet), which is why it arrives with the UPnP fallback and not
     /// before.
     pub fn internal_address(&self) -> Result<Ipv4Addr, ReachError> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(ReachError::Socket)?;
+        let socket = UdpSocket::bind("0.0.0.0:0").map_err(ReachError::Socket)?;
         socket.connect(self.gateway).map_err(ReachError::Socket)?;
         match socket.local_addr().map_err(ReachError::Socket)? {
             SocketAddr::V4(local) => Ok(*local.ip()),
@@ -315,7 +315,7 @@ impl NatPmp {
         }
     }
 
-    pub fn gateway(&self) -> SocketAddr {
+    pub const fn gateway(&self) -> SocketAddr {
         self.gateway
     }
 
@@ -601,8 +601,7 @@ pub fn parse_route_get(output: &str) -> Option<Ipv4Addr> {
     output
         .lines()
         .filter_map(|line| line.trim().strip_prefix("gateway:"))
-        .filter_map(|value| value.trim().parse::<Ipv4Addr>().ok())
-        .next()
+        .find_map(|value| value.trim().parse::<Ipv4Addr>().ok())
 }
 
 /// The first `default` row of `netstat -rn -f inet` whose gateway is an address.
@@ -611,16 +610,13 @@ pub fn parse_route_get(output: &str) -> Option<Ipv4Addr> {
 /// are skipped by the parse rather than by a special case: a gateway that is not
 /// an IPv4 address is not somewhere a 12-byte UDP request can be sent.
 pub fn parse_netstat_inet(output: &str) -> Option<Ipv4Addr> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            if fields.next() != Some("default") {
-                return None;
-            }
-            fields.next()?.parse::<Ipv4Addr>().ok()
-        })
-        .next()
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("default") {
+            return None;
+        }
+        fields.next()?.parse::<Ipv4Addr>().ok()
+    })
 }
 
 /// The gateway of the default route in a `/proc/net/route` table (Linux).
@@ -630,25 +626,21 @@ pub fn parse_netstat_inet(output: &str) -> Option<Ipv4Addr> {
 /// little-endian, so `0101A8C0` is 192.168.1.1 and reading it big-endian would
 /// give 1.1.168.192, a plausible-looking address pointing nowhere.
 pub fn parse_proc_net_route(table: &str) -> Option<Ipv4Addr> {
-    table
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let _iface = fields.next()?;
-            let destination = fields.next()?;
-            let gateway = fields.next()?;
-            if destination != "00000000" {
-                return None;
-            }
-            let raw = u32::from_str_radix(gateway, 16).ok()?;
-            let addr = Ipv4Addr::from(raw.to_le_bytes());
-            if addr.is_unspecified() {
-                return None;
-            }
-            Some(addr)
-        })
-        .next()
+    table.lines().skip(1).find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let _iface = fields.next()?;
+        let destination = fields.next()?;
+        let gateway = fields.next()?;
+        if destination != "00000000" {
+            return None;
+        }
+        let raw = u32::from_str_radix(gateway, 16).ok()?;
+        let addr = Ipv4Addr::from(raw.to_le_bytes());
+        if addr.is_unspecified() {
+            return None;
+        }
+        Some(addr)
+    })
 }
 
 /// Whether an IPv6 address is one the open internet can route to this Mac on.
@@ -757,7 +749,7 @@ pub const MAPPING_LIFETIME_SECS: u32 = 7_200;
 /// How often the mapping is re-asked for: well inside
 /// [`MAPPING_LIFETIME_SECS`], so three renewals in a row have to fail before a
 /// peer loses the address it was told.
-pub const MAPPING_RENEW_INTERVAL: Duration = Duration::from_secs(1_800);
+pub const MAPPING_RENEW_INTERVAL: Duration = Duration::from_mins(30);
 
 /// How often the keeper wakes to see whether it has been asked to stop.
 ///
@@ -853,7 +845,7 @@ impl MappingRetry {
     }
 
     /// Time has passed: `elapsed` more of it.
-    pub fn tick(&mut self, elapsed: Duration) {
+    pub const fn tick(&mut self, elapsed: Duration) {
         self.waited = self.waited.saturating_add(elapsed);
         self.since_gateway_read = self.since_gateway_read.saturating_add(elapsed);
     }
@@ -886,7 +878,7 @@ impl MappingRetry {
     }
 
     /// A request is going out now.
-    pub fn asked(&mut self) {
+    pub const fn asked(&mut self) {
         self.waited = Duration::ZERO;
     }
 
@@ -896,7 +888,7 @@ impl MappingRetry {
     /// Which LEVEL that answer is logged at is decided elsewhere, by
     /// [`mapping_answer_voice`], because the log is per gateway and per
     /// process while this ladder belongs to one loop.
-    pub fn answered(&mut self, answer: MappingAnswer) {
+    pub const fn answered(&mut self, answer: MappingAnswer) {
         match answer {
             MappingAnswer::Mapped => self.refusals = 0,
             MappingAnswer::Refused => self.refusals = self.refusals.saturating_add(1),
@@ -905,13 +897,13 @@ impl MappingRetry {
 
     /// Back to the first rung: the switch was toggled, or this Mac is on
     /// another router.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.refusals = 0;
         self.waited = Duration::ZERO;
     }
 
     /// How many refusals in a row are behind the current wait.
-    pub fn refusals(&self) -> u32 {
+    pub const fn refusals(&self) -> u32 {
         self.refusals
     }
 }
@@ -950,7 +942,7 @@ pub fn mapping_answer_voice(gateway: SocketAddr, answer: MappingAnswer) -> Answe
     let previous = LAST_MAPPING_ANSWER
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(|held| held.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(gateway, answer);
     let news = match answer {
         MappingAnswer::Refused => previous != Some(MappingAnswer::Refused),
@@ -991,7 +983,7 @@ pub enum MappingStep {
 /// Named here rather than written at each call site so `tcr peer reach` and the
 /// mapping keeper cannot end up searching two different ways and reporting two
 /// different answers about one router.
-pub fn upnp_discoverer() -> crate::peer::reach_upnp::Discoverer {
+pub const fn upnp_discoverer() -> crate::peer::reach_upnp::Discoverer {
     crate::peer::reach_upnp::Discoverer::multicast()
 }
 
@@ -1221,7 +1213,7 @@ pub enum MappedOver {
 
 impl MappingKeeper {
     /// A keeper for `internal_port` against `client`, holding nothing yet.
-    pub fn new(client: NatPmp, internal_port: u16, lifetime_secs: u32) -> Self {
+    pub const fn new(client: NatPmp, internal_port: u16, lifetime_secs: u32) -> Self {
         Self {
             client,
             internal_port,
@@ -1243,7 +1235,7 @@ impl MappingKeeper {
     /// or refuses the packet outright, is one that may not speak NAT-PMP at
     /// all, which is the case UPnP exists for here.
     #[must_use]
-    pub fn with_upnp(mut self, discoverer: crate::peer::reach_upnp::Discoverer) -> Self {
+    pub const fn with_upnp(mut self, discoverer: crate::peer::reach_upnp::Discoverer) -> Self {
         self.upnp = Some(discoverer);
         self
     }
@@ -1479,7 +1471,7 @@ impl MappingKeeper {
     }
 
     /// The mapping this keeper holds, as the gateway granted it.
-    pub fn held(&self) -> Option<Mapping> {
+    pub const fn held(&self) -> Option<Mapping> {
         self.held
     }
 
@@ -1816,7 +1808,7 @@ fn count_mapping_boot(decision: MappingBoot) {
 /// mapping, given `peer.internet`.
 ///
 /// Pure, so both arms are testable without a router.
-pub fn mapping_boot(internet: bool, local: SocketAddr) -> MappingBoot {
+pub const fn mapping_boot(internet: bool, local: SocketAddr) -> MappingBoot {
     if !internet {
         return MappingBoot::SwitchOff;
     }
@@ -1987,7 +1979,7 @@ pub enum KeeperStep {
 /// `start_peer_mapping` had only boot callers, so the mapping came back at the
 /// next restart and not before. `docs/cli.md` said a running server honours
 /// both without one.
-pub fn keeper_step(decision: MappingBoot, running: bool) -> KeeperStep {
+pub const fn keeper_step(decision: MappingBoot, running: bool) -> KeeperStep {
     match (decision, running) {
         (MappingBoot::Wanted { .. }, false) => KeeperStep::Start,
         (MappingBoot::Wanted { .. }, true) => KeeperStep::Renew,
@@ -2314,7 +2306,7 @@ const _: () = assert!(PORT_FLOOR as u64 + PORT_SPAN <= u16::MAX as u64);
 const PORT_INFO: &[u8] = b"tcr peer reach derived-port v1";
 
 /// Which slot a unix timestamp falls in.
-pub fn current_slot(unix_seconds: u64) -> u64 {
+pub const fn current_slot(unix_seconds: u64) -> u64 {
     unix_seconds / SLOT_SECONDS
 }
 
@@ -2893,7 +2885,7 @@ pub trait PunchNet {
         &self,
         port: u16,
         within: Duration,
-    ) -> impl std::future::Future<Output = std::io::Result<crate::peer::serve::PeerStream>> + Send;
+    ) -> impl Future<Output = std::io::Result<crate::peer::serve::PeerStream>> + Send;
 
     /// Connect to `target` FROM local `port`, within `within`.
     fn connect_from(
@@ -2901,7 +2893,7 @@ pub trait PunchNet {
         port: u16,
         target: SocketAddr,
         within: Duration,
-    ) -> impl std::future::Future<Output = std::io::Result<crate::peer::serve::PeerStream>> + Send;
+    ) -> impl Future<Output = std::io::Result<crate::peer::serve::PeerStream>> + Send;
 }
 
 /// Which half of the punch got through.
@@ -3250,7 +3242,7 @@ pub fn own_collapse_hint(
 ///
 /// Stated as a [`Duration`] once, because three callers need it and a second
 /// spelling of "a slot is 30 seconds" is a second answer.
-pub fn slot_window() -> Duration {
+pub const fn slot_window() -> Duration {
     Duration::from_secs(SLOT_SECONDS)
 }
 

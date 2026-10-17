@@ -106,7 +106,7 @@ pub const NEAR_LIMIT_CADENCE_DIVISOR: u64 = 2;
 /// one (or the last served response) left in its quota.
 ///
 /// There is deliberately no "busy" level. A serving account's three windows
-/// (5h, 7d, 7d_oi) and its unified status are rewritten by every served
+/// (5h, 7d, `7d_oi`) and its unified status are rewritten by every served
 /// response's headers (`Quota::update_from_headers`), which are the same
 /// windows a probe writes (`Quota::apply_usage`); probing a busy account more
 /// often would read numbers the proxy already has. An account at or over its
@@ -143,9 +143,9 @@ impl ProbeUrgency {
             || (account.codex.limit_reached_type.is_some()
                 && !matches!(account.gate, GateReason::Disabled | GateReason::Login));
         if account.quota_state != crate::stats::QuotaState::Normal || refused {
-            ProbeUrgency::NearLimit
+            Self::NearLimit
         } else {
-            ProbeUrgency::Routine
+            Self::Routine
         }
     }
 }
@@ -173,7 +173,7 @@ pub struct Rng {
 
 impl Rng {
     /// Seed explicitly. Used by the tests so a schedule is reproducible.
-    pub fn new(seed: u64) -> Self {
+    pub const fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
@@ -183,12 +183,12 @@ impl Rng {
     /// later draw advances the state instead.
     pub fn from_clock() -> Self {
         let now = time::OffsetDateTime::now_utc();
-        let seed = (crate::now_ms() as u64) ^ mix64(now.nanosecond() as u64);
+        let seed = (crate::now_ms() as u64) ^ mix64(u64::from(now.nanosecond()));
         Self::new(mix64(seed))
     }
 
     /// Advance the state and return the next value.
-    pub fn next_u64(&mut self) -> u64 {
+    pub const fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         mix64(self.state)
     }
@@ -196,7 +196,7 @@ impl Rng {
 
 /// SplitMix64's finalizer: an avalanche mix that turns a counter into a
 /// well-distributed 64-bit value.
-fn mix64(mut z: u64) -> u64 {
+const fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -447,8 +447,8 @@ pub async fn run(manager: Arc<Manager>, job: Job, cadence_secs: u64) {
             // wholesale, so it runs the ONE-SHOT sweep and re-draws every phase.
             Job::Warm => {
                 tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = manager.warm_wake().notified() => {
+                    () = tokio::time::sleep(wait) => {}
+                    () = manager.warm_wake().notified() => {
                         manager.warm_all().await;
                         schedule.reschedule_all(crate::now_ms(), cadence_secs, &mut rng);
                     }
@@ -556,7 +556,7 @@ mod tests {
     /// scheduler yields one distinct gap and fails.
     #[test]
     fn one_account_gets_a_fresh_draw_every_cycle() {
-        let mut rng = Rng::new(0xC0FFEE);
+        let mut rng = Rng::new(0x00C0_FFEE);
         let mut schedule = FleetSchedule::default();
         let mut now = 1_700_000_000_000;
         schedule.sync(now, &[0], 300, &mut rng);

@@ -257,22 +257,22 @@ pub enum ViaRoute {
 
 impl ViaSetting {
     /// The default: ask a trusted Mac once the direct path is dead.
-    pub fn auto() -> Self {
+    pub const fn auto() -> Self {
         Self::from_route(ViaRoute::Auto)
     }
 
     /// Never route out through a peer.
-    pub fn off() -> Self {
+    pub const fn off() -> Self {
         Self::from_route(ViaRoute::Off)
     }
 
     /// Always ask this one Mac, and never another.
-    pub fn pinned(peer: PeerId) -> Self {
+    pub const fn pinned(peer: PeerId) -> Self {
         Self::from_route(ViaRoute::Pinned(peer))
     }
 
     /// A route with no operator tuning attached.
-    fn from_route(route: ViaRoute) -> Self {
+    const fn from_route(route: ViaRoute) -> Self {
         Self {
             route,
             setup_timeout_ms: None,
@@ -970,12 +970,12 @@ impl PinnedPeerGap {
     /// A `true` here is what stops the direct path being taken afterwards: a
     /// non-strict pin falling back to the direct path would send the same POST
     /// a second time and pay for it twice.
-    pub fn request_may_have_left(self) -> bool {
+    pub const fn request_may_have_left(self) -> bool {
         matches!(self, Self::CarryFailed)
     }
 
     /// The half-sentence that says what the operator would have to change.
-    pub fn reason(self) -> &'static str {
+    pub const fn reason(self) -> &'static str {
         match self {
             Self::NotPinned => "this Mac has no pinned row for it",
             Self::NoCarryGrant => {
@@ -1065,7 +1065,7 @@ impl PinnedEgressError {
     /// error so the caller does not have to re-derive it from a sentence. The
     /// other three variants are decided before a socket exists, so they are
     /// `false` by construction rather than by omission.
-    pub fn request_may_have_left(&self) -> bool {
+    pub const fn request_may_have_left(&self) -> bool {
         match self {
             Self::PeerUnreachable { delivered, .. } => *delivered,
             Self::HostNotCarried { .. } | Self::NoNodeKey { .. } | Self::CodexNotCarried { .. } => {
@@ -1086,10 +1086,8 @@ impl PinnedEgressError {
     /// there would let this call it instead.
     pub fn into_response(self) -> axum::response::Response {
         if matches!(self, Self::CodexNotCarried { .. }) {
-            let message = format!(
-                "{} Clear this account's peer exit pin before using it with Codex.",
-                self
-            );
+            let message =
+                format!("{self} Clear this account's peer exit pin before using it with Codex.");
             let kind = tcr_status_wire::CodexRefusalKind::PoolUnavailable;
             tracing::warn!(
                 status = 400,
@@ -1667,7 +1665,7 @@ async fn record_the_hold_the_ladder_would(
         let hold = match crate::proxy::classify_transient_429(
             retry_after_raw,
             crate::proxy::MAX_SAME_ACCOUNT_429,
-            (time::OffsetDateTime::now_utc().nanosecond() as i64)
+            i64::from(time::OffsetDateTime::now_utc().nanosecond())
                 % (crate::proxy::NO_GUIDANCE_JITTER_MAX_SECS + 1),
         ) {
             crate::proxy::Transient429::Park(secs)
@@ -1914,8 +1912,7 @@ fn last_seen_from_state(peers_path: &Path) -> Vec<(PeerId, i64)> {
 /// The same derivation `tcr peer id` uses, so a test pointing `--peers` at a
 /// temp directory points this at the same one.
 fn node_key_dir(peers_path: &Path) -> std::path::PathBuf {
-    peers_path.parent().map_or_else(
-        crate::peer::id::default_config_dir,
-        std::path::Path::to_path_buf,
-    )
+    peers_path
+        .parent()
+        .map_or_else(crate::peer::id::default_config_dir, Path::to_path_buf)
 }

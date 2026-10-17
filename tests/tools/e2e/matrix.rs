@@ -12,7 +12,7 @@
 /// A function rather than a `println!` copied into every scenario: four
 /// copies of the same `format!` are four chances for one of them to drop the
 /// `MATRIX:` marker a watcher greps for.
-pub fn matrix_line(scenario: &str, outcome: &str) -> String {
+pub(super) fn matrix_line(scenario: &str, outcome: &str) -> String {
     format!("MATRIX: {scenario} -> {outcome}")
 }
 

@@ -24,7 +24,7 @@ use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
 /// Five minutes of milliseconds, the unit almost every fixture below counts in.
 const FIVE_MINUTES_MS: i64 = 5 * 60 * 1_000;
 
-fn node(byte: u8) -> PeerId {
+const fn node(byte: u8) -> PeerId {
     PeerId([byte; 32])
 }
 
@@ -70,7 +70,7 @@ fn row(byte: u8, label: &str, addrs: &[&str]) -> PeerRow {
 }
 
 /// A lease measured in tokens, as the lender's ledger holds it.
-fn tokens_lease(amount: u64, spent: f64, granted_at_ms: i64, expires_at_ms: i64) -> Lease {
+const fn tokens_lease(amount: u64, spent: f64, granted_at_ms: i64, expires_at_ms: i64) -> Lease {
     Lease {
         lease_id: 0x2a,
         window: Window::SevenDay,
@@ -143,15 +143,26 @@ fn the_row_speaks_the_panels_vocabulary_and_omits_what_it_cannot_measure() {
         "the panel decodes one `address`, never the file's `addrs` list: {wire}"
     );
     assert_eq!(
-        object.get("lastSeenMs").and_then(|v| v.as_i64()),
+        object.get("lastSeenMs").and_then(serde_json::Value::as_i64),
         Some(now_ms - FIVE_MINUTES_MS),
         "freshness, in the panel's key: {wire}"
     );
-    assert_eq!(object.get("trusted").and_then(|v| v.as_bool()), Some(true));
-    assert_eq!(object.get("carries").and_then(|v| v.as_bool()), Some(true));
-    assert_eq!(object.get("serves").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
-        object.get("byteCapPerHour").and_then(|v| v.as_u64()),
+        object.get("trusted").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        object.get("carries").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        object.get("serves").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        object
+            .get("byteCapPerHour")
+            .and_then(serde_json::Value::as_u64),
         Some(tcr::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR),
         "a row this Mac carries for names the ceiling it is measured against: {wire}"
     );
@@ -861,7 +872,7 @@ fn graph_schema_errors(value: &serde_json::Value) -> Vec<String> {
                 match edge.get("kind").and_then(|kind| kind.as_str()) {
                     Some("path") => check_object("a path edge", edge, PATH_EDGE_FIELDS, &mut out),
                     Some("lease") => {
-                        check_object("a lease edge", edge, LEASE_EDGE_FIELDS, &mut out)
+                        check_object("a lease edge", edge, LEASE_EDGE_FIELDS, &mut out);
                     }
                     other => out.push(format!(
                         "an edge's `kind` must be `path` or `lease`; got {other:?}: {edge}"
@@ -1231,7 +1242,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
     pinned.sees_us_at = Some(("203.0.113.9:7749".to_string(), 1_700_000_000_000));
     pinned.lend = vec![
         {
-            let mut grant = LendGrant::new(tcr_peer_wire::Window::SevenDay, 0.2, 900, 2);
+            let mut grant = LendGrant::new(Window::SevenDay, 0.2, 900, 2);
             grant.id = 0x2a;
             // Far future on purpose: `ended` is derived against the REAL clock
             // as the store hands a row out, so a sample end in the past would
@@ -1240,7 +1251,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
             grant
         },
         {
-            let mut grant = LendGrant::new(tcr_peer_wire::Window::FiveHour, 0.5, 600, 1);
+            let mut grant = LendGrant::new(Window::FiveHour, 0.5, 600, 1);
             grant.id = 0x2b;
             grant.mode = LendMode::Hand;
             grant.scope = tcr_peer_wire::LendScope::Group("work".to_string());
@@ -1251,7 +1262,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
     // greyed row. Its end is in the past and stays there.
     let mut second = row(9, "attic-nuc", &[]);
     second.lend = vec![{
-        let mut grant = LendGrant::new(tcr_peer_wire::Window::FiveHour, 0.1, 300, 1);
+        let mut grant = LendGrant::new(Window::FiveHour, 0.1, 300, 1);
         grant.id = 0x2c;
         grant.until = Some(ENDED_UNTIL_S);
         grant
@@ -1327,7 +1338,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
         lent_to,
         internet: false,
         network: true,
-        exits: [(
+        exits: std::iter::once((
             "alice".to_string(),
             tcr::status::PeerExitJson {
                 // The wire id, matching `Egress`'s own `Display` impl
@@ -1339,8 +1350,7 @@ fn peer_ls_fixture_document() -> tcr::status::PeerLsJson {
                 peer_down: false,
                 waiting_seconds: None,
             },
-        )]
-        .into_iter()
+        ))
         .collect(),
         peers_error: None,
     }

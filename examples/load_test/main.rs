@@ -148,7 +148,7 @@ fn main() -> anyhow::Result<()> {
                 result.errors + result.unfinished,
                 result
                     .cpu_s_per_1k
-                    .map_or("n/a".into(), |v| format!("{v:.2} s")),
+                    .map_or_else(|| "n/a".into(), |v| format!("{v:.2} s")),
                 result.peak_footprint_mb
             );
             if !failures.is_empty() {
@@ -198,7 +198,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     std::fs::create_dir_all(&a.out)?;
     let reply = Duration::from_millis(a.reply_ms);
     let stub = stub::Stub::new(reply);
-    let stub_port = stub::start(stub.clone()).await?;
+    let stub_port = stub::start(Arc::clone(&stub)).await?;
 
     let scratch = harness::Scratch::create(&a.scratch)?;
     let now = tcr::now_ms();
@@ -241,7 +241,7 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let sessions = plan::sessions(a.phase);
     let driver = driver::Driver::new(
         port,
-        stub.clone(),
+        Arc::clone(&stub),
         sessions,
         a.body_kb,
         a.phase.big_body_bytes(),
@@ -300,8 +300,8 @@ async fn run_phase(a: PhaseArgs) -> anyhow::Result<PhaseResult> {
     let stop = Arc::new(AtomicBool::new(false));
     let peak = Arc::new(AtomicU64::new(rss_boot));
     let sampler = {
-        let stop = stop.clone();
-        let peak = peak.clone();
+        let stop = Arc::clone(&stop);
+        let peak = Arc::clone(&peak);
         std::thread::spawn(move || {
             let mut sys = System::new();
             while !stop.load(Ordering::Relaxed) {
@@ -547,9 +547,10 @@ fn spread_table(runs: &[PathBuf]) -> anyhow::Result<String> {
             } else {
                 2
             };
-            report::spread(&values).map_or("n/a".into(), |(lo, mid, hi)| {
-                format!("{lo:.places$} / {mid:.places$} / {hi:.places$}")
-            })
+            report::spread(&values).map_or_else(
+                || "n/a".into(),
+                |(lo, mid, hi)| format!("{lo:.places$} / {mid:.places$} / {hi:.places$}"),
+            )
         };
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",

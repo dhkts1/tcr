@@ -28,7 +28,7 @@ use crate::save_gate::{SaveGate, SaveOutcome};
 /// One cache file as the manager holds it: whether it changed since the last flush, the
 /// flusher's wake-up, and the record of the last write.
 #[derive(Debug)]
-pub struct SavedFile {
+pub(crate) struct SavedFile {
     /// Set whenever the cache is mutated, cleared by the flusher that writes it. A relaxed
     /// atomic rather than a channel because the setter sits on the request path and the
     /// reader is a timer: the only ordering that matters is "a change eventually causes a
@@ -44,7 +44,7 @@ pub struct SavedFile {
 
 impl SavedFile {
     /// A file whose changes outside the shape are written at most once per `refresh`.
-    pub fn new(refresh: Duration) -> Self {
+    pub(crate) fn new(refresh: Duration) -> Self {
         Self {
             dirty: AtomicBool::new(false),
             wake: Notify::new(),
@@ -54,30 +54,30 @@ impl SavedFile {
 
     /// Flag the cache as changed and wake the flusher: one relaxed store and one notify, so it
     /// is safe on the request path.
-    pub fn mark(&self) {
+    pub(crate) fn mark(&self) {
         self.dirty.store(true, Ordering::Relaxed);
         self.wake.notify_one();
     }
 
     /// Resolves once the cache has changed since the last time this resolved.
-    pub async fn changed(&self) {
+    pub(crate) async fn changed(&self) {
         self.wake.notified().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
-    pub fn take(&self) -> bool {
+    pub(crate) fn take(&self) -> bool {
         self.dirty.swap(false, Ordering::Relaxed)
     }
 
     /// Whether the dirty flag is up, without consuming it.
     #[cfg(test)]
-    pub fn is_dirty(&self) -> bool {
+    pub(crate) fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
     }
 
     /// Write unconditionally (the shutdown save) and record the write, so the next gated save
     /// compares against it. `hashes` are the (shape, content) of what `write` puts on disk.
-    pub fn save(
+    pub(crate) fn save(
         &self,
         hashes: (u64, u64),
         write: impl FnOnce() -> Result<usize, ConfigError>,
@@ -90,7 +90,7 @@ impl SavedFile {
 
     /// The flusher's save: `write` only when the content differs from the last write, by the
     /// rule [`crate::save_gate`] states, and record it.
-    pub fn save_if_changed(
+    pub(crate) fn save_if_changed(
         &self,
         hashes: (u64, u64),
         write: impl FnOnce() -> Result<usize, ConfigError>,
@@ -108,7 +108,7 @@ impl SavedFile {
 
 /// What [`read_cache`] made of a cache file.
 #[derive(Debug)]
-pub enum CacheRead<T> {
+pub(crate) enum CacheRead<T> {
     /// No file: the first boot, or the first since the cache existed. Not a degradation.
     Missing,
     /// The file was ignored entirely, for this reason: unreadable, corrupt, or a format
@@ -125,7 +125,7 @@ pub enum CacheRead<T> {
 /// format often lacks a field this one requires, so it fails as "corrupt: missing field", the
 /// right refusal for the wrong reason, and the reason is what an operator reads when deciding
 /// whether a cache file is damaged or merely old.
-pub fn read_cache<T: DeserializeOwned>(path: &Path, version: u32) -> CacheRead<T> {
+pub(crate) fn read_cache<T: DeserializeOwned>(path: &Path, version: u32) -> CacheRead<T> {
     #[derive(serde::Deserialize)]
     struct VersionPeek {
         version: u32,
@@ -156,7 +156,7 @@ pub fn read_cache<T: DeserializeOwned>(path: &Path, version: u32) -> CacheRead<T
 
 /// How [`write_cache`] lays the JSON out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
+pub(crate) enum Layout {
     /// Indented, for a file small enough to read by eye.
     Pretty,
     /// One line, for a file of megabytes no one reads by eye.
@@ -168,7 +168,7 @@ pub enum Layout {
 /// Every cache here is rewritten on a timer and read back as empty when missing or damaged,
 /// so the write is atomic against this process dying but not flushed to the disk
 /// ([`Durability::Cache`]).
-pub fn write_cache<T: Serialize + ?Sized>(
+pub(crate) fn write_cache<T: Serialize + ?Sized>(
     path: &Path,
     file: &T,
     layout: Layout,

@@ -97,13 +97,13 @@ impl BuildInfo {
     }
 
     /// `"true"` / `"false"` / [`UNKNOWN`] — never collapses unknown into clean.
-    pub fn dirty_str(&self) -> &'static str {
+    pub const fn dirty_str(&self) -> &'static str {
         tri_bool_str(self.dirty)
     }
 }
 
 /// `"true"` / `"false"` / [`UNKNOWN`] for a tri-state flag.
-pub fn tri_bool_str(value: Option<bool>) -> &'static str {
+pub const fn tri_bool_str(value: Option<bool>) -> &'static str {
     match value {
         Some(true) => "true",
         Some(false) => "false",
@@ -214,12 +214,12 @@ impl Skew {
     /// a human at a quiet moment.
     pub fn report_line(&self) -> Option<String> {
         match self {
-            Skew::InSync => None,
-            Skew::Indeterminate { running, checkout } => Some(format!(
+            Self::InSync => None,
+            Self::Indeterminate { running, checkout } => Some(format!(
                 "[tcr] note build-skew-unknown: running={running} checkout={checkout} \
                  — cannot tell whether the running server is this checkout's code."
             )),
-            Skew::Drifted(drift) => Some(drift.report_line()),
+            Self::Drifted(drift) => Some(drift.report_line()),
         }
     }
 }
@@ -664,7 +664,7 @@ mod tests {
         assert!(line.contains("built_dirty=true"), "{line}");
     }
 
-    /// An unknown sha degrades to "cannot tell" — never to InSync, and never to
+    /// An unknown sha degrades to "cannot tell" — never to `InSync`, and never to
     /// a stale warning. Covers the tarball build, the git-less container, and a
     /// NEW client reading an OLD server whose payload has no build stamp.
     #[test]
@@ -692,7 +692,7 @@ mod tests {
     }
 
     /// The default a missing `build` object deserializes into. Every field
-    /// unknown, and comparing it is Indeterminate rather than InSync.
+    /// unknown, and comparing it is Indeterminate rather than `InSync`.
     #[test]
     fn default_build_info_is_unknown_not_empty() {
         let default = BuildInfo::default();

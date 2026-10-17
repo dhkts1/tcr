@@ -171,7 +171,7 @@ pub(crate) const MAX_SAME_ACCOUNT_429: u32 = 2;
 /// Hold applied to a transient 429 that carries NO retry-after / reset header
 /// (σ5, 2026-07-18 live capture: Anthropic burst 429s carry neither). Short so a
 /// cold-fan-out that trips every account recovers in seconds instead of the ~60s
-/// fleet blackout the old unwrap_or(60) default caused. Rotates rather than
+/// fleet blackout the old `unwrap_or(60)` default caused. Rotates rather than
 /// inline-retrying the limited account.
 const NO_GUIDANCE_HOLD_SECS: i64 = 15;
 /// Max random jitter (seconds) added to the no-guidance hold: desync the un-park
@@ -189,7 +189,7 @@ const QUOTA_HOLD_JITTER_MAX_SECS: i64 = 90;
 /// Ceiling for soft-waiting out a *transient* all-parked fleet at the exhausted
 /// branch instead of firing the hard 429. Set to the maximum no-guidance park
 /// (`NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS` = 20s): a burst park
-/// falls at/under it, while a real quota rejection (mark_rate_limited clamped up
+/// falls at/under it, while a real quota rejection (`mark_rate_limited` clamped up
 /// to 3600s) or a quota window (hours) sits far above it — so real exhaustion is
 /// NEVER soft-waited and still hard-fails immediately.
 const EXHAUSTION_SOFT_WAIT_MAX_SECS: i64 = NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS;
@@ -372,7 +372,7 @@ pub(crate) fn jittered_quota_hold(retry_after: i64, nanos: u32) -> i64 {
     if clamped < MAX_QUOTA_HOLD_SECS {
         return clamped;
     }
-    let jitter = (nanos as i64) % (QUOTA_HOLD_JITTER_MAX_SECS + 1);
+    let jitter = i64::from(nanos) % (QUOTA_HOLD_JITTER_MAX_SECS + 1);
     (clamped - jitter).max(1)
 }
 
@@ -437,9 +437,9 @@ fn carries_beta_flag(path_and_query: &str) -> bool {
 /// Decide whether an all-accounts-unavailable state is a *transient* fleet-park
 /// worth soft-waiting (Some(secs) to sleep) vs genuine exhaustion (None → hard 429).
 /// `soonest_free_secs` is `Manager::retry_after_hint`; `already_waited` caps us to
-/// ONE soft-wait per client request. Real exhaustion has soonest_free far above the
+/// ONE soft-wait per client request. Real exhaustion has `soonest_free` far above the
 /// transient ceiling → None. Kept pure so it is unit-tested without timing.
-fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
+const fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
     if already_waited || soonest_free_secs <= 0 || soonest_free_secs > EXHAUSTION_SOFT_WAIT_MAX_SECS
     {
         None
@@ -887,13 +887,13 @@ fn stable_session_key(
     // already discards the shared proxy secret; any other key names at best one client, never
     // one conversation, and one key shared by N sessions must not collapse them onto one
     // account, the same reason `metadata.user_id` outranks it on loopback.
-    match crate::provider::Provider::of_path(path) {
-        crate::provider::Provider::Codex => {
+    match Provider::of_path(path) {
+        Provider::Codex => {
             if let Some(sid) = codex_session_id(headers) {
                 return Some((stable_hash("sid:", sid), SessionKind::Stable));
             }
         }
-        crate::provider::Provider::Anthropic => {}
+        Provider::Anthropic => {}
     }
 
     // A proxy secret (`proxy.apiKey` or the request key) is not a client identity —
@@ -1030,7 +1030,7 @@ pub const PROVIDERS_HEADER: &str = "x-tcr-providers";
 
 /// [`PROVIDERS_HEADER`]'s value: every provider this build can store.
 fn advertised_providers() -> String {
-    crate::provider::Provider::ALL
+    Provider::ALL
         .iter()
         .map(|provider| provider.as_str())
         .collect::<Vec<_>>()
@@ -1040,10 +1040,10 @@ fn advertised_providers() -> String {
 /// The providers a [`PROVIDERS_HEADER`] value names. A name this build does not
 /// know is skipped (a newer server may store more), so an absent or unreadable
 /// header is no proof of anything, never a provider.
-pub fn providers_in_header(value: &str) -> Vec<crate::provider::Provider> {
+pub fn providers_in_header(value: &str) -> Vec<Provider> {
     value
         .split(',')
-        .filter_map(|name| crate::provider::Provider::from_name(name.trim()))
+        .filter_map(|name| Provider::from_name(name.trim()))
         .collect()
 }
 
@@ -1369,18 +1369,15 @@ pub fn host_is_loopback(host: &str) -> bool {
 /// [`crate::mitm::ALLOWED_HOSTS`], and no other (`every_intercepted_host_names_its_provider`
 /// pins both directions). `platform.claude.com` is Anthropic's: Claude Code refreshes its own
 /// login there.
-const INTERCEPTED_HOST_PROVIDERS: [(&str, crate::provider::Provider); 3] = [
-    ("api.anthropic.com", crate::provider::Provider::Anthropic),
-    ("platform.claude.com", crate::provider::Provider::Anthropic),
-    (
-        crate::provider::CODEX_HOST,
-        crate::provider::Provider::Codex,
-    ),
+const INTERCEPTED_HOST_PROVIDERS: [(&str, Provider); 3] = [
+    ("api.anthropic.com", Provider::Anthropic),
+    ("platform.claude.com", Provider::Anthropic),
+    (crate::provider::CODEX_HOST, Provider::Codex),
 ];
 
 /// The provider an intercepted `host` (no port) belongs to, compared as
 /// [`crate::mitm::host_allowed`] compares it; `None` for any other host, loopback included.
-fn intercepted_host_provider(host: &str) -> Option<crate::provider::Provider> {
+fn intercepted_host_provider(host: &str) -> Option<Provider> {
     INTERCEPTED_HOST_PROVIDERS
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(host))
@@ -1390,15 +1387,11 @@ fn intercepted_host_provider(host: &str) -> Option<crate::provider::Provider> {
 /// The refusal `handle` answers when an intercepted `host` and the `path` (whose provider is
 /// `path_provider`) name different providers. It names both, so the client's error says
 /// which request was refused and why.
-fn host_path_disagreement(
-    host: &str,
-    path: &str,
-    path_provider: crate::provider::Provider,
-) -> String {
-    fn kind(provider: crate::provider::Provider) -> &'static str {
+fn host_path_disagreement(host: &str, path: &str, path_provider: Provider) -> String {
+    const fn kind(provider: Provider) -> &'static str {
         match provider {
-            crate::provider::Provider::Anthropic => "an Anthropic",
-            crate::provider::Provider::Codex => "a Codex",
+            Provider::Anthropic => "an Anthropic",
+            Provider::Codex => "a Codex",
         }
     }
     match intercepted_host_provider(host) {
@@ -1509,15 +1502,15 @@ fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayM
     if *method == Method::POST && path_is_under(path, CLIENT_TOKEN_REFRESH_PATH) {
         return Some(RelayMode::Raw);
     }
-    let provider = crate::provider::Provider::of_path(path);
+    let provider = Provider::of_path(path);
     if CLIENT_CREDENTIAL_PREFIXES
         .iter()
         .any(|base| path_is_under(path, base))
         // Codex's model calls spend pooled quota. Its other paths (usage, threads,
         // plugins) retain the client's identity.
         || match provider {
-            crate::provider::Provider::Anthropic => false,
-            crate::provider::Provider::Codex => !provider.is_inference_path(path),
+            Provider::Anthropic => false,
+            Provider::Codex => !provider.is_inference_path(path),
         }
     {
         return Some(RelayMode::ClientCredential);
@@ -1538,7 +1531,7 @@ fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayM
 /// workspace routing of its own ([`names_codex_routing`]) is relayed on its own
 /// credential, inference included, and never pooled.
 fn is_inference_path(path: &str) -> bool {
-    crate::provider::Provider::of_path(path).is_inference_path(path)
+    Provider::of_path(path).is_inference_path(path)
 }
 
 /// The client's own OAuth bearer, if the request carries one. `Bearer` is
@@ -1859,8 +1852,8 @@ async fn status_handler(
         Some(manager.codex_traffic((now.unix_timestamp_nanos() / 1_000_000) as i64));
     // Named only when it is not the default, so a reader is told only of an upstream they did
     // not expect.
-    let codex_upstream = manager.upstream_for(crate::provider::Provider::Codex);
-    payload.codex_upstream = crate::config::non_default_codex_upstream(codex_upstream);
+    let codex_upstream = manager.upstream_for(Provider::Codex);
+    payload.codex_upstream = config::non_default_codex_upstream(codex_upstream);
     // Present only while the server holds a key: its presence is what a launcher
     // reads as "this server understands keys" (see `StatusPayload::request_key_mode`).
     if let Some(mode) = manager.request_key_mode() {
@@ -2540,7 +2533,7 @@ struct AddAccountRequest {
     /// that row's own single-use refresh token.
     /// `add_account_request_carries_the_provider` pins it.
     #[serde(default)]
-    provider: crate::provider::Provider,
+    provider: Provider,
     /// The folder a Codex login was imported from ([`config::Account::codex_home`]), named for
     /// the same seam reason as the plan fields above: without it the route drops the key, and a
     /// live import records no folder while the file route does.
@@ -2604,7 +2597,7 @@ pub struct AddAccountResponse {
     /// itself, which stores every account as a Claude account (see
     /// [`PROVIDERS_HEADER`]).
     #[serde(default)]
-    pub provider: Option<crate::provider::Provider>,
+    pub provider: Option<Provider>,
 }
 
 /// Shown when the submitted account carries no refresh token: it will serve
@@ -2634,7 +2627,7 @@ fn add_account_response(
     index: usize,
     persist: AddPersist,
     warning: Option<String>,
-    provider: Option<crate::provider::Provider>,
+    provider: Option<Provider>,
 ) -> Response {
     json_ok(
         &ADD_ACCOUNT_ROUTE,
@@ -2738,7 +2731,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         organization_type: parsed.organization_type,
         rate_limit_tier: parsed.rate_limit_tier,
         seat_tier: parsed.seat_tier,
-        egress: crate::config::Egress::Local,
+        egress: config::Egress::Local,
         egress_strict: false,
         codex_home: parsed.codex_home,
         extra: serde_json::Map::new(),
@@ -2788,14 +2781,14 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
 /// `try_send` on that request would latch `evidence_dropped`, making the
 /// classifier silently abstain on a turn whose evidence it never actually
 /// lost — an unrelated bug quietly disabling this feature.
-fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) -> bool {
+const fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) -> bool {
     matches!(err, tokio::sync::mpsc::error::TrySendError::Full(_))
 }
 
 /// Whether a Codex 403 actually rejects the pooled login. Codex only attempts authentication
 /// recovery for a 401 (`model-provider/src/provider.rs`); its 403s also include Cloudflare and
 /// policy blocks (`codex-api/src/api_bridge.rs`). Require the explicit JSON authentication
-/// signals CLIProxyAPI recognizes (`codex_executor_terminal.go`), and let a challenge header
+/// signals `CLIProxyAPI` recognizes (`codex_executor_terminal.go`), and let a challenge header
 /// override even an authentication-shaped body. Unknown errors are passed through unchanged.
 fn codex_forbidden_is_auth_error(headers: &HeaderMap, body: &[u8]) -> bool {
     if headers
@@ -2910,7 +2903,7 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn starting_at(arrived: Instant) -> Self {
+    const fn starting_at(arrived: Instant) -> Self {
         Self {
             arrived,
             armed: false,
@@ -2942,7 +2935,7 @@ impl RequestTiming {
 
     /// Moves the clock out, leaving a disarmed copy behind, so the streamed body
     /// owns the one line this request logs.
-    fn hand_off(&mut self) -> Self {
+    const fn hand_off(&mut self) -> Self {
         let arrived = self.arrived;
         std::mem::replace(self, Self::starting_at(arrived))
     }
@@ -3188,15 +3181,15 @@ async fn handle_request(
         .extensions
         .get::<InterceptedHost>()
         .is_some_and(|host| host.0.eq_ignore_ascii_case(crate::provider::CODEX_HOST));
-    let path_provider = crate::provider::Provider::of_path(&path);
+    let path_provider = Provider::of_path(&path);
     let provider = if codex_tunnel {
-        crate::provider::Provider::Codex
+        Provider::Codex
     } else {
         path_provider
     };
     let codex_passthrough = match path_provider {
-        crate::provider::Provider::Anthropic => codex_tunnel,
-        crate::provider::Provider::Codex => false,
+        Provider::Anthropic => codex_tunnel,
+        Provider::Codex => false,
     };
     // And the query on its own, for the one consumer that needs the two apart:
     // a request handed to a fallback provider is rebuilt on another Mac, and it
@@ -3366,7 +3359,7 @@ async fn handle_request(
     //      the real backend answers one with 101 (measured 2026-10-12), so through tcr it is this
     //      426 that moves the client onto the transport tcr relays.
     match provider {
-        crate::provider::Provider::Codex
+        Provider::Codex
             if path == crate::provider::CODEX_RESPONSES_PATH
                 && wants_websocket_upgrade(&req_headers) =>
         {
@@ -3379,7 +3372,7 @@ async fn handle_request(
             );
             return upgrade_required_response();
         }
-        crate::provider::Provider::Codex | crate::provider::Provider::Anthropic => {}
+        Provider::Codex | Provider::Anthropic => {}
     }
 
     // 1d. Rotation-bypassing relays. A request bound to the CLIENT's identity
@@ -3406,14 +3399,14 @@ async fn handle_request(
     //     whose identity a ChatGPT login can never match anyway.
     let client_bearer = client_bearer_of(&req_headers);
     match provider {
-        crate::provider::Provider::Anthropic => {
+        Provider::Anthropic => {
             if let Some(bearer) = client_bearer
                 && let Some(refusal) = refuse_foreign_client(&manager, bearer).await
             {
                 return refusal;
             }
         }
-        crate::provider::Provider::Codex => {}
+        Provider::Codex => {}
     }
     //     A Codex request that names a workspace routing of its own
     //     ([`names_codex_routing`]) is relayed too, whatever its path, inference
@@ -3429,8 +3422,8 @@ async fn handle_request(
     let relay = match path_relay {
         Some(mode) => Some(mode),
         None => match provider {
-            crate::provider::Provider::Anthropic => None,
-            crate::provider::Provider::Codex => {
+            Provider::Anthropic => None,
+            Provider::Codex => {
                 if names_codex_routing(&req_headers) {
                     manager.note_codex_unpooled(crate::now_ms());
                     Some(RelayMode::ClientCredential)
@@ -3543,8 +3536,8 @@ async fn handle_request(
     // already pins on. Its body is usually zstd, so the peek above read nothing from it, and
     // the header is the one place a Codex turn says which session it belongs to.
     let wire_session_id = match provider {
-        crate::provider::Provider::Codex => codex_session_id(&req_headers).map(str::to_string),
-        crate::provider::Provider::Anthropic => wire_session_id,
+        Provider::Codex => codex_session_id(&req_headers).map(str::to_string),
+        Provider::Anthropic => wire_session_id,
     };
     // Whether THIS request targets a Fable model — the same classification
     // selection uses (`select.rs`). Threaded into every fleet-exhausted 429 so the
@@ -3610,7 +3603,7 @@ async fn handle_request(
         },
         None => (None, SessionKind::Fallback),
     };
-    timing.model = request_model.clone();
+    timing.model.clone_from(&request_model);
     timing.session = session_key;
 
     // Whether THIS request asked Anthropic's cache for the extended 1h window, read
@@ -3889,17 +3882,18 @@ async fn handle_request(
         let now = OffsetDateTime::now_utc();
         let idx = match ladder.take_next() {
             Some(i) => i,
-            None => match manager.select_with_group(
-                ladder.tried(),
-                now,
-                request_model.as_deref(),
-                session_key,
-                &path,
-                conn_key,
-                request_group.as_deref(),
-            ) {
-                Some(idx) => idx,
-                None => {
+            None => {
+                if let Some(idx) = manager.select_with_group(
+                    ladder.tried(),
+                    now,
+                    request_model.as_deref(),
+                    session_key,
+                    &path,
+                    conn_key,
+                    request_group.as_deref(),
+                ) {
+                    idx
+                } else {
                     // A RESERVED group is strict: this request may only ever be
                     // served by one of its members, so every answer below — the
                     // wait it sizes, the revalidation it might attempt, the 429 it
@@ -3961,7 +3955,7 @@ async fn handle_request(
                     // `RELAYED_HEADER_NAME` is the one-hop rule: a request
                     // that has already crossed one Mac is served here or
                     // refused here, never borrowed onward. See that constant.
-                    let fallback_ask = (method == axum::http::Method::POST
+                    let fallback_ask = (method == Method::POST
                         && crate::peer::serve::serve_is_allowed_for_path(&path)
                         && !req_headers.contains_key(RELAYED_HEADER_NAME))
                     .then(|| fallback::Ask {
@@ -3996,7 +3990,7 @@ async fn handle_request(
                     // JS original's inline-wait-retry (L3). Real exhaustion (quota
                     // windows / long holds) has soonest_free >> the ceiling →
                     // soft_wait_secs returns None → fall through to the honest 429.
-                    match soft_wait_secs(
+                    if let Some(secs) = soft_wait_secs(
                         match (bound_to, strict_group) {
                             // Bound history: the one account it may use is the only
                             // clock that matters, for the same reason as the group arm.
@@ -4026,212 +4020,206 @@ async fn handle_request(
                         },
                         ladder.soft_waited_exhaustion(),
                     ) {
-                        Some(secs) => {
-                            ladder.spend_soft_wait();
-                            // Desync concurrent waiters: without this, every request
-                            // sleeping the same integer-ceil `secs` wakes on the SAME
-                            // second and races for the single earliest-freeing account,
-                            // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
-                            // and re-bursting that account. Waking `jitter` seconds later
-                            // still serves (the account already freed at `secs`); worst
-                            // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
-                            let jitter = (now.nanosecond() as i64
-                                % (NO_GUIDANCE_JITTER_MAX_SECS + 1))
-                                as u64;
-                            let wait = secs + jitter;
-                            tracing::info!(
-                                wait_secs = wait,
-                                "fleet transiently parked — soft-waiting once before exhausted"
-                            );
-                            tokio::time::sleep(Duration::from_secs(wait)).await;
-                            // Re-admit exactly what the sleep was timed for.
-                            // `Transient429::Park` benches an account TWICE — a
-                            // hold via `mark_rate_limited` AND an entry in
-                            // `tried` — and both `pick_eligible` and
-                            // `pick_least_loaded` test `tried` BEFORE they ever
-                            // evaluate eligibility. So clearing only the hold
-                            // leaves the account this sleep was timed for still
-                            // skipped: select() returns `None` a second time, the
-                            // one-shot guard blocks another wait, and the wait
-                            // buys nothing. Dropping the now-expired parks from
-                            // `tried` is what makes the recovery path actually
-                            // reach the account it was built to preserve.
-                            //
-                            // Precision matters more than reach here: an account
-                            // whose hold is still running stays parked, and one
-                            // benched for any NON-hold reason was never in
-                            // `parked_transient` to begin with.
-                            let (readmitted, still_parked) =
-                                ladder.readmit_expired_parks(&manager, crate::now_ms());
-                            tracing::info!(
-                                readmitted,
-                                still_parked,
-                                "soft-wait over — re-admitted the accounts whose hold expired"
-                            );
-                            continue; // re-run select(); the re-admitted accounts are eligible again
+                        ladder.spend_soft_wait();
+                        // Desync concurrent waiters: without this, every request
+                        // sleeping the same integer-ceil `secs` wakes on the SAME
+                        // second and races for the single earliest-freeing account,
+                        // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
+                        // and re-bursting that account. Waking `jitter` seconds later
+                        // still serves (the account already freed at `secs`); worst
+                        // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
+                        let jitter = (i64::from(now.nanosecond())
+                            % (NO_GUIDANCE_JITTER_MAX_SECS + 1))
+                            as u64;
+                        let wait = secs + jitter;
+                        tracing::info!(
+                            wait_secs = wait,
+                            "fleet transiently parked — soft-waiting once before exhausted"
+                        );
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        // Re-admit exactly what the sleep was timed for.
+                        // `Transient429::Park` benches an account TWICE — a
+                        // hold via `mark_rate_limited` AND an entry in
+                        // `tried` — and both `pick_eligible` and
+                        // `pick_least_loaded` test `tried` BEFORE they ever
+                        // evaluate eligibility. So clearing only the hold
+                        // leaves the account this sleep was timed for still
+                        // skipped: select() returns `None` a second time, the
+                        // one-shot guard blocks another wait, and the wait
+                        // buys nothing. Dropping the now-expired parks from
+                        // `tried` is what makes the recovery path actually
+                        // reach the account it was built to preserve.
+                        //
+                        // Precision matters more than reach here: an account
+                        // whose hold is still running stays parked, and one
+                        // benched for any NON-hold reason was never in
+                        // `parked_transient` to begin with.
+                        let (readmitted, still_parked) =
+                            ladder.readmit_expired_parks(&manager, crate::now_ms());
+                        tracing::info!(
+                            readmitted,
+                            still_parked,
+                            "soft-wait over — re-admitted the accounts whose hold expired"
+                        );
+                        continue; // re-run select(); the re-admitted accounts are eligible again
+                    }
+                    // A hard account lock has no failover. Normal selection
+                    // returned None because that one account already failed
+                    // this request. Revalidation must not escape the lock and
+                    // send the request through another pooled credential.
+                    //
+                    // **And neither may a lease.** This arm was changed to
+                    // `exhausted_or_fallback` when the fallback seam landed,
+                    // which consults a provider that never reads
+                    // `locked_account_name`: a request the operator pinned to
+                    // ONE account was then served on a PEER's credential the
+                    // moment that account 429'd, which is the same escape the
+                    // revalidation serve is refused for and a wider one, the
+                    // credential is not even this Mac's. The refusal is
+                    // written once, inside `exhausted_or_fallback`, so it
+                    // holds for this arm and for the two below it rather
+                    // than only for the arm somebody remembered.
+                    if manager.locked_account_for(provider).is_some() {
+                        return exhausted_or_fallback(
+                            &manager,
+                            now,
+                            provider_account_count,
+                            request_is_fable,
+                            provider,
+                            strict_group,
+                            bound_to,
+                            fallback_ask.as_ref(),
+                        )
+                        .await;
+                    }
+                    // Not a transient park — the whole fleet reads over the
+                    // SOFT switch threshold. Before synthesizing a 429, try a
+                    // last-resort revalidation serve on the least-utilized
+                    // account Anthropic still allows (default ON; disable via
+                    // top-level `revalidationServe: false`). An upstream 200
+                    // refreshes stale quota; a 429 arms a real hold via the
+                    // existing inline-429 handling. `None` (throttled, or
+                    // nothing servable) keeps the honest exhausted 429.
+                    // `strict_group.is_none()` guards the THIRD spill door,
+                    // and the least visible one. `select_revalidation`
+                    // passes `group: None` to its hard gate, which by
+                    // `Manager::reserved_blocks` EXCLUDES every account
+                    // carrying a reserved group — so for a strict request
+                    // it can only ever return a NON-member. Left ungated it
+                    // would hand the request to precisely the account the
+                    // reservation exists to keep it off, moments after the
+                    // strict arm in `select_with_group` refused to. A
+                    // reserved group falls straight through to the honest
+                    // 429 instead.
+                    //
+                    // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
+                    // its bound account has every other account benched, so
+                    // "the whole fleet is over the threshold" here means only
+                    // "that one account is", and the fleet's revalidation
+                    // window (one serve per 2 s, shared by every session) is
+                    // the wrong gate for it: the turn that lost the race got
+                    // a 429 naming the account's 5-hour window, which Claude
+                    // Code shows as "You've hit your session limit"
+                    // (2026-09-24). `bound_account_holds` already decided the
+                    // soft threshold does not release this conversation, so
+                    // the serve agrees with it: `Manager::select_bound`.
+                    //
+                    // And when the held account went out DURING this request
+                    // (an upstream rejection on it just turned
+                    // `bound_account_holds` to no), this is the same move the
+                    // top of the handler makes on a later turn, so it gets the
+                    // same answer now instead of a 429 that waits for that
+                    // turn: the warning once, then the fleet.
+                    if let Some(bound) = bound_to
+                        && !manager.bound_account_holds(
+                            bound,
+                            now,
+                            request_is_fable,
+                            request_group.as_deref(),
+                            manager.warm_window(session_key),
+                        )
+                    {
+                        if let Some(warning) = switch_warning(
+                            &manager,
+                            provider,
+                            session_key,
+                            bound,
+                            now,
+                            request_is_fable,
+                            request_group.as_deref(),
+                        ) {
+                            return warning;
                         }
-                        None => {
-                            // A hard account lock has no failover. Normal selection
-                            // returned None because that one account already failed
-                            // this request. Revalidation must not escape the lock and
-                            // send the request through another pooled credential.
-                            //
-                            // **And neither may a lease.** This arm was changed to
-                            // `exhausted_or_fallback` when the fallback seam landed,
-                            // which consults a provider that never reads
-                            // `locked_account_name`: a request the operator pinned to
-                            // ONE account was then served on a PEER's credential the
-                            // moment that account 429'd, which is the same escape the
-                            // revalidation serve is refused for and a wider one, the
-                            // credential is not even this Mac's. The refusal is
-                            // written once, inside `exhausted_or_fallback`, so it
-                            // holds for this arm and for the two below it rather
-                            // than only for the arm somebody remembered.
-                            if manager.locked_account_for(provider).is_some() {
-                                return exhausted_or_fallback(
-                                    &manager,
+                        tracing::info!(
+                            account = manager.account_name(bound).as_deref().unwrap_or("?"),
+                            "bound history's account went out during the request; \
+                             releasing the request to the fleet"
+                        );
+                        // Re-admit only what the hold benched: a lease's
+                        // account-set scope stays benched (see
+                        // `Ladder::release_hold`), and so does `bound`, which
+                        // failed this request.
+                        ladder.release_hold();
+                        bound_to = None;
+                        let released = same_org_release(
+                            &manager,
+                            bound,
+                            ladder.tried(),
+                            request_model.as_deref(),
+                            |narrowed| {
+                                manager.select_with_group(
+                                    narrowed,
                                     now,
-                                    provider_account_count,
-                                    request_is_fable,
-                                    provider,
-                                    strict_group,
-                                    bound_to,
-                                    fallback_ask.as_ref(),
-                                )
-                                .await;
-                            }
-                            // Not a transient park — the whole fleet reads over the
-                            // SOFT switch threshold. Before synthesizing a 429, try a
-                            // last-resort revalidation serve on the least-utilized
-                            // account Anthropic still allows (default ON; disable via
-                            // top-level `revalidationServe: false`). An upstream 200
-                            // refreshes stale quota; a 429 arms a real hold via the
-                            // existing inline-429 handling. `None` (throttled, or
-                            // nothing servable) keeps the honest exhausted 429.
-                            // `strict_group.is_none()` guards the THIRD spill door,
-                            // and the least visible one. `select_revalidation`
-                            // passes `group: None` to its hard gate, which by
-                            // `Manager::reserved_blocks` EXCLUDES every account
-                            // carrying a reserved group — so for a strict request
-                            // it can only ever return a NON-member. Left ungated it
-                            // would hand the request to precisely the account the
-                            // reservation exists to keep it off, moments after the
-                            // strict arm in `select_with_group` refused to. A
-                            // reserved group falls straight through to the honest
-                            // 429 instead.
-                            //
-                            // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
-                            // its bound account has every other account benched, so
-                            // "the whole fleet is over the threshold" here means only
-                            // "that one account is", and the fleet's revalidation
-                            // window (one serve per 2 s, shared by every session) is
-                            // the wrong gate for it: the turn that lost the race got
-                            // a 429 naming the account's 5-hour window, which Claude
-                            // Code shows as "You've hit your session limit"
-                            // (2026-09-24). `bound_account_holds` already decided the
-                            // soft threshold does not release this conversation, so
-                            // the serve agrees with it: `Manager::select_bound`.
-                            //
-                            // And when the held account went out DURING this request
-                            // (an upstream rejection on it just turned
-                            // `bound_account_holds` to no), this is the same move the
-                            // top of the handler makes on a later turn, so it gets the
-                            // same answer now instead of a 429 that waits for that
-                            // turn: the warning once, then the fleet.
-                            if let Some(bound) = bound_to
-                                && !manager.bound_account_holds(
-                                    bound,
-                                    now,
-                                    request_is_fable,
-                                    request_group.as_deref(),
-                                    manager.warm_window(session_key),
-                                )
-                            {
-                                if let Some(warning) = switch_warning(
-                                    &manager,
-                                    provider,
-                                    session_key,
-                                    bound,
-                                    now,
-                                    request_is_fable,
-                                    request_group.as_deref(),
-                                ) {
-                                    return warning;
-                                }
-                                tracing::info!(
-                                    account = manager.account_name(bound).as_deref().unwrap_or("?"),
-                                    "bound history's account went out during the request; \
-                                         releasing the request to the fleet"
-                                );
-                                // Re-admit only what the hold benched: a lease's
-                                // account-set scope stays benched (see
-                                // `Ladder::release_hold`), and so does `bound`, which
-                                // failed this request.
-                                ladder.release_hold();
-                                bound_to = None;
-                                let released = same_org_release(
-                                    &manager,
-                                    bound,
-                                    ladder.tried(),
                                     request_model.as_deref(),
-                                    |narrowed| {
-                                        manager.select_with_group(
-                                            narrowed,
-                                            now,
-                                            request_model.as_deref(),
-                                            session_key,
-                                            &path,
-                                            conn_key,
-                                            request_group.as_deref(),
-                                        )
-                                    },
-                                );
-                                ladder.set_next(released);
-                                continue;
-                            }
-                            let served = match bound_to {
-                                Some(bound) => manager.select_bound(
-                                    bound,
-                                    ladder.tried(),
-                                    now,
-                                    request_is_fable,
+                                    session_key,
+                                    &path,
+                                    conn_key,
                                     request_group.as_deref(),
-                                    strict_group,
-                                    manager.warm_window(session_key),
-                                ),
-                                None if strict_group.is_none()
-                                    && manager.revalidation_serve_enabled() =>
-                                {
-                                    manager.select_revalidation(
-                                        ladder.tried(),
-                                        now,
-                                        request_model.as_deref(),
-                                        session_key,
-                                        &path,
-                                    )
-                                }
-                                None => None,
-                            };
-                            match served {
-                                Some(idx) => idx,
-                                None => {
-                                    return exhausted_or_fallback(
-                                        &manager,
-                                        now,
-                                        provider_account_count,
-                                        request_is_fable,
-                                        provider,
-                                        strict_group,
-                                        bound_to,
-                                        fallback_ask.as_ref(),
-                                    )
-                                    .await;
-                                }
-                            }
+                                )
+                            },
+                        );
+                        ladder.set_next(released);
+                        continue;
+                    }
+                    let served = match bound_to {
+                        Some(bound) => manager.select_bound(
+                            bound,
+                            ladder.tried(),
+                            now,
+                            request_is_fable,
+                            request_group.as_deref(),
+                            strict_group,
+                            manager.warm_window(session_key),
+                        ),
+                        None if strict_group.is_none() && manager.revalidation_serve_enabled() => {
+                            manager.select_revalidation(
+                                ladder.tried(),
+                                now,
+                                request_model.as_deref(),
+                                session_key,
+                                &path,
+                            )
+                        }
+                        None => None,
+                    };
+                    match served {
+                        Some(idx) => idx,
+                        None => {
+                            return exhausted_or_fallback(
+                                &manager,
+                                now,
+                                provider_account_count,
+                                request_is_fable,
+                                provider,
+                                strict_group,
+                                bound_to,
+                                fallback_ask.as_ref(),
+                            )
+                            .await;
                         }
                     }
                 }
-            },
+            }
         };
 
         // RAII in-flight accounting for per-account pacing: bump this account's
@@ -4264,8 +4252,8 @@ async fn handle_request(
         // That id is the row's workspace, its `org_uuid`, else its `account_uuid` for a row
         // saved before the two were split (`Manager::codex_account_id`).
         let upstream_headers = match provider {
-            crate::provider::Provider::Anthropic => build_upstream_headers(&req_headers, &token),
-            crate::provider::Provider::Codex => {
+            Provider::Anthropic => build_upstream_headers(&req_headers, &token),
+            Provider::Codex => {
                 let id = manager.codex_account_id(idx);
                 build_codex_upstream_headers(&req_headers, &token, id.as_deref())
             }
@@ -4285,11 +4273,11 @@ async fn handle_request(
         // clone; only a genuine differing-UUID rewrite allocates.
         let upstream_body: Option<Bytes> =
             (method != Method::GET && method != Method::HEAD).then(|| match provider {
-                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
+                Provider::Anthropic => match manager.account_uuid(idx) {
                     Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
                     _ => body_bytes.clone(),
                 },
-                crate::provider::Provider::Codex => body_bytes.clone(),
+                Provider::Codex => body_bytes.clone(),
             });
         // **The exit lock, before the direct attempt and not inside its failure
         // arm.** An account the operator locked to one Mac leaves from that Mac
@@ -4797,24 +4785,21 @@ async fn handle_request(
                     Provider::Anthropic => RATE_LIMIT_BODY_CAP,
                     Provider::Codex => MAX_BODY_BYTES,
                 };
-                let body = match tokio::time::timeout(
+                let body = if let Ok(Ok(body)) = tokio::time::timeout(
                     Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
                     read_capped_body(resp.bytes_stream(), body_cap),
                 )
                 .await
                 {
-                    Ok(Ok(body)) => {
-                        log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                        Some(body)
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::warn!(
-                            account = account_name.as_deref().unwrap_or("?"),
-                            account_index = idx,
-                            "upstream 403 body could not be read within the cap"
-                        );
-                        None
-                    }
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                    Some(body)
+                } else {
+                    tracing::warn!(
+                        account = account_name.as_deref().unwrap_or("?"),
+                        account_index = idx,
+                        "upstream 403 body could not be read within the cap"
+                    );
+                    None
                 };
                 match provider {
                     Provider::Codex => {
@@ -4926,7 +4911,7 @@ async fn handle_request(
                 // Codex request or 429 carries either, so a Codex 429 never takes this branch:
                 // it would forward every one with no account held. Codex's arm is below.
                 match provider {
-                    crate::provider::Provider::Anthropic
+                    Provider::Anthropic
                         if is_request_scoped_429(
                             &path_and_query,
                             &up_headers,
@@ -4945,38 +4930,30 @@ async fn handle_request(
                         // request, logs the body (`log_upstream_error_body`) and forwards it
                         // verbatim, the same path a 400 or a spent 529 takes.
                     }
-                    crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => {
+                    Provider::Anthropic | Provider::Codex => {
                         // Read the bounded body before deciding whether Codex refused quota. Some
                         // quota errors carry no reached-type header at all.
-                        let refusal_body = match tokio::time::timeout(
+                        let refusal_body = if let Ok(Ok(body)) = tokio::time::timeout(
                             Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
                             read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
                         )
                         .await
                         {
-                            Ok(Ok(body)) => {
-                                log_upstream_error_body(
-                                    idx,
-                                    account_name.as_deref(),
-                                    status,
-                                    &body,
-                                );
-                                body
-                            }
-                            Ok(Err(_)) | Err(_) => {
-                                tracing::warn!(
-                                    account_index = idx,
-                                    "upstream 429 body could not be read within the cap"
-                                );
-                                Bytes::new()
-                            }
+                            log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                            body
+                        } else {
+                            tracing::warn!(
+                                account_index = idx,
+                                "upstream 429 body could not be read within the cap"
+                            );
+                            Bytes::new()
                         };
                         let retry_after = retry_after_raw.unwrap_or(60);
                         // Codex quota bodies name the reset in Unix seconds; prefer it to header
                         // windows, then retry-after, then the short default. Plain rate limits keep
                         // their retry-after even when a response also carries window readings.
                         match provider {
-                            crate::provider::Provider::Codex => {
+                            Provider::Codex => {
                                 let clock = OffsetDateTime::now_utc();
                                 let refusal = crate::quota::CodexQuotaRefusal::parse(
                                     &up_headers,
@@ -5027,7 +5004,7 @@ async fn handle_request(
                                 );
                                 break 'attempt step;
                             }
-                            crate::provider::Provider::Anthropic => {}
+                            Provider::Anthropic => {}
                         }
                         if !rejections.is_empty() {
                             // A model-scoped rejection is recorded in the window the selector
@@ -5055,7 +5032,8 @@ async fn handle_request(
                         let count = ladder.retries_429(idx);
                         // Desync the no-guidance un-park across accounts that tripped together;
                         // derive the jitter from the loop clock so no `rand` dependency is needed.
-                        let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                        let jitter =
+                            i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
                         match classify_transient_429(retry_after_raw, count, jitter) {
                             Transient429::InlineWait(wait) => {
                                 ladder.spend_429_retry(idx);
@@ -5244,8 +5222,8 @@ async fn handle_request(
                 status: status.as_u16(),
                 // The provider this request was routed on, decided once from its path.
                 wire: match provider {
-                    crate::provider::Provider::Codex => WireFold::Codex { path: &path },
-                    crate::provider::Provider::Anthropic => WireFold::Anthropic {
+                    Provider::Codex => WireFold::Codex { path: &path },
+                    Provider::Anthropic => WireFold::Anthropic {
                         model: request_model.clone(),
                         tool_uses: &wire_tool_uses,
                         tool_results: &wire_tool_results,
@@ -5318,7 +5296,7 @@ async fn handle_request(
             // instead of guessing.
             let evidence_dropped = Arc::new(AtomicBool::new(false));
             let evidence_dropped_reader = Arc::clone(&evidence_dropped);
-            let manager_side = manager.clone();
+            let manager_side = Arc::clone(&manager);
             let status_is_success = status.is_success();
             // Cloned, not moved: the spawned parser task below outlives this iteration, and
             // `account_name` (the original) is still moved into `TeeState` further below, in
@@ -5406,16 +5384,15 @@ async fn handle_request(
                 // here or about to be. A parse that stopped early on a malformed
                 // frame waits here for the stream to finish, which is when
                 // `total_ms` is known.
-                let timing = match timing_rx.await {
-                    Ok(fields) => Some(fields),
-                    Err(_) => {
-                        tracing::warn!(
-                            account_index = idx,
-                            "streamed request's timing was dropped unsent; \
-                             its request usage line carries no timing"
-                        );
-                        None
-                    }
+                let timing = if let Ok(fields) = timing_rx.await {
+                    Some(fields)
+                } else {
+                    tracing::warn!(
+                        account_index = idx,
+                        "streamed request's timing was dropped unsent; \
+                         its request usage line carries no timing"
+                    );
+                    None
                 };
                 if parsed.input_total > 0 || parsed.output > 0 {
                     turn.finish(
@@ -5733,7 +5710,7 @@ pub(crate) fn key_matches(provided: Option<&str>, expected: &str) -> bool {
     let (a, b) = (provided.as_bytes(), expected.as_bytes());
     // Seed the accumulator with the length mismatch instead of branching on it
     // (a bare `as u8` truncation would alias e.g. 256 vs 0, so reduce to 0/1).
-    let mut diff: u8 = (a.len() != b.len()) as u8;
+    let mut diff: u8 = u8::from(a.len() != b.len());
     for (i, &x) in a.iter().enumerate() {
         // Read past the configured key's end as 0 rather than short-circuiting;
         // the length delta above already forces a non-match in that case.
@@ -5840,7 +5817,7 @@ fn log_upstream_error_body(
 ) {
     let capped = &body[..body.len().min(ERROR_BODY_LOG_CAP)];
     let body_text = String::from_utf8_lossy(capped);
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let parsed: Option<Value> = serde_json::from_slice(body).ok();
     let error_type = parsed
         .as_ref()
         .and_then(|v| v.get("error"))
@@ -5870,7 +5847,7 @@ fn log_upstream_error_body(
 /// would defeat SSE usage parsing). Sets our own `Bearer`.
 fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
     let mut out = HeaderMap::new();
-    for (name, value) in req_headers.iter() {
+    for (name, value) in req_headers {
         // `as_str`, and named for what it is. It was called `lower`, which
         // claimed a lowercasing this line does not do: it holds only because
         // `HeaderName` is already lowercase, so the name promised a property
@@ -6230,7 +6207,7 @@ pub(crate) fn build_handed_bearer_headers(
 /// NOT one of ours is the client's own and passes through.
 fn build_passthrough_headers(req_headers: &HeaderMap, secrets: ProxySecrets<'_>) -> HeaderMap {
     let mut out = HeaderMap::new();
-    for (name, value) in req_headers.iter() {
+    for (name, value) in req_headers {
         // Named for what it is, not for a lowercasing this line does not do.
         // See `build_upstream_headers`.
         let name_str = name.as_str();
@@ -6345,7 +6322,7 @@ static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::
 async fn relay_upstream(
     manager: &Manager,
     mode: RelayMode,
-    provider: crate::provider::Provider,
+    provider: Provider,
     method: Method,
     path_and_query: &str,
     req_headers: &HeaderMap,
@@ -6384,7 +6361,7 @@ async fn relay_upstream(
 async fn relay_request(
     manager: &Manager,
     mode: RelayMode,
-    provider: crate::provider::Provider,
+    provider: Provider,
     method: Method,
     path_and_query: &str,
     req_headers: &HeaderMap,
@@ -6509,17 +6486,14 @@ async fn relay_request(
                     Body::from_stream(futures::stream::unfold(
                         (resp.bytes_stream(), clock),
                         |(mut inner, mut clock)| async move {
-                            match inner.next().await {
-                                Some(item) => {
-                                    if item.is_err() {
-                                        clock.mark_ended();
-                                    }
-                                    Some((item, (inner, clock)))
-                                }
-                                None => {
+                            if let Some(item) = inner.next().await {
+                                if item.is_err() {
                                     clock.mark_ended();
-                                    None
                                 }
+                                Some((item, (inner, clock)))
+                            } else {
+                                clock.mark_ended();
+                                None
                             }
                         },
                     ))
@@ -6683,7 +6657,7 @@ fn build_response(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     let headers = response.headers_mut();
-    for (name, value) in up_headers.iter() {
+    for (name, value) in up_headers {
         if is_response_skip(name.as_str()) {
             continue;
         }
@@ -6863,7 +6837,7 @@ struct JsonParse {
 }
 
 /// Every reading from one buffered 2xx body. Only Anthropic mints its bound-token
-/// kinds and tool_use blocks; Codex reads Responses usage and its response model.
+/// kinds and `tool_use` blocks; Codex reads Responses usage and its response model.
 #[derive(Debug, Default)]
 struct NonStreamedResponse {
     usage: ParsedUsage,
@@ -6874,10 +6848,7 @@ struct NonStreamedResponse {
 
 /// Parse once, then derive all provider-specific readings from that tree. A malformed
 /// body yields no readings and logs only its length and the decoder diagnostic.
-fn parse_non_streamed_response(
-    bytes: &[u8],
-    provider: crate::provider::Provider,
-) -> NonStreamedResponse {
+fn parse_non_streamed_response(bytes: &[u8], provider: Provider) -> NonStreamedResponse {
     let value = match serde_json::from_slice::<Value>(bytes) {
         Ok(value) => value,
         Err(err) => {
@@ -6892,11 +6863,11 @@ fn parse_non_streamed_response(
     };
     let parsed = usage_from_value(&value, provider);
     let (tool_uses, bound_tokens) = match provider {
-        crate::provider::Provider::Anthropic => (
+        Provider::Anthropic => (
             response_tool_uses_from_value(&value),
             response_bound_tokens_from_value(&value),
         ),
-        crate::provider::Provider::Codex => (Vec::new(), Vec::new()),
+        Provider::Codex => (Vec::new(), Vec::new()),
     };
     NonStreamedResponse {
         usage: parsed.usage,
@@ -6909,7 +6880,7 @@ fn parse_non_streamed_response(
 /// The token breakdown of a non-streamed body, parsing it on its own: the tests'
 /// entry point. The proxy reads it through [`parse_non_streamed_response`].
 #[cfg(test)]
-fn usage_from_json(bytes: &[u8], provider: crate::provider::Provider) -> JsonParse {
+fn usage_from_json(bytes: &[u8], provider: Provider) -> JsonParse {
     let response = parse_non_streamed_response(bytes, provider);
     JsonParse {
         usage: response.usage,
@@ -6937,13 +6908,13 @@ fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
 
 /// The token breakdown of a parsed non-streamed messages body. No `usage` key
 /// is ordinary and yields the default.
-fn usage_from_value(value: &Value, provider: crate::provider::Provider) -> JsonParse {
+fn usage_from_value(value: &Value, provider: Provider) -> JsonParse {
     let Some(usage) = value.get("usage") else {
         // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
         return JsonParse::default();
     };
     match provider {
-        crate::provider::Provider::Codex => {
+        Provider::Codex => {
             return JsonParse {
                 usage: codex_parsed_usage(usage),
                 model: value
@@ -6952,7 +6923,7 @@ fn usage_from_value(value: &Value, provider: crate::provider::Provider) -> JsonP
                     .map(str::to_string),
             };
         }
-        crate::provider::Provider::Anthropic => {}
+        Provider::Anthropic => {}
     }
     let output = usage
         .get("output_tokens")
@@ -7209,11 +7180,7 @@ fn response_bound_tokens_from_value(value: &Value) -> Vec<MintedToken> {
 /// a missing Responses terminator, while explicit error events still count.
 /// A Codex quota or rate-limit failure also returns [`SseParse::codex_stream_limit`]
 /// so the caller holds that account for subsequent turns without replaying this stream.
-async fn parse_sse_usage<S, B, E>(
-    stream: S,
-    provider: crate::provider::Provider,
-    path: &str,
-) -> SseParse
+async fn parse_sse_usage<S, B, E>(stream: S, provider: Provider, path: &str) -> SseParse
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -7257,7 +7224,7 @@ where
         }
         saw_any_event = true;
         match provider {
-            crate::provider::Provider::Codex => {
+            Provider::Codex => {
                 let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
                     continue;
                 };
@@ -7296,7 +7263,7 @@ where
                 }
                 continue;
             }
-            crate::provider::Provider::Anthropic => {}
+            Provider::Anthropic => {}
         }
         let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
             continue;
@@ -7508,12 +7475,12 @@ where
     // terminator on the Responses path. Auxiliary Codex endpoints do not promise it.
     let saw_turn_end = saw_message_stop || saw_codex_end;
     let confirmed_turn = match provider {
-        crate::provider::Provider::Anthropic => saw_message_start,
-        crate::provider::Provider::Codex => true,
+        Provider::Anthropic => saw_message_start,
+        Provider::Codex => true,
     };
     let expects_turn_end = match provider {
-        crate::provider::Provider::Anthropic => true,
-        crate::provider::Provider::Codex => path == crate::provider::CODEX_RESPONSES_PATH,
+        Provider::Anthropic => true,
+        Provider::Codex => path == crate::provider::CODEX_RESPONSES_PATH,
     };
     if expects_turn_end
         && !saw_turn_end
@@ -7625,8 +7592,8 @@ impl CodexStreamLimit {
                 if (name.eq_ignore_ascii_case("retry-after")
                     || name.to_ascii_lowercase().starts_with("x-codex-"))
                     && let (Ok(name), Some(Ok(value))) = (
-                        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                        value.as_str().map(reqwest::header::HeaderValue::from_str),
+                        HeaderName::from_bytes(name.as_bytes()),
+                        value.as_str().map(HeaderValue::from_str),
                     )
                 {
                     headers.insert(name, value);
@@ -7796,7 +7763,7 @@ async fn exhausted_or_fallback(
     now: OffsetDateTime,
     provider_account_count: usize,
     is_fable: bool,
-    provider: crate::provider::Provider,
+    provider: Provider,
     strict_group: Option<&str>,
     bound_to: Option<usize>,
     ask: Option<&fallback::Ask<'_>>,
@@ -7898,15 +7865,13 @@ fn exhausted_response(
     now: OffsetDateTime,
     provider_account_count: usize,
     is_fable: bool,
-    provider: crate::provider::Provider,
+    provider: Provider,
     strict_group: Option<&str>,
     bound_to: Option<usize>,
 ) -> Response {
     let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
     match provider {
-        crate::provider::Provider::Codex
-            if !manager.codex_account_can_serve_eventually(bound_to) =>
-        {
+        Provider::Codex if !manager.codex_account_can_serve_eventually(bound_to) => {
             tracing::warn!(
                 provider = provider.as_str(),
                 "no Codex account can serve by waiting; enable, unpark or repair a login, or add one with `tcr login --codex`"
@@ -7923,7 +7888,7 @@ fn exhausted_response(
                 None,
             );
         }
-        crate::provider::Provider::Codex | crate::provider::Provider::Anthropic => {}
+        Provider::Codex | Provider::Anthropic => {}
     }
     // Bound history is the narrowest scope there is — one account — so it wins over a group.
     let hint = match bound_to {
@@ -7933,7 +7898,7 @@ fn exhausted_response(
     let retry_after = hint.retry_after;
     let advertised_retry_after = advertised_retry_after(&hint);
     match provider {
-        crate::provider::Provider::Codex => {
+        Provider::Codex => {
             let usage_limit = codex_limit_is_quota(&hint);
             tracing::warn!(
                 provider = provider.as_str(),
@@ -7964,7 +7929,7 @@ fn exhausted_response(
                 Some(advertised_retry_after),
             );
         }
-        crate::provider::Provider::Anthropic => {}
+        Provider::Anthropic => {}
     }
     let causes = describe_gates(&hint.gated);
     let when = match hint.free_at {
@@ -7991,7 +7956,7 @@ fn exhausted_response(
         // send its reader to look for Claude accounts that were never there.
         (None, None)
             if provider_account_count == 0
-                && manager.provider_account_count(crate::provider::Provider::Codex) > 0 =>
+                && manager.provider_account_count(Provider::Codex) > 0 =>
         {
             "No Claude account is configured in tcr; run `tcr login` to add one.".to_string()
         }
@@ -8056,7 +8021,7 @@ fn advertised_retry_after(hint: &ExhaustionHint) -> i64 {
 /// Claude Code client maps to its limit types (`five_hour`, `seven_day`); the
 /// Fable weekly is reported as the plain weekly claim because the client has no
 /// Fable-specific one and a weekly reset is what it is.
-fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
+const fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
     match reason {
         GateReason::FiveHour => Some("five_hour"),
         GateReason::SevenDay | GateReason::FableWeekly => Some("seven_day"),
@@ -8197,7 +8162,7 @@ fn switch_warning(
 }
 
 /// What a gate means, in words a person reads after an account count or after "out".
-fn gate_phrase(reason: GateReason) -> &'static str {
+const fn gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Ok => "in rotation",
         GateReason::Hold => "on an upstream hold",
@@ -8239,7 +8204,7 @@ fn describe_gates_with(
 /// account's gate means something else. ChatGPT's own refusal is no Claude "rejected", and a
 /// Codex account in a reserved group is unreachable, because a Codex request carries no group
 /// that could reach it.
-fn codex_gate_phrase(reason: GateReason) -> &'static str {
+const fn codex_gate_phrase(reason: GateReason) -> &'static str {
     match reason {
         GateReason::Rejected => "refused by ChatGPT",
         GateReason::Reserved => "unreachable in a reserved group",
@@ -8277,7 +8242,10 @@ pub fn at_utc(at: OffsetDateTime, now: OffsetDateTime) -> String {
 /// works and that the right verdict for this request is quota exhaustion (or a
 /// forwarded status), never "upstream unreachable". Keeping the two counts apart
 /// is what lets one blip rotate away instead of collapsing the recovery ladder.
-fn every_attempt_transport_failed(transport_failures: usize, upstream_responses: usize) -> bool {
+const fn every_attempt_transport_failed(
+    transport_failures: usize,
+    upstream_responses: usize,
+) -> bool {
     transport_failures > 0 && upstream_responses == 0
 }
 
@@ -8399,14 +8367,14 @@ fn offline_unavailable(provider: Provider, dns_failures: usize) -> Response {
 /// While every available Codex account remains refused, later requests keep receiving 403
 /// without retry guidance. Anthropic retains its exhaustion 429 and bounded soft wait.
 fn credential_refused_response(
-    provider: crate::provider::Provider,
+    provider: Provider,
     refused: &[(usize, Option<String>)],
 ) -> Response {
     match provider {
-        crate::provider::Provider::Codex => {
+        Provider::Codex => {
             return codex_credential_refused_response(refused);
         }
-        crate::provider::Provider::Anthropic => {}
+        Provider::Anthropic => {}
     }
     let account_list: Vec<String> = refused
         .iter()
@@ -8499,7 +8467,7 @@ mod tests {
     }
 
     /// [`client_request`] carrying a JSON body, as reqwest's `.json(..)` sends it.
-    fn client_json(path: &str, value: &serde_json::Value) -> Request {
+    fn client_json(path: &str, value: &Value) -> Request {
         let mut req = client_request(Method::POST, path, value.to_string());
         req.headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -8537,11 +8505,11 @@ mod tests {
     fn the_relay_marker_is_not_carried_upstream() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            axum::http::HeaderName::from_static(RELAYED_HEADER_NAME),
+            HeaderName::from_static(RELAYED_HEADER_NAME),
             HeaderValue::from_static("1"),
         );
         headers.insert(
-            axum::http::HeaderName::from_static("anthropic-version"),
+            HeaderName::from_static("anthropic-version"),
             HeaderValue::from_static("2023-06-01"),
         );
         let upstream = build_upstream_headers(&headers, "not-a-real-token");
@@ -8765,7 +8733,7 @@ mod tests {
     #[test]
     fn add_account_request_carries_the_provider() {
         let mut account = Account {
-            provider: crate::provider::Provider::Codex,
+            provider: Provider::Codex,
             account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
             access_token: "at-codex".to_string(),
             refresh_token: Some("rt-codex".to_string()),
@@ -8777,14 +8745,14 @@ mod tests {
         let body = serde_json::to_string(&account).expect("serialize the account an import sends");
         let parsed: AddAccountRequest =
             serde_json::from_str(&body).expect("the route must accept the body an import sends");
-        assert_eq!(parsed.provider, crate::provider::Provider::Codex);
+        assert_eq!(parsed.provider, Provider::Codex);
 
-        account.provider = crate::provider::Provider::Anthropic;
+        account.provider = Provider::Anthropic;
         let body = serde_json::to_string(&account).expect("serialize an Anthropic account");
         assert!(!body.contains("provider"), "{body}");
         let parsed: AddAccountRequest =
             serde_json::from_str(&body).expect("a body with no provider key must still parse");
-        assert_eq!(parsed.provider, crate::provider::Provider::Anthropic);
+        assert_eq!(parsed.provider, Provider::Anthropic);
     }
 
     fn dummy_config(api_key: Option<&str>, upstream: &str) -> Config {
@@ -8996,7 +8964,7 @@ mod tests {
     /// `select` offering another account.
     #[test]
     fn overloaded_529_failover_worst_case_latency_is_bounded() {
-        let accounts_walked = 1 + MAX_529_FAILOVERS_PER_REQUEST as u64;
+        let accounts_walked = 1 + u64::from(MAX_529_FAILOVERS_PER_REQUEST);
         let ladder = |hint: Option<i64>| -> u64 {
             (0..MAX_SAME_ACCOUNT_529_RETRIES)
                 .map(|n| backoff_529_secs(n, hint))
@@ -9300,7 +9268,7 @@ mod tests {
     }
 
     /// The cacheable-prefix body used by every tier-3 scope-gating test below —
-    /// no x-api-key, no user_id, so tier 3 is the only tier that could fire.
+    /// no x-api-key, no `user_id`, so tier 3 is the only tier that could fire.
     const PREFIX_ONLY_BODY: &[u8] = br#"{"system":"You are a helpful assistant."}"#;
 
     #[test]
@@ -9521,11 +9489,7 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(
-                &self,
-                _provider: crate::provider::Provider,
-                _t: String,
-            ) -> crate::oauth::RefreshFuture {
+            fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -9567,7 +9531,10 @@ mod tests {
         req.extensions_mut().insert(SessionKey(0xF00D));
         req.extensions_mut().insert(ClientAddr(loopback_peer()));
 
-        let response = app(manager.clone()).oneshot(req).await.expect("response");
+        let response = app(Arc::clone(&manager))
+            .oneshot(req)
+            .await
+            .expect("response");
         assert_eq!(
             response.status(),
             StatusCode::OK,
@@ -9617,7 +9584,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             futures::stream::iter(chunks),
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9657,7 +9624,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9678,7 +9645,7 @@ mod tests {
     /// non-Messages endpoint that happens to share `text/event-stream` looks
     /// exactly like this from inside `parse_sse_usage`. This is the only
     /// shape that earns the exemption. A round-4 fix (see the sibling test
-    /// below) narrowed this from "no message_start" to "no message_start
+    /// below) narrowed this from "no `message_start`" to "no `message_start`
     /// AND at least one other event arrived" — a stream with ZERO events is
     /// a different, indistinguishable-from-severed-early shape and must NOT
     /// share this exemption; conflating the two was exactly the round-4 bug.
@@ -9694,7 +9661,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9728,7 +9695,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9755,7 +9722,7 @@ mod tests {
     /// byte (`0xFF`) that can never resolve into valid UTF-8 no matter what
     /// follows, and nothing follows. `parse_sse_usage`'s `break` on that `Err`
     /// must still leave `saw_message_start` set, so the post-loop check
-    /// classifies it exactly like the ordinary "no message_stop" case.
+    /// classifies it exactly like the ordinary "no `message_stop`" case.
     #[tokio::test]
     async fn sse_stream_with_malformed_utf8_after_message_start_records_truncation() {
         let head = concat!(
@@ -9773,7 +9740,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             futures::stream::iter(chunks),
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9818,7 +9785,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9857,7 +9824,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9894,7 +9861,7 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
         let SseParse { tool_uses, .. } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9941,7 +9908,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -9985,7 +9952,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -10027,7 +9994,7 @@ mod tests {
             ..
         } = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -10113,7 +10080,7 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(stream_text))]);
         let parsed = parse_sse_usage(
             stream,
-            crate::provider::Provider::Codex,
+            Provider::Codex,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -10132,7 +10099,7 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(text.into())]);
         parse_sse_usage(
             stream,
-            crate::provider::Provider::Codex,
+            Provider::Codex,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await
@@ -10148,11 +10115,11 @@ mod tests {
             codex_usage_from_event(CODEX_COMPLETED).expect("a completed event has usage");
         assert_eq!((streamed.usage.reasoning, streamed.usage.output), (10, 40));
         let body = br#"{"id":"resp_1","object":"response","status":"completed","model":"gpt-6-astra","output":[],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":110}}"#;
-        let json = usage_from_json(body, crate::provider::Provider::Codex);
+        let json = usage_from_json(body, Provider::Codex);
         assert_eq!((json.usage.reasoning, json.usage.output), (5, 10));
         let anthropic = usage_from_json(
             br#"{"usage":{"input_tokens":7,"output_tokens":3}}"#,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
         );
         assert_eq!(anthropic.usage.reasoning, 0);
     }
@@ -10338,7 +10305,7 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(stream_text))]);
         let parsed = parse_sse_usage(
             stream,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             crate::provider::CODEX_RESPONSES_PATH,
         )
         .await;
@@ -10482,7 +10449,7 @@ mod tests {
             );
         }
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             1,
             "the hold answered the second request: it never reached the origin"
         );
@@ -10643,12 +10610,12 @@ mod tests {
         ] {
             for body in ["", "event: done\ndata: {\"type\":\"done\"}\n\n"] {
                 let stream = futures::stream::iter(vec![Ok::<_, Infallible>(body)]);
-                let parsed = parse_sse_usage(stream, crate::provider::Provider::Codex, path).await;
+                let parsed = parse_sse_usage(stream, Provider::Codex, path).await;
                 assert_eq!(parsed.stream_error, None, "{path}: {body:?}");
             }
             let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
             let stream = futures::stream::iter(vec![Ok::<_, Infallible>(body)]);
-            let parsed = parse_sse_usage(stream, crate::provider::Provider::Codex, path).await;
+            let parsed = parse_sse_usage(stream, Provider::Codex, path).await;
             assert_eq!(
                 parsed.stream_error.as_deref(),
                 Some("server_error"),
@@ -10801,13 +10768,13 @@ mod tests {
             // A tool_use with no id, a thinking block with no signature.
             r#"{"id":"msg_fake_7","content":[{"type":"tool_use","name":"Grep"},{"type":"thinking","thinking":"x"}],"usage":{"input_tokens":2}}"#,
             // Not an object, and not JSON.
-            r#"[1,2,3]"#,
+            "[1,2,3]",
             "not json at all",
             "",
         ];
         for fixture in fixtures {
             let bytes = fixture.as_bytes();
-            let response = parse_non_streamed_response(bytes, crate::provider::Provider::Anthropic);
+            let response = parse_non_streamed_response(bytes, Provider::Anthropic);
             assert_eq!(
                 response.usage,
                 reference_usage_from_json(bytes),
@@ -10826,19 +10793,13 @@ mod tests {
         }
         // A positive control: the fixtures do carry every kind of result, so the equality
         // above is not three empty lists agreeing.
-        let rich = parse_non_streamed_response(
-            fixtures[1].as_bytes(),
-            crate::provider::Provider::Anthropic,
-        );
+        let rich = parse_non_streamed_response(fixtures[1].as_bytes(), Provider::Anthropic);
         assert_eq!(rich.tool_uses.len(), 2);
         assert_eq!(rich.bound_tokens.len(), 4);
         assert_eq!(
-            parse_non_streamed_response(
-                fixtures[0].as_bytes(),
-                crate::provider::Provider::Anthropic
-            )
-            .usage
-            .cache_creation_1h,
+            parse_non_streamed_response(fixtures[0].as_bytes(), Provider::Anthropic)
+                .usage
+                .cache_creation_1h,
             Some(20)
         );
     }
@@ -10953,11 +10914,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(cap.clone());
 
         let parsed_bad = tracing::subscriber::with_default(subscriber, || {
-            usage_from_json(
-                b"this is not json at all",
-                crate::provider::Provider::Anthropic,
-            )
-            .usage
+            usage_from_json(b"this is not json at all", Provider::Anthropic).usage
         });
         assert_eq!(
             parsed_bad,
@@ -10978,11 +10935,7 @@ mod tests {
         let cap2 = Capture::default();
         let subscriber2 = tracing_subscriber::registry().with(cap2.clone());
         let parsed_no_usage = tracing::subscriber::with_default(subscriber2, || {
-            usage_from_json(
-                br#"{"id":"msg_1","type":"message"}"#,
-                crate::provider::Provider::Anthropic,
-            )
-            .usage
+            usage_from_json(br#"{"id":"msg_1","type":"message"}"#, Provider::Anthropic).usage
         });
         assert_eq!(
             parsed_no_usage,
@@ -11013,7 +10966,7 @@ mod tests {
     #[test]
     fn json_usage_sums_cache_tokens() {
         let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
-        let parsed = usage_from_json(body, crate::provider::Provider::Anthropic).usage;
+        let parsed = usage_from_json(body, Provider::Anthropic).usage;
         // R1: 7 + 3 + 90 = 100, the quota sum, unchanged.
         assert_eq!(parsed.input_total, 100);
         assert_eq!(parsed.output, 11);
@@ -11045,7 +10998,7 @@ mod tests {
         let body = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_creation":{"ephemeral_5m_input_tokens":200000,"ephemeral_1h_input_tokens":0},
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(body, crate::provider::Provider::Anthropic).usage;
+        let parsed = usage_from_json(body, Provider::Anthropic).usage;
         assert_eq!(
             parsed.cache_creation_1h,
             Some(0),
@@ -11067,7 +11020,7 @@ mod tests {
         // this must not break: no nested object, so the request's ttl decides.
         let no_split = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(no_split, crate::provider::Provider::Anthropic).usage;
+        let parsed = usage_from_json(no_split, Provider::Anthropic).usage;
         assert_eq!(parsed.cache_creation_1h, None, "control: nothing reported");
         let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || true);
         assert_eq!(
@@ -11087,7 +11040,7 @@ mod tests {
             br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_creation":{"ephemeral_5m_input_tokens":200000},
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(five_minute_only, crate::provider::Provider::Anthropic).usage;
+        let parsed = usage_from_json(five_minute_only, Provider::Anthropic).usage;
         assert_eq!(
             parsed.cache_creation_1h,
             Some(0),
@@ -11104,7 +11057,7 @@ mod tests {
         // request's own ttl is then the only evidence there is.
         let no_object = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
             "cache_read_input_tokens":0,"output_tokens":11}}"#;
-        let parsed = usage_from_json(no_object, crate::provider::Provider::Anthropic).usage;
+        let parsed = usage_from_json(no_object, Provider::Anthropic).usage;
         assert_eq!(parsed.cache_creation_1h, None, "absent is absent");
         let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || true);
         assert_eq!(record.cache_1h, 200_000);
@@ -11362,10 +11315,15 @@ mod tests {
     #[tokio::test]
     async fn status_endpoint_always_reports_what_the_listener_intercepts() {
         let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
-        let (status, _, body) =
-            status_request(manager.clone(), Method::GET, Some(loopback_peer()), None).await;
+        let (status, _, body) = status_request(
+            Arc::clone(&manager),
+            Method::GET,
+            Some(loopback_peer()),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        let wire: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let wire: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(
             wire["mitm"],
             serde_json::json!({"interceptedHosts": [], "leaf": "none"}),
@@ -11541,7 +11499,7 @@ mod tests {
             "the body really is a populated status payload: {text}"
         );
         // Headers are part of the response too — nothing credential-shaped there.
-        for (name, value) in headers.iter() {
+        for (name, value) in &headers {
             let rendered = format!("{name}: {}", value.to_str().unwrap_or_default());
             assert!(
                 !rendered.contains("at-dummy")
@@ -11687,7 +11645,7 @@ mod tests {
         // Over `dummy_config`'s 0.90 threshold, so bob's gate names the window.
         feed_quota(&manager, 1, "0.96", "0.4", now_s);
 
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let (status, headers, body) = quota_request(
             Arc::clone(&manager),
             Method::GET,
@@ -11708,7 +11666,7 @@ mod tests {
             "the quota route answers from memory, took {elapsed:?}"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             0,
             "the quota route never calls upstream"
         );
@@ -11721,7 +11679,7 @@ mod tests {
             Some("no-store")
         );
 
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        let payload: Value = serde_json::from_slice(&body).expect("JSON body");
         assert_eq!(payload["kind"], "tcr.quota.v1");
         let accounts = payload["accounts"].as_array().expect("accounts array");
         assert_eq!(accounts.len(), 2, "one row per account: {payload}");
@@ -11761,7 +11719,7 @@ mod tests {
         // manager reaches the counted upstream.
         assert_eq!(post_one(Arc::clone(&manager)).await, 200);
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             1,
             "the upstream counter is live"
         );
@@ -11800,7 +11758,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        let payload: Value = serde_json::from_slice(&body).expect("JSON body");
         let rows = payload["accounts"].as_array().expect("accounts array");
         assert_eq!(rows[0]["name"], "alice@example.com");
         assert!(
@@ -11814,7 +11772,7 @@ mod tests {
         let (status, _, body) =
             status_request(manager, Method::GET, Some(loopback_peer()), None).await;
         assert_eq!(status, StatusCode::OK);
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        let payload: Value = serde_json::from_slice(&body).expect("status JSON");
         let rows = payload["accounts"].as_array().expect("status accounts");
         assert_eq!(rows[1]["name"], "bob@example.com/codex");
         assert_eq!(rows[1]["provider"], "codex", "{}", rows[1]);
@@ -11936,7 +11894,7 @@ mod tests {
     fn control_manager(tag: &str, api_key: Option<&str>) -> (Arc<Manager>, std::path::PathBuf) {
         let path = control_config_path(tag);
         let config = two_account_config(api_key);
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
         (manager, path)
     }
@@ -11971,9 +11929,9 @@ mod tests {
         (status, headers, bytes)
     }
 
-    fn disabled_in_file(path: &std::path::Path, index: usize) -> Option<serde_json::Value> {
+    fn disabled_in_file(path: &std::path::Path, index: usize) -> Option<Value> {
         let raw = std::fs::read_to_string(path).expect("read the test config");
-        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let doc: Value = serde_json::from_str(&raw).expect("valid json");
         doc["accounts"][index].get("disabled").cloned()
     }
 
@@ -12225,7 +12183,7 @@ mod tests {
         let path = control_config_path("ambiguous");
         let mut config = two_account_config(None);
         config.accounts[1].name = "alice@example.com".to_string();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
 
         let (status, headers, body) = control_request(
@@ -12266,7 +12224,7 @@ mod tests {
         let mut config = two_account_config(None);
         config.accounts[0].name = "alice@example.com".to_string();
         config.accounts[1].name = "alice@example.com/team".to_string();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
 
         let (status, _headers, body) = control_request(
@@ -12437,9 +12395,9 @@ mod tests {
 
     // --- POST /_tcr/accounts/control ----------------------------------------
 
-    fn control_account_in_file(path: &std::path::Path) -> Option<serde_json::Value> {
+    fn control_account_in_file(path: &std::path::Path) -> Option<Value> {
         let raw = std::fs::read_to_string(path).expect("read the test config");
-        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let doc: Value = serde_json::from_str(&raw).expect("valid json");
         doc.get("controlAccount").cloned()
     }
 
@@ -12697,7 +12655,7 @@ mod tests {
         let path = control_config_path("control-ambiguous");
         let mut config = two_account_config(None);
         config.accounts[1].name = "alice@example.com".to_string();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
         let (status, headers, body) = control_account_request(
             Arc::clone(&manager),
@@ -12730,9 +12688,9 @@ mod tests {
     async fn control_account_endpoint_refuses_a_codex_account_and_changes_nothing() {
         let path = control_config_path("control-codex");
         let mut config = two_account_config(None);
-        config.accounts[1].provider = crate::provider::Provider::Codex;
+        config.accounts[1].provider = Provider::Codex;
         let codex = config.accounts[1].name.clone();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
 
         let (status, headers, body) = control_account_request(
@@ -12970,7 +12928,7 @@ mod tests {
         let path = control_config_path("priority-ambiguous");
         let mut config = two_account_config(None);
         config.accounts[1].name = "alice@example.com".to_string();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
         let (status, headers, _b) = priority_request(
             Arc::clone(&manager),
@@ -13047,7 +13005,7 @@ mod tests {
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(
             (snap.accounts[2].priority, snap.accounts[2].provider),
-            (-1, crate::provider::Provider::Codex)
+            (-1, Provider::Codex)
         );
     }
 
@@ -13412,7 +13370,7 @@ mod tests {
         let with = |name: &str, value: &str| {
             let mut headers = HeaderMap::new();
             headers.insert(
-                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderName::from_bytes(name.as_bytes()).expect("header name"),
                 HeaderValue::from_str(value).expect("header value"),
             );
             headers
@@ -13528,16 +13486,16 @@ mod tests {
         (status, headers, bytes)
     }
 
-    fn account_in_file(path: &std::path::Path, index: usize) -> Option<serde_json::Value> {
+    fn account_in_file(path: &std::path::Path, index: usize) -> Option<Value> {
         let raw = std::fs::read_to_string(path).expect("read the test config");
-        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let doc: Value = serde_json::from_str(&raw).expect("valid json");
         doc["accounts"].get(index).cloned()
     }
 
     fn account_count_in_file(path: &std::path::Path) -> usize {
         let raw = std::fs::read_to_string(path).expect("read the test config");
-        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
-        doc["accounts"].as_array().map_or(0, |a| a.len())
+        let doc: Value = serde_json::from_str(&raw).expect("valid json");
+        doc["accounts"].as_array().map_or(0, Vec::len)
     }
 
     /// THE BITING TEST for the append half: a brand-new identity lands at the END
@@ -13879,7 +13837,7 @@ mod tests {
         let path = control_config_path("add-ambiguous");
         let mut config = two_account_config(None);
         config.accounts[1].name = "alice@example.com".to_string();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
 
         let (status, headers, body) = add_request(
@@ -14097,7 +14055,7 @@ mod tests {
         let path = control_config_path("add-providers-409");
         let mut config = two_account_config(None);
         config.accounts[1].name = "alice@example.com".to_string();
-        crate::config::save(&path, &config).expect("write the test config");
+        config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
         let (status, headers, _) = add_request(
             Arc::clone(&manager),
@@ -14154,18 +14112,18 @@ mod tests {
             (
                 r#"{"name":"bob@example.com/codex","provider":"codex","accessToken":"at-codex",
                     "accountUuid":"22222222-2222-4222-8222-222222222222"}"#,
-                crate::provider::Provider::Codex,
+                Provider::Codex,
                 true,
             ),
             (
                 r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
-                crate::provider::Provider::Anthropic,
+                Provider::Anthropic,
                 true,
             ),
             (
                 r#"{"name":"bob@example.com/codex","provider":"codex","accessToken":"at-codex-2",
                     "accountUuid":"22222222-2222-4222-8222-222222222222"}"#,
-                crate::provider::Provider::Codex,
+                Provider::Codex,
                 false,
             ),
         ] {
@@ -14191,7 +14149,7 @@ mod tests {
     }
 
     /// SEAM TEST. `oauth::probe_add_route` (unit 3)
-    /// decides whether `tcr login` takes the LIVE route by POSTing this exact
+    /// decides whether `tcr login` takes the LIVE route by `POSTing` this exact
     /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
     /// `cli::post_add_account` and reading whether the reply is a STAMPED
     /// 400. An unstamped answer, or a different (non-400) status, reads as
@@ -14234,7 +14192,7 @@ mod tests {
         // sends it (`cli.rs:478`, `.json(account)`).
         let probe_body = Account {
             name: String::new(),
-            account_type: crate::config::AccountType::OAuth,
+            account_type: config::AccountType::OAuth,
             provider: Default::default(),
             account_uuid: None,
             org_uuid: None,
@@ -14249,7 +14207,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
-            egress: crate::config::Egress::Local,
+            egress: config::Egress::Local,
             egress_strict: false,
             codex_home: None,
             extra: serde_json::Map::new(),
@@ -14414,10 +14372,7 @@ mod tests {
             for bearer in [false, true] {
                 assert_eq!(relay_mode(&Method::POST, path, bearer), None, "{path}");
             }
-            assert!(
-                crate::provider::Provider::Codex.is_inference_path(path),
-                "{path}"
-            );
+            assert!(Provider::Codex.is_inference_path(path), "{path}");
             let descendant = format!("{path}/other");
             assert_eq!(
                 relay_mode(&Method::POST, &descendant, true),
@@ -14587,11 +14542,7 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(
-                &self,
-                _provider: crate::provider::Provider,
-                _t: String,
-            ) -> crate::oauth::RefreshFuture {
+            fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -14602,7 +14553,7 @@ mod tests {
             messages_hits: Arc<AtomicUsize>,
             bootstrap_auth: Arc<std::sync::Mutex<Vec<String>>>,
         }
-        async fn profile(State(s): State<Seen>, headers: HeaderMap) -> axum::response::Response {
+        async fn profile(State(s): State<Seen>, headers: HeaderMap) -> Response {
             use axum::response::IntoResponse as _;
             s.profile_hits.fetch_add(1, Ordering::SeqCst);
             let (email, uuid) = match client_bearer_of(&headers) {
@@ -14617,14 +14568,14 @@ mod tests {
             }))
             .into_response()
         }
-        async fn messages(State(s): State<Seen>) -> Json<serde_json::Value> {
+        async fn messages(State(s): State<Seen>) -> Json<Value> {
             s.messages_hits.fetch_add(1, Ordering::SeqCst);
             Json(
                 serde_json::json!({"usage": {"input_tokens": 1, "cache_creation_input_tokens": 0,
                 "cache_read_input_tokens": 0, "output_tokens": 1}}),
             )
         }
-        async fn bootstrap(State(s): State<Seen>, headers: HeaderMap) -> Json<serde_json::Value> {
+        async fn bootstrap(State(s): State<Seen>, headers: HeaderMap) -> Json<Value> {
             let auth = headers
                 .get(AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
@@ -14643,11 +14594,11 @@ mod tests {
                 .with_state(seen.clone()),
         );
 
-        let manager_with = |mode: crate::config::ControlIdentityMode| {
+        let manager_with = |mode: config::ControlIdentityMode| {
             let mut config = dummy_config(None, &format!("http://{up_addr}"));
             config.accounts[0].name = "alice@example.com".to_string();
             config.accounts[0].account_uuid = Some(ALICE_UUID.to_string());
-            config.control_account = Some(crate::config::ControlAccountRef::Name(
+            config.control_account = Some(config::ControlAccountRef::Name(
                 "alice@example.com".to_string(),
             ));
             config.control_pooled = true;
@@ -14679,7 +14630,7 @@ mod tests {
             req
         };
         async fn body_text(response: Response) -> String {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            let bytes = to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("body");
             String::from_utf8_lossy(&bytes).into_owned()
@@ -14687,8 +14638,8 @@ mod tests {
 
         // refuse: bob is refused on a bookkeeping call and on inference, and
         // neither reaches upstream.
-        let manager = manager_with(crate::config::ControlIdentityMode::Refuse);
-        let response = app(manager.clone())
+        let manager = manager_with(config::ControlIdentityMode::Refuse);
+        let response = app(Arc::clone(&manager))
             .oneshot(request(
                 Method::GET,
                 "/api/claude_cli/bootstrap",
@@ -14706,7 +14657,7 @@ mod tests {
             text.contains("/logout"),
             "the refusal names the fix: {text}"
         );
-        let response = app(manager.clone())
+        let response = app(Arc::clone(&manager))
             .oneshot(request(
                 Method::POST,
                 "/v1/messages?beta=true",
@@ -14729,7 +14680,7 @@ mod tests {
 
         // The control account's own bearer passes, and its bootstrap call is
         // relayed under that bearer rather than the pooled token.
-        let response = app(manager.clone())
+        let response = app(Arc::clone(&manager))
             .oneshot(request(
                 Method::GET,
                 "/api/claude_cli/bootstrap",
@@ -14743,7 +14694,7 @@ mod tests {
             ["Bearer tok-alice".to_string()],
             "a bookkeeping call carries the CLIENT's credential upstream"
         );
-        let response = app(manager.clone())
+        let response = app(Arc::clone(&manager))
             .oneshot(request(
                 Method::POST,
                 "/v1/messages?beta=true",
@@ -14758,7 +14709,7 @@ mod tests {
         // A bearer the profile endpoint cannot resolve is fail-open, and is
         // asked again next time because a failure is never cached.
         for _ in 0..2 {
-            let response = app(manager.clone())
+            let response = app(Arc::clone(&manager))
                 .oneshot(request(
                     Method::POST,
                     "/v1/messages?beta=true",
@@ -14777,7 +14728,7 @@ mod tests {
         // A bearer upstream REFUSES (expired or revoked) is served too, but is
         // remembered: two requests on it cost one profile fetch, not two.
         for _ in 0..2 {
-            let response = app(manager.clone())
+            let response = app(Arc::clone(&manager))
                 .oneshot(request(
                     Method::POST,
                     "/v1/messages?beta=true",
@@ -14798,7 +14749,7 @@ mod tests {
         );
 
         // No bearer: nothing to check, nothing asked.
-        let response = app(manager.clone())
+        let response = app(Arc::clone(&manager))
             .oneshot(request(Method::POST, "/v1/messages?beta=true", None))
             .await
             .unwrap();
@@ -14806,7 +14757,7 @@ mod tests {
         assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 5);
 
         // warn: bob is served.
-        let manager = manager_with(crate::config::ControlIdentityMode::Warn);
+        let manager = manager_with(config::ControlIdentityMode::Warn);
         let response = app(manager)
             .oneshot(request(
                 Method::POST,
@@ -14823,7 +14774,7 @@ mod tests {
         assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 6);
 
         // off: bob is served and the profile endpoint is never asked.
-        let manager = manager_with(crate::config::ControlIdentityMode::Off);
+        let manager = manager_with(config::ControlIdentityMode::Off);
         let response = app(manager)
             .oneshot(request(
                 Method::POST,
@@ -15039,7 +14990,7 @@ mod tests {
             );
         }
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             paths.len(),
             "one upstream hit per relayed path"
         );
@@ -15274,7 +15225,7 @@ mod tests {
             );
         }
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             0,
             "no `/_tcr/…` request may ever reach an upstream"
         );
@@ -15340,7 +15291,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     /// The traversal table, end to end, against the fake upstream that reports what
@@ -15404,7 +15355,7 @@ mod tests {
             );
         }
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             0,
             "not one ambiguous path may reach an upstream, by either route"
         );
@@ -15443,7 +15394,7 @@ mod tests {
                 "{uri} reaches the upstream verbatim"
             );
         }
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
     }
 
     // --- account-bound history pins the conversation, and never diverts ---
@@ -15638,7 +15589,7 @@ mod tests {
             other_auth,
             "with no token to honour, the session goes back to its own pinned account"
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
     /// A bound account that is OUT (here `disabled`, the same terminal gate a `rejected` unified
@@ -15685,7 +15636,7 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             0,
             "the warning spends no account"
         );
@@ -15697,11 +15648,7 @@ mod tests {
             "bound to an account that cannot serve, the retry goes to one that can: {}",
             String::from_utf8_lossy(&body)
         );
-        assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the sibling served it"
-        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the sibling served it");
     }
 
     /// A released conversation that ran on the sibling stays there when its old account comes
@@ -15841,7 +15788,7 @@ mod tests {
         }
 
         let seen = seen.lock().expect("recorder");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
         assert!(
             seen[1..].iter().all(|auth| *auth != pinned_auth),
             "every held turn reached the signing account, never the pin: {seen:?}"
@@ -15907,30 +15854,14 @@ mod tests {
                 .map(str::to_string)
         };
 
-        let fleet = exhausted_response(
-            &manager,
-            now,
-            2,
-            false,
-            crate::provider::Provider::Anthropic,
-            None,
-            None,
-        );
+        let fleet = exhausted_response(&manager, now, 2, false, Provider::Anthropic, None, None);
         assert_eq!(
             claim(&fleet).as_deref(),
             Some("five_hour"),
             "control: with no history held, the fleet's 429 names the window"
         );
 
-        let held = exhausted_response(
-            &manager,
-            now,
-            2,
-            false,
-            crate::provider::Provider::Anthropic,
-            None,
-            Some(0),
-        );
+        let held = exhausted_response(&manager, now, 2, false, Provider::Anthropic, None, Some(0));
         assert_eq!(held.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(claim(&held), None, "a held 429 names no window");
         assert!(
@@ -16198,7 +16129,7 @@ mod tests {
             "the told session moves: {}",
             String::from_utf8_lossy(&body)
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(
             seen.lock().expect("recorder")[0].contains("at-bbbbbbbbbbbb"),
             "served by the sibling"
@@ -16242,7 +16173,7 @@ mod tests {
             "the Fable request diverts, no warning first: {}",
             String::from_utf8_lossy(&response)
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(
             seen.lock().expect("recorder")[0].contains("at-bbbbbbbbbbbb"),
             "served by the sibling"
@@ -16304,7 +16235,7 @@ mod tests {
             pinned_auth,
             "served by the sibling, not the held pin"
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     /// Three accounts over `upstream` in two organizations: alice (index 0, `at-aaaaaaaaaaaa`)
@@ -16349,7 +16280,7 @@ mod tests {
             "released and served: {}",
             String::from_utf8_lossy(&response)
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         seen.lock().expect("recorder")[0].clone()
     }
@@ -16467,8 +16398,8 @@ mod tests {
     }
 
     /// `body` with one top-level field set, for the two places a request names thread state.
-    fn with_body_field(body: &str, key: &str, value: serde_json::Value) -> String {
-        let mut parsed: serde_json::Value = serde_json::from_str(body).expect("test body is JSON");
+    fn with_body_field(body: &str, key: &str, value: Value) -> String {
+        let mut parsed: Value = serde_json::from_str(body).expect("test body is JSON");
         parsed[key] = value;
         parsed.to_string()
     }
@@ -16535,7 +16466,7 @@ mod tests {
             minting_auth,
             "a thread id holds the request to the account that holds the thread"
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
     /// A token this process never minted — from before this shipped, or aged out of the map —
@@ -16555,7 +16486,7 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK);
         }
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         let seen = seen.lock().expect("recorder").clone();
         assert_eq!(
             seen[0], seen[1],
@@ -16618,7 +16549,7 @@ mod tests {
             pinned_auth,
             "a bound conversation is held to its pin and waits, never diverted"
         );
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
     /// The other half of the hold: a bound conversation whose only account is parked for LONGER
@@ -16654,7 +16585,7 @@ mod tests {
         );
         manager.mark_rate_limited(0, 3);
         manager.mark_rate_limited(1, BOUND_HOLD);
-        let asked_at = std::time::Instant::now();
+        let asked_at = Instant::now();
         let response = drive_conversation_full(
             Arc::clone(&manager),
             &thinking_turn_body("sess-held", &["sig_fake_minted_before_this_build"]),
@@ -16683,7 +16614,7 @@ mod tests {
             asked_at.elapsed()
         );
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             1,
             "the held request reached no upstream at all"
         );
@@ -16858,13 +16789,13 @@ mod tests {
             );
         }
         assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
             0,
             "a refused caller's request never reached upstream"
         );
     }
 
-    /// key_matches behaviour is preserved after the length side-channel fix:
+    /// `key_matches` behaviour is preserved after the length side-channel fix:
     /// equal ⇔ true, and any mismatch (byte or length) ⇔ false.
     #[test]
     fn key_matches_equal_keys_true() {
@@ -16908,7 +16839,7 @@ mod tests {
         );
     }
 
-    /// The response-body cap rejects an over-cap stream (BAD_GATEWAY path) while
+    /// The response-body cap rejects an over-cap stream (`BAD_GATEWAY` path) while
     /// buffering a within-cap body verbatim and surfacing transport errors.
     #[tokio::test]
     async fn read_capped_body_rejects_oversized() {
@@ -16965,7 +16896,7 @@ mod tests {
         impl crate::oauth::TokenRefresher for AlwaysTransient {
             fn refresh(
                 &self,
-                _provider: crate::provider::Provider,
+                _provider: Provider,
                 _refresh_token: String,
             ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
@@ -16988,7 +16919,7 @@ mod tests {
 
         drop(
             send_to_proxy(
-                app(manager.clone()),
+                app(Arc::clone(&manager)),
                 client_request(Method::POST, "/v1/messages", "{}"),
             )
             .await,
@@ -17013,7 +16944,7 @@ mod tests {
         impl crate::oauth::TokenRefresher for NeverCalled {
             fn refresh(
                 &self,
-                _provider: crate::provider::Provider,
+                _provider: Provider,
                 _refresh_token: String,
             ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
@@ -17036,7 +16967,7 @@ mod tests {
 
         drop(
             send_to_proxy(
-                app(manager.clone()),
+                app(Arc::clone(&manager)),
                 client_request(Method::POST, "/v1/messages", "{}"),
             )
             .await,
@@ -17067,7 +16998,7 @@ mod tests {
         impl crate::oauth::TokenRefresher for AlwaysRefreshes {
             fn refresh(
                 &self,
-                _provider: crate::provider::Provider,
+                _provider: Provider,
                 _refresh_token: String,
             ) -> crate::oauth::RefreshFuture {
                 Box::pin(async {
@@ -17094,7 +17025,7 @@ mod tests {
 
         drop(
             send_to_proxy(
-                app(manager.clone()),
+                app(Arc::clone(&manager)),
                 client_request(Method::POST, "/v1/messages", "{}"),
             )
             .await,
@@ -17120,7 +17051,7 @@ mod tests {
         let mut polls = 0u32;
         let mut seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count;
         while seen != want && polls < 200 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count;
             polls += 1;
         }
@@ -17176,7 +17107,7 @@ mod tests {
     /// as `main.rs`'s `SharedBuf` — duplicated locally because that one is
     /// private to `main.rs`'s own test module.
     #[derive(Clone, Default)]
-    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl SharedBuf {
         fn contents(&self) -> String {
@@ -17199,7 +17130,7 @@ mod tests {
     }
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-        type Writer = SharedBuf;
+        type Writer = Self;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
@@ -17848,7 +17779,7 @@ mod tests {
         let mut polls = 0u32;
         let mut input_tokens = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
         while input_tokens == 0 && polls < 200 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             input_tokens = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
             polls += 1;
         }
@@ -17929,7 +17860,7 @@ mod tests {
             let mut polls = 0u32;
             let mut seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
             while seen == 0 && polls < 200 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
                 polls += 1;
             }
@@ -17966,7 +17897,7 @@ mod tests {
     /// turn. The fixture is deliberately the SAME shape that would have been
     /// misclassified as truncated before this fix (a `message_start` with no
     /// `message_stop`), on a 400 instead of a 200, to prove the status gate
-    /// — not the message_start gate above — is what suppresses it here.
+    /// — not the `message_start` gate above — is what suppresses it here.
     #[tokio::test]
     async fn non_2xx_sse_body_records_no_stream_error() {
         let up_addr = stub::canned(stub::reply(
@@ -17984,7 +17915,7 @@ mod tests {
         let proxy = app(Arc::clone(&manager));
 
         let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let _ = body_text(resp).await;
 
         // record_served fires on the terminal outcome regardless of status
@@ -17994,7 +17925,7 @@ mod tests {
         let mut polls = 0u32;
         let mut requests = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests;
         while requests == 0 && polls < 200 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             requests = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests;
             polls += 1;
         }
@@ -18039,7 +17970,7 @@ mod tests {
         let proxy = app(Arc::clone(&manager));
 
         let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
         let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
@@ -18083,7 +18014,7 @@ mod tests {
         let proxy = app(Arc::clone(&manager));
 
         let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
@@ -18108,7 +18039,7 @@ mod tests {
     /// is thoroughly UNIT-tested, but the proxy wiring at the call site is not — every
     /// other integration test posts a bare `{}`, so the rewrite branch never fires on
     /// a real request. Drive one whose `metadata.user_id` blob carries a DIFFERENT
-    /// account_uuid and assert, from what the UPSTREAM actually received, that the
+    /// `account_uuid` and assert, from what the UPSTREAM actually received, that the
     /// serving account's uuid was substituted, the client's is gone, and the body
     /// length is unchanged (the whole point of the same-length patch — it keeps the
     /// buffered request's Content-Length valid in flight).
@@ -18121,11 +18052,7 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(
-                &self,
-                _provider: crate::provider::Provider,
-                _t: String,
-            ) -> crate::oauth::RefreshFuture {
+            fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -18133,9 +18060,9 @@ mod tests {
         // Echo upstream: capture the full forwarded request (headers + Content-Length
         // body), then answer 200.
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let cap = captured.clone();
+        let cap = Arc::clone(&captured);
         let up_addr = stub::raw(move |conn| {
-            let cap = cap.clone();
+            let cap = Arc::clone(&cap);
             async move {
                 let mut sock = conn.stream;
                 // What the shared listener already read to route the request.
@@ -18187,7 +18114,7 @@ mod tests {
 
         drop(
             send_to_proxy(
-                app(manager.clone()),
+                app(Arc::clone(&manager)),
                 client_request(Method::POST, "/v1/messages", body),
             )
             .await,
@@ -18231,11 +18158,7 @@ mod tests {
     async fn same_user_id_pins_one_account_and_surfaces_cache_read() {
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(
-                &self,
-                _provider: crate::provider::Provider,
-                _t: String,
-            ) -> crate::oauth::RefreshFuture {
+            fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -18268,11 +18191,11 @@ mod tests {
         // resolving to one stable key can pin them 2/0 — so a green test proves the
         // body's user_id is what pins, not merely affinity-on.
         use std::sync::atomic::{AtomicU64, Ordering};
-        let served = manager.clone();
+        let served = Arc::clone(&manager);
         let seq = Arc::new(AtomicU64::new(1));
         let affinity_app = app(served).layer(axum::middleware::from_fn(
-            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-                let seq = seq.clone();
+            move |mut req: Request, next: axum::middleware::Next| {
+                let seq = Arc::clone(&seq);
                 async move {
                     req.extensions_mut()
                         .insert(SessionKey(seq.fetch_add(1, Ordering::Relaxed)));
@@ -18493,11 +18416,7 @@ mod tests {
     ) -> Arc<Manager> {
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(
-                &self,
-                _provider: crate::provider::Provider,
-                _t: String,
-            ) -> crate::oauth::RefreshFuture {
+            fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -18568,7 +18487,7 @@ mod tests {
     /// call drives a fresh router.
     async fn post_one_pinned(manager: Arc<Manager>, user_id: &str) -> u16 {
         let affinity_app = app(manager).layer(axum::middleware::from_fn(
-            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            move |mut req: Request, next: axum::middleware::Next| async move {
                 // The value is a per-connection ordinal upstream and is deliberately
                 // NOT the routing key (`stable_session_key` never falls back to it),
                 // so a constant is as faithful here as a counter.
@@ -18650,7 +18569,7 @@ mod tests {
         let leaked: Vec<&str> = response
             .headers()
             .keys()
-            .map(|k| k.as_str())
+            .map(HeaderName::as_str)
             .filter(|k| k.starts_with("anthropic-ratelimit"))
             .collect();
         assert!(
@@ -18718,7 +18637,7 @@ mod tests {
         let account = &manager.snapshot(OffsetDateTime::now_utc()).accounts[0];
         assert_eq!(
             account.gate,
-            crate::stats::GateReason::Rejected,
+            GateReason::Rejected,
             "`update_quota` must still have seen `unified-status: rejected`"
         );
         assert!(
@@ -18760,7 +18679,7 @@ mod tests {
             "the allowed response must clear the stale Fable rejection"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             3,
             "each client request must make exactly one upstream attempt"
         );
@@ -18777,7 +18696,7 @@ mod tests {
 
         assert_eq!(post_one(manager).await, 429);
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             1,
             "the lock must prevent a retry on account b"
         );
@@ -19035,7 +18954,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read the forwarded body");
         assert!(
@@ -19043,7 +18962,7 @@ mod tests {
             "the client must get upstream's own 429 body, not a synthesized one: {body:?}"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             1,
             "a request-scoped 429 must not rotate to another account"
         );
@@ -19083,7 +19002,7 @@ mod tests {
             StatusCode::OK,
             "the second account answers"
         );
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         let parked = manager
             .snapshot(OffsetDateTime::now_utc())
             .accounts
@@ -19237,7 +19156,7 @@ mod tests {
         );
         manager.update_quota(2, &over, 200);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(
             status, 200,
             "one transport blip alongside a real upstream 429 must not synthesize a \
@@ -19275,7 +19194,7 @@ mod tests {
         let up_addr = spawn_scripted_upstream(vec![None]).await; // every connection blips
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let (status, headers, _body) = post_one_full(manager.clone()).await;
+        let (status, headers, _body) = post_one_full(Arc::clone(&manager)).await;
         assert_eq!(
             status, 502,
             "no attempt reached an upstream at all — 502 is the honest verdict"
@@ -19314,7 +19233,7 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(status, 200, "the retry must serve the client");
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -19448,7 +19367,7 @@ mod tests {
 
         RELAY_CLIENT
             .detector()
-            .inject_sleep(Duration::from_secs(900));
+            .inject_sleep(Duration::from_mins(15));
         let woken = relay_client().expect("the relay client builds");
         assert!(
             !Arc::ptr_eq(&first, &woken),
@@ -19510,8 +19429,8 @@ mod tests {
 
     /// **The seam the arm actually calls**: `recycle_client_after_reset` swaps
     /// the account's client `Arc` (so the retry that follows genuinely lands on
-    /// a fresh connection), and only the StreamReset arm calls it, a
-    /// ConnectPhase failure must leave the client untouched, matching the live
+    /// a fresh connection), and only the `StreamReset` arm calls it, a
+    /// `ConnectPhase` failure must leave the client untouched, matching the live
     /// arm's own gating (`err.is_connect()` never reaches the recycle call).
     #[tokio::test]
     async fn recycle_client_after_reset_swaps_the_arc_only_when_called() {
@@ -19572,7 +19491,7 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(status, 200, "the third retry must still serve the client");
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -19589,7 +19508,7 @@ mod tests {
              on `b` means the aging-connection fault cost us a cold prefix"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             4,
             "one send plus three same-account retries, all on `a`"
         );
@@ -19615,7 +19534,7 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(status, 200, "`b` still serves the request");
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -19631,7 +19550,7 @@ mod tests {
             "`a` is benched once its transport-retry budget is spent"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             (MAX_SAME_ACCOUNT_TRANSPORT_RETRIES as usize) + 2,
             "one send plus the full retry budget on `a`, then exactly one rotation"
         );
@@ -19761,7 +19680,7 @@ mod tests {
             "a synthesized exhaustion body means the walk was truncated: {body}"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             12,
             "every rung of the mixed ladder has to have been walked — a smaller \
              number means the request stopped early and the 529 above was luck"
@@ -19785,7 +19704,7 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(
             status, 200,
             "a 529 is transient — the retry must serve the client the 200 rather \
@@ -19846,11 +19765,7 @@ mod tests {
             ])
             .await;
             let (status, body) = post_one_with_body(fleet(up_addr, &["a"])).await;
-            (
-                status,
-                body,
-                attempts.load(std::sync::atomic::Ordering::SeqCst),
-            )
+            (status, body, attempts.load(Ordering::SeqCst))
         };
         let (exact_status, (over_status, over_body, over_attempts)) = tokio::join!(exact, over);
 
@@ -19903,7 +19818,7 @@ mod tests {
         let manager = fleet(up_addr, &["a"]);
 
         assert_eq!(
-            post_one(manager.clone()).await,
+            post_one(Arc::clone(&manager)).await,
             529,
             "one account means nothing to fail over to, so the in-place ladder is the \
              whole budget and the upstream's 529 is forwarded"
@@ -19911,7 +19826,7 @@ mod tests {
         // Without this the test passes vacuously on a proxy that never retries at
         // all: one 529 forwarded straight through leaves the account unheld too.
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             MAX_SAME_ACCOUNT_529_RETRIES as usize + 1,
             "exactly one initial send plus {MAX_SAME_ACCOUNT_529_RETRIES} retries"
         );
@@ -19925,7 +19840,7 @@ mod tests {
         );
         assert_eq!(
             a.gate,
-            crate::stats::GateReason::Ok,
+            GateReason::Ok,
             "no hard gate of any kind may be left behind — the account stays in rotation"
         );
         assert_eq!(
@@ -19935,7 +19850,7 @@ mod tests {
 
         // The durable half of the claim, which only a second request can make.
         assert_eq!(
-            post_one(manager.clone()).await,
+            post_one(Arc::clone(&manager)).await,
             200,
             "the 529'd account must be fully eligible for the NEXT request"
         );
@@ -19971,13 +19886,13 @@ mod tests {
         const SESSION: &str = "529-failover-session";
 
         assert_eq!(
-            post_one_pinned(manager.clone(), SESSION).await,
+            post_one_pinned(Arc::clone(&manager), SESSION).await,
             200,
             "the overload is account-scoped, so a sibling can serve: the client must \
              get the 200 rather than a 529 it has to re-send by hand"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             MAX_SAME_ACCOUNT_529_RETRIES as usize + 2,
             "the in-place ladder still runs in FULL on `a` first — the failover is the \
              send AFTER it, not a replacement for it"
@@ -20010,7 +19925,7 @@ mod tests {
         );
 
         assert_eq!(
-            post_one_pinned(manager.clone(), SESSION).await,
+            post_one_pinned(Arc::clone(&manager), SESSION).await,
             200,
             "the session's next request must be servable"
         );
@@ -20034,13 +19949,13 @@ mod tests {
         let manager = fleet(up_addr, &["a", "b"]);
 
         assert_eq!(
-            post_one(manager.clone()).await,
+            post_one(Arc::clone(&manager)).await,
             200,
             "the 403 must never reach the client — it names a credential the client \
              never saw and cannot act on"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             2,
             "exactly one rotation: refused on `a`, served by `b`"
         );
@@ -20063,10 +19978,10 @@ mod tests {
         let manager = fleet(up_addr, &["a", "b"]);
 
         for _ in 0..4 {
-            assert_eq!(post_one(manager.clone()).await, 200);
+            assert_eq!(post_one(Arc::clone(&manager)).await, 200);
         }
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             5,
             "one wasted attempt on `a`, then `a` is held and never retried"
         );
@@ -20099,7 +20014,7 @@ mod tests {
         let (up_addr, attempts) = spawn_counted_upstream(vec![Some(raw_403())]).await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let (status, body) = post_one_with_body(manager.clone()).await;
+        let (status, body) = post_one_with_body(Arc::clone(&manager)).await;
         assert_eq!(
             status, 502,
             "both accounts refused — refusals are the WHOLE story, so this must \
@@ -20115,7 +20030,7 @@ mod tests {
              need attention: {body}"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             2,
             "every account in the fleet was tried exactly once, then the fast-fail \
              fired — no retry loop on a refusal"
@@ -20137,7 +20052,7 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(
             status, 429,
             "one refusal among a mixed fleet must fall through to the EXISTING \
@@ -20145,7 +20060,7 @@ mod tests {
              quota-rejected account might still recover on its own hold"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             2,
             "both accounts were tried once each before the fleet-exhausted 429"
         );
@@ -20239,12 +20154,8 @@ mod tests {
         for idx in 0..2 {
             manager.mark_rate_limited(idx, 3_600);
         }
-        let hint = manager.exhaustion_hint(
-            OffsetDateTime::now_utc(),
-            false,
-            crate::provider::Provider::Anthropic,
-            None,
-        );
+        let hint =
+            manager.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Anthropic, None);
         assert!(
             hint.retry_after > 3_500 && hint.free_at.is_some(),
             "fixture must be a MEASURED wait far above the cap: {hint:?}"
@@ -20372,7 +20283,7 @@ mod tests {
         let (up_addr, attempts) = spawn_counted_upstream(vec![Some(raw_529())]).await;
         let manager = fleet(up_addr, &["a", "b", "c", "d", "e"]);
 
-        let (status, body) = post_one_with_body(manager.clone()).await;
+        let (status, body) = post_one_with_body(Arc::clone(&manager)).await;
         assert_eq!(
             status, 529,
             "with the whole fleet overloaded the failover cannot help, so the client \
@@ -20388,7 +20299,7 @@ mod tests {
         let accounts_walked = 1 + MAX_529_FAILOVERS_PER_REQUEST as usize;
         let sends_per_account = MAX_SAME_ACCOUNT_529_RETRIES as usize + 1;
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             accounts_walked * sends_per_account,
             "{accounts_walked} accounts at {sends_per_account} sends each — two idle \
              accounts must be left untouched, or one overloaded request walks the fleet"
@@ -20435,7 +20346,7 @@ mod tests {
         let manager = fleet(up_addr, &["a", "b", "c"]);
 
         assert_eq!(
-            post_one(manager.clone()).await,
+            post_one(Arc::clone(&manager)).await,
             200,
             "precondition: the failover happened and served the client"
         );
@@ -20491,14 +20402,14 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(
             status, 200,
             "the soft-wait slept for THIS account's un-park — it must be back in \
              rotation when the sleep ends, not still excluded by `tried`"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             4,
             "three 429s then one serve — no extra attempt, so the re-admission did \
              not turn the rotation loop into a retry spin"
@@ -20542,10 +20453,10 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b", "c"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(status, 200, "the transiently parked `c` still recovers");
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             6,
             "one attempt each on `a` and `b`, three on `c`, then `c`'s serve — a \
              re-admitted `a` or `b` would add attempts here"
@@ -20590,13 +20501,13 @@ mod tests {
         .await;
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let status = post_one(Arc::clone(&manager)).await;
         assert_eq!(
             status, 429,
             "nothing recovered, so the honest exhausted-429 is still the verdict"
         );
         assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts.load(Ordering::SeqCst),
             5,
             "the second select() miss cannot soft-wait again, so the re-admission \
              buys exactly ONE extra attempt and the loop ends"
@@ -20617,7 +20528,7 @@ mod tests {
         // AT THE CEILING: upstream asked for >= 3600 and we were already going to
         // return early, so spreading inside [3600-N, 3600] costs nothing and
         // desyncs the herd. Distinct nanos MUST yield distinct holds.
-        let spread: std::collections::HashSet<i64> = (0..8)
+        let spread: HashSet<i64> = (0..8)
             .map(|k| jittered_quota_hold(7200, k * 111_111_111))
             .collect();
         assert!(
@@ -20671,11 +20582,7 @@ mod tests {
 
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
-            fn refresh(
-                &self,
-                _provider: crate::provider::Provider,
-                _t: String,
-            ) -> crate::oauth::RefreshFuture {
+            fn refresh(&self, _provider: Provider, _t: String) -> crate::oauth::RefreshFuture {
                 Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
             }
         }
@@ -20852,7 +20759,7 @@ mod tests {
         relay_upstream(
             &manager,
             RelayMode::Raw,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             Method::POST,
             "/v1/oauth/token",
             &HeaderMap::new(),
@@ -21240,8 +21147,7 @@ mod tests {
     #[test]
     fn codex_exhausted_body_is_the_shape_codex_renders() {
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("a valid instant");
-        let body: serde_json::Value =
-            serde_json::from_str(&codex_exhausted_body(now, 1234, true)).unwrap();
+        let body: Value = serde_json::from_str(&codex_exhausted_body(now, 1234, true)).unwrap();
         assert_eq!(body["error"]["type"], "usage_limit_reached");
         assert_eq!(body["error"]["code"], "usage_limit_reached");
         assert_eq!(body["error"]["resets_in_seconds"], 1234);
@@ -21316,7 +21222,7 @@ mod tests {
     #[test]
     fn codex_pool_unavailable_body_claims_no_limit() {
         for (wait_secs, measured) in [(45, true), (60, false)] {
-            let body: serde_json::Value =
+            let body: Value =
                 serde_json::from_str(&codex_pool_unavailable_body(wait_secs, measured))
                     .expect("a JSON body");
             assert_eq!(body["error"]["type"], "pool_unavailable", "{body}");
@@ -21445,7 +21351,7 @@ mod tests {
         };
         let bob = Account {
             name: "bob@example.com/codex".to_string(),
-            provider: crate::provider::Provider::Codex,
+            provider: Provider::Codex,
             account_uuid: Some(CODEX_SERVING_ID.to_string()),
             access_token: "at-bob".to_string(),
             refresh_token: Some("rt-bob".to_string()),
@@ -21644,8 +21550,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 
-        let logged: Vec<(String, String, crate::provider::Provider)> = manager
-            .snapshot(time::OffsetDateTime::now_utc())
+        let logged: Vec<(String, String, Provider)> = manager
+            .snapshot(OffsetDateTime::now_utc())
             .recent
             .into_iter()
             .map(|entry| (entry.path, entry.account, entry.provider))
@@ -21656,12 +21562,12 @@ mod tests {
                 (
                     "/v1/messages".to_string(),
                     "alice@example.com".to_string(),
-                    crate::provider::Provider::Anthropic
+                    Provider::Anthropic
                 ),
                 (
                     crate::provider::CODEX_RESPONSES_PATH.to_string(),
                     "bob@example.com/codex".to_string(),
-                    crate::provider::Provider::Codex
+                    Provider::Codex
                 ),
             ],
             "most recent first"
@@ -22065,7 +21971,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}{path}");
-            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON error");
+            let body: Value = serde_json::from_slice(&bytes).expect("a JSON error");
             let message = body["error"]["message"].as_str().expect("a message");
             assert!(
                 message.contains(&format!("{}{path}", strip_port(host))),
@@ -22128,7 +22034,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{host}{path}");
-            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON error");
+            let body: Value = serde_json::from_slice(&bytes).expect("a JSON error");
             let message = body["error"]["message"].as_str().expect("a message");
             assert!(
                 message.contains(&format!("{host}{path}")),
@@ -22233,7 +22139,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
             .await
             .expect("read body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["type"], "usage_limit_reached");
         assert_eq!(body["error"]["code"], "usage_limit_reached");
         assert_eq!(codex_echo.request_count(), 0);
@@ -23044,9 +22950,9 @@ mod tests {
     async fn codex_short_burst_retry_keeps_the_same_account_when_a_sibling_is_healthy() {
         let anthropic = CapturingUpstream::spawn().await;
         let bearers = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = bearers.clone();
+        let seen = Arc::clone(&bearers);
         let origin = Router::new().fallback(move |headers: HeaderMap| {
-            let seen = seen.clone();
+            let seen = Arc::clone(&seen);
             async move {
                 let first = {
                     let mut seen = seen.lock().unwrap();
@@ -23099,7 +23005,7 @@ mod tests {
             seen[0], seen[1],
             "a one-second burst must keep the warm account"
         );
-        assert!(started.elapsed() >= std::time::Duration::from_millis(850));
+        assert!(started.elapsed() >= Duration::from_millis(850));
         assert_eq!(anthropic.request_count(), 0);
     }
 
@@ -23111,7 +23017,7 @@ mod tests {
         let origin = Router::new().fallback(move || {
             let counted = Arc::clone(&counted);
             async move {
-                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Response::builder()
                         .status(StatusCode::TOO_MANY_REQUESTS)
                         .header(CONTENT_TYPE, "application/json")
@@ -23141,7 +23047,7 @@ mod tests {
             "{}",
         )
         .await;
-        let sent = sends.load(std::sync::atomic::Ordering::SeqCst);
+        let sent = sends.load(Ordering::SeqCst);
         assert_eq!(
             status,
             StatusCode::OK,
@@ -23459,7 +23365,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
             .await
             .expect("read body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
         let resets = body["error"]["resets_in_seconds"]
             .as_u64()
             .expect("a number of seconds");
@@ -23485,7 +23391,7 @@ mod tests {
         let anthropic_echo = CapturingUpstream::spawn().await;
         let codex_echo = CapturingUpstream::spawn().await;
         let mut config = codex_fleet(&anthropic_echo.url, &codex_echo.url);
-        config.control_account = Some(crate::config::ControlAccountRef::Name(
+        config.control_account = Some(config::ControlAccountRef::Name(
             "alice@example.com".to_string(),
         ));
         config.control_pooled = true;
@@ -23582,7 +23488,7 @@ mod tests {
             let bytes = to_bytes(anthropic.into_body(), MAX_BODY_BYTES)
                 .await
                 .expect("read body");
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 body["error"]["type"], "rate_limit_error",
                 "the Anthropic body is the one it always was"
@@ -23598,7 +23504,7 @@ mod tests {
             let bytes = to_bytes(codex.into_body(), MAX_BODY_BYTES)
                 .await
                 .expect("read body");
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 body["error"]["type"], "pool_unavailable",
                 "a pool that is only held is no usage limit: {body}"
@@ -23628,7 +23534,7 @@ mod tests {
             let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
                 .await
                 .expect("read body");
-            serde_json::from_slice::<serde_json::Value>(&bytes).expect("a JSON body")
+            serde_json::from_slice::<Value>(&bytes).expect("a JSON body")
         };
 
         // The one Codex account's weekly window is full, and resets in 300 seconds.
@@ -23751,7 +23657,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), MAX_BODY_BYTES)
             .await
             .expect("read body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["type"], "no_codex_account", "{body}");
         assert_eq!(body["error"]["code"], "no_codex_account", "{body}");
         let message = body["error"]["message"].as_str().unwrap_or_default();
@@ -23776,7 +23682,7 @@ mod tests {
     async fn the_anthropic_exhausted_429_counts_only_anthropic_accounts() {
         let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
         let manager = fleet_configured(up_addr, &["a", "b", "c"], |config| {
-            config.accounts[2].provider = crate::provider::Provider::Codex;
+            config.accounts[2].provider = Provider::Codex;
             // A revalidation serve has nothing to serve on held accounts anyway;
             // off so the 429 below is the only possible answer.
             config
@@ -23833,7 +23739,7 @@ mod tests {
     }
 
     /// A response's body, parsed as JSON.
-    async fn body_json(response: Response) -> serde_json::Value {
+    async fn body_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
             .await
             .expect("read body");
@@ -24011,7 +23917,7 @@ mod tests {
         // A Claude client's exhausted 429 is not a Codex refusal.
         let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
         let manager = fleet_configured(up_addr, &["a", "b", "c"], |config| {
-            config.accounts[2].provider = crate::provider::Provider::Codex;
+            config.accounts[2].provider = Provider::Codex;
             config
                 .extra
                 .insert("revalidationServe".to_string(), serde_json::json!(false));
@@ -24116,7 +24022,7 @@ mod tests {
         let (status, _, body) =
             status_request(manager, Method::GET, Some(loopback_peer()), None).await;
         assert_eq!(status, StatusCode::OK);
-        let raw: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let raw: Value = serde_json::from_slice(&body).expect("JSON");
         assert!(raw.get("codex_upstream").is_none(), "{raw}");
         assert_eq!(
             raw["codex_traffic"],
@@ -24132,7 +24038,7 @@ mod tests {
         use tower::ServiceExt as _;
         let plain = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
         let (_, _, body) = status_request(plain, Method::GET, Some(loopback_peer()), None).await;
-        let raw: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let raw: Value = serde_json::from_slice(&body).expect("JSON");
         for key in ["requestKeyMode", "unkeyedConnects", "unkeyedRequests"] {
             assert!(raw.get(key).is_none(), "{key} without a key: {raw}");
         }
@@ -24159,7 +24065,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         let (_, _, body) = status_request(manager, Method::GET, Some(loopback_peer()), None).await;
-        let raw: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let raw: Value = serde_json::from_slice(&body).expect("JSON");
         assert_eq!(raw["requestKeyMode"], "log", "{raw}");
         assert_eq!(raw["unkeyedConnects"], serde_json::json!([]), "{raw}");
         assert_eq!(
@@ -24205,10 +24111,7 @@ mod tests {
             leaf: crate::status::MitmStatus::LEAF_MINTED.to_string(),
         });
         let _ = manager.snapshot(OffsetDateTime::now_utc());
-        assert_eq!(
-            manager.provider_account_count(crate::provider::Provider::Codex),
-            1
-        );
+        assert_eq!(manager.provider_account_count(Provider::Codex), 1);
 
         // bob is deleted from the file; the next snapshot reloads it and marks him removed.
         write(std::slice::from_ref(&alice));
@@ -24216,7 +24119,7 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("open the config")
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
             .expect("move the config's mtime");
         let (status, _, body) = status_request(
             Arc::clone(&manager),
@@ -24226,12 +24129,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(manager.provider_account_count(Provider::Codex), 0);
         assert_eq!(
-            manager.provider_account_count(crate::provider::Provider::Codex),
-            0
-        );
-        assert_eq!(
-            manager.provider_account_count(crate::provider::Provider::Anthropic),
+            manager.provider_account_count(Provider::Anthropic),
             1,
             "the Anthropic count is the one it always was"
         );
@@ -24240,7 +24140,7 @@ mod tests {
         let codex_rows = payload
             .accounts
             .iter()
-            .filter(|row| row.provider == crate::provider::Provider::Codex)
+            .filter(|row| row.provider == Provider::Codex)
             .count();
         assert_eq!(codex_rows, 0, "the document no longer lists bob");
         let route = crate::codex_route::codex_route(
@@ -24284,7 +24184,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
             .unwrap();
         let response = drive_full(
             Arc::clone(&manager),
@@ -24301,14 +24201,8 @@ mod tests {
             body["error"]["message"],
             "No Claude account is configured in tcr; run `tcr login` to add one."
         );
-        assert_eq!(
-            manager.provider_account_count(crate::provider::Provider::Anthropic),
-            0
-        );
-        assert_eq!(
-            manager.provider_account_count(crate::provider::Provider::Codex),
-            1
-        );
+        assert_eq!(manager.provider_account_count(Provider::Anthropic), 0);
+        assert_eq!(manager.provider_account_count(Provider::Codex), 1);
     }
 
     /// **A pool that holds Codex accounts and no Claude account tells a Claude client so**,
@@ -24363,15 +24257,7 @@ mod tests {
         let mut empty = codex_fleet("http://127.0.0.1:9", "http://127.0.0.1:9");
         empty.accounts.clear();
         let empty = Manager::with_live_refresher(empty, None);
-        let control = exhausted_response(
-            &empty,
-            now,
-            0,
-            false,
-            crate::provider::Provider::Anthropic,
-            None,
-            None,
-        );
+        let control = exhausted_response(&empty, now, 0, false, Provider::Anthropic, None, None);
         assert_eq!(control.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(header(&control, "retry-after"), retry_after);
         assert_eq!(header(&control, "content-type"), content_type);
@@ -24393,7 +24279,7 @@ mod tests {
             now,
             1,
             false,
-            crate::provider::Provider::Anthropic,
+            Provider::Anthropic,
             None,
             None,
         ))
@@ -24407,8 +24293,7 @@ mod tests {
     /// **The no-Codex-account 429 names the command that adds one**: a login of tcr's own.
     #[test]
     fn the_no_codex_account_429_names_tcr_login_codex() {
-        let body: serde_json::Value =
-            serde_json::from_str(&codex_no_account_body()).expect("a JSON body");
+        let body: Value = serde_json::from_str(&codex_no_account_body()).expect("a JSON body");
         assert_eq!(
             body["error"]["message"],
             "No Codex account is configured in tcr; run `tcr login --codex` to add one."
@@ -24422,7 +24307,7 @@ mod tests {
     fn codex_exhausted_body_says_no_pooled_account_can_take_the_request() {
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("a valid instant");
         let message = |measured: bool| {
-            let body: serde_json::Value =
+            let body: Value =
                 serde_json::from_str(&codex_exhausted_body(now, 300, measured)).expect("JSON");
             body["error"]["message"]
                 .as_str()
@@ -24577,9 +24462,9 @@ mod tests {
     async fn codex_model_refusals_try_a_supporting_sibling_without_benching_free() {
         for shape in ["detail", "error", "message"] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-            let captured = seen.clone();
+            let captured = Arc::clone(&seen);
             let origin = Router::new().fallback(move |headers: HeaderMap, body: Bytes| {
-                let captured = captured.clone();
+                let captured = Arc::clone(&captured);
                 async move {
                     let bearer = headers["authorization"].to_str().unwrap().to_owned();
                     captured.lock().unwrap().push(bearer.clone());
@@ -24604,7 +24489,7 @@ mod tests {
             for model in ["gpt-6.1-sol", "gpt-6-luna"] {
                 let body = serde_json::json!({"model": model, "input": []}).to_string();
                 let response = drive_full(
-                    manager.clone(),
+                    Arc::clone(&manager),
                     Method::POST,
                     crate::provider::CODEX_RESPONSES_PATH,
                     Some(loopback_peer()),
@@ -24636,11 +24521,11 @@ mod tests {
     async fn codex_model_refusals_explain_an_unavailable_supporting_account() {
         for blocked in ["disabled", "held", "quota", "credential"] {
             let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let captured = requests.clone();
+            let captured = Arc::clone(&requests);
             let origin = Router::new().fallback(move |headers: HeaderMap| {
-                let captured = captured.clone();
+                let captured = Arc::clone(&captured);
                 async move {
-                    captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    captured.fetch_add(1, Ordering::SeqCst);
                     let (status, body) = if headers["authorization"] == "Bearer at-carol" {
                         (StatusCode::FORBIDDEN, r#"{"error":{"code":"invalid_api_key","type":"authentication_error"}}"#)
                     } else {
@@ -24661,7 +24546,7 @@ mod tests {
                 _ => {}
             }
             let response = drive_full(
-                manager.clone(),
+                Arc::clone(&manager),
                 Method::POST,
                 crate::provider::CODEX_RESPONSES_PATH,
                 Some(loopback_peer()),
@@ -24686,7 +24571,7 @@ mod tests {
                 assert!(message.contains("tcr login --codex --account carol@example.com"));
             }
             assert_eq!(
-                requests.load(std::sync::atomic::Ordering::SeqCst),
+                requests.load(Ordering::SeqCst),
                 if blocked == "credential" { 2 } else { 1 }
             );
             assert_eq!(
@@ -24734,9 +24619,9 @@ mod tests {
     async fn an_unreadable_codex_403_is_held_briefly_and_rotates_without_relogin() {
         for stalled in [false, true] {
             let first = Arc::new(std::sync::Mutex::new(None::<String>));
-            let observed = first.clone();
+            let observed = Arc::clone(&first);
             let origin = Router::new().fallback(move |headers: HeaderMap| {
-                let observed = observed.clone();
+                let observed = Arc::clone(&observed);
                 async move {
                     let bearer = headers["authorization"].to_str().unwrap().to_owned();
                     let original = observed
@@ -24824,9 +24709,9 @@ mod tests {
     #[tokio::test]
     async fn codex_account_access_403_rotates_without_requesting_relogin() {
         let first_bearer = Arc::new(std::sync::Mutex::new(None::<String>));
-        let captured = first_bearer.clone();
+        let captured = Arc::clone(&first_bearer);
         let origin = Router::new().fallback(move |req: Request| {
-            let captured = captured.clone();
+            let captured = Arc::clone(&captured);
             async move {
                 let bearer = req.headers()["authorization"].to_str().unwrap().to_owned();
                 let first = captured.lock().unwrap().get_or_insert(bearer.clone()).clone();
@@ -24881,9 +24766,7 @@ mod tests {
                 "attempt {attempt}"
             );
             assert!(!response.headers().contains_key("retry-after"));
-            let body = axum::body::to_bytes(response.into_body(), 65536)
-                .await
-                .unwrap();
+            let body = to_bytes(response.into_body(), 65536).await.unwrap();
             let text = std::str::from_utf8(&body).unwrap();
             assert!(!text.contains("pool_unavailable"), "{text}");
             assert!(!text.contains("tcr login"), "{text}");
@@ -24892,7 +24775,7 @@ mod tests {
             .snapshot(OffsetDateTime::now_utc())
             .accounts
             .iter()
-            .filter(|a| a.provider == crate::provider::Provider::Codex)
+            .filter(|a| a.provider == Provider::Codex)
         {
             assert_eq!(account.gate, GateReason::Refused);
             assert_eq!(account.codex.login_error, None);
@@ -24906,11 +24789,11 @@ mod tests {
             ("secondary", GateReason::SevenDay),
         ] {
             let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let seen = requests.clone();
+            let seen = Arc::clone(&requests);
             let origin = Router::new().fallback(move || {
-                let seen = seen.clone();
+                let seen = Arc::clone(&seen);
                 async move {
-                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    seen.fetch_add(1, Ordering::SeqCst);
                     Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header(CONTENT_TYPE, "application/json")
@@ -24924,39 +24807,28 @@ mod tests {
             let manager = Manager::with_live_refresher(config, None);
             let mut headers = HeaderMap::new();
             headers.insert(
-                axum::http::HeaderName::from_bytes(
-                    format!("x-codex-{window}-used-percent").as_bytes(),
-                )
-                .unwrap(),
+                HeaderName::from_bytes(format!("x-codex-{window}-used-percent").as_bytes())
+                    .unwrap(),
                 HeaderValue::from_static("95"),
             );
             headers.insert(
-                axum::http::HeaderName::from_bytes(format!("x-codex-{window}-reset-at").as_bytes())
-                    .unwrap(),
+                HeaderName::from_bytes(format!("x-codex-{window}-reset-at").as_bytes()).unwrap(),
                 HeaderValue::from_str(
                     &(OffsetDateTime::now_utc().unix_timestamp() + 7200).to_string(),
                 )
                 .unwrap(),
             );
             manager.update_quota(1, &headers, 200);
-            let hint = manager.exhaustion_hint(
-                OffsetDateTime::now_utc(),
-                false,
-                crate::provider::Provider::Codex,
-                None,
-            );
+            let hint =
+                manager.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Codex, None);
             assert_eq!(hint.gated.get(&gate), Some(&1));
             assert_eq!(
                 send_codex_turn(&manager).await.status(),
                 StatusCode::FORBIDDEN
             );
-            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-            let hint = manager.exhaustion_hint(
-                OffsetDateTime::now_utc(),
-                false,
-                crate::provider::Provider::Codex,
-                None,
-            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            let hint =
+                manager.exhaustion_hint(OffsetDateTime::now_utc(), false, Provider::Codex, None);
             assert_eq!(hint.gated.get(&gate), Some(&1));
             assert!(
                 !hint.gated.contains_key(&GateReason::Refused),
@@ -24970,7 +24842,7 @@ mod tests {
                 "credential_refused"
             );
             assert_eq!(
-                requests.load(std::sync::atomic::Ordering::SeqCst),
+                requests.load(Ordering::SeqCst),
                 1,
                 "requests during the refusal hold never reach the origin"
             );
@@ -24995,9 +24867,7 @@ mod tests {
                 "attempt {attempt}"
             );
             assert!(!response.headers().contains_key("retry-after"));
-            let body = axum::body::to_bytes(response.into_body(), 65536)
-                .await
-                .unwrap();
+            let body = to_bytes(response.into_body(), 65536).await.unwrap();
             let text = std::str::from_utf8(&body).unwrap();
             assert!(!text.contains("pool_unavailable"), "{text}");
             assert!(!text.contains("tcr login"), "{text}");
@@ -25006,9 +24876,7 @@ mod tests {
             .snapshot(OffsetDateTime::now_utc())
             .accounts
             .iter()
-            .filter(|a| {
-                a.provider == crate::provider::Provider::Codex && a.gate != GateReason::Disabled
-            })
+            .filter(|a| a.provider == Provider::Codex && a.gate != GateReason::Disabled)
         {
             assert_eq!(account.gate, GateReason::Refused);
             assert_eq!(account.codex.login_error, None);
@@ -25307,7 +25175,7 @@ mod tests {
                     config.accounts[2].groups = Some(vec!["test-group".into()]);
                     config.group_settings.insert(
                         "test-group".into(),
-                        crate::config::GroupSettings {
+                        config::GroupSettings {
                             parked: state == "parked",
                             reserved: state == "reserved",
                             ..Default::default()
@@ -25316,7 +25184,7 @@ mod tests {
                 }
                 "unsupported" => {
                     config.accounts[2].egress =
-                        crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32]));
+                        config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32]));
                     config.accounts[2].egress_strict = true;
                 }
                 "locked" => config.lock_account = Some(config.accounts[1].name.clone()),
@@ -25337,15 +25205,7 @@ mod tests {
                 crate::quota::CodexQuotaRefusal::parse(&headers, body.as_bytes(), now).unwrap();
             manager.update_quota_with_codex_refusal(1, &headers, 429, Some(&refusal));
             manager.mark_codex_quota_limited(1, 3 * 86400);
-            let response = exhausted_response(
-                &manager,
-                now,
-                2,
-                false,
-                crate::provider::Provider::Codex,
-                None,
-                None,
-            );
+            let response = exhausted_response(&manager, now, 2, false, Provider::Codex, None, None);
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
             let body = body_json(response).await;
             assert_eq!(
@@ -25431,7 +25291,7 @@ mod tests {
                 config.accounts[1].groups = Some(vec!["test-group".into()]);
                 config.group_settings.insert(
                     "test-group".into(),
-                    crate::config::GroupSettings {
+                    config::GroupSettings {
                         parked: true,
                         ..Default::default()
                     },
@@ -25441,7 +25301,7 @@ mod tests {
                 config.accounts[1].groups = Some(vec!["test-group".into()]);
                 config.group_settings.insert(
                     "test-group".into(),
-                    crate::config::GroupSettings {
+                    config::GroupSettings {
                         reserved: true,
                         ..Default::default()
                     },
@@ -25469,7 +25329,7 @@ mod tests {
     async fn codex_locked_unsupported_exit_cannot_wait_for_an_unreachable_sibling() {
         let mut config = codex_fleet_with_carol("http://127.0.0.1:9", "http://127.0.0.1:9");
         config.lock_account = Some(config.accounts[1].name.clone());
-        config.accounts[1].egress = crate::config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32]));
+        config.accounts[1].egress = config::Egress::Via(tcr_peer_wire::PeerId([0x55; 32]));
         config.accounts[1].egress_strict = true;
         let manager = Manager::with_live_refresher(config, None);
         let response = send_codex_turn(&manager).await;
@@ -25600,7 +25460,7 @@ mod tests {
             r#"{"code":"project_spend_limit_exceeded"}"#,
             r#"{"code":"organization_usage_limit_exceeded"}"#,
         ] {
-            let mut error: serde_json::Value = serde_json::from_str(error).unwrap();
+            let mut error: Value = serde_json::from_str(error).unwrap();
             error["resets_at"] = serde_json::json!("RESET");
             let body = serde_json::json!({"error":error})
                 .to_string()

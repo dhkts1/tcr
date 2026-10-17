@@ -303,7 +303,7 @@ mod legacy {
                 }
             } else {
                 // PREFIX has no internal repeat of its first byte.
-                self.match_pos = if b == PREFIX[0] { 1 } else { 0 };
+                self.match_pos = usize::from(b == PREFIX[0]);
             }
         }
     }
@@ -452,7 +452,7 @@ mod tests {
             b"not json at all".to_vec(),
             b"{".to_vec(),
             br#"{"metadata":{"user_id":"#.to_vec(),
-            br#"[1,2,3]"#.to_vec(),
+            b"[1,2,3]".to_vec(),
             br#"{"metadata":{"user_id":"{\"account_uuid\":\"unterminated"#.to_vec(),
             // Whitespace and escape noise around the real target.
             format!("{{ \"metadata\" : {{ \"user_id\" : {} }} }}", {

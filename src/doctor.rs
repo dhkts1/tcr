@@ -433,7 +433,7 @@ impl Report {
     /// The base URL alone does not reach this proxy, and a typed `claude`
     /// still does: the shell route is installed and nothing in a settings
     /// file overrides what `tcr run` exports.
-    pub fn routed_by_shell(&self) -> bool {
+    pub const fn routed_by_shell(&self) -> bool {
         !self.routed_here
             && self.shell_route.is_some()
             && matches!(
@@ -447,7 +447,7 @@ impl Report {
     ///
     /// "Somewhere else" outranks "nothing answered": when Claude is pointed at
     /// another URL, whether THIS proxy is up is not the operator's problem.
-    pub fn exit_code(&self) -> i32 {
+    pub const fn exit_code(&self) -> i32 {
         if !self.routed_here && !self.routed_by_shell() {
             2
         } else if self.requests_in_window.is_none() {
@@ -679,7 +679,7 @@ impl CodexEnv {
             })
         };
         let set = |name: &str| get(name).filter(|value| !value.is_empty());
-        CodexEnv {
+        Self {
             https_proxy: first(&["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]),
             no_proxy: first(&["NO_PROXY", "no_proxy"]),
             ssl_cert_file: set("SSL_CERT_FILE"),
@@ -1281,7 +1281,7 @@ pub fn points_at_tcr(value: &str, port: u16) -> bool {
 /// domain.
 pub fn no_proxy_entry_exempts(entry: &str, host: &str) -> bool {
     let entry = entry.trim();
-    if entry.is_empty() || entry.contains('/') || entry.parse::<std::net::IpAddr>().is_ok() {
+    if entry.is_empty() || entry.contains('/') || entry.parse::<IpAddr>().is_ok() {
         return false;
     }
     if entry == "*" {
@@ -2119,7 +2119,7 @@ mod tests {
             requests_10m: None,
             traffic: None,
             route: not_pooled("no-proxy", "no proxy answered on 127.0.0.1:3999"),
-            ..base.clone()
+            ..base
         };
         let offline_lines = offline.block_lines();
         for line in [
@@ -2385,7 +2385,7 @@ mod tests {
         assert_eq!(
             with_env(
                 not_pooled("unknown-leaf", "the proxy on :3999 reports a leaf"),
-                at_tcr.clone()
+                at_tcr
             )
             .intercept(),
             "unknown"
@@ -2425,7 +2425,7 @@ mod tests {
     #[test]
     fn a_codex_problem_names_a_reserved_codex_account() {
         let reserved = |name: &str, groups: &[&str]| CodexRow {
-            reserved_groups: groups.iter().map(|g| g.to_string()).collect(),
+            reserved_groups: groups.iter().map(ToString::to_string).collect(),
             ..codex_row(name, Some(GateReason::Reserved))
         };
         let report = CodexReport {

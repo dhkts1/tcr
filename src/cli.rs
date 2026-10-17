@@ -532,7 +532,7 @@ fn write_priority(config_path: &Path, query: &str, value: i64) -> anyhow::Result
 /// only: generating one is the server's job at boot, so a launcher and the
 /// server can never hold two different keys. With none, an error that says so.
 pub fn request_key(config_path: &Path) -> anyhow::Result<String> {
-    let key = crate::config::read_request_key(config_path)
+    let key = config::read_request_key(config_path)
         .with_context(|| format!("could not read {}", config_path.display()))?;
     key.ok_or_else(|| {
         anyhow::anyhow!(
@@ -592,7 +592,12 @@ fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usiz
 ///
 /// `None` when there is nothing to say, which is every ordinary add.
 fn control_account_group_notice(config: &Config, account: &str, group: &str) -> Option<String> {
-    if config.control_account.as_ref().map(|c| c.name()) != Some(account) {
+    if config
+        .control_account
+        .as_ref()
+        .map(config::ControlAccountRef::name)
+        != Some(account)
+    {
         return None;
     }
     Some(format!(
@@ -1171,12 +1176,11 @@ pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> an
     // tells us what the resolved value will be on the next read, and printing
     // it from the just-loaded `config` for the clear case keeps this from
     // silently drifting if `group_color`'s derivation ever changes.
-    let (resolved, source) = match &normalized {
-        Some(hex) => (hex.clone(), config::ColorSource::Set),
-        None => {
-            let (hex, _) = config.group_color(group);
-            (hex, config::ColorSource::Derived)
-        }
+    let (resolved, source) = if let Some(hex) = &normalized {
+        (hex.clone(), config::ColorSource::Set)
+    } else {
+        let (hex, _) = config.group_color(group);
+        (hex, config::ColorSource::Derived)
     };
     match outcome {
         config::GroupColorWrite::Updated => {
@@ -1450,7 +1454,11 @@ fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&
     if anthropic.is_empty() {
         return Some(ROUTE_BLOCK_CODEX_ONLY);
     }
-    let routes = match config.control_account.as_ref().map(|c| c.name()) {
+    let routes = match config
+        .control_account
+        .as_ref()
+        .map(config::ControlAccountRef::name)
+    {
         Some(control) => {
             anthropic.iter().any(|member| *member != control) || config.group_allows_control(group)
         }
@@ -1833,14 +1841,10 @@ pub(crate) enum LiveControlError {
 impl LiveControlError {
     pub(crate) fn why(&self) -> String {
         match self {
-            LiveControlError::NoServer => "nothing is listening".to_string(),
-            LiveControlError::NoRoute => {
-                "the running proxy has no account-control route".to_string()
-            }
-            LiveControlError::Unauthorized => "the proxy api-key was rejected".to_string(),
-            LiveControlError::NoAnswer(why)
-            | LiveControlError::Unusable(why)
-            | LiveControlError::Rejected(why) => why.clone(),
+            Self::NoServer => "nothing is listening".to_string(),
+            Self::NoRoute => "the running proxy has no account-control route".to_string(),
+            Self::Unauthorized => "the proxy api-key was rejected".to_string(),
+            Self::NoAnswer(why) | Self::Unusable(why) | Self::Rejected(why) => why.clone(),
         }
     }
 }
@@ -1848,9 +1852,9 @@ impl LiveControlError {
 impl From<Unreached> for LiveControlError {
     fn from(unreached: Unreached) -> Self {
         match unreached {
-            Unreached::Refused => LiveControlError::NoServer,
-            Unreached::Silent(why) => LiveControlError::NoAnswer(why),
-            Unreached::Unbuilt(why) => LiveControlError::Unusable(why),
+            Unreached::Refused => Self::NoServer,
+            Unreached::Silent(why) => Self::NoAnswer(why),
+            Unreached::Unbuilt(why) => Self::Unusable(why),
         }
     }
 }
@@ -2058,7 +2062,7 @@ async fn post_set_disabled(
 /// submitted identity already matches one — replace its credentials in place.
 /// No restart, so no session pin is invalidated.
 ///
-/// `account` is POSTed directly as the request body: [`config::Account`]
+/// `account` is `POSTed` directly as the request body: [`config::Account`]
 /// already serializes to the exact wire shape
 /// [`crate::proxy::ADD_ACCOUNT_PATH`] expects (see that route's
 /// `AddAccountRequest` doc-comment), so a caller builds the credential once —
@@ -2089,7 +2093,7 @@ pub(crate) async fn post_add_account_with_providers(
     account: &Account,
 ) -> (
     Result<crate::proxy::AddAccountResponse, LiveControlError>,
-    Vec<crate::provider::Provider>,
+    Vec<Provider>,
 ) {
     let answer: RouteAnswer<crate::proxy::AddAccountResponse> =
         call_route(config, &ADD_ACCOUNT_ROUTE, |client, url| {
@@ -2182,8 +2186,8 @@ fn write_control_account(
     // account, so writing one would persist a setting the next start throws away.
     if let Some(account) = &target {
         match account.provider {
-            crate::provider::Provider::Anthropic => {}
-            crate::provider::Provider::Codex => bail!(
+            Provider::Anthropic => {}
+            Provider::Codex => bail!(
                 "{} Nothing was changed.",
                 crate::manager::codex_control_refusal(&account.name)
             ),
@@ -2192,7 +2196,7 @@ fn write_control_account(
     let name = target.as_ref().map(|a| a.name.clone());
     let outcome = config::save_control_account(config_path, target.as_ref())
         .with_context(|| format!("save config at {}", config_path.display()))?;
-    if let config::ControlWrite::Ambiguous = outcome {
+    if outcome == config::ControlWrite::Ambiguous {
         bail!(
             "more than one config entry shares this account's identity — nothing was changed. \
              Give each its own accountUuid/orgUuid and retry."
@@ -2512,7 +2516,7 @@ fn held_suffix(a: &AccountSnapshot, threshold: f64, now: OffsetDateTime) -> Stri
 /// on the status line and in the JSON row so a held-but-has-headroom account
 /// (`near`) is never mistaken for a truly spent one (`spent`). `ok` is an
 /// in-rotation account comfortably under its threshold.
-fn quota_state_token(state: QuotaState) -> &'static str {
+const fn quota_state_token(state: QuotaState) -> &'static str {
     match state {
         QuotaState::Normal => "ok",
         QuotaState::NearLimit => "near",
@@ -2641,7 +2645,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
     }
     let now = OffsetDateTime::now_utc();
     let mut out = String::new();
-    for a in snapshot.accounts.iter() {
+    for a in &snapshot.accounts {
         let provider = match a.provider {
             Provider::Codex => " provider=codex",
             Provider::Anthropic => "",
@@ -2857,10 +2861,10 @@ pub enum StatusSource {
 }
 
 impl StatusSource {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
-            StatusSource::Live => "live",
-            StatusSource::Offline => "offline",
+            Self::Live => "live",
+            Self::Offline => "offline",
         }
     }
 }
@@ -3058,18 +3062,10 @@ fn account_status_rows_at(
                 // by the shared gating state, so a 7d-red account with an empty
                 // 5h window doesn't paint its 5h bar red.
                 five_hour_state: a.five_hour.map(|u| {
-                    quota_state_token(crate::stats::QuotaState::from_utilization(
-                        Some(u),
-                        threshold,
-                    ))
-                    .to_string()
+                    quota_state_token(QuotaState::from_utilization(Some(u), threshold)).to_string()
                 }),
                 seven_day_state: a.seven_day.map(|u| {
-                    quota_state_token(crate::stats::QuotaState::from_utilization(
-                        Some(u),
-                        threshold,
-                    ))
-                    .to_string()
+                    quota_state_token(QuotaState::from_utilization(Some(u), threshold)).to_string()
                 }),
                 // The Fable weekly window's per-window state, same shape and
                 // threshold as `sevenDayState` beside it — mirrors the
@@ -3077,11 +3073,7 @@ fn account_status_rows_at(
                 // (`GateReason::FableWeekly`), just evaluated unconditionally
                 // here rather than only when a request is Fable-scoped.
                 seven_day_oi_state: a.seven_day_oi.map(|u| {
-                    quota_state_token(crate::stats::QuotaState::from_utilization(
-                        Some(u),
-                        threshold,
-                    ))
-                    .to_string()
+                    quota_state_token(QuotaState::from_utilization(Some(u), threshold)).to_string()
                 }),
                 // A window's reset is a property of the window, not of whether
                 // it is currently pinning the account — UNCONDITIONAL, no
@@ -3414,9 +3406,9 @@ pub enum LiveStatusError {
 impl From<Unreached> for LiveStatusError {
     fn from(unreached: Unreached) -> Self {
         match unreached {
-            Unreached::Refused => LiveStatusError::NoServer,
-            Unreached::Silent(why) => LiveStatusError::NoAnswer(why),
-            Unreached::Unbuilt(why) => LiveStatusError::Unusable(why),
+            Unreached::Refused => Self::NoServer,
+            Unreached::Silent(why) => Self::NoAnswer(why),
+            Unreached::Unbuilt(why) => Self::Unusable(why),
         }
     }
 }
@@ -3428,15 +3420,15 @@ impl LiveStatusError {
     /// unparseable body is a process that ACCEPTED the connection, routed the
     /// request and wrote a response — the opposite of wedged — while a timeout
     /// means the listening socket is all that is left of it.
-    fn answered(&self) -> bool {
-        matches!(self, LiveStatusError::Unusable(_))
+    const fn answered(&self) -> bool {
+        matches!(self, Self::Unusable(_))
     }
 
     /// The failure in a few words, for an operator-facing line.
     pub fn why(&self) -> String {
         match self {
-            LiveStatusError::NoServer => "nothing is listening".to_string(),
-            LiveStatusError::NoAnswer(why) | LiveStatusError::Unusable(why) => why.clone(),
+            Self::NoServer => "nothing is listening".to_string(),
+            Self::NoAnswer(why) | Self::Unusable(why) => why.clone(),
         }
     }
 }
@@ -3782,23 +3774,23 @@ impl StatusCheck {
     /// Apply the rule above to every row of `snapshot`.
     pub fn of(snapshot: &StatsSnapshot) -> Self {
         if snapshot.accounts.iter().any(probe_failed) {
-            StatusCheck::ProbeFailed
+            Self::ProbeFailed
         } else {
-            StatusCheck::Clean
+            Self::Clean
         }
     }
 
     /// The process exit code this verdict maps to.
-    pub fn exit_code(self) -> i32 {
+    pub const fn exit_code(self) -> i32 {
         match self {
-            StatusCheck::Clean => 0,
-            StatusCheck::ProbeFailed => 4,
+            Self::Clean => 0,
+            Self::ProbeFailed => 4,
         }
     }
 }
 
 /// One row's half of [`StatusCheck`]'s rule.
-fn probe_failed(a: &AccountSnapshot) -> bool {
+const fn probe_failed(a: &AccountSnapshot) -> bool {
     if a.disabled {
         return false;
     }
@@ -5385,10 +5377,10 @@ mod tests {
     /// the only way to test the refusals that guard one.
     fn rename_account_in_file(path: &Path, index: usize, name: &str) {
         let mut doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).expect("readable"))
+            serde_json::from_str(&fs::read_to_string(path).expect("readable"))
                 .expect("the fixture is JSON");
         doc["accounts"][index]["name"] = serde_json::Value::String(name.to_string());
-        std::fs::write(
+        fs::write(
             path,
             serde_json::to_string_pretty(&doc).expect("serializes"),
         )
@@ -6838,13 +6830,7 @@ mod tests {
             matches!(answer, Err(LiveControlError::Rejected(_))),
             "the blank probe is still the route's own stamped 400: {answer:?}"
         );
-        assert_eq!(
-            providers,
-            vec![
-                crate::provider::Provider::Anthropic,
-                crate::provider::Provider::Codex
-            ]
-        );
+        assert_eq!(providers, vec![Provider::Anthropic, Provider::Codex]);
 
         let (listener, port) = crate::test_support::loopback::listener().await;
         tokio::spawn(async move {
@@ -6915,7 +6901,7 @@ mod tests {
         );
     }
 
-    /// THE ROUND TRIP: a real account, POSTed to a real live server, lands in
+    /// THE ROUND TRIP: a real account, `POSTed` to a real live server, lands in
     /// the SERVING rotation — not just in the response body.
     #[tokio::test]
     async fn post_add_account_adds_a_new_account_to_the_live_rotation() {
@@ -7441,7 +7427,7 @@ mod tests {
         // tokens in one request, so a small `requests` count with a large
         // token count is exactly the shape this guards, not a fixture
         // artefact.
-        let mut sparse = snapshot.clone();
+        let mut sparse = snapshot;
         sparse.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS - 1;
         sparse.accounts[0].input_tokens = 42_000;
         sparse.accounts[0].cache_read_tokens = 100;
@@ -8498,11 +8484,7 @@ mod tests {
         calls: Arc<AtomicU64>,
     }
     impl TokenRefresher for RecordingRefresher {
-        fn refresh(
-            &self,
-            _provider: crate::provider::Provider,
-            _refresh_token: String,
-        ) -> RefreshFuture {
+        fn refresh(&self, _provider: Provider, _refresh_token: String) -> RefreshFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(OAuthError::Transient(
@@ -8537,7 +8519,7 @@ mod tests {
         let config = load(&path);
         let calls = Arc::new(AtomicU64::new(0));
         let refresher = Arc::new(RecordingRefresher {
-            calls: calls.clone(),
+            calls: Arc::clone(&calls),
         });
         let snapshot = snapshot_offline(config, refresher, Arc::new(RejectingProber), true).await;
         let text = render_accounts(&snapshot, StatusSource::Offline);
@@ -8844,15 +8826,10 @@ mod tests {
             "a fresh probe reads as recent: {at}"
         );
 
-        let payload = crate::status::StatusPayload::from_snapshot(
-            &snapshot,
-            &thresholds,
-            false,
-            None,
-            Default::default(),
-        );
+        let payload =
+            StatusPayload::from_snapshot(&snapshot, &thresholds, false, None, Default::default());
         let wire = serde_json::to_string(&payload).expect("serialize");
-        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         let (rebuilt, rebuilt_thresholds) = back.into_snapshot();
         let live_json = status_json(&rebuilt, &rebuilt_thresholds, StatusSource::Live);
         let live: Vec<serde_json::Value> = serde_json::from_str(&live_json).expect("json");
@@ -9026,7 +9003,7 @@ mod tests {
     /// `apps/macos/Tests/TcrBarTests/RealWorldDecodeTests.swift` reaches the same
     /// path from `#filePath`.
     fn status_contract_fixture_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/status-contract.json")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/status-contract.json")
     }
 
     /// One fully-specified account row for the fixture.
@@ -9046,7 +9023,7 @@ mod tests {
         seven_day_reset: Option<OffsetDateTime>,
         seven_day_oi: Option<f64>,
         seven_day_oi_reset: Option<OffsetDateTime>,
-        probe_status: crate::probe::ProbeStatus,
+        probe_status: ProbeStatus,
         probe_error: Option<&str>,
         quota_state: QuotaState,
         groups: &[&str],
@@ -9104,7 +9081,7 @@ mod tests {
             } else {
                 None
             },
-            groups: groups.iter().map(|g| g.to_string()).collect(),
+            groups: groups.iter().map(ToString::to_string).collect(),
             reserved_groups: Vec::new(),
             parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
@@ -9268,7 +9245,7 @@ mod tests {
     /// exactly where a contract pin rots, because it is the one part of the
     /// comparison nothing checks.
     fn fixture_instant(unix_ms: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp_nanos(unix_ms as i128 * 1_000_000)
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(unix_ms) * 1_000_000)
             .expect("fixture instant is a valid timestamp")
     }
 
@@ -9292,7 +9269,7 @@ mod tests {
                 Some(seven_day_reset),
                 Some(0.0),
                 Some(seven_day_reset),
-                crate::probe::ProbeStatus::Ok,
+                ProbeStatus::Ok,
                 None,
                 QuotaState::Normal,
                 // Non-empty and multi-membership — the only row the Swift decode
@@ -9323,7 +9300,7 @@ mod tests {
                 Some(seven_day_reset),
                 Some(0.10),
                 Some(seven_day_reset),
-                crate::probe::ProbeStatus::RateLimited,
+                ProbeStatus::RateLimited,
                 None,
                 QuotaState::NearLimit,
                 &[],
@@ -9357,7 +9334,7 @@ mod tests {
                 Some(seven_day_reset),
                 Some(0.5),
                 Some(seven_day_reset),
-                crate::probe::ProbeStatus::Error,
+                ProbeStatus::Error,
                 Some("probe failed: connection reset"),
                 QuotaState::Exhausted,
                 &[],
@@ -9390,7 +9367,7 @@ mod tests {
                 None,
                 None,
                 None,
-                crate::probe::ProbeStatus::Never,
+                ProbeStatus::Never,
                 None,
                 QuotaState::Normal,
                 &[],
@@ -9429,7 +9406,7 @@ mod tests {
                 Some(seven_day_reset),
                 None,
                 None,
-                crate::probe::ProbeStatus::Ok,
+                ProbeStatus::Ok,
                 None,
                 QuotaState::Normal,
                 &[],
@@ -9485,7 +9462,7 @@ mod tests {
         let group_colors: std::collections::BTreeMap<String, String> = [
             (
                 "codereview".to_string(),
-                crate::config::derive_group_color("codereview"),
+                config::derive_group_color("codereview"),
             ),
             ("dev".to_string(), "#0a84ff".to_string()),
         ]
@@ -9575,7 +9552,7 @@ mod tests {
         let group_colors: std::collections::BTreeMap<String, String> = [
             (
                 "codereview".to_string(),
-                crate::config::derive_group_color("codereview"),
+                config::derive_group_color("codereview"),
             ),
             ("dev".to_string(), "#0a84ff".to_string()),
         ]
@@ -10039,7 +10016,7 @@ mod tests {
     /// with two proofs, the panel's decode and this renderer's output, is what keeps the
     /// producer and the consumer from drifting apart.
     fn canonical_fixture(name: &str) -> serde_json::Value {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("apps/macos/Tests/Fixtures")
             .join(name);
         let text = fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -10180,7 +10157,7 @@ mod tests {
             }),
             last_hour,
             today_by_model: if today.requests > 0 {
-                [("gpt-5.1-codex".to_string(), today)].into_iter().collect()
+                std::iter::once(("gpt-5.1-codex".to_string(), today)).collect()
             } else {
                 std::collections::BTreeMap::new()
             },
@@ -10213,7 +10190,7 @@ mod tests {
                 None,
                 None,
                 None,
-                crate::probe::ProbeStatus::Ok,
+                ProbeStatus::Ok,
                 None,
                 QuotaState::Normal,
                 &[],
@@ -10265,7 +10242,7 @@ mod tests {
             Some(at(4 * DAY_MS)),
             Some(0.62),
             Some(at(4 * DAY_MS)),
-            crate::probe::ProbeStatus::Ok,
+            ProbeStatus::Ok,
             None,
             QuotaState::Normal,
             &["orchard"],
@@ -10380,7 +10357,7 @@ mod tests {
             five_hour_reset: None,
             seven_day: Some(0.40),
             seven_day_reset: Some(at(2 * DAY_MS)),
-            probe_status: crate::probe::ProbeStatus::Error,
+            probe_status: ProbeStatus::Error,
             last_probe: Some(at(-MINUTE_MS)),
             probe_error: Some("refresh_token_reused".to_string()),
             gate: GateReason::Login,
@@ -10804,13 +10781,12 @@ mod tests {
         // Row by row, naming the keys: one assertion over the whole array prints over a
         // thousand lines and points at none of them.
         for (got, want) in rendered.iter().zip(&fixture) {
-            if got != want {
-                panic!(
-                    "{} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
-                    want["name"],
-                    differing_keys(got, want)
-                );
-            }
+            assert!(
+                got == want,
+                "{} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
+                want["name"],
+                differing_keys(got, want)
+            );
         }
     }
 
@@ -10833,13 +10809,12 @@ mod tests {
             panic!("both documents carry a sessions array: {rendered} / {fixture}");
         };
         for (got, want) in got.iter().zip(want) {
-            if got != want {
-                panic!(
-                    "session {} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
-                    want["sessionId"],
-                    differing_keys(got, want)
-                );
-            }
+            assert!(
+                got == want,
+                "session {} differs from the canonical fixture on {:?}\nrendered: {got:#}\nfixture: {want:#}",
+                want["sessionId"],
+                differing_keys(got, want)
+            );
         }
         assert_eq!(
             rendered, fixture,
@@ -10962,7 +10937,7 @@ mod tests {
         let group_colors: std::collections::BTreeMap<String, String> = [
             (
                 "codereview".to_string(),
-                crate::config::derive_group_color("codereview"),
+                config::derive_group_color("codereview"),
             ),
             ("dev".to_string(), "#0a84ff".to_string()),
         ]
@@ -11332,7 +11307,7 @@ mod tests {
             cache_creation_tokens: 0,
             last_used: None,
             rate_limited_until: None,
-            probe_status: crate::probe::ProbeStatus::Never,
+            probe_status: ProbeStatus::Never,
             last_probe: None,
             quota_updated_at: None,
             probe_error: None,
@@ -11403,19 +11378,14 @@ mod tests {
     #[test]
     fn reserved_groups_round_trip_through_status_payload() {
         let (snapshot, thresholds) = reserved_groups_snapshot();
-        let payload = crate::status::StatusPayload::from_snapshot(
-            &snapshot,
-            &thresholds,
-            false,
-            None,
-            Default::default(),
-        );
+        let payload =
+            StatusPayload::from_snapshot(&snapshot, &thresholds, false, None, Default::default());
         let wire = serde_json::to_string(&payload).expect("serialize");
         assert!(
             wire.contains("\"reservedGroups\":[\"codereview\"]"),
             "reservedGroups is camelCase on the wire: {wire}"
         );
-        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         let (rebuilt, _) = back.into_snapshot();
         assert_eq!(
             rebuilt.accounts[0].reserved_groups,
@@ -11451,19 +11421,14 @@ mod tests {
             "nothing parked renders [], never null: {dave}"
         );
 
-        let payload = crate::status::StatusPayload::from_snapshot(
-            &snapshot,
-            &thresholds,
-            false,
-            None,
-            Default::default(),
-        );
+        let payload =
+            StatusPayload::from_snapshot(&snapshot, &thresholds, false, None, Default::default());
         let wire = serde_json::to_string(&payload).expect("serialize");
         assert!(
             wire.contains("\"parkedGroups\":[\"codereview\"]"),
             "parkedGroups is camelCase on the wire: {wire}"
         );
-        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         let (rebuilt, _) = back.into_snapshot();
         assert_eq!(
             rebuilt.accounts[0].parked_groups,
@@ -11479,13 +11444,8 @@ mod tests {
     #[test]
     fn a_payload_without_parked_groups_still_deserializes() {
         let (snapshot, thresholds) = reserved_groups_snapshot();
-        let payload = crate::status::StatusPayload::from_snapshot(
-            &snapshot,
-            &thresholds,
-            false,
-            None,
-            Default::default(),
-        );
+        let payload =
+            StatusPayload::from_snapshot(&snapshot, &thresholds, false, None, Default::default());
         let mut wire: serde_json::Value =
             serde_json::to_value(&payload).expect("payload serializes");
         for account in wire["accounts"]
@@ -11498,7 +11458,7 @@ mod tests {
                 .remove("parkedGroups")
                 .expect("the field was there to remove — the positive control");
         }
-        let back: crate::status::StatusPayload =
+        let back: StatusPayload =
             serde_json::from_value(wire).expect("a row with no parkedGroups key still decodes");
         let (rebuilt, _) = back.into_snapshot();
         assert_eq!(rebuilt.accounts[0].parked_groups, Vec::<String>::new());
@@ -11666,7 +11626,7 @@ mod tests {
 
         let claude = AccountSnapshot {
             provider: Provider::Anthropic,
-            ..kim.clone()
+            ..kim
         };
         let claude_without_codex_facts = AccountSnapshot {
             codex: CodexFacts::default(),
@@ -11701,7 +11661,7 @@ mod tests {
     /// it back, and a Claude row never reads the list.
     #[test]
     fn five_hour_none_and_weekly_none_on_codex_rows() {
-        let windows = |list: &[&str]| Some(list.iter().map(|w| w.to_string()).collect());
+        let windows = |list: &[&str]| Some(list.iter().map(ToString::to_string).collect());
         let codex = |name: &str, quota_windows: Option<Vec<String>>| {
             let mut row =
                 canonical_codex_row(name, 0, "pro", "55555555-5555-4555-8555-555555555555");
@@ -11721,7 +11681,7 @@ mod tests {
             None,
             None,
             None,
-            crate::probe::ProbeStatus::Ok,
+            ProbeStatus::Ok,
             None,
             QuotaState::Normal,
             &[],
@@ -11774,7 +11734,7 @@ mod tests {
             None,
             None,
             None,
-            crate::probe::ProbeStatus::Never,
+            ProbeStatus::Never,
             None,
             QuotaState::Normal,
             &[],
@@ -11783,7 +11743,7 @@ mod tests {
             (Some("11111111-1111-1111-1111-111111111111"), None),
         );
         let bob = AccountSnapshot {
-            probe_status: crate::probe::ProbeStatus::Never,
+            probe_status: ProbeStatus::Never,
             ..canonical_codex_row(
                 "bob@example.com/codex",
                 1,
@@ -11817,7 +11777,7 @@ mod tests {
                 None,
                 None,
                 None,
-                crate::probe::ProbeStatus::Ok,
+                ProbeStatus::Ok,
                 None,
                 QuotaState::Normal,
                 &[],

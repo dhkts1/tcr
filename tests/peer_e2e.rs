@@ -893,8 +893,7 @@ async fn two_macs_find_each_other_pair_on_six_digits_and_pin() {
     let instance = asked
         .rsplit_once("as instance ")
         .and_then(|(_, rest)| rest.split_whitespace().next())
-        .map(str::to_string)
-        .unwrap_or(instance);
+        .map_or(instance, str::to_string);
     assert_eq!(
         instance.len(),
         16,
@@ -1041,13 +1040,10 @@ async fn two_macs_find_each_other_pair_on_six_digits_and_pin() {
 /// outside that range is a test-runner mistake, not a shape this test learns
 /// to tolerate, so it panics rather than clamping silently.
 fn e2e_node_count() -> usize {
-    let n = std::env::var("TCR_E2E_NODES")
-        .ok()
-        .map(|raw| {
-            raw.parse::<usize>()
-                .unwrap_or_else(|err| panic!("TCR_E2E_NODES={raw:?} is not a number: {err}"))
-        })
-        .unwrap_or(2);
+    let n = std::env::var("TCR_E2E_NODES").ok().map_or(2, |raw| {
+        raw.parse::<usize>()
+            .unwrap_or_else(|err| panic!("TCR_E2E_NODES={raw:?} is not a number: {err}"))
+    });
     assert!((2..=5).contains(&n), "TCR_E2E_NODES must be 2..=5, got {n}");
     n
 }
@@ -2084,7 +2080,7 @@ fn percentile(values: &[f64], pct: usize) -> f64 {
 ///
 /// If the borrowed leg cannot reach a served 200 (the LEASE-WIRE arm named in
 /// this file's module docs, gap 4, not yet in the tree), that is reported as
-/// `measure: latency_borrowed_blocked` with the file:line and status/body
+/// `measure: latency_borrowed_blocked` with the <file:line> and status/body
 /// that blocked it, and the local leg's numbers are still printed, this
 /// test never fakes a borrowed-leg number and never implements the missing
 /// arm itself.
@@ -2163,13 +2159,7 @@ async fn measure_latency_local_vs_borrowed() {
         percentile(&local_ms, 95)
     );
 
-    if !primed {
-        println!(
-            "measure: latency_borrowed_blocked src/peer/listener.rs:1486 \
-             (listener::serve_control's Control::LeaseRequest arm) never reached a served 200 \
-             within {BORROW_SERVED_ATTEMPTS} attempts"
-        );
-    } else {
+    if primed {
         println!("STEP: {SAMPLES} requests borrowed through the lender");
         let mut borrowed_ms = Vec::with_capacity(SAMPLES as usize);
         let mut blocked_at: Option<(u32, u16, String)> = None;
@@ -2183,22 +2173,27 @@ async fn measure_latency_local_vs_borrowed() {
             }
             borrowed_ms.push(elapsed);
         }
-        match blocked_at {
-            Some((i, status, body)) => println!(
+        if let Some((i, status, body)) = blocked_at {
+            println!(
                 "measure: latency_borrowed_blocked request {i} of {SAMPLES} answered \
-                 status={status} body={body}"
-            ),
-            None => {
-                let borrowed_p50 = percentile(&borrowed_ms, 50);
-                let borrowed_p95 = percentile(&borrowed_ms, 95);
-                println!("measure: latency_borrowed_p50 {borrowed_p50:.2} ms");
-                println!("measure: latency_borrowed_p95 {borrowed_p95:.2} ms");
-                println!(
-                    "measure: latency_delta_p50 {:.2} ms",
-                    borrowed_p50 - percentile(&local_ms, 50)
-                );
-            }
+             status={status} body={body}"
+            );
+        } else {
+            let borrowed_p50 = percentile(&borrowed_ms, 50);
+            let borrowed_p95 = percentile(&borrowed_ms, 95);
+            println!("measure: latency_borrowed_p50 {borrowed_p50:.2} ms");
+            println!("measure: latency_borrowed_p95 {borrowed_p95:.2} ms");
+            println!(
+                "measure: latency_delta_p50 {:.2} ms",
+                borrowed_p50 - percentile(&local_ms, 50)
+            );
         }
+    } else {
+        println!(
+            "measure: latency_borrowed_blocked src/peer/listener.rs:1486 \
+             (listener::serve_control's Control::LeaseRequest arm) never reached a served 200 \
+             within {BORROW_SERVED_ATTEMPTS} attempts"
+        );
     }
 
     lender.shutdown();
@@ -2340,10 +2335,10 @@ async fn five_concurrent_borrows_across_two_lenders_stop_at_four() {
         3,
         "spender joins bank1, which lends it a max_inflight:2 lease",
     );
-    let bank1_at_spender = lend_to(&bank1, &mut spender, "spender-mac-1");
+    let bank1_at_spender = lend_to(&bank1, &spender, "spender-mac-1");
 
     step(4, "spender joins bank2 as well, on the same terms");
-    let bank2_at_spender = lend_to(&bank2, &mut spender, "spender-mac-2");
+    let bank2_at_spender = lend_to(&bank2, &spender, "spender-mac-2");
     assert_ne!(
         bank1_at_spender, bank2_at_spender,
         "two joins must leave two distinct pinned lenders"
@@ -2470,12 +2465,12 @@ async fn five_concurrent_borrows(proxy: &str) -> Vec<u16> {
 /// it disclose to that lender: the five CLI steps every borrowing leg in this
 /// file repeats, in one place because the two-lender test performs them twice
 /// and a second hand-written copy is a second chance to mistype a fraction.
-fn lend_to(lender: &Mac, borrower: &mut Mac, label: &str) -> String {
+fn lend_to(lender: &Mac, borrower: &Mac, label: &str) -> String {
     lend_to_with(lender, borrower, label, &[])
 }
 
 /// [`lend_to`]'s five steps, with `extra` appended to the `lend` verb's argv.
-fn lend_to_with(lender: &Mac, borrower: &mut Mac, label: &str, extra: &[&str]) -> String {
+fn lend_to_with(lender: &Mac, borrower: &Mac, label: &str, extra: &[&str]) -> String {
     let pinned_before = borrower.pinned_nodes();
     let minted = lender.peer_ok(&["invite", "--label", label, "--ttl", "300"]);
     let key = minted
@@ -2780,7 +2775,7 @@ async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
     warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
-    let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
+    let lender_at_borrower = lend_to(&lender, &borrower, "borrower-mac");
 
     step(
         4,
@@ -2912,7 +2907,7 @@ fn until_for(mac: &Mac, node: &str) -> Option<u64> {
 /// real `until` an observer can read with [`until_for`] rather than the
 /// permanent `null` an open-ended grant produces. Otherwise identical: same
 /// five CLI steps, same fraction, same `max-inflight`.
-fn lend_to_for_a_bounded_time(lender: &Mac, borrower: &mut Mac, label: &str, for_: &str) -> String {
+fn lend_to_for_a_bounded_time(lender: &Mac, borrower: &Mac, label: &str, for_: &str) -> String {
     lend_to_with(lender, borrower, label, &["--for", for_])
 }
 
@@ -2978,7 +2973,7 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
     warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
-    let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
+    let lender_at_borrower = lend_to(&lender, &borrower, "borrower-mac");
 
     step(4, "borrower joins carrier and both grants are set");
     let (borrower_at_carrier, carrier_at_borrower) = join_to(&carrier, &borrower, "borrower-mac");
@@ -3097,7 +3092,7 @@ async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
     warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
-    let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
+    let lender_at_borrower = lend_to(&lender, &borrower, "borrower-mac");
 
     step(
         4,
@@ -3242,7 +3237,7 @@ async fn a_vanished_lenders_next_borrow_re_asks_and_the_cap_is_not_corrupted() {
         3,
         "spender joins bank and is granted a lease that ends in 30 minutes",
     );
-    let bank_at_spender = lend_to_for_a_bounded_time(&bank, &mut spender, "spender-mac", "30m");
+    let bank_at_spender = lend_to_for_a_bounded_time(&bank, &spender, "spender-mac", "30m");
 
     step(4, "spender restarts, installing the fallback");
     spender.shutdown();
@@ -3444,7 +3439,7 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
     warm(&lender).await;
 
     step(3, "borrower joins lender and is granted a lease");
-    let lender_at_borrower = lend_to(&lender, &mut borrower, "borrower-mac");
+    let lender_at_borrower = lend_to(&lender, &borrower, "borrower-mac");
 
     step(
         4,
@@ -3508,7 +3503,7 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
         "the borrow is SERVED, over the socket the lender parked, and through the fallback \
          provider the borrower's dry fleet installs for itself, inside the borrow timeout",
     );
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (status, _body) = post_messages(&borrower.proxy).await;
     let elapsed = started.elapsed();
     assert_eq!(

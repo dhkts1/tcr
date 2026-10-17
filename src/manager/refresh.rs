@@ -91,7 +91,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let Some(account) = accounts.get_mut(idx) else {
                 return;
             };
@@ -99,14 +99,14 @@ impl Manager {
                 account.pending_codex_writeback = None;
                 return;
             }
-            if !account
+            if account
                 .pending_codex_writeback
                 .as_ref()
-                .is_some_and(|p| crate::now_ms() >= p.retry_after_ms)
+                .is_none_or(|p| crate::now_ms() < p.retry_after_ms)
             {
                 return;
             }
-            account.refresh_lock.clone()
+            Arc::clone(&account.refresh_lock)
         };
         // Healthy turns never queue behind a refresh or an already-running publication.
         let Ok(guard) = lock.try_lock_owned() else {
@@ -122,7 +122,7 @@ impl Manager {
             let due = me
                 .accounts
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(idx)
                 .and_then(|a| a.pending_codex_writeback.as_ref())
                 .is_some_and(|p| crate::now_ms() >= p.retry_after_ms);
@@ -137,7 +137,7 @@ impl Manager {
 
     async fn persist_codex_sync_state(self: &Arc<Self>, idx: usize, access_before: Option<String>) {
         if self.access_token(idx) == access_before {
-            let me = self.clone();
+            let me = Arc::clone(self);
             tokio::task::spawn_blocking(move || me.persist_codex_writeback_record(idx))
                 .await
                 .log_warn("codex writeback record task did not finish");
@@ -146,10 +146,7 @@ impl Manager {
         // Only adopting a genuinely newer file pair changes credentials. Publishing the
         // already-current pair updates metadata alone and cannot undo a separate re-login.
         let state = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             accounts.get(idx).filter(|a| !a.removed).map(|a| {
                 (
                     a.name.clone(),
@@ -167,9 +164,9 @@ impl Manager {
             })
         };
         if let Some((name, account, org, org_name, provider, tokens)) = state {
-            let me = self.clone();
+            let me = Arc::clone(self);
             tokio::task::spawn_blocking(move || {
-                me.persist_tokens(&name, account, org, org_name, provider, &tokens)
+                me.persist_tokens(&name, account, org, org_name, provider, &tokens);
             })
             .await
             .log_warn("codex token persist task did not finish");
@@ -184,10 +181,7 @@ impl Manager {
             return;
         }
         let (target, refresh, pending) = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             let Some(account) = accounts.get(idx).filter(|a| !a.removed) else {
                 return;
             };
@@ -212,12 +206,9 @@ impl Manager {
         let _writing = self
             .config_write
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         {
-            let mut config = self
-                .config
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             if let crate::identity::Resolved::One(index) =
                 crate::identity::resolve(config.accounts.iter().enumerate(), &target)
                 && config.accounts[index].refresh_token.as_deref() == Some(refresh.as_str())
@@ -244,10 +235,7 @@ impl Manager {
     /// digest is persisted with tcr's current tokens, so restart can safely resume the retry.
     async fn flush_codex_writeback_locked(&self, idx: usize) -> Option<std::io::Result<bool>> {
         let (home, pending, name) = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             let account = accounts.get(idx)?;
             if account.removed {
                 return None;
@@ -287,7 +275,7 @@ impl Manager {
                         let identity = self
                             .accounts
                             .read()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .unwrap_or_else(PoisonError::into_inner)
                             .get(idx)
                             .map(|a| (a.org_uuid.clone(), a.account_uuid.clone()));
                         if let Some((org, account)) = identity {
@@ -316,7 +304,7 @@ impl Manager {
         if let Some(account) = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get_mut(idx)
         {
             if published {
@@ -362,10 +350,10 @@ impl Manager {
         let lock = match self
             .accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
         {
-            Some(account) => account.refresh_lock.clone(),
+            Some(account) => Arc::clone(&account.refresh_lock),
             None => return false,
         };
 
@@ -418,10 +406,7 @@ impl Manager {
         // single-use refresh token while the cooldown is still live. It
         // self-clears by time, so a later sequential retry is not suppressed.
         {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(until) = accounts.get(idx).and_then(|a| a.refresh_retry_after_ms)
                 && crate::now_ms() < until
             {
@@ -429,10 +414,7 @@ impl Manager {
             }
         }
         let (name, account_uuid, org_uuid, org_name, provider, codex_home) = {
-            let accounts = self
-                .accounts
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             match accounts.get(idx) {
                 Some(a) => (
                     a.name.clone(),
@@ -448,7 +430,7 @@ impl Manager {
 
         let imported_home = match provider {
             crate::provider::Provider::Anthropic => None,
-            crate::provider::Provider::Codex => codex_home.map(std::path::PathBuf::from),
+            crate::provider::Provider::Codex => codex_home.map(PathBuf::from),
         };
         let file_before = match imported_home.as_deref() {
             Some(home) => crate::codex_token_store::read_async(home).await.ok(),
@@ -491,7 +473,7 @@ impl Manager {
             if let Some(account) = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .get_mut(idx)
             {
                 account.pending_codex_writeback = None;
@@ -541,7 +523,7 @@ impl Manager {
                             let mut accounts = self
                                 .accounts
                                 .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                .unwrap_or_else(PoisonError::into_inner);
                             if let Some(account) = accounts.get_mut(idx) {
                                 let expected_refresh = account
                                     .pending_codex_writeback
@@ -578,7 +560,7 @@ impl Manager {
                             if let Some(account) = self
                                 .accounts
                                 .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .unwrap_or_else(PoisonError::into_inner)
                                 .get_mut(idx)
                             {
                                 account.pending_codex_writeback = None;
@@ -588,7 +570,7 @@ impl Manager {
                         && let Some(account) = self
                             .accounts
                             .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .unwrap_or_else(PoisonError::into_inner)
                             .get_mut(idx)
                     {
                         account.pending_codex_writeback = None;
@@ -640,7 +622,7 @@ impl Manager {
                 if let Some(a) = self
                     .accounts
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get_mut(idx)
                 {
                     a.status = AccountStatus::Error;
@@ -661,7 +643,7 @@ impl Manager {
                     crate::provider::Provider::Codex => {
                         if let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) {
                             tokio::task::spawn_blocking(move || {
-                                me.persist_codex_writeback_record(idx)
+                                me.persist_codex_writeback_record(idx);
                             })
                             .await
                             .log_warn("codex writeback record task did not finish");
@@ -686,7 +668,7 @@ impl Manager {
                 if let Some(a) = self
                     .accounts
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get_mut(idx)
                 {
                     a.refresh_retry_after_ms = Some(Self::cooldown_deadline());
@@ -721,10 +703,7 @@ impl Manager {
         if self.mutation_is_released() {
             return None;
         }
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         let account = accounts.get(idx)?;
         // Deleted from the config: nothing will ever store a rotated token for
         // it, so rotating would only burn the single-use refresh token.
@@ -770,14 +749,14 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
-            account.access_token = tokens.access_token.clone();
+            account.access_token.clone_from(&tokens.access_token);
             // THE TRAP: `tokens.refresh_token` must be `Some(...)` on every
             // reachable refresh success — see [`Tokens::refresh_token`]'s doc
             // comment. Writing a bare `None` here would silently make a
             // healthy account unrefreshable with no error and no log line.
-            account.refresh_token = tokens.refresh_token.clone();
+            account.refresh_token.clone_from(&tokens.refresh_token);
             account.expires_at_ms = Some(tokens.expires_at_ms);
             account.refresh_retry_after_ms = cooldown_after;
             if account.status == AccountStatus::Error {
@@ -802,7 +781,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.error_backoff_ms = if account.error_backoff_ms == 0 {
                 ERROR_REPROBE_BASE_MS
@@ -1346,7 +1325,7 @@ mod tests {
         );
         let (manager, _) = imported_manager(home.path(), None, false);
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(500));
             let mut fifo = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&auth_path)
@@ -1359,12 +1338,12 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let refresh = tokio::spawn(async move { manager.ensure_fresh_force(0).await });
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
         let heartbeat = started.elapsed();
         assert!(refresh.await.unwrap());
         writer.join().unwrap();
         assert!(
-            heartbeat < std::time::Duration::from_millis(250),
+            heartbeat < Duration::from_millis(250),
             "blocking auth.json read stalled the runtime for {heartbeat:?}"
         );
     }
@@ -1389,17 +1368,17 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let _guard = lock.lock().unwrap();
             ready.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(500));
         });
         acquired.recv().unwrap();
         let started = std::time::Instant::now();
         let refresh = tokio::spawn(async move { manager.ensure_fresh_force(0).await });
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
         let heartbeat = started.elapsed();
         assert!(refresh.await.unwrap());
         writer.join().unwrap();
         assert!(
-            heartbeat < std::time::Duration::from_millis(250),
+            heartbeat < Duration::from_millis(250),
             "config token persistence stalled the runtime for {heartbeat:?}"
         );
     }
@@ -1408,7 +1387,7 @@ mod tests {
         struct RefreshFileToken {
             home: PathBuf,
             changed_during_post: bool,
-            calls: Arc<std::sync::Mutex<Vec<String>>>,
+            calls: Arc<Mutex<Vec<String>>>,
         }
         impl TokenRefresher for RefreshFileToken {
             fn refresh(&self, _: crate::provider::Provider, token: String) -> oauth::RefreshFuture {
@@ -1450,7 +1429,7 @@ mod tests {
                 },
             );
             let (original, _) = imported_manager(home.path(), None, false);
-            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let calls = Arc::new(Mutex::new(Vec::new()));
             let manager = Manager::new(
                 original.config.lock().unwrap().clone(),
                 Arc::new(RefreshFileToken {
@@ -1582,8 +1561,8 @@ mod tests {
         let file_lock =
             std::fs::File::create(crate::paths::codex_auth_lock_file(home.path())).unwrap();
         file_lock.lock().unwrap();
-        let lock = manager.accounts.read().unwrap()[0].refresh_lock.clone();
-        let serving = manager.clone();
+        let lock = Arc::clone(&manager.accounts.read().unwrap()[0].refresh_lock);
+        let serving = Arc::clone(&manager);
         let request = tokio::spawn(async move { serving.ensure_fresh(0).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while lock.try_lock().is_ok() {
@@ -1690,11 +1669,11 @@ mod tests {
             home: home.clone(),
             replacement: None,
             failure_code: None,
-            calls: calls.clone(),
+            calls: Arc::clone(&calls),
         });
         let manager = Manager::new(
             config,
-            refresher.clone(),
+            Arc::<TestRefresh>::clone(&refresher),
             Arc::new(NoNetwork),
             Arc::new(NoNetwork),
             Some(path.clone()),

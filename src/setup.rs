@@ -58,7 +58,7 @@ pub enum Shell {
 }
 
 impl Shell {
-    pub const ALL: [Shell; 3] = [Shell::Zsh, Shell::Bash, Shell::Fish];
+    pub const ALL: [Self; 3] = [Self::Zsh, Self::Bash, Self::Fish];
 
     /// Recognise a shell from a name or a path (`zsh`, `/bin/zsh`, `-zsh`).
     pub fn from_name(name: &str) -> Option<Self> {
@@ -71,7 +71,7 @@ impl Shell {
         }
     }
 
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
@@ -152,7 +152,7 @@ pub enum ConflictKind {
 }
 
 impl ConflictKind {
-    fn describe(self) -> &'static str {
+    const fn describe(self) -> &'static str {
         match self {
             Self::Alias => "an alias",
             Self::Function => "a function",
@@ -603,7 +603,7 @@ fn write_file(path: &Path, text: &str) -> Result<(), SetupError> {
     let dir = target
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(io)?;
     let permissions = std::fs::metadata(&target)
         .ok()
@@ -779,7 +779,7 @@ struct ObjectSpan {
     members: Vec<Member>,
 }
 
-fn skip_ws(bytes: &[u8], mut at: usize) -> usize {
+const fn skip_ws(bytes: &[u8], mut at: usize) -> usize {
     while at < bytes.len() && matches!(bytes[at], b' ' | b'\t' | b'\n' | b'\r') {
         at += 1;
     }
@@ -966,32 +966,29 @@ fn with_base_url_text(text: &str, url: &str) -> Result<String, String> {
             &text[env.value_end..]
         ));
     }
-    match layout(text, &top) {
-        Some((lead, sep)) => {
-            let last = top
-                .members
-                .last()
-                .ok_or("an object with a layout has a member")?;
-            let addition = if lead.contains('\n') {
-                let indent = lead.rsplit('\n').next().unwrap_or_default();
-                format!(",{lead}\"env\"{sep}{{\n{indent}{indent}{key}{sep}{value}\n{indent}}}")
-            } else {
-                format!(",{lead}\"env\"{sep}{{{key}{sep}{value}}}")
-            };
-            Ok(format!(
-                "{}{addition}{}",
-                &text[..last.value_end],
-                &text[last.value_end..]
-            ))
-        }
-        None => {
-            let close = value_end(text.as_bytes(), top.open)?;
-            Ok(format!(
-                "{}{{\n  \"env\": {{\n    {key}: {value}\n  }}\n}}{}",
-                &text[..top.open],
-                &text[close..]
-            ))
-        }
+    if let Some((lead, sep)) = layout(text, &top) {
+        let last = top
+            .members
+            .last()
+            .ok_or("an object with a layout has a member")?;
+        let addition = if lead.contains('\n') {
+            let indent = lead.rsplit('\n').next().unwrap_or_default();
+            format!(",{lead}\"env\"{sep}{{\n{indent}{indent}{key}{sep}{value}\n{indent}}}")
+        } else {
+            format!(",{lead}\"env\"{sep}{{{key}{sep}{value}}}")
+        };
+        Ok(format!(
+            "{}{addition}{}",
+            &text[..last.value_end],
+            &text[last.value_end..]
+        ))
+    } else {
+        let close = value_end(text.as_bytes(), top.open)?;
+        Ok(format!(
+            "{}{{\n  \"env\": {{\n    {key}: {value}\n  }}\n}}{}",
+            &text[..top.open],
+            &text[close..]
+        ))
     }
 }
 
@@ -1239,7 +1236,7 @@ pub enum Route {
 }
 
 impl Route {
-    fn of(shell: bool, settings: bool) -> Self {
+    const fn of(shell: bool, settings: bool) -> Self {
         match (shell, settings) {
             (false, false) => Self::Off,
             (true, false) => Self::Shell,
@@ -1248,7 +1245,7 @@ impl Route {
         }
     }
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Shell => "shell",

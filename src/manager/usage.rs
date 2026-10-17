@@ -62,7 +62,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let read_five_hour = match account.provider {
@@ -162,7 +162,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     // The serving account's provider, which files the ledger line (`p`) and
@@ -217,7 +217,7 @@ impl Manager {
     /// caller can log whether the day was restored or genuinely started at zero.
     pub fn attach_usage_ledger(
         &self,
-        dir: std::path::PathBuf,
+        dir: PathBuf,
         retention_days: u32,
     ) -> crate::usage::ReplayReport {
         // The whole identity, not the name: the same email in two orgs is two
@@ -227,7 +227,7 @@ impl Manager {
         let accounts: Vec<crate::usage::LedgerAccount> = self
             .accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .map(|a| crate::usage::LedgerAccount {
                 name: a.name.clone(),
@@ -266,7 +266,7 @@ impl Manager {
     pub fn usage_retention_days(&self) -> u32 {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .usage_retention_days
     }
 
@@ -336,7 +336,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let was_codex_refused = match account.provider {
@@ -416,7 +416,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.quota.reject_model_weekly(headers);
             tracing::info!(
@@ -432,7 +432,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.status = AccountStatus::Throttled;
             account.rate_limited_until_ms = Some(until);
@@ -448,7 +448,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             let now = OffsetDateTime::now_utc();
             let hold = account
@@ -477,7 +477,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             account.rate_limited_until_ms = Some(until);
             account.hold_cause = HoldCause::Refused;
@@ -495,7 +495,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             if account.status == AccountStatus::Throttled {
                 account.status = AccountStatus::Active;
@@ -525,7 +525,7 @@ impl Manager {
         let mut accounts = self
             .accounts
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(idx) {
             tracing::warn!(
                 account = %account.name,

@@ -256,7 +256,7 @@ fn fake_account(index: usize) -> Account {
         } else {
             None
         },
-        ..tcr::config::Account::fixture(&format!("acct{index}@example.com"))
+        ..Account::fixture(&format!("acct{index}@example.com"))
     }
 }
 
@@ -265,7 +265,7 @@ fn fleet(accounts: Vec<Account>) -> Arc<Manager> {
         upstream: "http://127.0.0.1:1".to_string(),
         switch_threshold: SWITCH_THRESHOLD,
         control_reserve: CONTROL_RESERVE,
-        ..tcr::config::Config::fixture(accounts)
+        ..Config::fixture(accounts)
     };
     Manager::new(
         config,

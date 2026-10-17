@@ -24,7 +24,7 @@ pub enum ConfigError {
     Parse(#[from] serde_json::Error),
 }
 
-fn default_port() -> u16 {
+const fn default_port() -> u16 {
     3456
 }
 /// `pub(crate)` so `peer::lease` can read the one spelling of this address
@@ -44,13 +44,13 @@ pub(crate) fn is_default_codex_upstream(value: &str) -> bool {
 pub(crate) fn non_default_codex_upstream(value: &str) -> Option<String> {
     (!is_default_codex_upstream(value)).then(|| value.to_owned())
 }
-fn default_switch_threshold() -> f64 {
+const fn default_switch_threshold() -> f64 {
     0.95
 }
 /// Default headroom (§3, control-account part 2) reserved for the control
 /// account against general (non-control-preferred) picks — see
 /// [`Config::control_reserve`] and [`crate::manager::select::effective_threshold`].
-fn default_control_reserve() -> f64 {
+const fn default_control_reserve() -> f64 {
     0.05
 }
 
@@ -76,13 +76,13 @@ fn default_control_reserve() -> f64 {
 /// is alone in its bucket, which is the raw behaviour with extra steps). `0`
 /// disables the tier term outright and restores the pre-tier ordering — the
 /// config-only rollback, no rebuild.
-fn default_reset_urgency_tier_hours() -> u32 {
+const fn default_reset_urgency_tier_hours() -> u32 {
     24
 }
 
 /// Default [`Config::usage_retention_days`]: a quarter of history, which is ~180 MB
 /// at the observed ~2 MB/day and answers "how did last month compare".
-fn default_usage_retention_days() -> u32 {
+const fn default_usage_retention_days() -> u32 {
     90
 }
 /// Default pacing when the `pacing` key is absent: OFF — no in-flight cap, no
@@ -100,7 +100,7 @@ fn default_usage_retention_days() -> u32 {
 /// (min-spacing + burst at the send site), not concurrency bounds, and they are
 /// deliberately not a substitute for one. Turning the cap off leaves per-account
 /// concurrency genuinely unbounded.
-fn default_pacing() -> PacingConfig {
+const fn default_pacing() -> PacingConfig {
     PacingConfig {
         max_in_flight_per_account: None,
         min_spacing_ms: None,
@@ -136,7 +136,7 @@ fn default_pacing() -> PacingConfig {
 /// The speedup for a burst SPREAD across accounts does not come from this. It
 /// comes from the bucket being per-org rather than shared, so capacity grows with
 /// the account pool; a spread burst is free at any of these sizes.
-fn default_account_throttle() -> ThrottleConfig {
+const fn default_account_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(350),
         burst: Some(24),
@@ -147,7 +147,7 @@ fn default_account_throttle() -> ThrottleConfig {
 /// [`default_account_throttle`].
 ///
 /// This is INSURANCE against a mechanism nobody here has measured: that something
-/// SHARED across one provider's accounts (the source IP, the client_id) is rate-limited in
+/// SHARED across one provider's accounts (the source IP, the `client_id`) is rate-limited in
 /// addition to the per-organization limits. Whether such a limiter exists is
 /// genuinely unknown — see [`ThrottleConfig`]'s note on what the evidence does and
 /// does not show.
@@ -167,7 +167,7 @@ fn default_account_throttle() -> ThrottleConfig {
 /// `tests/throttle_exempt.rs::shipped_fleet_ceiling_can_actually_fire` is the
 /// guard: it drives a 48-wide runaway and asserts the ceiling engages. A ceiling
 /// never observed firing is indistinguishable from an absent one.
-fn default_fleet_throttle() -> ThrottleConfig {
+const fn default_fleet_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(100),
         burst: Some(32),
@@ -201,7 +201,7 @@ pub enum AccountType {
 
 impl AccountType {
     /// Only OAuth rows are refreshed, probed and warmed.
-    pub fn is_oauth(&self) -> bool {
+    pub const fn is_oauth(&self) -> bool {
         matches!(self, Self::OAuth)
     }
 }
@@ -512,7 +512,7 @@ impl Account {
 
     /// A strict peer exit cannot be honoured for Codex. Keep the row readable so
     /// the CLI can clear its pin, but never select it for a pooled request.
-    pub(crate) fn has_unsupported_strict_peer_exit(&self) -> bool {
+    pub(crate) const fn has_unsupported_strict_peer_exit(&self) -> bool {
         match self.provider {
             crate::provider::Provider::Anthropic => false,
             crate::provider::Provider::Codex => self.egress_strict && self.egress.peer().is_some(),
@@ -534,7 +534,7 @@ impl Account {
     /// filter of its own: the request path asks this question once per attempt
     /// and reads [`EgressPin`] from then on. Both halves are already parsed by
     /// the time this runs, at config load, which is what makes it infallible.
-    pub fn egress_pin(&self) -> EgressPin {
+    pub const fn egress_pin(&self) -> EgressPin {
         EgressPin {
             egress: self.egress,
             strict: self.egress_strict,
@@ -603,7 +603,7 @@ pub enum Egress {
 /// Separate from [`Egress::is_local`] because serde hands the predicate a
 /// reference and that method takes the value, which is `Copy`: one adapter
 /// here rather than a second spelling of the question.
-fn egress_is_local(egress: &Egress) -> bool {
+const fn egress_is_local(egress: &Egress) -> bool {
     egress.is_local()
 }
 
@@ -619,12 +619,12 @@ impl Egress {
 
     /// Whether this account is unpinned. Named rather than `== Local` so every
     /// reader asks the question the same way.
-    pub fn is_local(self) -> bool {
+    pub const fn is_local(self) -> bool {
         matches!(self, Self::Local)
     }
 
     /// The peer this account is pinned to, when it is pinned at all.
-    pub fn peer(self) -> Option<tcr_peer_wire::PeerId> {
+    pub const fn peer(self) -> Option<tcr_peer_wire::PeerId> {
         match self {
             Self::Local => None,
             Self::Via(peer) => Some(peer),
@@ -780,7 +780,7 @@ pub enum ColorSource {
 }
 
 impl ColorSource {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Derived => "derived",
             Self::Set => "set",
@@ -815,10 +815,10 @@ pub fn derive_group_color(group: &str) -> String {
     // FNV-1a: no dependency, good-enough avalanche for hashing short ASCII
     // labels into a hue — this is a display color, not a security boundary,
     // so cryptographic strength buys nothing here.
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in group.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     let hue = (hash % 360) as f64;
     oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, hue)
@@ -896,7 +896,7 @@ fn oklch_to_srgb_clamped(l: f64, c: f64, h_deg: f64) -> (f64, f64, f64) {
 }
 
 /// OKLCH(`l`, `c`, `h`-degrees) to linear sRGB, via OKLab — Björn Ottosson's
-/// published matrices (https://bottosson.github.io/posts/oklab/), the
+/// published matrices (<https://bottosson.github.io/posts/oklab>/), the
 /// reference conversion every OKLCH implementation uses. Channels are NOT
 /// clamped here; the caller decides what an out-of-`[0,1]` channel means.
 fn oklch_to_linear_srgb(l: f64, c: f64, h_deg: f64) -> (f64, f64, f64) {
@@ -904,24 +904,24 @@ fn oklch_to_linear_srgb(l: f64, c: f64, h_deg: f64) -> (f64, f64, f64) {
     let a = c * h.cos();
     let b = c * h.sin();
 
-    let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
-    let m_ = l - 0.1055613458 * a - 0.0638541728 * b;
-    let s_ = l - 0.0894841775 * a - 1.2914855480 * b;
+    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548_0 * b;
 
     let l3 = l_ * l_ * l_;
     let m3 = m_ * m_ * m_;
     let s3 = s_ * s_ * s_;
 
-    let r = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
-    let g = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
-    let b = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
+    let r = 4.076_741_662_1 * l3 - 3.307_711_591_3 * m3 + 0.230_969_929_2 * s3;
+    let g = -1.268_438_004_6 * l3 + 2.609_757_401_1 * m3 - 0.341_319_396_5 * s3;
+    let b = -0.004_196_086_3 * l3 - 0.703_418_614_7 * m3 + 1.707_614_701_0 * s3;
     (r, g, b)
 }
 
 /// Linear-light sRGB component in `[0, 1]` to gamma-encoded sRGB in `[0, 1]`
 /// — the standard piecewise sRGB EOTF inverse.
 fn linear_to_srgb_component(v: f64) -> f64 {
-    if v <= 0.0031308 {
+    if v <= 0.003_130_8 {
         12.92 * v
     } else {
         1.055 * v.powf(1.0 / 2.4) - 0.055
@@ -932,7 +932,7 @@ fn linear_to_srgb_component(v: f64) -> f64 {
 /// on a light background, negative is light text on a dark one — only the
 /// magnitude (`|Lc|`) matters for "is this readable" and that is what every
 /// caller here takes. Ported from the public APCA-W3 0.1.9 reference
-/// algorithm (https://github.com/Myndex/apca-w3) — not WCAG 2's ratio, which
+/// algorithm (<https://github.com/Myndex/apca-w3>) — not WCAG 2's ratio, which
 /// is a poor predictor of perceived contrast for exactly the kind of
 /// mid-lightness saturated color this module generates.
 fn apca_contrast(text_rgb: (u8, u8, u8), bg_rgb: (u8, u8, u8)) -> f64 {
@@ -944,8 +944,8 @@ fn apca_contrast(text_rgb: (u8, u8, u8), bg_rgb: (u8, u8, u8)) -> f64 {
     const LO_OFFSET: f64 = 0.027;
 
     let y = |rgb: (u8, u8, u8)| -> f64 {
-        let f = |v: u8| (v as f64 / 255.0).powf(2.4);
-        0.2126729 * f(rgb.0) + 0.7151522 * f(rgb.1) + 0.0721750 * f(rgb.2)
+        let f = |v: u8| (f64::from(v) / 255.0).powf(2.4);
+        0.212_672_9 * f(rgb.0) + 0.715_152_2 * f(rgb.1) + 0.072_175_0 * f(rgb.2)
     };
     let soft_black_clamp = |y: f64| -> f64 {
         if y > BLACK_THRESHOLD {
@@ -1058,7 +1058,7 @@ impl PacingConfig {
     /// request onto the least-loaded soft fallback and flooding the pacing log with
     /// a "skip in selection" line per account per request. Normalising it here keeps
     /// that footgun out of every read site.
-    pub fn effective_max_in_flight(&self) -> Option<u32> {
+    pub const fn effective_max_in_flight(&self) -> Option<u32> {
         match self.max_in_flight_per_account {
             Some(0) => None,
             other => other,
@@ -1068,7 +1068,7 @@ impl PacingConfig {
     /// Whether either knob is configured. When `false`, pacing is fully inert and
     /// eligibility/selection are byte-identical to the no-pacing build. A cap of
     /// `0` counts as unset (see [`Self::effective_max_in_flight`]).
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.effective_max_in_flight().is_some() || self.min_spacing_ms.is_some()
     }
 }
@@ -1094,7 +1094,7 @@ impl PacingConfig {
 ///
 /// **What was here before, and how far the evidence actually goes.** This
 /// doc-comment used to assert that the fleet-wide bucket paced "the AGGREGATE
-/// egress that Anthropic's shared IP/client_id burst limiter actually keys on,"
+/// egress that Anthropic's shared `IP/client_id` burst limiter actually keys on,"
 /// with no evidence attached. It is still uncited, and it is still the reason the
 /// bucket was shaped the way it was — but be careful about how much the
 /// counter-evidence proves:
@@ -1139,7 +1139,7 @@ pub struct ThrottleConfig {
 impl ThrottleConfig {
     /// Emission interval, treating `Some(0)` as unset (mirrors
     /// [`PacingConfig::effective_max_in_flight`]'s footgun normalization).
-    pub fn effective_min_spacing(&self) -> Option<u64> {
+    pub const fn effective_min_spacing(&self) -> Option<u64> {
         match self.min_spacing_ms {
             Some(0) => None,
             other => other,
@@ -1152,7 +1152,7 @@ impl ThrottleConfig {
     /// Whether the throttle does anything. `min_spacing_ms` is the required knob —
     /// a burst without a spacing interval is meaningless. When false the throttle is
     /// fully inert (see [`crate::manager::Manager::throttle_send`]).
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.effective_min_spacing().is_some()
     }
 }
@@ -1181,7 +1181,7 @@ pub enum ControlIdentityMode {
 
 impl ControlIdentityMode {
     /// The `controlIdentity` spelling, for log lines.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Refuse => "refuse",
             Self::Warn => "warn",
@@ -1269,7 +1269,7 @@ pub struct Config {
     /// [`crate::quota::Quota::model_weekly_rejected`]'s doc for why 1.0 is the
     /// value that collapses the prediction onto the authority. Consumed by
     /// [`crate::manager::select::Manager::model_blocked`] and
-    /// [`crate::manager::select::Manager::account_gate`]'s FableWeekly push
+    /// [`crate::manager::select::Manager::account_gate`]'s `FableWeekly` push
     /// through one shared resolver so the two can never disagree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fable_weekly_threshold: Option<f64>,
@@ -1487,7 +1487,7 @@ impl Config {
     pub fn session_affinity_enabled(&self) -> bool {
         self.extra
             .get("sessionAffinity")
-            .and_then(|v| v.as_bool())
+            .and_then(Value::as_bool)
             .unwrap_or(true)
     }
 
@@ -1495,7 +1495,7 @@ impl Config {
     /// `[0.0, 0.5]`, because a hand-edited file is not bound by the field's
     /// documented range. Read once at manager construction and by `tcr config
     /// show`.
-    pub fn effective_control_reserve(&self) -> f64 {
+    pub const fn effective_control_reserve(&self) -> f64 {
         self.control_reserve.clamp(0.0, 0.5)
     }
 
@@ -1765,7 +1765,7 @@ const CODEX_CREDENTIAL_VERSION: u64 = 2;
 /// The `credentialVersion` a row of `provider` is written at, and the highest
 /// [`load`] accepts on one. One exhaustive `match`, so a third provider cannot be
 /// stamped by default.
-fn credential_version_for(provider: crate::provider::Provider) -> u64 {
+const fn credential_version_for(provider: crate::provider::Provider) -> u64 {
     match provider {
         crate::provider::Provider::Anthropic => CREDENTIAL_VERSION,
         crate::provider::Provider::Codex => CODEX_CREDENTIAL_VERSION,
@@ -2271,7 +2271,7 @@ fn migrate_duplicate_names(path: &Path, config: &mut Config, file_index: &[usize
             "renamed account: {} -> {} ({where_from})",
             rename.from, rename.to
         ));
-        config.accounts[*index].name = rename.to.clone();
+        config.accounts[*index].name.clone_from(&rename.to);
     }
     if let Some(name) = &control_rename {
         say(&format!(
@@ -2382,7 +2382,7 @@ fn plan_renames(accounts: &[Account]) -> Vec<(usize, AccountRename)> {
 /// Whether an `organizationType` names a plan a person holds in their own right
 /// rather than through a seat someone granted them.
 fn is_personal_plan(organization_type: Option<&str>) -> bool {
-    matches!(organization_type, Some("claude_max") | Some("claude_pro"))
+    matches!(organization_type, Some("claude_max" | "claude_pro"))
 }
 
 /// Write the migration's renames — and the `controlAccount` that followed one —
@@ -2870,7 +2870,7 @@ pub enum CredentialScope {
 
 impl CredentialScope {
     /// Whether a loaded account at `position` is this write's business.
-    fn covers(self, position: usize) -> bool {
+    const fn covers(self, position: usize) -> bool {
         match self {
             Self::All => true,
             Self::Only(only) => only == position,
@@ -3881,7 +3881,7 @@ enum GroupKey {
 
 impl GroupKey {
     /// The key's spelling in the file.
-    fn wire(self) -> &'static str {
+    const fn wire(self) -> &'static str {
         match self {
             Self::Reserved => "reserved",
             Self::Parked => "parked",
@@ -4061,7 +4061,7 @@ pub fn save_group_color(
 /// of a credential file. See [`save_control_account`].
 fn merge_control_account(doc: &mut Map<String, Value>, target: Option<&Account>) -> ControlWrite {
     if let Some(account) = target
-        && let EntryMatch::Many = locate_account_entry(doc, account)
+        && locate_account_entry(doc, account) == EntryMatch::Many
     {
         return ControlWrite::Ambiguous;
     }
@@ -4584,7 +4584,7 @@ mod tests {
         assert_eq!(config.switch_threshold, 0.9);
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].name, "acct-a");
-        assert_eq!(config.accounts[0].expires_at, Some(1893456000000));
+        assert_eq!(config.accounts[0].expires_at, Some(1_893_456_000_000));
     }
 
     #[test]
@@ -4862,7 +4862,7 @@ mod tests {
     fn save_account_writes_a_codex_row_at_credential_version_2() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(
+        fs::write(
             &path,
             r#"{ "accounts": [
                 { "name": "alice@example.com", "accessToken": "at-anthropic" },
@@ -5659,7 +5659,7 @@ mod tests {
     // --- derived color band: OKLCH lightness/gamut/APCA (problem 2) ---------
 
     fn srgb_byte_to_linear(v: u8) -> f64 {
-        let v = v as f64 / 255.0;
+        let v = f64::from(v) / 255.0;
         if v <= 0.04045 {
             v / 12.92
         } else {
@@ -5679,12 +5679,12 @@ mod tests {
             srgb_byte_to_linear(g),
             srgb_byte_to_linear(b),
         );
-        let l_ = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
-        let m_ = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
-        let s_ = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
-        let l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
-        let a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
-        let b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+        let l_ = (0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b).cbrt();
+        let m_ = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
+        let s_ = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();
+        let l = 0.210_454_255_3 * l_ + 0.793_617_785_0 * m_ - 0.004_072_046_8 * s_;
+        let a = 1.977_998_495_1 * l_ - 2.428_592_205_0 * m_ + 0.450_593_709_9 * s_;
+        let b = 0.025_904_037_1 * l_ + 0.782_771_766_2 * m_ - 0.808_675_766_0 * s_;
         (l, a, b)
     }
 
@@ -5725,7 +5725,7 @@ mod tests {
         let mut min_l = f64::MAX;
         let mut max_l = f64::MIN;
         for hue in 0..360u32 {
-            let hex = oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, hue as f64);
+            let hex = oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, f64::from(hue));
             let l = measured_oklab_l(&hex);
             min_l = min_l.min(l);
             max_l = max_l.max(l);
@@ -5752,7 +5752,7 @@ mod tests {
         let mut worst = f64::MAX;
         let mut worst_hue = 0u32;
         for hue in 0..360u32 {
-            let hex = oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, hue as f64);
+            let hex = oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, f64::from(hue));
             let apca = best_readable_apca(&hex);
             if apca < worst {
                 worst = apca;
@@ -5773,7 +5773,7 @@ mod tests {
     #[test]
     fn derived_colors_are_fully_in_gamut_no_channel_clipped() {
         for hue in 0..360u32 {
-            let hex = oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, hue as f64);
+            let hex = oklch_to_hex(DERIVED_GROUP_COLOR_L, DERIVED_GROUP_COLOR_C, f64::from(hue));
             // Independent of `oklch_to_gamut_srgb`'s own internals (comparing
             // its output to itself would be tautological and blind to a bug
             // INSIDE that function, e.g. a naive clamp instead of a chroma
@@ -5793,7 +5793,7 @@ mod tests {
                  the fixed-lightness band should never fully desaturate"
             );
             let measured_hue = b.atan2(a).to_degrees().rem_euclid(360.0);
-            let mut delta = (measured_hue - hue as f64).abs();
+            let mut delta = (measured_hue - f64::from(hue)).abs();
             if delta > 180.0 {
                 delta = 360.0 - delta;
             }
@@ -7589,7 +7589,7 @@ mod tests {
 
     /// The refusal is scoped to the AMBIGUOUS identity, not to the file: an
     /// unambiguous account in the same document still writes. Without this pair,
-    /// "nothing was written" above would be satisfied by a save_disabled that had
+    /// "nothing was written" above would be satisfied by a `save_disabled` that had
     /// simply stopped working.
     #[test]
     fn a_duplicate_elsewhere_does_not_block_an_unambiguous_write() {
@@ -8196,7 +8196,7 @@ mod tests {
     /// `"codexUpstream": "https://chatgpt.com"`.
     ///
     /// What it pins is "no new keys", not bytes, and bytes could not be pinned:
-    /// serde_json is built without `preserve_order`, so every write sorts keys;
+    /// `serde_json` is built without `preserve_order`, so every write sorts keys;
     /// the Updated arm stamps `credentialVersion`; and `save_settings` writes
     /// defaults that have no skip, such as `switchThreshold`.
     #[test]
@@ -8218,11 +8218,11 @@ mod tests {
     }
   ]
 }"#;
-        std::fs::write(&path, original).unwrap();
+        fs::write(&path, original).unwrap();
         let (config, _) = load_or_init(&path).expect("loads"); // the loader the server boot uses
         let account = config.accounts[0].clone();
         save_account(&path, &account).expect("saves"); // unchanged row: an in-place Updated
-        let after = std::fs::read_to_string(&path).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
         assert!(
             !after.contains("provider"),
             "an Anthropic row must write no provider key:\n{after}"
@@ -8234,7 +8234,7 @@ mod tests {
         // `save_account` above never serializes the struct; the whole-config
         // writer is where either skip is actually exercised.
         save_settings(&path, &config).expect("saves the whole config");
-        let after = std::fs::read_to_string(&path).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
         assert!(
             !after.contains("provider"),
             "a whole-config save must write no provider key for an Anthropic row:\n{after}"
@@ -8269,31 +8269,25 @@ mod tests {
     }
   ]
 }"#;
-        std::fs::write(&path, original).unwrap();
+        fs::write(&path, original).unwrap();
         let (config, _) = load_or_init(&path).expect("loads");
         assert_eq!(config.accounts[0].codex_home, None);
         assert!(!config.accounts[0].extra.contains_key("codexHome"));
         save_account(&path, &config.accounts[0]).expect("saves the row");
         assert!(
-            !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("codexHome"),
+            !fs::read_to_string(&path).unwrap().contains("codexHome"),
             "the row writer adds no codexHome"
         );
         save_settings(&path, &config).expect("saves the whole config");
         assert!(
-            !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("codexHome"),
+            !fs::read_to_string(&path).unwrap().contains("codexHome"),
             "the whole-config writer adds no codexHome"
         );
-        let mut whole = config.clone();
+        let mut whole = config;
         whole.accounts[0].access_token = "at-b".to_string();
         save(&path, &whole).expect("writes the whole document");
         assert!(
-            !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("codexHome"),
+            !fs::read_to_string(&path).unwrap().contains("codexHome"),
             "nor does a full rewrite"
         );
     }
@@ -8304,7 +8298,7 @@ mod tests {
     fn bob_codex_row_with_a_codex_home() -> (tempfile::TempDir, PathBuf, Config) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(
+        fs::write(
             &path,
             r#"{ "accounts": [
                 { "name": "bob@example.com", "type": "oauth", "provider": "codex",
@@ -8335,7 +8329,7 @@ mod tests {
         save(&path, &config).expect("saves");
         let (again, _) = load_or_init(&path).expect("reloads");
         assert_eq!(again.accounts[0].codex_home, row.codex_home);
-        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["accounts"][0]["codexHome"], "/Users/example/.codex");
     }
 
@@ -8349,7 +8343,7 @@ mod tests {
     fn a_codex_save_without_codex_home_removes_it() {
         let (_dir, path, config) = bob_codex_row_with_a_codex_home();
         let codex_home_on_disk = |path: &Path| -> Value {
-            let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let doc: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             doc["accounts"][0]
                 .get("codexHome")
                 .cloned()
@@ -8390,7 +8384,7 @@ mod tests {
     fn a_codex_row_is_saved_with_its_provider_and_never_matches_an_anthropic_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(&path, r#"{ "accounts": [
+        fs::write(&path, r#"{ "accounts": [
             { "name": "alice@example.com", "accessToken": "at-anthropic", "refreshToken": "rt-anthropic" }
         ] }"#).unwrap();
         let mut codex = account_fixture("alice@example.com/codex");
@@ -8403,8 +8397,7 @@ mod tests {
             matches!(write, AccountWrite::Added),
             "a Codex row must be ADDED beside the Anthropic row, got {write:?}"
         );
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let rows = after["accounts"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -8588,7 +8581,7 @@ mod tests {
     fn save_account_update_drops_an_explicit_anthropic_provider_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(
+        fs::write(
             &path,
             r#"{ "accounts": [
                 { "name": "alice@example.com", "provider": "anthropic", "type": "oauth",
@@ -8618,7 +8611,7 @@ mod tests {
     fn a_non_default_codex_upstream_survives_save_settings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::paths::CONFIG_FILE);
-        std::fs::write(
+        fs::write(
             &path,
             r#"{ "codexUpstream": "https://codex-stub.example.com", "accounts": [] }"#,
         )

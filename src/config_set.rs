@@ -61,7 +61,7 @@ pub enum SettingKey {
 
 impl SettingKey {
     /// Every key, in the order `tcr config show` prints them.
-    pub const ALL: [SettingKey; 11] = [
+    pub const ALL: [Self; 11] = [
         Self::SwitchThreshold,
         Self::ControlReserve,
         Self::FableWeeklyThreshold,
@@ -76,7 +76,7 @@ impl SettingKey {
     ];
 
     /// The key as the config file spells it.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::SwitchThreshold => "switchThreshold",
             Self::ControlReserve => "controlReserve",
@@ -97,7 +97,7 @@ impl SettingKey {
     }
 
     /// What the value is, said the way a refusal says it.
-    fn expects(self) -> &'static str {
+    const fn expects(self) -> &'static str {
         match self {
             Self::SwitchThreshold | Self::FableWeeklyThreshold => {
                 "a share of quota above 0 and at most 100%, as 90% or 0.9"
@@ -221,7 +221,7 @@ impl Setting {
         Ok(setting)
     }
 
-    pub fn key(&self) -> SettingKey {
+    pub const fn key(&self) -> SettingKey {
         match self {
             Self::SwitchThreshold(_) => SettingKey::SwitchThreshold,
             Self::ControlReserve(_) => SettingKey::ControlReserve,

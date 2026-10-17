@@ -108,8 +108,8 @@ pub enum CommandClass {
     /// `wait-for-line`, `merge-when-green`, or a command starting with `until`/`sleep` —
     /// never a defect, since taking long is the job.
     Wait,
-    /// Any `;`, `&` or `|` left in the reduced command — a real compound, since a `cd
-    /// <dir> && <clause>` already had its `cd` prefix reduced away before this check runs.
+    /// Any `;`, `&` or `|` left in the reduced command — a real compound, since a
+    /// `cd <dir> && <clause>` already had its `cd` prefix reduced away before this check runs.
     Compound,
     /// `find`, `grep`, `fd`, `rg`, `bfs` or `du`.
     Search,
@@ -127,15 +127,15 @@ pub enum CommandClass {
 impl CommandClass {
     /// The wire/panel name — kebab-case, matching `hooks/log-slow-bash.sh`'s own
     /// `class=` values verbatim, so a person reading both sees the same word.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            CommandClass::Wait => "wait",
-            CommandClass::Compound => "compound",
-            CommandClass::Search => "search",
-            CommandClass::GitNet => "git-net",
-            CommandClass::GitLocal => "git-local",
-            CommandClass::Build => "build",
-            CommandClass::Other => "other",
+            Self::Wait => "wait",
+            Self::Compound => "compound",
+            Self::Search => "search",
+            Self::GitNet => "git-net",
+            Self::GitLocal => "git-local",
+            Self::Build => "build",
+            Self::Other => "other",
         }
     }
 }
@@ -1148,19 +1148,19 @@ mod identity {
                 }
             }
         }
-        if !fallback.is_empty() {
-            fallback
-        } else {
+        if fallback.is_empty() {
             finish(&strip_env_and_wrap(&c), maxlen)
+        } else {
+            fallback
         }
     }
 }
 
 /// Normalize a raw Bash `input.command` into a `(head, class)` pair for the Tools tab —
 /// ports `hooks/log-slow-bash.sh`'s `jq` normalization verbatim, in order: strip leading
-/// whitespace, strip leading env assignments, strip wrappers, reduce a `cd <dir> &&
-/// <clause>` prefix (only when `<clause>` is itself simple), strip wrappers again (`cd
-/// <dir> && timeout 15 rg ...` is the shape `prefer-fd-rg` itself emits) — THEN reduce the
+/// whitespace, strip leading env assignments, strip wrappers, reduce a
+/// `cd <dir> && <clause>` prefix (only when `<clause>` is itself simple), strip wrappers
+/// again (`cd <dir> && timeout 15 rg ...` is the shape `prefer-fd-rg` itself emits) — THEN reduce the
 /// result to its [`identity::identity`] (the one clause that says what the command is) before
 /// truncating to [`COMMAND_HEAD_MAX`], so the cap trims a short meaningful string instead of a
 /// long one mid-token. The class is read off the REDUCED command, before either the identity
@@ -1196,7 +1196,7 @@ const COMMAND_HEAD_MAX: usize = 120;
 /// parse while walking backward for the assistant turn that owns the newest `tool_use` — see
 /// the module doc. Comfortably covers the observed shape (one or two trailing non-assistant
 /// messages, e.g a system-reminder sent as its own message) while keeping the parse cost
-/// small and fixed even for a turn with no tool_use at all, where the walk never finds an
+/// small and fixed even for a turn with no `tool_use` at all, where the walk never finds an
 /// `assistant` message and runs all the way to the cap.
 pub(crate) const TAIL_SCAN_CAP: usize = 20;
 
@@ -1459,7 +1459,7 @@ pub fn tool_use_event_from_block(
             command_class = Some(class);
             head
         }),
-        Some("Agent") | Some("Task") => field("description").map(|description| {
+        Some("Agent" | "Task") => field("description").map(|description| {
             let head = match field("subagent_type") {
                 Some(subagent_type) => format!("{subagent_type}: {description}"),
                 None => description.to_string(),
@@ -1523,17 +1523,17 @@ const CODEX_ARGUMENTS_CAP: usize = 64 * 1024;
 ///   `timeout_ms` (`core/src/tools/spec_plan.rs:1276-1284`;
 ///   `core/src/tools/handlers/unified_exec/exec_command.rs:103-108,126-138`);
 /// - `wait_agent`'s `timeout_ms` (`core/src/tools/handlers/multi_agents_spec.rs:287-313`), and
-///   apply_patch as a freeform tool (`core/src/tools/handlers/apply_patch_spec.rs:9-28`).
+///   `apply_patch` as a freeform tool (`core/src/tools/handlers/apply_patch_spec.rs:9-28`).
 ///
 /// - A `function_call` names its tool and carries its arguments as a JSON object encoded
-///   in a string; a `custom_tool_call` (codex's freeform tools, apply_patch among them)
+///   in a string; a `custom_tool_call` (codex's freeform tools, `apply_patch` among them)
 ///   carries raw text instead; a `local_shell_call` is a command line in `action` (codex
 ///   parses that item, though at f82e365 it never offers the tool).
 /// - A shell command (`exec_command`'s `cmd`, or a local shell call's argv) is headed and
 ///   classified by [`normalize_bash_command`], the normalizer a Claude `Bash` call goes
 ///   through, so one command reads the same whichever client ran it. Every other tool is
 ///   headed by its bare name, as an unlisted Claude tool is. A freeform call's `input` (for
-///   apply_patch, the whole patch) is never read.
+///   `apply_patch`, the whole patch) is never read.
 /// - `timeout_ms` from an `exec_command`'s arguments or a local shell call's action becomes
 ///   whole seconds, rounded up. Without it, or with a zero one, the call carries no
 ///   timeout, never a guessed one. Only the one-shot `exec_command`, which codex offers
@@ -1718,7 +1718,7 @@ impl ToolBucket {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mid = sorted.len() / 2;
         if sorted.len().is_multiple_of(2) {
-            (sorted[mid - 1] + sorted[mid]) / 2.0
+            f64::midpoint(sorted[mid - 1], sorted[mid])
         } else {
             sorted[mid]
         }
@@ -1818,7 +1818,7 @@ impl ReqPerMinuteRing {
 /// Model this session has never been attributed a usage record under.
 const UNKNOWN_MODEL: &str = "unknown";
 
-fn is_zero(value: &u64) -> bool {
+const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
@@ -2644,7 +2644,7 @@ mod tests {
     /// assistant message, beside the ordinary text and `tool_use` blocks of that turn. The
     /// `encrypted_content` here is a placeholder — a real one decodes only on the org that
     /// minted it and has no business in a public repo.
-    fn advisor_pair(id: &str) -> serde_json::Value {
+    fn advisor_pair(id: &str) -> Value {
         serde_json::json!([
             {"type": "text", "text": "thinking"},
             {"type": "server_tool_use", "id": id, "name": "advisor", "input": {}},
@@ -2654,7 +2654,7 @@ mod tests {
     }
 
     /// A signed reasoning block, in the shape the API returns it and Claude Code echoes it.
-    fn thinking_block(signature: &str) -> serde_json::Value {
+    fn thinking_block(signature: &str) -> Value {
         serde_json::json!({"type": "thinking", "thinking": "step one", "signature": signature})
     }
 
@@ -2729,7 +2729,7 @@ mod tests {
                 "content": [thinking_block("sig_fake_0")],
             }));
         }
-        let found = extract_bound_tokens(&messages_raw(serde_json::Value::Array(history)));
+        let found = extract_bound_tokens(&messages_raw(Value::Array(history)));
         assert_eq!(found.tokens.len(), BOUND_TOKEN_SCAN_CAP);
         assert_eq!(found.tokens[0], "sig_fake_0");
         assert_eq!(
@@ -2747,8 +2747,7 @@ mod tests {
             {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
         ]));
         assert_eq!(extract_bound_tokens(&raw), BoundHistory::default());
-        let malformed = serde_json::value::RawValue::from_string("\"not an array\"".to_string())
-            .expect("raw value");
+        let malformed = RawValue::from_string("\"not an array\"".to_string()).expect("raw value");
         assert_eq!(
             extract_bound_tokens(&malformed),
             BoundHistory::default(),
@@ -3112,7 +3111,7 @@ mod tests {
     /// carries one.
     #[test]
     fn a_codex_timeout_is_whole_seconds_rounded_up() {
-        let timeout_of = |name: &str, arguments: serde_json::Value| {
+        let timeout_of = |name: &str, arguments: Value| {
             codex_tool_call_from_item(&serde_json::json!({
                 "type": "function_call",
                 "call_id": "call_1",
@@ -3531,7 +3530,7 @@ mod tests {
         let usage = crate::usage::UsageTracker::new(1, crate::pricing::PricingTable::default());
         usage.record(
             0,
-            &crate::usage::UsageRecord::from_quota_input(
+            &UsageRecord::from_quota_input(
                 usage_at,
                 Some("gpt-5.1-codex".to_string()),
                 None,

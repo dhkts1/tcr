@@ -117,7 +117,7 @@ fn store(tag: &str, max_hops: u8, rows: Vec<PeerRow>) -> PeerStore {
 /// of this file drive it); it is what these cases want, because each of them
 /// varies `hops_remaining` or `via` against a target [`forwarder_on`] supplies,
 /// so the field under test is the only one that moves.
-fn forward_header(hops_remaining: u8, via: Vec<PeerId>) -> StreamHeader {
+const fn forward_header(hops_remaining: u8, via: Vec<PeerId>) -> StreamHeader {
     StreamHeader {
         kind: StreamKind::Tunnel,
         target: None,
@@ -229,7 +229,7 @@ fn a_requester_without_the_relay_grant_is_refused() {
         ..forward_header(1, Vec::new())
     };
     let bare = row(&a.id, "requester", Vec::new(), false);
-    let refusal = tcr::peer::listener::peer_stream_gate_rows(&header, Some(&bare))
+    let refusal = listener::peer_stream_gate_rows(&header, Some(&bare))
         .expect_err("the gate refuses a relay target under a bare pin");
     assert!(
         format!("{refusal:?}").contains("NotGranted"),
@@ -669,7 +669,7 @@ impl tokio::io::AsyncRead for Tap {
     ) -> std::task::Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(())) = &poll {
+        if matches!(&poll, std::task::Poll::Ready(Ok(()))) {
             let fresh = buf.filled()[before..].to_vec();
             self.seen
                 .lock()

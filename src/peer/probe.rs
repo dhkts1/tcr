@@ -248,7 +248,7 @@ pub struct PathTable {
 
 impl PathTable {
     /// A table with the operator's policy and no measurements yet.
-    pub fn new(config: PathsConfig, stats: Vec<PathStat>) -> Self {
+    pub const fn new(config: PathsConfig, stats: Vec<PathStat>) -> Self {
         Self {
             config,
             stats,
@@ -324,19 +324,18 @@ impl PathTable {
             .stats
             .iter()
             .position(|stat| stat.peer == peer && stat.locator == locator);
-        let index = match existing {
-            Some(index) => index,
-            None => {
-                self.stats.push(PathStat {
-                    peer,
-                    locator,
-                    rtt_ms: None,
-                    loss_pct: 0.0,
-                    samples: 0,
-                    updated_at_ms: now_ms,
-                });
-                self.stats.len() - 1
-            }
+        let index = if let Some(index) = existing {
+            index
+        } else {
+            self.stats.push(PathStat {
+                peer,
+                locator,
+                rtt_ms: None,
+                loss_pct: 0.0,
+                samples: 0,
+                updated_at_ms: now_ms,
+            });
+            self.stats.len() - 1
         };
         let Some(stat) = self.stats.get_mut(index) else {
             return false;
@@ -478,7 +477,7 @@ pub fn order_endpoints(row: &PeerRow, table: &PathTable) -> Vec<Endpoint> {
 /// nothing about whether the address is right, and this key ranks evidence.
 /// What it costs to be wrong is one connect timeout at the bottom of the dial
 /// order, which is why the honest placement is the one the seal supports.
-fn source_rank(endpoint: &Endpoint) -> u8 {
+const fn source_rank(endpoint: &Endpoint) -> u8 {
     match endpoint.source {
         EndpointSource::Paired | EndpointSource::Hello => 0,
         EndpointSource::Mapping | EndpointSource::Beacon => 1,
@@ -521,7 +520,7 @@ pub fn drop_cooling_endpoints(
     let awake: Vec<Endpoint> = order
         .iter()
         .filter(|endpoint| !table.is_cooling(peer, &endpoint.locator, now_ms))
-        .cloned()
+        .copied()
         .collect();
     if awake.is_empty() { order } else { awake }
 }

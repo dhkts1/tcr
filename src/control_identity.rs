@@ -176,7 +176,7 @@ impl ClientIdentityCache {
         if entries.len() >= CACHE_CAP && !entries.contains_key(&key) {
             entries.clear();
         }
-        entries.entry(key).or_default().clone()
+        Arc::clone(entries.entry(key).or_default())
     }
 
     /// The identity behind `bearer`, fetched from `profile_url` on first sight

@@ -94,7 +94,7 @@ struct RefreshResponse {
 /// Normalize an `expires_at` to milliseconds. OAuth backends may report seconds;
 /// Claude Code credentials use milliseconds. Values below ~`1e12` are seconds
 /// (that boundary is year 2001 in ms, far in the future in seconds).
-pub fn normalize_expires_at(value: i64) -> i64 {
+pub const fn normalize_expires_at(value: i64) -> i64 {
     if value < 1_000_000_000_000 {
         value * 1000
     } else {
@@ -112,7 +112,7 @@ fn expires_at_from(now_ms: i64, expires_in: Option<i64>) -> i64 {
 
 /// Has the token already expired at `now_ms`? A `None` expiry is treated as
 /// non-expiring (nothing to refresh).
-pub fn is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+pub const fn is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     match expires_at_ms {
         Some(exp) => now_ms >= exp,
         None => false,
@@ -120,7 +120,7 @@ pub fn is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// Is the token within [`EXPIRING_SOON_MS`] of expiry at `now_ms`?
-pub fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+pub const fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     match expires_at_ms {
         Some(exp) => now_ms + EXPIRING_SOON_MS >= exp,
         None => false,
@@ -449,21 +449,18 @@ impl LoginUi {
     /// Point [`PROSE`] at this mode for the rest of the process. Called once,
     /// at the top of [`login`] and of every other login entry point.
     pub(crate) fn install(self) {
-        PROSE.store(
-            self == LoginUi::Terminal,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        PROSE.store(self == Self::Terminal, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// True when stdin is a completion path and a prompt has somewhere to go.
     fn reads_stdin(self) -> bool {
-        self == LoginUi::Terminal
+        self == Self::Terminal
     }
 
     /// Emit one progress event, or nothing at all in [`LoginUi::Terminal`]
     /// (which narrates in prose instead — see [`LoginUi::say`]).
     pub(crate) fn emit(self, event: LoginEvent<'_>) {
-        if self == LoginUi::Machine {
+        if self == Self::Machine {
             println!("{}", event.line());
         }
     }
@@ -473,7 +470,7 @@ impl LoginUi {
     /// it. Goes through [`prose`] rather than `println!` so this mode and the
     /// deep persist-path lines can never disagree about what silence means.
     fn say(self, message: &str) {
-        if self == LoginUi::Terminal {
+        if self == Self::Terminal {
             prose(format_args!("{message}"));
         }
     }
@@ -602,28 +599,25 @@ impl LoginRefusal {
 /// as it is. Anything else gives the uncoded line it always gave, its reason flattened from the
 /// whole chain by [`one_line_reason`].
 pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
-    match error
+    if let Some(refusal) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<LoginRefusal>())
     {
-        Some(refusal) => {
-            let reason = refusal
-                .reason
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let line = LoginEvent::Refused {
-                code: refusal.code,
-                reason: &reason,
-            }
-            .line();
-            (line, reason)
+        let reason = refusal
+            .reason
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = LoginEvent::Refused {
+            code: refusal.code,
+            reason: &reason,
         }
-        None => {
-            let reason = one_line_reason(error);
-            let line = LoginEvent::Error { reason: &reason }.line();
-            (line, reason)
-        }
+        .line();
+        (line, reason)
+    } else {
+        let reason = one_line_reason(error);
+        let line = LoginEvent::Error { reason: &reason }.line();
+        (line, reason)
     }
 }
 
@@ -936,13 +930,13 @@ async fn wait_for_code(
     if !ui.reads_stdin() {
         return tokio::select! {
             result = run_callback_server(listener, expected_state) => result,
-            _ = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
+            () = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
         };
     }
     tokio::select! {
         result = run_callback_server(listener, expected_state) => result,
         result = read_stdin_code(expected_state) => result,
-        _ = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
+        () = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
     }
 }
 
@@ -1136,14 +1130,14 @@ impl Profile {
     /// taken from the token-exchange response instead. A field the profile
     /// endpoint did send is kept. Both answers describe the one token the
     /// exchange just minted, so they cannot name two different accounts.
-    fn or_exchange_identity(self, identity: ExchangeIdentity) -> Profile {
+    fn or_exchange_identity(self, identity: ExchangeIdentity) -> Self {
         let (account_uuid, email) = identity
             .account
             .map_or((None, None), |a| (a.uuid, a.email_address));
         let (org_uuid, org_name) = identity
             .organization
             .map_or((None, None), |o| (o.uuid, o.name));
-        Profile {
+        Self {
             email: self.email.or(email),
             account_uuid: self.account_uuid.or(account_uuid),
             org_uuid: self.org_uuid.or(org_uuid),
@@ -1320,9 +1314,9 @@ pub fn upsert_account(
     match crate::identity::resolve(config.accounts.iter().enumerate(), &probe) {
         crate::identity::Resolved::One(index) => {
             let account = &mut config.accounts[index];
-            account.account_type = crate::config::AccountType::OAuth;
-            account.access_token = tokens.access_token.clone();
-            account.refresh_token = tokens.refresh_token.clone();
+            account.account_type = config::AccountType::OAuth;
+            account.access_token.clone_from(&tokens.access_token);
+            account.refresh_token.clone_from(&tokens.refresh_token);
             account.expires_at = Some(tokens.expires_at_ms);
             // Backfill any identity field the stored entry was missing (e.g. a
             // legacy pre-org entry newly profiled), without overwriting known
@@ -1342,13 +1336,15 @@ pub fn upsert_account(
             // `config::Account::organization_type`. A `None` writes nothing, so
             // a profile fetch that failed never blanks a known plan.
             if profile.organization_type.is_some() {
-                account.organization_type = profile.organization_type.clone();
+                account
+                    .organization_type
+                    .clone_from(&profile.organization_type);
             }
             if profile.rate_limit_tier.is_some() {
-                account.rate_limit_tier = profile.rate_limit_tier.clone();
+                account.rate_limit_tier.clone_from(&profile.rate_limit_tier);
             }
             if profile.seat_tier.is_some() {
-                account.seat_tier = profile.seat_tier.clone();
+                account.seat_tier.clone_from(&profile.seat_tier);
             }
             Ok(())
         }
@@ -1721,7 +1717,7 @@ async fn admit_login_against(
         }
     };
     let route = match route {
-        LoginRoute::Refuse(msg) => bail!("{}", msg),
+        LoginRoute::Refuse(msg) => bail!("{msg}"),
         LoginRoute::File => WriteRoute::File,
         LoginRoute::Live => WriteRoute::Live,
     };
@@ -1855,7 +1851,7 @@ pub async fn login(
 
     // Load the existing config once (missing file → empty default; a corrupt
     // file surfaces as an error so login never clobbers it with defaults).
-    let mut config = load_or_default(config_path)?;
+    let config = load_or_default(config_path)?;
 
     // Fetch the account+org identity, then MINT a name for it. A failed
     // profile fetch still names the row from the exchange response.
@@ -1867,7 +1863,7 @@ pub async fn login(
     let saved = finish_login_checked(
         config_path,
         route,
-        &mut config,
+        &config,
         &name,
         &tokens,
         profile,
@@ -2112,7 +2108,7 @@ pub async fn login_with_token(
         expires_at_ms: crate::now_ms() + SETUP_TOKEN_ASSUMED_LIFETIME_MS,
     };
 
-    let mut config = load_or_default(config_path)?;
+    let config = load_or_default(config_path)?;
 
     // One authenticated call BEFORE anything is written: a rejected token is
     // refused here, because nothing downstream would ever catch it (see
@@ -2141,7 +2137,7 @@ pub async fn login_with_token(
     let result = finish_login(
         config_path,
         route,
-        &mut config,
+        &config,
         &resolved_name,
         &tokens,
         profile,
@@ -2702,7 +2698,7 @@ fn existing_codex_row<'a>(
 /// NEWER than the one being imported (`import`). Only a provable "newer" counts:
 /// an expiry missing on either side is no evidence, and an equal one is the same
 /// credential imported twice, which is harmless.
-fn holds_newer_credential(stored: Option<i64>, import: Option<i64>) -> bool {
+const fn holds_newer_credential(stored: Option<i64>, import: Option<i64>) -> bool {
     matches!((stored, import), (Some(stored), Some(import)) if stored > import)
 }
 
@@ -2909,7 +2905,7 @@ async fn import_claude_code_login(
 
     let tokens = tokens_from_claude_code_login(login);
 
-    let mut config = load_or_default(config_path)?;
+    let config = load_or_default(config_path)?;
     // The caller's "fleet is empty" check ran on an earlier read, and the route
     // probe above can take a while against a server that is still booting.
     // Another `tcr` process may have imported in that gap, and minting a name
@@ -2927,7 +2923,7 @@ async fn import_claude_code_login(
     finish_login_checked(
         config_path,
         route,
-        &mut config,
+        &config,
         &resolved_name,
         &tokens,
         profile,
@@ -3085,7 +3081,7 @@ fn looks_like_email(s: &str) -> bool {
 async fn finish_login_checked(
     config_path: &Path,
     route: WriteRoute,
-    config: &mut Config,
+    config: &Config,
     name: &str,
     tokens: &Tokens,
     profile: Profile,
@@ -3232,7 +3228,7 @@ fn assert_requested_identity(
 /// One case `config::save_account` cannot serve on its own: no file exists
 /// at `config_path` yet at all. Its `read_document` is a bare
 /// `fs::read_to_string`, which cannot create a missing path — mirrors the
-/// same NotFound guard [`persist_via_account_or_file`] already carries for
+/// same `NotFound` guard [`persist_via_account_or_file`] already carries for
 /// exactly this reason. There is nothing on disk in that case for a stale
 /// snapshot to clobber, so falling back to a fresh single-account
 /// [`config::save`] is safe rather than a reintroduction of the hazard this
@@ -3514,7 +3510,7 @@ fn misstored_provider_refusal(
 async fn finish_login(
     config_path: &Path,
     route: WriteRoute,
-    config: &mut Config,
+    config: &Config,
     name: &str,
     tokens: &Tokens,
     profile: Profile,
@@ -3563,6 +3559,7 @@ pub(crate) fn load_or_default(config_path: &Path) -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn normalize_treats_small_values_as_seconds() {
@@ -3888,11 +3885,11 @@ mod tests {
     /// it fails on an empty sequence.
     #[tokio::test]
     async fn machine_mode_emits_browser_then_waiting_and_completes_on_the_callback() {
-        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
         // The fake browser: wait for the `browser` event, then GET the
         // loopback callback exactly as Claude's redirect would.
-        let watched = recorded.clone();
+        let watched = Arc::clone(&recorded);
         let browser = tokio::spawn(async move {
             let url = loop {
                 let first = watched.lock().expect("sink mutex").first().cloned();
@@ -3922,7 +3919,7 @@ mod tests {
                 .log_debug("calling the test callback");
         });
 
-        let collected = recorded.clone();
+        let collected = Arc::clone(&recorded);
         let mut sink = |event: LoginEvent<'_>| {
             collected.lock().expect("sink mutex").push(event.line());
         };
@@ -4185,11 +4182,11 @@ mod tests {
     /// client ids pin the pairing of grant to endpoint as well as the route.
     #[tokio::test]
     async fn live_refresher_sends_each_provider_to_its_own_token_endpoint() {
-        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>;
+        type Seen = Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>;
         let seen: Seen = Seen::default();
         let recorder = |route: &'static str, seen: Seen| {
             move |axum::Json(body): axum::Json<serde_json::Value>| {
-                let seen = seen.clone();
+                let seen = Arc::clone(&seen);
                 async move {
                     seen.lock().unwrap().push((route, body));
                     axum::Json(serde_json::json!({
@@ -4203,11 +4200,11 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/anthropic",
-                axum::routing::post(recorder("anthropic", seen.clone())),
+                axum::routing::post(recorder("anthropic", Arc::clone(&seen))),
             )
             .route(
                 "/codex",
-                axum::routing::post(recorder("codex", seen.clone())),
+                axum::routing::post(recorder("codex", Arc::clone(&seen))),
             );
         let addr = crate::test_support::stub_upstream::http(app);
 
@@ -4430,7 +4427,7 @@ mod tests {
         assert_eq!(config.accounts.len(), 1);
         let account = &config.accounts[0];
         assert_eq!(account.name, "new@example.com");
-        assert_eq!(account.account_type, crate::config::AccountType::OAuth);
+        assert_eq!(account.account_type, config::AccountType::OAuth);
         assert_eq!(account.access_token, "at1");
         assert_eq!(account.refresh_token.as_deref(), Some("rt1"));
         assert_eq!(account.expires_at, Some(111));
@@ -4919,7 +4916,7 @@ mod tests {
         listener: TcpListener,
         seed: &str,
         config_path: Option<std::path::PathBuf>,
-    ) -> std::sync::Arc<crate::manager::Manager> {
+    ) -> Arc<crate::manager::Manager> {
         crate::test_support::live_proxy::serve(
             listener,
             serde_json::from_str(seed).unwrap(),
@@ -5327,13 +5324,13 @@ mod tests {
     #[tokio::test]
     async fn finish_login_checked_mismatch_writes_nothing() {
         let path = login_file("account-mismatch", &two_account_seed());
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "alice@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("mallory@example.com"),
@@ -5357,12 +5354,12 @@ mod tests {
     #[tokio::test]
     async fn finish_login_checked_match_writes_normally() {
         let path = login_file("account-match", &two_account_seed());
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
 
         let name = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "alice@example.com",
             &tokens("at-fresh", "rt-fresh", 1_893_456_000_000),
             profile_named("alice@example.com"),
@@ -5387,7 +5384,7 @@ mod tests {
     #[tokio::test]
     async fn finish_login_checked_all_none_profile_refuses() {
         let path = login_file("account-allnone", &two_account_seed());
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let all_none = Profile {
@@ -5402,7 +5399,7 @@ mod tests {
         let err = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "alice@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             all_none,
@@ -5443,14 +5440,14 @@ mod tests {
         let path = login_file("account-ambiguous", seed);
         // Migrates: the two rows become `dup@example.com` and
         // `dup@example.com/corp-b`. `corp-b` on its own names neither.
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
         assert_eq!(config.accounts[1].name, "dup@example.com/corp-b");
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("dup@example.com"),
@@ -5490,14 +5487,14 @@ mod tests {
         let path = login_file("account-org-disambig", seed);
         // Loading migrates the duplicate: Corp A keeps the bare email (lower
         // priority number), Corp B takes its org's slug.
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
         assert_eq!(config.accounts[0].name, "dup@example.com");
         assert_eq!(config.accounts[1].name, "dup@example.com/corp-b");
 
         let name = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_with_identity(
@@ -5565,7 +5562,7 @@ mod tests {
     #[tokio::test]
     async fn finish_login_checked_same_uuid_different_org_is_a_mismatch() {
         let path = login_file("account-same-uuid-diff-org", ONE_PERSON_IN_TWO_ORGS);
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         // The browser authenticated as the SAME person, but the Personal org.
@@ -5579,7 +5576,7 @@ mod tests {
         let err = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "me@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             wrong_org_profile,
@@ -5732,7 +5729,7 @@ mod tests {
     #[tokio::test]
     async fn finish_login_checked_same_uuid_same_org_matches() {
         let path = login_file("account-same-uuid-same-org", ONE_PERSON_IN_TWO_ORGS);
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
 
         let right_profile = profile_with_identity(
             "me@example.com",
@@ -5744,7 +5741,7 @@ mod tests {
         let name = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "me@example.com (Corp)",
             &tokens("at-fresh-corp", "rt-fresh-corp", 1_893_456_000_000),
             right_profile,
@@ -5791,13 +5788,13 @@ mod tests {
               "refreshToken": "rt-work-DEAD", "expiresAt": 1893456000000, "priority": 0 }
         ] }"#;
         let path = login_file("account-non-email-name", seed);
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "work",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("someone@example.com"),
@@ -5829,12 +5826,12 @@ mod tests {
     #[tokio::test]
     async fn finish_login_checked_no_account_skips_the_check() {
         let path = login_file("account-none", &two_account_seed());
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
 
         let name = finish_login_checked(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
             profile_named("carol@example.com"),
@@ -5886,7 +5883,7 @@ mod tests {
 
         // The stale snapshot: what `login()` would have loaded before its own
         // async window (profile fetch / stdin prompt) opened.
-        let mut client_config = load_or_default(&path).unwrap();
+        let client_config = load_or_default(&path).unwrap();
 
         // The live server rotates bob's credentials WHILE that snapshot is
         // held — a real re-login through the same route this unit adds,
@@ -5915,7 +5912,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::Live,
-            &mut client_config,
+            &client_config,
             "charlie@example.com",
             &tokens("at-charlie", "rt-charlie", 1_893_456_000_000),
             profile_named("charlie@example.com"),
@@ -5965,7 +5962,7 @@ mod tests {
         serve_live_proxy(listener, &seed, Some(path.clone()));
 
         // The caller's config carries the WRONG key.
-        let mut client_config: Config = serde_json::from_str(&format!(
+        let client_config: Config = serde_json::from_str(&format!(
             r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#
         ))
         .unwrap();
@@ -5974,7 +5971,7 @@ mod tests {
         let err = finish_login(
             &path,
             WriteRoute::Live,
-            &mut client_config,
+            &client_config,
             "dave@example.com",
             &tokens("at-dave", "rt-dave", 1_893_456_000_000),
             profile_named("dave@example.com"),
@@ -6006,12 +6003,12 @@ mod tests {
             format!(r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [] }}"#),
         )
         .unwrap();
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
 
         let name = finish_login(
             &path,
             WriteRoute::Live,
-            &mut config,
+            &config,
             "erin@example.com",
             &tokens("at-erin", "rt-erin", 1_893_456_000_000),
             profile_named("erin@example.com"),
@@ -6050,7 +6047,7 @@ mod tests {
 
     /// Rotate alice's tokens on disk through `config::save_account`, the live server's own
     /// surgical persist path, and check the rotation landed.
-    fn rotate_alice_on_disk(path: &std::path::Path) {
+    fn rotate_alice_on_disk(path: &Path) {
         let rotated_alice = Account {
             access_token: "at-alice-ROTATED".to_string(),
             refresh_token: Some("rt-alice-ROTATED".to_string()),
@@ -6070,7 +6067,7 @@ mod tests {
     /// whole-file-write a stale snapshot back over `rotation`, and `<added>@example.com`
     /// was added.
     fn assert_the_rotation_survived_and_one_was_added(
-        path: &std::path::Path,
+        path: &Path,
         route: &str,
         rotation: &str,
         added: &str,
@@ -6123,7 +6120,7 @@ mod tests {
         // and the connect succeeds, but nothing is ever written back —
         // `post_add_account` times out at its own 5s deadline.
         let port = wedged_port();
-        let (path, mut client_config) = alice_on_a_proxy_port("live-timeout", port);
+        let (path, client_config) = alice_on_a_proxy_port("live-timeout", port);
 
         // A rotation lands on disk AFTER that snapshot was taken — the live
         // server's own persist path, used directly since the port itself is
@@ -6133,7 +6130,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::Live,
-            &mut client_config,
+            &client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
             profile_named("carol@example.com"),
@@ -6170,7 +6167,7 @@ mod tests {
         // was live a moment ago (mirroring the capability probe having
         // confirmed it), but by the time `finish_login` runs, nothing is
         // listening and a connect is refused outright.
-        let (path, mut client_config) = alice_on_a_proxy_port("live-noserver-clobber", DEAD_PORT);
+        let (path, client_config) = alice_on_a_proxy_port("live-noserver-clobber", DEAD_PORT);
 
         // A rotation lands on disk AFTER that snapshot was taken — the
         // (now-gone) server's own persist path, used directly since the port
@@ -6180,7 +6177,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::Live,
-            &mut client_config,
+            &client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
             profile_named("carol@example.com"),
@@ -6232,7 +6229,7 @@ mod tests {
         // The stale snapshot: what `login()` loads before its own async
         // window (profile fetch / possible stdin prompt) opens. No live
         // proxy is involved at all — this is the historical `File` route.
-        let mut client_config = load_or_default(&path).unwrap();
+        let client_config = load_or_default(&path).unwrap();
 
         // Out-of-band changes land on disk AFTER that snapshot was taken:
         // an unmodelled top-level key (standing in for `sessionAffinity`)
@@ -6253,7 +6250,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::File,
-            &mut client_config,
+            &client_config,
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
             profile_named("carol@example.com"),
@@ -6292,7 +6289,7 @@ mod tests {
     #[tokio::test]
     async fn finish_login_no_route_does_not_clobber_other_accounts() {
         let port = empty_router_port();
-        let (path, mut client_config) = alice_on_a_proxy_port("live-noroute", port);
+        let (path, client_config) = alice_on_a_proxy_port("live-noroute", port);
 
         // A rotation lands on disk AFTER that snapshot was taken — this
         // "older tcr" has no add-account route to have produced it, standing
@@ -6303,7 +6300,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::Live,
-            &mut client_config,
+            &client_config,
             "dana@example.com",
             &tokens("at-dana", "rt-dana", 1_893_456_000_000),
             profile_named("dana@example.com"),
@@ -6321,7 +6318,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `persist_via_account_or_file`'s NotFound guard: `config::save_account`'s
+    /// `persist_via_account_or_file`'s `NotFound` guard: `config::save_account`'s
     /// `read_document` opens the file with `fs::read_to_string`, which cannot
     /// create one that is not there — so a `NoServer` result reached with NO
     /// config file on disk at all must still fall back to `persist_via_file`
@@ -6342,13 +6339,13 @@ mod tests {
         // hold when there is nothing on disk yet. Must carry `dead_port`
         // explicitly: leaving `proxy.port` at its serde default would send
         // this test's request to whatever real port 3456 happens to hold.
-        let mut client_config: Config =
+        let client_config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {dead_port} }} }}"#)).unwrap();
 
         let name = finish_login(
             &path,
             WriteRoute::Live,
-            &mut client_config,
+            &client_config,
             "frank@example.com",
             &tokens("at-frank", "rt-frank", 1_893_456_000_000),
             profile_named("frank@example.com"),
@@ -6398,7 +6395,7 @@ mod tests {
     #[tokio::test]
     async fn setup_token_account_writes_with_refresh_token_absent_and_expires_at_set() {
         let path = login_file("setup-token-write", r#"{ "accounts": [] }"#);
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
 
         let setup_tokens = Tokens {
             id_token: None,
@@ -6410,7 +6407,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "gina",
             &setup_tokens,
             all_none_profile(),
@@ -6762,7 +6759,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, r#"{ "accounts": [] }"#).unwrap();
-        let mut config = load_or_default(&path).unwrap();
+        let config = load_or_default(&path).unwrap();
 
         let login = crate::claude_code_login::parse(FAKE_CLAUDE_CODE_JSON)
             .expect("the fake document parses")
@@ -6772,7 +6769,7 @@ mod tests {
         let name = finish_login(
             &path,
             WriteRoute::File,
-            &mut config,
+            &config,
             "imported@example.com",
             &tokens,
             profile_named("imported@example.com"),
@@ -7131,7 +7128,7 @@ mod tests {
 
     /// Import alice's Codex login (bearer `at-codex`) into the config at `path` with no flags:
     /// no `--force`, no name, no `--account`, no `CODEX_HOME`.
-    async fn import_alices_login(path: &std::path::Path) -> anyhow::Result<String> {
+    async fn import_alices_login(path: &Path) -> anyhow::Result<String> {
         import_codex_login(
             path,
             false,
@@ -7199,7 +7196,7 @@ mod tests {
     async fn accounts_check_stub(
         status: u16,
         body: &str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
+    ) -> (String, Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
         recording_stub(
             axum::http::StatusCode::from_u16(status).unwrap(),
             axum::http::header::CONTENT_TYPE,
@@ -7215,12 +7212,12 @@ mod tests {
         name: axum::http::HeaderName,
         value: &str,
         body: &str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = std::sync::Arc::clone(&seen);
+    ) -> (String, Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
         let (value, body) = (value.to_string(), body.to_string());
         let origin = axum::Router::new().fallback(move |req: axum::extract::Request| {
-            let recorded = std::sync::Arc::clone(&recorded);
+            let recorded = Arc::clone(&recorded);
             let (name, value, body) = (name.clone(), value.clone(), body.clone());
             async move {
                 let header = |name: &str| {
@@ -7275,17 +7272,14 @@ mod tests {
     async fn stub_add_route(
         advertise: bool,
         echo: Option<crate::provider::Provider>,
-    ) -> (
-        u16,
-        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    ) {
+    ) -> (u16, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
         use axum::response::IntoResponse as _;
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = std::sync::Arc::clone(&seen);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
         let route = axum::Router::new().route(
             crate::proxy::ADD_ACCOUNT_PATH,
             axum::routing::post(move |body: axum::body::Bytes| {
-                let recorded = std::sync::Arc::clone(&recorded);
+                let recorded = Arc::clone(&recorded);
                 async move {
                     let doc: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     recorded.lock().unwrap().push(doc.clone());
@@ -7551,7 +7545,7 @@ mod tests {
     // --- import_codex_login: `--account` ----------------------------------------
 
     /// What a recording stub has been asked, one entry per request.
-    type Asked<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+    type Asked<T> = Arc<std::sync::Mutex<Vec<T>>>;
 
     /// A live add route that advertises Codex and a `codexUpstream` whose workspace check
     /// clears account A, both recording what they are asked: the route's port and record, then
@@ -7857,9 +7851,7 @@ mod tests {
 
     /// A stub `codexUpstream` on 127.0.0.1:0 that answers every request `302 Found` with
     /// `Location: location`, and records it as [`accounts_check_stub`] does.
-    async fn redirecting_stub(
-        location: &str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
+    async fn redirecting_stub(location: &str) -> (String, Arc<std::sync::Mutex<Vec<SeenCheck>>>) {
         recording_stub(
             axum::http::StatusCode::FOUND,
             axum::http::header::LOCATION,

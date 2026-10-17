@@ -35,7 +35,7 @@ impl std::io::Write for SharedBuf {
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-    type Writer = SharedBuf;
+    type Writer = Self;
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }

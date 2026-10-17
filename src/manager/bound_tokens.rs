@@ -59,7 +59,7 @@ use super::{Manager, WarmWindow};
 /// [`Manager::first_switch_warning`]). The client's own retry comes within seconds; this only
 /// has to outlast a user who cancels the retry and sends the next turn by hand, without
 /// silencing a warning that is due again much later.
-pub const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
+pub(super) const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
 
 /// One token as the response path hands it over: its kind and the token itself, unhashed. The
 /// hashing happens here, once, so no caller can forget it.
@@ -249,7 +249,7 @@ impl ShardedBoundTokens {
     /// one lock: a mint that landed since the caller read the entry is fresher than this.
     pub(super) fn rebind(&self, hash: &str, from: usize, value: Minted, now_ms: i64) -> bool {
         let mut shard = self.shard(hash);
-        if !shard.get(hash).is_some_and(|(idx, _, _)| idx == from) {
+        if shard.get(hash).is_none_or(|(idx, _, _)| idx != from) {
             return false;
         }
         shard.insert(hash, value);
@@ -810,7 +810,7 @@ mod tests {
     }
 
     fn tokens(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+        list.iter().map(ToString::to_string).collect()
     }
 
     /// The flusher's save writes nothing when the map is what it last wrote. The file is
@@ -1477,7 +1477,7 @@ mod tests {
         let mut now: i64 = 10_000;
         for step in 0..5_000usize {
             now += (next() % 7) as i64;
-            for _ in 0..1 + next() % 3 {
+            for _ in 0..=(next() % 3) {
                 let hash = bound_tokens::hash_token(&format!("tok_fake_{}", next() % 120));
                 let value = (
                     step % 3,

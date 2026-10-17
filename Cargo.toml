@@ -7,15 +7,146 @@
 members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire"]
 resolver = "2"
 
+# One lint table for every crate (each opts in with `[lints] workspace = true`).
+# A lint whose fixes would make this code worse is turned off HERE with its
+# reason, never silenced at a call site. Settings a lint needs live in
+# clippy.toml.
+[workspace.lints.rust]
+unused_lifetimes = "warn"
+redundant_lifetimes = "warn"
+unreachable_pub = "warn"
+trivial_numeric_casts = "warn"
+unused_import_braces = "warn"
+meta_variable_misuse = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
 # Gil's rules for production code. `clippy.toml` sets allow-unwrap-in-tests and
 # allow-expect-in-tests, so `#[test]` functions and `#[cfg(test)]` modules may unwrap and expect;
 # integration-test crates carry one crate-level `#[expect]` for their helpers instead.
-[workspace.lints.clippy]
 # No `.unwrap()` or `.expect()` outside tests.
 unwrap_used = "deny"
 expect_used = "deny"
 # No `let _ = <must_use expr>`: a dropped `Result` goes through `tcr::log_err::LogErr` instead.
 let_underscore_must_use = "deny"
+
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints turned off, each with the reason its fixes do not pay here.
+# A binary, not a library: nobody reads a rustdoc `# Errors`/`# Panics`
+# section or relies on `#[must_use]` across a crate boundary, and the three
+# member crates have one consumer each, in this repository.
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# The numeric casts are counts, byte sizes, milliseconds and ratios whose
+# ranges the surrounding code already bounds; `try_from` at each one adds an
+# error branch that cannot be taken, or a behaviour change where it can.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Long functions here are long because they are a protocol's steps in order,
+# with the reason for each step beside it; splitting them hides the order.
+too_many_lines = "allow"
+# A constant declared beside the one statement that uses it, with its reason
+# in a comment, reads better than the same constant hoisted away from it.
+items_after_statements = "allow"
+# Names like `req`/`res` and `a`/`b` in tests are the clearest names.
+similar_names = "allow"
+many_single_char_names = "allow"
+# Config and wire structs mirror JSON documents; their bools and their field
+# names (`access_token`, `refresh_token`, `id_token`) are the format.
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+# `write!` into a String returns a Result that can never be Err, so the fix
+# trades one allocation for a discarded Result, against the no-`let _` rule.
+format_push_string = "allow"
+format_collect = "allow"
+# Merging two match arms that do the same thing for different documented
+# reasons loses the reasons.
+match_same_arms = "allow"
+# The `Manager` impl files under src/manager/ share their parent's imports
+# through `use super::*` on purpose; expanding it lists a dozen names per file.
+wildcard_imports = "allow"
+# Its fix turns `assert!(v.is_empty())` into `assert_eq!(v, [] as [T; 0])`,
+# naming the element type at every site; the original reads better.
+assert_is_empty = "allow"
+# `Default::default()` here is almost all fixture fields
+# (`provider: Default::default()`), where the field name already says what is
+# built, and the fix names a type the test module often does not import.
+default_trait_access = "allow"
+# An explicit `continue` in a loop's match arm says the arm skips the rest.
+needless_continue = "allow"
+# The flagged `_name` bindings are guards and handles held for their drop.
+used_underscore_binding = "allow"
+# `(2..).find(..)` and friends: finite because of what follows, which the lint
+# cannot see.
+maybe_infinite_iter = "allow"
+# The flagged sites are tests that panic on a poisoned lock; naming the error
+# adds nothing to a message that already says what failed.
+match_wild_err_arm = "allow"
+# A test float compared exactly is the point of the test.
+float_cmp = "allow"
+# Every hit compares a file name tcr wrote itself, lowercase by construction
+# (`.tmp`, `.rs`); the fix is a three-line `Path::extension` chain that also
+# starts accepting `.TMP`.
+case_sensitive_file_extension_comparisons = "allow"
+# Each hit is an arm like `refused => panic!("..{refused:?}")` that binds the
+# one other variant to print it whole; naming the variant there says nothing more.
+match_wildcard_for_single_variants = "allow"
+# Signature lints whose hits are shapes the code needs:
+# serde's `skip_serializing_if` and `with` functions must take `&T` and
+# `&Option<T>` (trivially_copy_pass_by_ref, ref_option); clap hands each
+# `run_*` its `Args` by value, a thread entry owns its channel, and test
+# fixtures take owned JSON (needless_pass_by_value); `Option<Option<T>>` is a
+# clap flag whose value is optional, or "absent or null" against "does not
+# parse" (option_option); a `#[cfg(test)]` twin of `wall_now` reads `self`
+# where the production one does not (unused_self); one hasher in a binary
+# (implicit_hasher). unnecessary_wraps: the hits are test fixtures that build
+# the `Option`/`Result` the code under test takes, and `quota::resolve_reset`,
+# whose five callers store an `Option`, so the wrap would move to each caller.
+trivially_copy_pass_by_ref = "allow"
+ref_option = "allow"
+needless_pass_by_value = "allow"
+option_option = "allow"
+unused_self = "allow"
+implicit_hasher = "allow"
+unnecessary_wraps = "allow"
+# Every hit is a test or stub helper that calls `tokio::spawn` (so it must be
+# called inside a runtime, which `async` says), an async trait method, or one of
+# three peer entry points kept async beside their awaiting siblings. Dropping
+# `async` moves an `.await` at every caller and says less.
+unused_async = "allow"
+unused_async_trait_impl = "allow"
+
+# Nursery lints that find slower or larger code. The rest of the nursery group
+# stays off: significant_drop_tightening, option_if_let_else,
+# redundant_pub_crate, future_not_send, too_long_first_doc_paragraph,
+# branches_sharing_code (its fix hoists a log line out of the branch that
+# explains it), collection_is_never_read (a Vec that holds connections open
+# by owning them) and needless_collect (its hits are tests that collect thread
+# handles so every thread starts before the first join; without the collect
+# they run one at a time) disagree with code here.
+redundant_clone = "warn"
+missing_const_for_fn = "warn"
+or_fun_call = "warn"
+use_self = "warn"
+equatable_if_let = "warn"
+iter_on_single_items = "warn"
+needless_pass_by_ref_mut = "warn"
+large_futures = "warn"
+
+# Restriction lints, each with a hit or a hazard that justifies it.
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+needless_raw_strings = "warn"
+# An explicit `Arc::clone(&x)` says a reference count moves, not a deep copy.
+clone_on_ref_ptr = "warn"
+# Not empty_structs_with_brackets: its one hit is `MoveOffer {}` in
+# tcr-peer-wire, and serde writes a braced empty struct as `{}` but a unit
+# struct as `null`, so the fix changes the peer wire.
 
 [package]
 name = "tcr"

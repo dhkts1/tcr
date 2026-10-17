@@ -650,7 +650,7 @@ fn build_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAccept
 
 fn load_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let data = std::fs::read(path)?;
-    let mut reader = std::io::BufReader::new(&data[..]);
+    let mut reader = io::BufReader::new(&data[..]);
     let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         anyhow::bail!("no certificates found in {}", path.display());
@@ -660,7 +660,7 @@ fn load_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateD
 
 fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
     let data = std::fs::read(path)?;
-    let mut reader = std::io::BufReader::new(&data[..]);
+    let mut reader = io::BufReader::new(&data[..]);
     rustls_pemfile::private_key(&mut reader)?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
 }
@@ -712,7 +712,7 @@ pub fn ca_bundle_contains(bundle: &Path, ca: &Path) -> bool {
     if bundle == ca {
         return true;
     }
-    let certs = |path: &Path| -> std::io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let certs = |path: &Path| -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
         let bytes = std::fs::read(path)?;
         rustls_pemfile::certs(&mut bytes.as_slice()).collect()
     };
@@ -725,7 +725,7 @@ pub fn ca_bundle_contains(bundle: &Path, ca: &Path) -> bool {
 }
 
 /// Scope Codex's proxy marker and CA to its launch; never export either for the whole shell.
-/// Claude can keep using its existing NODE_EXTRA_CA_CERTS setup.
+/// Claude can keep using its existing `NODE_EXTRA_CA_CERTS` setup.
 pub fn ca_export_hint(ca: &Path, holds_codex: bool) -> String {
     let mut line = format!(
         "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}",
@@ -740,7 +740,7 @@ pub fn ca_export_hint(ca: &Path, holds_codex: bool) -> String {
 /// The log line for a leaf re-minted under the persisted CA, which keeps every exported CA
 /// variable valid: `NODE_EXTRA_CA_CERTS`, and `CODEX_CA_CERTIFICATE` once the config holds a
 /// Codex account.
-fn remint_note(holds_codex: bool) -> &'static str {
+const fn remint_note(holds_codex: bool) -> &'static str {
     if holds_codex {
         "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS and \
          CODEX_CA_CERTIFICATE stay valid"
@@ -751,7 +751,7 @@ fn remint_note(holds_codex: bool) -> &'static str {
 
 /// The server's boot log line naming how a client trusts the CA it loaded:
 /// `NODE_EXTRA_CA_CERTS`, and `CODEX_CA_CERTIFICATE` once the config holds a Codex account.
-pub fn advertise_note(holds_codex: bool) -> &'static str {
+pub const fn advertise_note(holds_codex: bool) -> &'static str {
     if holds_codex {
         "MITM: advertise this CA via NODE_EXTRA_CA_CERTS and CODEX_CA_CERTIFICATE"
     } else {
@@ -939,7 +939,7 @@ pub async fn serve_with_shutdown(
     listener: TcpListener,
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl Future<Output = ()>,
 ) {
     serve_with_shutdown_using_connector(
         listener,
@@ -955,7 +955,7 @@ async fn serve_with_shutdown_using_connector(
     listener: TcpListener,
     manager: Arc<Manager>,
     tls: Option<Arc<TlsAcceptor>>,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl Future<Output = ()>,
     connector: TunnelConnector,
 ) {
     let mut shutdown = std::pin::pin!(shutdown);
@@ -977,7 +977,7 @@ async fn serve_with_shutdown_using_connector(
                 continue;
             }
         };
-        let manager = manager.clone();
+        let manager = Arc::clone(&manager);
         let tls = tls.clone();
         let connector = Arc::clone(&connector);
         tokio::spawn(
@@ -1722,16 +1722,16 @@ mod tests {
             let path = dir.path().join("config.json");
             std::fs::write(&path, b"{}").unwrap();
             let manager = dummy_manager_at(Some(path));
-            let held = manager.clone();
+            let held = Arc::clone(&manager);
             let (ready, acquired) = std::sync::mpsc::channel();
             let (release, released) = std::sync::mpsc::channel();
             let holder = std::thread::spawn(move || {
                 held.with_config_write_for_test(|| {
                     ready.send(()).unwrap();
                     released
-                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .recv_timeout(Duration::from_secs(2))
                         .log_debug("waiting for the test's release signal");
-                })
+                });
             });
             acquired.recv().unwrap();
             let start = std::time::Instant::now();
@@ -1742,7 +1742,7 @@ mod tests {
                 .log_debug("releasing the test's config writer");
             holder.join().unwrap();
             assert!(
-                elapsed < std::time::Duration::from_millis(500),
+                elapsed < Duration::from_millis(500),
                 "{host} waited {elapsed:?}"
             );
         }
@@ -1898,13 +1898,13 @@ mod tests {
             "www.example.org",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect();
         assert!(
             !sans_match(&before, FALLBACK_LEAF_SANS),
             "the pre-Codex SAN set must read as stale"
         );
-        let now: Vec<String> = FALLBACK_LEAF_SANS.iter().map(|s| s.to_string()).collect();
+        let now: Vec<String> = FALLBACK_LEAF_SANS.iter().map(ToString::to_string).collect();
         assert!(sans_match(&now, FALLBACK_LEAF_SANS));
     }
 
@@ -1968,7 +1968,7 @@ mod tests {
         // complete a real TLS handshake against the re-minted leaf.
         ensure_crypto_provider();
         let mut roots = rustls::RootCertStore::empty();
-        let mut reader = std::io::BufReader::new(&ca_pem_after[..]);
+        let mut reader = io::BufReader::new(&ca_pem_after[..]);
         for cert in rustls_pemfile::certs(&mut reader) {
             roots
                 .add(cert.expect("parse persisted CA cert"))
@@ -2100,13 +2100,13 @@ mod tests {
         dummy_manager_at(None)
     }
 
-    fn dummy_manager_at(config_path: Option<std::path::PathBuf>) -> Arc<Manager> {
+    fn dummy_manager_at(config_path: Option<PathBuf>) -> Arc<Manager> {
         dummy_manager_keyed(config_path, None)
     }
 
     /// [`dummy_manager_at`], holding `request_key` as `proxy.requestKey`.
     fn dummy_manager_keyed(
-        config_path: Option<std::path::PathBuf>,
+        config_path: Option<PathBuf>,
         request_key: Option<&str>,
     ) -> Arc<Manager> {
         let config = crate::config::Config {
@@ -2140,7 +2140,7 @@ mod tests {
                 let Ok((stream, peer)) = listener.accept().await else {
                     break;
                 };
-                let manager = manager.clone();
+                let manager = Arc::clone(&manager);
                 tokio::spawn(async move {
                     // Same shape as the production accept loop in
                     // `serve_with_shutdown`: a connection error is non-fatal but is

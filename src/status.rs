@@ -586,14 +586,14 @@ pub struct AccountStatus {
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
-fn to_ms(t: OffsetDateTime) -> i64 {
+const fn to_ms(t: OffsetDateTime) -> i64 {
     (t.unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 /// Inverse of [`to_ms`]. `None` on an out-of-range value rather than a panic — a
 /// nonsense timestamp from the wire degrades one rendered field, never the run.
 fn from_ms(ms: i64) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok()
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
 impl StatusPayload {
@@ -1622,7 +1622,7 @@ fn peer_paths(
 /// millisecond: a row exactly one window old is still inside its window on both
 /// sides, so "may carry this hour" and "carried this hour" cannot be read
 /// against two different hours.
-fn rolled(total: u64, updated_at_ms: i64, now_ms: i64) -> u64 {
+const fn rolled(total: u64, updated_at_ms: i64, now_ms: i64) -> u64 {
     if now_ms.saturating_sub(updated_at_ms) > crate::peer::tunnel::BUDGET_WINDOW_MS {
         0
     } else {
@@ -2104,7 +2104,7 @@ mod tests {
                     calls: 2,
                     errors: 0,
                     timeouts: 1,
-                    timeouts_by_class: [("git-net".to_string(), 1u64)].into_iter().collect(),
+                    timeouts_by_class: std::iter::once(("git-net".to_string(), 1u64)).collect(),
                     timed_out: vec![tcr_status_wire::SlowToolRow {
                         tool: "Bash".to_string(),
                         seconds: 600.0,
@@ -2147,7 +2147,7 @@ mod tests {
                 calls: 2,
                 over_one_minute: 0,
                 timeouts: 1,
-                timeouts_by_class: [("git-net".to_string(), 1u64)].into_iter().collect(),
+                timeouts_by_class: std::iter::once(("git-net".to_string(), 1u64)).collect(),
                 by_tool: vec![tcr_status_wire::ToolBucketRow {
                     tool: "Bash".to_string(),
                     calls: 2,
@@ -2545,9 +2545,7 @@ mod tests {
                 totals,
             }),
             last_hour: totals,
-            today_by_model: [("claude-opus-5".to_string(), totals)]
-                .into_iter()
-                .collect(),
+            today_by_model: std::iter::once(("claude-opus-5".to_string(), totals)).collect(),
             seven_day_window: None,
         });
         let wire = serde_json::to_string(&StatusPayload::from_snapshot(
@@ -2769,9 +2767,7 @@ mod tests {
             today: totals,
             window: None,
             last_hour: totals,
-            today_by_model: [("gpt-5.1-codex".to_string(), totals)]
-                .into_iter()
-                .collect(),
+            today_by_model: std::iter::once(("gpt-5.1-codex".to_string(), totals)).collect(),
             seven_day_window: Some(tcr_status_wire::UsageWindow {
                 since: 1_766_966_400_000,
                 totals,
@@ -2982,9 +2978,7 @@ mod tests {
                 totals,
             }),
             last_hour: totals,
-            today_by_model: [("claude-opus-5".to_string(), totals)]
-                .into_iter()
-                .collect(),
+            today_by_model: std::iter::once(("claude-opus-5".to_string(), totals)).collect(),
             seven_day_window: None,
         });
         assert_eq!(

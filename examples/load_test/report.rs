@@ -19,10 +19,10 @@ use crate::stats::{Frame, Summary};
 
 /// Sends allowed over the fleet ceiling in one second before the check fails: the stub
 /// timestamps arrivals, not the proxy's sends, and a loaded box can bunch a few together.
-pub const CEILING_JITTER: usize = 2;
+pub(crate) const CEILING_JITTER: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhaseResult {
+pub(crate) struct PhaseResult {
     pub phase: Phase,
     pub duration_s: f64,
     pub reply_ms: u64,
@@ -95,24 +95,24 @@ pub struct PhaseResult {
 
 impl PhaseResult {
     /// CPU seconds per minute of wall time: in the idle phase, what an idle minute costs.
-    pub fn cpu_s_per_minute(&self) -> Option<f64> {
+    pub(crate) fn cpu_s_per_minute(&self) -> Option<f64> {
         (self.wall_s > 0.0).then(|| self.cpu_seconds / self.wall_s * 60.0)
     }
 
     /// Megabytes the proxy wrote to disk over the phase.
-    pub fn disk_written_mb(&self) -> Option<f64> {
+    pub(crate) fn disk_written_mb(&self) -> Option<f64> {
         self.disk_written_bytes
             .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
     }
 
     /// INFO lines logged per served request.
-    pub fn info_lines_per_request(&self) -> Option<f64> {
+    pub(crate) fn info_lines_per_request(&self) -> Option<f64> {
         let lines = self.info_lines?;
         (self.served > 0).then(|| lines as f64 / self.served as f64)
     }
 
     /// Every reason this phase's numbers cannot be trusted, or the fence was crossed.
-    pub fn failures(&self) -> Vec<String> {
+    pub(crate) fn failures(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.refused_connects > 0 {
             out.push(format!(
@@ -198,7 +198,7 @@ fn fmt_load(l: [f64; 3]) -> String {
 /// the count is smaller than `served`. With the throttles off, `throttle_send` takes no lock
 /// and never sleeps (`src/manager/throttle.rs`), yet `src/proxy.rs` still times the call, so a
 /// nonzero value there is the call itself being descheduled, not a wait.
-pub fn throttle_line(r: &PhaseResult) -> String {
+pub(crate) fn throttle_line(r: &PhaseResult) -> String {
     let nonzero = r.throttled_requests;
     let lines = r.usage_lines;
     let max = r.throttle_ms.map_or(0.0, |s| s.max);
@@ -240,14 +240,18 @@ pub fn throttle_line(r: &PhaseResult) -> String {
 /// What one phase's flame graph says, in two lists: the leaf frames (often a system call) and
 /// the proxy code nearest them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Profile {
+pub(crate) struct Profile {
     pub samples: u64,
     pub self_frames: Vec<Frame>,
     pub tcr_frames: Vec<Frame>,
 }
 
 /// The run's markdown report: one table of headline figures, then the detail per phase.
-pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, meta: &str) -> String {
+pub(crate) fn markdown(
+    results: &[PhaseResult],
+    frames: &BTreeMap<String, Profile>,
+    meta: &str,
+) -> String {
     let mut md = String::new();
     out!(md, "# tcr load test\n\n{meta}\n");
     out!(
@@ -266,14 +270,15 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
             r.sent,
             r.served,
             r.errors + r.unfinished,
-            r.cpu_s_per_1k.map_or("n/a".into(), |v| format!("{v:.2}")),
+            r.cpu_s_per_1k
+                .map_or_else(|| "n/a".into(), |v| format!("{v:.2}")),
             r.cpu_s_per_minute()
-                .map_or("n/a".into(), |v| format!("{v:.3}")),
+                .map_or_else(|| "n/a".into(), |v| format!("{v:.3}")),
             r.disk_written_mb()
-                .map_or("n/a".into(), |v| format!("{v:.2}")),
-            r.threads.map_or("n/a".into(), |v| v.to_string()),
+                .map_or_else(|| "n/a".into(), |v| format!("{v:.2}")),
+            r.threads.map_or_else(|| "n/a".into(), |v| v.to_string()),
             r.info_lines_per_request()
-                .map_or("n/a".into(), |v| format!("{v:.2}")),
+                .map_or_else(|| "n/a".into(), |v| format!("{v:.2}")),
             fmt_summary(r.added_ms.as_ref()),
             if r.throttles_off {
                 "off".into()
@@ -309,7 +314,7 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
                 "- each request a generated long conversation of about {:.1} MiB; CPU per request {}",
                 bytes as f64 / (1024.0 * 1024.0),
                 r.cpu_s_per_1k
-                    .map_or("n/a".into(), |v| format!("{v:.2} ms"))
+                    .map_or_else(|| "n/a".into(), |v| format!("{v:.2} ms"))
             );
         }
         out!(
@@ -331,15 +336,16 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
             } else {
                 0.0
             },
-            r.cpu_s_per_1k.map_or("n/a".into(), |v| format!("{v:.2}")),
+            r.cpu_s_per_1k
+                .map_or_else(|| "n/a".into(), |v| format!("{v:.2}")),
         );
         out!(
             md,
             "- disk written {} MB; {} threads at the end; INFO lines {} ({:?})",
             r.disk_written_mb()
-                .map_or("n/a".into(), |v| format!("{v:.2}")),
-            r.threads.map_or("n/a".into(), |v| v.to_string()),
-            r.info_lines.map_or("n/a".into(), |v| v.to_string()),
+                .map_or_else(|| "n/a".into(), |v| format!("{v:.2}")),
+            r.threads.map_or_else(|| "n/a".into(), |v| v.to_string()),
+            r.info_lines.map_or_else(|| "n/a".into(), |v| v.to_string()),
             r.info_messages
         );
         out!(
@@ -413,12 +419,12 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
     md
 }
 
-pub fn read_phase(path: &Path) -> anyhow::Result<PhaseResult> {
+pub(crate) fn read_phase(path: &Path) -> anyhow::Result<PhaseResult> {
     Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
 }
 
 /// Min, median and max of one figure across runs.
-pub fn spread(values: &[f64]) -> Option<(f64, f64, f64)> {
+pub(crate) fn spread(values: &[f64]) -> Option<(f64, f64, f64)> {
     let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
     if v.is_empty() {
         return None;
@@ -427,7 +433,7 @@ pub fn spread(values: &[f64]) -> Option<(f64, f64, f64)> {
     let median = if v.len() % 2 == 1 {
         v[v.len() / 2]
     } else {
-        (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0
+        f64::midpoint(v[v.len() / 2 - 1], v[v.len() / 2])
     };
     Some((v[0], median, v[v.len() - 1]))
 }

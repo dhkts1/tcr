@@ -121,7 +121,7 @@ impl Run {
 async fn tcr(fleet: &Fleet, args: &[&str]) -> Run {
     let home = fleet.home.path().to_path_buf();
     let config = fleet.config.clone();
-    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let args: Vec<String> = args.iter().map(ToString::to_string).collect();
     tokio::task::spawn_blocking(move || {
         let mut command = crate::tcr_env::tcr(&home);
         command

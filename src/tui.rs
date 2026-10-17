@@ -603,24 +603,16 @@ fn key_action(key: &KeyEvent) -> Action {
         return Action::None;
     }
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
-        KeyCode::Char('c') | KeyCode::Char('C')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            Action::Quit
-        }
+        KeyCode::Char('q' | 'Q') => Action::Quit,
+        KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
         // `r` for redraw, plus the Ctrl-L every other full-screen program answers
         // to. Either one repairs a screen some other writer has corrupted.
-        KeyCode::Char('l') | KeyCode::Char('L')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            Action::Redraw
-        }
-        KeyCode::Char('r') | KeyCode::Char('R') => Action::Redraw,
+        KeyCode::Char('l' | 'L') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Redraw,
+        KeyCode::Char('r' | 'R') => Action::Redraw,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
-        KeyCode::Char('d') | KeyCode::Char('D') => Action::Disable,
-        KeyCode::Char('e') | KeyCode::Char('E') => Action::Enable,
+        KeyCode::Char('d' | 'D') => Action::Disable,
+        KeyCode::Char('e' | 'E') => Action::Enable,
         _ => Action::None,
     }
 }
@@ -1098,7 +1090,7 @@ const FULL_LAYOUT_MIN_WIDTH: u16 = 174;
 /// Pick the accounts-table layout for a pane `width` — the pure, rendering-free
 /// core of the responsive table, so the breakpoint is unit-testable without a
 /// terminal. See [`AccountsLayout`] for *why* the breakpoint is deterministic.
-fn accounts_layout(width: u16) -> AccountsLayout {
+const fn accounts_layout(width: u16) -> AccountsLayout {
     if width >= FULL_LAYOUT_MIN_WIDTH {
         AccountsLayout::Full
     } else {
@@ -2224,7 +2216,7 @@ fn status_style(status: &str) -> Style {
     }
 }
 
-fn status_color(status: u16) -> Color {
+const fn status_color(status: u16) -> Color {
     match status {
         200..=299 => Color::Green,
         429 => Color::Magenta,
@@ -2617,7 +2609,7 @@ mod tests {
     ///
     /// `Terminal::clear` does, and crossterm answers by writing `ESC [ 6 n` and
     /// reading the reply off stdin — which this TUI's `EventStream` is already
-    /// draining. On a terminal where the EventStream wins that race the read times
+    /// draining. On a terminal where the `EventStream` wins that race the read times
     /// out after two seconds and the clear fails having cleared nothing, so the
     /// repair re-arms and blocks the tick every time. That is issue #323's tail on
     /// 1.1.3: `could not clear a dirty screen error=The cursor position could not
@@ -3945,7 +3937,7 @@ mod tests {
             "bob moved down one, and the cursor with him"
         );
         assert_eq!(
-            reanchor(&drawn, 1, &[frank.clone(), bob.clone()]),
+            reanchor(&drawn, 1, &[frank.clone(), bob]),
             0,
             "alice was deleted above frank, and the cursor stays on frank"
         );
@@ -3953,7 +3945,7 @@ mod tests {
             reanchor(
                 &[alice.clone(), frank.clone()],
                 1,
-                &[alice.clone(), frank.clone(), carol.clone()]
+                &[alice.clone(), frank.clone(), carol]
             ),
             1,
             "a Claude-only table grows at its end"
@@ -4136,7 +4128,7 @@ mod tests {
         let notice = toggle(&manager, &before, 0, false);
         assert_eq!(
             notice.map(|n| n.text),
-            crate::manager::DisablePersist::NoSuchAccount.warning(false),
+            DisablePersist::NoSuchAccount.warning(false),
             "a key on a frame drawn before the delete reaches no row"
         );
         std::fs::remove_file(&path).ok();
@@ -4541,7 +4533,7 @@ mod tests {
                 .expect("test backend builds a terminal");
             terminal
                 .draw(|frame| {
-                    render_accounts_with(frame, frame.area(), snapshot, selected, &facts, anchor())
+                    render_accounts_with(frame, frame.area(), snapshot, selected, &facts, anchor());
                 })
                 .expect("render succeeds");
             terminal.backend().buffer().clone()
@@ -4765,7 +4757,7 @@ mod tests {
     #[test]
     fn render_shows_a_failed_persist_notice_without_hiding_the_fleet_banner() {
         let snapshot = util_snapshot(QuotaState::Normal);
-        let warning = crate::manager::DisablePersist::NoEntry
+        let warning = DisablePersist::NoEntry
             .warning(true)
             .expect("a NoEntry persist must warn");
 

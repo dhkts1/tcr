@@ -256,7 +256,7 @@ impl InstanceId {
     }
 
     /// The raw bytes, for the `XX` message-1 payload and the knock.
-    pub fn as_bytes(&self) -> &[u8; INSTANCE_ID_BYTES] {
+    pub const fn as_bytes(&self) -> &[u8; INSTANCE_ID_BYTES] {
         &self.0
     }
 }
@@ -286,7 +286,7 @@ impl TryFrom<String> for InstanceId {
     type Error = InstanceIdError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        InstanceId::parse(&value)
+        Self::parse(&value)
     }
 }
 
@@ -403,7 +403,7 @@ impl TryFrom<String> for PeerId {
     type Error = PeerIdError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        PeerId::parse(&value)
+        Self::parse(&value)
     }
 }
 
@@ -770,11 +770,13 @@ mod id_hex {
     use serde::de::Error as _;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(id: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(id: &u128, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&format!("{id:032x}"))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<u128, D::Error> {
         let raw = String::deserialize(deserializer)?;
         let trimmed = raw.trim();
         let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
@@ -1318,7 +1320,7 @@ pub struct HandoffToken(String);
 
 impl HandoffToken {
     /// Wrap the owner's short-lived bearer for the one frame that carries it.
-    pub fn new(value: String) -> Self {
+    pub const fn new(value: String) -> Self {
         Self(value)
     }
 

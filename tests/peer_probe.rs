@@ -111,11 +111,10 @@ fn far_end(
         anyhow::ensure!(header.kind == StreamKind::Control, "a CONTROL stream");
 
         loop {
-            let frame = match noise::recv_encrypted(&mut stream, &mut session.transport).await {
-                Ok(frame) => frame,
+            let Ok(frame) = noise::recv_encrypted(&mut stream, &mut session.transport).await else {
                 // The dialler hung up, which is how every one of these tests
                 // ends.
-                Err(_) => return Ok(()),
+                return Ok(());
             };
             let message: Control = serde_json::from_slice(&frame)?;
             let Control::Probe { nonce, sent_ms } = message else {
@@ -181,7 +180,7 @@ async fn scripted(behaviour: FarEnd) -> Scripted {
         far_secret,
         vec![pinned(dialer_public, "studio-mac")],
         behaviour,
-        probes.clone(),
+        Arc::clone(&probes),
     );
     Scripted {
         addr,

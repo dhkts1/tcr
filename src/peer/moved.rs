@@ -118,7 +118,7 @@ const MIN_LINK_BYTES: usize = FRAME_BYTES + NONCE_BYTES + TAG_BYTES + 1;
 /// address that is no longer true. What it costs is a replay window of the same
 /// length for anyone holding the link, bounded to weak endpoints on a row that
 /// was already pinned, worth at most a wasted connect attempt.
-pub const MAX_MOVED_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_MOVED_AGE: Duration = Duration::from_hours(24);
 
 // Two more ceilings apply and are deliberately NOT spelled again here: how far
 // ahead a publisher's clock may run ([`crate::peer::drop::MAX_CLOCK_SKEW`]) and

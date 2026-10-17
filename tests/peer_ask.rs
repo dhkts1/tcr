@@ -48,7 +48,7 @@ fn some_token() -> JoinToken {
     )
 }
 
-fn row(
+const fn row(
     id: u64,
     public: [u8; noise::KEY_BYTES],
     private: [u8; noise::KEY_BYTES],

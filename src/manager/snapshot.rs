@@ -25,7 +25,7 @@ impl Manager {
             let mut accounts = self
                 .accounts
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(account) = accounts.get_mut(idx) {
                 account.requests += 1;
                 account.last_used_ms = Some(odt_to_ms(now));
@@ -42,10 +42,7 @@ impl Manager {
         // pin map, so routing is unaffected.
         if let Some(key) = session_key {
             let now_ms = odt_to_ms(now);
-            let mut sessions = self
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             let stat = sessions.entry(key).or_insert(SessionStat {
                 account_idx: idx,
                 requests: 0,
@@ -63,10 +60,7 @@ impl Manager {
 
     /// Append a served-request entry to the ring buffer (most-recent-last).
     pub fn push_log(&self, entry: RequestLogEntry) {
-        let mut log = self
-            .log
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
         if log.len() >= REQUEST_LOG_CAPACITY {
             log.pop_front();
         }
@@ -85,7 +79,7 @@ impl Manager {
     pub fn thresholds(&self) -> Vec<f64> {
         self.accounts
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             // The same rows `Self::snapshot` lists, in the same order: the
             // status endpoint zips the two by position.
@@ -103,7 +97,7 @@ impl Manager {
     pub fn http1_only(&self) -> bool {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .http1_only
     }
 
@@ -113,7 +107,7 @@ impl Manager {
     pub fn proxy_port(&self) -> u16 {
         self.config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .proxy
             .port
     }
@@ -167,20 +161,14 @@ impl Manager {
         // only who SERVED last, which a divert deliberately moves while the pin
         // stays put.
         let pins: HashMap<u64, usize> = {
-            let affinity = self
-                .affinity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let affinity = self.affinity.lock().unwrap_or_else(PoisonError::into_inner);
             affinity
                 .iter()
                 .map(|(&key, &(idx, _))| (key, idx))
                 .collect()
         };
         // (2) UNDER THE ACCOUNTS LOCK: everything below resolves indices to names.
-        let accounts = self
-            .accounts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         // A row deleted from the config while this process ran keeps its slot
         // (see `AccountRuntime::removed`) and is left out of everything a
         // reader sees. `current` is re-counted over the rows that remain, so
@@ -190,16 +178,13 @@ impl Manager {
             (!accounts.get(idx)?.removed)
                 .then(|| accounts[..idx].iter().filter(|a| !a.removed).count())
         };
-        let current = (*self
-            .current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-        .and_then(listed_position);
+        let current = (*self.current.lock().unwrap_or_else(PoisonError::into_inner))
+            .and_then(listed_position);
         let current_by_provider = {
             let serving = *self
                 .current_by_provider
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             crate::stats::CurrentByProvider {
                 anthropic: serving.anthropic.and_then(listed_position),
                 codex: serving.codex.and_then(listed_position),
@@ -247,10 +232,9 @@ impl Manager {
                 // `limit_reached_type` instead (`schedule::ProbeUrgency::of`). See
                 // `Manager::codex_refusal_gate`.
                 let (gate, free_at) = Self::codex_refusal_gate(a, threshold, now, gate, free_at);
-                let reserved_groups = super::groups::carried_in(&a.groups, &groups.reserved);
-                let parked_groups = super::groups::carried_in(&a.groups, &groups.parked);
-                let control_allowed_groups =
-                    super::groups::carried_in(&a.groups, &groups.control_allowed);
+                let reserved_groups = groups::carried_in(&a.groups, &groups.reserved);
+                let parked_groups = groups::carried_in(&a.groups, &groups.parked);
+                let control_allowed_groups = groups::carried_in(&a.groups, &groups.control_allowed);
                 let codex = codex_snapshot_facts(a);
                 // A Codex row's weekly window: its live weekly reset, and the length its plan
                 // reported, or a week when it reported none. `None` on an Anthropic row, which
@@ -324,10 +308,7 @@ impl Manager {
                     quota_state,
                     gate,
                     free_at,
-                    stream_error_count: super::usage::stream_error_count(
-                        &a.stream_error_times_ms,
-                        now_ms,
-                    ),
+                    stream_error_count: usage::stream_error_count(&a.stream_error_times_ms, now_ms),
                     last_stream_error: a.last_stream_error.clone(),
                     groups: a.groups.clone(),
                     reserved_groups,
@@ -365,7 +346,7 @@ impl Manager {
         let recent = self
             .log
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .rev()
             .cloned()
@@ -378,10 +359,7 @@ impl Manager {
         // session pinned to a row deleted from the config keeps that row's provider
         // as it keeps that row's name.
         let sessions = {
-            let map = self
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             let name_of = |idx: usize| {
                 accounts
                     .get(idx)
@@ -420,7 +398,7 @@ impl Manager {
         };
 
         let wire_sessions = self.wire_sessions_snapshot(now);
-        let wire_sessions_summary = Manager::wire_sessions_summary(&wire_sessions);
+        let wire_sessions_summary = Self::wire_sessions_summary(&wire_sessions);
 
         StatsSnapshot {
             accounts: account_snaps,
