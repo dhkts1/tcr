@@ -26,21 +26,39 @@
 //! What still needs a socket of its own does not belong here: a port nothing listens on, a peer
 //! the code under test dials by a fixed port, an HTTP/2 stream reset, and a test that drives the
 //! proxy's own listener over a real socket (see each test's comment).
+//!
+//! # The Unix socket
+//!
+//! Most of a proxy test's connections are the proxy's OWN clients (the per-account serving client
+//! and the relay client) dialing a stub, and each was a loopback TCP connection and an ephemeral
+//! port. So the same routes are also served on one Unix domain socket per binary, and a serving or
+//! relay client built on a thread that registered a stub sends every request over it
+//! ([`client_socket`], read by `build_serving_client` in `manager/mod.rs` and `relay_client` in
+//! `proxy.rs` only in a test build). The request still carries its `http://127.0.0.1:<port>/stub/<id>`
+//! URL and `Host`, so a stub sees what it saw over TCP. A connection on the socket is routed by its
+//! first request: a raw stub gets the connection, an HTTP stub's request is served by hyper.
+//!
+//! A `unix_socket` client sends EVERYTHING over the socket and never resolves or dials, so a test
+//! whose serving client must reach something else (a refused port, its own HTTP/2 listener, a name
+//! that does not resolve) calls [`tcp_clients`] first. Forgetting to is loud: the socket answers a
+//! request that names no stub `421` with a message saying so.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::extract::Request;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tower::ServiceExt as _;
 
 use crate::log_err::LogErr as _;
@@ -69,10 +87,14 @@ impl fmt::Display for StubAddr {
 
 const PREFIX: &str = "/stub/";
 
-/// One accepted connection on the raw listener, handed to the stub its first request named.
+/// A byte stream a stub reads and writes: a loopback TCP connection or one on the Unix socket.
+pub trait StubIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> StubIo for T {}
+
+/// One accepted connection, handed to the raw stub its first request named.
 pub struct RawConn {
-    /// The socket, positioned just after [`RawConn::head`].
-    pub stream: TcpStream,
+    /// The connection, positioned just after [`RawConn::head`].
+    pub stream: Box<dyn StubIo>,
     /// What the shared listener read of the request (at least its whole head), prefix included.
     pub head: Vec<u8>,
 }
@@ -88,6 +110,7 @@ enum Route {
 struct Shared {
     http: SocketAddr,
     raw: SocketAddr,
+    socket: PathBuf,
     routes: Mutex<HashMap<u64, Route>>,
     next: AtomicU64,
 }
@@ -95,6 +118,36 @@ struct Shared {
 fn shared() -> &'static Shared {
     static SHARED: OnceLock<Shared> = OnceLock::new();
     SHARED.get_or_init(start)
+}
+
+thread_local! {
+    /// Whether a serving or relay client built on this thread goes over the Unix socket:
+    /// `None` until the thread registers a stub (then `true`) or calls [`tcp_clients`] (then
+    /// `false`, for good). libtest runs each test on a thread of its own, so this is per test.
+    static SOCKET_CLIENTS: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The Unix socket a serving or relay client built on this thread should send over, or `None`
+/// to dial TCP as production does. `Some` once this thread has registered a stub, unless it called
+/// [`tcp_clients`]. Read only by the two client builders, and only in a test build.
+pub fn client_socket() -> Option<&'static Path> {
+    match SOCKET_CLIENTS.with(Cell::get) {
+        Some(true) => Some(shared().socket.as_path()),
+        _ => None,
+    }
+}
+
+/// Keep this thread's serving and relay clients on TCP, for a test whose upstream is not a stub
+/// (a refused port, a listener of its own, an unresolvable name) while it also registers one.
+pub fn tcp_clients() {
+    SOCKET_CLIENTS.with(|cell| cell.set(Some(false)));
+}
+
+/// `$TMPDIR/tcr-stub-<pid>.sock`. The pid keeps two test binaries apart; a stale file a dead
+/// binary with the same pid left behind is removed before binding. The file outlives the binary,
+/// since nothing runs at process exit to unlink it; it is an empty inode in the temp dir.
+fn socket_path() -> PathBuf {
+    std::env::temp_dir().join(format!("tcr-stub-{}.sock", std::process::id()))
 }
 
 fn start() -> Shared {
@@ -110,6 +163,15 @@ fn start() -> Shared {
         .expect("HTTP stub listener nonblocking");
     raw.set_nonblocking(true)
         .expect("raw stub listener nonblocking");
+    let path = socket_path();
+    if path.exists() {
+        std::fs::remove_file(&path).expect("remove a stale stub socket");
+    }
+    let socket =
+        std::os::unix::net::UnixListener::bind(&path).expect("bind the shared stub Unix socket");
+    socket
+        .set_nonblocking(true)
+        .expect("stub Unix socket nonblocking");
     std::thread::Builder::new()
         .name("stub-upstreams".into())
         .spawn(move || {
@@ -121,7 +183,10 @@ fn start() -> Shared {
             runtime.block_on(async move {
                 let http = tokio::net::TcpListener::from_std(http).expect("adopt HTTP listener");
                 let raw = tokio::net::TcpListener::from_std(raw).expect("adopt raw listener");
+                let socket =
+                    tokio::net::UnixListener::from_std(socket).expect("adopt stub Unix socket");
                 tokio::spawn(serve_raw(raw));
+                tokio::spawn(serve_socket(socket));
                 axum::serve(http, Router::new().fallback(dispatch_http))
                     .await
                     .log_debug("serving the shared HTTP stub listener");
@@ -131,12 +196,18 @@ fn start() -> Shared {
     Shared {
         http: addrs.0,
         raw: addrs.1,
+        socket: path,
         routes: Mutex::new(HashMap::new()),
         next: AtomicU64::new(1),
     }
 }
 
 fn register(route: Route, raw: bool) -> StubAddr {
+    SOCKET_CLIENTS.with(|cell| {
+        if cell.get().is_none() {
+            cell.set(Some(true));
+        }
+    });
     let shared = shared();
     let id = shared.next.fetch_add(1, Ordering::SeqCst);
     shared
@@ -204,44 +275,154 @@ async fn dispatch_http(mut req: Request) -> Response {
 
 async fn serve_raw(listener: tokio::net::TcpListener) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
+        let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        tokio::spawn(async move {
-            let mut head = Vec::new();
-            let mut buf = [0u8; 4096];
-            // The request line is all routing needs, but read the whole head: a stub that
-            // answered and closed with request bytes still unread would reset the connection
-            // under its own reply. One read nearly always holds it all.
-            while !head.windows(4).any(|quad| quad == b"\r\n\r\n") {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => head.extend_from_slice(&buf[..n]),
-                }
-            }
-            let line = String::from_utf8_lossy(&head);
-            let target = line.split_whitespace().nth(1).unwrap_or("");
-            let handler = split_route(target).and_then(|(id, _)| {
-                match shared()
-                    .routes
-                    .lock()
-                    .expect("stub routes poisoned")
-                    .get(&id)
-                {
-                    Some(Route::Raw(handler)) => Some(Arc::clone(handler)),
-                    _ => None,
-                }
-            });
-            match handler {
-                Some(handler) => handler(RawConn { stream, head }).await,
-                None => {
-                    stream
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                        .await
-                        .log_debug("answering an unrouted raw stub request");
-                }
-            }
-        });
+        tokio::spawn(route_connection(Box::new(stream), Listener::Raw));
+    }
+}
+
+async fn serve_socket(listener: tokio::net::UnixListener) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(route_connection(Box::new(stream), Listener::Socket));
+    }
+}
+
+/// Which listener accepted a connection [`route_connection`] routes.
+#[derive(Clone, Copy)]
+enum Listener {
+    /// The raw TCP listener: only raw stubs answer on it.
+    Raw,
+    /// The Unix socket: every stub answers on it.
+    Socket,
+}
+
+/// Route one connection by its first request: a raw stub takes the connection, and on the Unix
+/// socket an HTTP stub's request is served by hyper from the bytes already read.
+async fn route_connection(mut stream: Box<dyn StubIo>, listener: Listener) {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    // The request line is all routing needs, but read the whole head: a stub that answered and
+    // closed with request bytes still unread would reset the connection under its own reply. One
+    // read nearly always holds it all.
+    while !head.windows(4).any(|quad| quad == b"\r\n\r\n") {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    let line = String::from_utf8_lossy(&head);
+    let target = line.split_whitespace().nth(1).unwrap_or("").to_string();
+    enum Found {
+        Raw(RawHandler),
+        Http,
+        Nothing,
+    }
+    let found = match split_route(&target) {
+        Some((id, _)) => match shared()
+            .routes
+            .lock()
+            .expect("stub routes poisoned")
+            .get(&id)
+        {
+            Some(Route::Raw(handler)) => Found::Raw(Arc::clone(handler)),
+            Some(Route::Http(_)) => Found::Http,
+            None => Found::Nothing,
+        },
+        None => Found::Nothing,
+    };
+    match (found, listener) {
+        (Found::Raw(handler), _) => handler(RawConn { stream, head }).await,
+        (Found::Http, Listener::Socket) => {
+            let service =
+                hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async {
+                    Ok::<_, std::convert::Infallible>(
+                        dispatch_http(req.map(axum::body::Body::new)).await,
+                    )
+                });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(Replay {
+                        head,
+                        read: 0,
+                        stream,
+                    }),
+                    service,
+                )
+                .await
+                .log_debug("serving an HTTP stub over the Unix socket");
+        }
+        (_, Listener::Raw) => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .log_debug("answering an unrouted raw stub request");
+        }
+        (Found::Nothing, Listener::Socket) => {
+            let body = format!(
+                "{target} names no stub, but it came over the stub Unix socket: a serving or \
+                 relay client built on a thread that registered a stub sends everything here. A \
+                 test whose upstream is not a stub calls stub_upstream::tcp_clients() first."
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 421 Misdirected Request\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .log_debug("answering a misdirected stub socket request");
+        }
+    }
+}
+
+/// A connection whose first bytes were already read for routing: reads return `head` first,
+/// then the rest of `stream`. Writes go straight to `stream`.
+struct Replay {
+    head: Vec<u8>,
+    read: usize,
+    stream: Box<dyn StubIo>,
+}
+
+impl AsyncRead for Replay {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if this.read < this.head.len() {
+            let n = out.remaining().min(this.head.len() - this.read);
+            out.put_slice(&this.head[this.read..this.read + n]);
+            this.read += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.stream).poll_read(cx, out)
+    }
+}
+
+impl AsyncWrite for Replay {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -414,6 +595,66 @@ mod tests {
                 assert_eq!(text, want);
             }
         }
+    }
+
+    /// A thread's clients go over the socket once it registers a stub, never before, and never
+    /// after it asked for TCP. Each case on a fresh thread, as libtest gives each test.
+    #[test]
+    fn client_socket_follows_this_threads_stubs() {
+        let on_thread =
+            |body: fn() -> Option<bool>| std::thread::spawn(body).join().expect("probe thread");
+        assert_eq!(
+            on_thread(|| Some(client_socket().is_some())),
+            Some(false),
+            "a thread with no stub dials TCP, as production does"
+        );
+        assert_eq!(
+            on_thread(|| {
+                canned(reply("200 OK", "text/plain", "ok"));
+                Some(client_socket().is_some())
+            }),
+            Some(true),
+            "a thread that registered a stub sends over the socket"
+        );
+        assert_eq!(
+            on_thread(|| {
+                tcp_clients();
+                canned(reply("200 OK", "text/plain", "ok"));
+                Some(client_socket().is_some())
+            }),
+            Some(false),
+            "tcp_clients() outlasts a later registration"
+        );
+    }
+
+    /// Over the Unix socket an HTTP stub and a raw stub both answer at the URL they answer at over
+    /// TCP, and a request naming no stub gets the 421 that says why.
+    #[tokio::test]
+    async fn the_unix_socket_serves_http_and_raw_stubs_and_refuses_the_rest() {
+        let http_stub = http(Router::new().fallback(|uri: Uri| async move { format!("h {uri}") }));
+        let raw_stub = canned(reply("200 OK", "text/plain", "raw"));
+        let client = crate::test_support::loopback::client_builder()
+            .unix_socket(client_socket().expect("registering made this thread a socket thread"))
+            .build()
+            .expect("socket client");
+        let get = |url: String| {
+            let client = client.clone();
+            async move {
+                let response = client.get(url).send().await.expect("send over the socket");
+                (response.status(), response.text().await.expect("body"))
+            }
+        };
+        assert_eq!(
+            get(format!("{}/v1/messages?beta=true", http_stub.url())).await,
+            (StatusCode::OK, "h /v1/messages?beta=true".to_string())
+        );
+        assert_eq!(
+            get(format!("{}/v1/messages", raw_stub.url())).await,
+            (StatusCode::OK, "raw".to_string())
+        );
+        let (status, body) = get("http://127.0.0.1:1/v1/messages".to_string()).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+        assert!(body.contains("tcp_clients()"), "{body}");
     }
 
     /// The raw half: attempt N is connection N, `None` is a transport failure, and the

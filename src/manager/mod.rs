@@ -675,6 +675,12 @@ pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
         // one request on that connection instead of every stream sharing it.
         builder = builder.http1_only();
     }
+    // Test builds only: a test whose upstream is a stub sends over the stubs' Unix socket instead
+    // of opening a loopback port per request (`test_support::stub_upstream`, § The Unix socket).
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(socket) = crate::test_support::stub_upstream::client_socket() {
+        builder = builder.unix_socket(socket);
+    }
     // A client that cannot be built (the TLS backend failed to initialise) leaves
     // the process unable to make any upstream request, and this function has no
     // error channel: its callers are the constructor, `from_runtimes` and the
