@@ -2879,7 +2879,7 @@ impl StatusSource {
 ///
 /// It renders no Codex route or traffic: every Codex row comes out without
 /// `codexRoute` and `codexTraffic`, as from a CLI that predates them. `tcr status
-/// --json` itself renders through [`render_accounts_json_at`], with both.
+/// --json` itself renders through [`account_status_rows_at`], with both.
 #[cfg(test)]
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
@@ -2890,8 +2890,7 @@ fn render_accounts_json(
     control: Option<&str>,
     group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    render_accounts_json_at(
-        OffsetDateTime::now_utc(),
+    status_rows_json(account_status_rows(
         snapshot,
         thresholds,
         source,
@@ -2899,57 +2898,22 @@ fn render_accounts_json(
         http1_only,
         control,
         group_colors,
-        None,
-        None,
-    )
+    ))
 }
 
-/// [`render_accounts_json`] at a given clock, with the fleet's Codex route and
-/// traffic.
-///
-/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
-/// are computed against. Taking it as a parameter lets a test compare a fixed
-/// instant with a committed fixture, with no normalisation layer between them.
-///
-/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
-/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
-///
-/// No Codex key ever reaches an Anthropic row — neither these two nor the
-/// account's own Codex facts — so such a row is the bytes it always was.
-#[allow(clippy::too_many_arguments)]
-fn render_accounts_json_at(
-    now: OffsetDateTime,
-    snapshot: &StatsSnapshot,
-    thresholds: &[f64],
-    source: StatusSource,
-    server: Option<&BuildInfo>,
-    http1_only: bool,
-    control: Option<&str>,
-    group_colors: &std::collections::BTreeMap<String, String>,
-    codex_route: Option<&tcr_status_wire::CodexRoute>,
-    codex_traffic: Option<&tcr_status_wire::CodexTraffic>,
-) -> String {
-    let rows: Vec<serde_json::Value> = account_status_rows_at(
-        now,
-        snapshot,
-        thresholds,
-        source,
-        server,
-        http1_only,
-        control,
-        group_colors,
-        codex_route,
-        codex_traffic,
-    )
-    .into_iter()
-    // Round-trip through `Value` rather than serializing the struct
-    // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
-    // out alphabetically ordered. That matches this wire's output before
-    // this struct existed (the committed fixture's key order), while
-    // `AccountStatusRow`'s own field order stays whatever reads best in
-    // this source file.
-    .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
-    .collect();
+/// The `tcr status --json` text of `rows`, as [`account_status_rows_at`] built
+/// them.
+fn status_rows_json(rows: Vec<tcr_status_wire::AccountStatusRow>) -> String {
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        // Round-trip through `Value` rather than serializing the struct
+        // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
+        // out alphabetically ordered. That matches this wire's output before
+        // this struct existed (the committed fixture's key order), while
+        // `AccountStatusRow`'s own field order stays whatever reads best in
+        // this source file.
+        .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
+        .collect();
     serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -2983,7 +2947,18 @@ fn account_status_rows(
 }
 
 /// [`account_status_rows`] at a given clock, with the fleet's Codex route and
-/// traffic: the typed rows [`render_accounts_json_at`] prints.
+/// traffic: the typed rows `tcr status --json` prints through
+/// [`status_rows_json`].
+///
+/// `now` is the clock that `held[].minutesUntilReset` and `secondsUntilFree`
+/// are computed against. Taking it as a parameter lets a test compare a fixed
+/// instant with a committed fixture, with no normalisation layer between them.
+///
+/// `codex_route` and `codex_traffic` are fleet-wide facts, repeated on every
+/// Codex row the way `serverSha` and `groupColors` are repeated on every row.
+///
+/// No Codex key ever reaches an Anthropic row — neither these two nor the
+/// account's own Codex facts — so such a row is the bytes it always was.
 #[allow(clippy::too_many_arguments)]
 fn account_status_rows_at(
     now: OffsetDateTime,
@@ -3949,7 +3924,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
     if json {
         println!(
             "{}",
-            render_accounts_json_at(
+            status_rows_json(account_status_rows_at(
                 OffsetDateTime::now_utc(),
                 &snapshot,
                 &thresholds,
@@ -3960,7 +3935,7 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
                 &group_colors,
                 wire_route.as_ref(),
                 wire_traffic.as_ref(),
-            )
+            ))
         );
     } else {
         // The route problem goes ABOVE the fleet, because it outranks it: a
@@ -10150,7 +10125,7 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let rendered = render_accounts_json_at(
+        let rendered = status_rows_json(account_status_rows_at(
             OffsetDateTime::from_unix_timestamp(1_767_225_600).expect("a valid instant"),
             &snapshot,
             &thresholds,
@@ -10161,7 +10136,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             route.as_ref(),
             traffic.as_ref(),
-        );
+        ));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&rendered).expect("an array");
         assert_eq!(rows.len(), 5);
         let mut anthropic = 0;
@@ -11034,7 +11009,7 @@ mod tests {
         vec![claude, codex]
     }
 
-    /// `render_accounts_json_at`, given the facts behind `codex-status.json`, emits exactly
+    /// `status_rows_json(account_status_rows_at(..))`, given the facts behind `codex-status.json`, emits exactly
     /// the rows TcrBar decodes from that file: every key and every derived value, compared
     /// as `serde_json::Value`s with no normalisation and no rounding.
     ///
@@ -11052,7 +11027,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let rendered = render_accounts_json_at(
+        let rendered = status_rows_json(account_status_rows_at(
             fixture_instant(CANONICAL_NOW_MS),
             &snapshot,
             &thresholds,
@@ -11063,7 +11038,7 @@ mod tests {
             &group_colors,
             Some(&route),
             Some(&traffic),
-        );
+        ));
         let rendered: Vec<serde_json::Value> =
             serde_json::from_str(&rendered).expect("the renderer emits a JSON array");
         let serde_json::Value::Array(fixture) = canonical_fixture("codex-status.json") else {
@@ -11162,7 +11137,7 @@ mod tests {
                 wire_sessions: Vec::new(),
                 wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
             };
-            let json = render_accounts_json_at(
+            let json = status_rows_json(account_status_rows_at(
                 now,
                 &snapshot,
                 &[0.85],
@@ -11173,7 +11148,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 None,
                 None,
-            );
+            ));
             let rows: Vec<serde_json::Value> =
                 serde_json::from_str(&json).expect("the renderer emits a JSON array");
             let held = rows[0]["held"]
@@ -11251,7 +11226,7 @@ mod tests {
         .collect();
         let (route, traffic) = canonical_codex_route_and_traffic();
         let render = |snapshot: &StatsSnapshot| -> Vec<serde_json::Value> {
-            let json = render_accounts_json_at(
+            let json = status_rows_json(account_status_rows_at(
                 // After every instant in the contract sample, so each clock-derived field
                 // clamps exactly as it does in the committed file.
                 fixture_instant(1_767_398_400_000),
@@ -11264,7 +11239,7 @@ mod tests {
                 &group_colors,
                 Some(&route),
                 Some(&traffic),
-            );
+            ));
             serde_json::from_str(&json).expect("the renderer emits a JSON array")
         };
         let check = |pass: &str, rows: Vec<serde_json::Value>| {

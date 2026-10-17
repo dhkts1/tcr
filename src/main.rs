@@ -2386,8 +2386,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // revoke and a listener's enrolment each wrote over the other's row,
             // silently, in a window of milliseconds. `accept_enrolment` takes the
             // same lock, which is what makes the pair exclusive.
-            let _lock = peer::config::FileLock::acquire(&peers_path)?;
-            let mut file = peer::config::read_or_default(&peers_path)?;
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
 
             match a.name {
                 None => println!("{}", file.display_name()),
@@ -2403,8 +2402,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Share(a) => {
             let peers_path = a.peers.path();
-            let _lock = peer::config::FileLock::acquire(&peers_path)?;
-            let mut file = peer::config::read_or_default(&peers_path)?;
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
             if file.peers.is_empty() {
                 println!(
                     "peer share: no peers are pinned, so there is nobody to share with \
@@ -2989,8 +2987,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         PeerAction::Forget(a) => {
             let path = a.peers.path();
             let store = tcr::peer::config::PeerStore::open(&path)?;
-            let peer = tcr_peer_wire::PeerId::parse(&a.peer)
-                .map_err(|refusal| anyhow::anyhow!("peer forget: {refusal}"))?;
+            let peer = parse_peer_arg("peer forget", &a.peer)?;
             if !tcr::peer::pair::forget(&store, &peer)? {
                 println!("peer forget: not-found peer={}", a.peer);
                 return Ok(());
@@ -3023,8 +3020,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         PeerAction::Hello(a) => {
             let path = a.peers.unwrap_or_else(tcr::peer::config::default_path);
             let store = tcr::peer::config::PeerStore::open(&path)?;
-            let peer = tcr_peer_wire::PeerId::parse(&a.peer)
-                .map_err(|refusal| anyhow::anyhow!("peer hello: {refusal}"))?;
+            let peer = parse_peer_arg("peer hello", &a.peer)?;
             match tcr::peer::serve::say_hello(&store, &peer).await? {
                 Some(_theirs) => println!("peer hello: ok peer={}", a.peer),
                 None => println!(
@@ -3036,10 +3032,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Allow(a) => {
             let peers_path = a.peers.path();
-            let _lock = peer::config::FileLock::acquire(&peers_path)?;
-            let mut file = peer::config::read_or_default(&peers_path)?;
-            let peer_id = tcr_peer_wire::PeerId::parse(&a.peer)
-                .map_err(|refusal| anyhow::anyhow!("peer allow: {refusal}"))?;
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
+            let peer_id = parse_peer_arg("peer allow", &a.peer)?;
             let on = matches!(a.state, peer_cli::Switch::On);
 
             let Some(row) = file.peers.iter_mut().find(|row| row.node == peer_id) else {
@@ -3106,10 +3100,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Lend(a) => {
             let peers_path = a.peers.path();
-            let _lock = peer::config::FileLock::acquire(&peers_path)?;
-            let mut file = peer::config::read_or_default(&peers_path)?;
-            let peer_id = tcr_peer_wire::PeerId::parse(&a.peer)
-                .map_err(|refusal| anyhow::anyhow!("peer lend: {refusal}"))?;
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
+            let peer_id = parse_peer_arg("peer lend", &a.peer)?;
             let window = tcr_peer_wire::Window::from(a.window);
 
             // The scope FIRST, so a refused `--scope` spelling changes nothing
@@ -3522,11 +3514,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Accept(a) => {
-            let peers_path = a.peers.path();
-            let state_path = peer_state_path(&peers_path);
-            let now = peer::pair::now_ms();
-            let _lock = peer::config::FileLock::acquire(&state_path)?;
-            let mut state = peer::state::load(&state_path, now)?;
+            let (state_path, now, _lock, mut state) = lock_peer_state(&a.peers.path())?;
             let Some(window) = state.accept_knock(&a.target, now, peer::pair::PAIRING_WINDOW_SECS)
             else {
                 anyhow::bail!(
@@ -3548,30 +3536,12 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Ignore(a) => {
-            let peers_path = a.peers.path();
-            let state_path = peer_state_path(&peers_path);
-            let now = peer::pair::now_ms();
-            let _lock = peer::config::FileLock::acquire(&state_path)?;
-            let mut state = peer::state::load(&state_path, now)?;
-            let addr = match state.find_pending(&a.target) {
-                Some(knock) => knock.addr.clone(),
-                // An address the operator wants quiet need not have a live
-                // request: "make this stop" is a reasonable thing to type at a
-                // row that just expired, and refusing it would send them to
-                // `block` for something a mute answers.
-                //
-                // It does have to BE an address, though. Anything else used to
-                // be stored verbatim, and the listener compares against the
-                // bare IP a connection arrives on, so the mute was one nothing
-                // could ever equal and the command printed ok.
-                None if peer::state::PeerState::is_knock_address(&a.target) => a.target.clone(),
-                None => anyhow::bail!(
-                    "peer ignore: {:?} matches no pairing request and is not an address \
-                     either (`tcr peer pending` lists the requests; an address is the bare \
-                     IP a knock arrived from, with no port)",
-                    a.target
-                ),
-            };
+            let (state_path, now, _lock, mut state) = lock_peer_state(&a.peers.path())?;
+            // An address the operator wants quiet need not have a live
+            // request: "make this stop" is a reasonable thing to type at a
+            // row that just expired, and refusing it would send them to
+            // `block` for something a mute answers.
+            let addr = knock_target_addr("peer ignore", &state, &a.target)?;
             state.mute(&addr, now);
             peer::state::save(&state_path, &state)?;
             println!(
@@ -3582,25 +3552,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Block(a) => {
-            let peers_path = a.peers.path();
-            let state_path = peer_state_path(&peers_path);
-            let now = peer::pair::now_ms();
-            let _lock = peer::config::FileLock::acquire(&state_path)?;
-            let mut state = peer::state::load(&state_path, now)?;
-            let addr = match state.find_pending(&a.target) {
-                Some(knock) => knock.addr.clone(),
-                // Same rule as `ignore`, and it matters more here: a ban
-                // recorded against something that is not an address is a ban
-                // the listener's comparison never equals, and the command said
-                // ok. See `PeerState::is_knock_address`.
-                None if peer::state::PeerState::is_knock_address(&a.target) => a.target.clone(),
-                None => anyhow::bail!(
-                    "peer block: {:?} matches no pairing request and is not an address either \
-                     (`tcr peer pending` lists the requests; an address is the bare IP a knock \
-                     arrived from, with no port)",
-                    a.target
-                ),
-            };
+            let (state_path, now, _lock, mut state) = lock_peer_state(&a.peers.path())?;
+            // Same rule as `ignore`, and it matters more here: a ban recorded
+            // against something that is not an address is a ban the listener's
+            // comparison never equals, and the command said ok.
+            let addr = knock_target_addr("peer block", &state, &a.target)?;
             // **Both halves, and this is the only moment the key half is
             // reachable.** A knock reveals no static key, so a request blocked
             // before it ever dialled can only be banned by address; one that
@@ -3627,11 +3583,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Unblock(a) => {
-            let peers_path = a.peers.path();
-            let state_path = peer_state_path(&peers_path);
-            let now = peer::pair::now_ms();
-            let _lock = peer::config::FileLock::acquire(&state_path)?;
-            let mut state = peer::state::load(&state_path, now)?;
+            let (state_path, _now, _lock, mut state) = lock_peer_state(&a.peers.path())?;
             if !state.unblock(&a.addr) {
                 println!("peer unblock: not-found addr={}", a.addr);
                 return Ok(());
@@ -3698,8 +3650,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // `LOCK_WAIT_MS` and then refuse.
             if on {
                 let written = {
-                    let _lock = peer::config::FileLock::acquire(&peers_path)?;
-                    let mut file = peer::config::read_or_default(&peers_path)?;
+                    let (_lock, mut file) = lock_peers_file(&peers_path)?;
                     match ensure_listen_for_opt_in(&mut file) {
                         Some(chosen) => {
                             peer::config::save(&peers_path, &file)?;
@@ -3742,8 +3693,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Drop(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
-            let _lock = peer::config::FileLock::acquire(&peers_path)?;
-            let mut file = peer::config::read_or_default(&peers_path)?;
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
             let on = matches!(a.state, peer_cli::Switch::On);
             // Same shape `tcr peer find on` uses when `listen` is absent: say
             // what to run first and change nothing, rather than writing a
@@ -3771,8 +3721,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::DropStore(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
-            let _lock = peer::config::FileLock::acquire(&peers_path)?;
-            let mut file = peer::config::read_or_default(&peers_path)?;
+            let (_lock, mut file) = lock_peers_file(&peers_path)?;
             match a.action {
                 peer_cli::PeerDropStoreAction::Show => {
                     match &file.dead_drop.store {
@@ -4211,8 +4160,7 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
              field of `tcr peer ls --json`"
         );
     };
-    let peer_id = tcr_peer_wire::PeerId::parse(target)
-        .map_err(|refusal| anyhow::anyhow!("peer moved: {refusal}"))?;
+    let peer_id = parse_peer_arg("peer moved", target)?;
 
     let file = peer::config::read_or_default(peers_path)?;
     let Some(row) = file.peers.iter().find(|row| row.node == peer_id) else {
@@ -4788,6 +4736,65 @@ fn peer_state_path(peers_path: &Path) -> PathBuf {
     }
 }
 
+/// The peers file at `peers_path`, read under its lock.
+///
+/// The lock comes back with the file and must stay bound for as long as the
+/// caller may write the file back: a peers-file mutation is a read-modify-write,
+/// and only the held lock keeps a listener's enrolment from landing in between.
+fn lock_peers_file(
+    peers_path: &Path,
+) -> anyhow::Result<(tcr::peer::config::FileLock, tcr::peer::config::PeerFile)> {
+    let lock = tcr::peer::config::FileLock::acquire(peers_path)?;
+    let file = tcr::peer::config::read_or_default(peers_path)?;
+    Ok((lock, file))
+}
+
+/// The runtime-state file that goes with `peers_path`, read under its lock at
+/// the current clock: its path, that clock, the held lock and the state.
+fn lock_peer_state(
+    peers_path: &Path,
+) -> anyhow::Result<(
+    PathBuf,
+    i64,
+    tcr::peer::config::FileLock,
+    tcr::peer::state::PeerState,
+)> {
+    let state_path = peer_state_path(peers_path);
+    let now = tcr::peer::pair::now_ms();
+    let lock = tcr::peer::config::FileLock::acquire(&state_path)?;
+    let state = tcr::peer::state::load(&state_path, now)?;
+    Ok((state_path, now, lock, state))
+}
+
+/// A `<peer>` argument parsed as a peer id, its refusal prefixed with the verb.
+fn parse_peer_arg(verb: &str, raw: &str) -> anyhow::Result<tcr_peer_wire::PeerId> {
+    tcr_peer_wire::PeerId::parse(raw).map_err(|refusal| anyhow::anyhow!("{verb}: {refusal}"))
+}
+
+/// The address `tcr peer ignore|block <target>` acts on: the address of the
+/// pending request `target` names, or `target` itself when it is a bare knock
+/// address with no live request.
+///
+/// It does have to BE an address, though. Anything else used to be stored
+/// verbatim, and the listener compares against the bare IP a connection arrives
+/// on, so the mute or ban was one nothing could ever equal and the command
+/// printed ok. See `PeerState::is_knock_address`.
+fn knock_target_addr(
+    verb: &str,
+    state: &tcr::peer::state::PeerState,
+    target: &str,
+) -> anyhow::Result<String> {
+    match state.find_pending(target) {
+        Some(knock) => Ok(knock.addr.clone()),
+        None if tcr::peer::state::PeerState::is_knock_address(target) => Ok(target.to_string()),
+        None => anyhow::bail!(
+            "{verb}: {target:?} matches no pairing request and is not an address either \
+             (`tcr peer pending` lists the requests; an address is the bare IP a knock \
+             arrived from, with no port)"
+        ),
+    }
+}
+
 /// `tcr peer network-key set|join|clear|show`.
 ///
 /// Split out of [`run_peer`]'s match for the same reason `run_peer_find` is: it
@@ -4797,8 +4804,7 @@ fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow::Result<()
     use tcr::peer;
 
     let peers_path = args.peers.path();
-    let _lock = peer::config::FileLock::acquire(&peers_path)?;
-    let mut file = peer::config::read_or_default(&peers_path)?;
+    let (_lock, mut file) = lock_peers_file(&peers_path)?;
 
     match args.action {
         peer_cli::PeerNetworkKeyAction::Show => {
@@ -5281,8 +5287,7 @@ async fn run_peer_find_with(
     finder: &impl PeerFinder,
 ) -> anyhow::Result<()> {
     let peers_path = args.peers.path();
-    let _lock = peer::config::FileLock::acquire(&peers_path)?;
-    let mut file = peer::config::read_or_default(&peers_path)?;
+    let (_lock, mut file) = lock_peers_file(&peers_path)?;
 
     // The flag flips the config key on BOTH arms. It used to be read only
     // inside the `on` arm, so `tcr peer find off --announce-name on` accepted
