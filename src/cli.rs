@@ -353,48 +353,17 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     let target = config.accounts[idx].clone();
     let name = target.name.clone();
 
-    let live = post_set_disabled(&config, &name, true).await;
-    let parked_live = live.is_ok();
-    let warning = match live {
-        Ok(_) => None,
-        // Nothing is listening: no live rotation to disagree with the file.
-        Err(LiveControlError::NoServer) => None,
-        // A server is there and refused our key. Deleting the record now
-        // would leave the running proxy still rotating an account that no
-        // longer exists on disk — worse than the disable case, because
-        // there is no record left to reconcile against on restart.
-        Err(LiveControlError::Unauthorized) => {
-            bail!(
-                "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            );
-        }
-        // The route resolved our query to nothing, or to more than one
-        // account. The file's own resolution could land on a different
-        // row than the server matched — a removal applied to the wrong
-        // account is unrecoverable, so this bails rather than falling back.
-        Err(LiveControlError::Rejected(message)) => {
-            bail!(
-                "the proxy running on :{} refused this: {message} Nothing was changed.",
-                config.proxy.port
-            );
-        }
-        // An older tcr with no account-control route. The file half is all
-        // we can do; say loudly that the proxy keeps using the account
-        // until it restarts.
-        Err(LiveControlError::NoRoute) => Some(format!(
-            "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{name}' until it restarts. {}",
-            config.proxy.port,
-            crate::proxy::DISABLED_PATH,
-            RESTART_HINT,
-        )),
-        // It answered something we cannot use, or did not answer at all.
-        Err(other) => Some(format!(
-            "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP routing to '{name}' until it restarts.",
-            config.proxy.port,
-            other.why(),
-        )),
+    let site = LiveSite {
+        config: &config,
+        config_path,
+        words: &REMOVE_WORDS,
+    };
+    let (parked_live, warning) = match site.decide(post_set_disabled(&config, &name, true).await)? {
+        Live::Applied(_) => (true, None),
+        Live::FileOnly(stale) => (
+            false,
+            stale.map(|stale| site.warning(&stale, Some(&format!("routing to '{name}'")))),
+        ),
     };
 
     let failed = match config::remove_account_entry(config_path, &target)
@@ -511,8 +480,13 @@ pub async fn set_priority(
     let provider = config.accounts[idx].provider;
     let value = priority_value(&config, provider, priority);
 
-    match post_set_priority(&config, query, value).await {
-        Ok(applied) => {
+    let site = LiveSite {
+        config: &config,
+        config_path,
+        words: &PRIORITY_WORDS,
+    };
+    match site.decide(post_set_priority(&config, query, value).await)? {
+        Live::Applied(applied) => {
             write_priority(config_path, query, value).with_context(|| {
                 format!(
                     "the running proxy already ranks '{}' at {value}, but the config file was not updated, so a restart will undo it",
@@ -523,49 +497,15 @@ pub async fn set_priority(
                 "{}",
                 priority_message(&applied.name, value, provider, priority)
             );
-            return Ok(());
         }
-        // Nothing is listening: the file is the whole truth.
-        Err(LiveControlError::NoServer) => {}
-        Err(LiveControlError::Unauthorized) => {
-            bail!(
-                "the proxy on :{} rejected the api-key in {}, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            );
-        }
-        // The server matched our query to nothing or to several accounts. The
-        // file's resolution could land on a different row, so do not fall back.
-        Err(LiveControlError::Rejected(message)) => {
-            bail!(
-                "the proxy running on :{} refused this: {message} Nothing was changed.",
-                config.proxy.port
-            );
-        }
-        Err(LiveControlError::NoRoute) => {
+        Live::FileOnly(stale) => {
             let name = write_priority(config_path, query, value)?;
-            eprintln!(
-                "[tcr] WARNING: the proxy running on :{} is too old to accept a live priority change (no {} route), so only the config file was changed. It will KEEP the old order until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
-                config.proxy.port,
-                crate::proxy::PRIORITY_PATH,
-            );
+            if let Some(stale) = stale {
+                eprintln!("{}", site.warning(&stale, Some("the old order")));
+            }
             println!("{}", priority_message(&name, value, provider, priority));
-            return Ok(());
-        }
-        Err(other) => {
-            let name = write_priority(config_path, query, value)?;
-            eprintln!(
-                "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP the old order until it restarts.",
-                config.proxy.port,
-                other.why(),
-            );
-            println!("{}", priority_message(&name, value, provider, priority));
-            return Ok(());
         }
     }
-
-    let name = write_priority(config_path, query, value)?;
-    println!("{}", priority_message(&name, value, provider, priority));
     Ok(())
 }
 
@@ -1377,8 +1317,13 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
     };
 
     if let Ok(config) = config::load(config_path) {
-        match post_set_config(&config, &setting).await {
-            Ok(applied) => {
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &CONFIG_SET_WORDS,
+        };
+        match site.decide(post_set_config(&config, &setting).await)? {
+            Live::Applied(applied) => {
                 println!(
                     "{} The proxy on :{} keeps its current value until it restarts.",
                     saved_line(applied.changed),
@@ -1386,37 +1331,10 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
                 );
                 return Ok(());
             }
-            Err(LiveControlError::NoServer) => {}
-            Err(LiveControlError::Unauthorized) => bail!(
-                "the proxy on :{} rejected the api-key in {}, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
-                config.proxy.port,
-                config_path.display()
-            ),
-            Err(LiveControlError::Rejected(message)) => bail!(
-                "the proxy running on :{} refused this: {message}",
-                config.proxy.port
-            ),
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 let write = write_setting(config_path, &setting)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to save settings itself (no {} route), so this process wrote the file beside it. {}",
-                    config.proxy.port,
-                    crate::proxy::CONFIG_PATH,
-                    RESTART_HINT,
-                );
-                println!(
-                    "{}",
-                    saved_line(write == crate::config_set::SettingWrite::Updated)
-                );
-                return Ok(());
-            }
-            Err(other) => {
-                let write = write_setting(config_path, &setting)?;
-                eprintln!(
-                    "[tcr] WARNING: could not hand this to the proxy running on :{} ({}), so this process wrote the file beside it.",
-                    config.proxy.port,
-                    other.why(),
-                );
+                eprintln!("{}", site.warning(&stale, None));
                 println!(
                     "{}",
                     saved_line(write == crate::config_set::SettingWrite::Updated)
@@ -1541,47 +1459,80 @@ fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&
     (!routes).then_some(ROUTE_BLOCK_CONTROL_ONLY)
 }
 
+/// One group as `tcr group ls` reports it. Both renderers read these rows, so
+/// the text line and the JSON object are computed once and cannot disagree.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupRow<'a> {
+    group: &'a str,
+    accounts: usize,
+    members: Vec<&'a str>,
+    reserved: bool,
+    parked: bool,
+    allows_control: bool,
+    routes: bool,
+    route_block: Option<&'static str>,
+    color: String,
+    color_source: &'static str,
+    /// Only when there is one, so a group with no Codex member, which is every
+    /// group of a fleet with no Codex account, carries no new key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_members: Option<usize>,
+}
+
+/// Every group's row, in name order, and the count of accounts in no group.
+fn group_rows(config: &Config) -> (Vec<GroupRow<'_>>, usize) {
+    let (groups, ungrouped) = group_membership(config);
+    let rows = groups
+        .into_iter()
+        .map(|(group, members)| {
+            let (color, source) = config.group_color(group);
+            let route_block = group_route_block(config, group, &members);
+            let codex_members = codex_member_count(config, &members);
+            GroupRow {
+                group,
+                accounts: members.len(),
+                reserved: config.is_group_reserved(group),
+                parked: config.is_group_parked(group),
+                allows_control: config.group_allows_control(group),
+                routes: route_block.is_none(),
+                route_block,
+                color,
+                color_source: source.as_str(),
+                codex_members: (codex_members > 0).then_some(codex_members),
+                members,
+            }
+        })
+        .collect();
+    (rows, ungrouped)
+}
+
 /// `tcr group ls` text: one greppable line per group, then `ungrouped`.
 fn render_groups_text(config: &Config) -> String {
     use std::fmt::Write as _;
-    let (groups, ungrouped) = group_membership(config);
-    let width = groups.keys().map(|g| g.len()).max().unwrap_or(0);
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let (rows, ungrouped) = group_rows(config);
+    let width = rows.iter().map(|r| r.group.len()).max().unwrap_or(0);
     let mut out = String::new();
-    for (group, members) in &groups {
-        let (color, source) = config.group_color(group);
-        let route_block = group_route_block(config, group, members);
-        let codex_members = codex_member_count(config, members);
+    for row in &rows {
         writeln!(
             out,
-            "group {group:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
-            members.len(),
-            members.join(","),
-            if codex_members > 0 {
-                format!(" codex_members={codex_members}")
-            } else {
-                String::new()
-            },
-            if config.is_group_reserved(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if config.is_group_parked(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if config.group_allows_control(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if route_block.is_none() { "yes" } else { "no" },
-            match route_block {
-                None => String::new(),
-                Some(block) => format!(" route_block={block}"),
-            },
-            source.as_str(),
+            "group {:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={} color_source={}",
+            row.group,
+            row.accounts,
+            row.members.join(","),
+            row.codex_members
+                .map(|n| format!(" codex_members={n}"))
+                .unwrap_or_default(),
+            yes_no(row.reserved),
+            yes_no(row.parked),
+            yes_no(row.allows_control),
+            yes_no(row.routes),
+            row.route_block
+                .map(|block| format!(" route_block={block}"))
+                .unwrap_or_default(),
+            row.color,
+            row.color_source,
         )
         .log_warn("rendering a group line");
     }
@@ -1592,37 +1543,10 @@ fn render_groups_text(config: &Config) -> String {
 /// `tcr group ls --json`: the structured equivalent of [`render_groups_text`]
 /// for the TcrBar panel.
 fn render_groups_json(config: &Config) -> anyhow::Result<String> {
-    let (groups, ungrouped) = group_membership(config);
-    let rows: Vec<serde_json::Value> = groups
-        .iter()
-        .map(|(group, members)| {
-            let (color, source) = config.group_color(group);
-            let route_block = group_route_block(config, group, members);
-            let mut row = serde_json::json!({
-                "group": group,
-                "accounts": members.len(),
-                "members": members,
-                "reserved": config.is_group_reserved(group),
-                "parked": config.is_group_parked(group),
-                "allowsControl": config.group_allows_control(group),
-                "routes": route_block.is_none(),
-                "routeBlock": match route_block {
-                    None => serde_json::Value::Null,
-                    Some(block) => serde_json::Value::String(block.to_string()),
-                },
-                "color": color,
-                "colorSource": source.as_str(),
-            });
-            // Only when there is one, so a group with no Codex member, which is
-            // every group of a fleet with no Codex account, carries no new key.
-            let codex_members = codex_member_count(config, members);
-            if codex_members > 0 {
-                row["codexMembers"] = serde_json::json!(codex_members);
-            }
-            row
-        })
-        .collect();
-    let out = serde_json::json!({ "groups": rows, "ungrouped": ungrouped });
+    let (rows, ungrouped) = group_rows(config);
+    // Through `Value`, so the keys come out in the order the JSON map keeps
+    // them, as they always have, rather than in field order.
+    let out = serde_json::json!({ "groups": serde_json::to_value(&rows)?, "ungrouped": ungrouped });
     Ok(serde_json::to_string_pretty(&out)?)
 }
 
@@ -1648,8 +1572,15 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
     // fall through to the file path, which reports the load failure as it always
     // has. Never a silent skip of the live attempt for any other reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_disabled(&config, query, disabled).await {
-            Ok(applied) => {
+        // A missing route is HALF a disable, the arm that used to be the whole
+        // function, silently; the warning says so.
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &ENABLE_WORDS,
+        };
+        match site.decide(post_set_disabled(&config, query, disabled).await)? {
+            Live::Applied(applied) => {
                 println!(
                     "{} account '{}'.",
                     if disabled { "Disabled" } else { "Enabled" },
@@ -1660,54 +1591,14 @@ pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> any
                 }
                 return Ok(());
             }
-            // Nothing is listening: the historical case, and the only quiet one.
-            // There is no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and REFUSED us. Writing the file here would be the
-            // old lie in a new place: the config would say benched while the proxy
-            // we could not talk to keeps rotating. Change nothing, exit non-zero.
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
-                    config.proxy.port,
-                    config_path.display()
-                );
-            }
-            // The route is missing: an older tcr is serving. The file write is all
-            // we can do, and it is HALF a disable — say so loudly. This arm is the
-            // one that used to be the whole function, silently.
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 let name = write_disabled_flag(config_path, query, disabled)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::DISABLED_PATH,
-                    if disabled { "routing to" } else { "benching" },
-                    RESTART_HINT,
+                let keeps = format!(
+                    "{} '{name}'",
+                    if disabled { "routing to" } else { "benching" }
                 );
-                return Ok(());
-            }
-            // The route ran and refused the QUERY: it matched no live account, or
-            // matched several. Do not fall back — the file's own resolution could
-            // land on a different account than the one the server was talking
-            // about, and a disable applied to the wrong row is worse than none.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // It answered something we cannot use, or did not answer at all. Same
-            // shape of consequence as the arm above, different cause, and equally
-            // never silent.
-            Err(other) => {
-                let name = write_disabled_flag(config_path, query, disabled)?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP {} '{name}' until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                    if disabled { "routing to" } else { "benching" },
-                );
+                eprintln!("{}", site.warning(&stale, Some(&keeps)));
                 return Ok(());
             }
         }
@@ -1749,6 +1640,164 @@ fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyho
 /// subcommand that never existed, and four copies is how that happened. `main.rs`'s `restart_hint_names_only_commands_that_parse` parses
 /// every backticked `tcr` command in this text with the real clap definition.
 pub const RESTART_HINT: &str = "Restart it when a cold prompt cache is acceptable: if TcrBar runs the proxy, use Restart in TcrBar's Settings > General; otherwise run `tcr server --replace`.";
+
+/// What a verb that asks the running proxy first may do with its file.
+enum Live<T> {
+    /// The running proxy applied it, and wrote the file if it owns that half.
+    Applied(T),
+    /// Write the file here. `None` when nothing is listening, the ordinary
+    /// offline case, which says nothing. `Some` when a proxy is there and the
+    /// change did not reach it, which is never silent: see [`LiveSite::warning`].
+    FileOnly(Option<Stale>),
+}
+
+/// Why a running proxy did not take a change the file is about to get.
+enum Stale {
+    /// An older tcr with no route for it.
+    NoRoute,
+    /// It answered something unusable, or nothing in time; the reason.
+    Failed(String),
+}
+
+/// The words one verb's refusals and warnings use for its own consequence.
+/// The policy around them is [`LiveSite::decide`], one copy for every verb.
+struct LiveWords {
+    /// The route the verb calls, named in the "too old" warning.
+    route_path: &'static str,
+    /// Follows "rejected the api-key in <path>": why nothing was written.
+    unauthorized: &'static str,
+    /// Follows the server's own refusal message.
+    rejected: &'static str,
+    /// Follows "is too old to".
+    too_old_to: &'static str,
+    /// Follows "could not".
+    could_not: &'static str,
+    /// Follows "so": what happened to the file.
+    file_written: &'static str,
+}
+
+/// After a refusal, on the verbs whose file half changes one account row.
+const NOTHING_CHANGED: &str = " Nothing was changed.";
+/// After a fallback write, on the same verbs.
+const ONLY_THE_FILE: &str = "only the config file was changed";
+
+/// `tcr rm`. Deleting the record beside a proxy that refused our key would
+/// leave it rotating an account that no longer exists on disk, with no record
+/// left to reconcile against on restart.
+const REMOVE_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::DISABLED_PATH,
+    unauthorized: " — the config was NOT changed, because deleting it would leave the running proxy still rotating this account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr priority`.
+const PRIORITY_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::PRIORITY_PATH,
+    unauthorized: ", so the config was NOT changed, because writing it would leave the running proxy on the old order.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept a live priority change",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr config set`. The proxy owns the file while it runs, so a fallback
+/// write is this process writing beside it, and a refusal carries the
+/// server's message alone.
+const CONFIG_SET_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::CONFIG_PATH,
+    unauthorized: ", so nothing was changed: writing the file beside a running proxy can lose the change to its own next write.",
+    rejected: "",
+    too_old_to: "save settings itself",
+    could_not: "hand this to",
+    file_written: "this process wrote the file beside it",
+};
+
+/// `tcr enable` and `tcr disable`. Writing the file beside a proxy that
+/// refused our key would be the config saying benched while the proxy keeps
+/// rotating.
+const ENABLE_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::DISABLED_PATH,
+    unauthorized: " — the config was NOT changed, because writing it would leave the running proxy still rotating this account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// `tcr control`. The running proxy is the one that resolves identity
+/// traffic, so a file naming a new control account beside it is a lie.
+const CONTROL_WORDS: LiveWords = LiveWords {
+    route_path: crate::proxy::CONTROL_PATH,
+    unauthorized: " — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account.",
+    rejected: NOTHING_CHANGED,
+    too_old_to: "accept live account control",
+    could_not: "apply this to",
+    file_written: ONLY_THE_FILE,
+};
+
+/// One verb's "running proxy first, file second" decision, at one config.
+struct LiveSite<'a> {
+    config: &'a Config,
+    config_path: &'a Path,
+    words: &'static LiveWords,
+}
+
+impl LiveSite<'_> {
+    /// The decision table. Nothing listening writes the file quietly. A
+    /// rejected api-key or a refused query changes nothing: the file's own
+    /// resolution could land on a different row than the server matched, and a
+    /// file written beside a proxy we could not talk to says one thing while the
+    /// proxy does another. A missing route or an unusable answer writes the file
+    /// and warns.
+    fn decide<T>(&self, answer: Result<T, LiveControlError>) -> anyhow::Result<Live<T>> {
+        let port = self.config.proxy.port;
+        match answer {
+            Ok(applied) => Ok(Live::Applied(applied)),
+            Err(LiveControlError::NoServer) => Ok(Live::FileOnly(None)),
+            Err(LiveControlError::Unauthorized) => bail!(
+                "the proxy on :{port} rejected the api-key in {}{} Fix `proxy.apiKey` and retry.",
+                self.config_path.display(),
+                self.words.unauthorized,
+            ),
+            Err(LiveControlError::Rejected(message)) => bail!(
+                "the proxy running on :{port} refused this: {message}{}",
+                self.words.rejected
+            ),
+            Err(LiveControlError::NoRoute) => Ok(Live::FileOnly(Some(Stale::NoRoute))),
+            Err(other) => Ok(Live::FileOnly(Some(Stale::Failed(other.why())))),
+        }
+    }
+
+    /// The warning for a file written beside a proxy that did not take the
+    /// change. `keeps` names what the running proxy goes on using, as in "It
+    /// will KEEP <keeps> until it restarts"; `None` leaves that sentence out.
+    fn warning(&self, stale: &Stale, keeps: Option<&str>) -> String {
+        let port = self.config.proxy.port;
+        let words = self.words;
+        match stale {
+            Stale::NoRoute => format!(
+                "[tcr] WARNING: the proxy running on :{port} is too old to {} (no {} route), so {}.{} {RESTART_HINT}",
+                words.too_old_to,
+                words.route_path,
+                words.file_written,
+                keeps
+                    .map(|k| format!(" It will KEEP {k} until it restarts."))
+                    .unwrap_or_default(),
+            ),
+            Stale::Failed(why) => format!(
+                "[tcr] WARNING: could not {} the proxy running on :{port} ({why}), so {}.{}",
+                words.could_not,
+                words.file_written,
+                keeps
+                    .map(|k| format!(" It may KEEP {k} until it restarts."))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
 
 /// Why a live account-control request did not apply.
 ///
@@ -1796,90 +1845,218 @@ impl LiveControlError {
     }
 }
 
-/// Ask the running proxy to park/unpark an account. Mirrors [`fetch_live_status`]:
-/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr, so honouring it
-/// would send this command through the proxy it is about), same timeouts, same
-/// api-key header — the control route has no loopback exemption either.
-async fn post_set_disabled(
+impl From<Unreached> for LiveControlError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => LiveControlError::NoServer,
+            Unreached::Silent(why) => LiveControlError::NoAnswer(why),
+            Unreached::Unbuilt(why) => LiveControlError::Unusable(why),
+        }
+    }
+}
+
+/// Why a call to the running proxy came back with no HTTP response at all.
+#[derive(Debug)]
+enum Unreached {
+    /// The connection was refused: nothing is listening on the port.
+    Refused,
+    /// Something holds the port and sent nothing back in time, or dropped the
+    /// connection mid-read.
+    Silent(String),
+    /// The HTTP client could not be built, so nothing was sent.
+    Unbuilt(String),
+}
+
+/// Sort a failed send. `is_timeout()` comes first: a connect TIMEOUT (a
+/// blackholed address, or a SYN dropped rather than refused) reports
+/// `is_connect() == true` as well, so asking `is_connect()` first would call a
+/// wedged proxy "nothing is listening" when the truer reading is "something is
+/// there but not answering".
+fn unreached(e: &reqwest::Error) -> Unreached {
+    if e.is_timeout() {
+        Unreached::Silent("the server did not answer within 5s".to_string())
+    } else if e.is_connect() {
+        Unreached::Refused
+    } else {
+        Unreached::Silent(e.to_string())
+    }
+}
+
+/// Send one request to the running proxy at `path` on 127.0.0.1 and the
+/// configured port. Every call to a `/_tcr/` route goes through here.
+///
+/// The client never honours a system proxy: `HTTP_PROXY` commonly points AT
+/// tcr, so honouring it would send this request through the proxy it is about.
+/// The api-key goes on every request, because no local route has a loopback
+/// exemption. 2s to connect, 5s in total.
+async fn send_loopback(
     config: &Config,
-    query: &str,
-    disabled: bool,
-) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    path: &str,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, Unreached> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::DISABLED_PATH
-    );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "disabled": disabled,
-    }));
+        .map_err(|e| Unreached::Unbuilt(format!("http client: {e}")))?;
+    let url = format!("http://127.0.0.1:{}{path}", config.proxy.port);
+    let mut request = build(&client, &url);
     if let Some(key) = config.proxy.api_key.as_deref() {
         request = request.header("x-api-key", key);
     }
+    request.send().await.map_err(|e| unreached(&e))
+}
 
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
-        // dropped rather than refused) reports `is_connect() == true` as
-        // well, so checking `is_connect()` first would misclassify it as
-        // `NoServer` — "nothing is listening" — when the truer reading is
-        // "something is there but not answering", `NoAnswer` below.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
+/// One local mutating route on the running proxy, as data: where it is, the
+/// [`crate::proxy::ENDPOINT_HEADER`] value it stamps on its answers, and which
+/// stamped statuses mean "the route refused this request".
+struct ControlRoute {
+    path: &'static str,
+    endpoint: &'static str,
+    /// Stamped statuses that are the route saying no, carried to the caller as
+    /// [`LiveControlError::Rejected`] with the server's own message. Per route,
+    /// because each route refuses with its own codes: 404 is "no such account"
+    /// on the account routes, 400 is request validation on the add and settings
+    /// routes, and 409 is an ambiguous match everywhere.
+    refusals: &'static [u16],
+    /// What the 2xx body is, for the error when it does not parse.
+    noun: &'static str,
+    /// Whether a 2xx counts only when the route stamped it.
+    success_needs_stamp: bool,
+}
+
+const DISABLED_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::DISABLED_PATH,
+    endpoint: crate::proxy::DISABLED_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "account-control",
+    success_needs_stamp: false,
+};
+
+/// 400 is the route's own request validation (a blank name or token), the
+/// positive capability signal `oauth::probe_add_route` looks for; 409 is a
+/// submitted identity that matched more than one live account.
+const ADD_ACCOUNT_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::ADD_ACCOUNT_PATH,
+    endpoint: crate::proxy::ADD_ACCOUNT_ENDPOINT,
+    refusals: &[400, 409],
+    noun: "account-add",
+    success_needs_stamp: false,
+};
+
+const CONTROL_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CONTROL_PATH,
+    endpoint: crate::proxy::CONTROL_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "control-account",
+    success_needs_stamp: false,
+};
+
+const PRIORITY_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::PRIORITY_PATH,
+    endpoint: crate::proxy::PRIORITY_ENDPOINT,
+    refusals: &[404, 409],
+    noun: "priority",
+    success_needs_stamp: false,
+};
+
+/// Both halves of [`crate::proxy::CONFIG_PATH`], the `GET` and the `POST`.
+const CONFIG_ROUTE: ControlRoute = ControlRoute {
+    path: crate::proxy::CONFIG_PATH,
+    endpoint: crate::proxy::CONFIG_ENDPOINT,
+    refusals: &[400, 409],
+    noun: "settings",
+    success_needs_stamp: true,
+};
+
+/// What [`call_route`] read: the sorted answer, and the response headers when
+/// the route stamped the answer, so a caller can read a second header off the
+/// same response with no second round trip.
+struct RouteAnswer<T> {
+    result: Result<T, LiveControlError>,
+    stamped: Option<reqwest::header::HeaderMap>,
+}
+
+/// Send one request to `route` and sort the answer.
+///
+/// Whether THIS route produced the answer is decided ONLY by
+/// [`crate::proxy::ENDPOINT_HEADER`], never by status code or error text: a 404
+/// from a tcr without the route and a 404 meaning "no such account" are the same
+/// status with opposite consequences, and the header is the only difference that
+/// is not a matched error string. So an unstamped 404 or 405 is
+/// [`LiveControlError::NoRoute`], and a stamped refusal status is
+/// [`LiveControlError::Rejected`] carrying the server's message.
+async fn call_route<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    route: &ControlRoute,
+    build: impl FnOnce(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> RouteAnswer<T> {
+    let response = match send_loopback(config, route.path, build).await {
+        Ok(response) => response,
+        Err(unreached) => {
+            return RouteAnswer {
+                result: Err(unreached.into()),
+                stamped: None,
+            };
         }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
     };
-
     let status = response.status();
-    // Whether THIS route produced the answer, decided structurally. A 404 from a
-    // tcr without the route and a 404 meaning "no such account" are the same status
-    // code with opposite consequences, and the header is the only difference that
-    // is not a matched error string.
     let from_route = response
         .headers()
         .get(crate::proxy::ENDPOINT_HEADER)
         .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::DISABLED_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
+        == Some(route.endpoint);
+    let stamped = from_route.then(|| response.headers().clone());
+    let body = response.text().await;
+    let message = || body.as_deref().ok().and_then(error_message_of);
 
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr account-control payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+    let result = if status.is_success() && (from_route || !route.success_needs_stamp) {
+        match &body {
+            Ok(body) => serde_json::from_str(body).map_err(|e| {
+                LiveControlError::Unusable(format!(
+                    "the response was not a tcr {} payload ({e})",
+                    route.noun
+                ))
+            }),
+            Err(e) => Err(LiveControlError::Unusable(format!(
+                "reading the answer: {e}"
+            ))),
+        }
+    } else if status.as_u16() == 401 {
+        Err(LiveControlError::Unauthorized)
+    } else if !from_route && matches!(status.as_u16(), 404 | 405) {
+        Err(LiveControlError::NoRoute)
+    } else if from_route && route.refusals.contains(&status.as_u16()) {
+        Err(LiveControlError::Rejected(
+            message().unwrap_or_else(|| format!("HTTP {status}")),
+        ))
+    } else {
+        Err(LiveControlError::Unusable(format!(
+            "HTTP {status}{}",
+            message().map(|m| format!(": {m}")).unwrap_or_default()
+        )))
+    };
+    RouteAnswer { result, stamped }
+}
+
+/// Ask the running proxy to park/unpark an account.
+async fn post_set_disabled(
+    config: &Config,
+    query: &str,
+    disabled: bool,
+) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    let body = serde_json::json!({ "query": query, "disabled": disabled });
+    call_route(config, &DISABLED_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Ask the running proxy to add an account to the live rotation, or — when the
 /// submitted identity already matches one — replace its credentials in place.
-/// No restart, so no session pin is invalidated. Mirrors [`post_set_disabled`]:
-/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr), same
-/// timeouts, same api-key header — the control route has no loopback
-/// exemption either.
+/// No restart, so no session pin is invalidated.
 ///
 /// `account` is POSTed directly as the request body: [`config::Account`]
 /// already serializes to the exact wire shape
@@ -1888,13 +2065,9 @@ async fn post_set_disabled(
 /// for a real login, or `crate::oauth::probe_add_route`'s deliberately
 /// blank probe — and this function never re-lists its fields.
 ///
-/// Reuses [`LiveControlError`] rather than a parallel enum, extended with one
-/// more structural case [`post_set_disabled`] never needs: a `400` FROM the
-/// route (stamped) is this route's own request-validation failure — e.g. a
-/// blank name or token — and is exactly as much a "the route said no" signal
-/// as the `404`/`409` [`post_set_disabled`] already treats that way. The
-/// [`crate::proxy::ENDPOINT_HEADER`] stamp remains the only thing that
-/// decides "no such route" vs "the route said no" — never error text.
+/// A stamped `400` is this route's own request-validation failure (a blank
+/// name or token), and reads as [`LiveControlError::Rejected`] like a stamped
+/// `409`; see [`ADD_ACCOUNT_ROUTE`].
 pub(crate) async fn post_add_account(
     config: &Config,
     account: &Account,
@@ -1918,99 +2091,22 @@ pub(crate) async fn post_add_account_with_providers(
     Result<crate::proxy::AddAccountResponse, LiveControlError>,
     Vec<crate::provider::Provider>,
 ) {
-    let mut providers = Vec::new();
-    let result = post_add_account_reading(config, account, &mut providers).await;
-    (result, providers)
-}
-
-/// The request [`post_add_account_with_providers`] makes, with `providers` filled
-/// from a stamped answer's [`crate::proxy::PROVIDERS_HEADER`].
-async fn post_add_account_reading(
-    config: &Config,
-    account: &Account,
-    providers: &mut Vec<crate::provider::Provider>,
-) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::ADD_ACCOUNT_PATH
-    );
-    let mut request = client.post(&url).json(account);
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
-        // dropped rather than refused) reports `is_connect() == true` as
-        // well, so checking `is_connect()` first would misclassify it as
-        // `NoServer` — "nothing is listening" — when the truer reading is
-        // "something is there but not answering", `NoAnswer` below.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    // Same structural discriminator `post_set_disabled` uses: whether THIS
-    // route produced the answer, decided by the header, never by status code
-    // or error text alone.
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
+    let answer: RouteAnswer<crate::proxy::AddAccountResponse> =
+        call_route(config, &ADD_ACCOUNT_ROUTE, |client, url| {
+            client.post(url).json(account)
+        })
+        .await;
+    let providers = answer
+        .stamped
+        .as_ref()
+        .and_then(|headers| headers.get(crate::proxy::PROVIDERS_HEADER))
         .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
-    if from_route
-        && let Some(advertised) = response
-            .headers()
-            .get(crate::proxy::PROVIDERS_HEADER)
-            .and_then(|v| v.to_str().ok())
-    {
-        *providers = crate::proxy::providers_in_header(advertised);
-    }
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr account-add payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    // 400: the route's own request validation (blank name/token) — the
-    // positive capability signal `oauth::probe_add_route` looks for. 409: the
-    // submitted identity matched more than one live account.
-    if from_route && matches!(status.as_u16(), 400 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+        .map(crate::proxy::providers_in_header)
+        .unwrap_or_default();
+    (answer.result, providers)
 }
 
 /// Ask the running proxy to set or clear the identity-bound control account.
-/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
-/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
-/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::CONTROL_ENDPOINT`] — never by status code or error text.
 ///
 /// `query = None` is the CLEAR request; it is sent through exactly like a
 /// name, since [`crate::proxy::SetControlRequest`] treats `query: null` as a
@@ -2019,203 +2115,26 @@ async fn post_set_control(
     config: &Config,
     query: Option<&str>,
 ) -> Result<crate::proxy::SetControlResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONTROL_PATH
-    );
-    let mut request = client
-        .post(&url)
-        .json(&serde_json::json!({ "query": query }));
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first — see `post_set_disabled`'s identical comment
-        // on why checking `is_connect()` first would misclassify a blackholed
-        // address as `NoServer`.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::CONTROL_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!(
-                "the response was not a tcr control-account payload ({e})"
-            ))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+    let body = serde_json::json!({ "query": query });
+    call_route(config, &CONTROL_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Ask the running proxy to set one account's priority in its live rotation.
-/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
-/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
-/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::PRIORITY_ENDPOINT`].
 async fn post_set_priority(
     config: &Config,
     query: &str,
     priority: i64,
 ) -> Result<crate::proxy::SetPriorityResponse, LiveControlError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::PRIORITY_PATH
-    );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "priority": priority,
-    }));
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        // `is_timeout()` first: see `post_set_disabled`'s identical comment.
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::PRIORITY_ENDPOINT);
-    let body = response.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!("the response was not a tcr priority payload ({e})"))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 404 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!("HTTP {status}")))
-}
-
-/// The client every call to [`crate::proxy::CONFIG_PATH`] uses: the same
-/// `no_proxy()` client and timeouts as [`post_set_disabled`].
-fn config_route_client() -> Result<reqwest::Client, LiveControlError> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))
-}
-
-/// Send one request to [`crate::proxy::CONFIG_PATH`] and sort the answer the
-/// way [`post_set_priority`] does: `is_timeout()` before `is_connect()`, and
-/// "the route answered" decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
-/// [`crate::proxy::CONFIG_ENDPOINT`]. A stamped 400 or 409 is the route
-/// refusing; the 200 body is parsed as `T`.
-async fn config_route_call<T: serde::de::DeserializeOwned>(
-    config: &Config,
-    request: reqwest::RequestBuilder,
-) -> Result<T, LiveControlError> {
-    let mut request = request;
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_timeout() => {
-            return Err(LiveControlError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
-        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
-    };
-    let status = response.status();
-    let from_route = response
-        .headers()
-        .get(crate::proxy::ENDPOINT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(crate::proxy::CONFIG_ENDPOINT);
-    let body = response
-        .text()
-        .await
-        .map_err(|e| LiveControlError::Unusable(format!("reading the answer: {e}")))?;
-    if status.is_success() && from_route {
-        return serde_json::from_str(&body).map_err(|e| {
-            LiveControlError::Unusable(format!("the response was not a tcr settings payload ({e})"))
-        });
-    }
-    if status.as_u16() == 401 {
-        return Err(LiveControlError::Unauthorized);
-    }
-    if !from_route && matches!(status.as_u16(), 404 | 405) {
-        return Err(LiveControlError::NoRoute);
-    }
-    if from_route && matches!(status.as_u16(), 400 | 409) {
-        return Err(LiveControlError::Rejected(
-            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
-        ));
-    }
-    Err(LiveControlError::Unusable(format!(
-        "HTTP {status}{}",
-        error_message_of(&body)
-            .map(|m| format!(": {m}"))
-            .unwrap_or_default()
-    )))
+    let body = serde_json::json!({ "query": query, "priority": priority });
+    call_route(config, &PRIORITY_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// Hand one setting to the running proxy, which writes it to its config file.
@@ -2223,16 +2142,15 @@ async fn post_set_config(
     config: &Config,
     setting: &crate::config_set::Setting,
 ) -> Result<crate::proxy::SetConfigResponse, LiveControlError> {
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONFIG_PATH
-    );
-    let request = config_route_client()?.post(&url).json(&serde_json::json!({
+    let body = serde_json::json!({
         "key": setting.key().as_str(),
         "value": setting.value_text(),
-    }));
-    config_route_call(config, request).await
+    });
+    call_route(config, &CONFIG_ROUTE, |client, url| {
+        client.post(url).json(&body)
+    })
+    .await
+    .result
 }
 
 /// The settings the running proxy is using: its `GET` on
@@ -2240,13 +2158,9 @@ async fn post_set_config(
 async fn fetch_running_settings(
     config: &Config,
 ) -> Result<crate::config_show::ConfigSettings, LiveControlError> {
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::CONFIG_PATH
-    );
-    let request = config_route_client()?.get(&url);
-    config_route_call(config, request).await
+    call_route(config, &CONFIG_ROUTE, |client, url| client.get(url))
+        .await
+        .result
 }
 
 /// The file half of `tcr control`: resolve OFFLINE (when `query` is `Some`) →
@@ -2366,8 +2280,13 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
     // it always has. Never a silent skip of the live attempt for any other
     // reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_control(&config, query).await {
-            Ok(applied) => {
+        let site = LiveSite {
+            config: &config,
+            config_path,
+            words: &CONTROL_WORDS,
+        };
+        match site.decide(post_set_control(&config, query).await)? {
+            Live::Applied(applied) => {
                 match &applied.name {
                     Some(name) => println!("Set control account to '{name}'."),
                     None => println!("Cleared the control account."),
@@ -2377,51 +2296,10 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
                 }
                 return Ok(());
             }
-            // Nothing is listening: the historical case, and the only quiet
-            // one. There is no live rotation to disagree with the file.
-            Err(LiveControlError::NoServer) => {}
-            // A server is there and REFUSED us. Writing the file here would
-            // be the old lie in a new place: the config would name a new
-            // control account while the running proxy — the one that actually
-            // resolves identity traffic — keeps using its old one (or none).
-            Err(LiveControlError::Unauthorized) => {
-                bail!(
-                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
-                    config.proxy.port,
-                    config_path.display()
-                );
-            }
-            // The route is missing: an older tcr is serving. The file write
-            // is all we can do, and it is HALF a control-account change — say
-            // so loudly.
-            Err(LiveControlError::NoRoute) => {
+            Live::FileOnly(None) => {}
+            Live::FileOnly(Some(stale)) => {
                 write_control_account(config_path, query)?;
-                eprintln!(
-                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {}",
-                    config.proxy.port,
-                    crate::proxy::CONTROL_PATH,
-                    RESTART_HINT,
-                );
-                return Ok(());
-            }
-            // The route ran and refused the QUERY: it matched no live
-            // account, or matched several. Do not fall back — the file's own
-            // offline resolution could land on a different account than the
-            // one the server was talking about.
-            Err(LiveControlError::Rejected(message)) => {
-                bail!(
-                    "the proxy running on :{} refused this: {message} Nothing was changed.",
-                    config.proxy.port
-                );
-            }
-            // It answered something we cannot use, or did not answer at all.
-            Err(other) => {
-                write_control_account(config_path, query)?;
-                eprintln!(
-                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP its OLD control account until it restarts.",
-                    config.proxy.port,
-                    other.why(),
-                );
+                eprintln!("{}", site.warning(&stale, Some("its OLD control account")));
                 return Ok(());
             }
         }
@@ -3558,6 +3436,16 @@ pub enum LiveStatusError {
     Unusable(String),
 }
 
+impl From<Unreached> for LiveStatusError {
+    fn from(unreached: Unreached) -> Self {
+        match unreached {
+            Unreached::Refused => LiveStatusError::NoServer,
+            Unreached::Silent(why) => LiveStatusError::NoAnswer(why),
+            Unreached::Unbuilt(why) => LiveStatusError::Unusable(why),
+        }
+    }
+}
+
 impl LiveStatusError {
     /// Did an HTTP response come back at all?
     ///
@@ -3659,38 +3547,10 @@ fn parse_live_status(body: &str) -> Result<StatusPayload, LiveStatusError> {
 /// The transport half of [`fetch_live_status`]: one GET, every failure mode
 /// classified, the body handed back unparsed.
 async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusError> {
-    let client = reqwest::Client::builder()
-        // Never route our own loopback read through a system proxy: `HTTP_PROXY`
-        // very commonly points AT tcr, so honouring it would send this query
-        // through the endpoint it is asking about.
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| LiveStatusError::Unusable(format!("http client: {e}")))?;
-
-    let url = format!(
-        "http://127.0.0.1:{}{}",
-        config.proxy.port,
-        crate::proxy::STATUS_PATH
-    );
-    let mut request = client.get(&url);
-    if let Some(key) = config.proxy.api_key.as_deref() {
-        request = request.header("x-api-key", key);
-    }
-
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_connect() => return Err(LiveStatusError::NoServer),
-        Err(e) if e.is_timeout() => {
-            return Err(LiveStatusError::NoAnswer(
-                "the server did not answer within 5s".to_string(),
-            ));
-        }
-        // No response object came back, and it was neither a refused connect nor
-        // the deadline: a reset or a truncated read. Nothing was served.
-        Err(e) => return Err(LiveStatusError::NoAnswer(e.to_string())),
-    };
+    let response = send_loopback(config, crate::proxy::STATUS_PATH, |client, url| {
+        client.get(url)
+    })
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -8403,6 +8263,208 @@ mod tests {
             }
         }
         drop(listener);
+    }
+
+    /// The other WEDGED shape: the connect itself runs into its 2s deadline,
+    /// because the SYN is dropped rather than refused. reqwest reports that
+    /// error as BOTH `is_connect()` and `is_timeout()`, so a sort that asks
+    /// `is_connect()` first files a wedged proxy as "nothing is listening", and
+    /// `tcr status` falls back offline without a word. The status read had that
+    /// order until it shared [`send_loopback`] with the control routes.
+    ///
+    /// A loopback port cannot stage it: a full accept queue on macOS answers
+    /// with a reset, not silence. So the request goes to a TEST-NET-3 address
+    /// (RFC 5737), which nobody answers, and costs the 2s connect deadline.
+    #[tokio::test]
+    async fn a_connect_timeout_is_no_answer_not_no_server() {
+        let config = load_from(TWO_ACCOUNTS);
+        let started = std::time::Instant::now();
+        let sent = send_loopback(&config, crate::proxy::STATUS_PATH, |client, _| {
+            client.get("http://203.0.113.10:41000/_tcr/status")
+        })
+        .await;
+        let waited = started.elapsed();
+        match sent.map_err(LiveStatusError::from) {
+            Err(LiveStatusError::NoAnswer(_)) => {}
+            Err(other) => panic!(
+                "a connect that ran into its deadline must be NoAnswer, got {other:?} after \
+                 {waited:?} (well under 2s means this box has no route to TEST-NET-3, which \
+                 refuses instead of blackholing)"
+            ),
+            Ok(response) => panic!("TEST-NET-3 answered: HTTP {}", response.status()),
+        }
+    }
+
+    /// Every verb that asks the running proxy first says what it said when each
+    /// verb spelled out its own refusals and warnings, word for word. The one
+    /// planned difference is `tcr priority`'s "too old" warning, which named a
+    /// `tcr restart` subcommand that does not exist and now ends in
+    /// [`RESTART_HINT`] like the rest.
+    #[test]
+    fn each_live_verb_keeps_its_own_refusal_and_warning_words() {
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = 3456;
+        let path = Path::new("/x/config.json");
+        let refusal = |words: &'static LiveWords, error: LiveControlError| {
+            let site = LiveSite {
+                config: &config,
+                config_path: path,
+                words,
+            };
+            match site.decide::<()>(Err(error)) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a rejected key or a refused query must not reach the file"),
+            }
+        };
+        let warning = |words: &'static LiveWords, stale: Stale, keeps: Option<&str>| {
+            LiveSite {
+                config: &config,
+                config_path: path,
+                words,
+            }
+            .warning(&stale, keeps)
+        };
+        let message = "no account matches 'zed'.";
+        let why = "HTTP 500 Internal Server Error";
+
+        struct Case {
+            words: &'static LiveWords,
+            keeps: Option<&'static str>,
+            unauthorized: &'static str,
+            rejected: String,
+            too_old: String,
+            failed: String,
+        }
+        let cases = [
+            Case {
+                words: &REMOVE_WORDS,
+                keeps: Some("routing to 'alice'"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/disabled route), so only the config file was changed. It will KEEP routing to 'alice' until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP routing to 'alice' until it restarts."
+                ),
+            },
+            Case {
+                words: &PRIORITY_WORDS,
+                keeps: Some("the old order"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json, so the config was NOT changed, because writing it would leave the running proxy on the old order. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept a live priority change (no /_tcr/accounts/priority route), so only the config file was changed. It will KEEP the old order until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP the old order until it restarts."
+                ),
+            },
+            Case {
+                words: &CONFIG_SET_WORDS,
+                keeps: None,
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json, so nothing was changed: writing the file beside a running proxy can lose the change to its own next write. Fix `proxy.apiKey` and retry.",
+                rejected: format!("the proxy running on :3456 refused this: {message}"),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to save settings itself (no /_tcr/config route), so this process wrote the file beside it. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not hand this to the proxy running on :3456 ({why}), so this process wrote the file beside it."
+                ),
+            },
+            Case {
+                words: &ENABLE_WORDS,
+                keeps: Some("benching 'alice'"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/disabled route), so only the config file was changed. It will KEEP benching 'alice' until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP benching 'alice' until it restarts."
+                ),
+            },
+            Case {
+                words: &CONTROL_WORDS,
+                keeps: Some("its OLD control account"),
+                unauthorized: "the proxy on :3456 rejected the api-key in /x/config.json — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
+                rejected: format!(
+                    "the proxy running on :3456 refused this: {message} Nothing was changed."
+                ),
+                too_old: format!(
+                    "[tcr] WARNING: the proxy running on :3456 is too old to accept live account control (no /_tcr/accounts/control route), so only the config file was changed. It will KEEP its OLD control account until it restarts. {RESTART_HINT}"
+                ),
+                failed: format!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :3456 ({why}), so only the config file was changed. It may KEEP its OLD control account until it restarts."
+                ),
+            },
+        ];
+        for case in cases {
+            let route = case.words.route_path;
+            assert_eq!(
+                refusal(case.words, LiveControlError::Unauthorized),
+                case.unauthorized,
+                "{route}"
+            );
+            assert_eq!(
+                refusal(case.words, LiveControlError::Rejected(message.to_string())),
+                case.rejected,
+                "{route}"
+            );
+            assert_eq!(
+                warning(case.words, Stale::NoRoute, case.keeps),
+                case.too_old,
+                "{route}"
+            );
+            assert_eq!(
+                warning(case.words, Stale::Failed(why.to_string()), case.keeps),
+                case.failed,
+                "{route}"
+            );
+        }
+    }
+
+    /// The decision itself: nothing listening is a quiet file write, a missing
+    /// route and an unusable answer are a warned one, and an answer is applied.
+    #[test]
+    fn the_live_decision_writes_the_file_only_where_it_may() {
+        let config = load_from(TWO_ACCOUNTS);
+        let site = LiveSite {
+            config: &config,
+            config_path: Path::new("/x/config.json"),
+            words: &ENABLE_WORDS,
+        };
+        assert!(matches!(site.decide(Ok(7)), Ok(Live::Applied(7))));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoServer)),
+            Ok(Live::FileOnly(None))
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoRoute)),
+            Ok(Live::FileOnly(Some(Stale::NoRoute)))
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::NoAnswer("late".into()))),
+            Ok(Live::FileOnly(Some(Stale::Failed(why)))) if why == "late"
+        ));
+        assert!(matches!(
+            site.decide::<()>(Err(LiveControlError::Unusable("HTTP 500".into()))),
+            Ok(Live::FileOnly(Some(Stale::Failed(why)))) if why == "HTTP 500"
+        ));
+        assert!(
+            site.decide::<()>(Err(LiveControlError::Unauthorized))
+                .is_err()
+        );
+        assert!(
+            site.decide::<()>(Err(LiveControlError::Rejected("no".into())))
+                .is_err()
+        );
     }
 
     /// The classification the two tests above exercise, pinned directly so a
