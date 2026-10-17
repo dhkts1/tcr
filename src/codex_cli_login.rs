@@ -217,7 +217,7 @@ async fn sign_in(
     let first = oauth::holds_no_codex_row(config_path)?;
     let plan = tcr_status_wire::codex_plan_label(login.plan_type.as_deref());
     let saved = oauth::import_codex_login_as(
-        oauth::LOGIN_CODEX_COMMAND,
+        oauth::LoginCommand::Codex,
         config_path,
         force,
         name,

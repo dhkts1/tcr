@@ -1361,26 +1361,8 @@ pub fn upsert_account(
                 .map_or(0, |max| max + 1);
 
             config.accounts.push(Account {
-                name: name.to_string(),
-                account_type: crate::config::AccountType::OAuth,
-                provider: Default::default(),
-                account_uuid,
-                org_uuid,
-                org_name,
-                access_token: tokens.access_token.clone(),
-                refresh_token: tokens.refresh_token.clone(),
-                expires_at: Some(tokens.expires_at_ms),
                 priority: Some(next_priority),
-                switch_threshold: None,
-                disabled: None,
-                groups: None,
-                organization_type: profile.organization_type.clone(),
-                rate_limit_tier: profile.rate_limit_tier.clone(),
-                seat_tier: profile.seat_tier.clone(),
-                egress: crate::config::Egress::Local,
-                egress_strict: false,
-                codex_home: None,
-                extra: serde_json::Map::new(),
+                ..claude_login_row(name, tokens, profile)
             });
             Ok(())
         }
@@ -1425,7 +1407,7 @@ enum LoginRoute {
     /// api-key rejection (`AddCapability::Unauthorized`) never resolves to
     /// this, under `--force` or otherwise: that is positive evidence the
     /// proxy is alive, so there is no unsafe file write for `--force` to
-    /// rescue — see `login_route`'s `Unauthorized` arm.
+    /// rescue — see `admit_login_against`'s `Unauthorized` arm.
     File,
     /// A live proxy is there and its add route is confirmed: route the
     /// finished credential through it instead of the file. Wins even against
@@ -1564,28 +1546,7 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
 /// header) learns it with no second request. Empty when the server named none,
 /// which is how a server that predates the header, and every non-answer, reads.
 async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider::Provider>) {
-    let probe = Account {
-        name: String::new(),
-        account_type: crate::config::AccountType::OAuth,
-        provider: Default::default(),
-        account_uuid: None,
-        org_uuid: None,
-        org_name: None,
-        access_token: String::new(),
-        refresh_token: None,
-        expires_at: None,
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        organization_type: None,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
-    };
+    let probe = Account::new("", crate::provider::Provider::default(), "");
     let (answer, providers) = crate::cli::post_add_account_with_providers(config, &probe).await;
     let capability = match answer {
         // A blank name/token can never be added, so `Ok` cannot happen in
@@ -1606,32 +1567,69 @@ async fn probe_add_route(config: &Config) -> (AddCapability, Vec<crate::provider
     (capability, providers)
 }
 
-/// Resolve which [`LoginRoute`] `login()` should take. Runs the impure HTTP
-/// capability probe UNCONDITIONALLY — including under `--force` — deliberately
-/// never gated on whether [`crate::singleton::live_proxy_server`]
-/// (`incumbent`) noticed anything on the port first, NOR on `force`: skipping
-/// the probe under `--force` is exactly the bug bridge item C removed, since
-/// it is what let `--force` take the file path even when the live route was
-/// confirmed and safe. `force` only changes what happens when the probe
-/// itself produced an UNUSABLE answer (something holds the port but is not
-/// confirmed safe) — that case falls back to `LoginRoute::File` under
-/// `--force` instead of erroring out, mirroring the historical "force always
-/// succeeds via the file" behaviour. An api-key rejection (`Unauthorized`) is
-/// a DIFFERENT case, and `--force` never rescues it: it is positive evidence
-/// of a live, healthy proxy — it answered, parsed our request, and rejected
-/// the key — which makes it the worst-informed moment to whole-file-write
-/// beside it, since a live server rotating tokens is exactly what makes that
-/// write destructive. Fully resolves before `login()` starts the OAuth
-/// dance, so a user is never told to stop a server AFTER completing a full
-/// browser round-trip, and never silently falls back to the file when a live
-/// proxy answered but rejected our api-key.
-async fn login_route(
-    config_path: &Path,
-    incumbent: Option<singleton::Incumbent>,
+/// The login a refusal tells the user to run again ([`login_guard_refusal_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginCommand {
+    /// `tcr login`
+    Browser,
+    /// `tcr login --from-claude-code`
+    FromClaudeCode,
+    /// `tcr login --from-codex`
+    FromCodex,
+    /// `tcr login --codex`
+    Codex,
+}
+
+impl LoginCommand {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => LOGIN_COMMAND,
+            Self::FromClaudeCode => LOGIN_FROM_CLAUDE_CODE_COMMAND,
+            Self::FromCodex => LOGIN_FROM_CODEX_COMMAND,
+            Self::Codex => LOGIN_CODEX_COMMAND,
+        }
+    }
+}
+
+/// A login the guard let through: the route to write by (never
+/// [`LoginRoute::Refuse`]), the port and incumbent it was decided against, and
+/// the providers the probe's answer advertised ([`probe_add_route`]).
+#[derive(Debug)]
+struct Admitted {
+    route: LoginRoute,
     port: u16,
+    pid: Option<u32>,
+    providers: Vec<crate::provider::Provider>,
+}
+
+impl Admitted {
+    /// Refuse a live server that cannot store a Codex login, naming `command`
+    /// as the login to run again ([`codex_live_route_refusal`]).
+    fn require_codex(&self, command: LoginCommand) -> anyhow::Result<()> {
+        if self.route == LoginRoute::Live
+            && !self.providers.contains(&crate::provider::Provider::Codex)
+        {
+            bail!(
+                "{}",
+                codex_live_route_refusal(self.port, self.pid, command.as_str())
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The admission every login starts with: find the port the server binds, look
+/// for an incumbent on it, and resolve which route the finished credential
+/// takes ([`admit_login_against`]). A refusal comes back as the error, so an
+/// [`Admitted`] route is never [`LoginRoute::Refuse`].
+async fn admit_login(
+    config_path: &Path,
     force: bool,
-) -> anyhow::Result<LoginRoute> {
-    login_route_for(config_path, incumbent, port, force, LOGIN_COMMAND).await
+    command: LoginCommand,
+) -> anyhow::Result<Admitted> {
+    let port = login_target_port(config_path);
+    let incumbent = singleton::live_proxy_server(port);
+    admit_login_against(config_path, incumbent, port, force, command).await
 }
 
 /// [`login_guard_refusal_for`] for plain `tcr login`, whose refusal says `run 'tcr login'`. The
@@ -1646,33 +1644,38 @@ fn login_guard_refusal(
     login_guard_refusal_for(incumbent, has_add_route, port, force, LOGIN_COMMAND)
 }
 
-/// [`login_route`] for the login `command` names (`tcr login --from-claude-code`, …), which a
-/// refusal tells the user to run again ([`login_guard_refusal_for`]).
-async fn login_route_for(
+/// [`admit_login`] against a given `incumbent` and `port`, which is the seam a
+/// test uses to say what process detection saw. `command` is the login that
+/// was run, which a refusal names ([`login_guard_refusal_for`]).
+///
+/// Runs the impure HTTP
+/// capability probe UNCONDITIONALLY — including under `--force` — deliberately
+/// never gated on whether [`crate::singleton::live_proxy_server`]
+/// (`incumbent`) noticed anything on the port first, NOR on `force`: skipping
+/// the probe under `--force` is exactly the bug bridge item C removed, since
+/// it is what let `--force` take the file path even when the live route was
+/// confirmed and safe. `force` only changes what happens when the probe
+/// itself produced an UNUSABLE answer (something holds the port but is not
+/// confirmed safe) — that case falls back to `LoginRoute::File` under
+/// `--force` instead of erroring out, mirroring the historical "force always
+/// succeeds via the file" behaviour. An api-key rejection (`Unauthorized`) is
+/// a DIFFERENT case, and `--force` never rescues it: it is positive evidence
+/// of a live, healthy proxy — it answered, parsed our request, and rejected
+/// the key — which makes it the worst-informed moment to whole-file-write
+/// beside it, since a live server rotating tokens is exactly what makes that
+/// write destructive. Fully resolves before a login starts the OAuth
+/// dance, so a user is never told to stop a server AFTER completing a full
+/// browser round-trip, and never silently falls back to the file when a live
+/// proxy answered but rejected our api-key.
+async fn admit_login_against(
     config_path: &Path,
     incumbent: Option<singleton::Incumbent>,
     port: u16,
     force: bool,
-    command: &str,
-) -> anyhow::Result<LoginRoute> {
-    login_route_with_providers(config_path, incumbent, port, force, command)
-        .await
-        .map(|(route, _)| route)
-}
-
-/// [`login_route`], plus the providers the probe's answer advertised
-/// ([`probe_add_route`]). Every decision is `login_route`'s; the list rides
-/// along for the callers that must refuse a live server unable to store their
-/// provider: `import_codex_login`, and `tcr login --codex` before codex runs
-/// ([`codex_login_route_check`]). `command` is the login that was run, which a
-/// refusal names ([`login_guard_refusal_for`]).
-async fn login_route_with_providers(
-    config_path: &Path,
-    incumbent: Option<singleton::Incumbent>,
-    port: u16,
-    force: bool,
-    command: &str,
-) -> anyhow::Result<(LoginRoute, Vec<crate::provider::Provider>)> {
+    command: LoginCommand,
+) -> anyhow::Result<Admitted> {
+    let pid = incumbent.map(|incumbent| incumbent.pid);
+    let command = command.as_str();
     let config = load_or_default(config_path)?;
     let (capability, providers) = probe_add_route(&config).await;
     let route = match capability {
@@ -1699,20 +1702,28 @@ async fn login_route_with_providers(
         // falling through to `LoginRoute::File` the way folding this into
         // `Absent` used to when `incumbent` was `None`.
         AddCapability::Unusable(why) => {
-            if force {
-                return Ok((LoginRoute::File, providers));
+            if !force {
+                bail!(
+                    "the proxy on :{port} answered but not usably ({why}) while checking whether \
+                     it could take a live login — no browser was opened and nothing was changed. \
+                     This is first-hand evidence something holds the port even though process \
+                     detection may have missed it, so the historical whole-file-write hazard still \
+                     applies. Re-run with --force to log in via the file instead (this still risks \
+                     the running server overwriting it on its next token refresh)."
+                );
             }
-            bail!(
-                "the proxy on :{port} answered but not usably ({why}) while checking whether \
-                 it could take a live login — no browser was opened and nothing was changed. \
-                 This is first-hand evidence something holds the port even though process \
-                 detection may have missed it, so the historical whole-file-write hazard still \
-                 applies. Re-run with --force to log in via the file instead (this still risks \
-                 the running server overwriting it on its next token refresh)."
-            );
+            LoginRoute::File
         }
     };
-    Ok((route, providers))
+    if let LoginRoute::Refuse(msg) = route {
+        bail!("{}", msg);
+    }
+    Ok(Admitted {
+        route,
+        port,
+        pid,
+        providers,
+    })
 }
 
 /// What the browser half of a login produced: the PKCE/CSRF material, the
@@ -1792,12 +1803,9 @@ pub async fn login(
     ui: LoginUi,
 ) -> anyhow::Result<String> {
     ui.install();
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let route = login_route(config_path, incumbent, port, force).await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = admit_login(config_path, force, LoginCommand::Browser)
+        .await?
+        .route;
 
     // Resolve --account early, ONLY to compute the login_hint (ergonomics —
     // see build_login_flow's doc-comment). Fail fast here on a typo'd or
@@ -1964,7 +1972,7 @@ fn read_setup_token() -> anyhow::Result<String> {
 
 /// Add an account from a `claude setup-token` credential instead of the
 /// browser flow. Reuses every downstream layer [`login`] does — the same
-/// [`login_route`] guard against a live server, the same [`fetch_profile`] /
+/// [`admit_login`] guard against a live server, the same [`fetch_profile`] /
 /// [`finish_login`] pipeline — and replaces only the browser half: instead of
 /// a PKCE round trip, the access token is read from stdin
 /// ([`read_setup_token`]) and wrapped in a [`Tokens`] with `refresh_token:
@@ -2085,12 +2093,9 @@ pub async fn login_with_token(
         );
     }
 
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let route = login_route(config_path, incumbent, port, force).await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = admit_login(config_path, force, LoginCommand::Browser)
+        .await?
+        .route;
 
     let access_token = read_setup_token()?;
     let tokens = Tokens {
@@ -2449,27 +2454,14 @@ pub(crate) fn say_codex_notices(ui: LoginUi, notices: &[crate::codex_local::Code
 /// checks it, and on the live route the provider gate [`import_codex_login`] applies, naming
 /// `tcr login --codex` as the command to run again.
 pub(crate) async fn codex_login_route_check(config_path: &Path, force: bool) -> anyhow::Result<()> {
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let pid = incumbent.map(|incumbent| incumbent.pid);
-    let (route, providers) =
-        login_route_with_providers(config_path, incumbent, port, force, LOGIN_CODEX_COMMAND)
-            .await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
-    if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
-        bail!(
-            "{}",
-            codex_live_route_refusal(port, pid, LOGIN_CODEX_COMMAND)
-        );
-    }
-    Ok(())
+    admit_login(config_path, force, LoginCommand::Codex)
+        .await?
+        .require_codex(LoginCommand::Codex)
 }
 
 /// The write half of `tcr login --from-codex`: everything after the read, given
 /// the login. The Codex twin of [`import_claude_code_login`]: the same route
-/// probe and persist path every other login takes ([`login_route`],
+/// probe and persist path every other login takes ([`admit_login`],
 /// [`finish_login_account`]), so a running proxy, `--force` and a corrupt config
 /// behave as they do for `tcr login`. The row is [`codex_account_row`]'s, with
 /// `provider: codex`.
@@ -2522,7 +2514,7 @@ pub(crate) async fn import_codex_login(
     codex_home: Option<&Path>,
 ) -> anyhow::Result<String> {
     import_codex_login_as(
-        LOGIN_FROM_CODEX_COMMAND,
+        LoginCommand::FromCodex,
         config_path,
         force,
         name,
@@ -2536,7 +2528,7 @@ pub(crate) async fn import_codex_login(
 /// [`import_codex_login`], for the login `command` names, which a refusal tells the user to run
 /// again: `tcr login --codex` writes through here too.
 pub(crate) async fn import_codex_login_as(
-    command: &str,
+    command: LoginCommand,
     config_path: &Path,
     force: bool,
     name: Option<&str>,
@@ -2576,17 +2568,9 @@ pub(crate) async fn import_codex_login_as(
             bail!("the Codex login on this machine is not '{wanted}'; nothing was written.");
         }
     }
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let pid = incumbent.map(|incumbent| incumbent.pid);
-    let (route, providers) =
-        login_route_with_providers(config_path, incumbent, port, force, command).await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
-    if route == LoginRoute::Live && !providers.contains(&crate::provider::Provider::Codex) {
-        bail!("{}", codex_live_route_refusal(port, pid, command));
-    }
+    let admitted = admit_login(config_path, force, command).await?;
+    admitted.require_codex(command)?;
+    let route = admitted.route;
     let config = load_or_default(config_path)?;
     let resolved_name = match existing_codex_row(&config, &login) {
         Some(row) => {
@@ -2729,26 +2713,13 @@ fn codex_account_row(
     codex_home: Option<&Path>,
 ) -> Account {
     Account {
-        name,
-        account_type: crate::config::AccountType::OAuth,
-        provider: crate::provider::Provider::Codex,
         account_uuid: login.user_id,
         org_uuid: login.account_id,
-        org_name: None,
-        access_token: login.access_token,
         refresh_token: Some(login.refresh_token),
         expires_at: login.expires_at_ms,
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
         organization_type: login.plan_type,
-        rate_limit_tier: None,
-        seat_tier: None,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
         codex_home: codex_home.map(|folder| folder.display().to_string()),
-        extra: serde_json::Map::new(),
+        ..Account::new(name, crate::provider::Provider::Codex, login.access_token)
     }
 }
 
@@ -2925,19 +2896,9 @@ async fn import_claude_code_login(
     ui: LoginUi,
 ) -> anyhow::Result<Option<String>> {
     ui.install();
-    let port = login_target_port(config_path);
-    let incumbent = singleton::live_proxy_server(port);
-    let route = login_route_for(
-        config_path,
-        incumbent,
-        port,
-        force,
-        LOGIN_FROM_CLAUDE_CODE_COMMAND,
-    )
-    .await?;
-    if let LoginRoute::Refuse(msg) = route {
-        bail!("{}", msg);
-    }
+    let route = admit_login(config_path, force, LoginCommand::FromClaudeCode)
+        .await?
+        .route;
 
     let tokens = tokens_from_claude_code_login(login);
 
@@ -3554,34 +3515,34 @@ async fn finish_login(
     tokens: &Tokens,
     profile: Profile,
 ) -> anyhow::Result<String> {
-    let account = Account {
-        name: name.to_string(),
-        account_type: crate::config::AccountType::OAuth,
-        provider: Default::default(),
-        account_uuid: profile.account_uuid,
-        org_uuid: profile.org_uuid,
-        org_name: profile.org_name,
-        access_token: tokens.access_token.clone(),
+    let account = claude_login_row(name, tokens, &profile);
+    finish_login_account(config_path, route, config, account).await
+}
+
+/// The Anthropic row a login becomes: the profile it authenticated as, plus the
+/// tokens it produced, with no priority (the caller sets one or leaves the
+/// server to).
+///
+/// The plan fields ride the SERVER route too, and for free: the request body
+/// `finish_login_account` posts is a serialized `config::Account`, so the two
+/// serde fields put the plan on the wire without a second payload shape to
+/// keep in step. Pinned by `add_account_request_carries_the_plan_fields`.
+fn claude_login_row(name: &str, tokens: &Tokens, profile: &Profile) -> Account {
+    Account {
+        account_uuid: profile.account_uuid.clone(),
+        org_uuid: profile.org_uuid.clone(),
+        org_name: profile.org_name.clone(),
         refresh_token: tokens.refresh_token.clone(),
         expires_at: Some(tokens.expires_at_ms),
-        priority: None,
-        switch_threshold: None,
-        disabled: None,
-        groups: None,
-        // Carried on the SERVER route too, and for free: the request body
-        // `finish_login_account` posts is a serialized `config::Account`, so the
-        // two serde fields put the plan on the wire without a second payload
-        // shape to keep in step. Pinned by
-        // `add_account_request_carries_the_plan_fields`.
-        organization_type: profile.organization_type,
-        rate_limit_tier: profile.rate_limit_tier,
-        seat_tier: profile.seat_tier,
-        egress: crate::config::Egress::Local,
-        egress_strict: false,
-        codex_home: None,
-        extra: serde_json::Map::new(),
-    };
-    finish_login_account(config_path, route, config, account).await
+        organization_type: profile.organization_type.clone(),
+        rate_limit_tier: profile.rate_limit_tier.clone(),
+        seat_tier: profile.seat_tier.clone(),
+        ..Account::new(
+            name,
+            crate::provider::Provider::Anthropic,
+            tokens.access_token.clone(),
+        )
+    }
 }
 
 /// Load the config for a login, creating the file with defaults when it does
@@ -5068,9 +5029,10 @@ mod tests {
         let manager = crate::manager::Manager::with_live_refresher(server_config, None);
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let route = login_route(&path, None, port, false)
+        let route = admit_login_against(&path, None, port, false, LoginCommand::Browser)
             .await
-            .expect("a confirmed route must not error");
+            .expect("a confirmed route must not error")
+            .route;
         assert_eq!(
             route,
             LoginRoute::Live,
@@ -5097,9 +5059,10 @@ mod tests {
         let manager = crate::manager::Manager::with_live_refresher(server_config, None);
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let route = login_route(&path, None, port, true)
+        let route = admit_login_against(&path, None, port, true, LoginCommand::Browser)
             .await
-            .expect("a confirmed route under --force must not error");
+            .expect("a confirmed route under --force must not error")
+            .route;
         assert_eq!(
             route,
             LoginRoute::Live,
@@ -5124,7 +5087,7 @@ mod tests {
         ));
         std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
-        let err = login_route(&path, None, port, false)
+        let err = admit_login_against(&path, None, port, false, LoginCommand::Browser)
             .await
             .expect_err("a wedged port must refuse, not silently choose File");
         assert!(err.to_string().contains("--force"), "{err}");
@@ -5145,13 +5108,58 @@ mod tests {
         ));
         std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
 
-        let route = login_route(&path, None, port, true)
+        let route = admit_login_against(&path, None, port, true, LoginCommand::Browser)
             .await
-            .expect("--force must still resolve past a wedged-port refusal");
+            .expect("--force must still resolve past a wedged-port refusal")
+            .route;
         assert_eq!(route, LoginRoute::File);
 
         std::fs::remove_file(&path).ok();
         drop(listener);
+    }
+
+    /// A refusal comes back as the error, naming the login that was run, and
+    /// `--force` turns the same refusal into an admitted file route: an
+    /// `Admitted` is never `Refuse`.
+    #[tokio::test]
+    async fn admit_login_bails_on_a_refusal_naming_the_command_and_force_admits_the_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-admit-refusal-{}-{port}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+
+        let err = admit_login_against(
+            &path,
+            incumbent(singleton::ProxyKind::Tcr),
+            port,
+            false,
+            LoginCommand::FromClaudeCode,
+        )
+        .await
+        .expect_err("an incumbent with no add route must refuse");
+        assert!(
+            err.to_string().contains(LOGIN_FROM_CLAUDE_CODE_COMMAND),
+            "{err}"
+        );
+
+        let admitted = admit_login_against(
+            &path,
+            incumbent(singleton::ProxyKind::Tcr),
+            port,
+            true,
+            LoginCommand::FromClaudeCode,
+        )
+        .await
+        .expect("--force admits the file route past that refusal");
+        assert_eq!(admitted.route, LoginRoute::File);
+        assert_eq!(admitted.pid, Some(4242));
+        assert!(admitted.require_codex(LoginCommand::Codex).is_ok());
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// THE OVERRULE: `--force` is the escape hatch past a wedged-port
@@ -5180,7 +5188,7 @@ mod tests {
         std::fs::write(&path, &seed).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = login_route(&path, None, port, true)
+        let err = admit_login_against(&path, None, port, true, LoginCommand::Browser)
             .await
             .expect_err("--force must not rescue a rejected api-key");
         assert!(err.to_string().contains("api-key"), "{err}");
