@@ -607,10 +607,8 @@ impl Manager {
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
-        let is_fable = match provider {
-            crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
-            crate::provider::Provider::Codex => false,
-        };
+        let is_fable =
+            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
         // Compute the control-account three-way split ONCE (part 2). Consulted
         // twice below: the routing overlay (control-preferred / noise) after the
         // affinity fast-path, and the pool-pick exclusion (inference must never
@@ -1798,10 +1796,8 @@ impl Manager {
         let filtered_tried = self.exclude_unsupported_codex_exits(tried, provider);
         let tried = filtered_tried.as_ref();
         // The Fable weekly bucket is an Anthropic fact; a Codex request never consults it.
-        let is_fable = match provider {
-            crate::provider::Provider::Anthropic => model.is_some_and(crate::model::is_fable_model),
-            crate::provider::Provider::Codex => false,
-        };
+        let is_fable =
+            provider.has_fable_bucket() && model.is_some_and(crate::model::is_fable_model);
 
         // HARD-gate predicate shared by both paths: the blocks that even a
         // revalidation serve must honor (soft utilization/pacing deliberately absent).

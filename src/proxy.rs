@@ -1003,7 +1003,7 @@ pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 /// Response header naming, comma-separated, every provider whose accounts this
 /// server can store: [`crate::provider::Provider::as_str`] over
 /// [`crate::provider::Provider::ALL`], so `anthropic,codex`. Set by
-/// `stamp_add_endpoint`, so it rides on every answer the account-add route
+/// `stamp` (for `ADD_ACCOUNT_ROUTE`), so it rides on every answer the account-add route
 /// stamps — the blank-probe 400 `oauth::probe_add_route` provokes, a 405, a
 /// 409, a 200 — and never on the unstamped gate refusal, which must not confirm
 /// the route exists to a caller that failed the gate.
@@ -1636,25 +1636,29 @@ pub fn app(manager: Arc<Manager>) -> Router {
         // 405, never fall through to `handle` and be forwarded upstream.
         .route(
             DISABLED_PATH,
-            axum::routing::post(set_disabled_handler).fallback(disabled_method_not_allowed),
+            axum::routing::post(set_disabled_handler)
+                .fallback(|| async { method_not_allowed(&DISABLED_ROUTE) }),
         )
         .route(
             ADD_ACCOUNT_PATH,
-            axum::routing::post(add_account_handler).fallback(add_account_method_not_allowed),
+            axum::routing::post(add_account_handler)
+                .fallback(|| async { method_not_allowed(&ADD_ACCOUNT_ROUTE) }),
         )
         .route(
             CONTROL_PATH,
-            axum::routing::post(set_control_handler).fallback(control_method_not_allowed),
+            axum::routing::post(set_control_handler)
+                .fallback(|| async { method_not_allowed(&CONTROL_ROUTE) }),
         )
         .route(
             PRIORITY_PATH,
-            axum::routing::post(set_priority_handler).fallback(priority_method_not_allowed),
+            axum::routing::post(set_priority_handler)
+                .fallback(|| async { method_not_allowed(&PRIORITY_ROUTE) }),
         )
         .route(
             CONFIG_PATH,
             axum::routing::get(config_get_handler)
                 .post(config_set_handler)
-                .fallback(config_method_not_allowed),
+                .fallback(|| async { method_not_allowed(&CONFIG_ROUTE) }),
         )
         .fallback(handle)
         .with_state(manager)
@@ -1910,45 +1914,163 @@ async fn quota_handler(
     response
 }
 
-/// A non-`POST` on [`DISABLED_PATH`]. Answered locally with 405 — the route is a
-/// command, and a command has exactly one verb. Stamped with [`ENDPOINT_HEADER`]
-/// so a caller can tell this 405 (the route exists, wrong verb) from the local 404
-/// a tcr without the route returns.
-async fn disabled_method_not_allowed() -> Response {
-    stamp_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr account-control endpoint takes POST.",
-        None,
-    ))
+/// One local `/_tcr/*` route that takes commands: the name its gate and its
+/// messages use, the [`ENDPOINT_HEADER`] value it stamps, and the verbs it
+/// takes. One const per route, so the name a person reads and the stamp the CLI
+/// reads come from one place and cannot drift apart.
+struct LocalRoute {
+    /// The route in the words of its messages: "The tcr {name} endpoint ...".
+    name: &'static str,
+    /// The [`ENDPOINT_HEADER`] value, a wire contract the CLI matches.
+    stamp: &'static str,
+    /// The verbs the 405 names: `POST`, or `GET or POST`.
+    verbs: &'static str,
+    /// Whether every stamped answer also carries [`PROVIDERS_HEADER`].
+    advertises_providers: bool,
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response, naming which local mutating route
-/// produced it. ONE implementation shared by both stampers below, so the two
-/// routes cannot drift on how the header is set — only on which value they set
-/// it to.
-fn stamp_endpoint_as(mut response: Response, endpoint: &'static str) -> Response {
+const DISABLED_ROUTE: LocalRoute = LocalRoute {
+    name: "disable-account",
+    stamp: DISABLED_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+const ADD_ACCOUNT_ROUTE: LocalRoute = LocalRoute {
+    name: "account-add",
+    stamp: ADD_ACCOUNT_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: true,
+};
+
+const CONTROL_ROUTE: LocalRoute = LocalRoute {
+    name: "control-account",
+    stamp: CONTROL_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+const PRIORITY_ROUTE: LocalRoute = LocalRoute {
+    name: "priority",
+    stamp: PRIORITY_ENDPOINT,
+    verbs: "POST",
+    advertises_providers: false,
+};
+
+const CONFIG_ROUTE: LocalRoute = LocalRoute {
+    name: "settings",
+    stamp: CONFIG_ENDPOINT,
+    verbs: "GET or POST",
+    advertises_providers: false,
+};
+
+/// Add [`ENDPOINT_HEADER`] to a response, naming which local route produced it
+/// (and [`PROVIDERS_HEADER`] beside it where the route advertises them): the one
+/// place they are set, so no stamped answer can carry one without the other.
+fn stamp(route: &LocalRoute, mut response: Response) -> Response {
     response
         .headers_mut()
-        .insert(ENDPOINT_HEADER, HeaderValue::from_static(endpoint));
-    response
-}
-
-/// Add [`ENDPOINT_HEADER`] to a response the account-control (disable) route
-/// produced.
-fn stamp_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, DISABLED_ENDPOINT)
-}
-
-/// Add [`ENDPOINT_HEADER`] to a response the account-add route produced, and
-/// [`PROVIDERS_HEADER`] beside it: the one place both are set, so no stamped
-/// answer can carry the stamp without the providers.
-fn stamp_add_endpoint(response: Response) -> Response {
-    let mut response = stamp_endpoint_as(response, ADD_ACCOUNT_ENDPOINT);
-    if let Ok(providers) = HeaderValue::from_str(&advertised_providers()) {
+        .insert(ENDPOINT_HEADER, HeaderValue::from_static(route.stamp));
+    if route.advertises_providers
+        && let Ok(providers) = HeaderValue::from_str(&advertised_providers())
+    {
         response.headers_mut().insert(PROVIDERS_HEADER, providers);
     }
     response
+}
+
+/// A stamped error answer from `route`.
+fn route_error(
+    route: &LocalRoute,
+    status: StatusCode,
+    kind: &'static str,
+    message: &str,
+) -> Response {
+    stamp(route, error_response(status, kind, message, None))
+}
+
+/// A stamped JSON 200 from `route`, marked `no-store`.
+fn json_ok<T: serde::Serialize>(route: &LocalRoute, payload: &T) -> Response {
+    let Ok(body) = serde_json::to_string(payload) else {
+        return route_error(
+            route,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            &format!("Could not serialize the {} result.", route.name),
+        );
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    stamp(route, response)
+}
+
+/// A wrong verb on `route`: a local 405, never forwarded upstream and never able
+/// to mutate anything. Stamped, so a caller can tell this 405 (the route exists,
+/// wrong verb) from the local 404 a tcr without the route returns.
+fn method_not_allowed(route: &LocalRoute) -> Response {
+    route_error(
+        route,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        &format!("The tcr {} endpoint takes {}.", route.name, route.verbs),
+    )
+}
+
+/// Run the checks every mutating `/_tcr/*` route shares, in this order, and
+/// return the parsed command body or the answer to send instead.
+///
+/// 1. [`local_endpoint_gate`]. Its refusal is NOT stamped: a refusal must not
+///    confirm the route exists to a caller that failed the gate, and the CLI
+///    never needs the discriminator on a 401/403, both terminal for it.
+/// 2. `application/json`. It is not a CORS simple media type, so requiring it
+///    forces a preflight this process never answers; see
+///    [`is_json_content_type`] for the four shapes that reached a handler and
+///    parked a live account before the check existed.
+/// 3. The body, read to [`CONTROL_BODY_LIMIT`].
+/// 4. A JSON OBJECT of type `T` ([`parse_object`]); `shape` is the 400 text.
+///
+/// From step 2 on the answer is stamped, because it is a request-shape error and
+/// the CLI reads the stamp to tell a route that answered from a tcr too old to
+/// have one.
+async fn read_command<T: serde::de::DeserializeOwned>(
+    route: &LocalRoute,
+    manager: &Manager,
+    req: Request,
+    shape: &str,
+) -> Result<T, Box<Response>> {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, manager, route.name) {
+        return Err(Box::new(refusal));
+    }
+    if !is_json_content_type(&parts.headers) {
+        return Err(Box::new(route_error(
+            route,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            &format!(
+                "The tcr {} endpoint requires Content-Type: application/json.",
+                route.name
+            ),
+        )));
+    }
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return Err(Box::new(route_error(
+            route,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+        )));
+    };
+    parse_object::<T>(&bytes).ok_or_else(|| {
+        Box::new(route_error(
+            route,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            shape,
+        ))
+    })
 }
 
 /// Deserialize `bytes` into `T`, but ONLY from a JSON object — `None` for
@@ -2021,115 +2143,57 @@ pub struct SetDisabledResponse {
 /// change that is in force right now and will vanish on restart, which is
 /// precisely the state the old code left the operator in silently.
 async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-control") {
-        // NOT stamped: a refusal must not confirm the route exists to a caller
-        // that failed the gate, and the CLI never needs the discriminator on a
-        // 401/403 — both are terminal for it.
-        return refusal;
-    }
-
-    // The browser gate. `application/json` is not a CORS simple media type, so
-    // requiring it forces a preflight this process never answers — see
-    // [`is_json_content_type`] for the four shapes that reached this handler and
-    // parked a live account before the check existed. Stamped, unlike the gate's
-    // refusals above: this is a request-shape error like the 400s below it, and the
-    // CLI reads the stamp to tell a route that answered from a tcr too old to have
-    // one.
-    if !is_json_content_type(&parts.headers) {
-        return stamp_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr account-control endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(parsed) = parse_object::<SetDisabledRequest>(&bytes) else {
-        return stamp_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\", \"disabled\": true}.",
-            None,
-        ));
+    let parsed: SetDisabledRequest = match read_command(
+        &DISABLED_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"query\": \"<account>\", \"disabled\": true}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     let (Some(query), Some(disabled)) = (parsed.query, parsed.disabled) else {
-        return stamp_endpoint(error_response(
+        return route_error(
+            &DISABLED_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "Both \"query\" (string) and \"disabled\" (bool) are required.",
-            None,
-        ));
+        );
     };
     if query.trim().is_empty() {
-        return stamp_endpoint(error_response(
+        return route_error(
+            &DISABLED_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "\"query\" must not be empty.",
-            None,
-        ));
+        );
     }
 
     match manager.set_disabled_by_query(&query, disabled) {
-        SetDisabledOutcome::NoMatch => stamp_endpoint(error_response(
+        SetDisabledOutcome::NoMatch => route_error(
+            &DISABLED_ROUTE,
             StatusCode::NOT_FOUND,
             "not_found_error",
             &format!("No account in the live rotation matches '{query}'."),
-            None,
-        )),
-        SetDisabledOutcome::Ambiguous(names) => stamp_endpoint(error_response(
+        ),
+        SetDisabledOutcome::Ambiguous(names) => route_error(
+            &DISABLED_ROUTE,
             StatusCode::CONFLICT,
             "invalid_request_error",
             &crate::cli::ambiguous_query_message(&query, &names),
-            None,
-        )),
-        SetDisabledOutcome::Applied { name, persist } => {
-            let payload = SetDisabledResponse {
+        ),
+        SetDisabledOutcome::Applied { name, persist } => json_ok(
+            &DISABLED_ROUTE,
+            &SetDisabledResponse {
                 name,
                 disabled,
                 persisted: matches!(persist, DisablePersist::Persisted),
                 warning: persist.warning(disabled).map(str::to_string),
-            };
-            let Ok(body) = serde_json::to_string(&payload) else {
-                return stamp_endpoint(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Could not serialize the account-control result.",
-                    None,
-                ));
-            };
-            let mut response = Response::new(Body::from(body));
-            let headers = response.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            stamp_endpoint(response)
-        }
+            },
+        ),
     }
-}
-
-/// A non-`POST` on [`CONTROL_PATH`]. Answered locally with 405, same reasoning
-/// as [`disabled_method_not_allowed`] — the route is a command with exactly
-/// one verb.
-async fn control_method_not_allowed() -> Response {
-    stamp_control_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr control-account endpoint takes POST.",
-        None,
-    ))
-}
-
-/// Add [`ENDPOINT_HEADER`] to a response the control-account route produced.
-fn stamp_control_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, CONTROL_ENDPOINT)
 }
 
 /// The request body of [`CONTROL_PATH`].
@@ -2191,106 +2255,56 @@ struct SetPriorityRequest {
     priority: Option<i64>,
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response the priority route produced.
-fn stamp_priority_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, PRIORITY_ENDPOINT)
-}
-
-/// A non-`POST` on [`PRIORITY_PATH`]. Answered locally with 405, same
-/// reasoning as [`disabled_method_not_allowed`].
-async fn priority_method_not_allowed() -> Response {
-    stamp_priority_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr priority endpoint takes POST.",
-        None,
-    ))
-}
-
 /// `POST /_tcr/accounts/priority`: set one account's priority IN THE LIVE
 /// ROTATION, for `tcr priority`.
 ///
-/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
-/// first (refusal NOT stamped), then [`is_json_content_type`] (stamped). The
+/// Gated by [`read_command`]. The
 /// work is [`Manager::set_priority_by_query`], which changes memory only; the
 /// CLI writes the config file, because `--first`/`--last` are computed from it.
 async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-priority") {
-        // NOT stamped: see `set_disabled_handler`'s identical comment.
-        return refusal;
-    }
-
-    if !is_json_content_type(&parts.headers) {
-        return stamp_priority_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr priority endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_priority_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(parsed) = parse_object::<SetPriorityRequest>(&bytes) else {
-        return stamp_priority_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\", \"priority\": 0}.",
-            None,
-        ));
+    let parsed: SetPriorityRequest = match read_command(
+        &PRIORITY_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"query\": \"<account>\", \"priority\": 0}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     let (Some(query), Some(priority)) = (parsed.query, parsed.priority) else {
-        return stamp_priority_endpoint(error_response(
+        return route_error(
+            &PRIORITY_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "Both \"query\" (string) and \"priority\" (integer) are required.",
-            None,
-        ));
+        );
     };
     if query.trim().is_empty() {
-        return stamp_priority_endpoint(error_response(
+        return route_error(
+            &PRIORITY_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "\"query\" must not be empty.",
-            None,
-        ));
+        );
     }
 
     match manager.set_priority_by_query(&query, priority) {
-        SetPriorityOutcome::NoMatch => stamp_priority_endpoint(error_response(
+        SetPriorityOutcome::NoMatch => route_error(
+            &PRIORITY_ROUTE,
             StatusCode::NOT_FOUND,
             "not_found_error",
             &format!("No account in the live rotation matches '{query}'."),
-            None,
-        )),
-        SetPriorityOutcome::Ambiguous(names) => stamp_priority_endpoint(error_response(
+        ),
+        SetPriorityOutcome::Ambiguous(names) => route_error(
+            &PRIORITY_ROUTE,
             StatusCode::CONFLICT,
             "invalid_request_error",
             &crate::cli::ambiguous_query_message(&query, &names),
-            None,
-        )),
+        ),
         SetPriorityOutcome::Applied { name } => {
-            let payload = SetPriorityResponse { name, priority };
-            let Ok(body) = serde_json::to_string(&payload) else {
-                return stamp_priority_endpoint(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Could not serialize the priority result.",
-                    None,
-                ));
-            };
-            let mut response = Response::new(Body::from(body));
-            let headers = response.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            stamp_priority_endpoint(response)
+            json_ok(&PRIORITY_ROUTE, &SetPriorityResponse { name, priority })
         }
     }
 }
@@ -2300,8 +2314,8 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
 /// ([`crate::config_set::Setting::parse`]).
 #[derive(serde::Deserialize)]
 struct SetConfigRequest {
-    key: Option<String>,
-    value: Option<String>,
+    key: String,
+    value: String,
 }
 
 /// The 200 body of a `POST` to [`CONFIG_PATH`]. Deserializable too, because
@@ -2316,38 +2330,6 @@ pub struct SetConfigResponse {
     pub changed: bool,
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response the settings route produced.
-fn stamp_config_endpoint(response: Response) -> Response {
-    stamp_endpoint_as(response, CONFIG_ENDPOINT)
-}
-
-/// A method other than `GET` or `POST` on [`CONFIG_PATH`]: a local 405.
-async fn config_method_not_allowed() -> Response {
-    stamp_config_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr settings endpoint takes GET or POST.",
-        None,
-    ))
-}
-
-/// A JSON 200, stamped as the settings route's.
-fn config_json_response<T: serde::Serialize>(payload: &T) -> Response {
-    let Ok(body) = serde_json::to_string(payload) else {
-        return stamp_config_endpoint(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            "Could not serialize the settings result.",
-            None,
-        ));
-    };
-    let mut response = Response::new(Body::from(body));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("cache-control", HeaderValue::from_static("no-store"));
-    stamp_config_endpoint(response)
-}
-
 /// `GET /_tcr/config`: the settings this process is running
 /// ([`Manager::running_settings`]), the `running` half of `tcr config show`.
 /// A read, gated like [`quota_handler`]; the refusal is not stamped, so a
@@ -2356,14 +2338,14 @@ async fn config_get_handler(
     State(manager): State<Arc<Manager>>,
     parts: axum::http::request::Parts,
 ) -> Response {
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "config") {
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, CONFIG_ROUTE.name) {
         return refusal;
     }
-    config_json_response(&manager.running_settings())
+    json_ok(&CONFIG_ROUTE, &manager.running_settings())
 }
 
 /// `POST /_tcr/config`: save one setting to the config file, for `tcr config
-/// set`. Cloned from [`set_priority_handler`]'s gate order. The value is parsed
+/// set`, gated by [`read_command`]. The value is parsed
 /// here again by the same [`crate::config_set::Setting::parse`] the CLI ran,
 /// so this route refuses what the CLI refuses, in the same words, whoever
 /// calls it. The work is [`Manager::persist_setting`], which writes the file
@@ -2372,188 +2354,117 @@ async fn config_get_handler(
 /// Every refusal is a stamped 400 or 409, which `tcr config set` reads as
 /// "the proxy said no" and writes nothing.
 async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "config") {
-        // NOT stamped: see `set_disabled_handler`'s identical comment.
-        return refusal;
-    }
-    if !is_json_content_type(&parts.headers) {
-        return stamp_config_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr settings endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_config_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(SetConfigRequest {
-        key: Some(key),
-        value: Some(value),
-    }) = parse_object::<SetConfigRequest>(&bytes)
-    else {
-        return stamp_config_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"key\": \"switchThreshold\", \"value\": \"0.9\"}.",
-            None,
-        ));
+    let SetConfigRequest { key, value } = match read_command(
+        &CONFIG_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"key\": \"switchThreshold\", \"value\": \"0.9\"}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     let setting = match crate::config_set::Setting::parse(&key, &value) {
         Ok(setting) => setting,
         Err(refusal) => {
-            return stamp_config_endpoint(error_response(
+            return route_error(
+                &CONFIG_ROUTE,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 &refusal.to_string(),
-                None,
-            ));
+            );
         }
     };
     match manager.persist_setting(&setting) {
-        Ok(write) => config_json_response(&SetConfigResponse {
-            key: setting.key().as_str().to_string(),
-            value: setting.value_text(),
-            changed: write == crate::config_set::SettingWrite::Updated,
-        }),
-        Err(crate::manager::SettingPersistError::NoConfigFile) => {
-            stamp_config_endpoint(error_response(
-                StatusCode::CONFLICT,
-                "invalid_request_error",
-                "This proxy was started without a config file, so it has nowhere to save a setting. Nothing was changed.",
-                None,
-            ))
-        }
-        Err(crate::manager::SettingPersistError::WriteFailed(why)) => {
-            stamp_config_endpoint(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                &format!("The proxy could not write its config file: {why}"),
-                None,
-            ))
-        }
+        Ok(write) => json_ok(
+            &CONFIG_ROUTE,
+            &SetConfigResponse {
+                key: setting.key().as_str().to_string(),
+                value: setting.value_text(),
+                changed: write == crate::config_set::SettingWrite::Updated,
+            },
+        ),
+        Err(crate::manager::SettingPersistError::NoConfigFile) => route_error(
+            &CONFIG_ROUTE,
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "This proxy was started without a config file, so it has nowhere to save a setting. Nothing was changed.",
+        ),
+        Err(crate::manager::SettingPersistError::WriteFailed(why)) => route_error(
+            &CONFIG_ROUTE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            &format!("The proxy could not write its config file: {why}"),
+        ),
     }
 }
 
 /// `POST /_tcr/accounts/control` — set or clear the identity-bound CONTROL
 /// account IN THE LIVE ROTATION, for `tcr control`.
 ///
-/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
-/// first (refusal NOT stamped — a caller that failed the gate gets no
-/// confirmation the route exists), then [`is_json_content_type`] (stamped —
-/// a request-shape error like the 400s below it). Does the work through
+/// Gated by [`read_command`]. Does the work through
 /// [`Manager::set_control_by_query`], the same call `tcr control` makes.
 ///
 /// Unlike [`set_disabled_handler`], a missing/`null` `query` is not a 400 — it
 /// is the CLEAR request, a complete operation on its own.
 async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "control-account") {
-        // NOT stamped — see `set_disabled_handler`'s identical comment.
-        return refusal;
-    }
-
-    if !is_json_content_type(&parts.headers) {
-        return stamp_control_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr control-account endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_control_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Some(parsed) = parse_object::<SetControlRequest>(&bytes) else {
-        return stamp_control_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\" | null}.",
-            None,
-        ));
+    let parsed: SetControlRequest = match read_command(
+        &CONTROL_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"query\": \"<account>\" | null}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     if matches!(&parsed.query, Some(q) if q.trim().is_empty()) {
-        return stamp_control_endpoint(error_response(
+        return route_error(
+            &CONTROL_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "\"query\" must not be empty; omit it or send null to clear.",
-            None,
-        ));
+        );
     }
     let cleared = parsed.query.is_none();
 
     match manager.set_control_by_query(parsed.query.as_deref()) {
-        SetControlOutcome::NoMatch => stamp_control_endpoint(error_response(
+        SetControlOutcome::NoMatch => route_error(
+            &CONTROL_ROUTE,
             StatusCode::NOT_FOUND,
             "not_found_error",
             &format!(
                 "No account in the live rotation matches '{}'.",
                 parsed.query.unwrap_or_default()
             ),
-            None,
-        )),
-        SetControlOutcome::Ambiguous(names) => stamp_control_endpoint(error_response(
+        ),
+        SetControlOutcome::Ambiguous(names) => route_error(
+            &CONTROL_ROUTE,
             StatusCode::CONFLICT,
             "invalid_request_error",
             &crate::cli::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
-            None,
-        )),
+        ),
         // 409, like the tie above: every `tcr control` client reads a stamped 404 or 409
         // from this route as a refusal of the query and writes nothing, where any other
         // status would send it to the file instead.
-        SetControlOutcome::CodexAccount(name) => stamp_control_endpoint(error_response(
+        SetControlOutcome::CodexAccount(name) => route_error(
+            &CONTROL_ROUTE,
             StatusCode::CONFLICT,
             "invalid_request_error",
             &crate::manager::codex_control_refusal(&name),
-            None,
-        )),
-        SetControlOutcome::Applied { name, persist } => {
-            let payload = SetControlResponse {
+        ),
+        SetControlOutcome::Applied { name, persist } => json_ok(
+            &CONTROL_ROUTE,
+            &SetControlResponse {
                 name,
                 cleared,
                 persisted: matches!(persist, ControlPersist::Persisted),
                 warning: persist.warning().map(str::to_string),
-            };
-            let Ok(body) = serde_json::to_string(&payload) else {
-                return stamp_control_endpoint(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Could not serialize the control-account result.",
-                    None,
-                ));
-            };
-            let mut response = Response::new(Body::from(body));
-            let headers = response.headers_mut();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            stamp_control_endpoint(response)
-        }
+            },
+        ),
     }
-}
-
-/// A non-`POST` on [`ADD_ACCOUNT_PATH`]. Answered locally with 405, same
-/// reasoning as [`disabled_method_not_allowed`] — the route is a command with
-/// exactly one verb, and it is stamped so a caller can tell this 405 (route
-/// exists, wrong verb) from the local 404 a tcr without the route returns.
-async fn add_account_method_not_allowed() -> Response {
-    stamp_add_endpoint(error_response(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
-        "The tcr account-add endpoint takes POST.",
-        None,
-    ))
 }
 
 /// The request body of [`ADD_ACCOUNT_PATH`].
@@ -2708,35 +2619,24 @@ fn add_account_response(
     warning: Option<String>,
     provider: Option<crate::provider::Provider>,
 ) -> Response {
-    let payload = AddAccountResponse {
-        name,
-        added,
-        index,
-        persisted: matches!(persist, AddPersist::Persisted),
-        warning,
-        provider,
-    };
-    let Ok(body) = serde_json::to_string(&payload) else {
-        return stamp_add_endpoint(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            "Could not serialize the account-add result.",
-            None,
-        ));
-    };
-    let mut response = Response::new(Body::from(body));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert("cache-control", HeaderValue::from_static("no-store"));
-    stamp_add_endpoint(response)
+    json_ok(
+        &ADD_ACCOUNT_ROUTE,
+        &AddAccountResponse {
+            name,
+            added,
+            index,
+            persisted: matches!(persist, AddPersist::Persisted),
+            warning,
+            provider,
+        },
+    )
 }
 
 /// `POST /_tcr/accounts` — add an account to the LIVE rotation with no proxy
 /// restart, for a `tcr login` that should not have to stop and restart the
 /// process to take effect.
 ///
-/// Gated exactly as [`set_disabled_handler`] is — [`local_endpoint_gate`], the
-/// `application/json` requirement, the same [`CONTROL_BODY_LIMIT`] — because this
+/// Gated by [`read_command`] like every other mutating route — because this
 /// route carries an OAuth access token and refresh token in its body and is a
 /// write, so it is authorized no more weakly than the read routes.
 ///
@@ -2749,79 +2649,57 @@ fn add_account_response(
 /// naming the candidates, via [`crate::cli::ambiguous_query_message`] — never
 /// guessed.
 async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-add") {
-        // NOT stamped — see [`set_disabled_handler`]'s identical comment: a
-        // refusal must not confirm the route exists to a caller that failed
-        // the gate.
-        return refusal;
-    }
-
-    if !is_json_content_type(&parts.headers) {
-        return stamp_add_endpoint(error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
-            "The tcr account-add endpoint requires Content-Type: application/json.",
-            None,
-        ));
-    }
-
-    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
-        return stamp_add_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Could not read the request body.",
-            None,
-        ));
-    };
-    let Ok(parsed) = serde_json::from_slice::<AddAccountRequest>(&bytes) else {
-        return stamp_add_endpoint(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Expected a JSON object: {\"name\": \"<account>\", \"accessToken\": \"<token>\", …}.",
-            None,
-        ));
+    let parsed: AddAccountRequest = match read_command(
+        &ADD_ACCOUNT_ROUTE,
+        &manager,
+        req,
+        "Expected a JSON object: {\"name\": \"<account>\", \"accessToken\": \"<token>\", …}.",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(refusal) => return *refusal,
     };
     // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_route` deliberately
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
-    // or answering without `stamp_add_endpoint`, silently turns that read into
+    // or answering without the route's stamp, silently turns that read into
     // `AddCapability::Unusable` — `login_route` then REFUSES outright (bridge
     // item D) rather than falling back to the file, so this degrades to a
     // needless refusal beside a server that actually has the route, not the
     // whole-file clobber this feature exists to remove. See the seam test
     // `probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing`.
     let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
-        return stamp_add_endpoint(error_response(
+        return route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "\"name\" (string) is required and must not be empty.",
-            None,
-        ));
+        );
     };
     // Same load-bearing signal as the blank-name branch above — the probe's
     // body is ALSO blank on `accessToken`, so whichever of the two checks
     // fires first is the one the probe actually exercises. Keep this one a
     // stamped 400 too.
     let Some(access_token) = parsed.access_token.filter(|t| !t.trim().is_empty()) else {
-        return stamp_add_endpoint(error_response(
+        return route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "\"accessToken\" (string) is required and must not be empty.",
-            None,
-        ));
+        );
     };
     // The same rule `config::load` applies to a file row: tcr does not serve
     // API-key accounts. Without this, one added here would serve, and only
     // the next load would set it aside.
     let account_type = parsed.account_type.unwrap_or_default();
     if matches!(account_type, config::AccountType::ApiKey) {
-        return stamp_add_endpoint(error_response(
+        return route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "tcr does not serve API-key accounts; add a Claude login instead.",
-            None,
-        ));
+        );
     }
     let refresh_token = parsed.refresh_token.filter(|t| !t.trim().is_empty());
     let no_refresh_token_warning = refresh_token.is_none().then_some(NO_REFRESH_TOKEN_WARNING);
@@ -2853,12 +2731,12 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     let query_name = account.name.clone();
 
     match manager.add_or_update_account(account) {
-        AddAccountOutcome::Ambiguous(names) => stamp_add_endpoint(error_response(
+        AddAccountOutcome::Ambiguous(names) => route_error(
+            &ADD_ACCOUNT_ROUTE,
             StatusCode::CONFLICT,
             "invalid_request_error",
             &crate::cli::ambiguous_query_message(&query_name, &names),
-            None,
-        )),
+        ),
         // The provider comes off the stored row, not the request: the echo is the
         // server's account of what it holds, which is what a client checks.
         AddAccountOutcome::Added { idx, name, persist } => {

@@ -107,6 +107,27 @@ impl Provider {
         }
     }
 
+    /// May this provider's requests and accounts cross the peer mesh, carried to a peer's exit or
+    /// lent as a lease? Codex stays off it in this version: a lease is sized on the lender's
+    /// Anthropic windows, and the carry path builds an Anthropic URL and splices an Anthropic
+    /// body. The one spelling of the rule: a provider added later answers here, and letting Codex
+    /// onto the mesh is a one-line change.
+    pub fn on_peer_mesh(self) -> bool {
+        match self {
+            Self::Anthropic => true,
+            Self::Codex => false,
+        }
+    }
+
+    /// Does this provider have a Fable weekly quota bucket? It is an Anthropic fact: a Codex
+    /// request whose model id merely contains "fable" never consults the bucket.
+    pub fn has_fable_bucket(self) -> bool {
+        match self {
+            Self::Anthropic => true,
+            Self::Codex => false,
+        }
+    }
+
     /// For `#[serde(skip_serializing_if)]` on `config::Account::provider`: an Anthropic row writes
     /// no key, so an upgraded Anthropic-only config re-saves without a `provider` key.
     pub fn is_anthropic(&self) -> bool {
@@ -148,6 +169,14 @@ mod tests {
         assert!(!Provider::Codex.is_inference_path("/backend-api/wham/usage"));
         assert!(!Provider::Codex.is_inference_path("/v1/messages"));
         assert!(!Provider::Anthropic.is_inference_path("/backend-api/codex/responses"));
+    }
+
+    #[test]
+    fn policy_questions_are_answered_per_provider() {
+        assert!(Provider::Anthropic.on_peer_mesh());
+        assert!(!Provider::Codex.on_peer_mesh());
+        assert!(Provider::Anthropic.has_fable_bucket());
+        assert!(!Provider::Codex.has_fable_bucket());
     }
 
     #[test]

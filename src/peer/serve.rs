@@ -152,9 +152,8 @@ pub fn serve_is_allowed_for_path(path: &str) -> bool {
     if !relay_path_is_routable(path) {
         return false;
     }
-    match crate::provider::Provider::of_path(path) {
-        crate::provider::Provider::Anthropic => {}
-        crate::provider::Provider::Codex => return false,
+    if !crate::provider::Provider::of_path(path).on_peer_mesh() {
+        return false;
     }
     if CLIENT_CREDENTIAL_PREFIXES
         .iter()
