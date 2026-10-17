@@ -30,7 +30,7 @@
 //!   `offline_unavailable` (DNS/name-resolution failure — a fact about this
 //!   machine, not any account) is unaffected and stays a `503`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,7 +66,7 @@ mod ladder;
 pub(crate) mod served;
 
 use client_error::{ClientError, ErrorKind};
-use ladder::Tally;
+use ladder::Ladder;
 use served::{ServedRequest, ServedTurn, WireFold, record_served_request};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -3755,7 +3755,8 @@ async fn handle_request(
     // fleet-wide count: in a mixed fleet the other provider's accounts are never tried for
     // this request, so counting them would read a spent Anthropic rotation as unspent.
     let provider_account_count = manager.provider_account_count(provider);
-    let mut tried: HashSet<usize> = HashSet::new();
+    // Every piece of per-request rotation state, changed only through its methods.
+    let mut ladder = Ladder::default();
     // THE BORROWED-REQUEST PATH, and nothing else reaches it: a lease's
     // account-set scope, as the header the lender's own serving leg wrote onto
     // this loopback request (see [`ACCOUNTS_HEADER_NAME`]).
@@ -3806,12 +3807,12 @@ async fn handle_request(
                 tcr_peer_wire::sanitize_label(&name).is_ok_and(|label| labels.contains(&label))
             });
             if !inside {
-                tried.insert(idx);
+                ladder.bench(idx);
             }
         }
         tracing::debug!(
             accounts = %labels.join(","),
-            benched = tried.len(),
+            benched = ladder.tried().len(),
             of = account_count,
             "account-set scope: this request may be served only by the accounts it names"
         );
@@ -3905,14 +3906,8 @@ async fn handle_request(
         same_provider
     });
     let mut bound_to: Option<usize> = None;
-    // The accounts the hold benched, and only those, so a release mid-request can re-admit
-    // them without re-admitting what another rule benched: `tried` already carries the
-    // account-set scope of a borrowed request (above), and that bench is the lease's only
-    // enforcement on this path. Clearing `tried` wholesale served a lease scoped to one
-    // account on another (found in review, 2026-09-24).
-    let mut benched_for_hold: Vec<usize> = Vec::new();
     // A same-organization sibling a released conversation is sent to first (`same_org_release`),
-    // already selected, so it seeds `next_idx` below.
+    // already selected, so it seeds the ladder's next attempt below.
     let mut released_to: Option<usize> = None;
     if let Some((bound_idx, via)) = bound_candidate {
         let now = OffsetDateTime::now_utc();
@@ -3931,8 +3926,8 @@ async fn handle_request(
         {
             bound_to = Some(bound_idx);
             for idx in 0..account_count {
-                if idx != bound_idx && tried.insert(idx) {
-                    benched_for_hold.push(idx);
+                if idx != bound_idx {
+                    ladder.bench_for_hold(idx);
                 }
             }
             if via == "session-pin" {
@@ -3973,7 +3968,7 @@ async fn handle_request(
             released_to = same_org_release(
                 &manager,
                 bound_idx,
-                &tried,
+                ladder.tried(),
                 request_model.as_deref(),
                 |narrowed| {
                     manager.select_with_group(
@@ -3989,80 +3984,11 @@ async fn handle_request(
             );
         }
     }
-    // Accounts that already got their one force-refresh on a 401.
-    let mut forced_401: HashSet<usize> = HashSet::new();
-    // Per-account inline-429 retry counters.
-    let mut retried_429: HashMap<usize, u32> = HashMap::new();
-    // Per-account in-place 529 retry counters. Separate from `retried_429`: a 429
-    // is "this account is over quota" and may rotate, a 529 is "the upstream is
-    // busy" and must not — sharing one counter would let one status spend the
-    // other's budget.
-    let mut retried_529: HashMap<usize, u32> = HashMap::new();
-    // How many times THIS request has failed over to a DIFFERENT account on a 529.
-    // Per-REQUEST, deliberately not per-account like the counter above: what needs
-    // bounding is how much of the fleet one client request may walk, so it must not
-    // reset when the account changes.
-    let mut failovers_529 = 0u32;
-    // Every attempt's outcome, counted for the terminal answer (`Tally::verdict`).
-    let mut tally = Tally::default();
-    // Blind peer egress is offered ONCE per request, and this is the bound.
-    //
-    // It sits beside `tally.unknown_outcome_transport_failure` because it is the same
-    // fact read the other way round: a carry is only ever offered while that
-    // flag is still false, nothing this request sent has left this box, so a
-    // resend down another path cannot double-send a POST. `src/peer/egress.rs`
-    // documents the seam; the offer itself is in the transport-failure arm
-    // below, above both the resolver arm's sleep and the exhausted-transport
-    // terminal, so both entry points the design names are one call site rather
-    // than two that can drift.
-    let mut peer_egress_tried = false;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
-    // The account the NEXT iteration must use, bypassing select(). Three producers:
-    //
-    //  - A genuine SAME-account retry (401 force-refresh, transient-429 inline wait,
-    //    529 in-place backoff), which select() would otherwise rotate AWAY from the
-    //    very account the retry means to keep.
-    //  - The 529 FAILOVER below, which parks the DIFFERENT account its availability
-    //    probe already chose. That probe IS this iteration's selection: re-running
-    //    select() next iteration would double its side effects (LRU stamp, divert
-    //    log) and could race to a `None` after we already benched the 529'd account
-    //    in `tried` — turning a forwardable 529 into a synthesized 429.
-    //  - A released conversation's same-organization sibling (`same_org_release`, here
-    //    and at the mid-request release), selected for the same reason as the failover.
-    let mut next_idx: Option<usize> = released_to;
-    // One-shot guard: at most one transient-fleet-park soft-wait per client request.
-    let mut soft_waited_exhaustion = false;
-    // The subset of `tried` that is held out by a TRANSIENT 429 park and nothing
-    // else — the only entries the soft-wait below is allowed to re-admit.
-    //
-    // `tried` alone cannot answer that question: it also carries accounts benched
-    // by a 401, a transport blip, a dead token, and a durable quota rejection.
-    // Only the transient park is a TIMER, so only it un-does itself when the clock
-    // runs out; re-admitting any of the others would re-send this request to an
-    // account that already failed it, in a loop. An account leaves this set the
-    // moment it is re-admitted, so membership always means "currently parked".
-    // A Codex 429 that is not a quota refusal parks the same way: its hold is a
-    // timer on the 429's own `retry-after` (the Codex arm below).
-    let mut parked_transient: HashSet<usize> = HashSet::new();
-    // Same-account transport retries this request has spent, per account. The
-    // failing resource in a transport error is the CONNECTION, not the account:
-    // reqwest pools by `(scheme, authority)` and the account is only a Bearer
-    // header, so it is not in the pool key at all. Benching the account for
-    // the whole request therefore fails over on the wrong axis — and with a small
-    // eligible pool a single blip walks it to empty and answers a 502 (measured:
-    // 42 of 205 client-visible 502s fired at `transport_failures == 1`). A dead
-    // connection is evicted from the pool by the error itself, so the retry gets a
-    // fresh one.
-    //
-    // Bounded by `MAX_SAME_ACCOUNT_TRANSPORT_RETRIES`, not by one. This used to
-    // stop after a single retry because "the second failure IS evidence about the
-    // account"; a day's live log says otherwise — the first retry succeeds 94.7%
-    // of the time, so a second failure is overwhelmingly the SAME aging-connection
-    // fault recurring, not a sick account. Rotating instead costs a cold prompt
-    // cache, which is the expensive outcome this whole arm exists to avoid.
-    //
-    // Gated on the error KIND. The transport-failure branch below is THREE arms,
+    ladder.set_next(released_to);
+    // The same-account transport retry (`Ladder::spend_transport_retry`) is gated on the
+    // error KIND. The transport-failure branch below is THREE arms,
     // evaluated in this order — read them as narrowing scope, machine → connection
     // → account:
     //
@@ -4070,36 +3996,22 @@ async fn handle_request(
     //     the MACHINE. Every account resolves the same hostname, so there is
     //     nothing to bench and nowhere to rotate to. Holds the pin, waits, retries
     //     the same account, and after `MAX_OFFLINE_WAITS_PER_REQUEST` answers 503.
-    //  2. SAME-ACCOUNT RETRY (this map): a non-CONNECT failure, i.e. a pooled
+    //  2. SAME-ACCOUNT RETRY: a non-CONNECT failure, i.e. a pooled
     //     CONNECTION died. Up to `MAX_SAME_ACCOUNT_TRANSPORT_RETRIES` per account
-    //     per request, per the rationale above. Deliberately not taken for a
+    //     per request (the rationale is on `Ladder`'s field). Deliberately not taken for a
     //     CONNECT failure — there was no connection to evict, nothing is
     //     refreshed by trying again, and the retry only buys a second connect
     //     timeout on a route already not answering.
     //  3. ROTATE: everything else — a route to a resolvable host that is refused,
     //     blackholed or timing out. That IS evidence about this route, so bench the
     //     account and let the rotation do its job.
-    let mut transport_retried: HashMap<usize, u32> = HashMap::new();
-    // Accounts whose client has already been recycled for a stream reset THIS
-    // request. An h2 stream reset leaves the connection pooled (unlike a
-    // connection-level death), so the same-account retry above would otherwise
-    // check out the identical broken connection every time, this recycles it
-    // once before the retry, not on every retry, so a burst of resets on one
-    // account rebuilds the client a single time rather than once per attempt.
-    let mut reset_recycled: HashSet<usize> = HashSet::new();
-    // In-place waits this request has spent on a name-resolution failure, and how
-    // many such failures it saw at all. Per-REQUEST: an offline machine is one
-    // condition shared by every account, so there is nothing to count per account.
-    // `tally.offline_failures` outlives the waits so the terminal answer can be the
-    // honest 503 even if the request later rotates for an unrelated reason.
-    let mut offline_waits = 0u32;
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
-        let idx = match next_idx.take() {
+        let idx = match ladder.take_next() {
             Some(i) => i,
             None => match manager.select_with_group(
-                &tried,
+                ladder.tried(),
                 now,
                 request_model.as_deref(),
                 session_key,
@@ -4185,11 +4097,11 @@ async fn handle_request(
                         model: request_model.as_deref(),
                         group: request_group.as_deref(),
                         affinity: session_key,
-                        tried_local: tried.len(),
+                        tried_local: ladder.tried().len(),
                         body: body_bytes.clone(),
                         headers: fallback::Ask::scrubbed(&req_headers),
                     });
-                    if let Some(answer) = tally.verdict(
+                    if let Some(answer) = ladder.verdict(
                         &manager,
                         provider,
                         request_model.as_deref(),
@@ -4233,10 +4145,10 @@ async fn handle_request(
                                 manager.retry_after_hint(now, request_is_fable, provider)
                             }
                         },
-                        soft_waited_exhaustion,
+                        ladder.soft_waited_exhaustion(),
                     ) {
                         Some(secs) => {
-                            soft_waited_exhaustion = true;
+                            ladder.spend_soft_wait();
                             // Desync concurrent waiters: without this, every request
                             // sleeping the same integer-ceil `secs` wakes on the SAME
                             // second and races for the single earliest-freeing account,
@@ -4270,19 +4182,11 @@ async fn handle_request(
                             // whose hold is still running stays parked, and one
                             // benched for any NON-hold reason was never in
                             // `parked_transient` to begin with.
-                            let now_ms = crate::now_ms();
-                            let freed: Vec<usize> = parked_transient
-                                .iter()
-                                .copied()
-                                .filter(|&i| manager.hold_expired(i, now_ms))
-                                .collect();
-                            for i in &freed {
-                                tried.remove(i);
-                                parked_transient.remove(i);
-                            }
+                            let (readmitted, still_parked) =
+                                ladder.readmit_expired_parks(&manager, crate::now_ms());
                             tracing::info!(
-                                readmitted = freed.len(),
-                                still_parked = parked_transient.len(),
+                                readmitted,
+                                still_parked,
                                 "soft-wait over — re-admitted the accounts whose hold expired"
                             );
                             continue; // re-run select(); the re-admitted accounts are eligible again
@@ -4382,16 +4286,14 @@ async fn handle_request(
                                 );
                                 // Re-admit only what the hold benched: a lease's
                                 // account-set scope stays benched (see
-                                // `benched_for_hold`), and so does `bound`, which
+                                // `Ladder::release_hold`), and so does `bound`, which
                                 // failed this request.
-                                for idx in benched_for_hold.drain(..) {
-                                    tried.remove(&idx);
-                                }
+                                ladder.release_hold();
                                 bound_to = None;
-                                next_idx = same_org_release(
+                                let released = same_org_release(
                                     &manager,
                                     bound,
-                                    &tried,
+                                    ladder.tried(),
                                     request_model.as_deref(),
                                     |narrowed| {
                                         manager.select_with_group(
@@ -4405,12 +4307,13 @@ async fn handle_request(
                                         )
                                     },
                                 );
+                                ladder.set_next(released);
                                 continue;
                             }
                             let served = match bound_to {
                                 Some(bound) => manager.select_bound(
                                     bound,
-                                    &tried,
+                                    ladder.tried(),
                                     now,
                                     request_is_fable,
                                     request_group.as_deref(),
@@ -4421,7 +4324,7 @@ async fn handle_request(
                                     && manager.revalidation_serve_enabled() =>
                                 {
                                     manager.select_revalidation(
-                                        &tried,
+                                        ladder.tried(),
                                         now,
                                         request_model.as_deref(),
                                         session_key,
@@ -4465,11 +4368,11 @@ async fn handle_request(
         // requests). If the refresh proved the credential dead, skip now.
         manager.ensure_fresh(idx).await;
         if manager.account_status(idx) == Some(AccountStatus::Error) {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         }
         let Some(token) = manager.access_token(idx) else {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         };
         // The upstream headers for THIS account, built once and handed to every route this
@@ -4559,7 +4462,7 @@ async fn handle_request(
         // `AccountRuntime::http` exists to fix: every account collapsing onto
         // one shared connection pool regardless of which one is serving.
         let Some(http) = manager.http_client(idx) else {
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         };
 
@@ -4611,7 +4514,7 @@ async fn handle_request(
                 // so a 502 assembled out of these failures had no line anywhere to
                 // attribute it to; `is_connect` / `is_timeout` separate "never
                 // reached the host" from "the host went quiet mid-request".
-                tally.transport_failures += 1;
+                ladder.transport_failed();
                 // **Blind peer egress, the one offer per request.**
                 //
                 // Four conjuncts, and the first two are what stop a carry
@@ -4652,11 +4555,11 @@ async fn handle_request(
                 // `is_offline_error`, `every_attempt_transport_failed` or
                 // either terminal status is widened.
                 let machine_level = is_offline_error(&err);
-                let nothing_ever_left_this_box = !tally.unknown_outcome_transport_failure
+                let nothing_ever_left_this_box = !ladder.tally().unknown_outcome_transport_failure
                     && (err.is_connect() || machine_level)
                     && every_attempt_transport_failed(
-                        tally.transport_failures,
-                        tally.upstream_responses,
+                        ladder.tally().transport_failures,
+                        ladder.tally().upstream_responses,
                     );
                 // `tried` never contains `idx` yet (it is inserted on the way
                 // out of this arm), so this account plus the benched ones is
@@ -4673,7 +4576,8 @@ async fn handle_request(
                 // offered the carry it gets on the same fleet without them. They
                 // are filtered out of `tried` too, because the scope header
                 // benches every account outside its set, whatever its provider.
-                let tried_of_provider = tried
+                let tried_of_provider = ladder
+                    .tried()
                     .iter()
                     .filter(|&&i| manager.live_provider(i) == Some(provider))
                     .count();
@@ -4683,7 +4587,7 @@ async fn handle_request(
                 // neither lent nor carried), and a carry offers the request to a
                 // peer's gateway as surely as a lease does. A Codex request keeps the
                 // answer it had before the mesh existed.
-                if !peer_egress_tried
+                if !ladder.peer_egress_tried()
                     && nothing_ever_left_this_box
                     && rotation_is_spent
                     && match provider {
@@ -4691,7 +4595,7 @@ async fn handle_request(
                         crate::provider::Provider::Codex => false,
                     }
                 {
-                    peer_egress_tried = true;
+                    ladder.spend_peer_egress();
                     let peers_path = crate::peer::egress::peers_path();
                     let carry = crate::peer::egress::retry_through_peer(
                         crate::peer::egress::CarriedRequest {
@@ -4777,49 +4681,51 @@ async fn handle_request(
                 // possibly help — it only unpins the session and burns the fleet.
                 // Hold the pin, wait briefly, retry the SAME account.
                 if is_offline_error(&err) {
-                    tally.offline_failures += 1;
-                    if offline_waits < MAX_OFFLINE_WAITS_PER_REQUEST {
-                        offline_waits += 1;
+                    let offline_failures = ladder.offline_failed();
+                    if let Some(offline_wait) =
+                        ladder.take_offline_wait(MAX_OFFLINE_WAITS_PER_REQUEST)
+                    {
                         tracing::warn!(
                             account_index = idx,
                             account = account_name.as_deref().unwrap_or("?"),
-                            offline_wait = offline_waits,
+                            offline_wait,
                             max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
                             error = ?err,
                             "name resolution failed — this machine is offline; \
                              holding the pinned account and waiting"
                         );
-                        next_idx = Some(idx);
+                        ladder.retry_same(idx);
                         tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
                         continue;
                     }
-                    return offline_unavailable(provider, tally.offline_failures);
+                    return offline_unavailable(provider, offline_failures);
                 }
                 // Past the connect phase: a connection existed and the request may
                 // already be in flight on the wire, so this attempt's outcome upstream
                 // is unknown regardless of whether it now gets retried in place or the
                 // ladder rotates away from it. See `unknown_outcome_transport_failure`.
                 if !err.is_connect() {
-                    tally.unknown_outcome_transport_failure = true;
+                    ladder.unknown_outcome();
                 }
                 // Classified ONCE per attempt, see `TransportFailureReason`'s own
                 // doc for why a stream reset needs different handling than a
                 // connection-level death even though both are `!is_connect()`.
                 let transport_reason = classify_transport_failure(&err);
                 if transport_reason == TransportFailureReason::StreamReset
-                    && reset_recycled.insert(idx)
+                    && ladder.first_reset_recycle(idx)
                 {
                     // The h2 connection survives a stream reset (unlike a
                     // connection-level death, which reqwest's own error already
                     // evicted from the pool), so without this the retry below
                     // would check out the SAME broken connection. Recycle once per
                     // account per request, a second reset here finds `idx`
-                    // already in `reset_recycled` and goes straight to the retry,
+                    // already recycled and goes straight to the retry,
                     // which by then really is on the fresh connection.
                     manager.recycle_client_after_reset(idx);
                 }
-                let transport_attempt = transport_retried.entry(idx).or_insert(0);
-                if !err.is_connect() && *transport_attempt < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES {
+                if !err.is_connect()
+                    && ladder.transport_retries(idx) < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES
+                {
                     // A blip on this account this request: retry it on a fresh
                     // connection rather than benching an account that is probably fine.
                     // A connection-level death is already evicted from the pool by
@@ -4827,7 +4733,7 @@ async fn handle_request(
                     // either way each retry genuinely gets a new connection, which
                     // is why repeating is worth more than rotating (94.7% land a
                     // 200).
-                    *transport_attempt += 1;
+                    let transport_retry = ladder.spend_transport_retry(idx);
                     // Message text unchanged — `scripts/` parses it. The attempt
                     // fields are ADDED alongside, never a replacement, so an existing
                     // grep keeps matching while a new one can see the ladder.
@@ -4836,12 +4742,12 @@ async fn handle_request(
                         account = account_name.as_deref().unwrap_or("?"),
                         is_connect = err.is_connect(),
                         is_timeout = err.is_timeout(),
-                        transport_retry = *transport_attempt,
+                        transport_retry,
                         max_transport_retries = MAX_SAME_ACCOUNT_TRANSPORT_RETRIES,
                         error = ?err,
                         "upstream transport failure — retrying the SAME account on a fresh connection"
                     );
-                    next_idx = Some(idx);
+                    ladder.retry_same(idx);
                     continue;
                 }
                 tracing::warn!(
@@ -4852,13 +4758,13 @@ async fn handle_request(
                     error = ?err,
                     "upstream transport failure — rotating to another account"
                 );
-                tried.insert(idx);
+                ladder.bench(idx);
                 continue;
             }
         };
         // This attempt reached an upstream and got an HTTP status back, whatever it
         // was. That fact alone disproves "every account transport-failed".
-        tally.upstream_responses += 1;
+        ladder.upstream_answered();
 
         let status = resp.status();
         // One greppable line per upstream response, tagged with the true serving
@@ -4922,12 +4828,12 @@ async fn handle_request(
                     "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
                 );
                 manager.mark_error(idx);
-                tried.insert(idx);
+                ladder.bench(idx);
                 continue;
             }
-            if forced_401.insert(idx) {
+            if ladder.first_forced_refresh(idx) {
                 if manager.ensure_fresh_force(idx).await {
-                    next_idx = Some(idx);
+                    ladder.retry_same(idx);
                     continue; // retry the same account with the fresh token
                 }
                 // The forced refresh produced no new token — it was coalesced /
@@ -4935,7 +4841,7 @@ async fn handle_request(
                 // refresh failed. Retrying would just 401 again on the same dead
                 // token. Rotate away; the account stays Active and the cooldown
                 // self-clears for the next request.
-                tried.insert(idx);
+                ladder.bench(idx);
                 continue;
             }
             // A SECOND 401: the retry with a freshly-minted token ALSO 401'd. That is
@@ -4956,7 +4862,7 @@ async fn handle_request(
             // A genuinely dead credential is still caught at the source: its refresh
             // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
             // this request fails over and the account stays eligible for the next one.
-            tried.insert(idx);
+            ladder.bench(idx);
             continue;
         }
 
@@ -5037,8 +4943,8 @@ async fn handle_request(
                         let hold = NO_GUIDANCE_HOLD_SECS
                             + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
                         manager.mark_rate_limited(idx, hold);
-                        tally.codex_access_read_failures += 1;
-                        tried.insert(idx);
+                        ladder.codex_access_unread();
+                        ladder.bench(idx);
                         continue;
                     }
                     let auth_error = body
@@ -5050,9 +4956,8 @@ async fn handle_request(
                             .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
                         {
                             manager.mark_refused(idx);
-                            tally.account_access_blocks += 1;
-                            tally.last_account_access_block = body.map(|body| (up_headers, body));
-                            tried.insert(idx);
+                            ladder.account_access_blocked(body.map(|body| (up_headers, body)));
+                            ladder.bench(idx);
                             continue;
                         }
                         tracing::warn!(
@@ -5083,8 +4988,8 @@ async fn handle_request(
                 "upstream 403 Forbidden — credential refused, rotating to another account"
             );
             manager.mark_refused(idx);
-            tally.refused_403.push((idx, account_name.clone()));
-            tried.insert(idx);
+            ladder.refused_403(idx, account_name.clone());
+            ladder.bench(idx);
             continue;
         }
 
@@ -5216,19 +5121,19 @@ async fn handle_request(
                             if quota_refusal {
                                 manager.mark_codex_quota_limited(idx, hold);
                             } else {
-                                let count = retried_429.entry(idx).or_insert(0);
+                                let count = ladder.retries_429(idx);
                                 let jitter = i64::from(clock.nanosecond())
                                     % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                                match classify_transient_429(retry_after_raw, *count, jitter) {
+                                match classify_transient_429(retry_after_raw, count, jitter) {
                                     Transient429::InlineWait(wait) => {
-                                        *count += 1;
+                                        ladder.spend_429_retry(idx);
                                         tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                                        next_idx = Some(idx);
+                                        ladder.retry_same(idx);
                                         continue;
                                     }
                                     Transient429::Park(wait) => {
                                         manager.mark_rate_limited(idx, wait);
-                                        parked_transient.insert(idx);
+                                        ladder.park(idx);
                                     }
                                 }
                             }
@@ -5237,7 +5142,7 @@ async fn handle_request(
                                 quota_refusal,
                                 "Codex 429: holding the account and rotating"
                             );
-                            tried.insert(idx);
+                            ladder.bench(idx);
                             continue;
                         }
                         crate::provider::Provider::Anthropic => {}
@@ -5263,28 +5168,27 @@ async fn handle_request(
                                 jittered_quota_hold(retry_after, now.nanosecond()),
                             );
                         }
-                        tried.insert(idx);
+                        ladder.bench(idx);
                         continue;
                     }
-                    let count = retried_429.entry(idx).or_insert(0);
+                    let count = ladder.retries_429(idx);
                     // Desync the no-guidance un-park across accounts that tripped together;
                     // derive the jitter from the loop clock so no `rand` dependency is needed.
                     let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                    match classify_transient_429(retry_after_raw, *count, jitter) {
+                    match classify_transient_429(retry_after_raw, count, jitter) {
                         Transient429::InlineWait(wait) => {
-                            *count += 1;
+                            ladder.spend_429_retry(idx);
                             tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                            next_idx = Some(idx);
+                            ladder.retry_same(idx);
                             continue; // retry the same account after the bounded wait
                         }
                         Transient429::Park(wait) => {
                             manager.mark_rate_limited(idx, wait);
-                            tried.insert(idx);
-                            // Record WHY this entry is in `tried`: a timer that expires on
-                            // its own, so the soft-wait above may take it back. The Codex
-                            // arm above records its non-quota hold the same way; every other
-                            // `tried.insert` in this loop deliberately omits this.
-                            parked_transient.insert(idx);
+                            // Benched AND re-admittable: a timer that expires on its own, so
+                            // the soft-wait above may take it back. The Codex arm above parks
+                            // its non-quota hold the same way; every other bench in this loop
+                            // is `Ladder::bench`, which is not re-admitted.
+                            ladder.park(idx);
                             continue;
                         }
                     }
@@ -5341,32 +5245,32 @@ async fn handle_request(
         // the terminal-outcome arm below, so the client sees the 529 forwarded
         // verbatim — byte-identical to the behaviour before this arm existed.
         if status.as_u16() == STATUS_OVERLOADED {
-            let retried = retried_529.entry(idx).or_insert(0);
-            if *retried < MAX_SAME_ACCOUNT_529_RETRIES {
-                let backoff = backoff_529_secs(*retried, parse_retry_after(&up_headers));
-                *retried += 1;
+            let retried = ladder.retries_529(idx);
+            if retried < MAX_SAME_ACCOUNT_529_RETRIES {
+                let backoff = backoff_529_secs(retried, parse_retry_after(&up_headers));
+                let retry = ladder.spend_529_retry(idx);
                 tracing::warn!(
                     account = account_name.as_deref().unwrap_or("?"),
                     account_index = idx,
-                    retry = *retried,
+                    retry,
                     max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
                     backoff_secs = backoff,
                     "upstream 529 Overloaded — backing off and retrying the SAME account"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
-                next_idx = Some(idx);
+                ladder.retry_same(idx);
                 continue; // retry the same account after the bounded backoff
             }
             // This account's in-place budget is spent. Fail the request over while
             // the per-request failover budget lasts AND another account is free.
-            let attempts = *retried + 1;
-            if failovers_529 < MAX_529_FAILOVERS_PER_REQUEST {
+            let attempts = retried + 1;
+            if ladder.failovers_529() < MAX_529_FAILOVERS_PER_REQUEST {
                 // Ask for the replacement BEFORE benching this account, and pass the
                 // `tried` set the next iteration WOULD have passed. A fresh clock,
                 // not the loop's `now`: the backoffs above have made that value up to
                 // several seconds stale, and an account whose hold expired during
                 // them is a legitimate target.
-                let mut with_this_one = tried.clone();
+                let mut with_this_one = ladder.tried().clone();
                 with_this_one.insert(idx);
                 let failover_now = OffsetDateTime::now_utc();
                 if let Some(other) = manager.select_with_group(
@@ -5382,21 +5286,19 @@ async fn handle_request(
                         other, idx,
                         "select must honour `tried`, or the failover re-sends to the overloaded account"
                     );
-                    tried.insert(idx);
-                    failovers_529 += 1;
+                    // The probe above IS this failover's selection; consume it rather
+                    // than re-selecting (see `Ladder`'s `next_idx`).
+                    ladder.fail_over_529(idx, other);
                     tracing::warn!(
                         account = account_name.as_deref().unwrap_or("?"),
                         account_index = idx,
                         attempts,
-                        failover = failovers_529,
+                        failover = ladder.failovers_529(),
                         max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
                         next_account = manager.account_name(other).as_deref().unwrap_or("?"),
                         next_account_index = other,
                         "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
                     );
-                    // The probe above IS this failover's selection; consume it rather
-                    // than re-selecting (see `next_idx`).
-                    next_idx = Some(other);
                     continue;
                 }
             }
@@ -5407,7 +5309,7 @@ async fn handle_request(
                 // Distinguishes the two give-up shapes in the log: 0 means nothing
                 // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
                 // means the fleet was walked and every account was overloaded too.
-                failovers = failovers_529,
+                failovers = ladder.failovers_529(),
                 "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
             );
         }
@@ -5799,8 +5701,8 @@ async fn handle_request(
                     && let Some(detail) = codex_model_refusal_detail(&bytes)
                 {
                     log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
-                    tally.model_refusals.push((account_name.clone(), detail));
-                    tried.insert(idx);
+                    ladder.model_refused(account_name.clone(), detail);
+                    ladder.bench(idx);
                     continue;
                 }
             }
@@ -5870,7 +5772,7 @@ async fn handle_request(
     let strict_group = request_group
         .as_deref()
         .filter(|g| manager.is_group_strict(g));
-    if let Some(answer) = tally.verdict(
+    if let Some(answer) = ladder.verdict(
         &manager,
         provider,
         request_model.as_deref(),
@@ -21472,6 +21374,8 @@ mod tests {
     /// 502 whatever the resolver said, and an all-refused walk with the exhausted 429.
     #[tokio::test]
     async fn the_terminal_verdict_reads_every_arm_off_the_tallies() {
+        use super::ladder::Tally;
+
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
             fn refresh(
