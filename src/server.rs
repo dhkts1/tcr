@@ -1153,7 +1153,6 @@ async fn boot_peer_listener(
     note_owner_headroom(manager, &ledger);
     {
         let manager = Arc::clone(manager);
-        let ledger = ledger;
         let mut stop = shutdown.subscribe();
         background.push(tokio::spawn(supervise("peer-headroom", async move {
             let notes = async {
