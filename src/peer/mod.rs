@@ -86,21 +86,16 @@
 //! 7. chains, deferred until a third machine exists
 //! 8. `tcr peer move`, out of the mesh
 //!
-//! Each `#[allow(clippy::todo, unused_variables)]` below is a phase's own
-//! marker: the phase that fills that file deletes its line, and the crate-level
-//! `warn(clippy::todo)` in `src/lib.rs` then holds the file to the same
-//! standard as the rest of the tree. Nothing else in this module suppresses a
-//! lint.
+//! Each phase's file once carried an `#[allow(clippy::todo, unused_variables)]`
+//! marker that the phase filling it deleted, so that the workspace lint table's
+//! `todo` then held the file to the same standard as the rest of the tree.
 //!
-//! **Nine of them are gone, which is what a filled phase looks like.**
-//! [`id`], [`config`], [`noise`], [`listener`], [`pair`], [`discovery`],
-//! [`state`], [`lease`] and [`serve`] carry no `todo!()` body any more, so
-//! their markers were deleted in the same change that emptied them rather than
-//! left behind, a suppression that outlives its reason is a suppression the
-//! next reader trusts.
-//!
-//! Two remain, and both are honest: [`tunnel`] and [`egress`] are phase 6 and
-//! still stubs.
+//! **All eleven are gone, which is what a filled phase looks like.** [`id`],
+//! [`config`], [`noise`], [`listener`], [`pair`], [`discovery`], [`state`],
+//! [`lease`], [`serve`], [`tunnel`] and [`egress`] carry no `todo!()` body any
+//! more. The last two outlived their stubs until the markers became
+//! `#[expect]`, which reported them unfulfilled: a suppression that outlives
+//! its reason is a suppression the next reader trusts.
 
 /// Phase 1: the node key, `tcr-node.key` in the config directory.
 pub mod id;
@@ -129,12 +124,10 @@ pub mod schedule;
 /// Phase 4: the SERVE stream, both halves of it.
 pub mod serve;
 
-/// Phase 6: the blind splice. Stub only in this skeleton.
-#[allow(clippy::todo, unused_variables)]
+/// Phase 6: the blind splice.
 pub mod tunnel;
 
-/// Phase 6: the loopback egress splice. Stub only in this skeleton.
-#[allow(clippy::todo, unused_variables)]
+/// Phase 6: the loopback egress splice.
 pub mod egress;
 
 /// Phase 1: runtime state, `teamclaude/peer-state.json` in the cache directory.

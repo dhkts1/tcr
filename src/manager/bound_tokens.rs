@@ -497,7 +497,10 @@ impl Manager {
     /// account already failed this request (`tried`), cannot serve it now, or sits outside the
     /// group this request asked for strictly: a strict group never serves from outside itself,
     /// held history included.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs `select_with_group` also takes"
+    )]
     pub fn select_bound(
         &self,
         idx: usize,

@@ -350,7 +350,10 @@ impl Granted {
 /// refused for a different reason", never "the window is always open"; the
 /// caller passes `None` in both cases and this function does not tell them
 /// apart, because neither one clamps.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the ask, the lender's grant and the lease's clock: inputs from three places"
+)]
 pub fn clamp_to_grant(
     ask: &LeaseRequest,
     granted: Option<LendGrant>,

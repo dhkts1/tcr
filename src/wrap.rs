@@ -279,7 +279,10 @@ fn dates_ending_at(end: Date, n: u32) -> Vec<Date> {
 /// claude, 1 is codex; [`usage::line_provider`]). `filed_by_model_id` counts the
 /// lines with no provider that their model id filed under Codex. Returns the
 /// malformed-line count over the period.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the totals it folds into are separate maps the caller reads separately"
+)]
 fn accumulate(
     dir: &Path,
     dates: &[Date],

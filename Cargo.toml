@@ -144,6 +144,11 @@ undocumented_unsafe_blocks = "warn"
 needless_raw_strings = "warn"
 # An explicit `Arc::clone(&x)` says a reference count moves, not a deep copy.
 clone_on_ref_ptr = "warn"
+# A lint is silenced at a site with `#[expect(lint, reason = "...")]`, never
+# `#[allow]`: an expectation that stops firing is itself a warning, so a stale
+# suppression cannot outlive the code it was written for.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 # Not empty_structs_with_brackets: its one hit is `MoveOffer {}` in
 # tcr-peer-wire, and serde writes a braced empty struct as `{}` but a unit
 # struct as `null`, so the fix changes the peer wire.

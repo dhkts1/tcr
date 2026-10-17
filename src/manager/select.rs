@@ -513,7 +513,10 @@ impl Manager {
     ///
     /// An already-warm session is never re-KEYED by any of it: every arm above
     /// diverts and keeps the pin.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     pub fn select_with_group(
         &self,
         tried: &HashSet<usize>,
@@ -2308,7 +2311,10 @@ impl Manager {
     /// gone?) — see [`Self::account_hard_ok`], which owns the latter.
     ///
     /// Pure and lock-free; the caller holds whichever accounts lock it needs.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     pub(super) fn hard_ok(
         account: &AccountRuntime,
         global_threshold: f64,
@@ -2400,7 +2406,10 @@ impl Manager {
     /// group holding none of them is [`GroupMiss::OtherProviderOnly`], and a
     /// Codex member beside the excluded control account does not hide that the
     /// control exclusion is the reason.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     pub(super) fn classify_group_miss(
         accounts: &[AccountRuntime],
         tried: &HashSet<usize>,
@@ -2493,7 +2502,10 @@ impl Manager {
     /// not a candidate at all, since its credential means nothing to the
     /// request's upstream. An exhausted Anthropic fleet answers 429 rather than
     /// spilling onto a Codex account, and the reverse.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     pub(super) fn eligible(
         account: &AccountRuntime,
         global_threshold: f64,
@@ -2635,7 +2647,10 @@ impl Manager {
     /// RESERVED gate actually blocks. Every current caller ([`Manager::snapshot`],
     /// [`Manager::retry_after_hint`]) reports the fleet as unrequested traffic
     /// sees it, so both pass `None`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     pub(super) fn account_gate(
         account: &AccountRuntime,
         threshold: f64,
@@ -2820,7 +2835,10 @@ impl Manager {
         remaining_ms / self.reset_urgency_tier_ms
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     fn pick_eligible(
         &self,
         accounts: &[AccountRuntime],
@@ -2915,7 +2933,10 @@ impl Manager {
     /// non-pacing eligibility (disabled/error/rate-limit/quota) still applies, so a
     /// genuinely exhausted fleet still yields `None` (a real 429), while a merely
     /// all-paced fleet always yields the coolest account. Read-only.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-request selection inputs, each read by a different gate"
+    )]
     fn pick_least_loaded(
         &self,
         accounts: &[AccountRuntime],

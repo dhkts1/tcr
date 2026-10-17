@@ -6318,7 +6318,10 @@ static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::
 /// `arrived` is [`handle`]'s clock, so the `relay timing` line's `total_ms` counts
 /// the gates the request passed before it got here. A streamed relay body takes
 /// the clock with it and logs when it ends; everything else logs here.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one relayed request's parts, passed through unchanged"
+)]
 async fn relay_upstream(
     manager: &Manager,
     mode: RelayMode,
@@ -6357,7 +6360,10 @@ async fn relay_upstream(
 
 /// [`relay_upstream`]'s body. `timing` is taken (left `None`) by a streamed
 /// response, whose body then owns the `relay timing` line.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one relayed request's parts, passed through unchanged"
+)]
 async fn relay_request(
     manager: &Manager,
     mode: RelayMode,
@@ -7293,14 +7299,13 @@ where
                     }
                 }
             }
-            Some("message_delta") => {
+            Some("message_delta")
                 if let Some(out) = value
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                {
-                    parsed.output = out;
-                }
+                    .and_then(Value::as_u64) =>
+            {
+                parsed.output = out;
             }
             Some("message_stop") => {
                 saw_message_stop = true;
@@ -7317,40 +7322,35 @@ where
                     // A SERVER-side tool call (`--advisor` today; `web_search` is next).
                     // Recorded by id alone: it is Anthropic's own call, nothing the client
                     // runs, and the only thing that matters later is which account minted it.
-                    Some(SERVER_TOOL_USE_BLOCK_TYPE) => {
-                        if let Some(id) = id.as_deref() {
-                            push_bound_token(
-                                &mut bound_tokens,
-                                BoundTokenKind::ServerToolUse,
-                                id.to_string(),
-                            );
-                        }
+                    Some(SERVER_TOOL_USE_BLOCK_TYPE) if let Some(id) = id.as_deref() => {
+                        push_bound_token(
+                            &mut bound_tokens,
+                            BoundTokenKind::ServerToolUse,
+                            id.to_string(),
+                        );
                     }
                     // A reasoning block: open the buffer its `signature_delta`s append to.
-                    Some(THINKING_BLOCK_TYPE) => {
-                        if let Some(index) = block_index(&value) {
-                            // A block start may already carry the whole signature (the
-                            // non-streamed shape arriving over SSE); the deltas then append to
-                            // it rather than to an empty string.
-                            let head = block
-                                .and_then(|b| b.get("signature"))
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            open_signatures.insert(index, head);
-                        }
+                    Some(THINKING_BLOCK_TYPE) if let Some(index) = block_index(&value) => {
+                        // A block start may already carry the whole signature (the
+                        // non-streamed shape arriving over SSE); the deltas then append to
+                        // it rather than to an empty string.
+                        let head = block
+                            .and_then(|b| b.get("signature"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        open_signatures.insert(index, head);
                     }
                     // Already encrypted, and whole at the start — nothing to assemble.
-                    Some(REDACTED_THINKING_BLOCK_TYPE) => {
+                    Some(REDACTED_THINKING_BLOCK_TYPE)
                         if let Some(data) =
-                            block.and_then(|b| b.get("data")).and_then(Value::as_str)
-                        {
-                            push_bound_token(
-                                &mut bound_tokens,
-                                BoundTokenKind::RedactedThinking,
-                                data.to_string(),
-                            );
-                        }
+                            block.and_then(|b| b.get("data")).and_then(Value::as_str) =>
+                    {
+                        push_bound_token(
+                            &mut bound_tokens,
+                            BoundTokenKind::RedactedThinking,
+                            data.to_string(),
+                        );
                     }
                     _ => {}
                 }
@@ -7710,7 +7710,10 @@ fn quiet_error_response(
 // The lint allow sits ABOVE the doc block, not between it and the signature:
 // `tests/peer_egress.rs` (`the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead`)
 // reads the run of `///` lines directly above `async fn exhausted_or_fallback(`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request state that both the 429 and the fallback ask are built from"
+)]
 /// The dry-fleet terminal: consult the fallback ladder once, then answer with
 /// exactly what this handler answered before it existed.
 ///

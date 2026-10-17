@@ -186,7 +186,10 @@ pub async fn login(
 }
 
 /// The flow from `codex login` to the notices, with the folder already made.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the login session plus the options the CLI parsed for it"
+)]
 async fn sign_in(
     session: Arc<Session>,
     codex: PathBuf,

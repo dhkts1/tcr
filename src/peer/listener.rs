@@ -2186,7 +2186,10 @@ pub struct AcceptedSession {
 /// the earliest moment a key is known. See
 /// [`crate::peer::state::PeerState::is_key_banned`] for why the address half of
 /// a ban is not enough on its own.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream, the handshake already begun and the pairing state it is checked against"
+)]
 async fn accept_pairing_or_return<S>(
     stream: &mut S,
     context: &SessionContext,

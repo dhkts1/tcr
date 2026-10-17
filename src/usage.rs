@@ -239,7 +239,10 @@ impl UsageRecord {
     /// once per boot. What must NOT happen is the old behaviour: silently
     /// re-summing the floored parts and handing the quota counter a bigger
     /// number than the caller passed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one response's token counts, each a separate field of the ledger line"
+    )]
     pub fn from_quota_input(
         ts_ms: i64,
         model: Option<String>,
