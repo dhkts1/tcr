@@ -19,7 +19,7 @@ let_underscore_must_use = "deny"
 
 [package]
 name = "tcr"
-version = "1.2.10"
+version = "1.2.11"
 edition = "2024"
 # The toolchain itself is pinned in rust-toolchain.toml; this is the floor a
 # build with any other toolchain is held to.
