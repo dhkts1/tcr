@@ -13,7 +13,7 @@
 //! process:
 //!
 //! * `HOME` → a fresh [`tempfile::TempDir`], so the real
-//!   `~/.config/teamclaude.json` (working credentials for real accounts) is
+//!   `~/.config/tcr.json` (working credentials for real accounts) is
 //!   never read or written.
 //! * `TCR_CLAUDE_CODE_CREDENTIALS` → a fake credentials file inside that
 //!   tempdir. A scratch `HOME` does NOT scratch the login Keychain: without
@@ -46,7 +46,7 @@ const FAKE_CREDENTIALS: &str = r#"{
 }"#;
 
 fn config_path_in(home: &Path) -> PathBuf {
-    home.join(".config").join("teamclaude.json")
+    home.join(".config").join("tcr.json")
 }
 
 /// A port nothing is listening on.

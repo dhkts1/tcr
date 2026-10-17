@@ -31,7 +31,7 @@ fn scratch() -> Scratch {
     let home = dir.path().to_path_buf();
     let config_dir = home.join(".config");
     std::fs::create_dir_all(&config_dir).expect("create the config directory");
-    let config = config_dir.join("teamclaude.json");
+    let config = config_dir.join("tcr.json");
     std::fs::write(
         &config,
         format!(

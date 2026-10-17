@@ -82,9 +82,10 @@ enum Signal {
     /// Signal nothing, ever. A recognized incumbent means stand down.
     #[default]
     Never,
-    /// The binary's default (`--no-replace`): replace a legacy JS proxy, stand
-    /// down for a `tcr` peer.
-    LegacyJsOnly,
+    /// The binary's default (`--no-replace`): signal nothing, stand down for a
+    /// `tcr` peer, and say so on stderr (and name a non-proxy holder) the way
+    /// TcrBar reads it.
+    Report,
     /// `--replace`: replace whichever recognized proxy holds the port.
     Recognized,
 }
@@ -99,12 +100,11 @@ impl IncumbentPolicy {
         Self(Signal::Never)
     }
 
-    /// `tcr server` without `--replace`: SIGTERM/SIGKILL a **legacy JS**
-    /// `teamclaude` proxy on the port (displacing it is why the takeover exists,
-    /// and leaving it running would token-war over single-use refresh tokens),
-    /// but stand down for a `tcr` peer.
-    pub const fn replace_legacy_js_only() -> Self {
-        Self(Signal::LegacyJsOnly)
+    /// `tcr server` without `--replace`: signal nothing, and stand down for a
+    /// `tcr` peer on the port with the stand-down message TcrBar parses
+    /// ([`singleton::INCUMBENT_MARKER`]).
+    pub const fn report_and_stand_down() -> Self {
+        Self(Signal::Report)
     }
 
     /// `tcr server --replace`: **SIGTERM, then SIGKILL after 800ms**, whichever
@@ -121,7 +121,7 @@ impl IncumbentPolicy {
     /// Whether this policy can signal a process at all — for a caller that wants
     /// to assert it is holding the harmless one.
     pub const fn signals_anything(&self) -> bool {
-        !matches!(self.0, Signal::Never)
+        matches!(self.0, Signal::Recognized)
     }
 }
 
@@ -2012,10 +2012,9 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
     // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
     // so our own startup can never token-war with the incumbent. Only a
-    // command-verified teamclaude/tcr server on THIS port is ever signalled — a
-    // `tcr` peer only under `--replace`, a legacy JS `teamclaude` always, since
-    // displacing that one is what the takeover exists for. `--no-replace` is the
-    // default now, and clap rejects it alongside `--replace`.
+    // command-verified `tcr` server on THIS port is ever signalled, and only
+    // under `--replace`. `--no-replace` is the default now, and clap rejects it
+    // alongside `--replace`.
     //
     // Which of those a caller gets is [`IncumbentPolicy`], and the default sends
     // no signal at all: it uses `live_proxy_server`, the detection-only half of
@@ -2034,7 +2033,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent),
             None => singleton::Takeover::Proceed,
         },
-        (_, Signal::LegacyJsOnly) => singleton::takeover_port(port, false),
+        (_, Signal::Report) => singleton::takeover_port(port, false),
         (_, Signal::Recognized) => singleton::takeover_port(port, true),
     };
     if let singleton::Takeover::IncumbentPresent(incumbent) = takeover {
@@ -2393,9 +2392,11 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let tls = match tls {
         TlsSetup::Load => match mitm::load_tls(holds_codex) {
             Ok(assets) => {
-                if let Some(ca) = &assets.ca_path {
-                    tracing::info!(ca = %ca.display(), "{}", mitm::advertise_note(holds_codex));
-                }
+                tracing::info!(
+                    ca = %assets.ca_path.display(),
+                    "{}",
+                    mitm::advertise_note(holds_codex)
+                );
                 manager.record_mitm_status(crate::status::MitmStatus::of(Some(&assets)));
                 Some(Arc::new(assets.acceptor))
             }
@@ -2431,7 +2432,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     };
     let bound = listener.local_addr()?;
 
-    // The boot marker. The durable log at `~/.cache/teamclaude/logs/` rotates
+    // The boot marker. The durable log at `~/.cache/tcr/logs/` rotates
     // daily (5 files kept) rather than growing forever, but within one day's
     // file a restart is still invisible without this line: request lines run
     // unbroken across a bounce and the log cannot be sliced "since this boot".
@@ -2440,7 +2441,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // on this port", not "this pid tried". A restart also wipes the in-memory
     // session→account pin map, the most expensive cache event in this system;
     // counting these lines is how that cost becomes measurable:
-    //   rg 'server started' ~/.cache/teamclaude/logs/*
+    //   rg 'server started' ~/.cache/tcr/logs/*
     //
     // `version` alone could not tell two boots apart: it is `CARGO_PKG_VERSION`,
     // the literal 0.1.0 from Cargo.toml, identical across every build ever made.

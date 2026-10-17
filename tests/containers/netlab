@@ -119,7 +119,7 @@ start_node() {
   # $1 name, $2 listen port, $3 proxy port, $4 find, $5 announce
   name="$1"; listen="$2"; proxy="$3"; find="$4"; announce="$5"
   home="$LAB/$name"
-  config="$home/.config/teamclaude.json"
+  config="$home/.config/tcr.json"
   peers="$home/.config/tcr-peers.json"
   cat > "$config" <<JSON
 {
@@ -184,7 +184,7 @@ start_client() {
   client_home="$LAB/$name"
   mkdir -p "$client_home"
   ip netns exec "$node" env HOME="$home" python3 "$SRC/netlab-client.py" \
-    "$home/.config/teamclaude.json" "$rate" "$body" "$count" \
+    "$home/.config/tcr.json" "$rate" "$body" "$count" \
     >"$client_home/client.log" 2>&1 &
   echo "$!" > "$client_home/pid"
 }
@@ -444,7 +444,7 @@ cmd_ps() {
     src="-"; status="-"; account="-"
     if [ "$role" = "node" ]; then
       row="$(ip netns exec "$name" env HOME="$dir" XDG_CACHE_HOME="$dir/.cache" \
-        tcr status --json --config "$dir/.config/teamclaude.json" 2>/dev/null \
+        tcr status --json --config "$dir/.config/tcr.json" 2>/dev/null \
         | python3 "$SRC/netlab-ps-row.py" || true)"
       if [ -n "$row" ]; then
         src="$(echo "$row" | cut -d' ' -f1)"

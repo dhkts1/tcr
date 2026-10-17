@@ -35,7 +35,7 @@
 //!
 //! One thing this file deliberately does NOT do:
 //!
-//! - **No rebuild from the usage ledger.** `~/.cache/teamclaude/usage/*.jsonl`
+//! - **No rebuild from the usage ledger.** `~/.cache/tcr/usage/*.jsonl`
 //!   persists every request already, but keyed on an internal `u64` session
 //!   NUMBER (`UsageRecord::session`), not the wire's session id string — it
 //!   cannot name a session after a restart, and reconstructing tool counts from

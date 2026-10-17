@@ -118,7 +118,7 @@ const TABLE: &[(&str, f64, f64, Option<f64>)] = &[
     ("claude-haiku-4-5", 1.0, 5.0, None),
 ];
 
-/// A per-model pricing override from `~/.config/teamclaude.json`'s `pricing`
+/// A per-model pricing override from `~/.config/tcr.json`'s `pricing`
 /// map. `input` and `output` are required (a half-specified price is a mistake,
 /// not a default); the three cache dimensions fall back to the same multipliers
 /// the built-in table uses, except that an OpenAI model's cache writes fall back

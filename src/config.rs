@@ -1,9 +1,9 @@
-//! Drop-in config on `~/.config/teamclaude.json`.
+//! The config file, `~/.config/tcr.json`.
 //!
-//! The file is the SAME one the JS proxy uses, so the structs mirror its
-//! camelCase shape and stay tolerant of fields we do not model (`routes`, `sx`,
-//! `quotaProbeSeconds`, `warmupSeconds`, …). Every struct carries a flattened
-//! `extra` map so an unknown key survives a load→save round-trip untouched.
+//! The structs use a camelCase shape and stay tolerant of fields we do not
+//! model (`routes`, `sx`, `quotaProbeSeconds`, `warmupSeconds`, …). Every
+//! struct carries a flattened `extra` map so an unknown key survives a
+//! load→save round-trip untouched.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -1406,7 +1406,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pricing: HashMap<String, crate::pricing::PricingOverride>,
     /// How many days of usage-ledger day files to keep in
-    /// `~/.cache/teamclaude/usage/`. Absent → 90. Checked once at boot; older
+    /// `~/.cache/tcr/usage/`. Absent → 90. Checked once at boot; older
     /// files are deleted then. `0` keeps only today and yesterday (the two the
     /// boot replay reads), which is the floor — the ledger cannot keep less and
     /// still survive a restart, so `crate::usage::prune` refuses to delete
@@ -1694,13 +1694,12 @@ impl Config {
     }
 }
 
-/// The default config path: `$HOME/.config/tcr.json`, or
-/// `$HOME/.config/teamclaude.json` on an install that has only that one.
+/// The default config path: `$HOME/.config/tcr.json`
+/// ([`crate::paths::config_file`]).
 ///
 /// Deliberately NOT the platform config dir (`directories` would pick
-/// `~/Library/Application Support` on macOS) — the JS proxy hard-codes
-/// `~/.config`, and this binary is a drop-in for it. The choice between the two
-/// names is [`crate::paths::config_file`]'s.
+/// `~/Library/Application Support` on macOS): every install already keeps it
+/// in `~/.config`, beside tcr's CA and peers file.
 pub fn default_path() -> PathBuf {
     crate::paths::config_file()
 }
@@ -1842,7 +1841,7 @@ enum Unusable {
     /// The entry's `type` is present but not a string, so it cannot be an
     /// [`AccountType`]. Holds the raw value, for the warning.
     UnreadableType(String),
-    /// The entry carries its own `upstream` (the teamclaude row shape for a
+    /// The entry carries its own `upstream` (a row shape some configs use for a
     /// third-party vendor) whose host is neither Anthropic's API nor the host
     /// this config forwards to. tcr ignores a per-account `upstream` and sends
     /// every account's token to the config's one upstream as a Bearer
@@ -1975,9 +1974,8 @@ fn unusable_account(
 /// `serde_json::from_str` over `Config` would — `Account::access_token` is a
 /// required `String` with no `serde(default)` (deliberately: an empty-string
 /// token must never reach rotation and send `Bearer ` upstream), so one such
-/// entry used to take every other account in the file down with it. Upstream
-/// (`resolve-accounts.js`) skips an unusable account the same way rather than
-/// crashing the fleet. Every `Account` that survives into memory still has a
+/// entry used to take every other account in the file down with it. It is
+/// skipped rather than crashing the fleet. Every `Account` that survives into memory still has a
 /// real, non-empty credential — the 142 call sites reading `access_token` as a
 /// plain `String` are entitled to assume that.
 ///
@@ -3544,8 +3542,8 @@ impl std::fmt::Display for DisabledWrite {
 /// default.
 ///
 /// `disabled == false` REMOVES the key rather than writing `false` — matching
-/// the CLI contract pinned by `cli::tests::set_enabled_false_drops_the_disabled_key`
-/// and the JS `delete account.disabled` it was ported from. A stale `false`
+/// the CLI contract pinned by `cli::tests::set_enabled_false_drops_the_disabled_key`.
+/// A stale `false`
 /// already on disk is dropped for the same reason.
 ///
 /// Unlike [`save_tokens`] there is deliberately NO whole-config fallback when the
@@ -5323,7 +5321,7 @@ mod tests {
         }
     }
 
-    /// A teamclaude-style row whose `upstream` names a third-party host
+    /// A row whose own `upstream` names a third-party host
     /// carries that vendor's key, and tcr forwards every account to its one
     /// configured upstream with the row's token as a Bearer. Such a row is
     /// quarantined at load, like a row with no token: it never serves, the

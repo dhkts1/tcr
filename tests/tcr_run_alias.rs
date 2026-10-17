@@ -26,7 +26,7 @@ fn scratch() -> Scratch {
     let port = tcr::test_support::loopback::unused_port();
     std::fs::create_dir_all(home.join(".config")).expect("config dir");
     std::fs::write(
-        home.join(".config/teamclaude.json"),
+        home.join(".config/tcr.json"),
         format!("{{\n  \"accounts\": [],\n  \"proxy\": {{ \"port\": {port} }}\n}}\n"),
     )
     .expect("write the config");

@@ -64,13 +64,12 @@ struct Profile {
 impl Profile {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("a temp profile directory");
-        std::fs::write(dir.path().join("teamclaude.json"), "{}")
-            .expect("the temp config file writes");
+        std::fs::write(dir.path().join("tcr.json"), "{}").expect("the temp config file writes");
         Self { dir }
     }
 
     fn config_path(&self) -> std::path::PathBuf {
-        self.dir.path().join("teamclaude.json")
+        self.dir.path().join("tcr.json")
     }
 
     fn peers_path(&self) -> std::path::PathBuf {
@@ -352,7 +351,7 @@ fn the_listener_and_the_beacon_name_one_boot_instance_id() {
 }
 
 /// The state file a booted listener writes is the one beside its peers file,
-/// never the operator's own cache file at `teamclaude/peer-state.json`
+/// never the operator's own cache file at `tcr/peer-state.json`
 /// under their cache directory.
 ///
 /// The gate for the resolution `boot_peer_listener` uses. Without it a

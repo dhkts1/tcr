@@ -5330,7 +5330,7 @@ fn cli_peers_file(dir: &Path) -> (PathBuf, String) {
 fn peer_lend_and_share_on_refuse_a_codex_scope() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (peers, node) = cli_peers_file(dir.path());
-    let config = dir.path().join("teamclaude.json");
+    let config = dir.path().join("tcr.json");
     std::fs::write(
         &config,
         r#"{"accounts":[
@@ -5647,7 +5647,7 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
 fn peer_ls_json_carries_the_lent_to_line_keyed_by_account_label() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (peers, node) = cli_peers_file(dir.path());
-    let config = dir.path().join("teamclaude.json");
+    let config = dir.path().join("tcr.json");
     // Obviously fake accounts: no real email, no org uuid. One in group `work`,
     // one in none.
     std::fs::write(
@@ -5729,7 +5729,7 @@ fn peer_ls_json_carries_the_lent_to_line_keyed_by_account_label() {
 fn peer_ls_json_carries_the_mode_the_handed_key_the_switch_and_the_exits() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (peers, node) = cli_peers_file(dir.path());
-    let config = dir.path().join("teamclaude.json");
+    let config = dir.path().join("tcr.json");
     // Obviously fake accounts, no real email and no org uuid. `work-fake` is
     // the one a hand grant can reach; `pinned-fake` carries the exit lock;
     // `spare-fake` has neither and is the control on both maps.
@@ -5868,7 +5868,7 @@ fn peer_ls_json_carries_the_mode_the_handed_key_the_switch_and_the_exits() {
 fn peer_ls_json_keeps_an_account_whose_name_is_not_a_label() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (peers, node) = cli_peers_file(dir.path());
-    let config = dir.path().join("teamclaude.json");
+    let config = dir.path().join("tcr.json");
     // `alice@example.com` is the obviously-fake email this repository uses in
     // every fixture, and an `@` is exactly what `sanitize_label` refuses.
     std::fs::write(
@@ -6090,7 +6090,7 @@ fn a_peer_ls_json_row_carries_until_and_ended() {
     let peers_path = home.path().join("tcr-peers.json");
     // A missing config, deliberately: `lentTo` is keyed by account label and
     // this test must never read the operator's real config directory.
-    let config_path = home.path().join("teamclaude.json");
+    let config_path = home.path().join("tcr.json");
     let borrower = PeerId([7_u8; 32]);
 
     write_peers(
@@ -6347,7 +6347,7 @@ async fn a_borrowed_lease_is_written_and_a_fresh_ls_reads_its_until() {
 
     // A DIFFERENT process, reading the same file: the whole point of item 1.
     // A missing config deliberately, so nothing reads the operator's real one.
-    let config_path = borrower_home.path().join("teamclaude.json");
+    let config_path = borrower_home.path().join("tcr.json");
     let row = ls_json_row(&borrower_peers, &config_path);
     assert_eq!(
         row["until"].as_u64(),
@@ -6449,7 +6449,7 @@ async fn a_borrow_through_the_provider_carries_the_headers_the_api_requires() {
 fn a_borrowed_lease_whose_end_has_passed_reads_ended() {
     let home = tempfile::tempdir().expect("a temp dir");
     let peers_path = home.path().join("tcr-peers.json");
-    let config_path = home.path().join("teamclaude.json");
+    let config_path = home.path().join("tcr.json");
     let lender = PeerId([9_u8; 32]);
     write_peers(
         &peers_path,

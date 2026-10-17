@@ -4,9 +4,9 @@
 //! # Why this reports and never rejects
 //!
 //! tcr keeps a key it does not model verbatim across a load and save round
-//! trip ([`crate::config::Config::extra`]), on purpose: the file is shared with
-//! teamclaude, and refusing a key teamclaude writes would break that drop-in
-//! promise. The cost of that tolerance is that a misspelled key
+//! trip ([`crate::config::Config::extra`]), on purpose: a key some other tool
+//! or an older config wrote must survive tcr's next save. The cost of that
+//! tolerance is that a misspelled key
 //! (`quotaProbeSecs` for `quotaProbeSeconds`) is kept on disk, has no effect,
 //! and nothing says so. This registry is what lets `tcr doctor` and the boot
 //! log name such a key, with the spelling it most likely meant, while the file
@@ -15,8 +15,8 @@
 //! # What counts as known
 //!
 //! Four kinds, see [`KeyKind`]: a field of [`crate::config::Config`], a key
-//! read by name out of the unmodelled `extra` map, a teamclaude key tcr keeps
-//! but does not use, and the legacy key `config::load` migrates. Two tests at
+//! read by name out of the unmodelled `extra` map, a key existing configs carry
+//! that tcr keeps but does not use, and the legacy key `config::load` migrates. Two tests at
 //! the bottom keep the first two kinds in step with the code: one reads the
 //! `Config` struct's own fields, the other every key `src/` reads out of the
 //! `extra` map.
@@ -36,9 +36,9 @@ pub enum KeyKind {
     /// Not a `Config` field, but read by name out of `Config::extra`
     /// (`src/manager/state.rs`, `src/manager/throttle.rs`).
     ReadFromExtra,
-    /// Written by teamclaude, the JS proxy this config is shared with. tcr
-    /// keeps it and does not read it.
-    JsProxy,
+    /// Carried by existing configs and kept verbatim, never read: reporting it
+    /// would warn on every boot about a key that is harmless where it is.
+    KeptUnread,
     /// tcr's own pre-split `throttle` key, which `config::load` migrates to
     /// `accountThrottle` and `fleetThrottle`.
     Legacy,
@@ -85,10 +85,10 @@ const KNOWN_KEYS: &[KnownKey] = &[
     key("throttleExemptNoise", KeyKind::ReadFromExtra),
     key("divertBudget", KeyKind::ReadFromExtra),
     key("claudeCodeImport", KeyKind::ReadFromExtra),
-    key("routes", KeyKind::JsProxy),
-    key("sx", KeyKind::JsProxy),
-    key("logDir", KeyKind::JsProxy),
-    key("autoUpdate", KeyKind::JsProxy),
+    key("routes", KeyKind::KeptUnread),
+    key("sx", KeyKind::KeptUnread),
+    key("logDir", KeyKind::KeptUnread),
+    key("autoUpdate", KeyKind::KeptUnread),
     key("throttle", KeyKind::Legacy),
 ];
 
@@ -234,10 +234,10 @@ mod tests {
         );
     }
 
-    /// teamclaude's keys and the legacy `throttle` are kept on purpose, so a
-    /// config written by teamclaude must read as clean.
+    /// The kept-unread keys and the legacy `throttle` are kept on purpose, so a
+    /// config carrying them must read as clean.
     #[test]
-    fn js_proxy_and_legacy_keys_are_not_reported() {
+    fn kept_unread_and_legacy_keys_are_not_reported() {
         let document = json!({
             "proxy": {"port": 3456}, "upstream": "https://api.anthropic.com",
             "switchThreshold": 0.9, "accounts": [], "routes": [], "sx": {},

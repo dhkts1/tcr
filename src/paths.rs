@@ -1,35 +1,23 @@
 //! Where `tcr` keeps its files: the only code that builds an on-disk path for
 //! the config file, the cache directory and the logs.
 //!
-//! A fresh install gets `~/.config/tcr.json` and `<cache base>/tcr/`. An install
-//! from before the rename keeps the `teamclaude` names it already has
-//! ([`crate::legacy_names`]), read and written where they are, until an update
-//! renames them with `tcr migrate` ([`crate::migrate`]). Resolving a path never
-//! moves, copies or symlinks anything.
+//! The config file is `~/.config/tcr.json` and the cache directory is
+//! `<cache base>/tcr/`. Resolving a path never creates, moves, copies or
+//! symlinks anything; the first write does.
 //!
-//! **The rule, decided per unit:** use the new path if it exists, else the old
-//! path if it exists, else the new path. The units are the config file and the
-//! cache directory. The cache directory is one unit: the usage ledger, the
-//! session-affinity pins, the session-wire file, peer state and the logs all
-//! follow the one resolved directory, so an install never splits its cache
-//! across two folders. The log file prefix follows the directory too, because
-//! `tracing_appender` prunes by prefix.
-//!
-//! The config lives in `~/.config` rather than the platform config dir
-//! (`~/Library/Application Support` on macOS) because the JS proxy hard-codes
-//! `~/.config`, and this binary was a drop-in for it.
+//! The cache directory is one unit: the usage ledger, the session-affinity
+//! pins, the session-wire file, peer state and the logs all live under the one
+//! directory.
 
 use std::path::{Path, PathBuf};
 
-use crate::legacy_names;
-
-/// The config file a fresh install gets, in `~/.config`.
+/// The config file, in `~/.config`.
 pub const CONFIG_FILE: &str = "tcr.json";
 
-/// The cache directory a fresh install gets, under the cache base.
+/// The cache directory, under the cache base.
 pub const CACHE_DIR: &str = "tcr";
 
-/// The rotating log file prefix inside the new cache directory.
+/// The rotating log file prefix inside the cache directory.
 pub const LOG_PREFIX: &str = "tcr.log";
 
 /// Codex's auth document inside an explicitly selected `CODEX_HOME`.
@@ -109,34 +97,9 @@ impl Roots {
     }
 }
 
-/// Which of the two names a unit resolved to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Generation {
-    /// The `tcr` name: a fresh install, or one that already has the new path.
-    Current,
-    /// The `teamclaude` name, kept because only it exists on disk.
-    Legacy,
-}
-
-/// The rule: new if it exists, else old if it exists, else new.
-const fn pick(new_exists: bool, old_exists: bool) -> Generation {
-    if !new_exists && old_exists {
-        Generation::Legacy
-    } else {
-        Generation::Current
-    }
-}
-
-/// The config file under `roots`: `~/.config/tcr.json`, or
-/// `~/.config/teamclaude.json` when only that one exists.
+/// The config file under `roots`: `~/.config/tcr.json`.
 pub fn config_file_in(roots: &Roots) -> PathBuf {
-    let base = roots.config_base();
-    let new = base.join(CONFIG_FILE);
-    let old = base.join(legacy_names::CONFIG_FILE);
-    match pick(new.exists(), old.exists()) {
-        Generation::Current => new,
-        Generation::Legacy => old,
-    }
+    roots.config_base().join(CONFIG_FILE)
 }
 
 /// The default config file for this process. See [`config_file_in`].
@@ -144,22 +107,16 @@ pub fn config_file() -> PathBuf {
     config_file_in(&Roots::from_env())
 }
 
-/// The resolved cache directory and everything that lives in it.
+/// The cache directory and everything that lives in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheDir {
     root: PathBuf,
-    generation: Generation,
 }
 
 impl CacheDir {
-    /// The directory itself: `<cache base>/tcr` or `<cache base>/teamclaude`.
+    /// The directory itself: `<cache base>/tcr`.
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Which name the directory resolved to.
-    pub const fn generation(&self) -> Generation {
-        self.generation
     }
 
     /// The usage ledger directory: `<root>/usage/`.
@@ -186,28 +143,13 @@ impl CacheDir {
     pub fn log_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
-
-    /// The log file prefix for this directory: `tcr.log` in the new one,
-    /// `teamclaude-rs.log` in the old one, so the old logs keep being pruned.
-    pub const fn log_prefix(&self) -> &'static str {
-        match self.generation {
-            Generation::Current => LOG_PREFIX,
-            Generation::Legacy => legacy_names::LOG_PREFIX,
-        }
-    }
 }
 
-/// The cache directory under `roots`, decided once for the whole directory.
+/// The cache directory under `roots`.
 pub fn cache_dir_in(roots: &Roots) -> CacheDir {
-    let base = roots.cache_base();
-    let new = base.join(CACHE_DIR);
-    let old = base.join(legacy_names::CACHE_DIR);
-    let generation = pick(new.is_dir(), old.is_dir());
-    let root = match generation {
-        Generation::Current => new,
-        Generation::Legacy => old,
-    };
-    CacheDir { root, generation }
+    CacheDir {
+        root: roots.cache_base().join(CACHE_DIR),
+    }
 }
 
 /// The cache directory for this process. See [`cache_dir_in`].
@@ -219,10 +161,7 @@ pub fn cache_dir() -> CacheDir {
 /// flag's own description by the CLI. Written once here so 31 flags cannot
 /// drift apart.
 pub fn config_flag_default_help() -> String {
-    format!(
-        "Default: ~/.config/{CONFIG_FILE}, or ~/.config/{} when only that one exists",
-        legacy_names::CONFIG_FILE
-    )
+    format!("Default: ~/.config/{CONFIG_FILE}")
 }
 
 #[cfg(test)]
@@ -254,122 +193,44 @@ mod tests {
             self.home.path().join(".config").join(name)
         }
 
-        fn write_config(&self, name: &str) {
-            let path = self.config(name);
-            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir .config");
-            std::fs::write(&path, "{}").expect("write config");
-        }
-
         fn cache(&self, name: &str) -> PathBuf {
             self.xdg.path().join(name)
         }
-
-        fn make_cache(&self, name: &str) {
-            std::fs::create_dir_all(self.cache(name)).expect("mkdir cache");
-        }
     }
 
     #[test]
-    fn config_old_only_keeps_the_old_file() {
+    fn config_is_tcr_json_and_resolving_creates_nothing() {
         let s = Scratch::new();
-        s.write_config(legacy_names::CONFIG_FILE);
-        assert_eq!(
-            config_file_in(&s.roots()),
-            s.config(legacy_names::CONFIG_FILE)
-        );
+        assert_eq!(config_file_in(&s.roots()), s.config(CONFIG_FILE));
         assert!(
             !s.config(CONFIG_FILE).exists(),
-            "resolving must not create the new file"
-        );
-    }
-
-    #[test]
-    fn config_new_only_uses_the_new_file() {
-        let s = Scratch::new();
-        s.write_config(CONFIG_FILE);
-        assert_eq!(config_file_in(&s.roots()), s.config(CONFIG_FILE));
-    }
-
-    #[test]
-    fn config_both_the_new_one_wins() {
-        let s = Scratch::new();
-        s.write_config(CONFIG_FILE);
-        s.write_config(legacy_names::CONFIG_FILE);
-        assert_eq!(config_file_in(&s.roots()), s.config(CONFIG_FILE));
-    }
-
-    #[test]
-    fn config_neither_is_the_new_file() {
-        let s = Scratch::new();
-        assert_eq!(config_file_in(&s.roots()), s.config(CONFIG_FILE));
-        assert!(
-            !s.config(CONFIG_FILE).exists() && !s.config(legacy_names::CONFIG_FILE).exists(),
             "resolving creates nothing; the first write does"
         );
     }
 
-    /// Neither exists, so the new file is the one that gets created, and from
-    /// then on it is the one resolved.
+    /// The first run creates the resolved file, and from then on it is the one
+    /// resolved.
     #[test]
-    fn config_neither_then_created_resolves_to_the_created_file() {
+    fn config_created_on_first_run_resolves_to_the_created_file() {
         let s = Scratch::new();
         let chosen = config_file_in(&s.roots());
         crate::config::load_or_init(&chosen).expect("first run creates the config");
-        assert!(chosen.is_file(), "the new file was created");
+        assert!(chosen.is_file(), "the file was created");
         assert_eq!(config_file_in(&s.roots()), s.config(CONFIG_FILE));
-        assert!(!s.config(legacy_names::CONFIG_FILE).exists());
     }
 
     #[test]
-    fn cache_old_only_keeps_the_old_directory_and_its_log_prefix() {
-        let s = Scratch::new();
-        s.make_cache(legacy_names::CACHE_DIR);
-        let cache = cache_dir_in(&s.roots());
-        let old = s.cache(legacy_names::CACHE_DIR);
-        assert_eq!(cache.generation(), Generation::Legacy);
-        assert_eq!(cache.root(), old);
-        // Every file in the unit follows the one directory.
-        assert_eq!(cache.usage_dir(), old.join("usage"));
-        assert_eq!(cache.affinity_file(), old.join("session-affinity.json"));
-        assert_eq!(cache.session_wire_file(), old.join("session-wire.json"));
-        assert_eq!(cache.peer_state_file(), old.join("peer-state.json"));
-        assert_eq!(cache.log_dir(), old.join("logs"));
-        assert_eq!(cache.log_prefix(), legacy_names::LOG_PREFIX);
-        assert!(!s.cache(CACHE_DIR).exists(), "resolving creates nothing");
-    }
-
-    #[test]
-    fn cache_new_only_uses_the_new_directory() {
-        let s = Scratch::new();
-        s.make_cache(CACHE_DIR);
-        let cache = cache_dir_in(&s.roots());
-        assert_eq!(cache.generation(), Generation::Current);
-        assert_eq!(cache.root(), s.cache(CACHE_DIR));
-        assert_eq!(cache.log_prefix(), LOG_PREFIX);
-    }
-
-    #[test]
-    fn cache_both_the_new_one_wins() {
-        let s = Scratch::new();
-        s.make_cache(CACHE_DIR);
-        s.make_cache(legacy_names::CACHE_DIR);
-        let cache = cache_dir_in(&s.roots());
-        assert_eq!(cache.root(), s.cache(CACHE_DIR));
-        assert_eq!(cache.log_dir(), s.cache(CACHE_DIR).join("logs"));
-        assert_eq!(cache.log_prefix(), LOG_PREFIX);
-    }
-
-    #[test]
-    fn cache_neither_is_the_new_directory() {
+    fn every_cache_file_follows_the_one_directory() {
         let s = Scratch::new();
         let cache = cache_dir_in(&s.roots());
-        assert_eq!(cache.generation(), Generation::Current);
-        assert_eq!(cache.root(), s.cache(CACHE_DIR));
-        assert_eq!(
-            cache.affinity_file(),
-            s.cache(CACHE_DIR).join("session-affinity.json")
-        );
-        assert!(!s.cache(CACHE_DIR).exists() && !s.cache(legacy_names::CACHE_DIR).exists());
+        let root = s.cache(CACHE_DIR);
+        assert_eq!(cache.root(), root);
+        assert_eq!(cache.usage_dir(), root.join("usage"));
+        assert_eq!(cache.affinity_file(), root.join("session-affinity.json"));
+        assert_eq!(cache.session_wire_file(), root.join("session-wire.json"));
+        assert_eq!(cache.peer_state_file(), root.join("peer-state.json"));
+        assert_eq!(cache.log_dir(), root.join("logs"));
+        assert!(!root.exists(), "resolving creates nothing");
     }
 
     /// The cache base keeps the old fallback chain: a non-empty
@@ -385,12 +246,6 @@ mod tests {
             cache_dir_in(&no_xdg).root(),
             s.home.path().join(".cache").join(CACHE_DIR)
         );
-        std::fs::create_dir_all(s.home.path().join(".cache").join(legacy_names::CACHE_DIR))
-            .expect("mkdir old cache under HOME");
-        assert_eq!(
-            cache_dir_in(&no_xdg).root(),
-            s.home.path().join(".cache").join(legacy_names::CACHE_DIR)
-        );
         let nothing = Roots::default();
         assert_eq!(cache_dir_in(&nothing).root().parent(), Some(Path::new(".")));
         assert_eq!(
@@ -399,22 +254,222 @@ mod tests {
         );
     }
 
-    /// A FILE named like the cache directory is not a cache directory.
     #[test]
-    fn a_file_where_the_new_cache_dir_would_be_does_not_win() {
-        let s = Scratch::new();
-        std::fs::write(s.cache(CACHE_DIR), "").expect("write a stray file");
-        s.make_cache(legacy_names::CACHE_DIR);
+    fn the_flag_help_names_the_default_file() {
+        let help = config_flag_default_help();
+        assert_eq!(help, format!("Default: ~/.config/{CONFIG_FILE}"));
+    }
+
+    /// `source` with every comment replaced by spaces (newlines kept, so line
+    /// numbers survive) and every string and char literal left as written.
+    ///
+    /// A lexer rather than "drop everything after `//`", because `//` occurs
+    /// inside string literals (`"https://..."`) and a char literal can hold a
+    /// quote (`'"'`) that would otherwise open a phantom string.
+    fn strip_comments(source: &str) -> String {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::with_capacity(source.len());
+        let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            let prev_is_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+            if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        out.push_str("  ");
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        out.push_str("  ");
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        out.push(blank(chars[i]));
+                        i += 1;
+                    }
+                }
+            } else if c == 'r'
+                && !(prev_is_ident && chars[i - 1] != 'b')
+                && matches!(next, Some('"' | '#'))
+            {
+                // A raw string: r"..." or r#"..."#, possibly after a `b`.
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while chars.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if chars.get(j) != Some(&'"') {
+                    // `r#ident`, a raw identifier.
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                loop {
+                    match chars.get(j) {
+                        None => break,
+                        Some('"') if (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) => {
+                            j += 1 + hashes;
+                            break;
+                        }
+                        Some(_) => j += 1,
+                    }
+                }
+                out.extend(&chars[i..j]);
+                i = j;
+            } else if c == '"' {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != '"' {
+                    j += if chars[j] == '\\' { 2 } else { 1 };
+                }
+                let end = (j + 1).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+            } else if c == '\'' {
+                // A char literal, or a lifetime / loop label.
+                let end = if next == Some('\\') {
+                    // Skip the backslash and the escaped char, so `'\''` ends
+                    // at its last quote rather than the escaped one.
+                    let mut j = i + 3;
+                    while j < chars.len() && chars[j] != '\'' {
+                        j += 1;
+                    }
+                    j + 1
+                } else if chars.get(i + 2) == Some(&'\'') {
+                    i + 3
+                } else {
+                    i + 1
+                };
+                let end = end.min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}"));
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every `(line, code)` in `source` that joins `.cache` or `.config` onto a
+    /// path (including `.config/fish`), comments removed. Spacing inside the
+    /// call is ignored, so `.join( ".cache" )` is seen too.
+    fn dot_dir_joins(source: &str) -> Vec<(usize, String)> {
+        strip_comments(source)
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                squeezed.contains("join(\".cache") || squeezed.contains("join(\".config")
+            })
+            .map(|(n, line)| (n + 1, line.trim().to_string()))
+            .collect()
+    }
+
+    /// The one site outside `src/paths.rs` that may join `.config`, named with
+    /// its reason: the fish shell's own config directory, which is fish's path
+    /// and not a `tcr` one.
+    const FISH_DIR_JOIN: (&str, &str) = (
+        "src/setup.rs",
+        ".unwrap_or_else(|| self.home.join(\".config\"))",
+    );
+
+    /// Routing: `src/paths.rs` is the only code that builds the `~/.config`
+    /// and `~/.cache` bases, so a second resolution of the cache directory
+    /// (one that ignores `XDG_CACHE_HOME`, say) cannot split the cache across
+    /// two folders. The walk covers `src/` and every crate under `crates/`; no
+    /// crate builds such a path today, and this keeps it that way.
+    #[test]
+    fn dot_dir_paths_are_built_only_in_paths() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let paths_rs = root.join("src").join("paths.rs");
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        rust_files(&root.join("crates"), &mut files);
+        assert!(
+            files.contains(&paths_rs) && files.iter().any(|f| f.starts_with(root.join("crates"))),
+            "the walk must reach src/paths.rs and the crates, found {} files",
+            files.len()
+        );
+        let mut found = Vec::new();
+        let mut allowed_seen = 0;
+        for file in files.iter().filter(|f| **f != paths_rs) {
+            let rel = file.strip_prefix(root).unwrap_or(file);
+            let source =
+                std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            for (line, code) in dot_dir_joins(&source) {
+                if rel == Path::new(FISH_DIR_JOIN.0) && code == FISH_DIR_JOIN.1 {
+                    allowed_seen += 1;
+                } else {
+                    found.push(format!("{}:{line}: {code}", rel.display()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "`.cache` and `.config` are joined in src/paths.rs only; call its functions:\n{}",
+            found.join("\n")
+        );
         assert_eq!(
-            cache_dir_in(&s.roots()).root(),
-            s.cache(legacy_names::CACHE_DIR)
+            allowed_seen, 1,
+            "the allowed fish-directory join moved or vanished: update FISH_DIR_JOIN"
         );
     }
 
+    /// The positive control for [`dot_dir_joins`]: it sees the shapes code can
+    /// write, and leaves comments and unrelated joins alone.
     #[test]
-    fn the_flag_help_names_both_files() {
-        let help = config_flag_default_help();
-        assert!(help.contains(&format!("~/.config/{CONFIG_FILE}")), "{help}");
-        assert!(help.contains(legacy_names::CONFIG_FILE), "{help}");
+    fn the_routing_guard_sees_joins_and_ignores_comments() {
+        let code = [
+            "let a = home.join(\".cache\").join(\"tcr\");",
+            "let b = home.join( \".config\" );",
+            "let c = base.join(\".config/fish\");",
+            "let d = home\n    .join(\".cache\");",
+        ]
+        .join("\n");
+        let lines: Vec<usize> = dot_dir_joins(&code).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(lines, vec![1, 2, 3, 5]);
+        assert_eq!(
+            dot_dir_joins("// home.join(\".cache\")\nlet e = home.join(\".claude\");\n"),
+            Vec::new()
+        );
+        // A quote inside a char literal must not open a string that swallows
+        // the comment marker after it.
+        assert_eq!(
+            dot_dir_joins("let q = '\"'; // home.join(\".cache\")\nlet r = 'a';\n"),
+            Vec::new()
+        );
+        // `//` inside a string is not a comment.
+        assert_eq!(
+            dot_dir_joins("let u = \"https://x\"; let v = home.join(\".cache\");\n"),
+            vec![(
+                1,
+                "let u = \"https://x\"; let v = home.join(\".cache\");".to_string()
+            )]
+        );
     }
 }

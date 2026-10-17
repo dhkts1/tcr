@@ -1,8 +1,6 @@
-//! OAuth token refresh, ported faithfully from `teamclaude/src/oauth.js`.
+//! OAuth token refresh.
 //!
-//! The request shape (endpoint, client id, JSON body, headers) matches the JS
-//! reference exactly so it stays a drop-in against the same Anthropic OAuth
-//! backend. The one behaviour that matters downstream is the error split: a
+//! The one behaviour that matters downstream is the error split: a
 //! `400/401/403` means the refresh token itself is dead (the account must drop
 //! out of rotation until re-login), whereas a `5xx`/network failure is transient
 //! (keep the current token and fail this one request over to another account).
@@ -18,9 +16,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Anthropic OAuth token endpoint (from the JS `DEFAULT_TOKEN_ENDPOINT`).
+/// Anthropic OAuth token endpoint.
 pub const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
-/// Claude Code OAuth client id (from the JS `DEFAULT_CLIENT_ID`).
+/// Claude Code OAuth client id.
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Threshold used by [`is_expiring_soon`]: refresh proactively 5 minutes out.
@@ -281,8 +279,8 @@ impl LiveRefresher {
             // total timeout (streams run long), but a refresh must not hang.
             //
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
-            // proxy — routing our own upstream through an ambient proxy (e.g. a
-            // teamclaude on :3456) loops us through the very thing we replace and fails
+            // proxy — routing our own upstream through an ambient proxy (e.g. one
+            // on :3456) loops us back through a proxy and fails
             // as "upstream unreachable". Always reach the token endpoint directly,
             // Anthropic's and Codex's alike.
             client,
@@ -362,9 +360,7 @@ impl TokenRefresher for NoRefresh {
 }
 
 // ===========================================================================
-// Browser OAuth login (PKCE), ported from `teamclaude/src/oauth.js`
-// (`loginOAuth` / `startCallbackServer` / `raceWithStdinCode` / `openBrowser` /
-// `fetchProfile`). Adds a new account to the drop-in config so friends can
+// Browser OAuth login (PKCE). Adds a new account to the config so friends can
 // onboard without hand-editing JSON.
 // ===========================================================================
 
@@ -382,12 +378,11 @@ use crate::config::{self, Account, Config};
 use crate::log_err::LogErr as _;
 use crate::singleton;
 
-/// Authorize endpoint (from the JS `OAUTH_AUTHORIZE`).
+/// Authorize endpoint.
 pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-/// Profile endpoint used to name the account (from the JS `PROFILE_URL`).
+/// Profile endpoint used to name the account.
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
-/// OAuth scopes requested at login. Narrowed from the JS reference's six
-/// scopes to the three the token endpoint will grant a custom `expires_in`
+/// OAuth scopes requested at login. Narrowed from six scopes to the three the token endpoint will grant a custom `expires_in`
 /// for. `org:create_api_key`, `user:sessions:claude_code` and
 /// `user:mcp_servers` are dropped: requesting any of them alongside a
 /// custom `expires_in` gets HTTP 400 `Custom expires_in not allowed for
@@ -397,7 +392,7 @@ pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 /// is not in the token response, so `fetch_profile` still needs it.
 pub const OAUTH_SCOPES: &str = "user:inference user:profile user:file_upload";
 
-/// Overall login timeout matching the JS 2-minute callback-server deadline.
+/// Overall login timeout: the callback server waits two minutes.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Who is on the other end of `tcr login`.
@@ -974,8 +969,7 @@ fn exchange_request_body(
 ///
 /// This is the ONE step kept as a manual `reqwest` JSON POST rather than
 /// oauth2's `exchange_code`: Claude's token endpoint is non-standard — it wants
-/// a JSON body with `Content-Type: application/json` (as the JS reference
-/// sends), not the RFC 6749 form-encoding oauth2 emits, and it echoes `state`
+/// a JSON body with `Content-Type: application/json`, not the RFC 6749 form-encoding oauth2 emits, and it echoes `state`
 /// in the body. Uses a `.no_proxy()` client so an ambient `HTTPS_PROXY` cannot
 /// swallow the request.
 async fn exchange_code(
@@ -1480,7 +1474,7 @@ fn login_guard_refusal_for(
                 singleton::ProxyKind::TcrEmbedded => format!(
                     "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — that pid is the HOST APPLICATION serving the proxy in-process, so do not signal it: quit the host application (killing it skips its shutdown and loses the session pin map), run '{command}', then start it again. Re-run with --force to log in anyway."
                 ),
-                singleton::ProxyKind::Tcr | singleton::ProxyKind::LegacyJs => format!(
+                singleton::ProxyKind::Tcr => format!(
                     "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — stop it (kill {pid}, or Ctrl-C in its terminal), run '{command}', then restart 'tcr server'. Re-run with --force to log in anyway."
                 ),
             })
@@ -2386,8 +2380,7 @@ pub(crate) fn holds_no_codex_row(config_path: &Path) -> anyhow::Result<bool> {
 /// What a Codex save says when the config held no Codex row before it: whether tcr pools codex
 /// from now on. [`CODEX_FIRST_ACCOUNT_NOTICE`] only when the proxy's leaf takes `chatgpt.com`:
 /// the running proxy reports a leaf it minted that intercepts it, or nothing listens on `port`
-/// and the next boot mints such a leaf because the JS teamclaude leaf is not on disk
-/// (`js_leaf_on_disk`). Otherwise `codex is not pooled: {reason}`, the sentence `tcr status`
+/// and the next boot mints such a leaf. Otherwise `codex is not pooled: {reason}`, the sentence `tcr status`
 /// prints after `codexVerdict:`, with [`crate::codex_route::codex_route`]'s reason over the same
 /// read, so it never claims what an unread proxy does.
 ///
@@ -2398,14 +2391,13 @@ pub fn first_codex_account_notice(
     port: u16,
     ca: &Path,
     ca_readable: bool,
-    js_leaf_on_disk: bool,
 ) -> String {
     let leaf_takes_chatgpt = match live {
         Ok(payload) => payload.mitm.as_ref().is_some_and(|mitm| {
             mitm.leaf == crate::status::MitmStatus::LEAF_MINTED
                 && mitm.intercepts(crate::provider::CODEX_HOST)
         }),
-        Err(crate::cli::LiveStatusError::NoServer) => !js_leaf_on_disk,
+        Err(crate::cli::LiveStatusError::NoServer) => true,
         Err(_) => false,
     };
     let codex_rows = live
@@ -2419,9 +2411,7 @@ pub fn first_codex_account_notice(
 }
 
 /// [`first_codex_account_notice`] over one read of the proxy the config at `config_path` names,
-/// tcr's CA, and the JS teamclaude leaf's files: `teamclaude-leaf.pem` and `teamclaude-leaf.key`
-/// beside the default config, the pair `mitm::load_tls_in` serves first when both are there.
-/// Existence checks, never a read of either file.
+/// and whether tcr's CA exists (an existence check, never a read of the file).
 ///
 /// It follows a save that already happened, so it cannot fail the login: a config it cannot read
 /// is read as the default one, by falling back to the serde default.
@@ -2432,12 +2422,7 @@ pub(crate) async fn read_first_codex_account_notice(config_path: &Path) -> Strin
     };
     let live = crate::cli::fetch_live_status(&config).await;
     let ca = crate::mitm::minted_ca_path();
-    let dir = config::default_path()
-        .parent()
-        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
-    let js_leaf_on_disk = dir.join(crate::legacy_names::JS_LEAF_CERT).is_file()
-        && dir.join(crate::legacy_names::JS_LEAF_KEY).is_file();
-    first_codex_account_notice(&live, config.proxy.port, &ca, ca.is_file(), js_leaf_on_disk)
+    first_codex_account_notice(&live, config.proxy.port, &ca, ca.is_file())
 }
 
 /// Say each of `notices`, in order: a `notice` event apiece in [`LoginUi::Machine`]; a stderr
@@ -3615,7 +3600,7 @@ mod tests {
         assert!(flow.auth_url.starts_with(AUTHORIZE_URL));
         // Claude's authorize endpoint rejects short states ("Invalid request
         // format", observed live 2026-07-17 with the 22-char crate default).
-        // 32 random bytes -> 43 base64url chars, matching the JS reference.
+        // 32 random bytes -> 43 base64url chars.
         assert_eq!(
             flow.state.len(),
             43,
@@ -4858,16 +4843,13 @@ mod tests {
     fn login_refuses_over_proxy_command_lines_but_allows_an_unrelated_holder() {
         use crate::singleton::is_proxy_server;
         // The real chain: a port holder blocks login IFF its argv is a
-        // recognized tcr/teamclaude *server*. Compose the pure classifier with the
-        // pure guard decision — refuse / refuse / allow. Argv, not a joined
+        // recognized tcr *server*. Compose the pure classifier with the
+        // pure guard decision — refuse / allow. Argv, not a joined
         // command line: `singleton::classify_proxy_server` takes pre-split argv
         // (as `sysinfo::Process::cmd()` returns it) so a space in an executable's
         // path can never be re-split into the wrong tokens.
         let refuses = |cmd: &[&str]| {
-            let argv: Vec<String> = cmd
-                .iter()
-                .map(|s| s.replace("{js}", crate::legacy_names::JS_PROXY_BIN))
-                .collect();
+            let argv: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
             let server = singleton::classify_proxy_server(&argv)
                 .map(|kind| singleton::Incumbent { pid: 4242, kind });
             assert_eq!(
@@ -4881,12 +4863,8 @@ mod tests {
             )
         };
         assert!(
-            refuses(&["/opt/{js}-rs/target/release/tcr", "server"]),
+            refuses(&["/opt/tcr/target/release/tcr", "server"]),
             "a live tcr server must block login"
-        );
-        assert!(
-            refuses(&["node", "/opt/nvm/bin/{js}", "server"]),
-            "a live JS proxy server must block login"
         );
         assert!(
             !refuses(&["python3", "-m", "http.server", "3456"]),
@@ -8267,36 +8245,18 @@ mod tests {
         Path::new("/tmp/tcr-run-test/tcr-ca.pem")
     }
 
-    /// A proxy serving the JS teamclaude leaf cannot terminate marked Codex connections, so the
-    /// first account is told codex is not pooled, and why. The same holds before any proxy runs
-    /// when the JS leaf is on disk, because the next boot serves it.
+    /// A proxy whose leaf cannot take `chatgpt.com` cannot terminate marked Codex connections,
+    /// so the first account is told codex is not pooled, and why.
     ///
-    /// Watched red: with the first-account notice keyed on the config's count alone, the
-    /// JS-leaf proxy gets a notice claiming marked Codex connections are pooled.
+    /// Watched red: with the first-account notice keyed on the config's count alone, such a
+    /// proxy gets a notice claiming marked Codex connections are pooled.
     #[test]
-    fn a_js_leaf_proxy_gets_the_not_pooled_notice() {
-        let js = live_proxy_reporting(
-            serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"}),
-        );
+    fn a_proxy_without_mitm_gets_the_not_pooled_notice() {
+        let off = live_proxy_reporting(serde_json::json!({"interceptedHosts": [], "leaf": "none"}));
         assert_eq!(
-            first_codex_account_notice(&js, NOTICE_PORT, notice_ca(), true, false),
-            format!(
-                "codex is not pooled: the proxy on :3999 is serving the JS {} leaf, which \
-             covers api.anthropic.com only and is never re-minted — a restart will not change \
-             this; see docs/troubleshooting.md",
-                crate::legacy_names::JS_PROXY_BIN
-            )
-        );
-        assert_eq!(
-            first_codex_account_notice(
-                &Err(crate::cli::LiveStatusError::NoServer),
-                NOTICE_PORT,
-                notice_ca(),
-                true,
-                true,
-            ),
-            "codex is not pooled: no proxy answered on 127.0.0.1:3999",
-            "nothing listens, and the JS leaf on disk is what the next boot serves"
+            first_codex_account_notice(&off, NOTICE_PORT, notice_ca(), true),
+            "codex is not pooled: the proxy on :3999 is running without MITM: its TLS material \
+             failed to load at boot — see its log"
         );
         assert_eq!(
             first_codex_account_notice(
@@ -8306,7 +8266,6 @@ mod tests {
                 NOTICE_PORT,
                 notice_ca(),
                 true,
-                false,
             ),
             "codex is not pooled: could not read the running proxy's status (the server did not \
              answer within 5s)",
@@ -8316,8 +8275,8 @@ mod tests {
 
     /// A proxy whose minted leaf covers chatgpt.com can take marked Codex traffic
     /// from now on, though its status, read right after the save, may not list the new row yet:
-    /// the notice keys on the leaf, not on the route. So does a released port with no JS leaf on
-    /// disk, where the next boot mints such a leaf.
+    /// the notice keys on the leaf, not on the route. So does a released port, where the next
+    /// boot mints such a leaf.
     #[test]
     fn a_minted_chatgpt_leaf_gets_the_first_account_notice() {
         let minted = live_proxy_reporting(serde_json::json!({
@@ -8325,7 +8284,7 @@ mod tests {
             "leaf": "minted",
         }));
         assert_eq!(
-            first_codex_account_notice(&minted, NOTICE_PORT, notice_ca(), true, false),
+            first_codex_account_notice(&minted, NOTICE_PORT, notice_ca(), true),
             "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep \
              the marker scoped to that launch, since unmarked connections keep their own login"
         );
@@ -8334,7 +8293,6 @@ mod tests {
                 &Err(crate::cli::LiveStatusError::NoServer),
                 NOTICE_PORT,
                 notice_ca(),
-                false,
                 false,
             ),
             CODEX_FIRST_ACCOUNT_NOTICE

@@ -1,10 +1,9 @@
 //! Account-management subcommands for the `tcr` CLI.
 //!
 //! These are the non-server verbs — `accounts`, `remove`, `priority`,
-//! `enable`, `disable`, `status` — that read or mutate the drop-in config
-//! (`~/.config/teamclaude.json`) directly, mirroring the JS `teamclaude`
-//! management commands so friends can curate the fleet without hand-editing
-//! JSON.
+//! `enable`, `disable`, `status` — that read or mutate the config
+//! (`~/.config/tcr.json`) directly, so friends can curate the fleet without
+//! hand-editing JSON.
 //!
 //! The seam copies [`crate::oauth::login`]: pure functions here `load` → mutate
 //! a `&mut Config` → [`config::save`]; `main.rs` is a thin parse-and-delegate
@@ -105,7 +104,7 @@ fn warn_if_server_running(config: &Config) {
 }
 
 /// Every CLI verb's read of the user's config file: [`config::load_or_init`],
-/// so a first run on a box with no `~/.config/teamclaude.json` creates the file
+/// so a first run on a box with no `~/.config/tcr.json` creates the file
 /// and continues instead of exiting 1 with `No such file or directory`. A
 /// missing config is not an error condition for any verb here — `tcr status` on
 /// a fresh install is the FIRST thing a new user runs, and it is what TcrBar's
@@ -1572,8 +1571,8 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
 /// not do the job — that silence is the entire reason the defect was invisible.
 ///
 /// `disabled = false` on the file path sets the field to `None` so
-/// `skip_serializing_if = Option::is_none` DROPS the key entirely — matching the
-/// JS `delete account.disabled`, not a `false` literal. `Manager::set_disabled`'s
+/// `skip_serializing_if = Option::is_none` DROPS the key entirely rather than
+/// writing a `false` literal. `Manager::set_disabled`'s
 /// persist does the same, so both paths leave the same document.
 pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> anyhow::Result<()> {
     // A config we cannot read has no port and no api-key to reach a server with;
@@ -9577,7 +9576,7 @@ mod tests {
             group_colors: &group_colors,
             claude_verdict: claude_verdict.map(str::to_string),
             // Not pooled, and a Claude-only fleet still prints no Codex line.
-            codex_route: Some(&js_leaf_route()),
+            codex_route: Some(&mitm_off_route()),
             holds_codex: holds_provider(&snapshot, Provider::Codex),
         })
     }
@@ -9621,15 +9620,9 @@ mod tests {
                                   /Users/example/.claude/settings.json sets \
                                   https://gateway.example.com";
 
-    /// The JS-leaf route's reason, as `tcr run --codex` words it for a proxy on :3999.
-    fn js_leaf_reason() -> String {
-        format!(
-            "the proxy on :3999 is serving the JS {} leaf, which covers api.anthropic.com \
-             only and is never re-minted — a restart will not change this; see \
-             docs/troubleshooting.md",
-            crate::legacy_names::JS_PROXY_BIN
-        )
-    }
+    /// The MITM-off route's reason, as `tcr run --codex` words it for a proxy on :3999.
+    const MITM_OFF_REASON: &str = "the proxy on :3999 is running without MITM: its TLS material \
+                                   failed to load at boot — see its log";
 
     /// The status read of a proxy on :3999, as `fetch_live_status` hands it over: parsed from
     /// the wire, with `mitm` as given, `codex_rows` Codex accounts and `traffic` as its counts.
@@ -9649,10 +9642,10 @@ mod tests {
         Path::new("/tmp/tcr-run-test/tcr-ca.pem")
     }
 
-    /// The route of a proxy on :3999 serving the JS teamclaude leaf: not pooled.
-    fn js_leaf_route() -> tcr_status_wire::CodexRoute {
+    /// The route of a proxy on :3999 running without MITM: not pooled.
+    fn mitm_off_route() -> tcr_status_wire::CodexRoute {
         let payload = live_payload(
-            serde_json::json!({"interceptedHosts": ["api.anthropic.com"], "leaf": "js"}),
+            serde_json::json!({"interceptedHosts": [], "leaf": "none"}),
             1,
             None,
         );
@@ -9716,21 +9709,21 @@ mod tests {
     fn the_codex_verdict_prints_only_with_a_codex_account_not_pooled() {
         // The contract sample: four Anthropic rows and a disabled Codex row.
         let (snapshot, _) = status_contract_snapshot();
-        let js = js_leaf_route();
-        let text = status_text_of(&snapshot, None, &js);
+        let off = mitm_off_route();
+        let text = status_text_of(&snapshot, None, &off);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            format!("codexVerdict: codex is not pooled: {}", js_leaf_reason())
+            format!("codexVerdict: codex is not pooled: {MITM_OFF_REASON}")
         );
         assert!(lines[1].starts_with("status source="), "{text}");
 
-        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &off);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], CLAUDE_VERDICT, "Claude's verdict stays first");
         assert_eq!(
             lines[1],
-            format!("codexVerdict: codex is not pooled: {}", js_leaf_reason())
+            format!("codexVerdict: codex is not pooled: {MITM_OFF_REASON}")
         );
         assert!(lines[2].starts_with("status source="), "{text}");
 
@@ -9751,12 +9744,12 @@ mod tests {
         snapshot
             .accounts
             .retain(|row| row.provider == Provider::Codex);
-        let js = js_leaf_route();
-        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let off = mitm_off_route();
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &off);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            format!("verdict: codex is not pooled: {}", js_leaf_reason())
+            format!("verdict: codex is not pooled: {MITM_OFF_REASON}")
         );
         assert!(lines[1].starts_with("status source="), "{text}");
         assert!(
@@ -9768,7 +9761,7 @@ mod tests {
         assert!(text.starts_with("status source="), "{text}");
 
         snapshot.accounts.clear();
-        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &js);
+        let text = status_text_of(&snapshot, Some(CLAUDE_VERDICT), &off);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], CLAUDE_VERDICT, "an empty fleet keeps it");
         assert!(lines[1].starts_with("status source="), "{text}");

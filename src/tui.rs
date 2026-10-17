@@ -862,7 +862,6 @@ fn not_pooled_reason(route: &CodexRoute, ca_path: Option<&std::path::Path>) -> O
         return None;
     }
     Some(match route.code.as_deref()? {
-        crate::codex_route::JS_LEAF => "JS leaf covers api.anthropic.com only".to_string(),
         crate::codex_route::MITM_OFF => "MITM off (TLS material failed to load)".to_string(),
         crate::codex_route::LEAF_MISSING_HOST => "leaf does not cover chatgpt.com".to_string(),
         crate::codex_route::NO_CA => match ca_path {
@@ -4338,10 +4337,6 @@ mod tests {
         )]);
         let yellow = Style::default().fg(Color::Yellow);
         for (code, suffix) in [
-            (
-                "js-leaf",
-                " · not pooled: JS leaf covers api.anthropic.com only",
-            ),
             (
                 "mitm-off",
                 " · not pooled: MITM off (TLS material failed to load)",

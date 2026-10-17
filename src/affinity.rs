@@ -37,7 +37,7 @@
 //!    This is a cache; a cache that can panic the process is a downgrade on the
 //!    memory-only version it replaces.
 //!
-//! The file is NOT the credential config, deliberately: `~/.config/teamclaude.json`
+//! The file is NOT the credential config, deliberately: `~/.config/tcr.json`
 //! holds live OAuth tokens behind a delicate read-modify-write merge, and a
 //! high-frequency cache write has no business anywhere near it. Pins live under
 //! the cache dir ([`default_path`]) and are written `0600` because they name
@@ -199,7 +199,7 @@ pub struct LoadReport {
 
 /// Default pin-file path: `session-affinity.json` in the cache directory
 /// ([`crate::paths::cache_dir`]: `$XDG_CACHE_HOME/tcr/`, else
-/// `$HOME/.cache/tcr/`, or the `teamclaude/` directory an older install has).
+/// `$HOME/.cache/tcr/`).
 ///
 /// A cache dir, not `~/.config`: this is regenerable state written on a timer,
 /// and the config file next door holds live OAuth credentials behind a merge

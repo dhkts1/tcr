@@ -116,7 +116,7 @@ pub struct StatusPayload {
     /// Whether the SERVING process is forcing HTTP/1.1 on its upstream
     /// clients — see [`crate::config::Config::http1_only`]. Server-wide, like
     /// `build`, and for the same reason: re-deriving it from
-    /// `~/.config/teamclaude.json` on the client would report the file's
+    /// `~/.config/tcr.json` on the client would report the file's
     /// state, not the already-booted process's, and the two can differ (the
     /// config was edited after boot; the flag is only read at client
     /// construction).
@@ -320,8 +320,8 @@ pub struct MitmStatus {
     /// on every CONNECT, and the payload's account rows say whether it does.
     #[serde(default)]
     pub intercepted_hosts: Vec<String>,
-    /// Which leaf the listener presents: [`Self::LEAF_JS`],
-    /// [`Self::LEAF_MINTED`] or [`Self::LEAF_NONE`]. A string rather than an
+    /// Which leaf the listener presents: [`Self::LEAF_MINTED`] or
+    /// [`Self::LEAF_NONE`]. A string rather than an
     /// enum because a closed enum here would make an OLDER client fail the
     /// whole payload parse on the day a value is added, and fall back to the
     /// offline snapshot; an unknown string costs only this one decision.
@@ -330,9 +330,6 @@ pub struct MitmStatus {
 }
 
 impl MitmStatus {
-    /// The JS proxy's `teamclaude-leaf.pem`: covers `api.anthropic.com` only
-    /// and is never re-minted, so a restart does not change what it intercepts.
-    pub const LEAF_JS: &'static str = "js";
     /// A leaf tcr minted under `tcr-ca.pem` ([`crate::mitm::minted_ca_path`]).
     pub const LEAF_MINTED: &'static str = "minted";
     /// No TLS material loaded: the boot-time load failed, or this process
@@ -348,13 +345,9 @@ impl MitmStatus {
                 leaf: Self::LEAF_NONE.to_string(),
             };
         };
-        let leaf = match assets.leaf {
-            crate::mitm::LeafSource::Js => Self::LEAF_JS,
-            crate::mitm::LeafSource::Minted => Self::LEAF_MINTED,
-        };
         Self {
             intercepted_hosts: assets.intercepted_hosts(),
-            leaf: leaf.to_string(),
+            leaf: Self::LEAF_MINTED.to_string(),
         }
     }
 
@@ -372,7 +365,7 @@ impl MitmStatus {
 /// [`AccountSnapshot`], plus the server's own `threshold` for that account.
 ///
 /// The threshold rides along deliberately: it decides which windows read as
-/// "held", and re-deriving it on the client from `~/.config/teamclaude.json`
+/// "held", and re-deriving it on the client from `~/.config/tcr.json`
 /// would silently use a file that may have been edited since the server booted —
 /// and, worse, would zip a client-ordered threshold list against a
 /// server-ordered account list. The server is the authority on its own state.

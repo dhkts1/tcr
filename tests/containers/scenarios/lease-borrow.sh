@@ -87,7 +87,7 @@ fi
 pass "node-a1 sees node-a2 as $a2_id, node-a2 sees node-a1 as $a1_id"
 
 # --- lend, and the two grants a lease needs on top of it -------------------
-lend_out="$(nx node-a1 tcr peer lend "$a2_id" --fraction 0.5 --ttl 600 --max-inflight 2 --scope all --peers /lab/node-a1/.config/tcr-peers.json --config /lab/node-a1/.config/teamclaude.json 2>&1 || true)"
+lend_out="$(nx node-a1 tcr peer lend "$a2_id" --fraction 0.5 --ttl 600 --max-inflight 2 --scope all --peers /lab/node-a1/.config/tcr-peers.json --config /lab/node-a1/.config/tcr.json 2>&1 || true)"
 case "$lend_out" in
   *"peer lend: ok"*) pass "node-a1 lent node-a2 a lease: $(echo "$lend_out" | head -1)" ;;
   *) fail "tcr peer lend did not report ok: $lend_out"; finish; exit 1 ;;
@@ -120,14 +120,14 @@ done
 
 # node-a1 serves one request through its own proxy first, so it has measured
 # headroom to lend: see the step-3 comment above.
-warm="$(nx node-a1 env HOME=/lab/node-a1 python3 "$SRC/netlab-client.py" /lab/node-a1/.config/teamclaude.json 1 128 1 2>&1 || true)"
+warm="$(nx node-a1 env HOME=/lab/node-a1 python3 "$SRC/netlab-client.py" /lab/node-a1/.config/tcr.json 1 128 1 2>&1 || true)"
 case "$warm" in
   *" 200 "*) pass "node-a1 served one request through its own account first: $warm" ;;
   *) fail "node-a1's own warm-up request did not serve 200: $warm" ;;
 esac
 
 # --- disable node-a2's own account, restart it ------------------------------
-nx node-a2 tcr disable node-a2-fake --config /lab/node-a2/.config/teamclaude.json >/dev/null 2>&1 || true
+nx node-a2 tcr disable node-a2-fake --config /lab/node-a2/.config/tcr.json >/dev/null 2>&1 || true
 oldpid="$(cat /lab/node-a2/pid 2>/dev/null || echo)"
 if [ -n "$oldpid" ]; then
   kill "$oldpid" 2>/dev/null || true
@@ -153,7 +153,7 @@ before="$SCRATCH/ledger-before.json"
 nx node-a2 wget -qO- "$NETLAB_UPSTREAM/_ledger" > "$before" 2>/dev/null || true
 before_count="$(python3 -c "import json; print(len(json.load(open('$before'))))" 2>/dev/null || echo 0)"
 
-borrow="$(nx node-a2 env HOME=/lab/node-a2 python3 "$SRC/netlab-client.py" /lab/node-a2/.config/teamclaude.json 1 128 1 2>&1 || true)"
+borrow="$(nx node-a2 env HOME=/lab/node-a2 python3 "$SRC/netlab-client.py" /lab/node-a2/.config/tcr.json 1 128 1 2>&1 || true)"
 echo "lease-borrow: node-a2's request: $borrow"
 status="$(echo "$borrow" | awk '{print $3}')"
 

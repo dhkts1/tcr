@@ -291,7 +291,7 @@ pub struct PortHolder {
     pub pid: u32,
     /// The process's own name, as the OS reports it.
     pub name: String,
-    /// Whether that process is a `tcr` (or the JS `teamclaude` it replaced).
+    /// Whether that process is a `tcr`.
     pub is_tcr: bool,
 }
 
@@ -304,15 +304,7 @@ pub struct PortHolder {
 /// returns `None` for `tcr run`, which is a tcr by any reading an operator
 /// cares about here.
 pub fn holder_from(pid: u32, name: &str, argv: &[String]) -> PortHolder {
-    let js_bin = crate::legacy_names::JS_PROXY_BIN;
-    let is_proxy_program = |token: &str| {
-        token == "tcr"
-            || token.ends_with("/tcr")
-            || token == js_bin
-            || token
-                .strip_suffix(js_bin)
-                .is_some_and(|dir| dir.ends_with('/'))
-    };
+    let is_proxy_program = |token: &str| token == "tcr" || token.ends_with("/tcr");
     let is_tcr =
         argv.first().is_some_and(|argv0| is_proxy_program(argv0)) || is_proxy_program(name);
     PortHolder {
@@ -785,13 +777,13 @@ impl CodexReport {
     /// `unknown` when no proxy answered, its status could not be read, it predates the report,
     /// or it reports a leaf this build does not know.
     pub fn intercept(&self) -> &'static str {
-        use crate::codex_route::{JS_LEAF, LEAF_MISSING_HOST, MITM_OFF, NO_CA, NO_CODEX_ACCOUNT};
+        use crate::codex_route::{LEAF_MISSING_HOST, MITM_OFF, NO_CA, NO_CODEX_ACCOUNT};
         if self.route.pooled {
             return "yes";
         }
         match self.route.code.as_deref() {
             Some(NO_CA) => "yes",
-            Some(JS_LEAF | MITM_OFF | NO_CODEX_ACCOUNT | LEAF_MISSING_HOST) => "no",
+            Some(MITM_OFF | NO_CODEX_ACCOUNT | LEAF_MISSING_HOST) => "no",
             _ => "unknown",
         }
     }
@@ -2329,11 +2321,9 @@ mod tests {
         assert!(
             !names_tcr(&with_env(
                 not_pooled(
-                    "js-leaf",
-                    &format!(
-                        "the proxy on :3999 is serving the JS {} leaf",
-                        crate::legacy_names::JS_PROXY_BIN
-                    )
+                    "mitm-off",
+                    "the proxy on :3999 is running without MITM: its TLS material failed to \
+                     load at boot — see its log"
                 ),
                 at_tcr.clone()
             )),

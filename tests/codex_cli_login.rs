@@ -6,7 +6,7 @@
 //! threads that share one environment):
 //!
 //! * `HOME` → a fresh [`tempfile::TempDir`], holding the config at
-//!   `$HOME/.config/teamclaude.json`, so the real config (working credentials for real accounts)
+//!   `$HOME/.config/tcr.json`, so the real config (working credentials for real accounts)
 //!   and the real `~/.codex` are never read or written. Every sign-in folder tcr makes lands
 //!   beside that config, inside the tempdir.
 //! * `proxy.port` in that config → `0`, which cannot name an actual listener, so the route probe

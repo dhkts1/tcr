@@ -493,6 +493,6 @@ async fn shutting_down_drains_the_usage_ledger_and_says_it_did() {
 fn the_default_incumbent_policy_cannot_signal_anything() {
     assert!(!IncumbentPolicy::default().signals_anything());
     assert!(!IncumbentPolicy::never_signal().signals_anything());
-    assert!(IncumbentPolicy::replace_legacy_js_only().signals_anything());
+    assert!(!IncumbentPolicy::report_and_stand_down().signals_anything());
     assert!(IncumbentPolicy::kill_the_incumbent_proxy().signals_anything());
 }

@@ -1,7 +1,6 @@
 //! tcr (Team Capacity Router) — a lean single-user rotating Anthropic proxy.
 //!
-//! A drop-in replacement for the JS teamclaude proxy: it reads the same
-//! `~/.config/teamclaude.json`, rotates across the configured OAuth accounts as
+//! It reads `~/.config/tcr.json`, rotates across the configured OAuth accounts as
 //! their quota fills, refreshes tokens on expiry, streams requests to Anthropic
 //! unchanged, and surfaces a live TUI. See `DESIGN.md` for the full contract.
 
@@ -35,10 +34,8 @@ pub mod file_log;
 pub mod handoff;
 pub mod http_client;
 pub mod identity;
-pub mod legacy_names;
 pub mod log_err;
 pub mod manager;
-pub mod migrate;
 pub mod mint;
 pub mod mitm;
 pub mod model;

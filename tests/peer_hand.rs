@@ -1974,7 +1974,7 @@ fn run_tcr_peer(
 fn a_strict_local_pin_refuses_a_hand_grant_at_lend_time() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
-    let config = dir.path().join("teamclaude.json");
+    let config = dir.path().join("tcr.json");
     let node = tcr_peer_wire::PeerId([31_u8; 32]);
 
     std::fs::write(

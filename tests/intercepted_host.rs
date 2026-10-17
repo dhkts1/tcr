@@ -13,13 +13,11 @@
 //! # Why this is its own test binary
 //!
 //! `handle_connect` terminates a `CONNECT` only for a host covered by the leaf this PROCESS
-//! loaded last. Lib tests in `src/mitm.rs`
-//! (`load_tls_prefers_the_preexisting_js_leaf` among them) load the JS proxy's leaf, which tcr
-//! counts as covering `api.anthropic.com` alone, so a `chatgpt.com` tunnel opened in the lib test
-//! binary while one of them ran would take the blind branch. Every test here loads a leaf tcr
-//! mints, which covers every intercepted host, and [`start`] checks that it does before any
-//! tunnel is opened. A test added to this file must start through [`start`] and must never
-//! load the JS leaf.
+//! loaded last, a process-wide value every leaf load replaces. Lib tests in `src/mitm.rs` load
+//! leaves of their own in parallel, so a `chatgpt.com` tunnel opened in the lib test binary could
+//! read the coverage another test just set. Every test here loads a leaf tcr mints, which covers
+//! every intercepted host, and [`start`] checks that it does before any tunnel is opened. A test
+//! added to this file must start through [`start`].
 //!
 //! # House rules
 //!
@@ -189,7 +187,7 @@ async fn start() -> Tcr {
             assets.covered_hosts
         );
     }
-    let ca_path = assets.ca_path.clone().expect("a minted leaf names its CA");
+    let ca_path = assets.ca_path.clone();
 
     let (anthropic, codex) = (Origin::default(), Origin::default());
     let anthropic_url = spawn_origin(anthropic.clone()).await;
