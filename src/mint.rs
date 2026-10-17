@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use crate::config::{self, Account};
 use crate::identity;
+use crate::log_err::LogErr as _;
 use crate::oauth;
 use crate::provider_guard::{self, ClaudeOnlyVerb};
 
@@ -542,7 +543,9 @@ fn wait_for_return_on_a_tty() {
     eprint!("\nPress Return to close. ");
     std::io::stderr().flush().ok();
     let mut discard = String::new();
-    let _ = std::io::stdin().read_line(&mut discard);
+    std::io::stdin()
+        .read_line(&mut discard)
+        .log_debug("waiting for Return before closing");
 }
 
 #[cfg(test)]

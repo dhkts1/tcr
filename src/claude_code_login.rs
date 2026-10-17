@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+use crate::log_err::LogErr as _;
 use anyhow::Context;
 use serde::Deserialize;
 
@@ -179,8 +180,12 @@ fn read_keychain() -> Option<String> {
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child
+                        .kill()
+                        .log_debug("killing the timed-out keychain reader");
+                    child
+                        .wait()
+                        .log_debug("reaping the timed-out keychain reader");
                     eprintln!(
                         "[tcr] warning: reading the Claude Code login from the Keychain took \
                          longer than {}s (an unanswered authorization dialog?) — continuing \
