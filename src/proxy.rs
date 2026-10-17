@@ -5213,7 +5213,7 @@ async fn handle_request(
         // off it got a 200 from a sibling 2s later). See
         // [`MAX_529_FAILOVERS_PER_REQUEST`].
         //
-        // The failover mechanism is exactly one line — `tried.insert(idx)` — because
+        // The failover mechanism is benching `idx` in `tried` (`Ladder::fail_over_529`), because
         // `select` already has the branch for it: a PINNED session whose pin is in
         // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
         // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
