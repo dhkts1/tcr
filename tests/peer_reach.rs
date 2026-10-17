@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use tcr::peer::noise;
 use tcr::peer::reach::{
-    self, MapProtocol, NatPmp, ReachError, ResultCode, GATEWAY_PORT, TRIES, VERSION,
+    self, GATEWAY_PORT, MapProtocol, NatPmp, ReachError, ResultCode, TRIES, VERSION,
 };
 
 /// A fake NAT-PMP gateway on loopback.
@@ -70,20 +70,22 @@ impl FakeGateway {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&asked);
 
-        std::thread::spawn(move || loop {
-            let mut buffer = [0_u8; 32];
-            let Ok((read, from)) = socket.recv_from(&mut buffer) else {
-                return;
-            };
-            counter.fetch_add(1, Ordering::SeqCst);
-            let request = &buffer[..read];
-            if let (Some(opcode), Some(lifetime)) =
-                (request.get(1).copied(), asked_lifetime(request))
-            {
-                log.lock().expect("the fake's log").push((opcode, lifetime));
-            }
-            if let Some(response) = answer(request, behaviour) {
-                let _sent = socket.send_to(&response, from);
+        std::thread::spawn(move || {
+            loop {
+                let mut buffer = [0_u8; 32];
+                let Ok((read, from)) = socket.recv_from(&mut buffer) else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let request = &buffer[..read];
+                if let (Some(opcode), Some(lifetime)) =
+                    (request.get(1).copied(), asked_lifetime(request))
+                {
+                    log.lock().expect("the fake's log").push((opcode, lifetime));
+                }
+                if let Some(response) = answer(request, behaviour) {
+                    let _sent = socket.send_to(&response, from);
+                }
             }
         });
 
@@ -2233,7 +2235,7 @@ fn forgetting_a_peer_clears_its_rendezvous_secret() {
 /// knows.
 #[test]
 fn a_hello_carries_the_address_this_node_saw_the_peer_from() {
-    use tcr::peer::listener::{hello_for_peer, NodeFacts};
+    use tcr::peer::listener::{NodeFacts, hello_for_peer};
 
     let node = tcr_peer_wire::PeerId([0x71; 32]);
     let seen: SocketAddr = "203.0.113.7:51820".parse().expect("a test address parses");
@@ -2253,7 +2255,7 @@ fn a_hello_carries_the_address_this_node_saw_the_peer_from() {
 /// reader has to decide the meaning of.
 #[test]
 fn a_hello_from_a_node_that_saw_no_address_carries_no_field() {
-    use tcr::peer::listener::{hello_for_peer, NodeFacts};
+    use tcr::peer::listener::{NodeFacts, hello_for_peer};
 
     let hello = hello_for_peer(
         &NodeFacts::minimal(tcr_peer_wire::PeerId([0x72; 32])),
@@ -2777,7 +2779,7 @@ impl Drop for FakeKeeper {
 /// this Mac can reach.
 #[test]
 fn the_internet_switch_decides_start_renew_stop_and_idle() {
-    use reach::{keeper_step, KeeperStep, MappingBoot};
+    use reach::{KeeperStep, MappingBoot, keeper_step};
 
     let wanted = MappingBoot::Wanted {
         internal_port: 7_755,
@@ -2810,7 +2812,7 @@ fn the_internet_switch_decides_start_renew_stop_and_idle() {
 /// it decides here is only that this listener is not on loopback.
 #[tokio::test]
 async fn the_internet_switch_starts_a_keeper_again_on_a_running_server() {
-    use tcr::peer::config::{save, PeerFile};
+    use tcr::peer::config::{PeerFile, save};
 
     let dir = tempfile::tempdir().expect("a temp profile directory");
     let peers_path = dir.path().join("tcr-peers.json");
@@ -3009,7 +3011,7 @@ impl CaptureLayer {
 #[test]
 fn a_router_that_refuses_is_asked_once_and_then_left_alone() {
     use std::sync::atomic::AtomicUsize;
-    use tcr::peer::config::{save, PeerFile};
+    use tcr::peer::config::{PeerFile, save};
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let dir = tempfile::tempdir().expect("a temp profile directory");
@@ -3398,7 +3400,7 @@ fn the_same_answer_from_one_router_is_said_once() {
 /// parked**, with no router and no friend.
 #[test]
 fn the_reverse_carry_decision_parks_releases_or_does_nothing() {
-    use tcr::peer::tunnel::{reverse_step, ReverseNeed, ReverseNotWanted, ReverseStep};
+    use tcr::peer::tunnel::{ReverseNeed, ReverseNotWanted, ReverseStep, reverse_step};
 
     let dialable = ReverseNeed::NotWanted(ReverseNotWanted::HoldsMapping);
     assert_eq!(reverse_step(ReverseNeed::Wanted, false), ReverseStep::Park);

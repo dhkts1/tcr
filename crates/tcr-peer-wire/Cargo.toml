@@ -1,7 +1,8 @@
 [package]
 name = "tcr-peer-wire"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.99"
 license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 description = "Serde types for the tcr peer-mesh wire contract, shared by both ends of a peer stream"

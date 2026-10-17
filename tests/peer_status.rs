@@ -18,7 +18,7 @@ use std::path::Path;
 
 use tcr::peer::config::{PeerFile, PeerRow, PeerStore};
 use tcr::peer::state::{BorrowedRow, LeaseRow, PeerState};
-use tcr::status::{peer_status_rows, PathKind, PeerStatusRow};
+use tcr::status::{PathKind, PeerStatusRow, peer_status_rows};
 use tcr_peer_wire::{Lease, LeaseUnit, PeerId, Window};
 
 /// Five minutes of milliseconds, the unit almost every fixture below counts in.
@@ -383,9 +383,11 @@ fn a_single_endpoint_carries_the_last_success_and_two_do_not() {
     // The peer-level freshness is still reported on both rows, the absence
     // above is about ATTRIBUTION, not about losing the fact.
     assert_eq!(derived[1].last_seen_ms, Some(seen));
-    assert!(derived
-        .iter()
-        .all(|row| row.paths.iter().all(|path| path.kind == PathKind::Direct)));
+    assert!(
+        derived
+            .iter()
+            .all(|row| row.paths.iter().all(|path| path.kind == PathKind::Direct))
+    );
 }
 
 /// The row-level end, over a lease this Mac BORROWS: a row whose
@@ -723,7 +725,7 @@ fn the_committed_peers_fixture_covers_the_absent_and_the_measured_row() {
 // validator that only ever sees a valid document proves nothing about what it
 // would catch, which is the whole defect the peers block existed to fix.
 
-use tcr::status::{peer_graph, PeerGraph, PEER_GRAPH_KIND};
+use tcr::status::{PEER_GRAPH_KIND, PeerGraph, peer_graph};
 
 /// What a JSON value is allowed to be, in the schema below.
 #[derive(Clone, Copy, PartialEq, Debug)]

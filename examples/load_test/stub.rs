@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
-use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The header the driver tags each request with, read back here to pair the two clocks.
 pub const TAG_HEADER: &str = "x-load-test-id";

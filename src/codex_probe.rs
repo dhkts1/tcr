@@ -953,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_sends_tcr_user_agent() {
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured = seen.clone();
@@ -991,7 +991,7 @@ mod tests {
     /// `None` call records it; drop the `retry-after` read and the 429 carries no wait.
     #[tokio::test]
     async fn fetch_sends_bearer_and_account_header_and_maps_401() {
-        use axum::{response::IntoResponse, routing::get, Router};
+        use axum::{Router, response::IntoResponse, routing::get};
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
         let seen2 = seen.clone();
         let app = Router::new().route(

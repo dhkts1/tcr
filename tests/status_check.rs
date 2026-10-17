@@ -98,11 +98,13 @@ async fn payload_from(dir: &Path, prober: Arc<dyn UsageProber>) -> String {
 fn fake_status_endpoint(body: String) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
     let port = listener.local_addr().expect("local addr").port();
-    std::thread::spawn(move || loop {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        serve_one(stream, &body);
+    std::thread::spawn(move || {
+        loop {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            serve_one(stream, &body);
+        }
     });
     port
 }

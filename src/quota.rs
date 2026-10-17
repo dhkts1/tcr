@@ -32,10 +32,10 @@ fn resolve_reset(
     if let Some(reset) = reported {
         return Some(reset);
     }
-    if let Some(prior) = prior {
-        if prior > now {
-            return Some(prior);
-        }
+    if let Some(prior) = prior
+        && prior > now
+    {
+        return Some(prior);
     }
     Some(now + window)
 }
@@ -276,15 +276,15 @@ impl Quota {
     /// live at `now`? Only the shared 5-hour and weekly buckets gate rotation
     /// (plus standard API-key limits); the model-scoped `7d_oi` bucket does not.
     pub fn is_near(&self, threshold: f64, now: OffsetDateTime) -> bool {
-        if let Some(w) = self.five_hour {
-            if w.effective(now) >= threshold {
-                return true;
-            }
+        if let Some(w) = self.five_hour
+            && w.effective(now) >= threshold
+        {
+            return true;
         }
-        if let Some(w) = self.seven_day {
-            if w.effective(now) >= threshold {
-                return true;
-            }
+        if let Some(w) = self.seven_day
+            && w.effective(now) >= threshold
+        {
+            return true;
         }
         // Standard (API-key) token/request limits have no live-past-reset path of
         // their own, so once `standard_reset` has passed the upstream limit has
@@ -294,15 +294,17 @@ impl Quota {
         // window is still unexpired.
         let standard_expired = self.standard_reset.is_some_and(|r| now >= r);
         if !standard_expired {
-            if let (Some(limit), Some(remaining)) = (self.tokens_limit, self.tokens_remaining) {
-                if limit > 0 && 1.0 - (remaining as f64 / limit as f64) >= threshold {
-                    return true;
-                }
+            if let (Some(limit), Some(remaining)) = (self.tokens_limit, self.tokens_remaining)
+                && limit > 0
+                && 1.0 - (remaining as f64 / limit as f64) >= threshold
+            {
+                return true;
             }
-            if let (Some(limit), Some(remaining)) = (self.requests_limit, self.requests_remaining) {
-                if limit > 0 && 1.0 - (remaining as f64 / limit as f64) >= threshold {
-                    return true;
-                }
+            if let (Some(limit), Some(remaining)) = (self.requests_limit, self.requests_remaining)
+                && limit > 0
+                && 1.0 - (remaining as f64 / limit as f64) >= threshold
+            {
+                return true;
             }
         }
         false
@@ -371,10 +373,8 @@ impl Quota {
         if let Some(w) = self.seven_day {
             max = max.max(w.effective(now));
         }
-        if is_fable {
-            if let Some(w) = self.seven_day_oi {
-                max = max.max(w.effective(now));
-            }
+        if is_fable && let Some(w) = self.seven_day_oi {
+            max = max.max(w.effective(now));
         }
         max
     }
@@ -430,10 +430,10 @@ impl Quota {
             // Only while a refusal stands: the kind is present exactly as long as the refusal.
             // `drop_rejection_if_a_window_rolled` ran first, so a probe that sees the window
             // roll has already ended the refusal before its own kind could refresh it.
-            if self.status.as_deref() == Some("rejected") {
-                if let Some(kind) = &facts.limit_reached_type {
-                    self.codex.limit_reached_type = Some(kind.clone());
-                }
+            if self.status.as_deref() == Some("rejected")
+                && let Some(kind) = &facts.limit_reached_type
+            {
+                self.codex.limit_reached_type = Some(kind.clone());
             }
         }
     }

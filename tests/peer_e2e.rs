@@ -82,10 +82,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
-use axum::Router;
 
 /// The E2E-MATRIX scenarios' one shared line format. See that module's docs.
 #[path = "tools/e2e/matrix.rs"]

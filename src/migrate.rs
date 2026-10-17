@@ -638,10 +638,11 @@ mod tests {
         ));
         assert!(s.config(paths::CONFIG_FILE).is_file());
         assert!(!s.config(legacy_names::CONFIG_FILE).exists());
-        assert!(s
-            .cache(paths::CACHE_DIR)
-            .join("session-affinity.json")
-            .is_file());
+        assert!(
+            s.cache(paths::CACHE_DIR)
+                .join("session-affinity.json")
+                .is_file()
+        );
         assert!(!s.cache(legacy_names::CACHE_DIR).exists());
         assert_eq!(
             paths::config_file_in(&s.roots()),
@@ -654,12 +655,16 @@ mod tests {
         // One line per thing moved, each naming both paths.
         let lines = report.lines();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0]
-            .1
-            .contains(&s.config(legacy_names::CONFIG_FILE).display().to_string()));
-        assert!(lines[0]
-            .1
-            .contains(&s.config(paths::CONFIG_FILE).display().to_string()));
+        assert!(
+            lines[0]
+                .1
+                .contains(&s.config(legacy_names::CONFIG_FILE).display().to_string())
+        );
+        assert!(
+            lines[0]
+                .1
+                .contains(&s.config(paths::CONFIG_FILE).display().to_string())
+        );
     }
 
     #[test]
@@ -819,10 +824,12 @@ mod tests {
         want.sort();
         assert_eq!(names, want);
         assert_eq!(report.logs.len(), 3, "{:?}", report.logs);
-        assert!(report
-            .logs
-            .iter()
-            .all(|l| matches!(l, LogOutcome::Renamed { .. })));
+        assert!(
+            report
+                .logs
+                .iter()
+                .all(|l| matches!(l, LogOutcome::Renamed { .. }))
+        );
     }
 
     #[test]

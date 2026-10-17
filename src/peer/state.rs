@@ -1049,14 +1049,13 @@ impl PeerState {
     /// admitted. The two readers agree again.
     pub fn find_pending(&self, selector: &str) -> Option<&Knock> {
         let selector = selector.trim();
-        if let Ok(id) = InstanceId::parse(selector) {
-            if let Some(row) = self
+        if let Ok(id) = InstanceId::parse(selector)
+            && let Some(row) = self
                 .pending
                 .iter()
                 .find(|knock| knock.instance_id == id && !knock.is_reservation_placeholder())
-            {
-                return Some(row);
-            }
+        {
+            return Some(row);
         }
         // The bare key, OR the `host:port` form the same row is printed under
         // ([`Knock::dial_address`]). Every string a surface shows for a row

@@ -57,12 +57,11 @@ impl Manager {
                 | ProbeStatus::UpstreamDown => {
                     account.consecutive_probe_failures =
                         account.consecutive_probe_failures.saturating_add(1);
-                    if status == ProbeStatus::RateLimited {
-                        if let Some(seconds) = retry_after_secs {
-                            let delay = seconds.min(PROBE_MAX_RETRY_AFTER_SECS) as i64 * 1000;
-                            account.probe_retry_after_ms =
-                                Some(crate::now_ms().saturating_add(delay));
-                        }
+                    if status == ProbeStatus::RateLimited
+                        && let Some(seconds) = retry_after_secs
+                    {
+                        let delay = seconds.min(PROBE_MAX_RETRY_AFTER_SECS) as i64 * 1000;
+                        account.probe_retry_after_ms = Some(crate::now_ms().saturating_add(delay));
                     }
                     // The CROSSING probe only, so a probe that stays broken logs
                     // once rather than every cadence. An account whose quota we did

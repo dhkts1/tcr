@@ -98,7 +98,11 @@ impl ConnectGuard {
     }
 
     pub fn assert_no_connections(&self) {
-        assert!(std::fs::read(self.directory.path().join("attempts")).unwrap().is_empty(),
-            "fixture attempted the live proxy or a non-loopback upstream; the test guard blocked it before connecting");
+        assert!(
+            std::fs::read(self.directory.path().join("attempts"))
+                .unwrap()
+                .is_empty(),
+            "fixture attempted the live proxy or a non-loopback upstream; the test guard blocked it before connecting"
+        );
     }
 }

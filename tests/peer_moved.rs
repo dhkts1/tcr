@@ -19,13 +19,13 @@
 
 use std::net::SocketAddr;
 
-use tcr::peer::config::{Allow, Endpoint, EndpointSource, PeerRow, MAX_ENDPOINTS_PER_PEER};
-use tcr::peer::discovery::{admissible_moved_endpoints, MAX_MOVED_ENDPOINTS_PER_PEER};
+use tcr::peer::config::{Allow, Endpoint, EndpointSource, MAX_ENDPOINTS_PER_PEER, PeerRow};
+use tcr::peer::discovery::{MAX_MOVED_ENDPOINTS_PER_PEER, admissible_moved_endpoints};
 use tcr::peer::moved::{
-    open_link, open_link_field, seal_link, seal_link_field, MintRefusal, MovedKeys, MovedRecord,
-    MovedRefusal, MAX_MOVED_AGE, MOVED_VERSION,
+    MAX_MOVED_AGE, MOVED_VERSION, MintRefusal, MovedKeys, MovedRecord, MovedRefusal, open_link,
+    open_link_field, seal_link, seal_link_field,
 };
-use tcr_peer_wire::{decode_bytes, PeerId};
+use tcr_peer_wire::{PeerId, decode_bytes};
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
 fn peer_id(fill: u8) -> PeerId {

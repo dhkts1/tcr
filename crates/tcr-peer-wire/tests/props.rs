@@ -19,8 +19,8 @@
 
 use proptest::prelude::*;
 use tcr_peer_wire::{
-    decode_frame, decode_key32, encode_frame, encode_key32, InstanceId, LendScope, PeerId,
-    MAX_FRAME_BYTES,
+    InstanceId, LendScope, MAX_FRAME_BYTES, PeerId, decode_frame, decode_key32, encode_frame,
+    encode_key32,
 };
 
 /// A label `sanitize_label`/`LendScope::parse` accepts unchanged: short,

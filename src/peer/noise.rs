@@ -116,12 +116,12 @@
 //! is how "zero bytes written after a refusal" is asserted on the socket rather
 //! than on a log line.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, TransportState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use tcr_peer_wire::{decode_frame, encode_frame, PeerId, MAX_FRAME_BYTES};
+use tcr_peer_wire::{MAX_FRAME_BYTES, PeerId, decode_frame, encode_frame};
 
 use crate::peer::config::{PeerRow, PeerStore};
 use crate::peer::id::NodeKey;
@@ -1390,7 +1390,7 @@ pub fn read_message_1_matching(
                     state,
                     psk,
                     payload: scratch[..len].to_vec(),
-                })
+                });
             }
             Err(err) => {
                 last = Some(anyhow!(

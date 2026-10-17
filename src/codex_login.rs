@@ -332,7 +332,9 @@ pub async fn check_workspace_routing(
     let status = response.status();
     if !status.is_success() {
         let hint = match status.as_u16() {
-            401 => " (the access token was refused: run codex once to refresh its login, then retry this import)",
+            401 => {
+                " (the access token was refused: run codex once to refresh its login, then retry this import)"
+            }
             403 => " (check Codex's connection and workspace access, then retry this import)",
             _ => "",
         };
@@ -691,10 +693,12 @@ mod tests {
         let error = read_codex_login(&path).expect_err("a symlink cannot be synchronized safely");
         assert!(error.to_string().contains("symlink"));
         assert_eq!(std::fs::read_to_string(original).unwrap(), fake_auth_json());
-        assert!(std::fs::symlink_metadata(path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     fn fake_auth_json() -> String {
@@ -732,9 +736,11 @@ mod tests {
                 .is_none(),
             "an API-key login is not one tcr can pool, whatever tokens ride along"
         );
-        assert!(parse_auth_json(r#"{"auth_mode":"chatgpt"}"#)
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_auth_json(r#"{"auth_mode":"chatgpt"}"#)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             parse_auth_json(r#"{"auth_mode":"chatgpt","tokens":{"access_token":"x"}}"#)
                 .unwrap()

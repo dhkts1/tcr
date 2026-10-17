@@ -99,18 +99,18 @@ pub fn complete_handoff(
     peer: &UnixStream,
 ) -> io::Result<()> {
     // 1. The final write, made while this process is still the owner.
-    if let (true, Some(path)) = (manager.session_affinity_enabled(), affinity_path) {
-        if let Err(err) = manager.flush_affinity(path) {
-            // Not fatal. The pin file is a cache, so losing it costs the
-            // successor a warm start and nothing else — and refusing the whole
-            // handoff over a cache write would trade a one-second outage for a
-            // guaranteed one.
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "could not flush session-affinity pins before handing over; the successor will start colder"
-            );
-        }
+    if let (true, Some(path)) = (manager.session_affinity_enabled(), affinity_path)
+        && let Err(err) = manager.flush_affinity(path)
+    {
+        // Not fatal. The pin file is a cache, so losing it costs the
+        // successor a warm start and nothing else — and refusing the whole
+        // handoff over a cache write would trade a one-second outage for a
+        // guaranteed one.
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not flush session-affinity pins before handing over; the successor will start colder"
+        );
     }
     manager.persist_now();
 

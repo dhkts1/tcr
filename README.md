@@ -56,7 +56,8 @@ the screen; set `TCR_NO_LAUNCH=1` to stop that (it is also skipped under CI and 
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/tcr/releases/latest/download/tcr-installer.sh | sh
 ```
 
-Or build from source with a Rust toolchain. Put the binary in place with the script and not with
+Or build from source with Rust 1.99 or newer (`rust-toolchain.toml` pins the exact version, and
+rustup installs it on the first build). Put the binary in place with the script and not with
 `cp`, because [`cp` onto a running binary rewrites the same inode and macOS then kills it](CONTRIBUTING.md#installing-it-onto-your-path):
 
 ```sh

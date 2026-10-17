@@ -2275,10 +2275,10 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             }
             // The save loop never ends, so reaching here means the shutdown signal (or the
             // sender's drop) arrived: write whatever changed since the last save.
-            if flusher.take_bound_tokens_dirty() {
-                if let Err(err) = flusher.flush_bound_tokens(&flush_path) {
-                    SavedCache::BoundTokens.warn(&flush_path, &err);
-                }
+            if flusher.take_bound_tokens_dirty()
+                && let Err(err) = flusher.flush_bound_tokens(&flush_path)
+            {
+                SavedCache::BoundTokens.warn(&flush_path, &err);
             }
         })));
     }

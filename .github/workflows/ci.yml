@@ -150,11 +150,16 @@ jobs:
           echo "scanning commits ${range}, merge commits included"
           "${gitleaks}" git --no-banner --redact --verbose --config .gitleaks.toml --log-opts="--remerge-diff ${range}" .
 
+      # The version here and rust-toolchain.toml's channel move together.
       - name: Install Rust toolchain
         if: needs.changes.outputs.inert != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
+
+      - name: Toolchain version
+        if: needs.changes.outputs.inert != 'true'
+        run: rustc -V && cargo -V && cargo clippy -V
 
       # Caches ~/.cargo/{registry,git} + target/. Auto-keys on Cargo.lock +
       # rustc version + job name, so this cache stays isolated from the tsan/
@@ -282,7 +287,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: Toolchain version
+        run: rustc -V && cargo -V
 
       # Auto-keys on runner OS as well as Cargo.lock, so this shares nothing
       # with the ubuntu jobs' caches.

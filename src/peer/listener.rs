@@ -68,10 +68,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tcr_peer_wire::{
-    Caps, Control, Hello, InstanceId, Lendable, NeighborBrief, PeerId, StreamHeader, StreamKind,
-    TunnelTarget, MAX_NEIGHBOR_BRIEFS, PROTO_VERSION,
+    Caps, Control, Hello, InstanceId, Lendable, MAX_NEIGHBOR_BRIEFS, NeighborBrief, PROTO_VERSION,
+    PeerId, StreamHeader, StreamKind, TunnelTarget,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -81,9 +81,9 @@ use crate::peer::config::{
 };
 use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
-use crate::peer::noise::{self, Handshake, PeerSession, PinRefusal, KEY_BYTES};
+use crate::peer::noise::{self, Handshake, KEY_BYTES, PeerSession, PinRefusal};
 use crate::peer::serve::{self, WindowUtilization};
-use crate::peer::state::{knock_address, PeerState};
+use crate::peer::state::{PeerState, knock_address};
 
 /// How long a peer has to complete a handshake before the socket is closed.
 /// A LAN round trip is milliseconds; this is a bound on a stalled connection,
@@ -1456,7 +1456,7 @@ where
                     "peer listener: no message 1 within the pre-authentication timeout; \
                      closed with nothing written",
                 ),
-            ))
+            ));
         }
     };
 
@@ -1550,7 +1550,7 @@ where
             return Err(ConnectionFailure::unauthenticated(
                 anyhow::Error::new(elapsed)
                     .context("peer handshake: timed out before it completed"),
-            ))
+            ));
         }
     };
 
@@ -1806,7 +1806,7 @@ where
             return Err(anyhow::Error::new(elapsed).context(
                 "peer knock: the pairing queue could not be reserved before this connection's \
                  unauthenticated deadline; closed with nothing written",
-            ))
+            ));
         }
     };
 

@@ -132,14 +132,14 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tcr_status_wire::{UsageRow, UsageTotals, UsageWindow};
 use time::{Date, OffsetDateTime, UtcOffset};
 
-use crate::pricing::{cost_nanos, PricingTable};
+use crate::pricing::{PricingTable, cost_nanos};
 use crate::provider::Provider;
 
 /// Minutes held in the ring: six hours, so a 5-hour window plus the trailing
@@ -756,10 +756,10 @@ fn compress_day(dir: &Path, date: Date) -> std::io::Result<Option<(u64, u64)>> {
         }
     });
     if let Err(err) = written.and_then(|()| std::fs::rename(&temp, &gz_path)) {
-        if let Err(cleanup) = std::fs::remove_file(&temp) {
-            if cleanup.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %temp.display(), error = %cleanup, "could not remove a temporary usage-ledger file");
-            }
+        if let Err(cleanup) = std::fs::remove_file(&temp)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %temp.display(), error = %cleanup, "could not remove a temporary usage-ledger file");
         }
         return Err(err);
     }
@@ -1104,11 +1104,11 @@ fn ledger_writer(rx: Receiver<LedgerMsg>, mut ledger: Ledger) {
             }
         };
         ledger.handle(msg);
-        if let Some(open) = ledger.open_date() {
-            if open > compressed_for {
-                compressed_for = open;
-                compress_ledger(&rx, &mut ledger, open);
-            }
+        if let Some(open) = ledger.open_date()
+            && open > compressed_for
+        {
+            compressed_for = open;
+            compress_ledger(&rx, &mut ledger, open);
         }
     }
 }

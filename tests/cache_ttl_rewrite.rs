@@ -5,10 +5,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
-use axum::Router;
 
 /// Every request body the fake upstream saw, in arrival order.
 type Bodies = Arc<Mutex<Vec<Vec<u8>>>>;
@@ -120,9 +120,11 @@ async fn breakpoints_arrive_upstream_as_1h_by_default() {
         body["tools"][0]["cache_control"]["ttl"], "1h",
         "an explicit 5m becomes 1h"
     );
-    assert!(body["messages"][0]["content"][0]
-        .get("cache_control")
-        .is_none());
+    assert!(
+        body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
     assert_eq!(body["model"], "claude-opus-5-5");
     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
 }

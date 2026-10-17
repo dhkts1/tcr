@@ -124,18 +124,17 @@ pub fn requests_extended_ttl(body: &[u8]) -> bool {
     if peek.system.is_some_and(|s| s.any_extended()) {
         return true;
     }
-    if let Some(messages) = peek.messages {
-        if messages
+    if let Some(messages) = peek.messages
+        && messages
             .iter()
             .any(|m| m.content.as_ref().is_some_and(TextOrBlocks::any_extended))
-        {
-            return true;
-        }
+    {
+        return true;
     }
-    if let Some(tools) = peek.tools {
-        if tools.iter().any(|t| is_extended(&t.cache_control)) {
-            return true;
-        }
+    if let Some(tools) = peek.tools
+        && tools.iter().any(|t| is_extended(&t.cache_control))
+    {
+        return true;
     }
     false
 }
@@ -741,18 +740,24 @@ mod tests {
         // an unrelated top-level key.)
         let escaped = |s: &str| s.replace('^', "\\").into_bytes();
         assert!(escaped("^u0031h").starts_with(b"\\u"));
-        assert!(extend_all_ttls(&escaped(
-            r#"{"system":[{"cache_control":{"ttl":"^u0031h"}}]}"#
-        ))
-        .is_none());
-        assert!(extend_all_ttls(&escaped(
-            r#"{"system":[{"cache_control":{"ttl":"^u0035m"}}]}"#
-        ))
-        .is_some());
-        assert!(extend_all_ttls(&escaped(
-            r#"{"system":[{"cache^u005fcontrol":{}}],"x":{"cache_control":0}}"#
-        ))
-        .is_some());
+        assert!(
+            extend_all_ttls(&escaped(
+                r#"{"system":[{"cache_control":{"ttl":"^u0031h"}}]}"#
+            ))
+            .is_none()
+        );
+        assert!(
+            extend_all_ttls(&escaped(
+                r#"{"system":[{"cache_control":{"ttl":"^u0035m"}}]}"#
+            ))
+            .is_some()
+        );
+        assert!(
+            extend_all_ttls(&escaped(
+                r#"{"system":[{"cache^u005fcontrol":{}}],"x":{"cache_control":0}}"#
+            ))
+            .is_some()
+        );
     }
 
     /// A body that is not valid UTF-8 is not JSON, even when the bad byte sits
@@ -803,9 +808,11 @@ mod tests {
                 "the full parse refuses {body}"
             );
             let out = extend_all_ttls(body.as_bytes()).expect("the skip accepts it");
-            assert!(String::from_utf8(out)
-                .expect("utf-8")
-                .contains(r#""cache_control":{"ttl":"1h"}"#));
+            assert!(
+                String::from_utf8(out)
+                    .expect("utf-8")
+                    .contains(r#""cache_control":{"ttl":"1h"}"#)
+            );
         }
     }
 

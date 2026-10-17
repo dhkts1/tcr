@@ -42,7 +42,7 @@
 //! a stream kind a future release invents: the parse survives it and the
 //! typed refusal, not a panic, is what stops it.
 
-use tcr::peer::listener::{peer_stream_gate_rows, StreamRefusal};
+use tcr::peer::listener::{StreamRefusal, peer_stream_gate_rows};
 use tcr_peer_wire::{
     Caps, Hello, InstanceId, Knock, Lease, LeaseGrant, LeaseReceipt, LeaseRefusal, LeaseRequest,
     LeaseUnit, Lendable, NeighborBrief, PeerId, StreamHeader, StreamKind, Window,

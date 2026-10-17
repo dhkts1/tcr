@@ -19,15 +19,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
 use tcr::peer::drop::{
-    self, current_slot, seal, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
-    RecordRefusal, DROP_SLOT_SECONDS, MAX_RECORD_AGE,
+    self, DROP_SLOT_SECONDS, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
+    MAX_RECORD_AGE, RecordRefusal, current_slot, seal,
 };
 use tcr_peer_wire::PeerId;
 

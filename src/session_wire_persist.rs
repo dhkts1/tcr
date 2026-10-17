@@ -559,9 +559,11 @@ mod tests {
         // sess-0 has the newest last_seen_ms (now - 0); the last few indices
         // are the oldest and must be the ones missing.
         assert!(report.sessions.contains_key("sess-0"));
-        assert!(!report
-            .sessions
-            .contains_key(&format!("sess-{}", PERSIST_CAP + 4)));
+        assert!(
+            !report
+                .sessions
+                .contains_key(&format!("sess-{}", PERSIST_CAP + 4))
+        );
     }
 
     /// Garbage on disk must not panic, and must not wipe whatever the caller

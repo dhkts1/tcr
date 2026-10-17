@@ -236,9 +236,9 @@ mod tests {
         };
         let bytes = token_bytes(&token);
         assert_eq!(bytes.len(), 32, "an audit token is eight 32-bit words");
-        for (word, chunk) in token.val.iter().zip(bytes.chunks_exact(4)) {
+        for (word, chunk) in token.val.iter().zip(bytes.as_chunks::<4>().0) {
             assert_eq!(
-                chunk,
+                *chunk,
                 word.to_ne_bytes(),
                 "each word must survive in native order"
             );

@@ -50,12 +50,11 @@ impl Manager {
             // SESSION_CAP, evict the single oldest-last-seen entry (not the one we just
             // touched). Personal use has a handful of sessions; this is a backstop.
             const SESSION_CAP: usize = 128;
-            if sessions.len() > SESSION_CAP {
-                if let Some((&oldest, _)) = sessions.iter().min_by_key(|(_, s)| s.last_seen_ms) {
-                    if oldest != key {
-                        sessions.remove(&oldest);
-                    }
-                }
+            if sessions.len() > SESSION_CAP
+                && let Some((&oldest, _)) = sessions.iter().min_by_key(|(_, s)| s.last_seen_ms)
+                && oldest != key
+            {
+                sessions.remove(&oldest);
             }
         }
         self.set_current(idx);

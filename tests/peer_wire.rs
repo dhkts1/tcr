@@ -11,9 +11,9 @@
 //! last gate un-ignores and stays green: `cargo test -- --ignored --list`
 //! prints nothing from this file.
 
-use tcr::peer::listener::{peer_stream_gate_rows, StreamRefusal};
+use tcr::peer::listener::{StreamRefusal, peer_stream_gate_rows};
 use tcr_peer_wire::{
-    Control, LabelRefusal, LeaseUnit, PeerId, StreamHeader, StreamKind, Window, MAX_LABEL_BYTES,
+    Control, LabelRefusal, LeaseUnit, MAX_LABEL_BYTES, PeerId, StreamHeader, StreamKind, Window,
 };
 
 /// The invariant the whole design rests on: **no credential field on the peer
@@ -854,9 +854,9 @@ fn the_allowlist_covers_every_serializable_wire_type() {
 fn every_wire_type_serializes_only_allowlisted_keys() {
     use std::collections::BTreeSet;
     use tcr_peer_wire::{
-        Caps, CollapseHint, Enroll, Hello, InstanceId, Knock, Lease, LeaseGrant, LeaseReceipt,
-        LeaseRefusal, LeaseRequest, LendScope, Lendable, MoveOffer, NeighborBrief, TunnelTarget,
-        INSTANCE_ID_BYTES,
+        Caps, CollapseHint, Enroll, Hello, INSTANCE_ID_BYTES, InstanceId, Knock, Lease, LeaseGrant,
+        LeaseReceipt, LeaseRefusal, LeaseRequest, LendScope, Lendable, MoveOffer, NeighborBrief,
+        TunnelTarget,
     };
 
     /// The keys one serialized sample carries at its top level, or a refusal

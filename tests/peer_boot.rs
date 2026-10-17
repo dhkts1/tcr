@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use tcr::config::Config;
 use tcr::peer::{config as peer_config, serve as peer_serve};
-use tcr::server::{serve, IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup};
+use tcr::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
 use tcr::singleton::ProxyHost;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -667,11 +667,11 @@ async fn an_account_scoped_lease_serves_only_the_account_it_names() {
 mod lender {
     use std::sync::Arc;
 
+    use axum::Router;
     use axum::body::Body;
     use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::any;
-    use axum::Router;
     use tcr::fallback::Ask;
     use tcr::peer::config::{
         Allow, ControlGrants, Endpoint, EndpointSource, LendGrant, PeerFile, PeerRow, PeerStore,

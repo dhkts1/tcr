@@ -950,9 +950,11 @@ mod tests {
             manager.lendable_fraction(&ALL, tcr_peer_wire::Window::SevenDay, now) > 0.0,
             "the control: the same account on the Anthropic upstream lends"
         );
-        assert!(manager
-            .lendable(&ALL, tcr_peer_wire::Window::SevenDay)
-            .is_some_and(|fraction| fraction > 0.0));
+        assert!(
+            manager
+                .lendable(&ALL, tcr_peer_wire::Window::SevenDay)
+                .is_some_and(|fraction| fraction > 0.0)
+        );
     }
 
     /// An empty fleet lends nothing, and does not panic reaching for a maximum

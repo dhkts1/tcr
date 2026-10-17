@@ -105,10 +105,10 @@ fn sanitize(value: &str) -> String {
 /// the epoch-seconds form is the honest fallback when it is not, and beats
 /// pulling in a date-formatting build-dependency for one string.
 fn build_time() -> String {
-    if let Some(stamp) = run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]) {
-        if !stamp.is_empty() {
-            return stamp;
-        }
+    if let Some(stamp) = run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        && !stamp.is_empty()
+    {
+        return stamp;
     }
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => format!("unix:{}", d.as_secs()),

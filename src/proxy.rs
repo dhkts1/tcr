@@ -33,16 +33,16 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::body::{to_bytes, Body};
+use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, USER_AGENT};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
-use axum::Router;
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -58,7 +58,7 @@ use crate::manager::{
     InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome, SetPriorityOutcome,
 };
 use crate::provider::Provider;
-use crate::quota::{quota_rejections, UnifiedRejectionKind};
+use crate::quota::{UnifiedRejectionKind, quota_rejections};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -905,10 +905,8 @@ fn stable_session_key(
     // its window and the next one handed advisor results minted on the first.
     // So on loopback the body's per-conversation `metadata.user_id` outranks
     // the header, and the header keys only a client that sends no `user_id`.
-    if !client_is_loopback {
-        if let Some(key) = api_key {
-            return Some(key);
-        }
+    if !client_is_loopback && let Some(key) = api_key {
+        return Some(key);
     }
 
     // Tier 2 (`metadata.user_id`) and tier 3 (`system`/`tools`) read the request's
@@ -1562,7 +1560,7 @@ fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
 /// debug and the request is served.
 async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Response> {
     use crate::config::ControlIdentityMode;
-    use crate::control_identity::{verdict, Verdict};
+    use crate::control_identity::{Verdict, verdict};
 
     let mode = manager.control_identity();
     if mode == ControlIdentityMode::Off {
@@ -1735,23 +1733,23 @@ fn local_endpoint_gate(
         }
     }
 
-    if let Some(host) = target_host(&parts.uri, &parts.headers) {
-        if !host_is_loopback(host) {
-            tracing::debug!(
-                target_host = %host,
-                endpoint,
-                "refused a tcr endpoint request addressed to a non-loopback host"
-            );
-            return Some(error_response(
-                StatusCode::MISDIRECTED_REQUEST,
-                "invalid_request_error",
-                &format!(
-                    "The tcr {endpoint} endpoint answers only to a loopback host, \
+    if let Some(host) = target_host(&parts.uri, &parts.headers)
+        && !host_is_loopback(host)
+    {
+        tracing::debug!(
+            target_host = %host,
+            endpoint,
+            "refused a tcr endpoint request addressed to a non-loopback host"
+        );
+        return Some(error_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid_request_error",
+            &format!(
+                "The tcr {endpoint} endpoint answers only to a loopback host, \
                      not to '{host}'."
-                ),
-                None,
-            ));
-        }
+            ),
+            None,
+        ));
     }
 
     if is_cross_site_request(&parts.headers) {
@@ -2415,7 +2413,7 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
                 "invalid_request_error",
                 &refusal.to_string(),
                 None,
-            ))
+            ));
         }
     };
     match manager.persist_setting(&setting) {
@@ -2687,8 +2685,7 @@ pub struct AddAccountResponse {
 /// can print the same hazard on the offline (file) route too — that path
 /// never goes through this module's `add_account_handler`, so nothing else
 /// would say it.
-pub(crate) const NO_REFRESH_TOKEN_WARNING: &str =
-    "this account has no refresh token — it will serve until its access token expires, then go dead";
+pub(crate) const NO_REFRESH_TOKEN_WARNING: &str = "this account has no refresh token — it will serve until its access token expires, then go dead";
 
 /// Join whichever of the durable-persist warning and the no-refresh-token
 /// warning actually apply into the single `warning` field the response carries.
@@ -2950,7 +2947,8 @@ fn codex_forbidden_is_account_error(headers: &HeaderMap, body: &[u8]) -> bool {
     let Some(error) = document.get("error") else {
         return false;
     };
-    let account_error = [error.get("code"), error.get("type")]
+
+    [error.get("code"), error.get("type")]
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
@@ -2965,8 +2963,7 @@ fn codex_forbidden_is_account_error(headers: &HeaderMap, body: &[u8]) -> bool {
             ]
             .iter()
             .any(|known| code.trim().eq_ignore_ascii_case(known))
-        });
-    account_error
+        })
 }
 
 /// Whole milliseconds from `from` to `to`, zero if `to` is not later. Saturates at
@@ -3319,17 +3316,17 @@ async fn handle_request(
     //    sends the proxy key. The JS proxy exempts loopback for exactly this
     //    reason. tcr binds 127.0.0.1 only, so every client is loopback in
     //    practice; the gate still guards a non-loopback client if bound wider.
-    if let Some(expected) = manager.proxy_api_key() {
-        if !client_is_loopback {
-            let provided = req_headers.get("x-api-key").and_then(|v| v.to_str().ok());
-            if !key_matches(provided, expected) {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "authentication_error",
-                    "Missing or invalid x-api-key.",
-                    None,
-                );
-            }
+    if let Some(expected) = manager.proxy_api_key()
+        && !client_is_loopback
+    {
+        let provided = req_headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        if !key_matches(provided, expected) {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Missing or invalid x-api-key.",
+                None,
+            );
         }
     }
 
@@ -3515,10 +3512,10 @@ async fn handle_request(
     let client_bearer = client_bearer_of(&req_headers);
     match provider {
         crate::provider::Provider::Anthropic => {
-            if let Some(bearer) = client_bearer {
-                if let Some(refusal) = refuse_foreign_client(&manager, bearer).await {
-                    return refusal;
-                }
+            if let Some(bearer) = client_bearer
+                && let Some(refusal) = refuse_foreign_client(&manager, bearer).await
+            {
+                return refusal;
             }
         }
         crate::provider::Provider::Codex => {}
@@ -3861,14 +3858,14 @@ async fn handle_request(
     // are its own, and a fallback provider (a peer's credential) is refused outright, since
     // it is one more account that cannot read this history.
     let minted = manager.bound_token_account(&bound.tokens);
-    if let Some((_, bound_kind)) = minted {
-        if manager.bound_tokens_disagree(&bound.tokens) {
-            tracing::warn!(
-                tokens = bound.tokens.len(),
-                kind = bound_kind.as_str(),
-                "bound tokens in one conversation name different accounts; taking the newest mint"
-            );
-        }
+    if let Some((_, bound_kind)) = minted
+        && manager.bound_tokens_disagree(&bound.tokens)
+    {
+        tracing::warn!(
+            tokens = bound.tokens.len(),
+            kind = bound_kind.as_str(),
+            "bound tokens in one conversation name different accounts; taking the newest mint"
+        );
     }
     let session_pin = session_key.and_then(|key| manager.affinity_pin(key));
     let bound_candidate: Option<(usize, &'static str)> = match (minted, session_pin) {
@@ -4252,46 +4249,49 @@ async fn handle_request(
                     if codex_access_read_failures > 0
                         && codex_access_read_failures == upstream_responses
                     {
-                        return error_response(StatusCode::BAD_GATEWAY, "proxy_error",
-                            "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.", None);
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "proxy_error",
+                            "Could not read the upstream access-denied responses. The affected Codex accounts are held briefly; retry shortly.",
+                            None,
+                        );
                     }
                     if account_access_blocks > 0
                         && account_access_blocks + refused_403.len() == upstream_responses
+                        && let Some((headers, body)) = last_account_access_block.take()
                     {
-                        if let Some((headers, body)) = last_account_access_block.take() {
-                            if !refused_403.is_empty() {
-                                let mut combined: Value = serde_json::from_slice(&body)
-                                    .unwrap_or_else(|_| {
-                                        codex_error_body(
-                                            CodexRefusalKind::CredentialRefused,
-                                            "ChatGPT refused workspace access.",
-                                        )
-                                    });
-                                let message = combined
-                                    .pointer("/error/message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("ChatGPT refused workspace access.");
-                                let message = format!(
-                                    "{message} {}",
-                                    codex_credential_refused_message(&refused_403)
-                                );
-                                if !combined.get("error").is_some_and(Value::is_object) {
-                                    combined["error"] = serde_json::json!({});
-                                }
-                                combined["error"]["message"] = message.into();
-                                return codex_error_response(
-                                    StatusCode::FORBIDDEN,
-                                    combined.to_string(),
-                                    None,
-                                );
+                        if !refused_403.is_empty() {
+                            let mut combined: Value =
+                                serde_json::from_slice(&body).unwrap_or_else(|_| {
+                                    codex_error_body(
+                                        CodexRefusalKind::CredentialRefused,
+                                        "ChatGPT refused workspace access.",
+                                    )
+                                });
+                            let message = combined
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("ChatGPT refused workspace access.");
+                            let message = format!(
+                                "{message} {}",
+                                codex_credential_refused_message(&refused_403)
+                            );
+                            if !combined.get("error").is_some_and(Value::is_object) {
+                                combined["error"] = serde_json::json!({});
                             }
-                            return build_response(
+                            combined["error"]["message"] = message.into();
+                            return codex_error_response(
                                 StatusCode::FORBIDDEN,
-                                &headers,
-                                Body::from(body),
-                                ServedBy::PooledAccount,
+                                combined.to_string(),
+                                None,
                             );
                         }
+                        return build_response(
+                            StatusCode::FORBIDDEN,
+                            &headers,
+                            Body::from(body),
+                            ServedBy::PooledAccount,
+                        );
                     }
                     if !refused_403.is_empty() && refused_403.len() == upstream_responses {
                         return credential_refused_response(provider, &refused_403);
@@ -4466,57 +4466,56 @@ async fn handle_request(
                             // top of the handler makes on a later turn, so it gets the
                             // same answer now instead of a 429 that waits for that
                             // turn: the warning once, then the fleet.
-                            if let Some(bound) = bound_to {
-                                if !manager.bound_account_holds(
+                            if let Some(bound) = bound_to
+                                && !manager.bound_account_holds(
                                     bound,
                                     now,
                                     request_is_fable,
                                     request_group.as_deref(),
                                     manager.warm_window(session_key),
+                                )
+                            {
+                                if let Some(warning) = switch_warning(
+                                    &manager,
+                                    session_key,
+                                    bound,
+                                    now,
+                                    request_is_fable,
+                                    request_group.as_deref(),
                                 ) {
-                                    if let Some(warning) = switch_warning(
-                                        &manager,
-                                        session_key,
-                                        bound,
-                                        now,
-                                        request_is_fable,
-                                        request_group.as_deref(),
-                                    ) {
-                                        return warning;
-                                    }
-                                    tracing::info!(
-                                        account =
-                                            manager.account_name(bound).as_deref().unwrap_or("?"),
-                                        "bound history's account went out during the request; \
-                                         releasing the request to the fleet"
-                                    );
-                                    // Re-admit only what the hold benched: a lease's
-                                    // account-set scope stays benched (see
-                                    // `benched_for_hold`), and so does `bound`, which
-                                    // failed this request.
-                                    for idx in benched_for_hold.drain(..) {
-                                        tried.remove(&idx);
-                                    }
-                                    bound_to = None;
-                                    next_idx = same_org_release(
-                                        &manager,
-                                        bound,
-                                        &tried,
-                                        request_model.as_deref(),
-                                        |narrowed| {
-                                            manager.select_with_group(
-                                                narrowed,
-                                                now,
-                                                request_model.as_deref(),
-                                                session_key,
-                                                &path,
-                                                conn_key,
-                                                request_group.as_deref(),
-                                            )
-                                        },
-                                    );
-                                    continue;
+                                    return warning;
                                 }
+                                tracing::info!(
+                                    account = manager.account_name(bound).as_deref().unwrap_or("?"),
+                                    "bound history's account went out during the request; \
+                                         releasing the request to the fleet"
+                                );
+                                // Re-admit only what the hold benched: a lease's
+                                // account-set scope stays benched (see
+                                // `benched_for_hold`), and so does `bound`, which
+                                // failed this request.
+                                for idx in benched_for_hold.drain(..) {
+                                    tried.remove(&idx);
+                                }
+                                bound_to = None;
+                                next_idx = same_org_release(
+                                    &manager,
+                                    bound,
+                                    &tried,
+                                    request_model.as_deref(),
+                                    |narrowed| {
+                                        manager.select_with_group(
+                                            narrowed,
+                                            now,
+                                            request_model.as_deref(),
+                                            session_key,
+                                            &path,
+                                            conn_key,
+                                            request_group.as_deref(),
+                                        )
+                                    },
+                                );
+                                continue;
                             }
                             let served = match bound_to {
                                 Some(bound) => manager.select_bound(
@@ -5175,7 +5174,10 @@ async fn handle_request(
                             tried.insert(idx);
                             continue;
                         }
-                        tracing::warn!(account_index = idx, "upstream Codex request blocked without an account failure; forwarding unchanged");
+                        tracing::warn!(
+                            account_index = idx,
+                            "upstream Codex request blocked without an account failure; forwarding unchanged"
+                        );
                         return match body {
                             Some(body) => build_response(
                                 status,
@@ -5909,10 +5911,10 @@ async fn handle_request(
                         // task's own `rx`-side stream already ended and it does
                         // not want any more bytes — so it must not poison the
                         // verdict the same way; see [`is_genuine_evidence_loss`].
-                        if let Err(err) = state.tx.try_send(bytes.clone()) {
-                            if is_genuine_evidence_loss(&err) {
-                                state.evidence_dropped.store(true, Ordering::SeqCst);
-                            }
+                        if let Err(err) = state.tx.try_send(bytes.clone())
+                            && is_genuine_evidence_loss(&err)
+                        {
+                            state.evidence_dropped.store(true, Ordering::SeqCst);
                         }
                         Some((Ok(bytes), state))
                     }
@@ -5991,13 +5993,13 @@ async fn handle_request(
         let buffered_at = Instant::now();
         match provider {
             Provider::Codex => {
-                if status == StatusCode::BAD_REQUEST {
-                    if let Some(detail) = codex_model_refusal_detail(&bytes) {
-                        log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
-                        model_refusals.push((account_name.clone(), detail));
-                        tried.insert(idx);
-                        continue;
-                    }
+                if status == StatusCode::BAD_REQUEST
+                    && let Some(detail) = codex_model_refusal_detail(&bytes)
+                {
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
+                    model_refusals.push((account_name.clone(), detail));
+                    tried.insert(idx);
+                    continue;
                 }
             }
             Provider::Anthropic => {}
@@ -6338,13 +6340,13 @@ pub(crate) fn build_codex_upstream_headers(
     for name in crate::provider::CODEX_ROUTING_HEADERS {
         out.remove(name);
     }
-    if let Some(id) = account_id {
-        if let Ok(value) = HeaderValue::from_str(id) {
-            out.insert(
-                HeaderName::from_static(crate::provider::CODEX_ACCOUNT_HEADER),
-                value,
-            );
-        }
+    if let Some(id) = account_id
+        && let Ok(value) = HeaderValue::from_str(id)
+    {
+        out.insert(
+            HeaderName::from_static(crate::provider::CODEX_ACCOUNT_HEADER),
+            value,
+        );
     }
     out
 }
@@ -6396,7 +6398,10 @@ fn codex_model_unavailable_response(
         .join(", ");
     let mut message = format!(
         "tcr could not serve {model} from its available pooled Codex accounts. ChatGPT rejected that model for {accounts}. Choose another model or make an account that supports it available. {}",
-        refused.first().map(|(_, detail)| detail.as_str()).unwrap_or_default(),
+        refused
+            .first()
+            .map(|(_, detail)| detail.as_str())
+            .unwrap_or_default(),
     );
     if !credential_refusals.is_empty() {
         message.push(' ');
@@ -6433,10 +6438,10 @@ pub(crate) fn codex_error_response(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(seconds) = retry_after {
-        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
-            response.headers_mut().insert("retry-after", value);
-        }
+    if let Some(seconds) = retry_after
+        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    {
+        response.headers_mut().insert("retry-after", value);
     }
     response
 }
@@ -7639,13 +7644,11 @@ where
                 // `response.output_item.added` that announces one before its arguments are complete.
                 if value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
                     && codex_tool_calls.len() < crate::session_wire::PENDING_TOOL_CAP
-                {
-                    if let Some(call) = value
+                    && let Some(call) = value
                         .get("item")
                         .and_then(crate::session_wire::codex_tool_call_from_item)
-                    {
-                        codex_tool_calls.push(call);
-                    }
+                {
+                    codex_tool_calls.push(call);
                 }
                 continue;
             }
@@ -7772,17 +7775,17 @@ where
                     })
                     .and_then(|d| d.get("signature"))
                     .and_then(Value::as_str);
-                if let (Some(index), Some(fragment)) = (block_index(&value), signature_fragment) {
-                    if let Some(open) = open_signatures.get_mut(&index) {
-                        // Bounded like the tool-input buffer beside it: a signature is a few
-                        // hundred bytes, so anything past this cap is a malformed or hostile
-                        // stream, and a half-signature is worth nothing anyway — drop the
-                        // buffer rather than grow with the response.
-                        if open.len() + fragment.len() <= SIGNATURE_CAP {
-                            open.push_str(fragment);
-                        } else {
-                            open.clear();
-                        }
+                if let (Some(index), Some(fragment)) = (block_index(&value), signature_fragment)
+                    && let Some(open) = open_signatures.get_mut(&index)
+                {
+                    // Bounded like the tool-input buffer beside it: a signature is a few
+                    // hundred bytes, so anything past this cap is a malformed or hostile
+                    // stream, and a half-signature is worth nothing anyway — drop the
+                    // buffer rather than grow with the response.
+                    if open.len() + fragment.len() <= SIGNATURE_CAP {
+                        open.push_str(fragment);
+                    } else {
+                        open.clear();
                     }
                 }
                 let partial = value
@@ -7794,17 +7797,17 @@ where
                     })
                     .and_then(|d| d.get("partial_json"))
                     .and_then(Value::as_str);
-                if let (Some(index), Some(partial)) = (block_index(&value), partial) {
-                    if let Some(open) = open_tool_blocks.get_mut(&index) {
-                        // A `Write` tool's input carries a whole file; only the head of one
-                        // field is ever displayed, so an oversized input is dropped rather
-                        // than buffered — the call still shows up, by name, with no head.
-                        if open.input_json.len() + partial.len() > TOOL_INPUT_JSON_CAP {
-                            open.over_cap = true;
-                            open.input_json.clear();
-                        } else if !open.over_cap {
-                            open.input_json.push_str(partial);
-                        }
+                if let (Some(index), Some(partial)) = (block_index(&value), partial)
+                    && let Some(open) = open_tool_blocks.get_mut(&index)
+                {
+                    // A `Write` tool's input carries a whole file; only the head of one
+                    // field is ever displayed, so an oversized input is dropped rather
+                    // than buffered — the call still shows up, by name, with no head.
+                    if open.input_json.len() + partial.len() > TOOL_INPUT_JSON_CAP {
+                        open.over_cap = true;
+                        open.input_json.clear();
+                    } else if !open.over_cap {
+                        open.input_json.push_str(partial);
                     }
                 }
             }
@@ -7812,14 +7815,13 @@ where
                 // A reasoning block's signature is complete here and nowhere earlier.
                 if let Some(signature) =
                     block_index(&value).and_then(|i| open_signatures.remove(&i))
+                    && !signature.is_empty()
                 {
-                    if !signature.is_empty() {
-                        push_bound_token(
-                            &mut bound_tokens,
-                            BoundTokenKind::ThinkingSignature,
-                            signature,
-                        );
-                    }
+                    push_bound_token(
+                        &mut bound_tokens,
+                        BoundTokenKind::ThinkingSignature,
+                        signature,
+                    );
                 }
                 if let Some(open) = block_index(&value).and_then(|i| open_tool_blocks.remove(&i)) {
                     let input = if open.over_cap {
@@ -7976,15 +7978,14 @@ impl CodexStreamLimit {
         let mut headers = HeaderMap::new();
         if let Some(values) = error.get("headers").and_then(Value::as_object) {
             for (name, value) in values {
-                if name.eq_ignore_ascii_case("retry-after")
-                    || name.to_ascii_lowercase().starts_with("x-codex-")
-                {
-                    if let (Ok(name), Some(Ok(value))) = (
+                if (name.eq_ignore_ascii_case("retry-after")
+                    || name.to_ascii_lowercase().starts_with("x-codex-"))
+                    && let (Ok(name), Some(Ok(value))) = (
                         reqwest::header::HeaderName::from_bytes(name.as_bytes()),
                         value.as_str().map(reqwest::header::HeaderValue::from_str),
-                    ) {
-                        headers.insert(name, value);
-                    }
+                    )
+                {
+                    headers.insert(name, value);
                 }
             }
         }
@@ -8092,10 +8093,10 @@ fn quiet_error_response(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(seconds) = retry_after {
-        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
-            response.headers_mut().insert("retry-after", value);
-        }
+    if let Some(seconds) = retry_after
+        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    {
+        response.headers_mut().insert("retry-after", value);
     }
     response
 }
@@ -8176,16 +8177,15 @@ async fn exhausted_or_fallback(
     // `None` is a path this seam refused to build an `Ask` for at all, a
     // client-credential path, which no provider may be offered. See the arm at
     // `:2352`.
-    if let (Some(ask), None, false, None) = (ask, strict_group, locked, bound_to) {
-        if let Some(provider) = fallback::configured_provider() {
-            if let Some(response) = provider.try_serve(ask).await {
-                tracing::info!(
-                    provider = provider.name(),
-                    "no local account could serve this request, served through a fallback provider"
-                );
-                return response;
-            }
-        }
+    if let (Some(ask), None, false, None) = (ask, strict_group, locked, bound_to)
+        && let Some(provider) = fallback::configured_provider()
+        && let Some(response) = provider.try_serve(ask).await
+    {
+        tracing::info!(
+            provider = provider.name(),
+            "no local account could serve this request, served through a fallback provider"
+        );
+        return response;
     }
     exhausted_response(
         manager,
@@ -10488,10 +10488,12 @@ mod tests {
             codex_usage_from_event(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
                 .is_none()
         );
-        assert!(codex_usage_from_event(
-            br#"{"type":"response.created","response":{"id":"r","model":"gpt-6-astra"}}"#
-        )
-        .is_none());
+        assert!(
+            codex_usage_from_event(
+                br#"{"type":"response.created","response":{"id":"r","model":"gpt-6-astra"}}"#
+            )
+            .is_none()
+        );
         assert!(codex_usage_from_event(b"not json").is_none());
     }
 
@@ -10833,7 +10835,11 @@ mod tests {
     async fn a_codex_request_tcr_answers_itself_closes_no_call() {
         let anthropic_echo = CapturingUpstream::spawn().await;
         let auth_body = r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#;
-        let auth_response = format!("HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", auth_body.len(), auth_body);
+        let auth_response = format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            auth_body.len(),
+            auth_body
+        );
         let (codex_origin, attempts) = spawn_counted_upstream(vec![Some(auth_response)]).await;
         let manager = Manager::with_live_refresher(
             codex_fleet(&anthropic_echo.url, &format!("http://{codex_origin}")),
@@ -10951,10 +10957,12 @@ mod tests {
     /// spent zero: [`parse_sse_usage`] then keeps the totals it had.
     #[test]
     fn a_codex_terminal_event_with_a_null_usage_yields_none() {
-        assert!(codex_usage_from_event(
-            br#"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"#
-        )
-        .is_none());
+        assert!(
+            codex_usage_from_event(
+                br#"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"#
+            )
+            .is_none()
+        );
     }
 
     /// **A failed Codex turn is a stream error, recorded under its code**, as a failed
@@ -16766,8 +16774,8 @@ mod tests {
             String::from_utf8_lossy(&response)
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let served = seen.lock().expect("recorder")[0].clone();
-        served
+
+        seen.lock().expect("recorder")[0].clone()
     }
 
     /// Sonnet 5.5 keeps a thinking block only inside the organization that minted it
@@ -17357,9 +17365,11 @@ mod tests {
 
         // A body whose total exactly equals the cap is accepted (only > rejects).
         let at_cap = vec![Ok::<Bytes, Infallible>(Bytes::from_static(b"12345678"))];
-        assert!(read_capped_body(futures::stream::iter(at_cap), 8)
-            .await
-            .is_ok());
+        assert!(
+            read_capped_body(futures::stream::iter(at_cap), 8)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -23809,8 +23819,11 @@ mod tests {
                 })
                 .unix_timestamp();
             assert!(
-                if retry_after.is_some() { (until - (before + expected_hold)).abs() <= 2 }
-                else { (13..=22).contains(&(until - before)) },
+                if retry_after.is_some() {
+                    (until - (before + expected_hold)).abs() <= 2
+                } else {
+                    (13..=22).contains(&(until - before))
+                },
                 "retry-after {retry_after:?}: held {expected_hold}s plus optional jitter from {before}, not to the \
                  weekly reset ({weekly_reset}); held until {until}"
             );
@@ -25580,11 +25593,13 @@ mod tests {
                 .as_ref(),
             body.as_bytes()
         );
-        assert!(manager
-            .snapshot(OffsetDateTime::now_utc())
-            .accounts
-            .iter()
-            .all(|row| row.gate == GateReason::Ok));
+        assert!(
+            manager
+                .snapshot(OffsetDateTime::now_utc())
+                .accounts
+                .iter()
+                .all(|row| row.gate == GateReason::Ok)
+        );
         server.abort();
     }
 

@@ -51,7 +51,7 @@ use std::path::Path;
 use serde::Serialize;
 use time::Date;
 
-use crate::pricing::{cost_nanos, PricingOverride, PricingTable};
+use crate::pricing::{PricingOverride, PricingTable, cost_nanos};
 use crate::provider::Provider;
 use crate::usage::{self, LedgerLine};
 
@@ -1215,11 +1215,15 @@ mod tests {
             .map(|row| (row.provider.as_str(), row.requests))
             .collect();
         assert_eq!(providers, [("anthropic", 1), ("codex", 4)]);
-        assert!(render_text(&report)
-            .ends_with("note: 3 older ledger line(s) carry no provider; filed by model id\n"));
-        assert!(!serde_json::to_string(&report)
-            .expect("serializes")
-            .contains("iledByModelId"));
+        assert!(
+            render_text(&report)
+                .ends_with("note: 3 older ledger line(s) carry no provider; filed by model id\n")
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .expect("serializes")
+                .contains("iledByModelId")
+        );
     }
 
     /// `unpricedRequests` rides on the totals and every bucket of `--json`, and is absent at

@@ -258,11 +258,20 @@ pub enum ReplyRefusal {
 impl std::fmt::Display for ReplyRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotOurs => write!(f, "this is not a reply (it must start with {REPLY_PREFIX:?})"),
+            Self::NotOurs => write!(
+                f,
+                "this is not a reply (it must start with {REPLY_PREFIX:?})"
+            ),
             Self::UnknownVersion { version } => {
-                write!(f, "this reply names format version {version}, which this build does not know")
+                write!(
+                    f,
+                    "this reply names format version {version}, which this build does not know"
+                )
             }
-            Self::CutShort => write!(f, "this reply is shorter than it should be, which is what a paste cut short looks like"),
+            Self::CutShort => write!(
+                f,
+                "this reply is shorter than it should be, which is what a paste cut short looks like"
+            ),
             Self::DidNotOpen => write!(
                 f,
                 "this reply did not open against anything outstanding here; it may answer an \

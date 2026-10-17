@@ -309,7 +309,7 @@ impl FleetSchedule {
         let mut due: Vec<(i64, usize)> = self
             .due_ms
             .iter()
-            .filter(|(_, &at)| at <= now_ms)
+            .filter(|&(_, &at)| at <= now_ms)
             .map(|(&idx, &at)| (at, idx))
             .collect();
         due.sort_unstable();

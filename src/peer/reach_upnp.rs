@@ -202,7 +202,9 @@ pub enum UpnpError {
     /// that redirects a description fetch is pointing this client at a host
     /// that answered no search, which is the same move the `controlURL` rule
     /// refuses one hop later.
-    #[error("peer reach (upnp): {url} answered HTTP {status} redirecting to {to}, which is never followed")]
+    #[error(
+        "peer reach (upnp): {url} answered HTTP {status} redirecting to {to}, which is never followed"
+    )]
     Redirected {
         /// The URL that was called.
         url: String,
@@ -557,17 +559,17 @@ impl<'a> Cursor<'a> {
             let trimmed = rest.trim_start();
             self.pos += rest.len() - trimmed.len();
             let rest = self.rest();
-            if let Some(body) = rest.strip_prefix("<?") {
-                if let Some(end) = body.find("?>") {
-                    self.pos += 2 + end + 2;
-                    continue;
-                }
+            if let Some(body) = rest.strip_prefix("<?")
+                && let Some(end) = body.find("?>")
+            {
+                self.pos += 2 + end + 2;
+                continue;
             }
-            if let Some(body) = rest.strip_prefix("<!--") {
-                if let Some(end) = body.find("-->") {
-                    self.pos += 4 + end + 3;
-                    continue;
-                }
+            if let Some(body) = rest.strip_prefix("<!--")
+                && let Some(end) = body.find("-->")
+            {
+                self.pos += 4 + end + 3;
+                continue;
             }
             break;
         }
@@ -1077,16 +1079,16 @@ fn fetch(
                 .map(|value| value.to_string());
             // The sender's own claim first: an answer that says it is larger
             // than the ceiling is refused before a byte of it is read.
-            if let Some(promised) = response.content_length() {
-                if promised > MAX_BODY_BYTES as u64 {
-                    return Err(UpnpError::UnreadableResponse {
-                        url: url_owned.clone(),
-                        reason: format!(
-                            "it promises {promised} bytes and the ceiling here is \
+            if let Some(promised) = response.content_length()
+                && promised > MAX_BODY_BYTES as u64
+            {
+                return Err(UpnpError::UnreadableResponse {
+                    url: url_owned.clone(),
+                    reason: format!(
+                        "it promises {promised} bytes and the ceiling here is \
                              {MAX_BODY_BYTES}; refused before reading the body"
-                        ),
-                    });
-                }
+                    ),
+                });
             }
             // And then the read, which is the half that holds: a chunked
             // answer promises no length, and a promise is not a limit anyway.

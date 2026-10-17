@@ -109,7 +109,9 @@ impl SettingKey {
             Self::AccountThrottle | Self::FleetThrottle => {
                 "two whole numbers of at least 1, the milliseconds between sends and the burst, or off"
             }
-            Self::Pacing => "a count of at least 1, the most requests one account may have in flight, or off",
+            Self::Pacing => {
+                "a count of at least 1, the most requests one account may have in flight, or off"
+            }
         }
     }
 }

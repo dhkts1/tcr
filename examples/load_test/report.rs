@@ -147,13 +147,13 @@ impl PhaseResult {
         if sends && self.served == 0 {
             out.push("nothing was served".into());
         }
-        if let Some(ceiling) = self.fleet_ceiling_per_s {
-            if self.upstream_max_per_s > ceiling + CEILING_JITTER {
-                out.push(format!(
+        if let Some(ceiling) = self.fleet_ceiling_per_s
+            && self.upstream_max_per_s > ceiling + CEILING_JITTER
+        {
+            out.push(format!(
                     "the fleet throttle did not hold: {} upstream sends in one second against a ceiling of {ceiling}",
                     self.upstream_max_per_s
                 ));
-            }
         }
         if sends && self.usage_lines == 0 {
             out.push(
@@ -326,7 +326,11 @@ pub fn markdown(results: &[PhaseResult], frames: &BTreeMap<String, Profile>, met
             "- proxy CPU {:.2} s over {:.1} s of wall time ({:.0}% of one core), {} s per 1,000 requests",
             r.cpu_seconds,
             r.wall_s,
-            if r.wall_s > 0.0 { r.cpu_seconds / r.wall_s * 100.0 } else { 0.0 },
+            if r.wall_s > 0.0 {
+                r.cpu_seconds / r.wall_s * 100.0
+            } else {
+                0.0
+            },
             r.cpu_s_per_1k.map_or("n/a".into(), |v| format!("{v:.2}")),
         );
         out!(

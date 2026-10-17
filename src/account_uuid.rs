@@ -232,10 +232,10 @@ mod legacy {
                 }
                 0x2c => {
                     // , (next object member is a key)
-                    if let Some(top) = self.frames.last_mut() {
-                        if top.is_obj {
-                            top.awaiting_key = true;
-                        }
+                    if let Some(top) = self.frames.last_mut()
+                        && top.is_obj
+                    {
+                        top.awaiting_key = true;
                     }
                 }
                 0x22 => {

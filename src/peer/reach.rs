@@ -2060,10 +2060,10 @@ where
     ticker.tick().await;
     let mut round = 0_usize;
     loop {
-        if let Some(limit) = rounds {
-            if round >= limit {
-                return tally;
-            }
+        if let Some(limit) = rounds
+            && round >= limit
+        {
+            return tally;
         }
         round += 1;
         ticker.tick().await;

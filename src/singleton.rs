@@ -234,14 +234,14 @@ pub fn remove_owner_file_if_owned(path: &Path, pid: u32, port: u16) {
             return;
         }
     }
-    if let Err(err) = std::fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "could not remove the proxy owner file; a stale claim is harmless (its pid is re-checked against the live listeners)"
-            );
-        }
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not remove the proxy owner file; a stale claim is harmless (its pid is re-checked against the live listeners)"
+        );
     }
 }
 

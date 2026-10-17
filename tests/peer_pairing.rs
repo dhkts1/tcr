@@ -35,7 +35,7 @@ use tcr::peer::listener::{self, SessionContext};
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::pair;
 use tcr::peer::state::{self, BanReason, PeerState};
-use tcr_peer_wire::{InstanceId, Knock, PeerId, INSTANCE_ID_BYTES};
+use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, Knock, PeerId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -3329,15 +3329,17 @@ fn a_join_link_does_not_replace_a_network_key_without_replace() {
         .to_string();
 
     // This Mac already has one.
-    assert!(tcr(&[
-        "peer",
-        "network-key",
-        "set",
-        "--peers",
-        mine.peers.to_str().expect("a utf-8 path"),
-    ])
-    .status
-    .success());
+    assert!(
+        tcr(&[
+            "peer",
+            "network-key",
+            "set",
+            "--peers",
+            mine.peers.to_str().expect("a utf-8 path"),
+        ])
+        .status
+        .success()
+    );
     let before = mine.file().network_key.expect("this Mac has a key");
 
     let refused = tcr(&[
@@ -4477,9 +4479,11 @@ fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
         .expect("an invite is minted");
     assert_eq!(
         token.sockets().collect::<Vec<_>>(),
-        vec!["127.0.0.1:9600"
-            .parse::<SocketAddr>()
-            .expect("a loopback address")],
+        vec![
+            "127.0.0.1:9600"
+                .parse::<SocketAddr>()
+                .expect("a loopback address")
+        ],
         "somebody typed that address into the peers file, so it is the one they meant"
     );
 }

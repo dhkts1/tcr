@@ -46,11 +46,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::PeerId;
 
-use crate::peer::config::{hmac_sha256, Endpoint, EndpointSource, Observed};
+use crate::peer::config::{Endpoint, EndpointSource, Observed, hmac_sha256};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -736,13 +736,13 @@ impl DeadDropStore for HttpsTemplateStore {
                     name: name_wire,
                 });
             }
-            if let Some(promised) = response.content_length() {
-                if promised > MAX_STORE_BODY_BYTES as u64 {
-                    return Err(StoreRefusal::TooLarge {
-                        name: name_wire,
-                        ceiling: MAX_STORE_BODY_BYTES,
-                    });
-                }
+            if let Some(promised) = response.content_length()
+                && promised > MAX_STORE_BODY_BYTES as u64
+            {
+                return Err(StoreRefusal::TooLarge {
+                    name: name_wire,
+                    ceiling: MAX_STORE_BODY_BYTES,
+                });
             }
             let mut collected: Vec<u8> = Vec::new();
             let mut response = response;

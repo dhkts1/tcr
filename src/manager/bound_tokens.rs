@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 use crate::bound_tokens::{
-    self, BoundTokenKind, LoadReport, StoredAccount, BOUND_TOKEN_CAP, BOUND_TOKEN_TTL_MS,
+    self, BOUND_TOKEN_CAP, BOUND_TOKEN_TTL_MS, BoundTokenKind, LoadReport, StoredAccount,
 };
 use crate::config::ConfigError;
 use crate::identity;
@@ -1058,9 +1058,11 @@ mod tests {
             manager.bound_token_account(&tokens(&["sig_fake_ancient"])),
             None
         );
-        assert!(manager
-            .bound_token_account(&tokens(&["sig_fake_fresh"]))
-            .is_some());
+        assert!(
+            manager
+                .bound_token_account(&tokens(&["sig_fake_fresh"]))
+                .is_some()
+        );
     }
 
     /// A Codex account's bound token comes back to the Codex row after a restart, beside an
@@ -1175,9 +1177,11 @@ mod tests {
         let second = manager_over(&accounts);
         let report = second.restore_bound_tokens(&path, BOUND_TOKEN_TTL_MS);
         assert_eq!(report.expired, 1);
-        assert!(second
-            .bound_token_account(&tokens(&["sig_fake_fresh"]))
-            .is_some());
+        assert!(
+            second
+                .bound_token_account(&tokens(&["sig_fake_fresh"]))
+                .is_some()
+        );
         assert_eq!(
             second.bound_token_account(&tokens(&["sig_fake_stale"])),
             None
@@ -1553,9 +1557,11 @@ mod tests {
         );
         assert_eq!(manager.bound_tokens.len(), BOUND_TOKEN_CAP);
         let newest = format!("sig_fake_bench_{}", rounds - 1);
-        assert!(manager
-            .bound_token_account(std::slice::from_ref(&newest))
-            .is_some());
+        assert!(
+            manager
+                .bound_token_account(std::slice::from_ref(&newest))
+                .is_some()
+        );
     }
 
     /// The comparison behind the store's design: one lock (the map as it was), 16 locked parts

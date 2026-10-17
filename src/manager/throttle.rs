@@ -1,6 +1,6 @@
 //! `Manager` throttle methods, split verbatim from `mod.rs`.
 
-use super::select::{classify_request, RequestClass};
+use super::select::{RequestClass, classify_request};
 use super::*;
 
 /// Whether a [`RequestClass`] is exempt from the PER-ORG GCRA when
@@ -152,17 +152,15 @@ impl Manager {
         let now = crate::now_ms();
         let mut allow_at = now;
 
-        if !noise_exempt {
-            if let Some(spacing_ms) = self.account_throttle.effective_min_spacing() {
-                let burst = self.account_throttle.effective_burst();
-                let key = self.throttle_bucket_key(idx);
-                let mut tats = self.org_tat_ms.lock().await;
-                let tat = tats.entry(key).or_insert(0);
-                let (new_tat, org_allow_at) = throttle_slot(*tat, now, spacing_ms as i64, burst);
-                *tat = new_tat;
-                allow_at = allow_at.max(org_allow_at);
-            } // guard dropped here — never held across the sleep
-        }
+        if !noise_exempt && let Some(spacing_ms) = self.account_throttle.effective_min_spacing() {
+            let burst = self.account_throttle.effective_burst();
+            let key = self.throttle_bucket_key(idx);
+            let mut tats = self.org_tat_ms.lock().await;
+            let tat = tats.entry(key).or_insert(0);
+            let (new_tat, org_allow_at) = throttle_slot(*tat, now, spacing_ms as i64, burst);
+            *tat = new_tat;
+            allow_at = allow_at.max(org_allow_at);
+        } // guard dropped here — never held across the sleep
 
         if let Some(spacing_ms) = self.fleet_throttle.effective_min_spacing() {
             let burst = self.fleet_throttle.effective_burst();

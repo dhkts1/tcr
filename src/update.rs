@@ -50,7 +50,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 
 /// How this `tcr` binary was installed — determines act vs notify.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1479,12 +1479,16 @@ mod tests {
             );
         }
         // Both refusals name what was checked, so the printed fallback says why.
-        assert!(HandoffRefusal::UnreadableIdentity
-            .reason()
-            .contains(TCRBAR_BUNDLE_ID));
-        assert!(HandoffRefusal::ForeignBundle("com.example.x".into())
-            .reason()
-            .contains("com.example.x"));
+        assert!(
+            HandoffRefusal::UnreadableIdentity
+                .reason()
+                .contains(TCRBAR_BUNDLE_ID)
+        );
+        assert!(
+            HandoffRefusal::ForeignBundle("com.example.x".into())
+                .reason()
+                .contains("com.example.x")
+        );
     }
 
     /// The whole point of defect #1: with `CARGO_TARGET_DIR` set, cargo writes
@@ -1732,9 +1736,11 @@ mod tests {
         // Tag-pinned, NOT /releases/latest/download/…: a release cut between the
         // API query and the download would otherwise install a version we never
         // compared against.
-        assert!(!installer_url_for_tag("v0.1.0")
-            .unwrap()
-            .contains("/latest/"));
+        assert!(
+            !installer_url_for_tag("v0.1.0")
+                .unwrap()
+                .contains("/latest/")
+        );
     }
 
     /// Mirrors `asset_and_api_urls_are_built_from_one_repo_constant` for the
@@ -1797,9 +1803,11 @@ mod tests {
                 validate_release_tag(tag).is_ok(),
                 "tag {tag:?} is a legitimate release tag and must be accepted"
             );
-            assert!(installer_url_for_tag(tag)
-                .unwrap()
-                .starts_with("https://github.com/dhkts1/tcr/releases/download/"));
+            assert!(
+                installer_url_for_tag(tag)
+                    .unwrap()
+                    .starts_with("https://github.com/dhkts1/tcr/releases/download/")
+            );
         }
 
         // The same rejection happens at the API ingress, so a poisoned
@@ -1981,10 +1989,10 @@ mod tests {
             );
         }
         // …and the one variable we DO set survives the scrub.
-        assert!(envs
-            .iter()
-            .any(|(k, v)| k == UNMANAGED_INSTALL_ENV
-                && v.as_deref() == Some(&*base.to_string_lossy())));
+        assert!(
+            envs.iter().any(|(k, v)| k == UNMANAGED_INSTALL_ENV
+                && v.as_deref() == Some(&*base.to_string_lossy()))
+        );
 
         fs::remove_dir_all(&base).ok();
     }

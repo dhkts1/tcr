@@ -439,8 +439,7 @@ mod tests {
     /// `{"email":"alice@example.com","https://api.openai.com/profile":{"email":"bob@example.com"}}`.
     #[test]
     fn an_email_only_in_the_profile_claim_is_read_and_a_top_level_one_wins() {
-        const PROFILE_ONLY_PAYLOAD: &str =
-            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSJ9fQ";
+        const PROFILE_ONLY_PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSJ9fQ";
         const BOTH_EMAILS_PAYLOAD: &str = "eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9wcm9maWxlIjp7ImVtYWlsIjoiYm9iQGV4YW1wbGUuY29tIn19";
         let profile_only = id_claims(&format!("{JWT_HEADER}.{PROFILE_ONLY_PAYLOAD}.sig")).unwrap();
         assert_eq!(profile_only.email.as_deref(), Some("alice@example.com"));
@@ -458,8 +457,7 @@ mod tests {
     #[test]
     fn the_fedramp_claim_is_read_from_the_openai_auth_namespace() {
         const FEDRAMP_PAYLOAD: &str = "eyJleHAiOjE4MDAwMDAwMDAsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJlbnRlcnByaXNlIiwiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOnRydWV9fQ";
-        const NOT_FEDRAMP_PAYLOAD: &str =
-            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOmZhbHNlfX0";
+        const NOT_FEDRAMP_PAYLOAD: &str = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOmZhbHNlfX0";
         let fedramp = id_claims(&format!("{JWT_HEADER}.{FEDRAMP_PAYLOAD}.sig")).unwrap();
         assert!(fedramp.chatgpt_account_is_fedramp, "{fedramp:?}");
         assert_eq!(fedramp.chatgpt_plan_type.as_deref(), Some("enterprise"));
@@ -497,7 +495,7 @@ mod tests {
         String,
         std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     ) {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let seen2 = seen.clone();
         let app = Router::new().route(

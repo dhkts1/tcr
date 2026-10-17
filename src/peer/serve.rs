@@ -106,15 +106,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{
-    Control, Hello, Lease, LeaseRefusal, PeerId, StreamHeader, StreamKind, Window, MAX_FRAME_BYTES,
-    PROTO_VERSION,
+    Control, Hello, Lease, LeaseRefusal, MAX_FRAME_BYTES, PROTO_VERSION, PeerId, StreamHeader,
+    StreamKind, Window,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -126,7 +126,7 @@ use crate::peer::noise::{self, Handshake};
 // ONE list, two readers. See the module docs: these are `pub(crate)` in
 // `src/proxy.rs` precisely so this file holds no list and no matcher of its own.
 use crate::proxy::{
-    is_request_hop_by_hop, path_is_under, CLIENT_CREDENTIAL_PREFIXES, CLIENT_TOKEN_REFRESH_PATH,
+    CLIENT_CREDENTIAL_PREFIXES, CLIENT_TOKEN_REFRESH_PATH, is_request_hop_by_hop, path_is_under,
 };
 
 /// **The borrower's refusal**: may a SERVE be opened for this path at all?
@@ -2051,19 +2051,19 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
     // for when the recorded endpoints stop answering.
     crate::peer::reach::remember_observed_peer(*peer, reached);
 
-    if let Some(briefs) = theirs.briefs.as_deref() {
-        if let Err(err) = crate::peer::discovery::observe_neighbor_briefs(
+    if let Some(briefs) = theirs.briefs.as_deref()
+        && let Err(err) = crate::peer::discovery::observe_neighbor_briefs(
             store.path(),
             peer,
             briefs,
             crate::now_ms(),
-        ) {
-            tracing::warn!(
-                peer = %peer.display(),
-                error = %err,
-                "peer hello: could not record a neighbor brief from this peer",
-            );
-        }
+        )
+    {
+        tracing::warn!(
+            peer = %peer.display(),
+            error = %err,
+            "peer hello: could not record a neighbor brief from this peer",
+        );
     }
 
     let now = crate::now_ms();

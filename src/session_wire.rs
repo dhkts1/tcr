@@ -56,8 +56,8 @@
 //! which both creates its temp file with that mode and normalises the destination after the
 //! rename, so an operator's umask cannot loosen it.
 
-use serde_json::value::RawValue;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// A `tool_use` block found in an assistant message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,10 +768,10 @@ mod identity {
                 if let Some((tok, after)) = take_ws_token(rest) {
                     if let Some(stripped) = tok.strip_prefix('-') {
                         let _ = stripped;
-                        if let Some((tok2, after2)) = take_ws_token(after) {
-                            if is_timeout_duration(tok2) {
-                                return Some(after2);
-                            }
+                        if let Some((tok2, after2)) = take_ws_token(after)
+                            && is_timeout_duration(tok2)
+                        {
+                            return Some(after2);
                         }
                         return None;
                     }
@@ -782,18 +782,18 @@ mod identity {
                 None
             }
             "nice" => {
-                if let Some((tok, after)) = take_ws_token(rest) {
-                    if let Some(numpart) = tok.strip_prefix("-n") {
-                        if !numpart.is_empty() {
-                            let d = numpart.strip_prefix('-').unwrap_or(numpart);
-                            if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
-                                return Some(after);
-                            }
-                        } else if let Some((tok2, after2)) = take_ws_token(after) {
-                            let d = tok2.strip_prefix('-').unwrap_or(tok2);
-                            if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
-                                return Some(after2);
-                            }
+                if let Some((tok, after)) = take_ws_token(rest)
+                    && let Some(numpart) = tok.strip_prefix("-n")
+                {
+                    if !numpart.is_empty() {
+                        let d = numpart.strip_prefix('-').unwrap_or(numpart);
+                        if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
+                            return Some(after);
+                        }
+                    } else if let Some((tok2, after2)) = take_ws_token(after) {
+                        let d = tok2.strip_prefix('-').unwrap_or(tok2);
+                        if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
+                            return Some(after2);
                         }
                     }
                 }
@@ -804,10 +804,10 @@ mod identity {
                 Some(after)
             }
             "caffeinate" => {
-                if let Some((tok, after)) = take_ws_token(rest) {
-                    if tok.starts_with('-') {
-                        return Some(after);
-                    }
+                if let Some((tok, after)) = take_ws_token(rest)
+                    && tok.starts_with('-')
+                {
+                    return Some(after);
                 }
                 Some(rest)
             }
@@ -2336,15 +2336,14 @@ impl WireSessionTracker {
         {
             return;
         }
-        if tools.running.len() >= PENDING_TOOL_CAP {
-            if let Some(oldest) = tools
+        if tools.running.len() >= PENDING_TOOL_CAP
+            && let Some(oldest) = tools
                 .running
                 .iter()
                 .min_by_key(|(_, r)| r.started_ms)
                 .map(|(k, _)| k.clone())
-            {
-                tools.running.remove(&oldest);
-            }
+        {
+            tools.running.remove(&oldest);
         }
         tools.running.insert(
             tu.id.clone(),
@@ -2374,15 +2373,14 @@ impl WireSessionTracker {
     }
 
     fn evict_over_cap(&mut self) {
-        if self.sessions.len() > SESSION_CAP {
-            if let Some(oldest) = self
+        if self.sessions.len() > SESSION_CAP
+            && let Some(oldest) = self
                 .sessions
                 .iter()
                 .min_by_key(|(_, s)| s.last_seen_ms)
                 .map(|(k, _)| k.clone())
-            {
-                self.sessions.remove(&oldest);
-            }
+        {
+            self.sessions.remove(&oldest);
         }
     }
 

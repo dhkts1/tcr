@@ -129,11 +129,7 @@ fn parse_reset_ms(value: &Value) -> Option<i64> {
 }
 
 fn to_ms(v: i64) -> i64 {
-    if v < 1_000_000_000_000 {
-        v * 1000
-    } else {
-        v
-    }
+    if v < 1_000_000_000_000 { v * 1000 } else { v }
 }
 
 /// Normalize one usage bucket (`five_hour`, `seven_day`, or a scoped limit) into
