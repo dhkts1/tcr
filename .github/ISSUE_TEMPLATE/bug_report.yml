@@ -7,7 +7,7 @@ body:
       value: |
         **This tracker is public.** Before you paste anything, remove account emails, organization
         and account UUIDs, workspace or org names, OAuth tokens, the proxy API key, and any part of
-        your config file (`~/.config/tcr.json`, or `~/.config/teamclaude.json` on an older install).
+        your config file (`~/.config/tcr.json`).
         Replace them with fake values such as `alice@example.com`. Never attach the config file itself.
 
         Many problems have an answer in [docs/troubleshooting.md](https://github.com/dhkts1/tcr/blob/main/docs/troubleshooting.md).

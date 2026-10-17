@@ -202,7 +202,7 @@ understands version 1 only. Rather than read the Codex row as a Claude account, 
 whole file, and its server refuses to start:
 
 ```
-config at /Users/example/.config/teamclaude.json is unreadable/corrupt: config parse error: account "alice@example.com" carries credentialVersion 2, which this build only understands up to 1; refusing to load rather than silently reinterpret its credential shape — refusing to start rather than serve an empty fleet; fix the file and restart
+config at /Users/example/.config/tcr.json is unreadable/corrupt: config parse error: account "alice@example.com" carries credentialVersion 2, which this build only understands up to 1; refusing to load rather than silently reinterpret its credential shape — refusing to start rather than serve an empty fleet; fix the file and restart
 ```
 
 The file is intact, whatever the message says, so do not edit it: lowering the version by
@@ -272,16 +272,6 @@ account, and that leaf's CA is on disk. Each `<reason>`, verbatim, and its fix a
 [`cli.md`](cli.md#--codex-launching-codex-through-the-pool). `tcr doctor --codex` prints the same
 reason, and checks the route, tcr's CA, this shell's proxy variables and the `codex` binary in one
 go ([`cli.md`](cli.md#the-codex-block)).
-
-One reason sends you here, because a restart does not fix it: `the proxy on :<port> is
-serving the JS teamclaude leaf …`. That proxy found the JS teamclaude proxy's
-`teamclaude-leaf.pem` and `teamclaude-leaf.key` in `~/.config` and loads them at every boot,
-whenever both are there and load. It cannot read which hosts that leaf names, so it claims
-`api.anthropic.com` alone and tunnels `chatgpt.com` untouched, and it never re-mints a leaf it
-did not mint. To pool `codex`, move both files out of `~/.config` and restart the proxy at a
-quiet moment: its next boot reuses or mints `~/.config/tcr-ca.pem` and a leaf under it, and
-every client that trusted only `teamclaude-ca.pem` then has to trust `~/.config/tcr-ca.pem`
-instead (`tcr run` points the sessions it launches at the right one by itself).
 
 ## Codex works but `tcr status` shows no Codex traffic
 
