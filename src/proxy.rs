@@ -6223,26 +6223,39 @@ fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
 /// `None` only if the TLS backend fails to initialise, which the caller answers with
 /// a 502 — a proxy never panics on a client request. The next relay tries the build
 /// again.
+///
+/// In a test build only, a test whose upstream is a stub gets a fresh client with the same
+/// settings that sends over the stubs' Unix socket (`test_support::stub_upstream`, § The Unix
+/// socket); every other caller gets the shared one.
 fn relay_client() -> Option<Arc<reqwest::Client>> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(socket) = crate::test_support::stub_upstream::client_socket() {
+        return build_relay_client(relay_client_builder().unix_socket(socket)).map(Arc::new);
+    }
     RELAY_CLIENT.get()
+}
+
+/// [`RELAY_CLIENT`]'s settings, before `build`.
+fn relay_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+fn build_relay_client(builder: reqwest::ClientBuilder) -> Option<reqwest::Client> {
+    match builder.build() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            tracing::error!(error = %err, "could not build the relay HTTP client");
+            None
+        }
+    }
 }
 
 static RELAY_CLIENT: std::sync::LazyLock<crate::wake::SleepAwareClient<reqwest::Client>> =
     std::sync::LazyLock::new(|| {
-        crate::wake::SleepAwareClient::new("relay", || {
-            match reqwest::Client::builder()
-                .no_proxy()
-                .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
-                Ok(client) => Some(client),
-                Err(err) => {
-                    tracing::error!(error = %err, "could not build the relay HTTP client");
-                    None
-                }
-            }
-        })
+        crate::wake::SleepAwareClient::new("relay", || build_relay_client(relay_client_builder()))
     });
 
 /// Forward a request upstream WITHOUT touching account rotation — see the `1c`

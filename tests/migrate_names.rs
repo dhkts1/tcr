@@ -21,9 +21,10 @@ use crate::connect_guard;
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
+use tcr::test_support::child::KillOnDrop;
 
 use serde_json::Value;
 use tcr::{legacy_names, paths, singleton::owner_path_in};
@@ -124,7 +125,7 @@ fn tcr(home: &Path, args: &[&str]) -> Out {
 
 /// A scratch server on the port its config names, stopped on drop.
 struct Server {
-    child: Child,
+    child: KillOnDrop,
     _guard: connect_guard::ConnectGuard,
 }
 
@@ -134,10 +135,7 @@ impl Server {
         let mut cmd = isolated_tcr(home);
         cmd.args(["server", "--headless", "--no-replace"]);
         let guard = connect_guard::ConnectGuard::attach(&mut cmd, home);
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let mut child = KillOnDrop::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::null()))
             .expect("spawn the built tcr server");
         let stdout = child.stdout.take().expect("stdout was piped");
         let (tx, rx) = mpsc::channel();
