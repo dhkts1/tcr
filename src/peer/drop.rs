@@ -356,16 +356,27 @@ pub(crate) fn seal_payload(
     aad: &[u8],
     plaintext: &[u8],
 ) -> std::result::Result<Vec<u8>, SealFailure> {
-    use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-
     let mut nonce = [0_u8; NONCE_BYTES];
     getrandom::fill(&mut nonce).map_err(SealFailure::Csprng)?;
+    seal_payload_with_nonce(seal_key, &nonce, aad, plaintext)
+}
+
+/// [`seal_payload`] with the nonce handed in. Private, and called only by
+/// `seal_payload` and the fixed-vector test below: a caller that picks its own
+/// nonce is how a nonce repeats.
+fn seal_payload_with_nonce(
+    seal_key: &[u8; 32],
+    nonce: &[u8; NONCE_BYTES],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> std::result::Result<Vec<u8>, SealFailure> {
+    use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(seal_key));
     let sealed = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            Nonce::from_slice(nonce),
             Payload {
                 msg: plaintext,
                 aad,
@@ -376,7 +387,7 @@ pub(crate) fn seal_payload(
         .map_err(|_| SealFailure::Aead)?;
 
     let mut payload = Vec::with_capacity(NONCE_BYTES + sealed.len());
-    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(nonce);
     payload.extend_from_slice(&sealed);
     Ok(payload)
 }
@@ -644,7 +655,7 @@ impl HttpsTemplateStore {
         if !template.contains("{name}") {
             bail!("dead drop: the store template has no {{name}} placeholder: {template}");
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
@@ -1038,5 +1049,48 @@ pub async fn keep_drops_published<S: DeadDropStore + Sync>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NONCE_BYTES, open_payload, seal_payload_with_nonce};
+
+    /// Fixed inputs for the sealed-payload vector below.
+    const KEY: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    const NONCE: [u8; NONCE_BYTES] = [
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab,
+    ];
+    const AAD: &[u8] = b"tcr peer seal vector aad";
+    const PLAINTEXT: &[u8] = b"{\"v\":1,\"eps\":[\"203.0.113.4:7755\"]}";
+    /// What chacha20poly1305 0.10.1 sealed from the inputs above, captured
+    /// before the move to 0.11: the nonce, then the ciphertext and tag. Python's
+    /// `cryptography` package gives the same bytes:
+    /// `ChaCha20Poly1305(bytes(range(32))).encrypt(bytes(range(0xa0, 0xac)), PLAINTEXT, AAD)`.
+    const SEALED_HEX: &str = "a0a1a2a3a4a5a6a7a8a9aaab77890e7d77d7ee8fc57f8036c6a1dfc9ad6dfd8f6d\
+5b51909aece1864657f62e31fd0761c98811baf4bfd8ffa5c542161b78";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A sealed record crosses machines (the dead drop, the moved notice), so
+    /// a Mac on an older build and one on a newer build must produce and open
+    /// the same bytes. A dependency bump that changed them would strand every
+    /// record already published; this pins them to the crate version that
+    /// wrote the records in the field.
+    #[test]
+    fn a_fixed_key_and_nonce_seal_to_the_bytes_the_previous_crate_wrote() {
+        let sealed = seal_payload_with_nonce(&KEY, &NONCE, AAD, PLAINTEXT)
+            .unwrap_or_else(|_| panic!("the fixed inputs must seal"));
+        assert_eq!(hex(&sealed), SEALED_HEX);
+
+        let opened = open_payload(&KEY, AAD, &sealed)
+            .unwrap_or_else(|_| panic!("the vector must open under the same key and aad"));
+        assert_eq!(opened, PLAINTEXT);
     }
 }

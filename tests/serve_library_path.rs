@@ -181,7 +181,7 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
 
     // One real request, over a real socket, through the real listener.
-    let client = reqwest::Client::builder()
+    let client = tcr::http_client::builder()
         // HTTP_PROXY very commonly points AT tcr; routing this through it would
         // send the request to the live proxy instead of ours.
         .no_proxy()

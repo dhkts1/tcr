@@ -3601,7 +3601,7 @@ mod tests {
 
         // One POST at a fleet with no account that can serve it: the dry-fleet
         // arm, which is the only condition under which a provider is consulted.
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .no_proxy()
             .build()
             .expect("a loopback client");

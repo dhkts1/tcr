@@ -131,7 +131,7 @@ async fn exchange_mint_code(
     verifier: &str,
     state: &str,
 ) -> anyhow::Result<MintExchangeResponse> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .build()
         .context("build mint token-exchange client")?;

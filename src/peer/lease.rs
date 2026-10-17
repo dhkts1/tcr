@@ -2866,7 +2866,7 @@ impl PeerLeaseProvider {
             // `peer::serve::serve_on_own_account` gives: an environment proxy
             // variable must not silently route a request that is spending
             // somebody else's account through a third host.
-            hand_egress: reqwest::Client::builder()
+            hand_egress: crate::http_client::builder()
                 .no_proxy()
                 .build()
                 .inspect_err(|err| {

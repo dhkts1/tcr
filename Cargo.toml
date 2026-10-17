@@ -269,7 +269,16 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 # (hyper_util::server::conn::auto::Builder) used in src/mitm.rs so base-URL/MITM
 # clients can negotiate h2 instead of being forced to h1.
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2"] }
+# `rustls-no-provider`, not `rustls`: the latter compiles aws-lc-rs, a C library, beside the ring
+# provider rustls and tokio-rustls already use here. Every client is built through
+# `tcr::http_client::builder`, which installs ring first (a build without it panics).
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-no-provider", "http2"] }
+# The Mozilla root set every client trusts, as DER certificates for reqwest's `tls_certs_only`
+# (`tcr::http_client::builder`). reqwest 0.12's `rustls-tls` compiled this set in through
+# `webpki-roots`; 0.13 would check against the OS trust store instead, and Gil chose to keep
+# the bundled set on every OS (2026-10-17). Same data, same publisher; `webpki-roots` left
+# the lock with reqwest 0.12.
+webpki-root-certs = "1"
 tower = "0.5"
 bytes = "1"
 futures = "0.3"

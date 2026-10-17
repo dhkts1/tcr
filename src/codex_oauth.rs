@@ -590,7 +590,7 @@ mod tests {
     /// The one client a test uses for all its calls, so they share one pooled connection to the
     /// shared stub instead of one connection each.
     fn client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
+        crate::http_client::builder().no_proxy().build().unwrap()
     }
 
     #[tokio::test]

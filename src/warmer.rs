@@ -94,7 +94,7 @@ impl LiveWarmer {
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
             // proxy — an ambient proxy env var would route the warm request through
             // another proxy and silently fail it (mirrors LiveUsageProber).
-            client: reqwest::Client::builder()
+            client: crate::http_client::builder()
                 .no_proxy()
                 .build()
                 .expect("build reqwest client"),

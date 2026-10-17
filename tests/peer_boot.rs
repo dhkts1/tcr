@@ -216,7 +216,7 @@ async fn a_booted_server_answers_a_knock_and_refuses_the_local_route_on_its_peer
     // The positive control for claim 3: that exact request IS answered, on the
     // proxy's own port. Without it, "zero bytes" could mean the server was
     // never up.
-    let status = reqwest::Client::builder()
+    let status = tcr::http_client::builder()
         .no_proxy()
         .build()
         .expect("a loopback client")
@@ -866,7 +866,7 @@ mod lender {
         // which lands on the first account (`spare-fake`) and pins this session
         // to it. `no_proxy` because this is a loopback call to the lender's own
         // proxy and an operator's `HTTPS_PROXY` must not redirect it.
-        let local = reqwest::Client::builder()
+        let local = tcr::http_client::builder()
             .no_proxy()
             .build()
             .expect("the local client builds");

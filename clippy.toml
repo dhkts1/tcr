@@ -25,3 +25,12 @@ doc-valid-idents = [
     "SipHash",
     "DoS",
 ]
+
+# reqwest 0.13 is built with `rustls-no-provider`, and a client built before a rustls crypto
+# provider is installed panics. `tcr::http_client::builder` installs ring first; these are the
+# calls that skip it.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "use tcr::http_client::builder, which installs the rustls crypto provider first" },
+    { path = "reqwest::Client::new", reason = "use tcr::http_client::builder().build(), which installs the rustls crypto provider first" },
+    { path = "reqwest::get", reason = "build a client with tcr::http_client::builder, which installs the rustls crypto provider first" },
+]
