@@ -66,7 +66,7 @@ mod ladder;
 pub(crate) mod served;
 
 use client_error::{ClientError, ErrorKind};
-use ladder::Ladder;
+use ladder::{Ladder, Step};
 use served::{ServedRequest, ServedTurn, WireFold, record_served_request};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -4379,816 +4379,851 @@ async fn handle_request(
         }
 
         timing.note_send(idx, account_name.as_deref());
-        let resp = match builder.send().await {
-            Ok(resp) => {
-                timing.headers_at = Some(Instant::now());
-                resp
-            }
-            Err(err) => {
-                // Transport failure is not proof of a bad credential, so nothing
-                // here ever disables an account — the three arms differ only in
-                // whether this request retries in place, rotates, or gives up.
-                // Their order and rationale are at `transport_retried` above. The
-                // `reqwest::Error` used to be discarded by a `let Ok(..) else`,
-                // so a 502 assembled out of these failures had no line anywhere to
-                // attribute it to; `is_connect` / `is_timeout` separate "never
-                // reached the host" from "the host went quiet mid-request".
-                ladder.transport_failed();
-                // **Blind peer egress, the one offer per request.**
-                //
-                // Four conjuncts, and the first two are what stop a carry
-                // RESENDING a request an upstream may already have acted on.
-                // `err.is_connect()` alone was not enough, and that was the
-                // CRITICAL a measurement found: it describes only THIS
-                // attempt, so a request whose earlier attempt died past the
-                // connect phase (`unknown_outcome_transport_failure`, set
-                // below) and whose next one failed to connect satisfied it and
-                // carried a POST that may have been received. So:
-                //
-                //  - `!unknown_outcome_transport_failure`: no attempt in this
-                //    request has ever been written onto a live connection.
-                //  - `every_attempt_transport_failed(..)`: no attempt ever
-                //    reached an upstream at all. An upstream answer, a 429, a
-                //    403, anything, is proof the request left this box, and it
-                //    is a fact about the REQUEST, not about this attempt.
-                //  - `err.is_connect() || is_offline_error(&err)`: this attempt
-                //    died before or at connect.
-                //  - `rotation_is_spent`: the ladder has no untried account
-                //    left to rotate to, OR the failure is machine-level
-                //    (the resolver), where rotating cannot help because every
-                //    account resolves the same name. Offering on the FIRST
-                //    connect failure of a multi-account fleet is what let a
-                //    carry run while an account that would have answered had
-                //    not been tried yet.
-                //
-                // Position follows from that last conjunct: after rotation,
-                // and still ABOVE the resolver arm's fixed six-second wait, so
-                // an offline machine is offered a carry before it sleeps
-                // rather than after. One call site, bounded once per request by
-                // `peer_egress_tried`.
-                //
-                // Inert by construction when the mesh is not set up: no peers
-                // file, `via off`, or no pinned Mac with an address all answer
-                // `None` before anything is dialled, and then this arm carries
-                // on to exactly the behaviour it had before. Nothing about
-                // `is_offline_error`, `every_attempt_transport_failed` or
-                // either terminal status is widened.
-                let machine_level = is_offline_error(&err);
-                let nothing_ever_left_this_box = !ladder.tally().unknown_outcome_transport_failure
-                    && (err.is_connect() || machine_level)
-                    && every_attempt_transport_failed(
-                        ladder.tally().transport_failures,
-                        ladder.tally().upstream_responses,
-                    );
-                // `tried` never contains `idx` yet (it is inserted on the way
-                // out of this arm), so this account plus the benched ones is
-                // the whole of this request's provider's accounts exactly when
-                // the ladder is out of moves. A request narrowed by the
-                // account-set scope header counts its own benched accounts here
-                // too, which is right: they are not rotatable for this request
-                // either.
-                //
-                // Both sides count only the REQUEST's provider: the other
-                // provider's accounts are never rotatable for it, so with the
-                // fleet-wide count a mixed fleet read one Anthropic ladder short
-                // of spent per Codex account, and an Anthropic request was never
-                // offered the carry it gets on the same fleet without them. They
-                // are filtered out of `tried` too, because the scope header
-                // benches every account outside its set, whatever its provider.
-                let tried_of_provider = ladder
-                    .tried()
-                    .iter()
-                    .filter(|&&i| manager.live_provider(i) == Some(provider))
-                    .count();
-                let rotation_is_spent =
-                    machine_level || tried_of_provider + 1 >= provider_account_count;
-                // Anthropic only: Codex stays off the peer mesh in this version (it is
-                // neither lent nor carried), and a carry offers the request to a
-                // peer's gateway as surely as a lease does. A Codex request keeps the
-                // answer it had before the mesh existed.
-                if !ladder.peer_egress_tried()
-                    && nothing_ever_left_this_box
-                    && rotation_is_spent
-                    && provider.on_peer_mesh()
-                {
-                    ladder.spend_peer_egress();
-                    let peers_path = crate::peer::egress::peers_path();
-                    let carry = crate::peer::egress::retry_through_peer(
-                        crate::peer::egress::CarriedRequest {
-                            url: &url,
-                            method: &method,
-                            headers: upstream_headers.clone(),
-                            body: upstream_body.clone(),
-                            peers_path: &peers_path,
-                        },
-                    )
-                    .await;
-                    // A GATEWAY THAT TOOK THE CARRY AND FAILED IS AN ANSWER,
-                    // never a fall-through. The ladder below this arm sleeps
-                    // and retries the same account, or benches it and rotates,
-                    // and either way sends a request the splice may already
-                    // have put on the wire a second time. Nothing else on this
-                    // path can say so: `unknown_outcome_transport_failure` is
-                    // written by the direct attempt's own error arm, which a
-                    // carry never reaches, so the terminal answer was a 503
-                    // the client is built to retry. Same typed outcome as the
-                    // pinned sibling, same 502 with `x-should-retry: false`.
-                    if let crate::peer::egress::ViaCarry::TakenAndFailed(gap) = &carry {
-                        return crate::peer::egress::delivered_unknown_response(gap);
-                    }
-                    if let crate::peer::egress::ViaCarry::Carried(carried) = carry {
-                        // A carried request is a served request, and it is
-                        // recorded exactly like one, the counter, the
-                        // wire-session table and the ring buffer, in the order
-                        // the terminal outcome below uses. The account and the
-                        // credential were ours; only the route out belonged to
-                        // a peer, so a carry that did not count would make all
-                        // three under-report this fleet's own traffic.
-                        // `egress::record_carried` documents which figure it
-                        // cannot record and why.
-                        //
-                        // The headers it folds into the quota are the ORIGIN's
-                        // own, carried out of the peer path unfiltered
-                        // alongside the client's response, because the client's
-                        // copy no longer has them, `is_account_scoped` strips
-                        // them there exactly as `build_response` does here.
-                        crate::peer::egress::record_carried(
-                            &manager,
-                            crate::peer::egress::CarriedRecord {
-                                account_idx: idx,
-                                account: account_name.clone(),
-                                session_key,
-                                session_kind,
-                                wire_session_id: wire_session_id.as_deref(),
-                                model: request_model.clone(),
-                                method: method.to_string(),
-                                path: path_and_query.clone(),
-                                status: carried.response.status().as_u16(),
-                                tool_uses: &wire_tool_uses,
-                                tool_results: &wire_tool_results,
-                                upstream_headers: &carried.upstream_headers,
+        // The attempt, from the send to the last status arm, evaluates to the one `Step` it
+        // decided, and the `match` after it is the only place the ladder moves. An arm that
+        // changed the ladder and jumped by itself is how a park once forgot its second set.
+        let step = 'attempt: {
+            let resp = match builder.send().await {
+                Ok(resp) => {
+                    timing.headers_at = Some(Instant::now());
+                    resp
+                }
+                Err(err) => {
+                    // Transport failure is not proof of a bad credential, so nothing
+                    // here ever disables an account — the three arms differ only in
+                    // whether this request retries in place, rotates, or gives up.
+                    // Their order and rationale are at `transport_retried` above. The
+                    // `reqwest::Error` used to be discarded by a `let Ok(..) else`,
+                    // so a 502 assembled out of these failures had no line anywhere to
+                    // attribute it to; `is_connect` / `is_timeout` separate "never
+                    // reached the host" from "the host went quiet mid-request".
+                    ladder.transport_failed();
+                    // **Blind peer egress, the one offer per request.**
+                    //
+                    // Four conjuncts, and the first two are what stop a carry
+                    // RESENDING a request an upstream may already have acted on.
+                    // `err.is_connect()` alone was not enough, and that was the
+                    // CRITICAL a measurement found: it describes only THIS
+                    // attempt, so a request whose earlier attempt died past the
+                    // connect phase (`unknown_outcome_transport_failure`, set
+                    // below) and whose next one failed to connect satisfied it and
+                    // carried a POST that may have been received. So:
+                    //
+                    //  - `!unknown_outcome_transport_failure`: no attempt in this
+                    //    request has ever been written onto a live connection.
+                    //  - `every_attempt_transport_failed(..)`: no attempt ever
+                    //    reached an upstream at all. An upstream answer, a 429, a
+                    //    403, anything, is proof the request left this box, and it
+                    //    is a fact about the REQUEST, not about this attempt.
+                    //  - `err.is_connect() || is_offline_error(&err)`: this attempt
+                    //    died before or at connect.
+                    //  - `rotation_is_spent`: the ladder has no untried account
+                    //    left to rotate to, OR the failure is machine-level
+                    //    (the resolver), where rotating cannot help because every
+                    //    account resolves the same name. Offering on the FIRST
+                    //    connect failure of a multi-account fleet is what let a
+                    //    carry run while an account that would have answered had
+                    //    not been tried yet.
+                    //
+                    // Position follows from that last conjunct: after rotation,
+                    // and still ABOVE the resolver arm's fixed six-second wait, so
+                    // an offline machine is offered a carry before it sleeps
+                    // rather than after. One call site, bounded once per request by
+                    // `peer_egress_tried`.
+                    //
+                    // Inert by construction when the mesh is not set up: no peers
+                    // file, `via off`, or no pinned Mac with an address all answer
+                    // `None` before anything is dialled, and then this arm carries
+                    // on to exactly the behaviour it had before. Nothing about
+                    // `is_offline_error`, `every_attempt_transport_failed` or
+                    // either terminal status is widened.
+                    let machine_level = is_offline_error(&err);
+                    let nothing_ever_left_this_box =
+                        !ladder.tally().unknown_outcome_transport_failure
+                            && (err.is_connect() || machine_level)
+                            && every_attempt_transport_failed(
+                                ladder.tally().transport_failures,
+                                ladder.tally().upstream_responses,
+                            );
+                    // `tried` never contains `idx` yet (it is inserted on the way
+                    // out of this arm), so this account plus the benched ones is
+                    // the whole of this request's provider's accounts exactly when
+                    // the ladder is out of moves. A request narrowed by the
+                    // account-set scope header counts its own benched accounts here
+                    // too, which is right: they are not rotatable for this request
+                    // either.
+                    //
+                    // Both sides count only the REQUEST's provider: the other
+                    // provider's accounts are never rotatable for it, so with the
+                    // fleet-wide count a mixed fleet read one Anthropic ladder short
+                    // of spent per Codex account, and an Anthropic request was never
+                    // offered the carry it gets on the same fleet without them. They
+                    // are filtered out of `tried` too, because the scope header
+                    // benches every account outside its set, whatever its provider.
+                    let tried_of_provider = ladder
+                        .tried()
+                        .iter()
+                        .filter(|&&i| manager.live_provider(i) == Some(provider))
+                        .count();
+                    let rotation_is_spent =
+                        machine_level || tried_of_provider + 1 >= provider_account_count;
+                    // Anthropic only: Codex stays off the peer mesh in this version (it is
+                    // neither lent nor carried), and a carry offers the request to a
+                    // peer's gateway as surely as a lease does. A Codex request keeps the
+                    // answer it had before the mesh existed.
+                    if !ladder.peer_egress_tried()
+                        && nothing_ever_left_this_box
+                        && rotation_is_spent
+                        && provider.on_peer_mesh()
+                    {
+                        ladder.spend_peer_egress();
+                        let peers_path = crate::peer::egress::peers_path();
+                        let carry = crate::peer::egress::retry_through_peer(
+                            crate::peer::egress::CarriedRequest {
+                                url: &url,
+                                method: &method,
+                                headers: upstream_headers.clone(),
+                                body: upstream_body.clone(),
+                                peers_path: &peers_path,
                             },
                         )
                         .await;
-                        return carried.response;
+                        // A GATEWAY THAT TOOK THE CARRY AND FAILED IS AN ANSWER,
+                        // never a fall-through. The ladder below this arm sleeps
+                        // and retries the same account, or benches it and rotates,
+                        // and either way sends a request the splice may already
+                        // have put on the wire a second time. Nothing else on this
+                        // path can say so: `unknown_outcome_transport_failure` is
+                        // written by the direct attempt's own error arm, which a
+                        // carry never reaches, so the terminal answer was a 503
+                        // the client is built to retry. Same typed outcome as the
+                        // pinned sibling, same 502 with `x-should-retry: false`.
+                        if let crate::peer::egress::ViaCarry::TakenAndFailed(gap) = &carry {
+                            break 'attempt Step::Answer(
+                                crate::peer::egress::delivered_unknown_response(gap),
+                            );
+                        }
+                        if let crate::peer::egress::ViaCarry::Carried(carried) = carry {
+                            // A carried request is a served request, and it is
+                            // recorded exactly like one, the counter, the
+                            // wire-session table and the ring buffer, in the order
+                            // the terminal outcome below uses. The account and the
+                            // credential were ours; only the route out belonged to
+                            // a peer, so a carry that did not count would make all
+                            // three under-report this fleet's own traffic.
+                            // `egress::record_carried` documents which figure it
+                            // cannot record and why.
+                            //
+                            // The headers it folds into the quota are the ORIGIN's
+                            // own, carried out of the peer path unfiltered
+                            // alongside the client's response, because the client's
+                            // copy no longer has them, `is_account_scoped` strips
+                            // them there exactly as `build_response` does here.
+                            crate::peer::egress::record_carried(
+                                &manager,
+                                crate::peer::egress::CarriedRecord {
+                                    account_idx: idx,
+                                    account: account_name.clone(),
+                                    session_key,
+                                    session_kind,
+                                    wire_session_id: wire_session_id.as_deref(),
+                                    model: request_model.clone(),
+                                    method: method.to_string(),
+                                    path: path_and_query.clone(),
+                                    status: carried.response.status().as_u16(),
+                                    tool_uses: &wire_tool_uses,
+                                    tool_results: &wire_tool_results,
+                                    upstream_headers: &carried.upstream_headers,
+                                },
+                            )
+                            .await;
+                            break 'attempt Step::Answer(carried.response);
+                        }
                     }
-                }
-                // `?err`, NOT `%err`. reqwest's `Display` prints only its own top
-                // frame and never walks `source()`, so the h2 sub-kind
-                // (`SendRequest` / `Canceled` / `ChannelClosed`) and its reason code
-                // — the only things that say WHY the connection died — are
-                // structurally unreachable from a `%` rendering. `Debug` carries the
-                // whole chain. Do not "tidy" this back to `%err`.
-                // A CONNECT-phase failure is not a blip on a pooled connection —
-                // there was no connection. Nothing was evicted, nothing is
-                // refreshed by trying again, and the retry is the identical
-                // operation with no new information; all it buys is a second full
-                // `connect_timeout` (10s, `manager/mod.rs`) on a route that is
-                // already not answering. On a blackholed upstream (VPN drop,
-                // captive portal, edge unreachable — no RST, no reply) that
-                // doubles every request's time-to-502 — ~80s to ~160s on an
-                // 8-account fleet — while each request holds its per-account
-                // in-flight slot for the whole of it. Bench the account and let
-                // the rotation do its job.
-                // FIRST arm, ahead of both of the account-level ones: a resolver
-                // failure is a fact about this MACHINE, not about the account that
-                // happened to be selected. Every account resolves the same
-                // hostname, so neither benching this one nor moving to the next can
-                // possibly help — it only unpins the session and burns the fleet.
-                // Hold the pin, wait briefly, retry the SAME account.
-                if is_offline_error(&err) {
-                    let offline_failures = ladder.offline_failed();
-                    if let Some(offline_wait) =
-                        ladder.take_offline_wait(MAX_OFFLINE_WAITS_PER_REQUEST)
+                    // `?err`, NOT `%err`. reqwest's `Display` prints only its own top
+                    // frame and never walks `source()`, so the h2 sub-kind
+                    // (`SendRequest` / `Canceled` / `ChannelClosed`) and its reason code
+                    // — the only things that say WHY the connection died — are
+                    // structurally unreachable from a `%` rendering. `Debug` carries the
+                    // whole chain. Do not "tidy" this back to `%err`.
+                    // A CONNECT-phase failure is not a blip on a pooled connection —
+                    // there was no connection. Nothing was evicted, nothing is
+                    // refreshed by trying again, and the retry is the identical
+                    // operation with no new information; all it buys is a second full
+                    // `connect_timeout` (10s, `manager/mod.rs`) on a route that is
+                    // already not answering. On a blackholed upstream (VPN drop,
+                    // captive portal, edge unreachable — no RST, no reply) that
+                    // doubles every request's time-to-502 — ~80s to ~160s on an
+                    // 8-account fleet — while each request holds its per-account
+                    // in-flight slot for the whole of it. Bench the account and let
+                    // the rotation do its job.
+                    // FIRST arm, ahead of both of the account-level ones: a resolver
+                    // failure is a fact about this MACHINE, not about the account that
+                    // happened to be selected. Every account resolves the same
+                    // hostname, so neither benching this one nor moving to the next can
+                    // possibly help — it only unpins the session and burns the fleet.
+                    // Hold the pin, wait briefly, retry the SAME account.
+                    if is_offline_error(&err) {
+                        let offline_failures = ladder.offline_failed();
+                        if let Some(offline_wait) =
+                            ladder.take_offline_wait(MAX_OFFLINE_WAITS_PER_REQUEST)
+                        {
+                            tracing::warn!(
+                                account_index = idx,
+                                account = account_name.as_deref().unwrap_or("?"),
+                                offline_wait,
+                                max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
+                                error = ?err,
+                                "name resolution failed — this machine is offline; \
+                                 holding the pinned account and waiting"
+                            );
+                            tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
+                            break 'attempt Step::RetrySame;
+                        }
+                        break 'attempt Step::Answer(offline_unavailable(
+                            provider,
+                            offline_failures,
+                        ));
+                    }
+                    // Past the connect phase: a connection existed and the request may
+                    // already be in flight on the wire, so this attempt's outcome upstream
+                    // is unknown regardless of whether it now gets retried in place or the
+                    // ladder rotates away from it. See `unknown_outcome_transport_failure`.
+                    if !err.is_connect() {
+                        ladder.unknown_outcome();
+                    }
+                    // Classified ONCE per attempt, see `TransportFailureReason`'s own
+                    // doc for why a stream reset needs different handling than a
+                    // connection-level death even though both are `!is_connect()`.
+                    let transport_reason = classify_transport_failure(&err);
+                    if transport_reason == TransportFailureReason::StreamReset
+                        && ladder.first_reset_recycle(idx)
                     {
+                        // The h2 connection survives a stream reset (unlike a
+                        // connection-level death, which reqwest's own error already
+                        // evicted from the pool), so without this the retry below
+                        // would check out the SAME broken connection. Recycle once per
+                        // account per request, a second reset here finds `idx`
+                        // already recycled and goes straight to the retry,
+                        // which by then really is on the fresh connection.
+                        manager.recycle_client_after_reset(idx);
+                    }
+                    if !err.is_connect()
+                        && ladder.transport_retries(idx) < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES
+                    {
+                        // A blip on this account this request: retry it on a fresh
+                        // connection rather than benching an account that is probably fine.
+                        // A connection-level death is already evicted from the pool by
+                        // the error itself; a stream reset was just recycled above ,
+                        // either way each retry genuinely gets a new connection, which
+                        // is why repeating is worth more than rotating (94.7% land a
+                        // 200).
+                        let transport_retry = ladder.spend_transport_retry(idx);
+                        // Message text unchanged — `scripts/` parses it. The attempt
+                        // fields are ADDED alongside, never a replacement, so an existing
+                        // grep keeps matching while a new one can see the ladder.
                         tracing::warn!(
                             account_index = idx,
                             account = account_name.as_deref().unwrap_or("?"),
-                            offline_wait,
-                            max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
+                            is_connect = err.is_connect(),
+                            is_timeout = err.is_timeout(),
+                            transport_retry,
+                            max_transport_retries = MAX_SAME_ACCOUNT_TRANSPORT_RETRIES,
                             error = ?err,
-                            "name resolution failed — this machine is offline; \
-                             holding the pinned account and waiting"
+                            "upstream transport failure — retrying the SAME account on a fresh connection"
                         );
-                        ladder.retry_same(idx);
-                        tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
-                        continue;
+                        break 'attempt Step::RetrySame;
                     }
-                    return offline_unavailable(provider, offline_failures);
-                }
-                // Past the connect phase: a connection existed and the request may
-                // already be in flight on the wire, so this attempt's outcome upstream
-                // is unknown regardless of whether it now gets retried in place or the
-                // ladder rotates away from it. See `unknown_outcome_transport_failure`.
-                if !err.is_connect() {
-                    ladder.unknown_outcome();
-                }
-                // Classified ONCE per attempt, see `TransportFailureReason`'s own
-                // doc for why a stream reset needs different handling than a
-                // connection-level death even though both are `!is_connect()`.
-                let transport_reason = classify_transport_failure(&err);
-                if transport_reason == TransportFailureReason::StreamReset
-                    && ladder.first_reset_recycle(idx)
-                {
-                    // The h2 connection survives a stream reset (unlike a
-                    // connection-level death, which reqwest's own error already
-                    // evicted from the pool), so without this the retry below
-                    // would check out the SAME broken connection. Recycle once per
-                    // account per request, a second reset here finds `idx`
-                    // already recycled and goes straight to the retry,
-                    // which by then really is on the fresh connection.
-                    manager.recycle_client_after_reset(idx);
-                }
-                if !err.is_connect()
-                    && ladder.transport_retries(idx) < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES
-                {
-                    // A blip on this account this request: retry it on a fresh
-                    // connection rather than benching an account that is probably fine.
-                    // A connection-level death is already evicted from the pool by
-                    // the error itself; a stream reset was just recycled above ,
-                    // either way each retry genuinely gets a new connection, which
-                    // is why repeating is worth more than rotating (94.7% land a
-                    // 200).
-                    let transport_retry = ladder.spend_transport_retry(idx);
-                    // Message text unchanged — `scripts/` parses it. The attempt
-                    // fields are ADDED alongside, never a replacement, so an existing
-                    // grep keeps matching while a new one can see the ladder.
                     tracing::warn!(
                         account_index = idx,
                         account = account_name.as_deref().unwrap_or("?"),
                         is_connect = err.is_connect(),
                         is_timeout = err.is_timeout(),
-                        transport_retry,
-                        max_transport_retries = MAX_SAME_ACCOUNT_TRANSPORT_RETRIES,
                         error = ?err,
-                        "upstream transport failure — retrying the SAME account on a fresh connection"
+                        "upstream transport failure — rotating to another account"
                     );
-                    ladder.retry_same(idx);
-                    continue;
+                    break 'attempt Step::Rotate;
                 }
-                tracing::warn!(
-                    account_index = idx,
-                    account = account_name.as_deref().unwrap_or("?"),
-                    is_connect = err.is_connect(),
-                    is_timeout = err.is_timeout(),
-                    error = ?err,
-                    "upstream transport failure — rotating to another account"
-                );
-                ladder.bench(idx);
-                continue;
-            }
-        };
-        // This attempt reached an upstream and got an HTTP status back, whatever it
-        // was. That fact alone disproves "every account transport-failed".
-        ladder.upstream_answered();
-
-        let status = resp.status();
-        // One greppable line per upstream response, tagged with the true serving
-        // account, the PATH and the outcome status. "serving request" logs BEFORE the
-        // outcome, so without this the logs are status-blind — the gap that hid the
-        // 401 storm. The path is here because without it a status is undiagnosable:
-        // the only other record of which path produced a 404 is the in-memory TUI
-        // ring (`push_log` below), which is lost on every restart.
-        //
-        // INFO only when the answer was not a success. A 2xx is the common case, and
-        // a served one is already on its `request usage` line with the same account,
-        // path and status; an INFO line for it too would be a second line per request
-        // in a log that runs to tens of megabytes a day. The statuses that diagnose
-        // something (a 401 storm, a 429, a 404 on an unknown path) stay at INFO.
-        if status.is_success() {
-            tracing::debug!(
-                account_index = idx,
-                account = account_name.as_deref().unwrap_or("?"),
-                path = %path_and_query,
-                status = status.as_u16(),
-                "upstream response"
-            );
-        } else {
-            tracing::info!(
-                account_index = idx,
-                account = account_name.as_deref().unwrap_or("?"),
-                path = %path_and_query,
-                status = status.as_u16(),
-                "upstream response"
-            );
-        }
-        let up_headers = resp.headers().clone();
-        let rejections = quota_rejections(&up_headers);
-        match provider {
-            Provider::Codex if status == StatusCode::TOO_MANY_REQUESTS => {}
-            Provider::Codex | Provider::Anthropic => {
-                manager.update_quota(idx, &up_headers, status.as_u16());
-            }
-        }
-        // Any non-429 is live proof a rate-limit hold no longer binds.
-        if status.as_u16() != 429 {
-            manager.clear_rate_limited(idx);
-        }
-
-        // 401 → force-refresh once, then retry the SAME account with the fresh
-        // token. Neither arm may set the terminal `Error` status — see below.
-        if status == StatusCode::UNAUTHORIZED {
-            // A 401 on an account with NO refresh token is not churn — there is no
-            // refresh that could have rotated the token out from under this
-            // request, and none that could ever revive it. The credential is dead
-            // and only a re-login cures it, so `Error` (terminal, skipped by
-            // selection) is the truthful state. Without this arm a `tcr login
-            // --token` account whose token was rejected sat Active forever: never
-            // probed (`probeable_indices` wants a refresh token), never refreshed
-            // (`refresh_plan` has nothing to send), and rotated away from on every
-            // request while `tcr status` reported it healthy.
-            if !manager.has_refresh_token(idx) {
-                tracing::error!(
-                    account = account_name.as_deref().unwrap_or("?"),
-                    account_index = idx,
-                    "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
-                );
-                manager.mark_error(idx);
-                ladder.bench(idx);
-                continue;
-            }
-            if ladder.first_forced_refresh(idx) {
-                if manager.ensure_fresh_force(idx).await {
-                    ladder.retry_same(idx);
-                    continue; // retry the same account with the fresh token
-                }
-                // The forced refresh produced no new token — it was coalesced /
-                // cooldown-suppressed by the refresh-storm throttle, or the upstream
-                // refresh failed. Retrying would just 401 again on the same dead
-                // token. Rotate away; the account stays Active and the cooldown
-                // self-clears for the next request.
-                ladder.bench(idx);
-                continue;
-            }
-            // A SECOND 401: the retry with a freshly-minted token ALSO 401'd. That is
-            // almost always ROTATION CHURN — a concurrent request's force-refresh
-            // superseded the very token we retried with — and is NOT evidence the
-            // credential is dead. So it must never set `Error`.
-            //
-            // `Error` means "refresh token rejected, re-login needed" and is
-            // deliberately TERMINAL: the prober (`probeable_indices`), selection
-            // (`Manager::select`) and warming all skip errored rows by design, and the
-            // only thing that clears it is a successful refresh — which can never run
-            // on a row nobody probes or selects. So condemning a HEALTHY account here
-            // is permanent: left unchecked it walks every account to `error` one
-            // transient 401 at a time until the proxy goes dark holding a full set of
-            // perfectly good tokens (observed live 2026-07-17: 7/7 `error` while every
-            // token still probed 200).
-            //
-            // A genuinely dead credential is still caught at the source: its refresh
-            // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
-            // this request fails over and the account stays eligible for the next one.
-            ladder.bench(idx);
-            continue;
-        }
-
-        // A JSON auth 403 → upstream refuses the credential WE injected. The client never saw
-        // it and can do nothing about it, so this must never reach them as-is:
-        // Claude Code reads a 403 as "your own session is dead" and drops the
-        // user's login over an account problem that is not theirs. Rotate away, as
-        // the 401 branch above does — this account may simply be disabled while its
-        // siblings are fine. Codex account access failures rotate without asking for a
-        // re-login. Challenges, region blocks and unknown errors pass through without
-        // holding healthy accounts: another credential cannot fix a shared IP block.
-        //
-        // Deliberately does NOT set the terminal `Error` account status, for the
-        // same reason the 401 branch above does not: `Error` is permanent, skipped
-        // by the prober and by selection, and the only thing that clears it is a
-        // successful refresh, which can never run on a row nobody selects again.
-        // A 403 here is evidence about THIS request's account access, not proof the
-        // refresh token itself is dead — that is still caught at the source, where
-        // a rejected refresh sets `Error` directly.
-        //
-        // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
-        // keeps the status `Active`. Without one, rotation brought the account
-        // straight back and the next request paid the same refused round trip,
-        // while `tcr status` read the row as `gate: ok`; the hold's gate reads
-        // `refused` instead.
-        // Refusal diagnostics use response-header allowlists only, never a whole map or
-        // request credentials, cookies or body content.
-        let header_str = |name: &str| {
-            up_headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("<absent>")
-        };
-        if status == StatusCode::FORBIDDEN {
-            tracing::info!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                provider = provider.as_str(),
-                content_type = header_str("content-type"),
-                cf_mitigated = header_str("cf-mitigated"),
-                cf_ray = header_str("cf-ray"),
-                server = header_str("server"),
-                request_id = header_str("request-id"),
-                x_request_id = header_str("x-request-id"),
-                retry_after_raw = header_str("retry-after"),
-                "403 diagnostic"
-            );
-            // Upstream's own words for the refusal, read capped in size and time
-            // exactly as the 429 arm reads its body, so a body that never
-            // completes cannot become a hang. A Codex body can also be forwarded, so it gets
-            // the ordinary response cap rather than the smaller diagnostic-only cap.
-            let body_cap = match provider {
-                Provider::Anthropic => RATE_LIMIT_BODY_CAP,
-                Provider::Codex => MAX_BODY_BYTES,
             };
-            let body = match tokio::time::timeout(
-                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
-                read_capped_body(resp.bytes_stream(), body_cap),
-            )
-            .await
-            {
-                Ok(Ok(body)) => {
-                    log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                    Some(body)
+            // This attempt reached an upstream and got an HTTP status back, whatever it
+            // was. That fact alone disproves "every account transport-failed".
+            ladder.upstream_answered();
+
+            let status = resp.status();
+            // One greppable line per upstream response, tagged with the true serving
+            // account, the PATH and the outcome status. "serving request" logs BEFORE the
+            // outcome, so without this the logs are status-blind — the gap that hid the
+            // 401 storm. The path is here because without it a status is undiagnosable:
+            // the only other record of which path produced a 404 is the in-memory TUI
+            // ring (`push_log` below), which is lost on every restart.
+            //
+            // INFO only when the answer was not a success. A 2xx is the common case, and
+            // a served one is already on its `request usage` line with the same account,
+            // path and status; an INFO line for it too would be a second line per request
+            // in a log that runs to tens of megabytes a day. The statuses that diagnose
+            // something (a 401 storm, a 429, a 404 on an unknown path) stay at INFO.
+            if status.is_success() {
+                tracing::debug!(
+                    account_index = idx,
+                    account = account_name.as_deref().unwrap_or("?"),
+                    path = %path_and_query,
+                    status = status.as_u16(),
+                    "upstream response"
+                );
+            } else {
+                tracing::info!(
+                    account_index = idx,
+                    account = account_name.as_deref().unwrap_or("?"),
+                    path = %path_and_query,
+                    status = status.as_u16(),
+                    "upstream response"
+                );
+            }
+            let up_headers = resp.headers().clone();
+            let rejections = quota_rejections(&up_headers);
+            match provider {
+                Provider::Codex if status == StatusCode::TOO_MANY_REQUESTS => {}
+                Provider::Codex | Provider::Anthropic => {
+                    manager.update_quota(idx, &up_headers, status.as_u16());
                 }
-                Ok(Err(_)) | Err(_) => {
-                    tracing::warn!(
+            }
+            // Any non-429 is live proof a rate-limit hold no longer binds.
+            if status.as_u16() != 429 {
+                manager.clear_rate_limited(idx);
+            }
+
+            // 401 → force-refresh once, then retry the SAME account with the fresh
+            // token. Neither arm may set the terminal `Error` status — see below.
+            if status == StatusCode::UNAUTHORIZED {
+                // A 401 on an account with NO refresh token is not churn — there is no
+                // refresh that could have rotated the token out from under this
+                // request, and none that could ever revive it. The credential is dead
+                // and only a re-login cures it, so `Error` (terminal, skipped by
+                // selection) is the truthful state. Without this arm a `tcr login
+                // --token` account whose token was rejected sat Active forever: never
+                // probed (`probeable_indices` wants a refresh token), never refreshed
+                // (`refresh_plan` has nothing to send), and rotated away from on every
+                // request while `tcr status` reported it healthy.
+                if !manager.has_refresh_token(idx) {
+                    tracing::error!(
                         account = account_name.as_deref().unwrap_or("?"),
                         account_index = idx,
-                        "upstream 403 body could not be read within the cap"
+                        "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
                     );
-                    None
+                    manager.mark_error(idx);
+                    break 'attempt Step::Rotate;
                 }
-            };
-            match provider {
-                Provider::Codex => {
-                    if body.is_none() {
-                        let hold = NO_GUIDANCE_HOLD_SECS
-                            + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                        manager.mark_rate_limited(idx, hold);
-                        ladder.codex_access_unread();
-                        ladder.bench(idx);
-                        continue;
+                if ladder.first_forced_refresh(idx) {
+                    if manager.ensure_fresh_force(idx).await {
+                        break 'attempt Step::RetrySame; // the same account, with the fresh token
                     }
-                    let auth_error = body
-                        .as_deref()
-                        .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
-                    if !auth_error {
-                        if body
-                            .as_deref()
-                            .is_some_and(|body| codex_forbidden_is_account_error(&up_headers, body))
-                        {
-                            manager.mark_refused(idx);
-                            ladder.account_access_blocked(body.map(|body| (up_headers, body)));
-                            ladder.bench(idx);
-                            continue;
-                        }
-                        tracing::warn!(
-                            account_index = idx,
-                            "upstream Codex request blocked without an account failure; forwarding unchanged"
-                        );
-                        return match body {
-                            Some(body) => build_response(
-                                status,
-                                &up_headers,
-                                Body::from(body),
-                                ServedBy::PooledAccount,
-                            ),
-                            None => ClientError::new(
-                                StatusCode::BAD_GATEWAY,
-                                ErrorKind::Proxy,
-                                "Failed to read the upstream access-denied response.",
-                            )
-                            .respond(provider),
-                        };
-                    }
+                    // The forced refresh produced no new token — it was coalesced /
+                    // cooldown-suppressed by the refresh-storm throttle, or the upstream
+                    // refresh failed. Retrying would just 401 again on the same dead
+                    // token. Rotate away; the account stays Active and the cooldown
+                    // self-clears for the next request.
+                    break 'attempt Step::Rotate;
                 }
-                Provider::Anthropic => {}
+                // A SECOND 401: the retry with a freshly-minted token ALSO 401'd. That is
+                // almost always ROTATION CHURN — a concurrent request's force-refresh
+                // superseded the very token we retried with — and is NOT evidence the
+                // credential is dead. So it must never set `Error`.
+                //
+                // `Error` means "refresh token rejected, re-login needed" and is
+                // deliberately TERMINAL: the prober (`probeable_indices`), selection
+                // (`Manager::select`) and warming all skip errored rows by design, and the
+                // only thing that clears it is a successful refresh — which can never run
+                // on a row nobody probes or selects. So condemning a HEALTHY account here
+                // is permanent: left unchecked it walks every account to `error` one
+                // transient 401 at a time until the proxy goes dark holding a full set of
+                // perfectly good tokens (observed live 2026-07-17: 7/7 `error` while every
+                // token still probed 200).
+                //
+                // A genuinely dead credential is still caught at the source: its refresh
+                // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
+                // this request fails over and the account stays eligible for the next one.
+                break 'attempt Step::Rotate;
             }
-            tracing::warn!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                "upstream 403 Forbidden — credential refused, rotating to another account"
-            );
-            manager.mark_refused(idx);
-            ladder.refused_403(idx, account_name.clone());
-            ladder.bench(idx);
-            continue;
-        }
 
-        // 429 → durable quota rejection rotates; a transient limit waits/rotates.
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            tracing::info!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                retry_after_raw = header_str("retry-after"),
-                retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
-                unified_status = header_str("anthropic-ratelimit-unified-status"),
-                // The MODEL-SCOPED twin of `unified_status`. Logged to make one
-                // specific class observable: a Fable-weekly-only rejection, which
-                // upstream also reports in the aggregate `unified_status`. Reading
-                // the aggregate alone benched the whole account and re-keyed the
-                // session (issue #178); `quota_rejections` now separates the two,
-                // and this line is how a live response is checked against it —
-                // diagnostic only, no routing reads it.
-                unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
-                unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
-                unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
-                quota_rejected = !rejections.is_empty(),
-                provider = provider.as_str(),
-                codex_primary_used_percent = header_str("x-codex-primary-used-percent"),
-                codex_primary_window_minutes = header_str("x-codex-primary-window-minutes"),
-                codex_primary_reset_at = header_str("x-codex-primary-reset-at"),
-                codex_secondary_used_percent = header_str("x-codex-secondary-used-percent"),
-                codex_secondary_window_minutes = header_str("x-codex-secondary-window-minutes"),
-                codex_secondary_reset_at = header_str("x-codex-secondary-reset-at"),
-                codex_rate_limit_reached_type = header_str("x-codex-rate-limit-reached-type"),
-                codex_credits_has_credits = header_str("x-codex-credits-has-credits"),
-                codex_credits_unlimited = header_str("x-codex-credits-unlimited"),
-                codex_credits_balance = header_str("x-codex-credits-balance"),
-                content_type = header_str("content-type"),
-                cf_mitigated = header_str("cf-mitigated"),
-                cf_ray = header_str("cf-ray"),
-                server = header_str("server"),
-                request_id = header_str("request-id"),
-                x_request_id = header_str("x-request-id"),
-                // WHO asked, so a 429 that follows one client around can be told
-                // from one that follows an account. Measured 2026-09-24: 143 of 145
-                // requests to `/v1/messages` WITHOUT `?beta=true` got a 429 with no
-                // quota headers, on accounts at 0% used, while 10,575 of 10,575 on
-                // `?beta=true` got a 200, and nothing in the log named the client.
-                user_agent = req_headers
-                    .get(USER_AGENT)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("<absent>"),
-                model = request_model.as_deref().unwrap_or("?"),
-                "429 diagnostic"
-            );
-            let retry_after_raw = parse_retry_after(&up_headers);
-            // A 429 about the REQUEST, not the account: no quota guidance at all, on
-            // a request that did not come through Claude Code's own client. Parking
-            // the account for it is wrong and rotating is wasted, so it is forwarded
-            // as-is and every account stays in rotation. See
-            // [`is_request_scoped_429`] for the measurements that draw this line.
-            // Those measurements are Anthropic's (`?beta=true`, `unified-status`), and no
-            // Codex request or 429 carries either, so a Codex 429 never takes this branch:
-            // it would forward every one with no account held. Codex's arm is below.
-            match provider {
-                crate::provider::Provider::Anthropic
-                    if is_request_scoped_429(
-                        &path_and_query,
-                        &up_headers,
-                        !rejections.is_empty(),
-                    ) =>
+            // A JSON auth 403 → upstream refuses the credential WE injected. The client never saw
+            // it and can do nothing about it, so this must never reach them as-is:
+            // Claude Code reads a 403 as "your own session is dead" and drops the
+            // user's login over an account problem that is not theirs. Rotate away, as
+            // the 401 branch above does — this account may simply be disabled while its
+            // siblings are fine. Codex account access failures rotate without asking for a
+            // re-login. Challenges, region blocks and unknown errors pass through without
+            // holding healthy accounts: another credential cannot fix a shared IP block.
+            //
+            // Deliberately does NOT set the terminal `Error` account status, for the
+            // same reason the 401 branch above does not: `Error` is permanent, skipped
+            // by the prober and by selection, and the only thing that clears it is a
+            // successful refresh, which can never run on a row nobody selects again.
+            // A 403 here is evidence about THIS request's account access, not proof the
+            // refresh token itself is dead — that is still caught at the source, where
+            // a rejected refresh sets `Error` directly.
+            //
+            // It does arm a SHORT hold (`Manager::mark_refused`), which self-frees and
+            // keeps the status `Active`. Without one, rotation brought the account
+            // straight back and the next request paid the same refused round trip,
+            // while `tcr status` read the row as `gate: ok`; the hold's gate reads
+            // `refused` instead.
+            // Refusal diagnostics use response-header allowlists only, never a whole map or
+            // request credentials, cookies or body content.
+            let header_str = |name: &str| {
+                up_headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("<absent>")
+            };
+            if status == StatusCode::FORBIDDEN {
+                tracing::info!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    provider = provider.as_str(),
+                    content_type = header_str("content-type"),
+                    cf_mitigated = header_str("cf-mitigated"),
+                    cf_ray = header_str("cf-ray"),
+                    server = header_str("server"),
+                    request_id = header_str("request-id"),
+                    x_request_id = header_str("x-request-id"),
+                    retry_after_raw = header_str("retry-after"),
+                    "403 diagnostic"
+                );
+                // Upstream's own words for the refusal, read capped in size and time
+                // exactly as the 429 arm reads its body, so a body that never
+                // completes cannot become a hang. A Codex body can also be forwarded, so it gets
+                // the ordinary response cap rather than the smaller diagnostic-only cap.
+                let body_cap = match provider {
+                    Provider::Anthropic => RATE_LIMIT_BODY_CAP,
+                    Provider::Codex => MAX_BODY_BYTES,
+                };
+                let body = match tokio::time::timeout(
+                    Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                    read_capped_body(resp.bytes_stream(), body_cap),
+                )
+                .await
                 {
-                    tracing::warn!(
-                        account = account_name.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        path = %path_and_query,
-                        "upstream 429 with no quota guidance on a request without ?beta=true: \
-                         refused for the request, not the account, so it is forwarded and no \
-                         account is parked"
-                    );
-                    // Falls through to the terminal outcome below, which counts the
-                    // request, logs the body (`log_upstream_error_body`) and forwards it
-                    // verbatim, the same path a 400 or a spent 529 takes.
-                }
-                crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => {
-                    // Read the bounded body before deciding whether Codex refused quota. Some
-                    // quota errors carry no reached-type header at all.
-                    let refusal_body = match tokio::time::timeout(
-                        Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
-                        read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
-                    )
-                    .await
-                    {
-                        Ok(Ok(body)) => {
-                            log_upstream_error_body(idx, account_name.as_deref(), status, &body);
-                            body
+                    Ok(Ok(body)) => {
+                        log_upstream_error_body(idx, account_name.as_deref(), status, &body);
+                        Some(body)
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            "upstream 403 body could not be read within the cap"
+                        );
+                        None
+                    }
+                };
+                match provider {
+                    Provider::Codex => {
+                        if body.is_none() {
+                            let hold = NO_GUIDANCE_HOLD_SECS
+                                + i64::from(now.nanosecond()) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                            manager.mark_rate_limited(idx, hold);
+                            ladder.codex_access_unread();
+                            break 'attempt Step::Rotate;
                         }
-                        Ok(Err(_)) | Err(_) => {
+                        let auth_error = body
+                            .as_deref()
+                            .is_some_and(|body| codex_forbidden_is_auth_error(&up_headers, body));
+                        if !auth_error {
+                            if body.as_deref().is_some_and(|body| {
+                                codex_forbidden_is_account_error(&up_headers, body)
+                            }) {
+                                manager.mark_refused(idx);
+                                ladder.account_access_blocked(body.map(|body| (up_headers, body)));
+                                break 'attempt Step::Rotate;
+                            }
                             tracing::warn!(
                                 account_index = idx,
-                                "upstream 429 body could not be read within the cap"
+                                "upstream Codex request blocked without an account failure; forwarding unchanged"
                             );
-                            Bytes::new()
-                        }
-                    };
-                    let retry_after = retry_after_raw.unwrap_or(60);
-                    // Codex quota bodies name the reset in Unix seconds; prefer it to header
-                    // windows, then retry-after, then the short default. Plain rate limits keep
-                    // their retry-after even when a response also carries window readings.
-                    match provider {
-                        crate::provider::Provider::Codex => {
-                            let clock = OffsetDateTime::now_utc();
-                            let refusal = crate::quota::CodexQuotaRefusal::parse(
-                                &up_headers,
-                                &refusal_body,
-                                clock,
-                            );
-                            manager.update_quota_with_codex_refusal(
-                                idx,
-                                &up_headers,
-                                429,
-                                refusal.as_ref(),
-                            );
-                            let quota_refusal = refusal.is_some();
-                            let hold = refusal.as_ref().and_then(|refusal| refusal.reset).map_or(
-                                retry_after,
-                                |reset| {
-                                    reset
-                                        .unix_timestamp()
-                                        .saturating_sub(clock.unix_timestamp())
-                                },
-                            );
-                            if quota_refusal {
-                                manager.mark_codex_quota_limited(idx, hold);
-                            } else {
-                                let count = ladder.retries_429(idx);
-                                let jitter = i64::from(clock.nanosecond())
-                                    % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                                match classify_transient_429(retry_after_raw, count, jitter) {
-                                    Transient429::InlineWait(wait) => {
-                                        ladder.spend_429_retry(idx);
-                                        tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                                        ladder.retry_same(idx);
-                                        continue;
-                                    }
-                                    Transient429::Park(wait) => {
-                                        manager.mark_rate_limited(idx, wait);
-                                        ladder.park(idx);
-                                    }
-                                }
-                            }
-                            tracing::info!(
-                                account_index = idx,
-                                quota_refusal,
-                                "Codex 429: holding the account and rotating"
-                            );
-                            ladder.bench(idx);
-                            continue;
-                        }
-                        crate::provider::Provider::Anthropic => {}
-                    }
-                    if !rejections.is_empty() {
-                        // A model-scoped rejection is recorded in the window the selector
-                        // already gates that model class on, NOT as an account-wide hold:
-                        // the account still serves every other model class, and the window
-                        // self-frees at its own reset (issue #178). A rejection any shared
-                        // scope reports is account-wide and still arms the hold — clamped
-                        // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
-                        // doc-comment explains why durable exhaustion must be carried by
-                        // the learned quota rather than by an unbounded hold.
-                        if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
-                            manager.mark_model_weekly_rejected(idx, &up_headers);
-                        }
-                        if rejections
-                            .iter()
-                            .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
-                        {
-                            manager.mark_rate_limited(
-                                idx,
-                                jittered_quota_hold(retry_after, now.nanosecond()),
-                            );
-                        }
-                        ladder.bench(idx);
-                        continue;
-                    }
-                    let count = ladder.retries_429(idx);
-                    // Desync the no-guidance un-park across accounts that tripped together;
-                    // derive the jitter from the loop clock so no `rand` dependency is needed.
-                    let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-                    match classify_transient_429(retry_after_raw, count, jitter) {
-                        Transient429::InlineWait(wait) => {
-                            ladder.spend_429_retry(idx);
-                            tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                            ladder.retry_same(idx);
-                            continue; // retry the same account after the bounded wait
-                        }
-                        Transient429::Park(wait) => {
-                            manager.mark_rate_limited(idx, wait);
-                            // Benched AND re-admittable: a timer that expires on its own, so
-                            // the soft-wait above may take it back. The Codex arm above parks
-                            // its non-quota hold the same way; every other bench in this loop
-                            // is `Ladder::bench`, which is not re-admitted.
-                            ladder.park(idx);
-                            continue;
+                            break 'attempt Step::Answer(match body {
+                                Some(body) => build_response(
+                                    status,
+                                    &up_headers,
+                                    Body::from(body),
+                                    ServedBy::PooledAccount,
+                                ),
+                                None => ClientError::new(
+                                    StatusCode::BAD_GATEWAY,
+                                    ErrorKind::Proxy,
+                                    "Failed to read the upstream access-denied response.",
+                                )
+                                .respond(provider),
+                            });
                         }
                     }
+                    Provider::Anthropic => {}
                 }
-            }
-        }
-
-        // 529 Overloaded → this SEND was refused, and the ladder below spends two
-        // budgets before the client ever sees it. Measured live 2026-07-26: 256 of
-        // the last 4,963 upstream responses were 529 (5.2%), every one of them
-        // surfaced in Claude Code as a failed request the user re-sent by hand.
-        //
-        // FIRST the SAME account, after a short escalating backoff: its prompt cache
-        // is warm and a brief overload usually clears within a second or two.
-        //
-        // THEN — and this is what the arm originally refused to do — a bounded
-        // FAILOVER to a different account. The original premise was that a 529 means
-        // the SERVER is saturated, so a sibling would be equally overloaded and the
-        // rotation would buy a cold prompt cache for nothing. The live log falsifies
-        // it: the overload is ACCOUNT-scoped and time-varying (one account answered
-        // 136 529s over 8 minutes while its siblings served 200s; a session diverted
-        // off it got a 200 from a sibling 2s later). See
-        // [`MAX_529_FAILOVERS_PER_REQUEST`].
-        //
-        // The failover mechanism is benching `idx` in `tried` (`Ladder::fail_over_529`), because
-        // `select` already has the branch for it: a PINNED session whose pin is in
-        // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
-        // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
-        // its warm account on its next request; nothing re-keys, and `tried` is
-        // per-request so the 529'd account is fully eligible again immediately.
-        // `mark_rate_limited` is still NEVER called here — an overloaded account is
-        // not over quota, and arming a hold would bench it for OTHER requests.
-        //
-        // The failover is gated on `select` actually offering another account, and
-        // that gate is load-bearing rather than defensive: benching the account
-        // FIRST and discovering the fleet is empty AFTERWARDS would drop this
-        // request into the exhausted path and answer a synthesized 429 — replacing
-        // the upstream's own 529 with a status that means something else entirely.
-        // With no account to move to, the arm degrades exactly into its pre-failover
-        // self. (Under a hard account lock `select` returns `None` for a tried
-        // account by construction, so the lock's "no failover to the pool" contract
-        // holds here for free.)
-        //
-        // Latency: the in-flight guard taken at the top of this iteration is HELD
-        // across every backoff, so a retrying request keeps its per-account
-        // concurrency slot. Per account that is MAX_SAME_ACCOUNT_529_RETRIES waits
-        // each clamped to RETRY_529_MAX_BACKOFF_SECS (3s on the no-`retry-after`
-        // ladder the live captures actually carry, 8s if the upstream asks for
-        // more); per REQUEST it is that times `1 + MAX_529_FAILOVERS_PER_REQUEST`,
-        // i.e. 9s and 24s. Both are asserted, not assumed —
-        // `overloaded_529_failover_worst_case_latency_is_bounded`.
-        //
-        // On BOTH budgets being spent this does NOT return. Control falls through to
-        // the terminal-outcome arm below, so the client sees the 529 forwarded
-        // verbatim — byte-identical to the behaviour before this arm existed.
-        if status.as_u16() == STATUS_OVERLOADED {
-            let retried = ladder.retries_529(idx);
-            if retried < MAX_SAME_ACCOUNT_529_RETRIES {
-                let backoff = backoff_529_secs(retried, parse_retry_after(&up_headers));
-                let retry = ladder.spend_529_retry(idx);
                 tracing::warn!(
                     account = account_name.as_deref().unwrap_or("?"),
                     account_index = idx,
-                    retry,
-                    max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
-                    backoff_secs = backoff,
-                    "upstream 529 Overloaded — backing off and retrying the SAME account"
+                    "upstream 403 Forbidden — credential refused, rotating to another account"
                 );
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                ladder.retry_same(idx);
-                continue; // retry the same account after the bounded backoff
+                manager.mark_refused(idx);
+                ladder.refused_403(idx, account_name.clone());
+                break 'attempt Step::Rotate;
             }
-            // This account's in-place budget is spent. Fail the request over while
-            // the per-request failover budget lasts AND another account is free.
-            let attempts = retried + 1;
-            if ladder.failovers_529() < MAX_529_FAILOVERS_PER_REQUEST {
-                // Ask for the replacement BEFORE benching this account, and pass the
-                // `tried` set the next iteration WOULD have passed. A fresh clock,
-                // not the loop's `now`: the backoffs above have made that value up to
-                // several seconds stale, and an account whose hold expired during
-                // them is a legitimate target.
-                let mut with_this_one = ladder.tried().clone();
-                with_this_one.insert(idx);
-                let failover_now = OffsetDateTime::now_utc();
-                if let Some(other) = manager.select_with_group(
-                    &with_this_one,
-                    failover_now,
-                    request_model.as_deref(),
-                    session_key,
-                    &path,
-                    conn_key,
-                    request_group.as_deref(),
-                ) {
-                    debug_assert_ne!(
-                        other, idx,
-                        "select must honour `tried`, or the failover re-sends to the overloaded account"
-                    );
-                    // The probe above IS this failover's selection; consume it rather
-                    // than re-selecting (see `Ladder`'s `next_idx`).
-                    ladder.fail_over_529(idx, other);
+
+            // 429 → durable quota rejection rotates; a transient limit waits/rotates.
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                tracing::info!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    retry_after_raw = header_str("retry-after"),
+                    retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
+                    unified_status = header_str("anthropic-ratelimit-unified-status"),
+                    // The MODEL-SCOPED twin of `unified_status`. Logged to make one
+                    // specific class observable: a Fable-weekly-only rejection, which
+                    // upstream also reports in the aggregate `unified_status`. Reading
+                    // the aggregate alone benched the whole account and re-keyed the
+                    // session (issue #178); `quota_rejections` now separates the two,
+                    // and this line is how a live response is checked against it —
+                    // diagnostic only, no routing reads it.
+                    unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
+                    unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
+                    unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
+                    quota_rejected = !rejections.is_empty(),
+                    provider = provider.as_str(),
+                    codex_primary_used_percent = header_str("x-codex-primary-used-percent"),
+                    codex_primary_window_minutes = header_str("x-codex-primary-window-minutes"),
+                    codex_primary_reset_at = header_str("x-codex-primary-reset-at"),
+                    codex_secondary_used_percent = header_str("x-codex-secondary-used-percent"),
+                    codex_secondary_window_minutes = header_str("x-codex-secondary-window-minutes"),
+                    codex_secondary_reset_at = header_str("x-codex-secondary-reset-at"),
+                    codex_rate_limit_reached_type = header_str("x-codex-rate-limit-reached-type"),
+                    codex_credits_has_credits = header_str("x-codex-credits-has-credits"),
+                    codex_credits_unlimited = header_str("x-codex-credits-unlimited"),
+                    codex_credits_balance = header_str("x-codex-credits-balance"),
+                    content_type = header_str("content-type"),
+                    cf_mitigated = header_str("cf-mitigated"),
+                    cf_ray = header_str("cf-ray"),
+                    server = header_str("server"),
+                    request_id = header_str("request-id"),
+                    x_request_id = header_str("x-request-id"),
+                    // WHO asked, so a 429 that follows one client around can be told
+                    // from one that follows an account. Measured 2026-09-24: 143 of 145
+                    // requests to `/v1/messages` WITHOUT `?beta=true` got a 429 with no
+                    // quota headers, on accounts at 0% used, while 10,575 of 10,575 on
+                    // `?beta=true` got a 200, and nothing in the log named the client.
+                    user_agent = req_headers
+                        .get(USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<absent>"),
+                    model = request_model.as_deref().unwrap_or("?"),
+                    "429 diagnostic"
+                );
+                let retry_after_raw = parse_retry_after(&up_headers);
+                // A 429 about the REQUEST, not the account: no quota guidance at all, on
+                // a request that did not come through Claude Code's own client. Parking
+                // the account for it is wrong and rotating is wasted, so it is forwarded
+                // as-is and every account stays in rotation. See
+                // [`is_request_scoped_429`] for the measurements that draw this line.
+                // Those measurements are Anthropic's (`?beta=true`, `unified-status`), and no
+                // Codex request or 429 carries either, so a Codex 429 never takes this branch:
+                // it would forward every one with no account held. Codex's arm is below.
+                match provider {
+                    crate::provider::Provider::Anthropic
+                        if is_request_scoped_429(
+                            &path_and_query,
+                            &up_headers,
+                            !rejections.is_empty(),
+                        ) =>
+                    {
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            path = %path_and_query,
+                            "upstream 429 with no quota guidance on a request without ?beta=true: \
+                             refused for the request, not the account, so it is forwarded and no \
+                             account is parked"
+                        );
+                        // Falls through to the terminal outcome below, which counts the
+                        // request, logs the body (`log_upstream_error_body`) and forwards it
+                        // verbatim, the same path a 400 or a spent 529 takes.
+                    }
+                    crate::provider::Provider::Anthropic | crate::provider::Provider::Codex => {
+                        // Read the bounded body before deciding whether Codex refused quota. Some
+                        // quota errors carry no reached-type header at all.
+                        let refusal_body = match tokio::time::timeout(
+                            Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                            read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+                        )
+                        .await
+                        {
+                            Ok(Ok(body)) => {
+                                log_upstream_error_body(
+                                    idx,
+                                    account_name.as_deref(),
+                                    status,
+                                    &body,
+                                );
+                                body
+                            }
+                            Ok(Err(_)) | Err(_) => {
+                                tracing::warn!(
+                                    account_index = idx,
+                                    "upstream 429 body could not be read within the cap"
+                                );
+                                Bytes::new()
+                            }
+                        };
+                        let retry_after = retry_after_raw.unwrap_or(60);
+                        // Codex quota bodies name the reset in Unix seconds; prefer it to header
+                        // windows, then retry-after, then the short default. Plain rate limits keep
+                        // their retry-after even when a response also carries window readings.
+                        match provider {
+                            crate::provider::Provider::Codex => {
+                                let clock = OffsetDateTime::now_utc();
+                                let refusal = crate::quota::CodexQuotaRefusal::parse(
+                                    &up_headers,
+                                    &refusal_body,
+                                    clock,
+                                );
+                                manager.update_quota_with_codex_refusal(
+                                    idx,
+                                    &up_headers,
+                                    429,
+                                    refusal.as_ref(),
+                                );
+                                let quota_refusal = refusal.is_some();
+                                let hold = refusal
+                                    .as_ref()
+                                    .and_then(|refusal| refusal.reset)
+                                    .map_or(retry_after, |reset| {
+                                        reset
+                                            .unix_timestamp()
+                                            .saturating_sub(clock.unix_timestamp())
+                                    });
+                                // A quota refusal is held and benched; a plain rate limit parks
+                                // on its timer, exactly as the Anthropic arm below parks one.
+                                let step = if quota_refusal {
+                                    manager.mark_codex_quota_limited(idx, hold);
+                                    Step::Rotate
+                                } else {
+                                    let count = ladder.retries_429(idx);
+                                    let jitter = i64::from(clock.nanosecond())
+                                        % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                                    match classify_transient_429(retry_after_raw, count, jitter) {
+                                        Transient429::InlineWait(wait) => {
+                                            ladder.spend_429_retry(idx);
+                                            tokio::time::sleep(Duration::from_secs(wait as u64))
+                                                .await;
+                                            break 'attempt Step::RetrySame;
+                                        }
+                                        Transient429::Park(wait) => {
+                                            manager.mark_rate_limited(idx, wait);
+                                            Step::Park
+                                        }
+                                    }
+                                };
+                                tracing::info!(
+                                    account_index = idx,
+                                    quota_refusal,
+                                    "Codex 429: holding the account and rotating"
+                                );
+                                break 'attempt step;
+                            }
+                            crate::provider::Provider::Anthropic => {}
+                        }
+                        if !rejections.is_empty() {
+                            // A model-scoped rejection is recorded in the window the selector
+                            // already gates that model class on, NOT as an account-wide hold:
+                            // the account still serves every other model class, and the window
+                            // self-frees at its own reset (issue #178). A rejection any shared
+                            // scope reports is account-wide and still arms the hold — clamped
+                            // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
+                            // doc-comment explains why durable exhaustion must be carried by
+                            // the learned quota rather than by an unbounded hold.
+                            if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
+                                manager.mark_model_weekly_rejected(idx, &up_headers);
+                            }
+                            if rejections
+                                .iter()
+                                .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
+                            {
+                                manager.mark_rate_limited(
+                                    idx,
+                                    jittered_quota_hold(retry_after, now.nanosecond()),
+                                );
+                            }
+                            break 'attempt Step::Rotate;
+                        }
+                        let count = ladder.retries_429(idx);
+                        // Desync the no-guidance un-park across accounts that tripped together;
+                        // derive the jitter from the loop clock so no `rand` dependency is needed.
+                        let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                        match classify_transient_429(retry_after_raw, count, jitter) {
+                            Transient429::InlineWait(wait) => {
+                                ladder.spend_429_retry(idx);
+                                tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+                                break 'attempt Step::RetrySame; // after the bounded wait
+                            }
+                            Transient429::Park(wait) => {
+                                manager.mark_rate_limited(idx, wait);
+                                // Benched AND re-admittable: a timer that expires on its own, so
+                                // the soft-wait above may take it back. The Codex arm above parks
+                                // its non-quota hold the same way; every other bench in this loop
+                                // is `Step::Rotate`, which is not re-admitted.
+                                break 'attempt Step::Park;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 529 Overloaded → this SEND was refused, and the ladder below spends two
+            // budgets before the client ever sees it. Measured live 2026-07-26: 256 of
+            // the last 4,963 upstream responses were 529 (5.2%), every one of them
+            // surfaced in Claude Code as a failed request the user re-sent by hand.
+            //
+            // FIRST the SAME account, after a short escalating backoff: its prompt cache
+            // is warm and a brief overload usually clears within a second or two.
+            //
+            // THEN — and this is what the arm originally refused to do — a bounded
+            // FAILOVER to a different account. The original premise was that a 529 means
+            // the SERVER is saturated, so a sibling would be equally overloaded and the
+            // rotation would buy a cold prompt cache for nothing. The live log falsifies
+            // it: the overload is ACCOUNT-scoped and time-varying (one account answered
+            // 136 529s over 8 minutes while its siblings served 200s; a session diverted
+            // off it got a 200 from a sibling 2s later). See
+            // [`MAX_529_FAILOVERS_PER_REQUEST`].
+            //
+            // The failover mechanism is benching `idx` in `tried` (`Ladder::fail_over_529`), because
+            // `select` already has the branch for it: a PINNED session whose pin is in
+            // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
+            // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
+            // its warm account on its next request; nothing re-keys, and `tried` is
+            // per-request so the 529'd account is fully eligible again immediately.
+            // `mark_rate_limited` is still NEVER called here — an overloaded account is
+            // not over quota, and arming a hold would bench it for OTHER requests.
+            //
+            // The failover is gated on `select` actually offering another account, and
+            // that gate is load-bearing rather than defensive: benching the account
+            // FIRST and discovering the fleet is empty AFTERWARDS would drop this
+            // request into the exhausted path and answer a synthesized 429 — replacing
+            // the upstream's own 529 with a status that means something else entirely.
+            // With no account to move to, the arm degrades exactly into its pre-failover
+            // self. (Under a hard account lock `select` returns `None` for a tried
+            // account by construction, so the lock's "no failover to the pool" contract
+            // holds here for free.)
+            //
+            // Latency: the in-flight guard taken at the top of this iteration is HELD
+            // across every backoff, so a retrying request keeps its per-account
+            // concurrency slot. Per account that is MAX_SAME_ACCOUNT_529_RETRIES waits
+            // each clamped to RETRY_529_MAX_BACKOFF_SECS (3s on the no-`retry-after`
+            // ladder the live captures actually carry, 8s if the upstream asks for
+            // more); per REQUEST it is that times `1 + MAX_529_FAILOVERS_PER_REQUEST`,
+            // i.e. 9s and 24s. Both are asserted, not assumed —
+            // `overloaded_529_failover_worst_case_latency_is_bounded`.
+            //
+            // On BOTH budgets being spent this does NOT return. Control falls through to
+            // the terminal-outcome arm below, so the client sees the 529 forwarded
+            // verbatim — byte-identical to the behaviour before this arm existed.
+            if status.as_u16() == STATUS_OVERLOADED {
+                let retried = ladder.retries_529(idx);
+                if retried < MAX_SAME_ACCOUNT_529_RETRIES {
+                    let backoff = backoff_529_secs(retried, parse_retry_after(&up_headers));
+                    let retry = ladder.spend_529_retry(idx);
                     tracing::warn!(
                         account = account_name.as_deref().unwrap_or("?"),
                         account_index = idx,
-                        attempts,
-                        failover = ladder.failovers_529(),
-                        max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
-                        next_account = manager.account_name(other).as_deref().unwrap_or("?"),
-                        next_account_index = other,
-                        "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
+                        retry,
+                        max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
+                        backoff_secs = backoff,
+                        "upstream 529 Overloaded — backing off and retrying the SAME account"
                     );
-                    continue;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    break 'attempt Step::RetrySame; // after the bounded backoff
                 }
+                // This account's in-place budget is spent. Fail the request over while
+                // the per-request failover budget lasts AND another account is free.
+                let attempts = retried + 1;
+                if ladder.failovers_529() < MAX_529_FAILOVERS_PER_REQUEST {
+                    // Ask for the replacement BEFORE benching this account, and pass the
+                    // `tried` set the next iteration WOULD have passed. A fresh clock,
+                    // not the loop's `now`: the backoffs above have made that value up to
+                    // several seconds stale, and an account whose hold expired during
+                    // them is a legitimate target.
+                    let mut with_this_one = ladder.tried().clone();
+                    with_this_one.insert(idx);
+                    let failover_now = OffsetDateTime::now_utc();
+                    if let Some(other) = manager.select_with_group(
+                        &with_this_one,
+                        failover_now,
+                        request_model.as_deref(),
+                        session_key,
+                        &path,
+                        conn_key,
+                        request_group.as_deref(),
+                    ) {
+                        debug_assert_ne!(
+                            other, idx,
+                            "select must honour `tried`, or the failover re-sends to the overloaded account"
+                        );
+                        // The probe above IS this failover's selection; `Step::FailOver`
+                        // consumes it rather than re-selecting (see `Ladder`'s `next_idx`).
+                        tracing::warn!(
+                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = idx,
+                            attempts,
+                            // The failover this step spends, counted before
+                            // `Ladder::fail_over_529` applies it.
+                            failover = ladder.failovers_529() + 1,
+                            max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
+                            next_account = manager.account_name(other).as_deref().unwrap_or("?"),
+                            next_account_index = other,
+                            "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
+                        );
+                        break 'attempt Step::FailOver(other);
+                    }
+                }
+                tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    attempts,
+                    // Distinguishes the two give-up shapes in the log: 0 means nothing
+                    // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
+                    // means the fleet was walked and every account was overloaded too.
+                    failovers = ladder.failovers_529(),
+                    "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
+                );
             }
-            tracing::warn!(
-                account = account_name.as_deref().unwrap_or("?"),
-                account_index = idx,
-                attempts,
-                // Distinguishes the two give-up shapes in the log: 0 means nothing
-                // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
-                // means the fleet was walked and every account was overloaded too.
-                failovers = ladder.failovers_529(),
-                "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
-            );
-        }
+
+            Step::Forward {
+                resp,
+                status,
+                up_headers,
+            }
+        };
+        // The one place the ladder moves for an attempt.
+        let (resp, status, up_headers) = match step {
+            Step::RetrySame => {
+                ladder.retry_same(idx);
+                continue;
+            }
+            Step::Rotate => {
+                ladder.bench(idx);
+                continue;
+            }
+            Step::Park => {
+                ladder.park(idx);
+                continue;
+            }
+            Step::FailOver(other) => {
+                ladder.fail_over_529(idx, other);
+                continue;
+            }
+            Step::Answer(response) => return response,
+            Step::Forward {
+                resp,
+                status,
+                up_headers,
+            } => (resp, status, up_headers),
+        };
 
         // Terminal outcome (2xx, or a 3xx/4xx/5xx forwarded verbatim). Count the
         // request once against the true serving account and log it.
