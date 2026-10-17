@@ -22,6 +22,7 @@ use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::codex_login::CodexLogin;
+use crate::log_err::LogErr as _;
 use crate::oauth::Tokens;
 
 pub(crate) struct ImportedAuth {
@@ -169,14 +170,16 @@ struct PrivateTokenFile {
 }
 
 impl PrivateTokenFile {
-    fn file_mut(&mut self) -> &mut tempfile::NamedTempFile {
-        self.temporary
-            .as_mut()
-            .expect("unpublished token temporary")
+    fn file_mut(&mut self) -> io::Result<&mut tempfile::NamedTempFile> {
+        self.temporary.as_mut().ok_or_else(Self::already_published)
+    }
+
+    fn already_published() -> io::Error {
+        io::Error::other("the Codex token temporary was already published")
     }
 
     fn publish(mut self, destination: &Path) -> io::Result<()> {
-        let temporary = self.temporary.take().expect("unpublished token temporary");
+        let temporary = self.temporary.take().ok_or_else(Self::already_published)?;
         match temporary.persist(destination) {
             Ok(_) => Ok(()),
             Err(failure) => {
@@ -301,8 +304,8 @@ fn write_back_with_digest(
                 .tempfile_in(home)?,
         ),
     };
-    temporary.file_mut().write_all(&bytes)?;
-    temporary.file_mut().as_file().sync_all()?;
+    temporary.file_mut()?.write_all(&bytes)?;
+    temporary.file_mut()?.as_file().sync_all()?;
     // Compare all bytes so an unrelated field edited while the temp was prepared is preserved
     // too. A Codex write completed before this read is preserved. Codex ignores our lock,
     // so a later external write can still race the rename; this is not an atomic CAS.
@@ -333,7 +336,9 @@ fn write_back_with_digest(
         ));
     }
     temporary.publish(&auth.path)?;
-    let _ = fs::File::open(home).and_then(|directory| directory.sync_all());
+    fs::File::open(home)
+        .and_then(|directory| directory.sync_all())
+        .log_warn("syncing the Codex home directory");
     Ok(true)
 }
 

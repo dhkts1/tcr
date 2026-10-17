@@ -112,20 +112,16 @@ pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<SocketAddr>, &[u8]), DecodeRef
         let (&family, after_family) = rest.split_first().ok_or(DecodeRefusal::CutShort)?;
         let (ip, after_ip): (IpAddr, &[u8]) = match family {
             FAMILY_V4 => {
-                if after_family.len() < 4 {
-                    return Err(DecodeRefusal::CutShort);
-                }
-                let (octets, tail) = after_family.split_at(4);
-                let octets: [u8; 4] = octets.try_into().expect("checked length");
-                (IpAddr::V4(Ipv4Addr::from(octets)), tail)
+                let (octets, tail) = after_family
+                    .split_first_chunk::<4>()
+                    .ok_or(DecodeRefusal::CutShort)?;
+                (IpAddr::V4(Ipv4Addr::from(*octets)), tail)
             }
             FAMILY_V6 => {
-                if after_family.len() < 16 {
-                    return Err(DecodeRefusal::CutShort);
-                }
-                let (octets, tail) = after_family.split_at(16);
-                let octets: [u8; 16] = octets.try_into().expect("checked length");
-                (IpAddr::V6(Ipv6Addr::from(octets)), tail)
+                let (octets, tail) = after_family
+                    .split_first_chunk::<16>()
+                    .ok_or(DecodeRefusal::CutShort)?;
+                (IpAddr::V6(Ipv6Addr::from(*octets)), tail)
             }
             byte => return Err(DecodeRefusal::UnknownFamily { byte }),
         };

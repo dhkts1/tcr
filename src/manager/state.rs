@@ -9,7 +9,7 @@ impl Manager {
     pub fn probe_interval_seconds(&self) -> u64 {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extra
             .get("quotaProbeSeconds")
             .and_then(|v| v.as_i64())
@@ -23,7 +23,7 @@ impl Manager {
     pub fn warmup_interval_seconds(&self) -> u64 {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extra
             .get("warmupSeconds")
             .and_then(|v| v.as_i64())
@@ -46,7 +46,7 @@ impl Manager {
     pub fn session_affinity_enabled(&self) -> bool {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .session_affinity_enabled()
     }
 
@@ -58,7 +58,7 @@ impl Manager {
     pub fn revalidation_serve_enabled(&self) -> bool {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extra
             .get("revalidationServe")
             .and_then(|v| v.as_bool())
@@ -79,7 +79,7 @@ impl Manager {
     pub fn load_balance_migration_enabled(&self) -> bool {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extra
             .get("loadBalanceMigration")
             .and_then(|v| v.as_bool())
@@ -107,7 +107,10 @@ impl Manager {
     /// account; the fleet's composition is the finest grain it has. An explicit
     /// `"cacheTtlRewrite": true` or `false` overrides the default either way.
     pub fn cache_ttl_rewrite_enabled(&self) -> bool {
-        let config = self.config.lock().expect("config lock poisoned");
+        let config = self
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match config
             .extra
             .get("cacheTtlRewrite")
@@ -133,7 +136,7 @@ impl Manager {
     pub fn divert_budget(&self) -> u32 {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extra
             .get("divertBudget")
             .and_then(|v| v.as_u64())
@@ -155,7 +158,10 @@ impl Manager {
     }
 
     pub fn account_count(&self) -> usize {
-        self.accounts.read().expect("accounts lock poisoned").len()
+        self.accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// How many accounts belong to `provider`, in any state (disabled, held, rejected): every
@@ -171,7 +177,7 @@ impl Manager {
         self.reload_groups_if_changed();
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|a| a.provider == provider)
             .filter(|a| !a.removed)
@@ -245,7 +251,7 @@ impl Manager {
         let locked = self.locked_account_for(crate::provider::Provider::Codex);
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .enumerate()
             .filter(|(idx, account)| match account.provider {
@@ -271,7 +277,7 @@ impl Manager {
         let idx = self.locked_idx?;
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .filter(|account| !account.removed && account.provider == provider)
             .map(|_| idx)
@@ -368,7 +374,7 @@ impl Manager {
     pub fn http_client(&self, idx: usize) -> Option<Arc<reqwest::Client>> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .map(|a| a.http.clone())
     }
@@ -378,7 +384,7 @@ impl Manager {
     pub fn access_token(&self, idx: usize) -> Option<String> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .map(|a| a.access_token.clone())
     }
@@ -390,7 +396,7 @@ impl Manager {
     pub fn has_refresh_token(&self, idx: usize) -> bool {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .is_some_and(|a| a.refresh_token.is_some())
     }
@@ -399,7 +405,7 @@ impl Manager {
     pub fn account_name(&self, idx: usize) -> Option<String> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .map(|a| a.name.clone())
     }
@@ -417,7 +423,7 @@ impl Manager {
     pub fn account_egress(&self, idx: usize) -> Option<crate::config::EgressPin> {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accounts
             .get(idx)
             .map(crate::config::Account::egress_pin)
@@ -429,7 +435,7 @@ impl Manager {
     pub fn account_uuid(&self, idx: usize) -> Option<String> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .and_then(|a| a.account_uuid.clone())
     }
@@ -439,7 +445,10 @@ impl Manager {
     /// saved before the workspace was split from the user keeps that id. `None` for an index
     /// that no longer exists, or a row with neither.
     pub fn codex_account_id(&self, idx: usize) -> Option<String> {
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let row = accounts.get(idx)?;
         row.org_uuid
             .as_deref()
@@ -453,7 +462,7 @@ impl Manager {
     pub fn provider(&self, idx: usize) -> Option<crate::provider::Provider> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .map(|a| a.provider)
     }
@@ -463,7 +472,7 @@ impl Manager {
     pub(crate) fn live_provider(&self, idx: usize) -> Option<crate::provider::Provider> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(idx)
             .filter(|account| !account.removed)
             .map(|account| account.provider)

@@ -125,9 +125,10 @@ pub fn hash_token(token: &str) -> String {
     let out = digest.finalize();
     let mut hex = String::with_capacity(out.len() * 2);
     for byte in out {
+        use crate::log_err::LogErr as _;
         use std::fmt::Write as _;
-        // Infallible on a String; the result is only read to satisfy the lint.
-        let _ = write!(hex, "{byte:02x}");
+        // Infallible on a String; logged rather than dropped to satisfy the lint.
+        write!(hex, "{byte:02x}").log_warn("formatting a token hash byte");
     }
     hex
 }

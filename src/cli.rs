@@ -27,6 +27,7 @@ use time::OffsetDateTime;
 use crate::build_info::{self, BuildInfo};
 use crate::config::{self, Account, Config};
 use crate::identity;
+use crate::log_err::LogErr as _;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
@@ -825,7 +826,9 @@ pub fn remove_from_group(
 
     // clap's ArgGroup on `GroupRmArgs` guarantees exactly one of
     // `account`/`--all` — see this function's doc-comment.
-    let account = account.expect("clap guarantees `account` is Some when `all` is false");
+    let Some(account) = account else {
+        bail!("name the account to remove from the group, or pass --all");
+    };
     let idx = find_account_by_name(&config.accounts, account)?;
     let target = &config.accounts[idx];
     let outcome = config::save_group_membership(config_path, target, group, false)
@@ -1548,7 +1551,7 @@ fn render_groups_text(config: &Config) -> String {
         let (color, source) = config.group_color(group);
         let route_block = group_route_block(config, group, members);
         let codex_members = codex_member_count(config, members);
-        let _ = writeln!(
+        writeln!(
             out,
             "group {group:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
             members.len(),
@@ -1579,9 +1582,10 @@ fn render_groups_text(config: &Config) -> String {
                 Some(block) => format!(" route_block={block}"),
             },
             source.as_str(),
-        );
+        )
+        .log_warn("rendering a group line");
     }
-    let _ = writeln!(out, "ungrouped accounts={ungrouped}");
+    writeln!(out, "ungrouped accounts={ungrouped}").log_warn("rendering the ungrouped line");
     out
 }
 
@@ -3495,16 +3499,18 @@ fn account_status_rows_at(
 
 /// The wire's kebab-case `gate` token for a [`crate::stats::GateReason`] —
 /// `GateReason` itself is `#[serde(rename_all = "kebab-case")]`, so this reuses
-/// that `Serialize` impl rather than hand-duplicating the mapping. Infallible:
-/// an enum-to-string serialization has no failure mode, so the `expect` names
-/// that invariant rather than guessing at a fallback token that could silently
-/// paper over a future variant nobody wired up.
+/// that `Serialize` impl rather than hand-duplicating the mapping. An
+/// enum-to-string serialization has no failure mode, so the `unknown` token is
+/// unreachable; if a future variant ever broke that, it is logged at ERROR
+/// instead of crashing the status path.
 fn gate_reason_token(gate: crate::stats::GateReason) -> String {
     serde_json::to_value(gate)
-        .expect("GateReason serializes infallibly")
-        .as_str()
-        .expect("GateReason serializes to a JSON string")
-        .to_string()
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            tracing::error!("a gate reason did not serialize to a JSON string");
+            "unknown".to_owned()
+        })
 }
 
 /// `tcr accounts [--probe]` — list configured accounts (offline). With
@@ -7079,7 +7085,9 @@ mod tests {
                     "",
                 )
             });
-            let _ = axum::serve(listener, unstamped).await;
+            axum::serve(listener, unstamped)
+                .await
+                .log_debug("serving the test stub");
         });
         let config = add_route_config(port);
         let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
@@ -7101,7 +7109,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, axum::Router::new()).await;
+            axum::serve(listener, axum::Router::new())
+                .await
+                .log_debug("serving the test stub");
         });
         let config = add_route_config(port);
 

@@ -58,7 +58,7 @@ impl Manager {
         let mut ext = self
             .affinity_extended
             .lock()
-            .expect("affinity_extended lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if extended {
             ext.insert(key);
         } else {
@@ -77,7 +77,7 @@ impl Manager {
         let extended = self
             .affinity_extended
             .lock()
-            .expect("affinity_extended lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&key);
         if extended {
             WarmWindow::EXTENDED
@@ -96,7 +96,7 @@ impl Manager {
     pub fn affinity_pin(&self, key: u64) -> Option<usize> {
         self.affinity
             .lock()
-            .expect("affinity lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
             .map(|&(index, _)| index)
     }
@@ -110,7 +110,10 @@ impl Manager {
     /// design exists to prevent.
     pub fn affinity_pin_snapshot(&self) -> Vec<StoredPin> {
         let pins: Vec<(u64, usize, i64)> = {
-            let map = self.affinity.lock().expect("affinity lock poisoned");
+            let map = self
+                .affinity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.iter()
                 .map(|(&key, &(index, touched))| (key, index, touched))
                 .collect()
@@ -120,7 +123,7 @@ impl Manager {
             // let it accumulate keys no snapshot will ever consult again.
             self.affinity_extended
                 .lock()
-                .expect("affinity_extended lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
             return Vec::new();
         }
@@ -130,7 +133,7 @@ impl Manager {
             let mut ext = self
                 .affinity_extended
                 .lock()
-                .expect("affinity_extended lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // A key can only fall out of `affinity` via the same LRU eviction
             // `select()` already applies; once gone there, its extended-TTL
             // record is dead weight — drop it here so this side map is bounded
@@ -138,7 +141,10 @@ impl Manager {
             ext.retain(|key| live_keys.contains(key));
             ext.clone()
         };
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         pins.into_iter()
             .filter_map(|(key, index, touched_at_ms)| {
                 let account = accounts.get(index)?;
@@ -197,7 +203,10 @@ impl Manager {
     /// accounts all replaced) and never an error.
     pub fn restore_affinity(&self, path: &Path, ttl_ms: i64) -> LoadReport {
         let candidates: Vec<crate::config::Account> = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self
+                .accounts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             accounts
                 .iter()
                 .map(|a| {
@@ -213,7 +222,10 @@ impl Manager {
         };
         let report = affinity::load(path, &candidates, crate::now_ms(), ttl_ms);
         {
-            let mut map = self.affinity.lock().expect("affinity lock poisoned");
+            let mut map = self
+                .affinity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (&key, &value) in &report.pins {
                 map.entry(key).or_insert(value);
             }
@@ -225,7 +237,7 @@ impl Manager {
             let mut ext = self
                 .affinity_extended
                 .lock()
-                .expect("affinity_extended lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for &key in &report.extended {
                 ext.insert(key);
             }

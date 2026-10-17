@@ -201,10 +201,15 @@ pub fn boot_instance_id() -> tcr_peer_wire::InstanceId {
         // wrong dial. A machine whose CSPRNG has failed twice cannot complete a
         // Noise handshake either, both patterns need the same randomness, so
         // there is nothing this process could go on to do that would work.
-        mint_instance_id(primary, fallback()).expect(
+        #[expect(
+            clippy::expect_used,
+            reason = "a double CSPRNG failure must stop the process: any fallback id is a stable name for this machine"
+        )]
+        let id = mint_instance_id(primary, fallback()).expect(
             "peer instance id: this Mac's randomness failed twice, so no peer handshake on \
              it can succeed either",
-        )
+        );
+        id
     })
 }
 
