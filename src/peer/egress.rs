@@ -1718,30 +1718,28 @@ pub async fn record_carried(manager: &crate::manager::Manager, record: CarriedRe
         record.upstream_headers,
     )
     .await;
-    manager.record_served(
-        record.account_idx,
-        served_at,
-        record.session_key,
-        record.session_kind,
+    crate::proxy::served::record_served_request(
+        manager,
+        crate::proxy::served::ServedRequest {
+            idx: record.account_idx,
+            served_at,
+            session_key: record.session_key,
+            session_kind: record.session_kind,
+            wire_session_id: record.wire_session_id,
+            account: record.account,
+            method: record.method,
+            path_and_query: record.path,
+            status: record.status,
+            // A peer carries Claude requests only: no Codex request leaves through a peer in
+            // this version (see the Codex arm of `pinned_egress`), so a carried request is
+            // Anthropic's.
+            wire: crate::proxy::served::WireFold::Anthropic {
+                model: record.model,
+                tool_uses: record.tool_uses,
+                tool_results: record.tool_results,
+            },
+        },
     );
-    manager.record_wire_session(
-        record.wire_session_id,
-        record.account.clone(),
-        record.model,
-        served_at,
-        record.tool_uses,
-        record.tool_results,
-    );
-    manager.push_log(crate::stats::RequestLogEntry {
-        time: served_at,
-        method: record.method,
-        path: record.path,
-        status: record.status,
-        account: record.account.unwrap_or_default(),
-        // A peer carries Claude requests only: no Codex request leaves through a peer in this
-        // version (see the Codex arm of `pinned_egress`), so a carried request is Anthropic's.
-        provider: crate::provider::Provider::Anthropic,
-    });
 }
 
 /// Send the request through the loopback splice.

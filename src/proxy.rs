@@ -59,13 +59,15 @@ use crate::manager::{
 };
 use crate::provider::Provider;
 use crate::quota::{UnifiedRejectionKind, quota_rejections};
-use crate::stats::{GateReason, RequestLogEntry, SessionKind};
+use crate::stats::{GateReason, SessionKind};
 
 mod client_error;
 mod ladder;
+pub(crate) mod served;
 
 use client_error::{ClientError, ErrorKind};
 use ladder::Tally;
+use served::{ServedRequest, ServedTurn, WireFold, record_served_request};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
@@ -5412,8 +5414,32 @@ async fn handle_request(
 
         // Terminal outcome (2xx, or a 3xx/4xx/5xx forwarded verbatim). Count the
         // request once against the true serving account and log it.
-        let served_at = OffsetDateTime::now_utc();
-        manager.record_served(idx, served_at, session_key, session_kind);
+        // F1: the wire-session table (`tcr status --json`'s `sessions` array) gets this
+        // request's session id, model and tool events. Cloned, not moved: the usage-recording
+        // arms below (streamed and non-streamed) still need `account_name`/`request_model`.
+        record_served_request(
+            &manager,
+            ServedRequest {
+                idx,
+                served_at: OffsetDateTime::now_utc(),
+                session_key,
+                session_kind,
+                wire_session_id: wire_session_id.as_deref(),
+                account: account_name.clone(),
+                method: method.to_string(),
+                path_and_query: path_and_query.clone(),
+                status: status.as_u16(),
+                // The provider this request was routed on, decided once from its path.
+                wire: match provider {
+                    crate::provider::Provider::Codex => WireFold::Codex { path: &path },
+                    crate::provider::Provider::Anthropic => WireFold::Anthropic {
+                        model: request_model.clone(),
+                        tool_uses: &wire_tool_uses,
+                        tool_results: &wire_tool_results,
+                    },
+                },
+            },
+        );
         // A history bound elsewhere and answered here has moved here: re-bind its tokens, or the
         // next full-history request is held back to the old account's cold cache once it
         // recovers (`Manager::rebind_served_history`).
@@ -5425,43 +5451,6 @@ async fn handle_request(
                 crate::now_ms(),
             );
         }
-        // F1: fold this request's session id, model and tool events into the wire-session
-        // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
-        // `None`. Cloned, not moved: the usage-recording arms below (streamed and
-        // non-streamed) still need `account_name`/`request_model`/`wire_session_id`.
-        // Codex request bodies carry no tool events here. Only a Responses turn closes
-        // calls started by the previous response; auxiliary model calls leave them running.
-        match provider {
-            crate::provider::Provider::Codex => {
-                manager.record_codex_wire_request(
-                    wire_session_id.as_deref(),
-                    account_name.clone(),
-                    &path,
-                    served_at,
-                );
-            }
-            crate::provider::Provider::Anthropic => {
-                manager.record_wire_session(
-                    wire_session_id.as_deref(),
-                    account_name.clone(),
-                    request_model.clone(),
-                    served_at,
-                    &wire_tool_uses,
-                    &wire_tool_results,
-                );
-            }
-        }
-        manager.push_log(RequestLogEntry {
-            time: served_at,
-            method: method.to_string(),
-            path: path_and_query.clone(),
-            status: status.as_u16(),
-            // Cloned, not moved: the streaming arm below still needs
-            // `account_name` to log a mid-stream transport failure by name.
-            account: account_name.clone().unwrap_or_default(),
-            // The provider this request was routed on, decided once from its path.
-            provider,
-        });
 
         let is_stream = up_headers
             .get(CONTENT_TYPE)
@@ -5501,23 +5490,20 @@ async fn handle_request(
             let evidence_dropped_reader = Arc::clone(&evidence_dropped);
             let manager_side = manager.clone();
             let status_is_success = status.is_success();
-            // Cloned, not moved: `account_name` (the original) is still moved
-            // into `TeeState` further below, in this same iteration — see the
-            // comment there. This clone is ONLY for the per-request usage log
-            // line inside the spawned parser task.
-            let account_name_for_log = account_name.clone();
-            // Cloned for the same reason and in the same place as
-            // `account_name_for_log` above: the model this request targeted is
-            // parsed once per request (`request_model`) and the spawned parser
-            // task below outlives this iteration. A `String` clone per streamed
-            // request, so the ledger can attribute tokens to a model at all.
-            let request_model_for_usage = request_model.clone();
-            // Same reasoning, for F1's wire-session token counts: the spawned parser task
-            // outlives this iteration, so it needs its own clone of the session id.
-            let wire_session_id_for_usage = wire_session_id.clone();
-            // The answer, a `bool`: the spawned task never holds the body.
-            let extended_ttl_for_usage = extended_ttl;
-            let stream_path = path.clone();
+            // Cloned, not moved: the spawned parser task below outlives this iteration, and
+            // `account_name` (the original) is still moved into `TeeState` further below, in
+            // this same iteration (see the comment there). `extended_ttl` is the answer, a
+            // `bool`: the spawned task never holds the body.
+            let turn = ServedTurn {
+                provider,
+                idx,
+                account_name: account_name.clone(),
+                path: path.clone(),
+                session_key,
+                wire_session_id: wire_session_id.clone(),
+                request_model: request_model.clone(),
+                extended_ttl,
+            };
             // The request's clock moves into the passthrough body (`StreamTiming`),
             // which finishes it when the body ends and sends the fields here, to
             // the task that owns the `request usage` line.
@@ -5545,7 +5531,7 @@ async fn handle_request(
                     bound_tokens,
                     codex_tool_calls,
                     codex_stream_limit,
-                } = parse_sse_usage(byte_stream, provider, &stream_path).await;
+                } = parse_sse_usage(byte_stream, provider, &turn.path).await;
                 // A 200 can carry a quota refusal in its SSE body. The client has
                 // already received that stream, so never replay it here; bench the
                 // serving account before its next pinned turn is selected.
@@ -5573,7 +5559,7 @@ async fn handle_request(
                 // no usage still has tools running.
                 let stream_ended = OffsetDateTime::now_utc();
                 manager_side.record_wire_session_tool_uses(
-                    wire_session_id_for_usage.as_deref(),
+                    turn.wire_session_id.as_deref(),
                     stream_ended,
                     &response_tool_uses,
                 );
@@ -5581,7 +5567,7 @@ async fn handle_request(
                 // running from the same instant with their own timeouts. Empty on an
                 // Anthropic stream.
                 manager_side.record_codex_wire_session_calls(
-                    wire_session_id_for_usage.as_deref(),
+                    turn.wire_session_id.as_deref(),
                     stream_ended,
                     &codex_tool_calls,
                 );
@@ -5602,80 +5588,13 @@ async fn handle_request(
                     }
                 };
                 if parsed.input_total > 0 || parsed.output > 0 {
-                    // The REQUEST's model whenever its body named one. `response_model` is set
-                    // only on a Codex stream, so an Anthropic record is exactly what it was; a
-                    // Codex body is usually zstd and then does not parse, so its turn is filed
-                    // under the model its own terminal event named instead of under "unknown".
-                    let record = usage_record(
+                    turn.finish(
+                        &manager_side,
+                        status,
                         &parsed,
-                        request_model_for_usage.or(response_model),
-                        session_key,
-                        || extended_ttl_for_usage,
+                        response_model,
+                        timing.as_ref(),
                     );
-                    // One line per terminal request, never per SSE event — a
-                    // per-event log here would be the same flood vector the
-                    // stream-error path above is careful to avoid on a long
-                    // erroring stream. It carries the request's timing too,
-                    // rather than a second INFO line per request.
-                    let t = timing.as_ref();
-                    // `account_index`, `path` and `status` are the fields the DEBUG
-                    // `serving request` and `upstream response` lines carry, so this one
-                    // line is a served request's whole INFO record.
-                    tracing::info!(
-                        account = account_name_for_log.as_deref().unwrap_or("?"),
-                        account_index = idx,
-                        path = %stream_path,
-                        status = status.as_u16(),
-                        session = ?session_key,
-                        model = record.model.as_deref().unwrap_or("?"),
-                        cache_read_tokens = parsed.cache_read,
-                        cache_creation_tokens = parsed.cache_creation,
-                        cache_creation_1h_tokens = record.cache_1h,
-                        input_tokens = parsed.input_total,
-                        output_tokens = parsed.output,
-                        wait_ms = t.and_then(|t| t.wait_ms),
-                        throttle_ms = t.map(|t| t.throttle_ms),
-                        upstream_ms = t.and_then(|t| t.upstream_ms),
-                        first_byte_ms = t.and_then(|t| t.first_byte_ms),
-                        total_ms = t.map(|t| t.total_ms),
-                        attempts = t.map(|t| t.attempts),
-                        switched = t.map(|t| t.switched),
-                        completed = t.map(|t| t.completed),
-                        "request usage"
-                    );
-                    if let Some(t) = t {
-                        t.log_if_held();
-                    }
-                    // A Codex session also keeps the turn's reasoning tokens, and its model is
-                    // the one the ledger files the turn under: the stream's, in practice, since
-                    // a Codex body is usually zstd and names none tcr can read.
-                    match provider {
-                        crate::provider::Provider::Codex => {
-                            manager_side.record_codex_wire_session_usage(
-                                wire_session_id_for_usage.as_deref(),
-                                record.model.as_deref(),
-                                record.input,
-                                record.cache_5m,
-                                record.cache_1h,
-                                record.cache_read,
-                                record.output,
-                                parsed.reasoning,
-                                record.ts_ms,
-                            );
-                        }
-                        crate::provider::Provider::Anthropic => {
-                            manager_side.record_wire_session_usage(
-                                wire_session_id_for_usage.as_deref(),
-                                record.model.as_deref(),
-                                record.input,
-                                record.cache_5m,
-                                record.cache_1h,
-                                record.cache_read,
-                                record.output,
-                            );
-                        }
-                    }
-                    manager_side.record_usage(idx, record);
                 } else if let Some(t) = &timing {
                     // No usage, so no `request usage` line to ride on.
                     t.log_alone();
@@ -5905,71 +5824,23 @@ async fn handle_request(
             let parsed = response.usage;
             let response_model = response.model;
             if parsed.input_total > 0 || parsed.output > 0 {
-                // As on the streaming arm: the REQUEST's model whenever its body named one,
-                // else, for a Codex body only, the model its Responses object names.
-                let record = usage_record(
-                    &parsed,
-                    request_model.clone().or(response_model),
-                    session_key,
-                    || extended_ttl,
-                );
-                // One line per terminal (non-streamed) request — see the
-                // matching log line on the streaming arm above. It carries the
-                // timing, so `handle` must not log it a second time: disarmed.
+                // The `request usage` line carries the timing, so `handle` must not log it a
+                // second time: disarmed. No Codex tool calls are read here: codex streams its
+                // turns, so a non-streamed Responses object comes only from a client that is
+                // not codex.
                 let t = timing.finish(status.as_u16(), Instant::now(), true);
                 timing.armed = false;
-                tracing::info!(
-                    account = account_name.as_deref().unwrap_or("?"),
-                    account_index = idx,
-                    path = %path,
-                    status = status.as_u16(),
-                    session = ?session_key,
-                    model = record.model.as_deref().unwrap_or("?"),
-                    cache_read_tokens = parsed.cache_read,
-                    cache_creation_tokens = parsed.cache_creation,
-                    cache_creation_1h_tokens = record.cache_1h,
-                    input_tokens = parsed.input_total,
-                    output_tokens = parsed.output,
-                    wait_ms = t.wait_ms,
-                    throttle_ms = t.throttle_ms,
-                    upstream_ms = t.upstream_ms,
-                    first_byte_ms = t.first_byte_ms,
-                    total_ms = t.total_ms,
-                    attempts = t.attempts,
-                    switched = t.switched,
-                    completed = t.completed,
-                    "request usage"
-                );
-                t.log_if_held();
-                // No Codex tool calls are read here: codex streams its turns, so a
-                // non-streamed Responses object comes only from a client that is not codex.
-                match provider {
-                    crate::provider::Provider::Codex => {
-                        manager.record_codex_wire_session_usage(
-                            wire_session_id.as_deref(),
-                            record.model.as_deref(),
-                            record.input,
-                            record.cache_5m,
-                            record.cache_1h,
-                            record.cache_read,
-                            record.output,
-                            parsed.reasoning,
-                            record.ts_ms,
-                        );
-                    }
-                    crate::provider::Provider::Anthropic => {
-                        manager.record_wire_session_usage(
-                            wire_session_id.as_deref(),
-                            record.model.as_deref(),
-                            record.input,
-                            record.cache_5m,
-                            record.cache_1h,
-                            record.cache_read,
-                            record.output,
-                        );
-                    }
+                ServedTurn {
+                    provider,
+                    idx,
+                    account_name: account_name.clone(),
+                    path: path.clone(),
+                    session_key,
+                    wire_session_id: wire_session_id.clone(),
+                    request_model: request_model.clone(),
+                    extended_ttl,
                 }
-                manager.record_usage(idx, record);
+                .finish(&manager, status, &parsed, response_model, Some(&t));
             }
         } else {
             // The "upstream response" line above (:2587) has never carried a
