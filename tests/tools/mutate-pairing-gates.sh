@@ -52,9 +52,23 @@ backup() {
 PASS=0
 FAIL=0
 
-# mutate <label> <file> <test-binary> <test-name> <python-mutation>
+# The cargo arguments that run test <name> from tests/<file>.rs, one per line:
+# the file's own target when Cargo.toml declares one, otherwise the shared `it`
+# test crate, where the file is a module of the same name.
+test_target() {
+  local file="$1" test_name="$2"
+  if grep -qx "name = \"$file\"" "$ROOT/Cargo.toml"; then
+    printf '%s\n' --test "$file" "$test_name"
+  else
+    printf '%s\n' --test it "$file::$test_name"
+  fi
+}
+
+# mutate <label> <file> <test-file> <test-name> <python-mutation>
 mutate() {
   local label="$1" file="$2" binary="$3" test_name="$4" mutation="$5"
+  local -a target
+  mapfile -t target < <(test_target "$binary" "$test_name")
   backup "$file"
   if ! MUT_FILE="$ROOT/$file" python3 -c "$mutation"; then
     printf '%s: FAIL: mutation-could-not-apply: %s\n' "$file" "$label"
@@ -63,8 +77,7 @@ mutate() {
     return
   fi
   local rc
-  cargo test --manifest-path "$ROOT/Cargo.toml" --test "$binary" "$test_name" \
-    >"$LOG" 2>&1
+  cargo test --manifest-path "$ROOT/Cargo.toml" "${target[@]}" >"$LOG" 2>&1
   rc=$?
   restore_all
   if [[ $rc -ne 0 ]]; then
@@ -80,9 +93,11 @@ mutate() {
 # --- Control: with nothing mutated, every gate under test is GREEN. -----------
 # Without this, a script whose `cargo test` invocation was simply broken would
 # report every row RED and call it a success.
-if cargo test --manifest-path "$ROOT/Cargo.toml" \
-     --test peer_wire --test peer_pairing --test peer_discovery \
-     --test peer_noise --test peer_refusal_log >"$LOG" 2>&1; then
+# Two runs, because libtest filters apply to every target named: the module
+# filters below would match nothing in `peer_refusal_log`, its own target.
+if cargo test --manifest-path "$ROOT/Cargo.toml" --test it -- \
+     peer_wire:: peer_pairing:: peer_discovery:: peer_noise:: >"$LOG" 2>&1 &&
+   cargo test --manifest-path "$ROOT/Cargo.toml" --test peer_refusal_log >>"$LOG" 2>&1; then
   printf 'control: PASS: every gate is green before any mutation\n'
   PASS=$((PASS + 1))
 else
@@ -126,7 +141,7 @@ pub struct Probe {
 """
 open(p, "w").write(s)
 '
-  cargo test --manifest-path "$ROOT/Cargo.toml" --test peer_wire "$pair" >"$LOG" 2>&1
+  cargo test --manifest-path "$ROOT/Cargo.toml" --test it "peer_wire::$pair" >"$LOG" 2>&1
   rc=$?
   restore_all
   if [[ $rc -eq 0 ]]; then

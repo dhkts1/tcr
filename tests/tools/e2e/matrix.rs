@@ -2,7 +2,7 @@
 //! `tests/peer_e2e.rs` prints one line per driver step.
 //!
 //! `scripts/peer-e2e-local.sh` (owned by the reverse-dial suite) and a human running
-//! `cargo test --test peer_e2e -- --nocapture` read the same stdout, so this
+//! `cargo test --test it peer_e2e:: -- --nocapture` read the same stdout, so this
 //! is the one place the line's shape is written rather than four scenarios
 //! each choosing their own wording.
 

@@ -40,8 +40,9 @@ trap restore EXIT INT TERM
 
 run_gate() {
   # $1 = test name, $2 = log file. Never piped: the exit code is the verdict.
+  # `tests/peer_wire.rs` is the `peer_wire` module of the shared `it` test crate.
   CARGO_TARGET_DIR="$ROOT/target-mutate" cargo test \
-    --manifest-path "$ROOT/Cargo.toml" --test peer_wire "$1" \
+    --manifest-path "$ROOT/Cargo.toml" --test it "peer_wire::$1" \
     >"$2" 2>&1
   echo $?
 }

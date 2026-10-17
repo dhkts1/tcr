@@ -103,9 +103,10 @@ commit gates; put the scope in the body. Allowed types and examples:
 - When you restore a file after such an experiment, verify the *file* (`git status`, re-read the line) —
   not just a re-run. `mv` preserves mtime, so a restored file can leave a stale build in place and the
   suite will re-run the broken binary.
-- **A green CI run is not a control for a red local run.** `cargo` compiles every file in `tests/`,
-  including untracked ones, so a stale scratch file in your checkout fails the whole suite while CI —
-  which checks out a clean tree — stays green. Before blaming a merge, run `git status` on the failing
+- **A green CI run is not a control for a red local run.** The suite reads every file in `tests/`,
+  including untracked ones (`every_test_file_is_a_module_here_or_its_own_test_target` in
+  `tests/it/main.rs` fails on a file that is not listed), so a stale scratch file in your checkout
+  fails the suite while CI — which checks out a clean tree — stays green. Before blaming a merge, run `git status` on the failing
   path: if it is `??`, it is not the branch's fault and it is not yours to delete without asking.
 - An empty search result is a claim about your probe, not about the world. Run a positive control — grep
   for something you know is there — before concluding something is absent.

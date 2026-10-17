@@ -99,14 +99,27 @@ fi
 
 # `--test-threads=1` so the STEP lines of the tests do not interleave, and
 # `--nocapture` because those lines are the point of running this by hand.
-CARGO_ARGS=(test --manifest-path "$MANIFEST" --test peer_e2e)
+# `tests/peer_e2e.rs` is the `peer_e2e` module of the shared `it` test crate.
+CARGO_ARGS=(test --manifest-path "$MANIFEST" --test it)
 
 run_suite() {
   # $1: an extra test-name filter, or empty for the whole file.
   local filter="$1"
-  local test_args=(--nocapture --test-threads=1)
+  local test_args=(peer_e2e:: --nocapture --test-threads=1)
   if [ -n "$filter" ]; then
-    test_args=(--include-ignored "$filter" --nocapture --test-threads=1)
+    # libtest runs a test that matches ANY of its filters, so `peer_e2e::`
+    # beside "$filter" would also run every other module's test whose name
+    # holds "$filter". List this file's tests that hold it and run exactly those.
+    local names=() name
+    while IFS= read -r name; do
+      names+=("$name")
+    done < <(cargo "${CARGO_ARGS[@]}" -- --list peer_e2e:: | sed -n 's/^\(peer_e2e::.*\): test$/\1/p' |
+      grep -F -- "$filter")
+    if [ "${#names[@]}" -eq 0 ]; then
+      echo "no test in tests/peer_e2e.rs has '$filter' in its name" >&2
+      return 1
+    fi
+    test_args=(--include-ignored --exact "${names[@]}" --nocapture --test-threads=1)
   fi
   if [ -n "$NODES" ]; then
     TCR_E2E_NODES="$NODES" cargo "${CARGO_ARGS[@]}" -- "${test_args[@]}"

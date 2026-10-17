@@ -82,8 +82,8 @@ probe() {
   fi
 }
 
-probe pairing_window_not_persisted --test=peer_noise \
-  the_pairing_window_survives_a_save_and_a_load src/peer/state.rs <<'SPEC'
+probe pairing_window_not_persisted --test=it \
+  peer_noise::the_pairing_window_survives_a_save_and_a_load src/peer/state.rs <<'SPEC'
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_window_until_ms: Option<i64>,
 @@@
@@ -91,23 +91,23 @@ probe pairing_window_not_persisted --test=peer_noise \
     pub pairing_window_until_ms: Option<i64>,
 SPEC
 
-probe clock_jump_ignored --test=peer_noise \
-  a_clock_that_moved_closes_the_pairing_window src/peer/state.rs <<'SPEC'
+probe clock_jump_ignored --test=it \
+  peer_noise::a_clock_that_moved_closes_the_pairing_window src/peer/state.rs <<'SPEC'
 if now_ms >= opened_at_ms && now_ms < until_ms {
 @@@
 if now_ms < until_ms {
 SPEC
 
-probe enrolment_writes_nothing --test=peer_noise \
-  a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides src/peer/pair.rs <<'SPEC'
+probe enrolment_writes_nothing --test=it \
+  peer_noise::a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides src/peer/pair.rs <<'SPEC'
     file.peers.push(row.clone());
     save(peers_path, &file)?;
 @@@
     file.peers.push(row.clone());
 SPEC
 
-probe invite_not_spent --test=peer_noise \
-  a_one_use_invite_refuses_its_second_joiner src/peer/pair.rs <<'SPEC'
+probe invite_not_spent --test=it \
+  peer_noise::a_one_use_invite_refuses_its_second_joiner src/peer/pair.rs <<'SPEC'
         invite.uses_left = invite.uses_left.saturating_sub(1);
         invite.clone()
     };
@@ -119,30 +119,30 @@ probe invite_not_spent --test=peer_noise \
     };
 SPEC
 
-probe enrolment_label_unsanitized --test=peer_noise \
-  a_hostile_enrolment_label_is_refused_and_spends_nothing src/peer/pair.rs <<'SPEC'
+probe enrolment_label_unsanitized --test=it \
+  peer_noise::a_hostile_enrolment_label_is_refused_and_spends_nothing src/peer/pair.rs <<'SPEC'
     let label = sanitize_label(&enroll.label)
         .map_err(|refusal| anyhow!("peer enrol: the joiner's label is refused: {refusal}"))?;
 @@@
     let label = enroll.label.clone();
 SPEC
 
-probe peers_file_mode --test=peer_noise \
-  the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise.rs <<'SPEC'
+probe peers_file_mode --test=it \
+  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused tests/peer_noise.rs <<'SPEC'
     tcr::peer::config::save(path, &file).expect("the peers file is written");
 @@@
     std::fs::write(path, serde_json::to_string(&file).expect("json")).expect("written");
 SPEC
 
-probe peers_mode_check --test=peer_noise \
-  the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused src/peer/config.rs <<'SPEC'
+probe peers_mode_check --test=it \
+  peer_noise::the_peers_file_is_written_at_0600_and_a_wider_mode_is_refused src/peer/config.rs <<'SPEC'
             if mode != 0o600 {
 @@@
             if false {
 SPEC
 
-probe key_file_follows_symlink --test=peer_noise \
-  a_planted_symlink_does_not_capture_the_node_key src/peer/id.rs <<'SPEC'
+probe key_file_follows_symlink --test=it \
+  peer_noise::a_planted_symlink_does_not_capture_the_node_key src/peer/id.rs <<'SPEC'
         .create_new(true)
         .mode(mode)
 @@@
@@ -151,8 +151,8 @@ probe key_file_follows_symlink --test=peer_noise \
         .mode(mode)
 SPEC
 
-probe stdin_ignores_its_reader --test=peer_noise \
-  a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
+probe stdin_ignores_its_reader --test=it \
+  peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
     reader
         .read_line(&mut line)
         .context("peer join: could not read the join key from standard input")?;
@@ -160,8 +160,8 @@ probe stdin_ignores_its_reader --test=peer_noise \
     let _ignored = &mut reader;
 SPEC
 
-probe refusal_echoes_the_secret --test=peer_noise \
-  a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
+probe refusal_echoes_the_secret --test=it \
+  peer_noise::a_join_token_arrives_on_stdin_and_never_in_a_message src/peer/pair.rs <<'SPEC'
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
 @@@
             .with_context(|| format!("peer join: the secret field {secret:?} is not 32 base32-encoded bytes"))?;
@@ -187,7 +187,7 @@ SPEC
 
 restore
 CARGO_TARGET_DIR="$ROOT/target-mutate" cargo test --manifest-path "$ROOT/Cargo.toml" \
-  --test peer_noise --test peer_wire --test peer_discovery \
+  --test it -- peer_noise:: peer_wire:: peer_discovery:: \
   >"$LOG_DIR/mutid-$STAMP-restored.log" 2>&1
 green=$?
 CARGO_TARGET_DIR="$ROOT/target-mutate" cargo test --manifest-path "$ROOT/Cargo.toml" \

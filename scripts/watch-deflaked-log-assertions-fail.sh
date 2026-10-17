@@ -75,7 +75,7 @@ echo "=== control: both guards must RUN and pass on the unbroken tree ==="
 cp "$BACKUP_DIR/server.rs" "$SERVER"; cp "$BACKUP_DIR/main.rs" "$MAIN"; touch "$SERVER" "$MAIN"
 c1="$(mktemp -t deflake-c1.XXXXXX)"; c2="$(mktemp -t deflake-c2.XXXXXX)"
 cargo test --lib boot_line_carries_every_new_knob >"$c1" 2>&1
-cargo test --test headless_sigterm >"$c2" 2>&1
+cargo test --test it headless_sigterm:: >"$c2" 2>&1
 ok=1
 grep -qE '^test .*boot_line_carries_every_new_knob.* \.\.\. ok' "$c1" || { echo "CONTROL: boot-line guard did not run or pass."; ok=0; }
 grep -qE '^test .*a_supervised_sigterm.* \.\.\. ok' "$c2" || { echo "CONTROL: sigterm guard did not run or pass."; ok=0; }
@@ -93,8 +93,8 @@ run_break "no-boot-line" "$SERVER" "--lib" \
 
 # 2. The SIGTERM line is never emitted, so NEITHER stdout nor the durable log
 #    can carry it. Accepting a second source must not mean accepting none.
-run_break "no-sigterm-line" "$MAIN" "--test headless_sigterm" \
-  "a_supervised_sigterm_drains_before_the_process_exits" \
+run_break "no-sigterm-line" "$MAIN" "--test it" \
+  "headless_sigterm::a_supervised_sigterm_drains_before_the_process_exits" \
   'Self::Sigterm => "SIGTERM received; shutting down",::=Self::Sigterm => "stopping",'
 
 echo
