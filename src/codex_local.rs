@@ -38,6 +38,8 @@
 //! `HOME`. An empty value counts as unset, as for every tcr override.
 
 use std::io::Read as _;
+
+use crate::log_err::LogErr as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -530,7 +532,9 @@ fn run_with_deadline(path: &Path, args: &[&str], deadline: Duration) -> Option<S
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
+        stdout
+            .read_to_string(&mut text)
+            .log_warn("reading the probed command's output");
         text
     });
     let started = Instant::now();
@@ -550,8 +554,8 @@ fn run_with_deadline(path: &Path, args: &[&str], deadline: Duration) -> Option<S
                 std::thread::sleep(Duration::from_millis(20));
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill().log_debug("killing a probe past its deadline");
+                child.wait().log_debug("reaping a probe past its deadline");
                 return None;
             }
         }

@@ -1315,7 +1315,7 @@ fn restore_counts_changed(path: &Path, counts: RestoreCounts) -> bool {
     let mut cache = LAST_RESTORE_LOG
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .expect("restore-log cache lock poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous = cache.insert(path.to_path_buf(), counts);
     previous != Some(counts)
 }
