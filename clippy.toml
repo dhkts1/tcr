@@ -1,0 +1,4 @@
+# Gil's rules ban .unwrap() and .expect() outside tests; .expect(...) is how a test fails with a message,
+# so both lints are exempt inside #[test] functions and #[cfg(test)] modules.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
