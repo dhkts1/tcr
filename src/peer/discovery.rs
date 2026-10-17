@@ -583,7 +583,21 @@ pub async fn advertise(store: &PeerStore, name: Option<&str>, port: u16) -> Resu
 pub async fn browse(store: &PeerStore) -> Result<Vec<Discovered>> {
     let daemon = shared_daemon()?;
     let network_key = crate::peer::config::read_or_default(store.path())?.network_key;
-    browse_once(&daemon, BROWSE_WINDOW, network_key.as_ref())
+    browse_off_runtime(daemon, BROWSE_WINDOW, network_key).await
+}
+
+/// [`browse_once`] on a blocking-pool thread. It waits out the whole browse
+/// window on a channel, which on a tokio worker would hold that worker for the
+/// window (seconds) and starve every task scheduled on it. The seam [`browse`]
+/// delegates to, so a test can run it with a short window.
+async fn browse_off_runtime(
+    daemon: std::sync::Arc<ServiceDaemon>,
+    window: Duration,
+    network_key: Option<crate::peer::config::NetworkKey>,
+) -> Result<Vec<Discovered>> {
+    tokio::task::spawn_blocking(move || browse_once(&daemon, window, network_key.as_ref()))
+        .await
+        .context("the mDNS browse task did not finish")?
 }
 
 /// Which per-boot instance id belongs to which pinned static key.
@@ -1552,6 +1566,36 @@ mod tests {
         assert!(
             !found.iter().any(|row| row.port == NEVER_REGISTERED_PORT),
             "a daemon that never advertised must not find its own row: {found:?}"
+        );
+        log_teardown_err(daemon.shutdown(), "shutting down test mDNS daemon");
+    }
+
+    /// **A browse does not hold the async runtime for its window.** On a
+    /// current-thread runtime there is one worker, so a browse that blocks it
+    /// leaves a sibling task unable to tick for the whole window. Here a ticker
+    /// must run many times during a 1 s browse; on the old code ([`browse_once`]
+    /// called straight from the async fn) it runs zero times.
+    #[tokio::test(flavor = "current_thread")]
+    async fn browse_does_not_block_the_runtime() {
+        let daemon = std::sync::Arc::new(ServiceDaemon::new().expect("test daemon"));
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = std::sync::Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+        browse_off_runtime(std::sync::Arc::clone(&daemon), Duration::from_secs(1), None)
+            .await
+            .expect("browse");
+        ticker.abort();
+        let seen = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            seen >= 10,
+            "a sibling task ticked {seen} times in a 1 s browse; the runtime was blocked"
         );
         log_teardown_err(daemon.shutdown(), "shutting down test mDNS daemon");
     }
