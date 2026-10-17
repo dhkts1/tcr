@@ -2,7 +2,6 @@
 //! `mod.rs`, mirroring `usage.rs`/`snapshot.rs`'s split.
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::session_wire::{CodexToolCall, ToolResultEvent, ToolUseEvent};
@@ -425,19 +424,18 @@ impl Manager {
     /// [`Self::mark_affinity_dirty`]: a single relaxed store on the request path, with the
     /// actual write done off it by a debounced flusher.
     pub fn mark_wire_sessions_dirty(&self) {
-        self.wire_sessions_dirty.store(true, Ordering::Relaxed);
-        self.wire_sessions_wake.notify_one();
+        self.wire_sessions_file.mark();
     }
 
     /// Resolves once the wire-session table has changed since the last time this resolved:
     /// the Sessions/Tools flusher's wake-up, as [`Self::affinity_changed`] is the pins'.
     pub async fn wire_sessions_changed(&self) {
-        self.wire_sessions_wake.notified().await;
+        self.wire_sessions_file.changed().await;
     }
 
     /// Consume the dirty flag: `true` when something changed since the last call.
     pub fn take_wire_sessions_dirty(&self) -> bool {
-        self.wire_sessions_dirty.swap(false, Ordering::Relaxed)
+        self.wire_sessions_file.take()
     }
 
     /// Write the wire-session table to `path`, atomically. Returns how many sessions
@@ -448,11 +446,10 @@ impl Manager {
     pub fn flush_wire_sessions(&self, path: &Path) -> Result<usize, crate::config::ConfigError> {
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
-        let count = session_wire_persist::save(path, &sessions, now_ms)?;
-        let (shape, content) = session_wire_persist::save_hashes(&sessions)?;
-        self.wire_sessions_save
-            .wrote(shape, content, std::time::Instant::now());
-        Ok(count)
+        self.wire_sessions_file
+            .save(session_wire_persist::save_hashes(&sessions)?, || {
+                session_wire_persist::save(path, &sessions, now_ms)
+            })
     }
 
     /// The flusher's save: [`Self::flush_wire_sessions`] when the table differs from what the
@@ -465,14 +462,10 @@ impl Manager {
     ) -> Result<crate::save_gate::SaveOutcome, crate::config::ConfigError> {
         let now_ms = crate::now_ms();
         let sessions = self.wire_sessions_to_save(now_ms);
-        let (shape, content) = session_wire_persist::save_hashes(&sessions)?;
-        let now = std::time::Instant::now();
-        if let Some(skipped) = self.wire_sessions_save.skip(shape, content, now) {
-            return Ok(skipped);
-        }
-        let count = session_wire_persist::save(path, &sessions, now_ms)?;
-        self.wire_sessions_save.wrote(shape, content, now);
-        Ok(crate::save_gate::SaveOutcome::Wrote(count))
+        self.wire_sessions_file
+            .save_if_changed(session_wire_persist::save_hashes(&sessions)?, || {
+                session_wire_persist::save(path, &sessions, now_ms)
+            })
     }
 
     /// The live table as the cache file holds it: a copy taken under the lock, written

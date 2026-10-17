@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::cache_file::{CacheRead, Layout, read_cache, write_cache};
 use crate::config::{Account, ConfigError};
 use crate::identity::{self, Resolved};
 use crate::provider::Provider;
@@ -312,13 +313,7 @@ impl Prepared {
             accounts: self.accounts,
             tokens: self.tokens,
         };
-        // A cache of several megabytes, which `load` reads as empty when it is missing or
-        // damaged: atomic, but not flushed to the disk (see `Durability::Cache`).
-        crate::config::write_atomic_with(
-            path,
-            &serde_json::to_string(&file)?,
-            crate::config::Durability::Cache,
-        )?;
+        write_cache(path, &file, Layout::Compact)?;
         Ok(count)
     }
 }
@@ -370,53 +365,14 @@ pub fn prepare(snapshot: Snapshot) -> Result<Prepared, ConfigError> {
 ///
 /// Infallible by construction — every failure mode returns an empty map with `degraded` set.
 pub fn load(path: &Path, accounts: &[Account], now_ms: i64, ttl_ms: i64) -> LoadReport {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // First boot, and the boot right after this feature ships. Not a degradation.
-            return LoadReport::default();
-        }
-        Err(err) => {
+    // The advisor-only build's file has neither `accounts` nor `tokens`; `read_cache` reads
+    // the version first, so it is refused for its version and not as a missing field.
+    let file: BoundTokenFile = match read_cache(path, FORMAT_VERSION) {
+        CacheRead::Read(file) => file,
+        CacheRead::Missing => return LoadReport::default(),
+        CacheRead::Degraded(reason) => {
             return LoadReport {
-                degraded: Some(format!("unreadable: {err}")),
-                ..LoadReport::default()
-            };
-        }
-    };
-
-    // The VERSION is read first, on its own, and a foreign one is reported as a version rather
-    // than as corruption. Parsing the whole struct first gets this backwards: the advisor-only
-    // build's file has neither `accounts` nor `tokens`, so it fails as "corrupt: missing field"
-    // — the right refusal for exactly the wrong reason, and the reason is what an operator
-    // reads when deciding whether their cache file is damaged or merely old.
-    #[derive(Deserialize)]
-    struct VersionPeek {
-        version: u32,
-    }
-    match serde_json::from_str::<VersionPeek>(&data) {
-        Ok(peek) if peek.version != FORMAT_VERSION => {
-            return LoadReport {
-                degraded: Some(format!(
-                    "format version {} is not {FORMAT_VERSION}",
-                    peek.version
-                )),
-                ..LoadReport::default()
-            };
-        }
-        Ok(_) => {}
-        Err(err) => {
-            return LoadReport {
-                degraded: Some(format!("corrupt: {err}")),
-                ..LoadReport::default()
-            };
-        }
-    }
-
-    let file: BoundTokenFile = match serde_json::from_str(&data) {
-        Ok(file) => file,
-        Err(err) => {
-            return LoadReport {
-                degraded: Some(format!("corrupt: {err}")),
+                degraded: Some(reason),
                 ..LoadReport::default()
             };
         }

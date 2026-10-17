@@ -18,6 +18,7 @@ pub mod account_uuid;
 pub mod affinity;
 pub mod bound_tokens;
 pub mod build_info;
+pub(crate) mod cache_file;
 pub mod cache_ttl;
 pub mod claude_code_login;
 pub mod cli;

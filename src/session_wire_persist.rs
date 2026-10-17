@@ -27,7 +27,7 @@
 //! 2026-09-13 ruling, reversing #299, and it is what makes a restored SLOWEST
 //! TODAY row readable — without it, 72 of 95 rows came back after a restart
 //! saying the bare word `Bash` (measured the same day). The file is written
-//! `0600` by [`crate::config::write_atomic`], which creates its temp file with
+//! `0600` by [`crate::config::write_atomic_with`], which creates its temp file with
 //! that mode and normalises the destination's mode after the rename, so the
 //! heads are readable by their owner and nobody else; this module adds no
 //! `set_permissions` call of its own because there would be nothing left for it
@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache_file::{CacheRead, Layout, read_cache, write_cache};
 use crate::config::ConfigError;
 use crate::session_wire::WireSession;
 
@@ -172,10 +173,11 @@ pub fn save_hashes(
     ))
 }
 
-/// Write `sessions` to `path` atomically at `0600` (`crate::config::write_atomic`
-/// sets the mode — see its own doc for why: a symlink-safe, fsynced temp file
-/// plus rename, so a crash mid-write leaves the previous file intact), keeping
-/// at most [`PERSIST_CAP`] of them (freshest by `last_seen_ms` first).
+/// Write `sessions` to `path` atomically at `0600` ([`write_cache`]: a temp file
+/// plus rename, so a process killed mid-write leaves the previous file intact;
+/// not flushed to the disk, so a power loss can leave it truncated, which
+/// [`load`] reads as empty), keeping at most [`PERSIST_CAP`] of them (freshest
+/// by `last_seen_ms` first).
 ///
 /// Returns how many were written. Never called on the request hot path — see
 /// the debounced flusher in `manager/wire_sessions.rs` — and the caller decides
@@ -193,13 +195,7 @@ pub fn save(
         saved_at_ms: now_ms,
         sessions,
     };
-    // A cache rewritten every few seconds, which `load` reads as empty when it is missing or
-    // damaged: atomic, but not flushed to the disk (see `Durability::Cache`).
-    crate::config::write_atomic_with(
-        path,
-        &serde_json::to_string_pretty(&file)?,
-        crate::config::Durability::Cache,
-    )?;
+    write_cache(path, &file, Layout::Pretty)?;
     Ok(count)
 }
 
@@ -213,43 +209,16 @@ pub fn save(
 /// Same contract as [`crate::affinity::load`], for the same reason: this is a
 /// cache, and a boot must never fail, or even pause, over a corrupt one.
 pub fn load(path: &Path, now_ms: i64, ttl_ms: i64) -> LoadReport {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // First boot, or the first boot since this feature shipped. Not a
-            // degradation.
-            return LoadReport::default();
-        }
-        Err(err) => {
+    let file: WireSessionsFile = match read_cache(path, FORMAT_VERSION) {
+        CacheRead::Read(file) => file,
+        CacheRead::Missing => return LoadReport::default(),
+        CacheRead::Degraded(reason) => {
             return LoadReport {
-                degraded: Some(format!("unreadable: {err}")),
+                degraded: Some(reason),
                 ..LoadReport::default()
             };
         }
     };
-
-    let file: WireSessionsFile = match serde_json::from_str(&data) {
-        Ok(file) => file,
-        Err(err) => {
-            // Truncated (a full disk or a SIGKILL between `write` and `rename`
-            // cannot produce this — `write_atomic` fsyncs before the rename —
-            // but a hand-edit or a future format change can) or otherwise
-            // corrupt.
-            return LoadReport {
-                degraded: Some(format!("corrupt: {err}")),
-                ..LoadReport::default()
-            };
-        }
-    };
-    if file.version != FORMAT_VERSION {
-        return LoadReport {
-            degraded: Some(format!(
-                "format version {} is not {FORMAT_VERSION}",
-                file.version
-            )),
-            ..LoadReport::default()
-        };
-    }
 
     let mut report = LoadReport::default();
     let mut rows: Vec<(String, WireSession)> = file.sessions.into_iter().collect();
@@ -378,7 +347,7 @@ mod tests {
             "the timed-out head is on disk"
         );
 
-        // 0600 comes from `config::write_atomic`, which creates the temp file with that
+        // 0600 comes from `config::write_atomic_with`, which creates the temp file with that
         // mode AND normalises the destination after the rename; this asserts the property
         // at the file the heads actually land in.
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
@@ -610,6 +579,23 @@ mod tests {
         let report = load(&path, 1_000_000, RESTORE_TTL_MS);
         assert!(report.sessions.is_empty());
         assert!(report.degraded.unwrap().contains("format version"));
+    }
+
+    /// A file of another version shaped differently (here, without `sessions`) is refused for
+    /// its version, not as "corrupt: missing field": the reason is what tells an operator
+    /// whether the cache is damaged or merely old.
+    #[test]
+    fn a_foreign_version_without_sessions_is_refused_for_its_version() {
+        let path = tmp("foreign-shape");
+        std::fs::write(&path, r#"{"version":2,"savedAtMs":0,"rows":[]}"#).expect("write v2");
+
+        let report = load(&path, 1_000_000, RESTORE_TTL_MS);
+        assert!(report.sessions.is_empty());
+        assert_eq!(
+            report.degraded.as_deref(),
+            Some("format version 2 is not 1"),
+            "the reason must name the version"
+        );
     }
 
     /// `ToolBucket`'s median reservoir — a private field reached only through
