@@ -30,6 +30,11 @@ mod tcr_env;
 #[path = "../support/fixtures.rs"]
 mod fixtures;
 
+/// The harness pieces the `peer_*` modules share (and compiled into the separate `peer_*`
+/// targets that use them too).
+#[path = "../support/peer.rs"]
+mod peer_support;
+
 /// Shared by `codex_e2e` and `peer_e2e` (and compiled into the separate `peer_lease` too).
 #[path = "../tools/api_contract.rs"]
 mod api_contract;

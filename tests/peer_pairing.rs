@@ -48,14 +48,7 @@ use tokio::net::TcpStream;
 /// two tests in this binary (and five lanes running at once), never collide on
 /// one path.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-pairing-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
+    crate::peer_support::scratch_dir("pairing", tag)
 }
 
 /// A command's default files belong to its fixture, including the node key a
@@ -137,18 +130,7 @@ impl Node {
 /// the pattern dispatch and the knock queue all live in it, so a test harness
 /// that re-implemented the loop would be measuring the harness.
 async fn serve(context: SessionContext) -> SocketAddr {
-    let listener = listener::bind("127.0.0.1:0".parse().expect("a loopback address"))
-        .await
-        .expect("bind a kernel-chosen port on loopback");
-    let addr = listener.local_addr().expect("the bound address");
-    tokio::spawn(async move {
-        // The loop only returns on an accept failure, which is the harness
-        // shutting down at the end of the test.
-        listener::serve_on_with(listener, context)
-            .await
-            .log_debug("serving a test peer listener");
-    });
-    addr
+    crate::peer_support::serve_shipped(context).await
 }
 
 fn instance(byte: u8) -> InstanceId {

@@ -24,10 +24,13 @@
     reason = "test helpers outside #[test] fail the test with a message; the ban is for production code"
 )]
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+/// The harness pieces the `peer_*` test files share.
+#[path = "support/peer.rs"]
+mod peer_support;
+
 use std::time::Duration;
 
+use peer_support::CaptureLayer;
 use tcr::config::Config;
 use tcr::peer::{config as peer_config, serve as peer_serve};
 use tcr::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
@@ -378,74 +381,6 @@ fn a_profiles_peer_state_file_is_the_one_beside_its_peers_file() {
 // Item 4: the lender's log line names four things and nothing else
 // ---------------------------------------------------------------------------
 
-/// One captured tracing event: its message and its field set.
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    message: String,
-    fields: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Default)]
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<CapturedEvent>>>,
-}
-
-struct FieldVisitor(BTreeMap<String, String>);
-
-impl tracing::field::Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_string(), format!("{value:?}"));
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = FieldVisitor(BTreeMap::new());
-        event.record(&mut visitor);
-        let message = visitor
-            .0
-            .get("message")
-            .cloned()
-            .unwrap_or_else(|| "<no message field>".to_string());
-        self.events
-            .lock()
-            .expect("capture lock")
-            .push(CapturedEvent {
-                message,
-                fields: visitor.0,
-            });
-    }
-}
-
-impl CaptureLayer {
-    fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
-        self.events
-            .lock()
-            .expect("capture lock")
-            .iter()
-            .filter(|event| event.message == needle)
-            .cloned()
-            .collect()
-    }
-}
-
 /// **The lender writes ONE line per served request and it names four things:
 /// the peer, the window, the bytes and the milliseconds.**
 ///
@@ -491,7 +426,7 @@ async fn the_lenders_served_line_names_the_peer_the_window_the_bytes_and_the_ms(
     // counted raw: the scope gate above serves a request in this same process,
     // and a raw count of the message would be a count of both tests.
     let lines: Vec<_> = capture
-        .matching(peer_serve::SERVED_LINE)
+        .matching_exactly(peer_serve::SERVED_LINE)
         .into_iter()
         .filter(|event| event.fields.get("peer") == Some(&served.peer))
         .collect();
@@ -500,7 +435,7 @@ async fn the_lenders_served_line_names_the_peer_the_window_the_bytes_and_the_ms(
         1,
         "one served request, one line for this borrower ({}): {:?}",
         served.peer,
-        capture.events.lock().expect("capture lock").len()
+        capture.count()
     );
 
     let fields: Vec<&str> = lines[0]

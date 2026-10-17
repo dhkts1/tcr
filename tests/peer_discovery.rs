@@ -8,7 +8,6 @@
 //! Trust, which is why a first pairing is always `Noise_XX` with a six-digit
 //! compare.
 
-use tcr::log_err::LogErr as _;
 use tcr::peer::config::NetworkKey;
 use tcr::peer::discovery::{self, Discovered, FoundList};
 use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
@@ -468,14 +467,7 @@ fn a_row_that_stops_announcing_leaves_after_sixty_seconds() {
 /// A scratch directory per test, per process and per thread, so two tests here,
 /// and several lanes at once, never share a peers file.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-discovery-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
+    crate::peer_support::scratch_dir("discovery", tag)
 }
 
 /// One pinned row whose only endpoint is `addr`.

@@ -32,7 +32,7 @@
 //! process-and-thread-unique scratch directory, no address, account or key is
 //! real, and nothing touches the proxy on `127.0.0.1:3456`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tcr::log_err::LogErr as _;
 
@@ -51,44 +51,16 @@ use tcr_peer_wire::{
     Lease, LeaseUnit, LendScope, PeerId, StreamHeader, StreamKind, TunnelTarget, Window,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 /// A fixed instant for the FILE fixtures: when a row was pinned, when a lease
 /// was granted. Never the instant traffic is charged at: see the module docs.
 const PINNED_AT_MS: i64 = 1_767_225_600_000;
 
-/// A scratch directory named after this process and thread, so five lanes
-/// running at once never collide on one path.
+use crate::peer_support::{Node, dial_and_open, loopback, node, target_on};
+
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tcr-peer-path-acct-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_dir_all(&dir).log_debug("removing a test directory");
-    std::fs::create_dir_all(&dir).expect("create the scratch dir");
-    dir
-}
-
-/// One machine's key material, as a test holds it.
-struct Node {
-    secret: [u8; 32],
-    id: PeerId,
-}
-
-fn node() -> Node {
-    let (secret, public) = noise::generate_static().expect("mint a static keypair");
-    Node {
-        secret,
-        id: PeerId(public),
-    }
-}
-
-/// A listener on a kernel-chosen loopback port.
-async fn loopback() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a loopback listener")
+    crate::peer_support::scratch_dir("path-acct", tag)
 }
 
 /// A pinned row with the endpoints spelled out, which is the whole point here:
@@ -204,42 +176,6 @@ fn forwarder_on(
     })
 }
 
-/// A target that counts what reached it and answers a fixed string: a forwarder
-/// splices raw bytes and has no business knowing its target's protocol.
-#[derive(Clone, Default)]
-struct Target {
-    connections: Arc<AtomicUsize>,
-}
-
-fn target_on(listener: TcpListener, reply: Vec<u8>) -> Target {
-    let target = Target::default();
-    let watch = target.clone();
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            watch.connections.fetch_add(1, Ordering::SeqCst);
-            let reply = reply.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0_u8; 4096];
-                let mut answered = false;
-                loop {
-                    match socket.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(_) => {
-                            if !answered {
-                                answered = true;
-                                if socket.write_all(&reply).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    target
-}
-
 /// The requester's half: the outer session to the forwarder, the header, and
 /// the plaintext stream the forwarder splices onward.
 async fn ask_to_forward(
@@ -248,25 +184,7 @@ async fn ask_to_forward(
     forwarder: &Node,
     header: &StreamHeader,
 ) -> NoiseStream {
-    let mut stream = TcpStream::connect(forwarder_addr)
-        .await
-        .expect("dial the forwarder");
-    let mut session = noise::dial_handshake(
-        &mut stream,
-        &requester.secret,
-        Handshake::Return,
-        Some(&forwarder.id.0),
-        None,
-    )
-    .await
-    .expect("the outer handshake completes");
-    noise::send_encrypted(
-        &mut stream,
-        &mut session.transport,
-        &serde_json::to_vec(header).expect("the header serializes"),
-    )
-    .await
-    .expect("the header is written");
+    let (stream, session) = dial_and_open(forwarder_addr, requester, &forwarder.id, header).await;
     NoiseStream::start(stream, session)
 }
 
