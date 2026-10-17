@@ -4259,6 +4259,28 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    /// A [`CountingRefresher`] and the count it keeps.
+    fn refresh_counter() -> (Arc<CountingRefresher>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::clone(&calls),
+        });
+        (refresher, calls)
+    }
+
+    /// A [`CountingRefresher`] whose count no test reads.
+    fn counting_refresher() -> Arc<CountingRefresher> {
+        Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// A manager over `accounts` with the defaults [`build_manager`] gives:
+    /// a [`counting_refresher`], no prober, no warmer, no config file.
+    fn manager_of(accounts: Vec<Account>) -> Arc<Manager> {
+        build_manager(config_with(accounts), counting_refresher())
+    }
+
     impl TokenRefresher for CountingRefresher {
         fn refresh(
             &self,
@@ -4637,9 +4659,7 @@ mod tests {
     fn build_manager_with_path(config: Config, path: PathBuf) -> Arc<Manager> {
         Manager::new(
             config,
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
             Arc::new(NoProber),
             Arc::new(NoWarmer),
             Some(path),
@@ -4886,12 +4906,7 @@ mod tests {
     /// both `shutdown` and `Drop` can reach the same path.
     #[test]
     fn releasing_mutation_ownership_is_terminal_and_idempotent() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![account("a", 0)]);
         assert!(!manager.mutation_is_released(), "starts owning mutation");
         manager.release_mutation_ownership();
         assert!(manager.mutation_is_released());
@@ -4918,33 +4933,67 @@ mod tests {
         }
     }
 
+    /// Give `manager` a [`CountingPlanProber`] that answers `plan`, and return its call count.
+    fn count_plan_fetches(manager: &Manager, plan: crate::probe::Plan) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan,
+            calls: Arc::clone(&calls),
+        }));
+        calls
+    }
+
+    /// One Anthropic OAuth row, `alice@example.com`, that has no plan yet.
+    const ALICE_WITHOUT_A_PLAN: &str = r#"{ "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "refreshToken": "rt-a", "priority": 0 }
+    ] }"#;
+
+    /// One Codex row, `bob@example.com/codex`, on the `plus` plan.
+    const BOB_CODEX_ON_PLUS: &str = r#"{ "accounts": [
+        { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
+          "credentialVersion": 2,
+          "accountUuid": "22222222-2222-4222-8222-222222222222",
+          "organizationType": "plus", "groups": ["orchard"], "priority": 0,
+          "accessToken": "at-bob", "refreshToken": "rt-bob",
+          "expiresAt": 4102444800000 }
+    ] }"#;
+
+    /// `json` written to a fresh temp config path tagged `tag`.
+    fn config_file(tag: &str, json: &str) -> PathBuf {
+        let path = tmp_config_path(tag);
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    /// A manager over the config file at `path` that probes usage with `prober`.
+    fn manager_on_file(path: &std::path::Path, prober: Arc<dyn UsageProber>) -> Arc<Manager> {
+        Manager::new(
+            crate::config::load(path).unwrap(),
+            counting_refresher(),
+            prober,
+            Arc::new(NoWarmer),
+            Some(path.to_path_buf()),
+        )
+    }
+
     /// The reason this feature has a backfill at all: fifteen accounts logged in
     /// before the plan fields existed, and re-authenticating each in a browser is
     /// not an answer. One probe learns the plan, writes it to the runtime row AND
     /// to disk, and never asks again.
     #[tokio::test]
     async fn probing_backfills_a_missing_plan_once_and_persists_it() {
-        let path = tmp_config_path("plan-backfill");
-        std::fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
-                  "refreshToken": "rt-a", "priority": 0 }
-            ] }"#,
-        )
-        .unwrap();
-        let config = crate::config::load(&path).unwrap();
-        let manager = build_manager_with_path(config, path.clone());
+        let path = config_file("plan-backfill", ALICE_WITHOUT_A_PLAN);
+        let manager = manager_on_file(&path, Arc::new(NoProber));
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan {
+        let calls = count_plan_fetches(
+            &manager,
+            crate::probe::Plan {
                 organization_type: Some("claude_team".to_string()),
                 rate_limit_tier: Some("default_raven".to_string()),
                 seat_tier: Some("team_standard".to_string()),
             },
-            calls: Arc::clone(&calls),
-        }));
+        );
 
         manager.probe_account(0).await;
 
@@ -5007,36 +5056,12 @@ mod tests {
     /// runtime plan stays `plus`.
     #[tokio::test]
     async fn a_plus_to_pro_probe_updates_the_plan_and_saves_only_that_key() {
-        let path = tmp_config_path("codex-plan");
-        std::fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
-                  "credentialVersion": 2,
-                  "accountUuid": "22222222-2222-4222-8222-222222222222",
-                  "organizationType": "plus", "groups": ["orchard"], "priority": 0,
-                  "accessToken": "at-bob", "refreshToken": "rt-bob",
-                  "expiresAt": 4102444800000 }
-            ] }"#,
-        )
-        .unwrap();
+        let path = config_file("codex-plan", BOB_CODEX_ON_PLUS);
         let original = read_config_json(&path);
-        let manager = Manager::new(
-            crate::config::load(&path).unwrap(),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            Arc::new(CodexPlanProber { plan: "pro" }),
-            Arc::new(NoWarmer),
-            Some(path.clone()),
-        );
+        let manager = manager_on_file(&path, Arc::new(CodexPlanProber { plan: "pro" }));
         // The Anthropic profile endpoint is never this plan's source: a Codex row skips the
         // backfill, and the counting fake keeps the live endpoint out should that ever break.
-        let profile_calls = Arc::new(AtomicUsize::new(0));
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::clone(&profile_calls),
-        }));
+        let profile_calls = count_plan_fetches(&manager, crate::probe::Plan::default());
 
         manager.probe_account(0).await;
 
@@ -5102,6 +5127,26 @@ mod tests {
         (held, std::fs::read_to_string(path).unwrap())
     }
 
+    /// Nothing reaches the config file at `path` while another writer holds `config_write`,
+    /// and once it is released `probe_account(0)` has written `plan` to the row.
+    fn assert_the_plan_write_waits_for_the_write_lock(
+        manager: &Manager,
+        path: &std::path::Path,
+        plan: &str,
+    ) {
+        let before = std::fs::read_to_string(path).unwrap();
+        let (held, after) = config_while_and_after_the_write_lock(manager, path);
+        assert_eq!(
+            held, before,
+            "nothing reaches the file while another writer holds the lock"
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after["accounts"][0]["organizationType"], plan,
+            "once the lock is released, the plan is written"
+        );
+    }
+
     /// **The Codex plan write holds the config writers' lock** (INV1). `save_plan` reads the
     /// whole document, changes one key and writes the document back, so without the lock a
     /// read taken before another writer's rename and written after it puts back what that
@@ -5125,31 +5170,10 @@ mod tests {
             ] }"#,
         )
         .unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-        let manager = Manager::new(
-            crate::config::load(&path).unwrap(),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            Arc::new(CodexPlanProber { plan: "pro" }),
-            Arc::new(NoWarmer),
-            Some(path.clone()),
-        );
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        let manager = manager_on_file(&path, Arc::new(CodexPlanProber { plan: "pro" }));
+        count_plan_fetches(&manager, crate::probe::Plan::default());
 
-        let (held, after) = config_while_and_after_the_write_lock(&manager, &path);
-        assert_eq!(
-            held, before,
-            "nothing reaches the file while another writer holds the lock"
-        );
-        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(
-            after["accounts"][0]["organizationType"], "pro",
-            "once the lock is released, the plan is written"
-        );
+        assert_the_plan_write_waits_for_the_write_lock(&manager, &path, "pro");
         std::fs::remove_file(&path).ok();
     }
 
@@ -5159,36 +5183,18 @@ mod tests {
     /// Watched red: without the lock, the learned plan is on disk while the lock is still held.
     #[test]
     fn a_backfilled_plan_write_waits_for_the_config_write_lock() {
-        let path = tmp_config_path("plan-backfill-lock");
-        std::fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
-                  "refreshToken": "rt-a", "priority": 0 }
-            ] }"#,
-        )
-        .unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-        let manager = build_manager_with_path(crate::config::load(&path).unwrap(), path.clone());
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan {
+        let path = config_file("plan-backfill-lock", ALICE_WITHOUT_A_PLAN);
+        let manager = manager_on_file(&path, Arc::new(NoProber));
+        count_plan_fetches(
+            &manager,
+            crate::probe::Plan {
                 organization_type: Some("claude_team".to_string()),
                 rate_limit_tier: None,
                 seat_tier: None,
             },
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        );
 
-        let (held, after) = config_while_and_after_the_write_lock(&manager, &path);
-        assert_eq!(
-            held, before,
-            "nothing reaches the file while another writer holds the lock"
-        );
-        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(
-            after["accounts"][0]["organizationType"], "claude_team",
-            "once the lock is released, the plan is written"
-        );
+        assert_the_plan_write_waits_for_the_write_lock(&manager, &path, "claude_team");
         std::fs::remove_file(&path).ok();
     }
 
@@ -5212,35 +5218,15 @@ mod tests {
     #[tokio::test]
     async fn a_probe_with_an_empty_plan_type_leaves_the_plan_as_it_was() {
         for plan_type in ["", "   "] {
-            let path = tmp_config_path("codex-empty-plan");
-            std::fs::write(
-                &path,
-                r#"{ "accounts": [
-                    { "name": "bob@example.com/codex", "type": "oauth", "provider": "codex",
-                      "credentialVersion": 2,
-                      "accountUuid": "22222222-2222-4222-8222-222222222222",
-                      "organizationType": "plus", "groups": ["orchard"], "priority": 0,
-                      "accessToken": "at-bob", "refreshToken": "rt-bob",
-                      "expiresAt": 4102444800000 }
-                ] }"#,
-            )
-            .unwrap();
+            let path = config_file("codex-empty-plan", BOB_CODEX_ON_PLUS);
             let before = std::fs::read(&path).unwrap();
-            let manager = Manager::new(
-                crate::config::load(&path).unwrap(),
-                Arc::new(CountingRefresher {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                }),
+            let manager = manager_on_file(
+                &path,
                 Arc::new(CodexPayloadProber {
                     payload: serde_json::json!({ "plan_type": plan_type, "rate_limit": null }),
                 }),
-                Arc::new(NoWarmer),
-                Some(path.clone()),
             );
-            manager.set_plan_prober(Arc::new(CountingPlanProber {
-                plan: crate::probe::Plan::default(),
-                calls: Arc::new(AtomicUsize::new(0)),
-            }));
+            count_plan_fetches(&manager, crate::probe::Plan::default());
 
             manager.probe_account(0).await;
 
@@ -5273,26 +5259,13 @@ mod tests {
     /// must ask again next time rather than latching.
     #[tokio::test]
     async fn a_failed_plan_fetch_records_nothing_and_never_fails_the_probe() {
-        let path = tmp_config_path("plan-fetch-fails");
-        std::fs::write(
-            &path,
-            r#"{ "accounts": [
-                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
-                  "refreshToken": "rt-a", "priority": 0 }
-            ] }"#,
-        )
-        .unwrap();
-        let config = crate::config::load(&path).unwrap();
-        let manager = build_manager_with_path(config, path.clone());
+        let path = config_file("plan-fetch-fails", ALICE_WITHOUT_A_PLAN);
+        let manager = manager_on_file(&path, Arc::new(NoProber));
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            // An all-`None` reading is exactly what `fetch_profile` returns on
-            // any failure — network, non-2xx, or a malformed body.
-            plan: crate::probe::Plan::default(),
-            calls: Arc::clone(&calls),
-        }));
+        // An all-`None` reading is exactly what `fetch_profile` returns on
+        // any failure — network, non-2xx, or a malformed body.
+        let calls = count_plan_fetches(&manager, crate::probe::Plan::default());
 
         manager.probe_account(0).await;
 
@@ -5321,19 +5294,16 @@ mod tests {
     /// the probe loop never spends a request on it.
     #[tokio::test]
     async fn an_account_that_already_has_a_plan_is_never_re_fetched() {
-        let path = tmp_config_path("plan-already-known");
-        std::fs::write(
-            &path,
+        let path = config_file(
+            "plan-already-known",
             r#"{ "accounts": [
                 { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
                   "refreshToken": "rt-a", "priority": 0,
                   "organizationType": "claude_max",
                   "rateLimitTier": "default_claude_max_20x" }
             ] }"#,
-        )
-        .unwrap();
-        let config = crate::config::load(&path).unwrap();
-        let manager = build_manager_with_path(config, path.clone());
+        );
+        let manager = manager_on_file(&path, Arc::new(NoProber));
         assert_eq!(
             manager.accounts.read().expect("lock")[0]
                 .rate_limit_tier
@@ -5342,11 +5312,7 @@ mod tests {
             "the plan is read from config at boot, not only learned by probing"
         );
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::clone(&calls),
-        }));
+        let calls = count_plan_fetches(&manager, crate::probe::Plan::default());
 
         manager.probe_account(0).await;
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -5369,6 +5335,47 @@ mod tests {
         }
     }
 
+    /// Row `idx`'s `quotaUpdatedAtMs` in the `tcr.status.v1` payload the server would send now.
+    fn quota_updated_at_on_the_wire(manager: &Manager, idx: usize) -> Option<i64> {
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &snap,
+            &[],
+            false,
+            None,
+            Default::default(),
+        );
+        let json = serde_json::to_value(&payload).expect("payload serializes");
+        json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
+    }
+
+    /// An Anthropic row, `alice@example.com`, whose account uuid is all ones.
+    fn alice_with_an_account_uuid() -> Account {
+        Account {
+            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            ..account("alice@example.com", 0)
+        }
+    }
+
+    /// Probe each of `accounts` once, in order, and answer the credentials the probes carried.
+    /// The plan backfill gets a counting fake, so no row asks the live profile endpoint.
+    async fn probe_credentials_of(accounts: Vec<Account>) -> Vec<crate::probe::ProbeCredential> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let count = accounts.len();
+        let manager = build_manager_with_prober(
+            config_with(accounts),
+            counting_refresher(),
+            Arc::new(RecordingProber {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        count_plan_fetches(&manager, crate::probe::Plan::default());
+        for idx in 0..count {
+            manager.probe_account(idx).await;
+        }
+        seen.lock().expect("seen lock poisoned").clone()
+    }
+
     /// **A probe names the account it is for, not just the bearer it pays with.** The
     /// provider picks the usage endpoint, and a Codex probe must also send its ChatGPT
     /// account id in `chatgpt-account-id`, which is the row's `account_uuid`. An Anthropic
@@ -5379,37 +5386,13 @@ mod tests {
     /// account id is missing.
     #[tokio::test]
     async fn a_probe_credential_names_the_accounts_provider_and_account_uuid() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let anthropic = Account {
-            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
-            ..account("alice@example.com", 0)
-        };
         let codex = Account {
             provider: crate::provider::Provider::Codex,
             account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
             ..account("bob@example.com", 1)
         };
-        let manager = build_manager_with_prober(
-            config_with(vec![anthropic, codex]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            Arc::new(RecordingProber {
-                seen: Arc::clone(&seen),
-            }),
-        );
-        // The Anthropic row's plan backfill would otherwise ask the live profile endpoint.
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
-
-        manager.probe_account(0).await;
-        manager.probe_account(1).await;
-
-        let seen: Vec<_> = seen
-            .lock()
-            .expect("seen lock poisoned")
+        let seen: Vec<_> = probe_credentials_of(vec![alice_with_an_account_uuid(), codex])
+            .await
             .iter()
             .map(|c| (c.provider, c.access_token.clone(), c.account_id.clone()))
             .collect();
@@ -5439,11 +5422,6 @@ mod tests {
     /// Watched red: with the Codex arm reading `account_uuid`, bob's probe names his user.
     #[tokio::test]
     async fn a_codex_probe_names_the_workspace_and_falls_back_to_the_account_uuid() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let anthropic = Account {
-            account_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
-            ..account("alice@example.com", 0)
-        };
         let codex = Account {
             provider: crate::provider::Provider::Codex,
             account_uuid: Some("55555555-5555-4555-8555-555555555555".to_string()),
@@ -5455,27 +5433,8 @@ mod tests {
             account_uuid: Some("77777777-7777-4777-8777-777777777777".to_string()),
             ..account("carol@example.com", 2)
         };
-        let manager = build_manager_with_prober(
-            config_with(vec![anthropic, codex, older]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            Arc::new(RecordingProber {
-                seen: Arc::clone(&seen),
-            }),
-        );
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
-
-        for idx in 0..3 {
-            manager.probe_account(idx).await;
-        }
-
-        let seen: Vec<_> = seen
-            .lock()
-            .expect("seen lock poisoned")
+        let seen: Vec<_> = probe_credentials_of(vec![alice_with_an_account_uuid(), codex, older])
+            .await
             .iter()
             .map(|c| (c.provider, c.account_id.clone()))
             .collect();
@@ -5652,12 +5611,7 @@ mod tests {
             codex_home: Some("/Users/example/.codex".to_string()),
             ..codex_account("bob@example.com", 1)
         };
-        let manager = build_manager(
-            config_with(vec![account("alice@example.com", 0), codex]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![account("alice@example.com", 0), codex]);
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(snap.accounts[0].codex.codex_home, None);
         assert_eq!(
@@ -5760,7 +5714,7 @@ mod tests {
             account_uuid: Some("22222222-2222-4222-8222-222222222222".to_string()),
             ..account("bob@example.com", 0)
         };
-        let manager = build_manager(config_with(vec![codex]), lock_refresher());
+        let manager = manager_of(vec![codex]);
         let gone = manager.probe_credential(1, "at-bob@example.com".to_string());
         assert!(
             gone.is_none(),
@@ -5793,16 +5747,10 @@ mod tests {
         };
         let manager = build_manager_with_prober(
             config_with(vec![account("alice@example.com", 0), codex]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
             Arc::new(NoProber),
         );
-        let calls = Arc::new(AtomicUsize::new(0));
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::clone(&calls),
-        }));
+        let calls = count_plan_fetches(&manager, crate::probe::Plan::default());
 
         manager.probe_account(1).await;
         assert_eq!(
@@ -5900,10 +5848,7 @@ mod tests {
         );
         // The backfill skips a Codex row; should that ever break, this keeps the live
         // profile endpoint out of the test.
-        manager.set_plan_prober(Arc::new(CountingPlanProber {
-            plan: crate::probe::Plan::default(),
-            calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        count_plan_fetches(&manager, crate::probe::Plan::default());
         let codex_request = || {
             manager.select(
                 &HashSet::new(),
@@ -5974,6 +5919,20 @@ mod tests {
         );
     }
 
+    /// A manager over `alice@example.com` at priority 0, then one Codex row
+    /// `<name>@example.com/codex` per name, at priorities 1, 2, and on.
+    fn alice_then_codex_rows(names: &[&str]) -> Arc<Manager> {
+        let codex = names.iter().zip(1..).map(|(name, priority)| Account {
+            provider: crate::provider::Provider::Codex,
+            ..account(&format!("{name}@example.com/codex"), priority)
+        });
+        manager_of(
+            std::iter::once(account("alice@example.com", 0))
+                .chain(codex)
+                .collect(),
+        )
+    }
+
     /// Codex quota headers saying the weekly window (the only one the measured plan
     /// reports) is `used` percent spent, resetting a day out.
     fn codex_weekly(used: &str) -> reqwest::header::HeaderMap {
@@ -6006,23 +5965,12 @@ mod tests {
         };
         let manager = build_manager_with_prober(
             config_with(vec![account("alice@example.com", 0), codex]),
-            lock_refresher(),
+            counting_refresher(),
             Arc::new(RecordingProber {
                 seen: Arc::new(Mutex::new(Vec::new())),
             }),
         );
-        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
-            let snap = manager.snapshot(OffsetDateTime::now_utc());
-            let payload = crate::status::StatusPayload::from_snapshot(
-                &snap,
-                &[],
-                false,
-                None,
-                Default::default(),
-            );
-            let json = serde_json::to_value(&payload).expect("payload serializes");
-            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
-        };
+        let wire_value = quota_updated_at_on_the_wire;
         let stale = crate::now_ms() - 40 * 60 * 1000;
         let rewind = |manager: &Manager| {
             accounts_mut(manager)[1].quota.updated_at = Some(
@@ -6079,19 +6027,7 @@ mod tests {
     #[test]
     fn a_held_codex_account_gets_the_near_limit_probe_cadence() {
         use crate::schedule::ProbeUrgency;
-        let codex = |name: &str, priority: i64| Account {
-            provider: crate::provider::Provider::Codex,
-            ..account(name, priority)
-        };
-        let manager = build_manager(
-            config_with(vec![
-                account("alice@example.com", 0),
-                codex("bob@example.com/codex", 1),
-                codex("carol@example.com/codex", 2),
-                codex("dave@example.com/codex", 3),
-            ]),
-            lock_refresher(),
-        );
+        let manager = alice_then_codex_rows(&["bob", "carol", "dave"]);
         // bob: at its weekly limit, read from a served 200.
         manager.update_quota(1, &codex_weekly("97"), 200);
         // carol: a Codex quota refusal at half its weekly window.
@@ -6148,21 +6084,7 @@ mod tests {
     fn a_codex_refusal_keeps_the_near_limit_cadence_whatever_gate_its_row_reports() {
         use crate::schedule::ProbeUrgency;
         use crate::stats::{GateReason, QuotaState};
-        let codex = |name: &str, priority: i64| Account {
-            provider: crate::provider::Provider::Codex,
-            ..account(name, priority)
-        };
-        let manager = build_manager(
-            config_with(vec![
-                account("alice@example.com", 0),
-                codex("bob@example.com/codex", 1),
-                codex("carol@example.com/codex", 2),
-                codex("dave@example.com/codex", 3),
-                codex("erin@example.com/codex", 4),
-                codex("frank@example.com/codex", 5),
-            ]),
-            lock_refresher(),
-        );
+        let manager = alice_then_codex_rows(&["bob", "carol", "dave", "erin", "frank"]);
         let refusal = |mut headers: reqwest::header::HeaderMap| {
             headers.insert(
                 crate::quota::CODEX_REACHED_TYPE_HEADER,
@@ -6261,17 +6183,14 @@ mod tests {
     fn the_reached_type_is_present_exactly_while_the_refusal_stands() {
         use crate::codex_probe::CodexProbeFacts;
         use tcr_status_wire::CodexCredits;
-        let manager = build_manager(
-            config_with(vec![
-                Account {
-                    provider: crate::provider::Provider::Codex,
-                    account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
-                    ..account("bob@example.com", 0)
-                },
-                account("alice@example.com", 1),
-            ]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![
+            Account {
+                provider: crate::provider::Provider::Codex,
+                account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
+                ..account("bob@example.com", 0)
+            },
+            account("alice@example.com", 1),
+        ]);
         let snap = |idx: usize| manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].clone();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let now_ms = crate::now_ms();
@@ -6415,17 +6334,14 @@ mod tests {
     fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
         use crate::codex_probe::usage_from_payload;
         use serde_json::{Value, json};
-        let manager = build_manager(
-            config_with(vec![
-                Account {
-                    provider: crate::provider::Provider::Codex,
-                    account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
-                    ..account("bob@example.com", 0)
-                },
-                account("alice@example.com", 1),
-            ]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![
+            Account {
+                provider: crate::provider::Provider::Codex,
+                account_uuid: Some("22222222-2222-4222-8222-222222222222".into()),
+                ..account("bob@example.com", 0)
+            },
+            account("alice@example.com", 1),
+        ]);
         let gate = |idx: usize| {
             let row = manager.snapshot(OffsetDateTime::now_utc()).accounts[idx].clone();
             (row.gate, row.codex.limit_reached_type)
@@ -6663,7 +6579,7 @@ mod tests {
     fn group_preference_prefers_then_refuses_when_exhausted() {
         let grouped = account_in_groups("grouped", 5, &["codereview"]);
         let plain = account("plain", 0); // lower priority number sorts FIRST ordinarily
-        let manager = build_manager(config_with(vec![grouped, plain]), lock_refresher());
+        let manager = manager_of(vec![grouped, plain]);
         let now = OffsetDateTime::now_utc();
 
         // Sanity control: with NO group requested, priority ordering picks the
@@ -6745,7 +6661,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
         );
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         let now = OffsetDateTime::now_utc();
 
         // Confirm the preference still applies before exhausting the group —
@@ -6816,7 +6732,7 @@ mod tests {
         let plain = account("plain", 5); // worse priority — must lose ordinarily
         let manager = build_manager(
             config_with_reserved(vec![reserved_acct, plain], &["codereview"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -6826,13 +6742,10 @@ mod tests {
         );
 
         // Direction 2: same accounts, group NOT reserved — priority wins again.
-        let unreserved = build_manager(
-            config_with(vec![
-                account_in_groups("reserved-acct", 0, &["codereview"]),
-                account("plain", 5),
-            ]),
-            lock_refresher(),
-        );
+        let unreserved = manager_of(vec![
+            account_in_groups("reserved-acct", 0, &["codereview"]),
+            account("plain", 5),
+        ]);
         assert_eq!(
             unreserved.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(0),
@@ -6849,7 +6762,7 @@ mod tests {
         let plain = account("plain", 5);
         let manager = build_manager(
             config_with_reserved(vec![reserved_acct, plain], &["codereview"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -6888,7 +6801,7 @@ mod tests {
         let plain = account("plain", 0); // better priority — would win any pool pick
         let manager = build_manager(
             config_with_reserved(vec![reserved_acct, plain], &["codereview"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
 
@@ -6948,7 +6861,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
         );
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         let now = OffsetDateTime::now_utc();
 
         {
@@ -6993,7 +6906,7 @@ mod tests {
         let outsider = account("outsider", 1);
         let manager = build_manager(
             config_with_reserved(vec![member, outsider], &["codereview"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         manager.mark_rate_limited(0, 600); // the group's member
         manager.mark_rate_limited(1, 60); // an unrelated account, free much sooner
@@ -7031,7 +6944,7 @@ mod tests {
         let plain = account("plain", 5);
         let manager = build_manager(
             config_with_reserved(vec![multi, plain], &["codereview"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -7105,7 +7018,7 @@ mod tests {
         let plain = account("plain", 5); // worse priority — must lose ordinarily
         let manager = build_manager(
             config_with_parked(vec![parked_acct, plain], &["codereview"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -7135,7 +7048,7 @@ mod tests {
                 vec![account_in_groups("parked-acct", 0, &["codereview"])],
                 &["codereview"],
             ),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(
             only_parked.select_with_group(
@@ -7157,29 +7070,15 @@ mod tests {
     /// group's pin gets, because `parked_blocks` sits inside `account_hard_ok`.
     #[test]
     fn pin_reclaim_when_the_pinned_accounts_group_is_parked() {
-        let acct = account_in_groups("acct", 0, &["codereview"]);
-        let other = account("other", 5);
         let manager = build_manager(
-            config_with_parked(vec![acct, other], &["codereview"]),
-            lock_refresher(),
+            config_with_parked(codereview_acct_and_other(), &["codereview"]),
+            counting_refresher(),
         );
-        let now = OffsetDateTime::now_utc();
-        let now_ms = odt_to_ms(now);
         let key = 4242u64;
-        {
-            let mut affinity = manager.affinity.lock().expect("affinity lock poisoned");
-            affinity.insert(key, (0, now_ms));
-        }
-        let served = manager
-            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+        let served = select_with_a_fresh_pin_on_the_first_account(&manager, key)
             .expect("the unparked account is still eligible");
         assert_eq!(served, 1, "a parked account must not keep serving its pin");
-        let pinned_now = manager
-            .affinity
-            .lock()
-            .expect("affinity lock poisoned")
-            .get(&key)
-            .map(|&(idx, _)| idx);
+        let pinned_now = pin_of(&manager, key);
         assert_eq!(
             pinned_now,
             Some(1),
@@ -7193,10 +7092,7 @@ mod tests {
     /// measured rather than assumed.
     #[test]
     fn reload_picks_up_a_group_being_parked() {
-        let path = tmp_config_path("reload-group-park");
-        let boot = reload_config(&[("acct", 0, &["codereview"]), ("other", 5, &[])]);
-        config::save(&path, &boot).expect("write initial reload config");
-        let manager = build_manager_with_path(boot, path.clone());
+        let (path, manager) = acct_and_other_on_disk("reload-group-park");
 
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -7206,13 +7102,7 @@ mod tests {
         );
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let parked_config = config_with_parked(
-            vec![
-                account_in_groups("acct", 0, &["codereview"]),
-                account("other", 5),
-            ],
-            &["codereview"],
-        );
+        let parked_config = config_with_parked(codereview_acct_and_other(), &["codereview"]);
         config::save(&path, &parked_config).expect("write parked reload config");
 
         assert_eq!(
@@ -7252,7 +7142,7 @@ mod tests {
                 ],
                 &["codereview"],
             ),
-            lock_refresher(),
+            counting_refresher(),
         );
         let snapshot = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(
@@ -7312,7 +7202,7 @@ mod tests {
 
         let blocked = build_manager(
             config_with_control(vec![control.clone(), other.clone()], "control-acct"),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -7346,7 +7236,7 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
         );
-        let opted_in = build_manager(opted_in_config, lock_refresher());
+        let opted_in = build_manager(opted_in_config, counting_refresher());
         assert_eq!(
             opted_in.select_with_group(
                 &HashSet::new(),
@@ -7371,7 +7261,7 @@ mod tests {
         let other = account("other", 5);
         let manager = build_manager(
             config_with_control_allowed(vec![control, other], "control-acct", &["research"]),
-            lock_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -7391,22 +7281,12 @@ mod tests {
     /// predates the reservation" sentence describes.
     #[test]
     fn pin_reclaim_when_the_pinned_accounts_group_is_reserved() {
-        let acct = account_in_groups("acct", 0, &["codereview"]);
-        let other = account("other", 5);
         let manager = build_manager(
-            config_with_reserved(vec![acct, other], &["codereview"]),
-            lock_refresher(),
+            config_with_reserved(codereview_acct_and_other(), &["codereview"]),
+            counting_refresher(),
         );
-        let now = OffsetDateTime::now_utc();
-        let now_ms = odt_to_ms(now);
         let key = 4242u64;
-        {
-            let mut affinity = manager.affinity.lock().expect("affinity lock poisoned");
-            affinity.insert(key, (0, now_ms));
-        }
-
-        let served = manager
-            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+        let served = select_with_a_fresh_pin_on_the_first_account(&manager, key)
             .expect("the plain account is still eligible");
         assert_eq!(
             served, 1,
@@ -7416,12 +7296,7 @@ mod tests {
         // The pin itself must have MOVED — "reservation is not a preference":
         // an ordinary per-request divert would leave the OLD index pinned and
         // only serve elsewhere for this one request; that is NOT enough here.
-        let pinned_now = manager
-            .affinity
-            .lock()
-            .expect("affinity lock poisoned")
-            .get(&key)
-            .map(|&(idx, _)| idx);
+        let pinned_now = pin_of(&manager, key);
         assert_eq!(
             pinned_now,
             Some(1),
@@ -7429,7 +7304,32 @@ mod tests {
         );
     }
 
+    /// Pin session `key` to account 0 as of now, then select for it with nothing tried.
+    fn select_with_a_fresh_pin_on_the_first_account(manager: &Manager, key: u64) -> Option<usize> {
+        let now = OffsetDateTime::now_utc();
+        seed_pin(manager, key, 0, odt_to_ms(now));
+        manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+    }
+
     // ---- live group reload (problem 1: group edits appear to do nothing) ------
+
+    /// `acct` at priority 0 in group `codereview`, then `other` at priority 5 in no group.
+    fn codereview_acct_and_other() -> Vec<Account> {
+        vec![
+            account_in_groups("acct", 0, &["codereview"]),
+            account("other", 5),
+        ]
+    }
+
+    /// A manager booted from a config file tagged `tag` that holds
+    /// [`codereview_acct_and_other`] and nothing parked or reserved, and that file's path.
+    fn acct_and_other_on_disk(tag: &str) -> (PathBuf, Arc<Manager>) {
+        let path = tmp_config_path(tag);
+        let boot = config_with(codereview_acct_and_other());
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+        (path, manager)
+    }
 
     /// A `Config` with one account per `(name, priority, groups)` tuple —
     /// `groups = &[]` means no `groups` key, matching [`account`]/
@@ -7746,29 +7646,16 @@ mod tests {
     /// re-keyed on its next unrequested `select`.
     #[test]
     fn reload_re_keys_a_pin_when_its_group_becomes_reserved() {
-        let path = tmp_config_path("reload-pin-reclaim");
-        let boot = reload_config(&[("acct", 0, &["codereview"]), ("other", 5, &[])]);
-        config::save(&path, &boot).expect("write initial reload config");
-        let manager = build_manager_with_path(boot, path.clone());
+        let (path, manager) = acct_and_other_on_disk("reload-pin-reclaim");
 
         let now = OffsetDateTime::now_utc();
-        let now_ms = odt_to_ms(now);
         let key = 9191u64;
-        {
-            let mut affinity = manager.affinity.lock().expect("affinity lock poisoned");
-            affinity.insert(key, (0, now_ms));
-        }
+        seed_pin(&manager, key, 0, odt_to_ms(now));
 
         // Reserve 'codereview' via a fresh file write — no construction-time
         // reservation at all, unlike the sibling test above.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let reserved_config = config_with_reserved(
-            vec![
-                account_in_groups("acct", 0, &["codereview"]),
-                account("other", 5),
-            ],
-            &["codereview"],
-        );
+        let reserved_config = config_with_reserved(codereview_acct_and_other(), &["codereview"]);
         config::save(&path, &reserved_config).expect("write reserved reload config");
 
         let served = manager
@@ -7778,12 +7665,7 @@ mod tests {
             served, 1,
             "a group reserved via RELOAD must not keep serving an unrequested pinned session"
         );
-        let pinned_now = manager
-            .affinity
-            .lock()
-            .expect("affinity lock poisoned")
-            .get(&key)
-            .map(|&(idx, _)| idx);
+        let pinned_now = pin_of(&manager, key);
         assert_eq!(
             pinned_now,
             Some(1),
@@ -7866,12 +7748,6 @@ mod tests {
 
     // ---- hard account lock (`lockAccount`; no failover) -----------------------
 
-    fn lock_refresher() -> Arc<CountingRefresher> {
-        Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
     fn config_with_lock(accounts: Vec<Account>, lock: &str) -> Config {
         let mut config = config_with(accounts);
         config.lock_account = Some(lock.to_string());
@@ -7893,7 +7769,7 @@ mod tests {
                 vec![account("zero", 0), account("one", 0), account("two", 0)],
                 "one",
             ),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(manager.locked_idx, Some(1));
         let now = OffsetDateTime::now_utc();
@@ -7922,7 +7798,7 @@ mod tests {
     fn select_lock_returns_none_when_locked_tried() {
         let manager = build_manager(
             config_with_lock(vec![account("zero", 0), account("one", 0)], "one"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(manager.locked_idx, Some(1));
         let now = OffsetDateTime::now_utc();
@@ -7940,13 +7816,13 @@ mod tests {
     fn assemble_resolves_lock_name() {
         let matched = build_manager(
             config_with_lock(vec![account("a", 0), account("b", 0), account("c", 0)], "c"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(matched.locked_idx, Some(2));
 
         let unmatched = build_manager(
             config_with_lock(vec![account("a", 0), account("b", 0)], "ghost"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(unmatched.locked_idx, None);
     }
@@ -7954,7 +7830,7 @@ mod tests {
     /// Absent `lockAccount` → `locked_idx == None` → select is unchanged.
     #[test]
     fn unlocked_default_leaves_locked_idx_none() {
-        let manager = build_manager(config_with(vec![account("solo", 0)]), lock_refresher());
+        let manager = manager_of(vec![account("solo", 0)]);
         assert_eq!(manager.locked_idx, None);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -7970,13 +7846,13 @@ mod tests {
     fn assemble_resolves_control_name() {
         let matched = build_manager(
             config_with_control(vec![account("a", 0), account("b", 0), account("c", 0)], "c"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(matched.control(), Some(2));
 
         let unmatched = build_manager(
             config_with_control(vec![account("a", 0), account("b", 0)], "ghost"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(unmatched.control(), None);
     }
@@ -8000,7 +7876,7 @@ mod tests {
                 vec![account("alice@example.com", 0), codex],
                 "bob@example.com",
             ),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(
             manager.control(),
@@ -8016,7 +7892,7 @@ mod tests {
                 ],
                 "bob@example.com",
             ),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(
             anthropic.control(),
@@ -8032,7 +7908,7 @@ mod tests {
         let mut config = config_with(vec![account("alice@example.com", 0)]);
         config.upstream = "http://anthropic.test".to_string();
         config.codex_upstream = "http://codex.test".to_string();
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         assert_eq!(
             manager.upstream_for(crate::provider::Provider::Anthropic),
             "http://anthropic.test"
@@ -8060,10 +7936,7 @@ mod tests {
             provider: crate::provider::Provider::Codex,
             ..account("bob@example.com", 0)
         };
-        let manager = build_manager(
-            config_with(vec![account("alice@example.com", 0), codex]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("alice@example.com", 0), codex]);
         assert_eq!(
             manager.provider(0),
             Some(crate::provider::Provider::Anthropic)
@@ -8088,7 +7961,7 @@ mod tests {
             ..account("dup@example.com", 0)
         };
         let config = config_with_control(vec![dup_a, dup_b], "dup@example.com");
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         assert_eq!(
             manager.control(),
             None,
@@ -8118,7 +7991,7 @@ mod tests {
             org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             org_name: None,
         });
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         assert_eq!(
             manager.control(),
             Some(1),
@@ -8194,7 +8067,7 @@ mod tests {
     /// Absent `controlAccount` → `control() == None`.
     #[test]
     fn control_absent_default_leaves_control_none() {
-        let manager = build_manager(config_with(vec![account("solo", 0)]), lock_refresher());
+        let manager = manager_of(vec![account("solo", 0)]);
         assert_eq!(manager.control(), None);
     }
 
@@ -8220,13 +8093,10 @@ mod tests {
     /// covers the (expected) non-inference side changing.
     #[test]
     fn setting_a_control_account_does_not_change_selection() {
-        let without_control = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let without_control = manager_of(vec![account("a", 0), account("b", 0)]);
         let with_control = build_manager(
             config_with_control(vec![account("a", 0), account("b", 0)], "a"),
-            lock_refresher(),
+            counting_refresher(),
         );
         // Realistic deployment shape: the control account stays `disabled` —
         // see the doc-comment above for why this is what keeps the invariant
@@ -8262,13 +8132,10 @@ mod tests {
     /// it now prefers the control account, byte-different from `without_control`.
     #[test]
     fn control_preference_prefers_control_for_non_inference_paths() {
-        let without_control = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let without_control = manager_of(vec![account("a", 0), account("b", 0)]);
         let with_control = build_manager(
             config_with_control(vec![account("a", 0), account("b", 0)], "b"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(with_control.control(), Some(1));
 
@@ -8295,10 +8162,7 @@ mod tests {
     /// the control preference, even after control is set at runtime.
     #[test]
     fn control_preference_never_moves_an_existing_pin() {
-        let manager = build_manager(
-            config_with(vec![account("pool", 0), account("ctrl", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("pool", 0), account("ctrl", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 555u64;
         // Pin session `key` to account 0 (pool) BEFORE any control account
@@ -8346,10 +8210,7 @@ mod tests {
     /// `Some(_)` when the overlay's `keep_pin.is_none()` gate is checked.
     #[test]
     fn control_preference_never_moves_a_diverted_pin() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 777u64;
         let pinned = manager
@@ -8421,7 +8282,7 @@ mod tests {
     fn control_is_picked_even_though_disabled() {
         let manager = build_manager(
             config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
-            lock_refresher(),
+            counting_refresher(),
         );
         manager.set_disabled(1, true);
         assert_eq!(manager.control(), Some(1));
@@ -8437,7 +8298,7 @@ mod tests {
     fn control_is_not_picked_when_errored() {
         let manager = build_manager(
             config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
-            lock_refresher(),
+            counting_refresher(),
         );
         manager.set_disabled(1, true);
         {
@@ -8456,7 +8317,7 @@ mod tests {
     fn control_is_not_picked_when_rejected() {
         let manager = build_manager(
             config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
-            lock_refresher(),
+            counting_refresher(),
         );
         manager.set_disabled(1, true);
         {
@@ -8475,7 +8336,7 @@ mod tests {
     fn control_is_not_picked_when_rate_limited() {
         let manager = build_manager(
             config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
-            lock_refresher(),
+            counting_refresher(),
         );
         manager.set_disabled(1, true);
         let now = OffsetDateTime::now_utc();
@@ -8498,7 +8359,7 @@ mod tests {
     fn inference_never_goes_to_control_even_when_unpinned() {
         let manager = build_manager(
             config_with_control(vec![account("ctrl", 0), account("pool", 0)], "ctrl"),
-            lock_refresher(),
+            counting_refresher(),
         );
         assert_eq!(manager.control(), Some(0));
         let now = OffsetDateTime::now_utc();
@@ -8520,7 +8381,7 @@ mod tests {
     fn pooled_control_account_takes_inference() {
         let mut config = config_with_control(vec![account("ctrl", 0), account("pool", 0)], "ctrl");
         config.control_pooled = true;
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         assert_eq!(manager.control(), Some(0));
         let now = OffsetDateTime::now_utc();
         let reached_control = (0..10).any(|_| {
@@ -8545,7 +8406,7 @@ mod tests {
     fn pooled_control_account_is_held_out_by_the_reserve() {
         let mut config = config_with_control(vec![account("ctrl", 0), account("pool", 0)], "ctrl");
         config.control_pooled = true;
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         let now = OffsetDateTime::now_utc();
         {
             let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
@@ -8568,10 +8429,7 @@ mod tests {
     /// served.
     #[test]
     fn noise_path_follows_its_connection() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         let now = OffsetDateTime::now_utc();
         let conn = 42u64;
         let first = manager
@@ -8605,10 +8463,7 @@ mod tests {
     /// new winner (not left stale on the held account).
     #[test]
     fn noise_path_falls_back_when_its_account_is_held() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
         let conn = 7u64;
@@ -8661,7 +8516,7 @@ mod tests {
     fn identity_path_still_goes_to_control_on_the_same_connection() {
         let manager = build_manager(
             config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
-            lock_refresher(),
+            counting_refresher(),
         );
         manager.set_disabled(1, true);
         let now = OffsetDateTime::now_utc();
@@ -8697,10 +8552,7 @@ mod tests {
     /// it, mirroring `Self::affinity`'s own persistence contract.
     #[test]
     fn conn_affinity_is_never_persisted() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         assert!(!manager.affinity_file.is_dirty());
         let now = OffsetDateTime::now_utc();
         for i in 0..5u64 {
@@ -8731,10 +8583,7 @@ mod tests {
     /// changes nothing about ordinary LRU.
     #[test]
     fn control_preference_is_inert_when_unset() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         assert_eq!(manager.control(), None);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -8751,7 +8600,7 @@ mod tests {
         let mut config =
             config_with_control(vec![account("locked", 0), account("ctrl", 0)], "ctrl");
         config.lock_account = Some("locked".to_string());
-        let manager = build_manager(config, lock_refresher());
+        let manager = build_manager(config, counting_refresher());
         assert_eq!(manager.locked_idx, Some(0));
         assert_eq!(manager.control(), Some(1));
         let now = OffsetDateTime::now_utc();
@@ -8767,10 +8616,7 @@ mod tests {
     /// and a `None` query clears it.
     #[test]
     fn set_control_by_query_resolves_sets_and_clears() {
-        let manager = build_manager(
-            config_with(vec![account("gil", 0), account("other", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("gil", 0), account("other", 0)]);
 
         let outcome = manager.set_control_by_query(Some("gil"));
         assert_eq!(
@@ -8808,10 +8654,7 @@ mod tests {
             provider: crate::provider::Provider::Codex,
             ..account("bob@example.com/codex", 0)
         };
-        let manager = build_manager(
-            config_with(vec![account("alice@example.com", 0), codex]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("alice@example.com", 0), codex]);
         let refused = SetControlOutcome::CodexAccount("bob@example.com/codex".to_string());
         assert_eq!(
             manager.set_control_by_query(Some("bob@example.com/codex")),
@@ -8838,10 +8681,7 @@ mod tests {
 
     #[test]
     fn set_control_by_query_no_match_and_ambiguous() {
-        let manager = build_manager(
-            config_with(vec![account("dup", 0), account("dup", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("dup", 0), account("dup", 0)]);
         assert_eq!(
             manager.set_control_by_query(Some("ghost")),
             SetControlOutcome::NoMatch
@@ -8859,13 +8699,10 @@ mod tests {
 
     #[test]
     fn account_uuid_accessor_returns_configured_value() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let mut with_uuid = account("has-uuid", 0);
         with_uuid.account_uuid = Some("abcdef01-2345-6789-abcd-ef0123456789".to_string());
         let without_uuid = account("no-uuid", 0);
-        let manager = build_manager(config_with(vec![with_uuid, without_uuid]), refresher);
+        let manager = manager_of(vec![with_uuid, without_uuid]);
 
         assert_eq!(
             manager.account_uuid(0).as_deref(),
@@ -8878,18 +8715,12 @@ mod tests {
 
     // ---- per-account request pacing (default-OFF; soft; RAII in-flight) --------
 
-    fn pacing_refresher() -> Arc<CountingRefresher> {
-        Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
     /// #1 Default-OFF is inert: an account that WOULD be paced (saturated
     /// in_flight + just served) is still selected exactly as before, so an
     /// unconfigured proxy is byte-identical to the pre-pacing build.
     #[test]
     fn pacing_off_is_inert() {
-        let manager = build_manager(config_with(vec![account("solo", 0)]), pacing_refresher());
+        let manager = manager_of(vec![account("solo", 0)]);
         {
             let mut a = manager.accounts.write().expect("accounts lock poisoned");
             a[0].in_flight = 5; // would exceed any cap …
@@ -8913,7 +8744,7 @@ mod tests {
         };
         let manager = build_manager(
             config_with_pacing(vec![account("busy", 0), account("free", 0)], pacing),
-            pacing_refresher(),
+            counting_refresher(),
         );
         {
             let mut a = manager.accounts.write().expect("accounts lock poisoned");
@@ -8938,7 +8769,7 @@ mod tests {
         };
         let manager = build_manager(
             config_with_pacing(vec![account("a", 0)], pacing.clone()),
-            pacing_refresher(),
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
@@ -8998,7 +8829,7 @@ mod tests {
         };
         let manager = build_manager(
             config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
-            pacing_refresher(),
+            counting_refresher(),
         );
         {
             let mut a = manager.accounts.write().expect("accounts lock poisoned");
@@ -9018,7 +8849,7 @@ mod tests {
     /// exit can leak a counter and strand an account.
     #[test]
     fn in_flight_guard_decrements_on_drop() {
-        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let manager = manager_of(vec![account("a", 0)]);
         {
             let _guard = manager.enter_in_flight(0);
             assert_eq!(
@@ -9046,7 +8877,7 @@ mod tests {
     /// doc-comment forbids.
     #[test]
     fn the_upstream_client_is_recycled_once_its_serve_budget_is_spent() {
-        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let manager = manager_of(vec![account("a", 0)]);
         let original = manager.http_client(0).expect("account 0 exists");
 
         for _ in 0..(MAX_SERVES_PER_CONNECTION - 1) {
@@ -9086,10 +8917,7 @@ mod tests {
     /// second send after the same sleep keeps the client the first one built.
     #[test]
     fn every_upstream_client_is_retired_on_the_first_send_after_a_sleep() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         let clients = |m: &Manager| -> Vec<Arc<reqwest::Client>> {
             (0..3)
                 .map(|i| m.http_client(i).expect("account exists"))
@@ -9137,7 +8965,7 @@ mod tests {
     fn in_flight_guard_lifetime_follows_stream_not_scope() {
         use futures::StreamExt;
 
-        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let manager = manager_of(vec![account("a", 0)]);
 
         // Build the guarded stream exactly as the SSE passthrough does: move the owned
         // guard into a `move` map closure so the stream body OWNS it. The `&guard`
@@ -9192,7 +9020,7 @@ mod tests {
 
         let manager = build_manager(
             config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
-            pacing_refresher(),
+            counting_refresher(),
         );
         {
             let mut a = manager.accounts.write().expect("accounts lock poisoned");
@@ -9232,13 +9060,7 @@ mod tests {
 
     #[test]
     fn select_prefers_lower_priority_value() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("low-pri", 5), account("high-pri", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("low-pri", 5), account("high-pri", 0)]);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
@@ -9248,13 +9070,7 @@ mod tests {
 
     #[test]
     fn select_skips_disabled_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         manager.set_disabled(0, true);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -9265,13 +9081,7 @@ mod tests {
 
     #[test]
     fn select_skips_rate_limited_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         manager.mark_rate_limited(0, 300);
         let now = OffsetDateTime::now_utc();
         assert_eq!(
@@ -9282,13 +9092,7 @@ mod tests {
 
     #[test]
     fn select_skips_account_over_threshold() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         // Drive account 0 over the 0.90 threshold via real headers.
         let reset = (now + Duration::hours(1)).unix_timestamp();
@@ -9310,10 +9114,7 @@ mod tests {
 
     #[test]
     fn select_returns_none_when_all_tried() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         let now = OffsetDateTime::now_utc();
         let tried: HashSet<usize> = [0].into_iter().collect();
         assert_eq!(
@@ -9330,13 +9131,17 @@ mod tests {
     /// same-millisecond burst still rotates.
     #[test]
     fn select_spreads_load_across_a_priority_tier() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            refresher,
+        assert_eq!(
+            six_sessionless_selects_over_one_tier_of_three(),
+            [2, 2, 2],
+            "load must spread evenly across the tier, not pin one account"
         );
+    }
+
+    /// How many of six selects with no session key, at one fixed `now`, landed on each of
+    /// three accounts that share priority 0.
+    fn six_sessionless_selects_over_one_tier_of_three() -> [usize; 3] {
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         let now = OffsetDateTime::now_utc();
         let mut counts = [0usize; 3];
         for _ in 0..6 {
@@ -9345,11 +9150,7 @@ mod tests {
                 .expect("an account is eligible");
             counts[idx] += 1;
         }
-        assert_eq!(
-            counts,
-            [2, 2, 2],
-            "load must spread evenly across the tier, not pin one account"
-        );
+        counts
     }
 
     /// Priority still dominates the spread: a lower-priority-value account is
@@ -9357,13 +9158,7 @@ mod tests {
     /// load-balancing is *within* a tier, never across tiers.
     #[test]
     fn select_spread_respects_priority_tiers() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("primary", 0), account("pillow", 10)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("primary", 0), account("pillow", 10)]);
         let now = OffsetDateTime::now_utc();
         for _ in 0..5 {
             assert_eq!(
@@ -9389,12 +9184,10 @@ mod tests {
         ));
         let n = 8usize;
         let accts: Vec<Account> = (0..n).map(|i| account(&format!("a{i}"), 0)).collect();
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
+
         let manager = Manager::new(
             config_with(accts),
-            refresher,
+            counting_refresher(),
             Arc::new(NoProber),
             Arc::new(NoWarmer),
             Some(tmp.clone()),
@@ -9520,10 +9313,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_ensure_fresh_coalesces_to_single_refresh() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
+        let (refresher, calls) = refresh_counter();
         let mut acct = account("expired", 0);
         acct.expires_at = Some(crate::now_ms() - 60_000); // already expired
         let manager = build_manager(config_with(vec![acct]), refresher);
@@ -9547,10 +9337,7 @@ mod tests {
     /// so a burst of 401s never rotates the refresh token N times back-to-back.
     #[tokio::test]
     async fn concurrent_ensure_fresh_force_coalesces_to_single_refresh() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
+        let (refresher, calls) = refresh_counter();
         // A perfectly valid (unexpired) token — only `force` drives the refresh.
         let manager = build_manager(config_with(vec![account("valid", 0)]), refresher);
 
@@ -9637,10 +9424,7 @@ mod tests {
     /// test proves refresh actually fires for it, not just that the call returns.
     #[tokio::test]
     async fn appended_account_refreshes() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
+        let (refresher, calls) = refresh_counter();
         // Seed with one pre-existing account so the appended one is NOT index 0 —
         // the desync this guards against only bites an index beyond the
         // construction-time Vec's length.
@@ -9738,9 +9522,6 @@ mod tests {
     /// asserting the base case: an ordinary disabled account is skipped.
     #[tokio::test]
     async fn probe_all_skips_disabled_and_errored_accounts() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let prober = Arc::new(ScriptedProber {
             ok_token: "at-ok".to_string(),
         });
@@ -9750,7 +9531,7 @@ mod tests {
                 account("off", 0),
                 account("dead", 0),
             ]),
-            refresher,
+            counting_refresher(),
             prober,
         );
         manager.set_disabled(1, true);
@@ -9782,13 +9563,7 @@ mod tests {
     /// even though it is deliberately out of the inference rotation.
     #[test]
     fn probeable_indices_still_includes_a_disabled_control_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("ok", 0), account("gil", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("ok", 0), account("gil", 0)]);
         manager.set_control_by_query(Some("gil"));
         manager.set_disabled(1, true);
 
@@ -9804,13 +9579,7 @@ mod tests {
     /// `probeable_indices()`.
     #[test]
     fn probeable_indices_excludes_a_disabled_non_control_account_even_with_a_control_set() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("gil", 0), account("ok", 0), account("off", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("gil", 0), account("ok", 0), account("off", 0)]);
         manager.set_control_by_query(Some("gil"));
         manager.set_disabled(0, true); // the control account itself, disabled
         manager.set_disabled(2, true); // an unrelated account, disabled
@@ -9826,10 +9595,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_fresh_skips_when_token_still_valid() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
+        let (refresher, calls) = refresh_counter();
         // Default account expiry is 1h out — not hard-expired.
         let manager = build_manager(config_with(vec![account("valid", 0)]), refresher);
         manager.ensure_fresh(0).await;
@@ -9883,11 +9649,7 @@ mod tests {
     /// throttle can never be clobbered by a success-path clear.
     #[tokio::test]
     async fn forced_success_re_arms_refresh_cooldown() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
-        let manager = build_manager(config_with(vec![account("valid", 0)]), refresher);
+        let manager = manager_of(vec![account("valid", 0)]);
         let before = crate::now_ms();
         assert!(
             manager.ensure_fresh_force(0).await,
@@ -9907,10 +9669,7 @@ mod tests {
     /// within the cooldown window collapse to exactly ONE upstream POST.
     #[tokio::test]
     async fn sequential_forced_refresh_within_cooldown_posts_once() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
+        let (refresher, calls) = refresh_counter();
         let manager = build_manager(config_with(vec![account("valid", 0)]), refresher);
         assert!(
             manager.ensure_fresh_force(0).await,
@@ -9939,12 +9698,7 @@ mod tests {
     fn hard_expired_force_override_intact_in_plan() {
         let mut acct = account("expired", 0);
         acct.expires_at = Some(crate::now_ms() - 60_000);
-        let manager = build_manager(
-            config_with(vec![acct]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![acct]);
         let now = crate::now_ms();
         {
             let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
@@ -9959,12 +9713,7 @@ mod tests {
         // cooldown STAYS suppressed (the U1 proactive path never overrides).
         let mut soon = account("soon", 0);
         soon.expires_at = Some(now + 60_000);
-        let soon_mgr = build_manager(
-            config_with(vec![soon]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let soon_mgr = manager_of(vec![soon]);
         {
             let mut accounts = soon_mgr.accounts.write().expect("accounts lock poisoned");
             accounts[0].refresh_retry_after_ms = Some(now + REFRESH_RETRY_COOLDOWN_MS);
@@ -9979,10 +9728,7 @@ mod tests {
     /// is allowed again — the throttle self-clears by time, never suppress-forever.
     #[tokio::test]
     async fn forced_refresh_allowed_after_cooldown_elapses() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
-            calls: calls.clone(),
-        });
+        let (refresher, calls) = refresh_counter();
         let manager = build_manager(config_with(vec![account("valid", 0)]), refresher);
         assert!(manager.ensure_fresh_force(0).await);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -10006,16 +9752,13 @@ mod tests {
     /// credential, is unhappy), and it must not fabricate a fresh bar.
     #[tokio::test]
     async fn probe_all_updates_every_account_and_records_failures() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         // Account 0's token ("at-ok") probes OK; account 1's does not.
         let prober = Arc::new(ScriptedProber {
             ok_token: "at-ok".to_string(),
         });
         let manager = build_manager_with_prober(
             config_with(vec![account("ok", 0), account("bad", 0)]),
-            refresher,
+            counting_refresher(),
             prober,
         );
 
@@ -10050,25 +9793,12 @@ mod tests {
     async fn quota_updated_at_is_the_newest_reading_from_probe_or_headers() {
         let manager = build_manager_with_prober(
             config_with(vec![account("ok", 0), account("bad", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
             Arc::new(ScriptedProber {
                 ok_token: "at-ok".to_string(),
             }),
         );
-        let wire_value = |manager: &Manager, idx: usize| -> Option<i64> {
-            let snap = manager.snapshot(OffsetDateTime::now_utc());
-            let payload = crate::status::StatusPayload::from_snapshot(
-                &snap,
-                &[],
-                false,
-                None,
-                Default::default(),
-            );
-            let json = serde_json::to_value(&payload).expect("payload serializes");
-            json["accounts"][idx]["quotaUpdatedAtMs"].as_i64()
-        };
+        let wire_value = quota_updated_at_on_the_wire;
 
         // Nothing read yet: absent, never a fabricated "just now".
         assert_eq!(wire_value(&manager, 0), None);
@@ -10165,14 +9895,14 @@ mod tests {
     /// intact — so a throttled sweep never blanks the bars nor cries false error.
     #[tokio::test]
     async fn probe_429_is_rate_limited_and_keeps_last_utilization() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let prober = Arc::new(FirstOkThen429Prober {
             calls: Arc::new(AtomicUsize::new(0)),
         });
-        let manager =
-            build_manager_with_prober(config_with(vec![account("a", 0)]), refresher, prober);
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            counting_refresher(),
+            prober,
+        );
 
         // First sweep: probe succeeds, the 5-hour bar is learned.
         manager.probe_all().await;
@@ -10223,7 +9953,7 @@ mod tests {
     async fn a_single_5xx_probe_stays_rate_limited() {
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            pacing_refresher(),
+            counting_refresher(),
             Arc::new(AlwaysStatusProber { status: 503 }),
         );
 
@@ -10244,7 +9974,7 @@ mod tests {
     async fn sustained_5xx_probes_escalate_to_upstream_down() {
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            pacing_refresher(),
+            counting_refresher(),
             Arc::new(AlwaysStatusProber { status: 502 }),
         );
 
@@ -10276,7 +10006,7 @@ mod tests {
     async fn repeated_429s_never_escalate_to_upstream_down() {
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            pacing_refresher(),
+            counting_refresher(),
             Arc::new(AlwaysStatusProber { status: 429 }),
         );
 
@@ -10334,7 +10064,7 @@ mod tests {
 
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            pacing_refresher(),
+            counting_refresher(),
             Arc::new(FlakyProber { state }),
         );
 
@@ -10356,9 +10086,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
             Arc::new(RetryAfterProber {
                 calls: Arc::clone(&calls),
             }),
@@ -10375,7 +10103,7 @@ mod tests {
 
     #[test]
     fn probe_retry_after_has_a_seven_day_safety_cap() {
-        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let manager = manager_of(vec![account("a", 0)]);
         let before = crate::now_ms();
 
         manager.record_probe(
@@ -10411,12 +10139,10 @@ mod tests {
                 })
             }
         }
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
+
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(NetFailProber),
         );
         manager.probe_all().await;
@@ -10434,29 +10160,11 @@ mod tests {
     #[test]
     fn near_and_over_quota_render_active_with_honest_quota_state() {
         use crate::stats::QuotaState;
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("near", 0), account("full", 0)]),
-            refresher,
-        );
+
+        let manager = manager_of(vec![account("near", 0), account("full", 0)]);
         let now = OffsetDateTime::now_utc();
-        let reset = (now + Duration::hours(2)).unix_timestamp();
-        let set_7d = |idx: usize, util: &str| {
-            let mut h = reqwest::header::HeaderMap::new();
-            h.insert(
-                "anthropic-ratelimit-unified-7d-utilization",
-                util.parse().unwrap(),
-            );
-            h.insert(
-                "anthropic-ratelimit-unified-7d-reset",
-                reset.to_string().parse().unwrap(),
-            );
-            manager.update_quota(idx, &h, 200);
-        };
-        set_7d(0, "0.95"); // over the 0.90 threshold, under 100% → NearLimit
-        set_7d(1, "1.20"); // over 100% → Exhausted
+        set_7d(&manager, 0, "0.95"); // over the 0.90 threshold, under 100% → NearLimit
+        set_7d(&manager, 1, "1.20"); // over 100% → Exhausted
 
         let snap = manager.snapshot(now);
         // Both are held out of rotation …
@@ -10482,9 +10190,7 @@ mod tests {
     #[test]
     fn default_threshold_raise_gives_92pct_headroom_normal_near_full() {
         use crate::stats::QuotaState;
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
+
         // The default the shipped config applies when `switchThreshold` is absent.
         let default_threshold = serde_json::from_str::<Config>(r#"{ "accounts": [] }"#)
             .expect("minimal config parses")
@@ -10495,24 +10201,11 @@ mod tests {
             account("full", 0),
         ]);
         config.switch_threshold = default_threshold;
-        let manager = build_manager(config, refresher);
+        let manager = build_manager(config, counting_refresher());
         let now = OffsetDateTime::now_utc();
-        let reset = (now + Duration::hours(2)).unix_timestamp();
-        let set_7d = |idx: usize, util: &str| {
-            let mut h = reqwest::header::HeaderMap::new();
-            h.insert(
-                "anthropic-ratelimit-unified-7d-utilization",
-                util.parse().unwrap(),
-            );
-            h.insert(
-                "anthropic-ratelimit-unified-7d-reset",
-                reset.to_string().parse().unwrap(),
-            );
-            manager.update_quota(idx, &h, 200);
-        };
-        set_7d(0, "0.92"); // under the 0.95 default → real headroom, Normal
-        set_7d(1, "0.96"); // over 0.95, under 100% → NearLimit
-        set_7d(2, "1.00"); // at 100% → Exhausted
+        set_7d(&manager, 0, "0.92"); // under the 0.95 default → real headroom, Normal
+        set_7d(&manager, 1, "0.96"); // over 0.95, under 100% → NearLimit
+        set_7d(&manager, 2, "1.00"); // at 100% → Exhausted
 
         let snap = manager.snapshot(now);
         assert_eq!(
@@ -10539,13 +10232,7 @@ mod tests {
     /// status from the live deadline, like the quota bars and `rate_limited_until`.
     #[test]
     fn snapshot_status_is_active_once_the_throttle_hold_expires() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("live-hold", 0), account("expired-hold", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("live-hold", 0), account("expired-hold", 0)]);
         let now = OffsetDateTime::now_utc();
 
         manager.mark_rate_limited(0, 300); // a LIVE hold → still "throttled"
@@ -10576,10 +10263,7 @@ mod tests {
     /// upstream responses (a retry that rotated accounts) still counts one.
     #[test]
     fn request_counter_counts_once_across_retries() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         let now = OffsetDateTime::now_utc();
 
         // Simulate two upstream responses for a single client request (e.g. a
@@ -10600,10 +10284,7 @@ mod tests {
     /// A stable serve persists `SessionKind::Stable`; a fallback serve `Fallback`.
     #[test]
     fn record_served_threads_stable_flag_into_snapshot() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         let now = OffsetDateTime::now_utc();
 
         // Two distinct session keys: one stable-identity serve, one fallback.
@@ -10633,6 +10314,20 @@ mod tests {
         );
     }
 
+    /// Session `key`'s row in the manager's snapshot at `now`.
+    fn session_in_the_snapshot(
+        manager: &Manager,
+        now: OffsetDateTime,
+        key: u64,
+    ) -> crate::stats::SessionSnapshot {
+        manager
+            .snapshot(now)
+            .sessions
+            .into_iter()
+            .find(|s| s.id == short_session_id(key))
+            .expect("the session is present in the snapshot")
+    }
+
     /// The sessions pane must report the PIN, never whoever happened to serve the
     /// last request. A hold that clears while the pinned account's prompt cache is
     /// still warm DIVERTS one request and deliberately keeps the pin (see
@@ -10643,10 +10338,7 @@ mod tests {
     /// "sessions keep jumping".
     #[test]
     fn snapshot_reports_the_pin_not_the_last_serve() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 0xFEEDu64;
 
@@ -10670,12 +10362,7 @@ mod tests {
         );
         manager.record_served(1, now, Some(key), SessionKind::Stable);
 
-        let snap = manager.snapshot(now);
-        let session = snap
-            .sessions
-            .iter()
-            .find(|s| s.id == short_session_id(key))
-            .expect("the session is present in the snapshot");
+        let session = session_in_the_snapshot(&manager, now, key);
         assert_eq!(
             session.account, "a",
             "the snapshot must report the PIN, which a divert never moves"
@@ -10693,10 +10380,7 @@ mod tests {
     /// and let the next select re-pin the session to `b`.
     #[test]
     fn snapshot_account_follows_a_real_rekey() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            lock_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 0xBEEFu64;
 
@@ -10716,12 +10400,7 @@ mod tests {
         );
         manager.record_served(1, now, Some(key), SessionKind::Stable);
 
-        let snap = manager.snapshot(now);
-        let session = snap
-            .sessions
-            .iter()
-            .find(|s| s.id == short_session_id(key))
-            .expect("the session is present in the snapshot");
+        let session = session_in_the_snapshot(&manager, now, key);
         assert_eq!(
             session.account, "b",
             "a REAL re-key must move the reported account — the pin is the authority \
@@ -10736,7 +10415,7 @@ mod tests {
     /// fleet looked like it was thrashing.
     #[test]
     fn session_rows_do_not_reorder_on_a_serve() {
-        let manager = build_manager(config_with(vec![account("a", 0)]), lock_refresher());
+        let manager = manager_of(vec![account("a", 0)]);
         let now = OffsetDateTime::now_utc();
         let keys = [0x11u64, 0x22, 0x33];
 
@@ -10779,10 +10458,7 @@ mod tests {
     /// which for the proxy includes cache-creation + cache-read input tokens.
     #[test]
     fn update_usage_accumulates_input_and_output() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         // e.g. input_tokens=10 + cache_creation=100 + cache_read=1000 = 1110.
         // The last two args are the cache-read / cache-creation SUBSETS of that sum.
         manager.update_usage(0, 1110, 42, 1000, 100);
@@ -10804,10 +10480,7 @@ mod tests {
     /// quota consumption and the denominator of `cacheHitRatio`.
     #[test]
     fn update_usage_adds_the_callers_input_verbatim() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         // An inconsistent caller: 100 of input against 800 of components.
         manager.update_usage(0, 100, 5, 750, 50);
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -10836,19 +10509,20 @@ mod tests {
         manager.update_quota(idx, &h, 200);
     }
 
+    /// Accounts `a` and `b` at one priority with `a`'s Fable bucket exhausted, and the
+    /// `now` it was exhausted at.
+    fn a_and_b_with_a_oi_exhausted() -> (Arc<Manager>, OffsetDateTime) {
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
+        let now = OffsetDateTime::now_utc();
+        exhaust_oi_bucket(&manager, 0, now);
+        (manager, now)
+    }
+
     /// HEADLINE per-model routing: a Fable request SKIPS an account whose `7d_oi`
     /// (Fable weekly) bucket is exhausted, and rotates to the next eligible one.
     #[test]
     fn fable_request_skips_oi_exhausted_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
-        let now = OffsetDateTime::now_utc();
-        exhaust_oi_bucket(&manager, 0, now);
+        let (manager, now) = a_and_b_with_a_oi_exhausted();
         assert_eq!(
             manager.select(
                 &HashSet::new(),
@@ -10867,15 +10541,7 @@ mod tests {
     /// account 1 already tried, a non-Fable request lands right back on account 0.
     #[test]
     fn fable_exhausted_account_still_serves_non_fable() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
-        let now = OffsetDateTime::now_utc();
-        exhaust_oi_bucket(&manager, 0, now);
+        let (manager, now) = a_and_b_with_a_oi_exhausted();
         let tried: HashSet<usize> = [1].into_iter().collect();
         assert_eq!(
             manager.select(
@@ -10895,15 +10561,7 @@ mod tests {
     /// (OI-exhausted) is still picked when it is the only untried account.
     #[test]
     fn no_model_ignores_oi_bucket() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
-        let now = OffsetDateTime::now_utc();
-        exhaust_oi_bucket(&manager, 0, now);
+        let (manager, now) = a_and_b_with_a_oi_exhausted();
         let tried: HashSet<usize> = [1].into_iter().collect();
         assert_eq!(
             manager.select(&tried, now, None, None, "/v1/messages", None),
@@ -10917,13 +10575,7 @@ mod tests {
     /// idx — the exact inverse of `select_spreads_load_across_a_priority_tier`.
     #[test]
     fn affinity_pins_session_to_one_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         let now = OffsetDateTime::now_utc();
         let first = manager
             .select(&HashSet::new(), now, None, Some(7), "/v1/messages", None)
@@ -10941,23 +10593,8 @@ mod tests {
     /// behaviour — six selects over three accounts still fan out evenly [2,2,2].
     #[test]
     fn affinity_none_still_spreads() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            refresher,
-        );
-        let now = OffsetDateTime::now_utc();
-        let mut counts = [0usize; 3];
-        for _ in 0..6 {
-            let idx = manager
-                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
-                .expect("an account is eligible");
-            counts[idx] += 1;
-        }
         assert_eq!(
-            counts,
+            six_sessionless_selects_over_one_tier_of_three(),
             [2, 2, 2],
             "the disabled affinity path must spread exactly like today"
         );
@@ -10968,13 +10605,7 @@ mod tests {
     /// re-pins to a DIFFERENT eligible account and then sticks to that one.
     #[test]
     fn affinity_repins_when_pinned_account_ineligible() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(42), "/v1/messages", None)
@@ -10994,6 +10625,23 @@ mod tests {
         }
     }
 
+    /// Accounts `a` and `b` at one priority, paced to one request in flight each, and the
+    /// account session `key`'s first select at `now` pinned it to.
+    fn one_in_flight_pair_with_a_pin(key: u64, now: OffsetDateTime) -> (Arc<Manager>, usize) {
+        let pacing = PacingConfig {
+            max_in_flight_per_account: Some(1),
+            min_spacing_ms: None,
+        };
+        let manager = build_manager(
+            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
+            counting_refresher(),
+        );
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an account is eligible");
+        (manager, pinned)
+    }
+
     /// PACING gates DIVERT, they never RE-KEY: a pinned account that is merely paced
     /// (at the in-flight cap, every hard gate clear) yields THIS request to another
     /// account while the pin stays put, and the session returns to it the moment the
@@ -11008,18 +10656,8 @@ mod tests {
     /// exists; utilization is arithmetic over headers that go stale by minutes.
     #[test]
     fn soft_paced_pin_diverts_without_repinning() {
-        let pacing = PacingConfig {
-            max_in_flight_per_account: Some(1),
-            min_spacing_ms: None,
-        };
-        let manager = build_manager(
-            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
-            pacing_refresher(),
-        );
         let now = OffsetDateTime::now_utc();
-        let pinned = manager
-            .select(&HashSet::new(), now, None, Some(77), "/v1/messages", None)
-            .expect("an account is eligible");
+        let (manager, pinned) = one_in_flight_pair_with_a_pin(77, now);
         // Saturate ONLY the pinned account: at cap=1 it is soft-paced while every
         // hard gate (disabled/error/hold/quota) stays clear.
         {
@@ -11057,18 +10695,8 @@ mod tests {
     /// eviction sorts on exactly this field).
     #[test]
     fn soft_paced_divert_refreshes_pin_last_touch() {
-        let pacing = PacingConfig {
-            max_in_flight_per_account: Some(1),
-            min_spacing_ms: None,
-        };
-        let manager = build_manager(
-            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
-            pacing_refresher(),
-        );
         let now = OffsetDateTime::now_utc();
-        let pinned = manager
-            .select(&HashSet::new(), now, None, Some(88), "/v1/messages", None)
-            .expect("an account is eligible");
+        let (manager, pinned) = one_in_flight_pair_with_a_pin(88, now);
         {
             let mut a = manager.accounts.write().expect("accounts lock poisoned");
             a[pinned].in_flight = 1;
@@ -11097,13 +10725,7 @@ mod tests {
     /// other account while leaving the session pinned where it was.
     #[test]
     fn affinity_falls_through_when_pinned_in_tried_and_hard_gated() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let a = manager
             .select(&HashSet::new(), now, None, Some(9), "/v1/messages", None)
@@ -11138,10 +10760,7 @@ mod tests {
     /// is the single largest remaining cause of per-account prompt-cache loss.
     #[test]
     fn soft_gated_pin_is_served_not_diverted() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(1234), "/v1/messages", None)
@@ -11183,17 +10802,16 @@ mod tests {
     /// account, exactly as a genuinely dead pin does.
     #[test]
     fn idle_cold_session_on_over_threshold_account_rekeys_to_an_eligible_account() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         set_over_threshold(&manager, 0, 0.95, "allowed_warning");
         let key = 9001u64;
-        {
-            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (0, odt_to_ms(now) - (CACHE_WARM_HOLD_SECS + 1) * 1000));
-        }
+        seed_pin(
+            &manager,
+            key,
+            0,
+            odt_to_ms(now) - (CACHE_WARM_HOLD_SECS + 1) * 1000,
+        );
 
         let served = manager
             .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
@@ -11216,17 +10834,11 @@ mod tests {
     /// already established — this is today's behaviour, unchanged.
     #[test]
     fn warm_session_on_over_threshold_account_keeps_its_pin() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         set_over_threshold(&manager, 0, 0.95, "allowed_warning");
         let key = 9002u64;
-        {
-            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (0, odt_to_ms(now) - 10_000));
-        }
+        seed_pin(&manager, key, 0, odt_to_ms(now) - 10_000);
 
         let served = manager
             .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
@@ -11249,23 +10861,22 @@ mod tests {
     /// gives a genuinely dead pin.
     #[test]
     fn idle_cold_session_stays_when_no_eligible_alternative() {
-        let manager = build_manager(
-            config_with(vec![
-                account("a", 0),
-                Account {
-                    disabled: Some(true),
-                    ..account("b", 0)
-                },
-            ]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![
+            account("a", 0),
+            Account {
+                disabled: Some(true),
+                ..account("b", 0)
+            },
+        ]);
         let now = OffsetDateTime::now_utc();
         set_over_threshold(&manager, 0, 0.95, "allowed_warning");
         let key = 9003u64;
-        {
-            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (0, odt_to_ms(now) - (CACHE_WARM_HOLD_SECS + 1) * 1000));
-        }
+        seed_pin(
+            &manager,
+            key,
+            0,
+            odt_to_ms(now) - (CACHE_WARM_HOLD_SECS + 1) * 1000,
+        );
 
         let served = manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None);
         assert_eq!(
@@ -11283,10 +10894,7 @@ mod tests {
     /// `short_hold_diverts_but_keeps_the_pin`.)
     #[test]
     fn pin_with_live_hold_is_rekeyed() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(2345), "/v1/messages", None)
@@ -11320,10 +10928,7 @@ mod tests {
     /// it. `hard_ok` stays the sole authority in both directions.
     #[test]
     fn pin_that_fails_a_hard_gate_still_rotates() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(5678), "/v1/messages", None)
@@ -11358,10 +10963,7 @@ mod tests {
     /// every other field. This pair is the whole soft/hard distinction in two tests.
     #[test]
     fn pin_rejected_by_upstream_is_rekeyed() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(3456), "/v1/messages", None)
@@ -11390,10 +10992,7 @@ mod tests {
     /// select re-keys on that evidence instead of on a single blip.
     #[test]
     fn transient_tried_failure_keeps_the_pin() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(4567), "/v1/messages", None)
@@ -11467,10 +11066,7 @@ mod tests {
     /// 200k-token conversation onto a cold account.
     #[test]
     fn fable_exhaustion_diverts_the_request_but_keeps_the_pin() {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 909_090u64;
         let home = manager
@@ -11525,10 +11121,7 @@ mod tests {
     /// re-key durably.
     #[test]
     fn account_death_still_rekeys_a_fable_session() {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 808_080u64;
         let home = manager
@@ -11587,10 +11180,7 @@ mod tests {
     /// takes.
     #[test]
     fn revalidation_fable_divert_keeps_the_pin() {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 707_070u64;
         let home = manager
@@ -11669,10 +11259,7 @@ mod tests {
     /// is this same fixture with only the hold duration changed.
     #[test]
     fn short_hold_diverts_but_keeps_the_pin() {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 515_151u64;
         let home = manager
@@ -11721,10 +11308,7 @@ mod tests {
     /// account that can warm up.
     #[test]
     fn long_hold_rekeys_the_session() {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 525_252u64;
         let home = manager
@@ -11769,14 +11353,11 @@ mod tests {
     /// with or without stickiness.
     #[test]
     fn sticky_divert_reuses_first_destination() {
-        let manager = build_manager(
-            config_with(vec![
-                account("home", 0),
-                account("alt1", 0),
-                account("alt2", 0),
-            ]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![
+            account("home", 0),
+            account("alt1", 0),
+            account("alt2", 0),
+        ]);
         let now = OffsetDateTime::now_utc();
         let key = 616_161u64;
         let home = manager
@@ -11826,14 +11407,11 @@ mod tests {
     /// a stale sticky pick for a hold it never happened during.
     #[test]
     fn new_hold_deadline_resets_the_episode() {
-        let manager = build_manager(
-            config_with(vec![
-                account("home", 0),
-                account("alt1", 0),
-                account("alt2", 0),
-            ]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![
+            account("home", 0),
+            account("alt1", 0),
+            account("alt2", 0),
+        ]);
         // A single wall-clock read for the whole test — both hold deadlines
         // below are EXPLICIT, fixed offsets from this one `now_ms`, never
         // from `mark_rate_limited` (which takes its own, separate real-clock
@@ -11924,10 +11502,7 @@ mod tests {
     /// for the 1h cache (`extended`), recorded the way the request path records
     /// it, through `note_affinity_ttl`, before the hold is weighed.
     fn rekeys_with_hold_remaining_for(remaining_ms: i64, extended: bool) -> bool {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
         let key = 424_242u64;
@@ -12007,10 +11582,7 @@ mod tests {
     /// reset `remaining_ms` away. No `rate_limited_until_ms` is armed, so the only
     /// clock the router can read is the quota's own reset.
     fn rekeys_with_rejection_rolling_in(remaining_ms: i64, extended: bool) -> bool {
-        let manager = build_manager(
-            config_with(vec![account("home", 0), account("other", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("home", 0), account("other", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 535_353u64;
         manager.note_affinity_ttl(key, extended);
@@ -12075,18 +11647,12 @@ mod tests {
     /// assertion failed, a fleet with an API-key account still rewrote.
     #[test]
     fn cache_ttl_rewrite_defaults_to_the_fleets_account_types() {
-        let all_oauth = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let all_oauth = manager_of(vec![account("a", 0), account("b", 0)]);
         assert!(all_oauth.cache_ttl_rewrite_enabled(), "all OAuth: on");
 
         let mut api_key = account("k", 0);
         api_key.account_type = crate::config::AccountType::Unrecognized("static".to_string());
-        let mixed = build_manager(
-            config_with(vec![account("a", 0), api_key.clone()]),
-            pacing_refresher(),
-        );
+        let mixed = manager_of(vec![account("a", 0), api_key.clone()]);
         assert!(
             !mixed.cache_ttl_rewrite_enabled(),
             "one API-key account: off, its writes are billed"
@@ -12097,7 +11663,7 @@ mod tests {
             .extra
             .insert("cacheTtlRewrite".to_string(), serde_json::Value::Bool(true));
         assert!(
-            build_manager(forced, pacing_refresher()).cache_ttl_rewrite_enabled(),
+            build_manager(forced, counting_refresher()).cache_ttl_rewrite_enabled(),
             "an explicit true overrides the default"
         );
 
@@ -12107,7 +11673,7 @@ mod tests {
             serde_json::Value::Bool(false),
         );
         assert!(
-            !build_manager(off, pacing_refresher()).cache_ttl_rewrite_enabled(),
+            !build_manager(off, counting_refresher()).cache_ttl_rewrite_enabled(),
             "an explicit false overrides the default"
         );
     }
@@ -12126,10 +11692,7 @@ mod tests {
     /// nothing to come home FROM. The two together are the whole rule.
     #[test]
     fn hold_expiry_leaves_the_session_on_its_failover() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let key = 606_060u64;
         let home = manager
@@ -12173,13 +11736,7 @@ mod tests {
     /// normal LRU pick) and then each key stays on its own account.
     #[test]
     fn affinity_distinct_keys_fan_out_then_stick() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         let x = manager
             .select(&HashSet::new(), now, None, Some(1), "/v1/messages", None)
@@ -12208,13 +11765,8 @@ mod tests {
     fn affinity_map_is_bounded_by_cap_with_lru_eviction() {
         // Mirror of the private `AFFINITY_CAP` in `select`.
         const AFFINITY_CAP: usize = 1024;
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let base = OffsetDateTime::now_utc();
 
         // Fill to exactly CAP distinct keys, each stamped at a strictly later
@@ -12277,15 +11829,21 @@ mod tests {
         );
     }
 
-    /// Directly pin `key` to account `idx` in the affinity map (last-touch = now),
-    /// bypassing a select() call — lets a migration test set up an arbitrary stacked
-    /// starting layout without depending on how the initial pins were formed.
-    fn pin_session(manager: &Manager, key: u64, idx: usize) {
+    /// Pin session `key` to account `idx` as of `at_ms`, the shape a pin restored from disk
+    /// at boot takes.
+    fn seed_pin(manager: &Manager, key: u64, idx: usize, at_ms: i64) {
         manager
             .affinity
             .lock()
             .expect("affinity lock poisoned")
-            .insert(key, (idx, crate::now_ms()));
+            .insert(key, (idx, at_ms));
+    }
+
+    /// Directly pin `key` to account `idx` in the affinity map (last-touch = now),
+    /// bypassing a select() call — lets a migration test set up an arbitrary stacked
+    /// starting layout without depending on how the initial pins were formed.
+    fn pin_session(manager: &Manager, key: u64, idx: usize) {
+        seed_pin(manager, key, idx, crate::now_ms());
     }
 
     /// Like [`config_with`] but with the (default-OFF) load-balancing migration
@@ -12315,13 +11873,7 @@ mod tests {
     /// be byte-identical to honouring the pin.
     #[test]
     fn lone_session_never_migrates() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         // One session pinned to acct 0; acct 1 is idle and eligible.
         pin_session(&manager, 100, 0);
@@ -12340,12 +11892,9 @@ mod tests {
     /// acct 1, and the affinity map records the new pin.
     #[test]
     fn stacked_session_migrates_to_idle() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager(
             config_with_migration(vec![account("a", 0), account("b", 0)]),
-            refresher,
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         pin_session(&manager, 10, 0);
@@ -12368,12 +11917,9 @@ mod tests {
     /// selects for BOTH sessions are stable — neither bounces back.
     #[test]
     fn migration_converges_no_thrash() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager(
             config_with_migration(vec![account("a", 0), account("b", 0)]),
-            refresher,
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         pin_session(&manager, 10, 0);
@@ -12403,13 +11949,7 @@ mod tests {
     /// its pin rather than migrating onto a throttled/dead account.
     #[test]
     fn no_migration_when_no_emptier_eligible() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         let now = OffsetDateTime::now_utc();
         pin_session(&manager, 20, 0);
         pin_session(&manager, 21, 0);
@@ -12429,12 +11969,9 @@ mod tests {
     /// (convergence across three accounts).
     #[test]
     fn three_sessions_spread_across_three_idle() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager(
             config_with_migration(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            refresher,
+            counting_refresher(),
         );
         let now = OffsetDateTime::now_utc();
         pin_session(&manager, 1, 0);
@@ -12470,12 +12007,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         // --- default config: the migration scan never runs ---
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         assert!(
             !manager.load_balance_migration_enabled(),
             "loadBalanceMigration must default to OFF"
@@ -12501,9 +12033,7 @@ mod tests {
         // --- same layout, key explicitly true: the old behaviour is intact ---
         let enabled = build_manager(
             config_with_migration(vec![account("a", 0), account("b", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
         );
         assert!(
             enabled.load_balance_migration_enabled(),
@@ -12528,10 +12058,7 @@ mod tests {
     /// `retry_after_hint` advertises that reset, not the 60s fallthrough default.
     #[test]
     fn retry_after_hint_uses_seven_day_oi_window() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         let now = OffsetDateTime::now_utc();
         // Only the 7d_oi window has a future reset (~2h out); five_hour / seven_day /
         // rate-limit hold are all absent, so before the fix the hint fell through to 60s.
@@ -12961,6 +12488,30 @@ mod tests {
         account
     }
 
+    /// A manager over one refused Codex account, as [`refused_runtime`] builds it.
+    fn refused_codex_manager(
+        now: OffsetDateTime,
+        five_hour: Option<(f64, Duration)>,
+        seven_day: Option<(f64, Duration)>,
+    ) -> Arc<Manager> {
+        Manager::from_runtimes(vec![refused_runtime(
+            crate::provider::Provider::Codex,
+            now,
+            five_hour,
+            seven_day,
+        )])
+    }
+
+    /// A manager over one refused Codex account whose windows are both half spent, so no
+    /// window explains the refusal.
+    fn codex_refused_with_neither_window_full(now: OffsetDateTime) -> Arc<Manager> {
+        refused_codex_manager(
+            now,
+            Some((0.5, Duration::hours(2))),
+            Some((0.5, Duration::days(3))),
+        )
+    }
+
     /// The (gate, free-at in Unix seconds) the snapshot reports for account 0.
     fn reported_gate(manager: &Manager, now: OffsetDateTime) -> (GateReason, Option<i64>) {
         let row = &manager.snapshot(now).accounts[0];
@@ -12976,12 +12527,11 @@ mod tests {
     #[test]
     fn a_weekly_refusal_reports_seven_day_and_its_reset() {
         let now = OffsetDateTime::now_utc();
-        let manager = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
+        let manager = refused_codex_manager(
             now,
             Some((0.3, Duration::hours(2))),
             Some((1.0, Duration::days(3))),
-        )]);
+        );
         manager.mark_rate_limited(0, 3600);
         assert_eq!(
             reported_gate(&manager, now),
@@ -13001,12 +12551,11 @@ mod tests {
     #[test]
     fn a_five_hour_refusal_reports_five_hour() {
         let now = OffsetDateTime::now_utc();
-        let manager = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
+        let manager = refused_codex_manager(
             now,
             Some((1.0, Duration::minutes(52))),
             Some((0.17, Duration::days(5))),
-        )]);
+        );
         assert_eq!(
             reported_gate(&manager, now),
             (
@@ -13015,12 +12564,11 @@ mod tests {
             )
         );
 
-        let both_full = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
+        let both_full = refused_codex_manager(
             now,
             Some((1.0, Duration::hours(1))),
             Some((1.0, Duration::days(3))),
-        )]);
+        );
         assert_eq!(
             reported_gate(&both_full, now),
             (
@@ -13036,12 +12584,7 @@ mod tests {
     #[test]
     fn a_refusal_with_no_full_window_holds_until_its_reset() {
         let now = OffsetDateTime::now_utc();
-        let manager = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
-            now,
-            Some((0.5, Duration::hours(2))),
-            Some((0.5, Duration::days(3))),
-        )]);
+        let manager = codex_refused_with_neither_window_full(now);
         manager.mark_rate_limited(0, 1800);
         let row = manager.snapshot(now).accounts[0].clone();
         assert!(row.rate_limited_until.is_some(), "the hold is armed");
@@ -13060,12 +12603,7 @@ mod tests {
     #[test]
     fn a_refusal_held_by_an_upstream_403_reports_refused() {
         let now = OffsetDateTime::now_utc();
-        let manager = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
-            now,
-            Some((0.5, Duration::hours(2))),
-            Some((0.5, Duration::days(3))),
-        )]);
+        let manager = codex_refused_with_neither_window_full(now);
         manager.mark_refused(0);
         let row = manager.snapshot(now).accounts[0].clone();
         assert!(row.rate_limited_until.is_some(), "the 403's hold is armed");
@@ -13084,12 +12622,7 @@ mod tests {
     #[test]
     fn a_refusing_window_past_its_reset_keeps_its_gate_until_a_probe_confirms_the_roll() {
         let now = OffsetDateTime::now_utc();
-        let weekly = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
-            now,
-            None,
-            Some((1.0, Duration::minutes(1))),
-        )]);
+        let weekly = refused_codex_manager(now, None, Some((1.0, Duration::minutes(1))));
         weekly.mark_rate_limited(0, 60);
         assert_eq!(
             reported_gate(&weekly, now),
@@ -13105,12 +12638,11 @@ mod tests {
             "past the reset, no probe yet: the same window, with no time"
         );
 
-        let five_hour = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
+        let five_hour = refused_codex_manager(
             now,
             Some((1.0, Duration::minutes(1))),
             Some((0.3, Duration::days(5))),
-        )]);
+        );
         assert_eq!(
             reported_gate(&five_hour, now + Duration::minutes(2)),
             (GateReason::FiveHour, None)
@@ -13121,12 +12653,7 @@ mod tests {
     #[test]
     fn a_refusal_with_neither_stays_rejected() {
         let now = OffsetDateTime::now_utc();
-        let manager = Manager::from_runtimes(vec![refused_runtime(
-            crate::provider::Provider::Codex,
-            now,
-            Some((0.5, Duration::hours(2))),
-            Some((0.5, Duration::days(3))),
-        )]);
+        let manager = codex_refused_with_neither_window_full(now);
         assert_eq!(reported_gate(&manager, now), (GateReason::Rejected, None));
     }
 
@@ -13336,10 +12863,7 @@ mod tests {
     /// connector. Only the total timeout is surfaced.)
     #[test]
     fn serving_client_has_no_total_timeout() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
 
         // reqwest prints the total timeout as a `TotalTimeout` field, and only when
         // one is set. Prove the marker on a control client first, so a future reqwest
@@ -13378,13 +12902,7 @@ mod tests {
     /// upstream to observe.
     #[test]
     fn different_accounts_never_share_a_serving_client() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
 
         let client_a = manager.http_client(0).expect("account 0 exists");
         let client_b = manager.http_client(1).expect("account 1 exists");
@@ -13407,6 +12925,31 @@ mod tests {
         );
     }
 
+    /// Three accounts out of rotation at `now`, each with a 5-hour reset that misleads
+    /// differently:
+    ///
+    /// - A, weekly-gated: its 5h resets SOON (200s) but its 7d stays over threshold until
+    ///   5000s, so A does NOT actually return until 5000s.
+    /// - B, a dead credential (Error) that holds the SOONEST raw reset (100s). It never
+    ///   self-frees, so it must contribute nothing to the hint.
+    /// - C, the TRUE first recovery: 5h-gated with a later reset (900s) and a healthy 7d,
+    ///   so it genuinely returns at 900s.
+    fn weekly_gated_dead_and_five_hour_gated(now: OffsetDateTime) -> Arc<Manager> {
+        let at = |secs: i64| now + Duration::seconds(secs);
+        let mut a = AccountRuntime::from_config(&account("a", 0), false);
+        a.switch_threshold = Some(0.90);
+        a.quota.five_hour = Some(window(0.99, Some(at(200))));
+        a.quota.seven_day = Some(window(0.99, Some(at(5_000))));
+        let mut b = AccountRuntime::from_config(&account("b", 0), false);
+        b.switch_threshold = Some(0.90);
+        b.status = AccountStatus::Error;
+        b.quota.five_hour = Some(window(0.99, Some(at(100))));
+        let mut c = AccountRuntime::from_config(&account("c", 0), false);
+        c.switch_threshold = Some(0.90);
+        c.quota.five_hour = Some(window(0.99, Some(at(900))));
+        Manager::from_runtimes(vec![a, b, c])
+    }
+
     /// The live-incident shape: a fleet-exhausted 429's `retry-after` must name the
     /// TRUE soonest recovery, never an earlier reset belonging to an account that
     /// stays gated for another reason or never self-frees at all.
@@ -13414,28 +12957,7 @@ mod tests {
     fn retry_after_hint_skips_error_and_still_gated_accounts() {
         let now = OffsetDateTime::now_utc();
         let at = |secs: i64| now + Duration::seconds(secs);
-
-        // Account A — weekly-gated: its 5h resets SOON (200s) but its 7d stays over
-        // threshold until 5000s, so A does NOT actually return until 5000s.
-        let mut a = AccountRuntime::from_config(&account("a", 0), false);
-        a.switch_threshold = Some(0.90);
-        a.quota.five_hour = Some(window(0.99, Some(at(200))));
-        a.quota.seven_day = Some(window(0.99, Some(at(5_000))));
-
-        // Account B — a dead credential (Error) that holds the SOONEST raw reset
-        // (100s). It never self-frees, so it must contribute nothing to the hint.
-        let mut b = AccountRuntime::from_config(&account("b", 0), false);
-        b.switch_threshold = Some(0.90);
-        b.status = AccountStatus::Error;
-        b.quota.five_hour = Some(window(0.99, Some(at(100))));
-
-        // Account C — the TRUE first recovery: 5h-gated with a later reset (900s)
-        // and a healthy 7d, so it genuinely returns at 900s.
-        let mut c = AccountRuntime::from_config(&account("c", 0), false);
-        c.switch_threshold = Some(0.90);
-        c.quota.five_hour = Some(window(0.99, Some(at(900))));
-
-        let manager = Manager::from_runtimes(vec![a, b, c]);
+        let manager = weekly_gated_dead_and_five_hour_gated(now);
         let hint = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
 
         // Correct = C's 900s reset. The pre-fix raw-min over every window's reset
@@ -13458,19 +12980,7 @@ mod tests {
     fn exhaustion_hint_names_the_binding_gate_and_counts_every_gated_account() {
         let now = OffsetDateTime::now_utc();
         let at = |secs: i64| now + Duration::seconds(secs);
-        let mut a = AccountRuntime::from_config(&account("a", 0), false);
-        a.switch_threshold = Some(0.90);
-        a.quota.five_hour = Some(window(0.99, Some(at(200))));
-        a.quota.seven_day = Some(window(0.99, Some(at(5_000))));
-        let mut b = AccountRuntime::from_config(&account("b", 0), false);
-        b.switch_threshold = Some(0.90);
-        b.status = AccountStatus::Error;
-        b.quota.five_hour = Some(window(0.99, Some(at(100))));
-        let mut c = AccountRuntime::from_config(&account("c", 0), false);
-        c.switch_threshold = Some(0.90);
-        c.quota.five_hour = Some(window(0.99, Some(at(900))));
-
-        let manager = Manager::from_runtimes(vec![a, b, c]);
+        let manager = weekly_gated_dead_and_five_hour_gated(now);
         let hint = manager.exhaustion_hint(now, false, crate::provider::Provider::Anthropic, None);
         assert_eq!(
             hint.binding,
@@ -13739,10 +13249,7 @@ mod tests {
     /// `next_session_key` hands out strictly-increasing, unique u64s starting at 1.
     #[test]
     fn session_keys_are_monotonic_and_unique() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         let mut prev = 0u64;
         let mut seen = HashSet::new();
         for i in 0..5 {
@@ -14156,12 +13663,7 @@ mod tests {
         write_account_file(&path, &["acct-a"]);
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let manager = build_manager(
-            config_with(vec![account("acct-a", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![account("acct-a", 0)]);
         assert!(manager.config_path.is_none());
 
         manager.set_disabled(0, true);
@@ -14320,12 +13822,7 @@ mod tests {
     /// "not saved" banner on every keypress there would be noise, not honesty.
     #[test]
     fn set_disabled_without_a_config_file_is_not_a_failure() {
-        let manager = build_manager(
-            config_with(vec![account("acct-a", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![account("acct-a", 0)]);
         assert_eq!(manager.set_disabled(0, true), DisablePersist::NoConfigFile);
         assert_eq!(manager.set_disabled(9, true), DisablePersist::NoSuchAccount);
     }
@@ -14447,6 +13944,15 @@ mod tests {
     }
 
     // ---- live account-add identity resolution (`POST /_tcr/accounts`) ----
+
+    /// Submit `submission` and assert it replaced the credential on row 0.
+    fn assert_it_updates_the_first_row(manager: &Manager, submission: Account) {
+        let outcome = manager.add_or_update_account(submission);
+        assert!(
+            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
+            "{outcome:?}"
+        );
+    }
 
     /// A manager whose in-memory config AND on-disk file both start out equal
     /// to `config` — so both halves of `add_or_update_account` are observable:
@@ -14819,7 +14325,7 @@ mod tests {
     /// and asserts BOTH locks survive.
     #[test]
     fn add_or_update_account_added_path_does_not_poison_either_lock_on_a_client_build_panic() {
-        let manager = build_manager(config_with(vec![]), lock_refresher());
+        let manager = manager_of(vec![]);
         let submission = account("brand-new@example.com", 0);
 
         fail_next_client_build();
@@ -14861,7 +14367,7 @@ mod tests {
     #[test]
     fn add_or_update_account_updated_path_never_builds_a_client() {
         let existing = account("alice@example.com", 0);
-        let manager = build_manager(config_with(vec![existing.clone()]), lock_refresher());
+        let manager = manager_of(vec![existing.clone()]);
         let mut resubmission = existing.clone();
         resubmission.access_token = "at-alice-rotated".to_string();
 
@@ -14980,11 +14486,7 @@ mod tests {
             refresh_token: Some("rt-fresh".to_string()),
             ..account("alice@example.com", 0)
         };
-        let outcome = manager.add_or_update_account(submission);
-        assert!(
-            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
-            "{outcome:?}"
-        );
+        assert_it_updates_the_first_row(&manager, submission);
 
         {
             let accounts = manager.accounts.read().expect("accounts lock poisoned");
@@ -15042,11 +14544,7 @@ mod tests {
             refresh_token: Some("rt-fresh".to_string()),
             ..account("alice@example.com", 0)
         };
-        let outcome = manager.add_or_update_account(submission);
-        assert!(
-            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
-            "{outcome:?}"
-        );
+        assert_it_updates_the_first_row(&manager, submission);
 
         let reloaded = config::load(&path).expect("reload persisted config");
         assert_eq!(reloaded.accounts.len(), 1);
@@ -15092,11 +14590,7 @@ mod tests {
             refresh_token: Some("rt-fresh".to_string()),
             ..account("alice@example.com", 0)
         };
-        let outcome = manager.add_or_update_account(submission);
-        assert!(
-            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
-            "{outcome:?}"
-        );
+        assert_it_updates_the_first_row(&manager, submission);
 
         {
             let accounts = manager.accounts.read().expect("accounts lock poisoned");
@@ -15237,11 +14731,7 @@ mod tests {
     /// value, and treats `<= 0` as disabled.
     #[test]
     fn warmup_interval_defaults_off_reads_value_and_disables_on_nonpositive() {
-        let refresher = || {
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            })
-        };
+        let refresher = || counting_refresher();
         // Absent → 0 (dark default).
         let m = build_manager(config_with(vec![account("a", 0)]), refresher());
         assert_eq!(m.warmup_interval_seconds(), 0);
@@ -15257,21 +14747,15 @@ mod tests {
     /// errored, or throttled account is never a target.
     #[test]
     fn warm_targets_skips_disabled_errored_and_throttled() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let mut api = account("api", 0);
         api.account_type = crate::config::AccountType::Unrecognized("api".to_string());
-        let manager = build_manager(
-            config_with(vec![
-                account("idle", 0),
-                account("off", 0),
-                account("dead", 0),
-                account("throttled", 0),
-                api, // non-oauth
-            ]),
-            refresher,
-        );
+        let manager = manager_of(vec![
+            account("idle", 0),
+            account("off", 0),
+            account("dead", 0),
+            account("throttled", 0),
+            api, // non-oauth
+        ]);
         mark_all_probed(&manager); // isolate from the never-probed boot gate
         manager.set_disabled(1, true);
         manager.mark_error(2);
@@ -15289,17 +14773,11 @@ mod tests {
     /// passed IS a target.
     #[test]
     fn warm_targets_skips_live_5h_window_keeps_cold_and_past() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![
-                account("live", 0),
-                account("cold", 0),
-                account("past", 0),
-            ]),
-            refresher,
-        );
+        let manager = manager_of(vec![
+            account("live", 0),
+            account("cold", 0),
+            account("past", 0),
+        ]);
         mark_all_probed(&manager); // isolate from the never-probed boot gate
         set_5h(&manager, 0, "0.10", 3); // live: low util, reset 3h out → already warm
         // account 1 (cold): no 5h data at all
@@ -15317,13 +14795,7 @@ mod tests {
     /// live-5h check.
     #[test]
     fn warm_targets_skips_near_threshold_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("full", 0), account("idle", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("full", 0), account("idle", 0)]);
         mark_all_probed(&manager); // isolate from the never-probed boot gate
         set_7d(&manager, 0, "0.95"); // over the 0.90 threshold
 
@@ -15352,9 +14824,7 @@ mod tests {
         };
         let manager = build_manager_with_warmer(
             config_with(vec![account("alice@example.com", 0), codex]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
             Arc::new(RecordingWarmer {
                 warmed: Arc::clone(&warmed),
             }),
@@ -15378,9 +14848,6 @@ mod tests {
     /// while a live-window account, a disabled one, and an errored one are not.
     #[tokio::test]
     async fn warm_all_warms_only_idle_targets() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let warmed = Arc::new(Mutex::new(Vec::new()));
         let warmer = Arc::new(RecordingWarmer {
             warmed: warmed.clone(),
@@ -15392,7 +14859,7 @@ mod tests {
                 account("off", 0),
                 account("dead", 0),
             ]),
-            refresher,
+            counting_refresher(),
             warmer,
         );
         mark_all_probed(&manager); // isolate from the never-probed boot gate
@@ -15414,15 +14881,15 @@ mod tests {
     /// zero eligible targets.
     #[tokio::test]
     async fn warm_all_is_noop_when_no_targets() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let warmed = Arc::new(Mutex::new(Vec::new()));
         let warmer = Arc::new(RecordingWarmer {
             warmed: warmed.clone(),
         });
-        let manager =
-            build_manager_with_warmer(config_with(vec![account("off", 0)]), refresher, warmer);
+        let manager = build_manager_with_warmer(
+            config_with(vec![account("off", 0)]),
+            counting_refresher(),
+            warmer,
+        );
         manager.set_disabled(0, true);
 
         manager.warm_all().await;
@@ -15438,14 +14905,14 @@ mod tests {
     /// (populated `five_hour`, a live future reset) — which suppresses a re-warm.
     #[tokio::test]
     async fn warm_account_folds_response_headers_into_five_hour() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let warmer = Arc::new(RecordingWarmer {
             warmed: Arc::new(Mutex::new(Vec::new())),
         });
-        let manager =
-            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        let manager = build_manager_with_warmer(
+            config_with(vec![account("cold", 0)]),
+            counting_refresher(),
+            warmer,
+        );
         mark_all_probed(&manager); // isolate from the never-probed boot gate
         // Before: no 5h window, so this account is a target.
         assert_eq!(manager.warm_targets(), vec![0]);
@@ -15469,6 +14936,24 @@ mod tests {
         );
     }
 
+    /// One cold account, probed, that is first a warm target and then gets fifty warms
+    /// whose 200s carry no rate-limit headers. Fifty is a generous number of cadence-driven
+    /// warms standing in for "forever": if the account is STILL a target after this many,
+    /// the loop has no bound at all.
+    async fn one_cold_account_warmed_fifty_times_without_evidence() -> Arc<Manager> {
+        let manager = build_manager_with_warmer(
+            config_with(vec![account("cold", 0)]),
+            counting_refresher(),
+            Arc::new(HeaderlessWarmer),
+        );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+        manager
+    }
+
     /// **THE truncation guard.** `warm_targets`' own doc-comment calls a warm that
     /// latches no evidence "self-limiting", on the strength of `warm_account`
     /// folding the response's rate-limit headers back into the account's quota. A
@@ -15481,22 +14966,7 @@ mod tests {
     /// latches evidence must not repeat without limit.
     #[tokio::test]
     async fn warm_account_without_evidence_headers_does_not_repeat_forever() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let warmer = Arc::new(HeaderlessWarmer);
-        let manager =
-            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
-        mark_all_probed(&manager); // isolate from the never-probed boot gate
-        assert_eq!(manager.warm_targets(), vec![0]);
-
-        // A generous number of cadence-driven warms, standing in for "forever" —
-        // if the account is STILL a target after this many header-less 200s, the
-        // loop has no bound at all.
-        for _ in 0..50 {
-            manager.warm_account(0).await;
-        }
-
+        let manager = one_cold_account_warmed_fifty_times_without_evidence().await;
         assert!(
             !manager.warm_targets().contains(&0),
             "a warm that never latches evidence must not remain an eligible target forever"
@@ -15518,18 +14988,7 @@ mod tests {
     /// probe traffic.
     #[tokio::test]
     async fn repeated_probe_cycles_do_not_reopen_a_warm_exclusion() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let warmer = Arc::new(HeaderlessWarmer);
-        let manager =
-            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
-        mark_all_probed(&manager); // isolate from the never-probed boot gate
-        assert_eq!(manager.warm_targets(), vec![0]);
-
-        for _ in 0..50 {
-            manager.warm_account(0).await;
-        }
+        let manager = one_cold_account_warmed_fifty_times_without_evidence().await;
         assert!(
             !manager.warm_targets().contains(&0),
             "setup: the account must be excluded before the probe-cycle check runs"
@@ -15572,18 +15031,7 @@ mod tests {
     /// unit test), and asserts the account is a warm target again.
     #[tokio::test]
     async fn warm_evidence_retry_cooldown_recovers_an_excluded_account() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let warmer = Arc::new(HeaderlessWarmer);
-        let manager =
-            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
-        mark_all_probed(&manager); // isolate from the never-probed boot gate
-        assert_eq!(manager.warm_targets(), vec![0]);
-
-        for _ in 0..50 {
-            manager.warm_account(0).await;
-        }
+        let manager = one_cold_account_warmed_fifty_times_without_evidence().await;
         assert!(
             !manager.warm_targets().contains(&0),
             "setup: the account must be excluded before recovery is exercised"
@@ -15625,12 +15073,9 @@ mod tests {
     /// again immediately, not just eventually.
     #[tokio::test]
     async fn a_failing_retry_does_not_reset_the_warm_evidence_cooldown() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager_with_warmer(
             config_with(vec![account("cold", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(NoWarmer),
         );
         mark_all_probed(&manager); // isolate from the never-probed boot gate
@@ -15672,13 +15117,7 @@ mod tests {
     /// quota is unknown, not known-cold, so with probing on there are no targets.
     #[test]
     fn warm_targets_is_empty_at_boot_while_probing_is_enabled() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            refresher,
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         // Boot state, untouched: probing on by default (75s), nothing probed yet.
         assert!(manager.probe_interval_seconds() > 0);
 
@@ -15697,15 +15136,12 @@ mod tests {
     /// probe must leave the account a NON-target.
     #[tokio::test]
     async fn warm_targets_stays_empty_after_a_failed_probe() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         // `ScriptedProber` errors (500) on every token but `ok_token`; no account
         // here carries that token, so the whole sweep fails — the fleet-wide false
         // error `probing.rs` documents.
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0), account("b", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(ScriptedProber {
                 ok_token: "at-nobody".to_string(),
             }),
@@ -15746,12 +15182,9 @@ mod tests {
     /// target with `five_hour` still `None`.
     #[tokio::test]
     async fn a_successful_probe_opens_the_gate_and_wakes_the_warm_loop() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(ColdOkProber),
         );
         let wake_window = std::time::Duration::from_millis(50);
@@ -15787,12 +15220,9 @@ mod tests {
     /// accounts signals nothing.
     #[tokio::test]
     async fn a_repeat_probe_does_not_re_wake_the_warm_loop() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(ColdOkProber),
         );
         let wake_window = std::time::Duration::from_millis(50);
@@ -15823,10 +15253,7 @@ mod tests {
     /// does — an eligible account may not sit out a whole `warmupSeconds`.
     #[tokio::test]
     async fn a_served_response_header_is_quota_evidence_and_opens_the_gate() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
         let wake_window = std::time::Duration::from_millis(50);
         assert!(manager.probe_interval_seconds() > 0);
         assert!(manager.warm_targets().is_empty(), "boot: nothing read yet");
@@ -15855,10 +15282,7 @@ mod tests {
     /// no 5h window, which is exactly that shape.
     #[test]
     fn a_response_without_the_five_hour_header_latches_nothing() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let manager = manager_of(vec![account("a", 0)]);
 
         set_7d(&manager, 0, "0.10");
 
@@ -15883,13 +15307,10 @@ mod tests {
     /// documents is a one-sweep event, and lifting on it hands the boot burst back.
     #[tokio::test]
     async fn a_persistently_failing_probe_stops_blocking_keep_warm() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         // No account carries `ok_token`, so every sweep fails on every row.
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(ScriptedProber {
                 ok_token: "at-nobody".to_string(),
             }),
@@ -15939,12 +15360,9 @@ mod tests {
     /// again drifts into "stop waiting" on evidence it actually has.
     #[tokio::test]
     async fn a_successful_probe_resets_the_failure_run() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager_with_prober(
             config_with(vec![account("a", 0)]),
-            refresher,
+            counting_refresher(),
             Arc::new(ScriptedProber {
                 ok_token: "at-nobody".to_string(),
             }),
@@ -15969,17 +15387,11 @@ mod tests {
     /// keep-warm. A probed account with a LIVE window stays skipped.
     #[test]
     fn warm_targets_resumes_once_the_probe_has_reported() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let manager = build_manager(
-            config_with(vec![
-                account("cold", 0),
-                account("live", 0),
-                account("dark", 0),
-            ]),
-            refresher,
-        );
+        let manager = manager_of(vec![
+            account("cold", 0),
+            account("live", 0),
+            account("dark", 0),
+        ]);
         // Only the first two have had their quota read; the third never has.
         {
             let mut accounts = manager.accounts.write().unwrap();
@@ -16004,12 +15416,9 @@ mod tests {
     /// still reading as enabled — so with probing off, the gate does not apply.
     #[test]
     fn warm_targets_ignores_the_boot_gate_when_probing_is_disabled() {
-        let refresher = Arc::new(CountingRefresher {
-            calls: Arc::new(AtomicUsize::new(0)),
-        });
         let manager = build_manager(
             config_with_probe_seconds(vec![account("a", 0), account("b", 0)], 0),
-            refresher,
+            counting_refresher(),
         );
         assert_eq!(manager.probe_interval_seconds(), 0);
         // Nothing has been (or ever will be) probed, so no quota is known.
@@ -16058,9 +15467,7 @@ mod tests {
                 ],
                 pacing,
             ),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
         );
 
         let handles: Vec<_> = (0..THREADS)
@@ -16149,9 +15556,7 @@ mod tests {
                 account("a2", 0),
                 account("a3", 0),
             ]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
+            counting_refresher(),
         );
         // Pathological start: ALL N sessions pinned to account 0.
         for key in 0..N as u64 {
@@ -16218,10 +15623,7 @@ mod tests {
     /// account.
     #[test]
     fn revalidation_serves_least_utilized_when_all_over_threshold() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("c", 0)]);
         set_over_threshold(&manager, 0, 0.995, "allowed_warning");
         set_over_threshold(&manager, 1, 0.970, "allowed_warning"); // least utilized
         set_over_threshold(&manager, 2, 0.999, "allowed_warning");
@@ -16246,20 +15648,14 @@ mod tests {
     /// least-utilized survivor and RE-PINS the session there.
     #[test]
     fn revalidation_honors_pin_through_threshold() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("pinned", 0)]);
         // The pinned account (idx 2) is the MOST utilized; the others are cooler.
         set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least utilized
         set_over_threshold(&manager, 1, 0.970, "allowed_warning");
         set_over_threshold(&manager, 2, 0.999, "allowed_warning"); // the warm pin
         let key = 424_242u64;
         let now = OffsetDateTime::now_utc();
-        {
-            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (2, odt_to_ms(now)));
-        }
+        seed_pin(&manager, key, 2, odt_to_ms(now));
 
         assert_eq!(
             manager.select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages"),
@@ -16276,28 +15672,17 @@ mod tests {
 
         // When the pin becomes HARD-blocked (rejected), fall back to least-utilized
         // and RE-PIN the session there. Use a fresh manager (throttle valve reset).
-        let manager2 = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
-            pacing_refresher(),
-        );
+        let manager2 = manager_of(vec![account("a", 0), account("b", 0), account("pinned", 0)]);
         set_over_threshold(&manager2, 0, 0.950, "allowed_warning"); // least utilized
         set_over_threshold(&manager2, 1, 0.970, "allowed_warning");
         set_over_threshold(&manager2, 2, 0.999, "rejected"); // pin now blocked
-        {
-            let mut pins = manager2.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (2, odt_to_ms(now)));
-        }
+        seed_pin(&manager2, key, 2, odt_to_ms(now));
         assert_eq!(
             manager2.select_revalidation(&HashSet::new(), now, None, Some(key), "/v1/messages"),
             Some(0),
             "a rejected pin falls back to the least-utilized survivor"
         );
-        let repinned = manager2
-            .affinity
-            .lock()
-            .expect("affinity lock poisoned")
-            .get(&key)
-            .map(|&(idx, _)| idx);
+        let repinned = pin_of(&manager2, key);
         assert_eq!(
             repinned,
             Some(0),
@@ -16321,19 +15706,13 @@ mod tests {
     /// other `select_revalidation` test passes `&HashSet::new()`.
     #[test]
     fn revalidation_keeps_the_pin_when_it_is_merely_tried() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0), account("pinned", 0)]);
         set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least utilized
         set_over_threshold(&manager, 1, 0.970, "allowed_warning");
         set_over_threshold(&manager, 2, 0.999, "allowed_warning"); // the warm pin
         let key = 515_151u64;
         let now = OffsetDateTime::now_utc();
-        {
-            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (2, odt_to_ms(now)));
-        }
+        seed_pin(&manager, key, 2, odt_to_ms(now));
 
         // The pin failed THIS request and nothing more: not disabled, not errored,
         // not rejected, no hold. It clears every ACCOUNT-level hard gate.
@@ -16343,12 +15722,7 @@ mod tests {
             Some(0),
             "a tried pin cannot serve THIS request → the least-utilized survivor does"
         );
-        let pin_after = manager
-            .affinity
-            .lock()
-            .expect("affinity lock poisoned")
-            .get(&key)
-            .map(|&(idx, _)| idx);
+        let pin_after = pin_of(&manager, key);
         assert_eq!(
             pin_after,
             Some(2),
@@ -16367,24 +15741,12 @@ mod tests {
         let key = 626_262u64;
         let now = OffsetDateTime::now_utc();
         let tried = HashSet::from([2usize]);
-        let pin_session = |manager: &Manager, idx: usize| {
-            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (idx, odt_to_ms(now)));
-        };
-        let pin_of = |manager: &Manager| {
-            manager
-                .affinity
-                .lock()
-                .expect("affinity lock poisoned")
-                .get(&key)
-                .map(|&(idx, _)| idx)
-        };
+        let pin_session =
+            |manager: &Manager, idx: usize| seed_pin(manager, key, idx, odt_to_ms(now));
+        let pin_of = |manager: &Manager| pin_of(manager, key);
 
         // (a) REJECTED and tried — a durable block, so the session must move off it.
-        let rejected = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
-            pacing_refresher(),
-        );
+        let rejected = manager_of(vec![account("a", 0), account("b", 0), account("pinned", 0)]);
         set_over_threshold(&rejected, 0, 0.950, "allowed_warning"); // least utilized
         set_over_threshold(&rejected, 1, 0.970, "allowed_warning");
         set_over_threshold(&rejected, 2, 0.999, "rejected");
@@ -16402,10 +15764,7 @@ mod tests {
 
         // (b) HELD PAST THE CACHE and tried — also durable (a fresh manager, so the
         // anti-storm valve the serve above armed does not swallow this call).
-        let held = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
-            pacing_refresher(),
-        );
+        let held = manager_of(vec![account("a", 0), account("b", 0), account("pinned", 0)]);
         set_over_threshold(&held, 0, 0.950, "allowed_warning"); // least utilized
         set_over_threshold(&held, 1, 0.970, "allowed_warning");
         set_over_threshold(&held, 2, 0.999, "allowed_warning");
@@ -16430,10 +15789,7 @@ mod tests {
     /// `allowed` one is served. If ALL are `rejected` → `None`.
     #[test]
     fn revalidation_skips_rejected_accounts() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         set_over_threshold(&manager, 0, 0.960, "rejected"); // least util but blocked
         set_over_threshold(&manager, 1, 0.990, "allowed_warning");
 
@@ -16447,10 +15803,7 @@ mod tests {
         // Now reject BOTH → nothing servable → None.
         set_over_threshold(&manager, 1, 0.990, "rejected");
         // A fresh manager to reset the anti-storm valve (previous serve armed it).
-        let manager2 = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager2 = manager_of(vec![account("a", 0), account("b", 0)]);
         set_over_threshold(&manager2, 0, 0.960, "rejected");
         set_over_threshold(&manager2, 1, 0.990, "rejected");
         assert_eq!(
@@ -16463,10 +15816,7 @@ mod tests {
     /// #3 An account under a live rate-limit hold is skipped even if least-utilized.
     #[test]
     fn revalidation_skips_hard_held_account() {
-        let manager = build_manager(
-            config_with(vec![account("held", 0), account("free", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("held", 0), account("free", 0)]);
         set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least util …
         set_over_threshold(&manager, 1, 0.990, "allowed_warning");
         {
@@ -16485,10 +15835,7 @@ mod tests {
     /// `REVALIDATION_MIN_SPACING_MS`) returns `None`.
     #[test]
     fn revalidation_throttle_spacing_respected() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("a", 0), account("b", 0)]);
         set_over_threshold(&manager, 0, 0.970, "allowed_warning");
         set_over_threshold(&manager, 1, 0.990, "allowed_warning");
         let now = OffsetDateTime::now_utc();
@@ -16508,10 +15855,7 @@ mod tests {
     /// revalidation path is never consulted — the normal path stays unchanged.
     #[test]
     fn revalidation_not_consulted_when_an_account_is_eligible() {
-        let manager = build_manager(
-            config_with(vec![account("hot", 0), account("cool", 0)]),
-            pacing_refresher(),
-        );
+        let manager = manager_of(vec![account("hot", 0), account("cool", 0)]);
         set_over_threshold(&manager, 0, 0.999, "allowed_warning");
         // account 1 stays healthy (no quota set) → under threshold → eligible.
         let now = OffsetDateTime::now_utc();
@@ -16528,10 +15872,7 @@ mod tests {
     #[test]
     fn revalidation_fable_skips_fable_exhausted() {
         let build = || {
-            let manager = build_manager(
-                config_with(vec![account("fable-full", 0), account("other", 0)]),
-                pacing_refresher(),
-            );
+            let manager = manager_of(vec![account("fable-full", 0), account("other", 0)]);
             let now = OffsetDateTime::now_utc();
             // account 0: least-utilized on shared dims but Fable weekly exhausted.
             set_over_threshold(&manager, 0, 0.950, "allowed_warning");
@@ -16572,12 +15913,7 @@ mod tests {
 
     /// A manager with no account, for the Codex traffic counts, which no account owns.
     fn traffic_manager() -> Arc<Manager> {
-        build_manager(
-            config_with(Vec::new()),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        )
+        manager_of(Vec::new())
     }
 
     /// The refused count covers the last ten minutes, by the minute: a 429 drops out once ten
@@ -16631,12 +15967,7 @@ mod tests {
     /// key for good. Over the cap the least recently noted key goes, and the newest stays.
     #[test]
     fn the_extended_cache_set_is_capped_without_a_pin_flush() {
-        let manager = build_manager(
-            config_with(vec![account("a", 0)]),
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        let manager = manager_of(vec![account("a", 0)]);
         let noted = select::AFFINITY_CAP as u64 * 2;
         for key in 0..noted {
             manager.note_affinity_ttl(key, true);
@@ -16686,11 +16017,7 @@ mod tests {
         };
         let neither = config_with_g_settings(accounts(), false, false);
         let both = config_with_g_settings(accounts(), true, true);
-        let refresher = || {
-            Arc::new(CountingRefresher {
-                calls: Arc::new(AtomicUsize::new(0)),
-            })
-        };
+        let refresher = || counting_refresher();
         let select_g = |manager: &Manager| {
             manager.select_with_group(
                 &HashSet::new(),
