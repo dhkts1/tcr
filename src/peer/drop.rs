@@ -373,10 +373,10 @@ fn seal_payload_with_nonce(
     use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(seal_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*seal_key));
     let sealed = cipher
         .encrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: plaintext,
                 aad,
@@ -417,10 +417,7 @@ pub(crate) fn open_payload(
     use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
-    let Some(nonce) = payload.get(..NONCE_BYTES) else {
-        return Err(OpenFailure::TooShort);
-    };
-    let Some(body) = payload.get(NONCE_BYTES..) else {
+    let Some((nonce, body)) = payload.split_first_chunk::<NONCE_BYTES>() else {
         return Err(OpenFailure::TooShort);
     };
     if body.len() <= TAG_BYTES {
@@ -429,9 +426,9 @@ pub(crate) fn open_payload(
         return Err(OpenFailure::TooShort);
     }
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(seal_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*seal_key));
     cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: body, aad })
+        .decrypt(&Nonce::from(*nonce), Payload { msg: body, aad })
         .map_err(|_| OpenFailure::DidNotAuthenticate)
 }
 
