@@ -309,7 +309,7 @@ impl NatPmp {
         match socket.local_addr().map_err(ReachError::Socket)? {
             SocketAddr::V4(local) => Ok(*local.ip()),
             SocketAddr::V6(local) => Err(ReachError::Malformed(format!(
-                "peer internet: the route to {} is v6 ({local}) and a UPnP internal client                  is an IPv4 address",
+                "peer internet: the route to {} is v6 ({local}) and a UPnP internal client is an IPv4 address",
                 self.gateway
             ))),
         }
@@ -1303,7 +1303,7 @@ impl MappingKeeper {
         let client = UpnpClient::discover(discoverer).map_err(named)?;
         let internal = self.client.internal_address().map_err(|err| {
             ReachError::Malformed(format!(
-                "peer internet: UPnP needs this Mac's address on the LAN and it could not                  be read: {err}"
+                "peer internet: UPnP needs this Mac's address on the LAN and it could not be read: {err}"
             ))
         })?;
         client
@@ -2777,15 +2777,15 @@ impl std::fmt::Display for PunchFailure {
             ),
             Self::SelfAddressUnknown => write!(
                 f,
-                "punch: no peer has told this Mac its own public address yet, so there is                  nothing to ask that peer to aim at"
+                "punch: no peer has told this Mac its own public address yet, so there is nothing to ask that peer to aim at"
             ),
             Self::NotAnnounced => write!(
                 f,
-                "punch: no pinned Mac could carry the ask to that peer, so it would not be                  in the slot"
+                "punch: no pinned Mac could carry the ask to that peer, so it would not be in the slot"
             ),
             Self::AddressNotUnderstood { told } => write!(
                 f,
-                "punch: that peer asked for a punch from `{told}`, which is not a socket                  address"
+                "punch: that peer asked for a punch from `{told}`, which is not a socket address"
             ),
             Self::NoSlotConnected { slots_tried, ports } => write!(
                 f,
