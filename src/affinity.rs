@@ -313,14 +313,14 @@ pub fn rename_pins(path: &Path, renames: &[(String, String)]) -> usize {
             rewritten += 1;
         }
     }
-    if rewritten > 0 {
-        if let Err(err) = crate::config::write_atomic(
+    if rewritten > 0
+        && let Err(err) = crate::config::write_atomic(
             path,
             &serde_json::to_string_pretty(&file).unwrap_or_default(),
-        ) {
-            tracing::warn!(error = %err, "could not carry session-affinity pins across the account rename");
-            return 0;
-        }
+        )
+    {
+        tracing::warn!(error = %err, "could not carry session-affinity pins across the account rename");
+        return 0;
     }
     rewritten
 }

@@ -805,12 +805,11 @@ fn kill_hard(expected: (u32, u64)) {
         true,
         ProcessRefreshKind::nothing(),
     );
-    if let Some(process) = system.process(Pid::from_u32(pid)) {
-        if process.status() != sysinfo::ProcessStatus::Zombie
-            && cleanup_identity_is_current(expected, (pid, process.start_time()))
-        {
-            let _ = process.kill_with(Signal::Kill);
-        }
+    if let Some(process) = system.process(Pid::from_u32(pid))
+        && process.status() != sysinfo::ProcessStatus::Zombie
+        && cleanup_identity_is_current(expected, (pid, process.start_time()))
+    {
+        let _ = process.kill_with(Signal::Kill);
     }
 }
 
@@ -1015,10 +1014,14 @@ fn cancelling_codex_login_reports_a_throwaway_folder_it_could_not_delete() {
     let scratch = Scratch::new("[]");
     let auth = scratch.path("prepared-auth.json");
     std::fs::write(&auth, bob_auth()).unwrap();
-    write_script(&scratch.codex, &format!(
-        "#!/bin/sh\necho pid $$ >> '{log}'\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\necho ready >> '{log}'\nwhile :; do /bin/sleep 1; done\n",
-        log = scratch.log.display(), auth = auth.display(),
-    ));
+    write_script(
+        &scratch.codex,
+        &format!(
+            "#!/bin/sh\necho pid $$ >> '{log}'\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\necho ready >> '{log}'\nwhile :; do /bin/sleep 1; done\n",
+            log = scratch.log.display(),
+            auth = auth.display(),
+        ),
+    );
     let error_log = scratch.path("cancel.stderr");
     let event_log = scratch.path("cancel.stdout");
     let mut child = scratch
@@ -1280,10 +1283,10 @@ fn proxy_without_providers() -> u16 {
             let mut length = 0usize;
             let mut line = String::new();
             while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse().unwrap_or(0);
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap_or(0);
                 }
                 line.clear();
             }
@@ -1338,10 +1341,14 @@ fn a_failed_codex_login_reports_its_folder_cleanup_failure_too() {
     let scratch = Scratch::new("[]");
     let auth = scratch.path("prepared-auth.json");
     std::fs::write(&auth, bob_auth()).unwrap();
-    write_script(&scratch.codex, &format!(
-        "#!/bin/sh\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\nexit 7\n",
-        log=scratch.log.display(), auth=auth.display(),
-    ));
+    write_script(
+        &scratch.codex,
+        &format!(
+            "#!/bin/sh\necho \"home $CODEX_HOME\" >> '{log}'\n/bin/cp '{auth}' \"$CODEX_HOME/auth.json\"\n/bin/chmod 500 \"$CODEX_HOME\"\nexit 7\n",
+            log = scratch.log.display(),
+            auth = auth.display(),
+        ),
+    );
     let out = scratch
         .tcr()
         .args(["login", "--codex", "--non-interactive", "--config"])

@@ -19,7 +19,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::codex_login::CodexLogin;
 use crate::oauth::Tokens;
@@ -465,10 +465,12 @@ mod tests {
             result.is_err(),
             "symlinked credentials require an explicit writeback refusal"
         );
-        assert!(fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_to_string(target).unwrap(), original);
     }
 

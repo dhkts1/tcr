@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::conversation::History;
@@ -180,7 +180,7 @@ impl Driver {
                     ttfb_ms: None,
                     total_ms: ms(started.elapsed()),
                     added_ms: None,
-                }
+                };
             }
         };
         let status = response.status().as_u16();
@@ -202,13 +202,14 @@ impl Driver {
         }
         let total = started.elapsed();
         let ok = read_error.is_none() && (200..300).contains(&status);
-        if ok && kind != Kind::CountTokens {
-            if let Some(minted) = minted_tokens(&bytes) {
-                *session
-                    .last
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(minted);
-            }
+        if ok
+            && kind != Kind::CountTokens
+            && let Some(minted) = minted_tokens(&bytes)
+        {
+            *session
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(minted);
         }
         let added = self
             .stub

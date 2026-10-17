@@ -490,10 +490,11 @@ fn source_rank(endpoint: &Endpoint) -> u8 {
 /// Key 1 of [`order_endpoints`]: which kind of path this is, as the policy
 /// ranks it.
 fn kind_rank(endpoint: &Endpoint, config: &PathsConfig) -> u8 {
-    if let Locator::Via { node } = endpoint.locator {
-        if !config.via_allow.is_empty() && !config.via_allow.contains(&node) {
-            return 2;
-        }
+    if let Locator::Via { node } = endpoint.locator
+        && !config.via_allow.is_empty()
+        && !config.via_allow.contains(&node)
+    {
+        return 2;
     }
     match (config.prefer, endpoint.is_via()) {
         (PathPolicy::Direct, false) | (PathPolicy::Via, true) => 0,
@@ -522,11 +523,7 @@ pub fn drop_cooling_endpoints(
         .filter(|endpoint| !table.is_cooling(peer, &endpoint.locator, now_ms))
         .cloned()
         .collect();
-    if awake.is_empty() {
-        order
-    } else {
-        awake
-    }
+    if awake.is_empty() { order } else { awake }
 }
 
 /// [`order_endpoints`] against the process-local table, with cooling

@@ -39,14 +39,14 @@
 //!    "prefix". If this ever starts failing, `classify_request`'s matching
 //!    got stricter and this comment (and case 3's) should be revisited.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::any;
-use axum::Router;
 use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
 use tcr::manager::Manager;
 use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};

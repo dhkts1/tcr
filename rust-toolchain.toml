@@ -1,0 +1,8 @@
+# One toolchain for every build of this repository: a developer's Mac, CI and
+# the release jobs. CI once installed a newer stable than a local machine had,
+# and a clippy lint the local clippy did not know failed a pull request. Move
+# this pin and `rust-version` in each Cargo.toml together.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

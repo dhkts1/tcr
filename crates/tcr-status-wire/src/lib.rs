@@ -792,6 +792,17 @@ pub fn codex_plan_label(raw: Option<&str>) -> Option<String> {
     })
 }
 
+impl AccountStatusRow {
+    /// Decode one already-parsed row. This is the row-at-a-time entry point —
+    /// call it per-element over the array (`serde_json::Value::Array` iterated
+    /// one item at a time, or one line of a JSONL rendering), never
+    /// `serde_json::from_slice::<Vec<AccountStatusRow>>` against the whole
+    /// payload, which lets one malformed row fail every row alongside it.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,24 +1052,15 @@ mod tests {
     #[test]
     fn provider_is_absent_on_the_wire_for_anthropic_rows_and_present_for_codex() {
         let mut row = committed_anthropic_row();
-        assert!(!serde_json::to_string(&row)
-            .unwrap()
-            .contains("\"provider\""));
+        assert!(
+            !serde_json::to_string(&row)
+                .unwrap()
+                .contains("\"provider\"")
+        );
         row.provider = Some("codex".to_string());
         let json = serde_json::to_string(&row).unwrap();
         assert!(json.contains("\"provider\":\"codex\""));
         let back: AccountStatusRow = serde_json::from_str(&json).unwrap();
         assert_eq!(back.provider.as_deref(), Some("codex"));
-    }
-}
-
-impl AccountStatusRow {
-    /// Decode one already-parsed row. This is the row-at-a-time entry point —
-    /// call it per-element over the array (`serde_json::Value::Array` iterated
-    /// one item at a time, or one line of a JSONL rendering), never
-    /// `serde_json::from_slice::<Vec<AccountStatusRow>>` against the whole
-    /// payload, which lets one malformed row fail every row alongside it.
-    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        serde_json::from_value(value)
     }
 }

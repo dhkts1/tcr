@@ -1784,10 +1784,10 @@ mod fleet {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use axum::Router;
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::any;
-    use axum::Router;
     use tcr::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
     use tcr::manager::Manager;
     use tcr::oauth::{OAuthError, RefreshFuture, TokenRefresher};

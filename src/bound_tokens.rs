@@ -897,8 +897,10 @@ mod tests {
         );
         assert!(!report.tokens.contains_key(&hash_token("t0")));
         assert!(!report.tokens.contains_key(&hash_token("t1")));
-        assert!(report
-            .tokens
-            .contains_key(&hash_token(&format!("t{}", BOUND_TOKEN_CAP + 1))));
+        assert!(
+            report
+                .tokens
+                .contains_key(&hash_token(&format!("t{}", BOUND_TOKEN_CAP + 1)))
+        );
     }
 }

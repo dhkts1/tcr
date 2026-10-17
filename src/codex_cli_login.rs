@@ -429,15 +429,14 @@ fn spawn_reader(
             if let Some(url) = line
                 .split_whitespace()
                 .find(|token| token.starts_with(AUTHORIZE_URL_PREFIX))
+                && !output.url_sent.swap(true, Ordering::SeqCst)
             {
-                if !output.url_sent.swap(true, Ordering::SeqCst) {
-                    if CODEX_OPENS_ITS_BROWSER {
-                        ui.emit(LoginEvent::BrowserOpened { url });
-                    } else {
-                        ui.emit(LoginEvent::Browser { url });
-                    }
-                    ui.emit(LoginEvent::Waiting);
+                if CODEX_OPENS_ITS_BROWSER {
+                    ui.emit(LoginEvent::BrowserOpened { url });
+                } else {
+                    ui.emit(LoginEvent::Browser { url });
                 }
+                ui.emit(LoginEvent::Waiting);
             }
         }
         let _ = done.send(());
@@ -529,7 +528,7 @@ struct Signals {
 
 impl Signals {
     fn arm() -> anyhow::Result<Self> {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
             terminate: signal(SignalKind::terminate()).context("arming SIGTERM")?,
             interrupt: signal(SignalKind::interrupt()).context("arming SIGINT")?,

@@ -1203,14 +1203,13 @@ pub fn inspect_codex(
     let ca = crate::mitm::minted_ca_path();
     let ca_readable = ca.is_file();
     let mut route = crate::codex_route::codex_route(live, port, &ca, ca_readable, rows.len());
-    if route.pooled {
-        if let Err(reason) =
+    if route.pooled
+        && let Err(reason) =
             crate::codex_route::codex_ca_for_launch(&ca, &|var| std::env::var(var).ok())
-        {
-            route.pooled = false;
-            route.code = Some(crate::codex_route::NO_CA.to_string());
-            route.reason = Some(reason);
-        }
+    {
+        route.pooled = false;
+        route.code = Some(crate::codex_route::NO_CA.to_string());
+        route.reason = Some(reason);
     }
     let default_upstream = crate::config::default_codex_upstream();
     let (upstream, upstream_is_default) = match live {
@@ -1722,9 +1721,11 @@ mod tests {
         assert_eq!(json["baseUrl"], "http://127.0.0.1:3456");
         assert_eq!(json["portHolder"]["isTcr"], true);
         assert_eq!(json["requestWindowMinutes"], 10);
-        assert!(json["verdict"]
-            .as_str()
-            .is_some_and(|v| v.starts_with("verdict: ")));
+        assert!(
+            json["verdict"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("verdict: "))
+        );
         assert_eq!(
             json["unknownKeys"],
             serde_json::json!([]),

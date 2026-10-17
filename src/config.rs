@@ -2650,14 +2650,14 @@ pub(crate) fn write_atomic_with(
     // with `Durability::Cache` and skip this sync. The credential
     // writers run per token rotation. If a future caller writes at request rate,
     // revisit this line before assuming it is free.
-    if durability == Durability::Flushed {
-        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
-            tracing::warn!(
-                dir = %dir.display(),
-                error = %e,
-                "state file renamed into place, but the parent directory could not be fsynced; the rename may not survive a power loss"
-            );
-        }
+    if durability == Durability::Flushed
+        && let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all())
+    {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "state file renamed into place, but the parent directory could not be fsynced; the rename may not survive a power loss"
+        );
     }
 
     // NOT a guard against a looser pre-existing destination: `persist` is a
@@ -3844,12 +3844,12 @@ fn merge_group_reserved(
             .as_object_mut()
             .expect("just ensured object")
             .insert("reserved".to_string(), Value::Bool(true));
-    } else if let Some(entry) = settings_obj.get_mut(group) {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.remove("reserved");
-            if obj.is_empty() {
-                settings_obj.remove(group);
-            }
+    } else if let Some(entry) = settings_obj.get_mut(group)
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.remove("reserved");
+        if obj.is_empty() {
+            settings_obj.remove(group);
         }
     }
     if settings_obj.is_empty() {
@@ -3926,12 +3926,12 @@ fn merge_group_parked(doc: &mut Map<String, Value>, group: &str, parked: bool) -
             .as_object_mut()
             .expect("just ensured object")
             .insert("parked".to_string(), Value::Bool(true));
-    } else if let Some(entry) = settings_obj.get_mut(group) {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.remove("parked");
-            if obj.is_empty() {
-                settings_obj.remove(group);
-            }
+    } else if let Some(entry) = settings_obj.get_mut(group)
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.remove("parked");
+        if obj.is_empty() {
+            settings_obj.remove(group);
         }
     }
     if settings_obj.is_empty() {
@@ -4013,12 +4013,12 @@ fn merge_group_allow_control(
             .as_object_mut()
             .expect("just ensured object")
             .insert("allowControlAccount".to_string(), Value::Bool(true));
-    } else if let Some(entry) = settings_obj.get_mut(group) {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.remove("allowControlAccount");
-            if obj.is_empty() {
-                settings_obj.remove(group);
-            }
+    } else if let Some(entry) = settings_obj.get_mut(group)
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.remove("allowControlAccount");
+        if obj.is_empty() {
+            settings_obj.remove(group);
         }
     }
     if settings_obj.is_empty() {
@@ -4106,12 +4106,12 @@ fn merge_group_color(
                 .insert("color".to_string(), Value::String(hex.to_string()));
         }
         None => {
-            if let Some(entry) = settings_obj.get_mut(group) {
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.remove("color");
-                    if obj.is_empty() {
-                        settings_obj.remove(group);
-                    }
+            if let Some(entry) = settings_obj.get_mut(group)
+                && let Some(obj) = entry.as_object_mut()
+            {
+                obj.remove("color");
+                if obj.is_empty() {
+                    settings_obj.remove(group);
                 }
             }
         }
@@ -4126,10 +4126,10 @@ fn merge_group_color(
 /// the document actually changed, so the caller can skip a pointless rewrite
 /// of a credential file. See [`save_control_account`].
 fn merge_control_account(doc: &mut Map<String, Value>, target: Option<&Account>) -> ControlWrite {
-    if let Some(account) = target {
-        if let EntryMatch::Many = locate_account_entry(doc, account) {
-            return ControlWrite::Ambiguous;
-        }
+    if let Some(account) = target
+        && let EntryMatch::Many = locate_account_entry(doc, account)
+    {
+        return ControlWrite::Ambiguous;
     }
     let desired = target.map(|account| {
         serde_json::to_value(ControlAccountRef::from(account))
@@ -4512,20 +4512,20 @@ fn merge_account(
                     }
                 }
                 let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
-                if !present(entry, "accountUuid") {
-                    if let Some(uuid) = &account.account_uuid {
-                        entry.insert("accountUuid".to_string(), Value::String(uuid.clone()));
-                    }
+                if !present(entry, "accountUuid")
+                    && let Some(uuid) = &account.account_uuid
+                {
+                    entry.insert("accountUuid".to_string(), Value::String(uuid.clone()));
                 }
-                if !present(entry, "orgUuid") {
-                    if let Some(uuid) = &account.org_uuid {
-                        entry.insert("orgUuid".to_string(), Value::String(uuid.clone()));
-                    }
+                if !present(entry, "orgUuid")
+                    && let Some(uuid) = &account.org_uuid
+                {
+                    entry.insert("orgUuid".to_string(), Value::String(uuid.clone()));
                 }
-                if !present(entry, "orgName") {
-                    if let Some(name) = &account.org_name {
-                        entry.insert("orgName".to_string(), Value::String(name.clone()));
-                    }
+                if !present(entry, "orgName")
+                    && let Some(name) = &account.org_name
+                {
+                    entry.insert("orgName".to_string(), Value::String(name.clone()));
                 }
                 // Plan fields are OVERWRITTEN, not backfilled — the opposite of
                 // the identity fields above, deliberately. An identity does not

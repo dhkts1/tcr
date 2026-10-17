@@ -97,11 +97,11 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
 use tokio::io::{
     AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf,
@@ -2166,10 +2166,10 @@ where
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut round = 0_usize;
     loop {
-        if let Some(limit) = rounds {
-            if round >= limit {
-                return tally;
-            }
+        if let Some(limit) = rounds
+            && round >= limit
+        {
+            return tally;
         }
         round += 1;
         ticker.tick().await;
@@ -2240,10 +2240,10 @@ where
     let mut tally = ReverseKeeperRun::default();
     let mut round = 0_usize;
     loop {
-        if let Some(limit) = runs {
-            if round >= limit {
-                return tally;
-            }
+        if let Some(limit) = runs
+            && round >= limit
+        {
+            return tally;
         }
         round += 1;
         match run_one(friend.clone()).await {

@@ -30,11 +30,11 @@
 //! account reads `unavailable`, not `api_key`, because [`AccountStatusRow`] does not
 //! say which kind of account a row is.
 
-use serde::de::value::{Error as TokenError, StrDeserializer};
 use serde::de::IntoDeserializer;
+use serde::de::value::{Error as TokenError, StrDeserializer};
 use serde::{Deserialize, Serialize};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::AccountStatusRow;
 

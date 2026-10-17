@@ -25,8 +25,8 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tcr::peer::config::{Allow, Endpoint, EndpointSource, Locator, PeerFile, PeerRow, PeerStore};

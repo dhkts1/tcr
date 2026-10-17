@@ -7,8 +7,8 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 struct Fixture {
@@ -97,7 +97,7 @@ impl Fixture {
                                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                             ) && std::time::Instant::now() < deadline =>
                         {
-                            continue
+                            continue;
                         }
                         Err(error) => panic!("read fixture status request: {error}"),
                     }

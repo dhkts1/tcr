@@ -365,7 +365,7 @@ use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 use oauth2::basic::BasicClient;
 use oauth2::{AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope, TokenUrl};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
@@ -622,8 +622,7 @@ pub fn machine_error_line(error: &anyhow::Error) -> (String, String) {
 /// Printed once a Codex account is saved into a config that held no Codex row before, in any
 /// state, enabled, disabled or needing a re-login. The account enables marked Codex connections
 /// to join the pool (`mitm::handle_connect`); unmarked clients keep their own TLS and login.
-pub const CODEX_FIRST_ACCOUNT_NOTICE: &str =
-    "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep \
+pub const CODEX_FIRST_ACCOUNT_NOTICE: &str = "tcr pools marked Codex connections to chatgpt.com: use `tcr run --codex`; keep \
     the marker scoped to that launch, since unmarked connections keep their own login";
 
 /// The warning for a `tcr` at `path`, reporting `version`, that is 0.2.45 or older: it predates
@@ -889,10 +888,10 @@ async fn read_stdin_code(expected_state: &str) -> anyhow::Result<String> {
             if let Some(code) = code {
                 // Only reject when a state was supplied and does not match —
                 // a bare code without state stays acceptable (JS parity).
-                if let Some(state) = state {
-                    if state != expected_state {
-                        bail!("OAuth state mismatch");
-                    }
+                if let Some(state) = state
+                    && state != expected_state
+                {
+                    bail!("OAuth state mismatch");
                 }
                 return Ok(code);
             }
@@ -2130,8 +2129,7 @@ pub async fn login_with_token(
 /// so the first time tcr refreshes the imported credential, the copy the
 /// `claude` CLI is still holding becomes dead and `claude` asks for a browser
 /// login once.
-pub const CLAUDE_CODE_IMPORT_CONSEQUENCE: &str =
-    "this copies the login the `claude` CLI itself uses, and each refresh token is single-use, \
+pub const CLAUDE_CODE_IMPORT_CONSEQUENCE: &str = "this copies the login the `claude` CLI itself uses, and each refresh token is single-use, \
      so the next time tcr refreshes it, `claude` will ask you to log in again in the browser, \
      once. Sessions started with `tcr run` are not affected.";
 

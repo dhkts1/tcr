@@ -38,7 +38,9 @@ pub fn codex_ca_for_launch(
             return if crate::mitm::ca_bundle_contains(&bundle, ca) {
                 Ok(bundle)
             } else {
-                Err(format!("{variable} does not include tcr's CA; keep the caller's trust settings and use codex's own login. Add tcr's CA to that bundle before retrying `tcr run --codex` to pool it"))
+                Err(format!(
+                    "{variable} does not include tcr's CA; keep the caller's trust settings and use codex's own login. Add tcr's CA to that bundle before retrying `tcr run --codex` to pool it"
+                ))
             };
         }
     }
@@ -83,14 +85,14 @@ pub fn codex_route(
                 NO_PROXY,
                 format!("no proxy answered on 127.0.0.1:{port}"),
                 None,
-            )
+            );
         }
         Err(err) => {
             return not_pooled(
                 STATUS_UNREADABLE,
                 format!("could not read the running proxy's status ({})", err.why()),
                 None,
-            )
+            );
         }
         Ok(payload) => payload,
     };

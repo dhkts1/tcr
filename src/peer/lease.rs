@@ -780,10 +780,10 @@ fn note_handed_baseline(lease_id: u128, utilization: f64) {
     if !utilization.is_finite() {
         return;
     }
-    if let Ok(mut meters) = handed_meters().lock() {
-        if let Some(meter) = meters.get_mut(&lease_id) {
-            meter.last = Some(meter.last.map_or(utilization, |last| last.max(utilization)));
-        }
+    if let Ok(mut meters) = handed_meters().lock()
+        && let Some(meter) = meters.get_mut(&lease_id)
+    {
+        meter.last = Some(meter.last.map_or(utilization, |last| last.max(utilization)));
     }
 }
 
@@ -1774,16 +1774,16 @@ impl Ledger {
         // and the close computed against a different one.
         let schedule_now = time::OffsetDateTime::now_utc();
         let schedule = granted.as_ref().and_then(|grant| grant.schedule());
-        if let Some(schedule) = schedule.as_ref() {
-            if let Some(refusal) = schedule_refusal(Some(schedule), schedule_now) {
-                tracing::info!(
-                    peer = %peer.display(),
-                    window = ?ask.window,
-                    "peer lease: this grant is outside the hours it was lent for, so nothing \
-                     is granted until it opens again"
-                );
-                return Granted::unfunded(refusal);
-            }
+        if let Some(schedule) = schedule.as_ref()
+            && let Some(refusal) = schedule_refusal(Some(schedule), schedule_now)
+        {
+            tracing::info!(
+                peer = %peer.display(),
+                window = ?ask.window,
+                "peer lease: this grant is outside the hours it was lent for, so nothing \
+                 is granted until it opens again"
+            );
+            return Granted::unfunded(refusal);
         }
         // THE FIFTH CLAMP's input: the window this lease is being minted
         // inside stops being open at this instant, so nothing after mint has
@@ -3264,7 +3264,7 @@ impl FallbackProvider for PeerLeaseProvider {
                     // is the same double-send one hop further out. So the
                     // client is told the outcome is unknown, once.
                     Ok(serve::Borrowed::DeliveredUnknown) => {
-                        return Some(delivered_unknown_response())
+                        return Some(delivered_unknown_response());
                     }
                     Ok(serve::Borrowed::NotThisLender) => {
                         // A refusal, or nothing reachable. The lease may be the

@@ -61,19 +61,19 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tcr_peer_wire::{
-    decode_bytes, decode_key32, encode_bytes, encode_key32, sanitize_label, Control, Enroll,
-    PeerId, StreamHeader, StreamKind,
+    Control, Enroll, PeerId, StreamHeader, StreamKind, decode_bytes, decode_key32, encode_bytes,
+    encode_key32, sanitize_label,
 };
 
 use crate::peer::config::{
-    read_or_default, save, ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore,
-    PendingInvite,
+    ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
+    read_or_default, save,
 };
 use crate::peer::dialaddrs;
-use crate::peer::id::{default_config_dir, NodeKey};
-use crate::peer::listener::{hello_for_peer, NodeFacts};
+use crate::peer::id::{NodeKey, default_config_dir};
+use crate::peer::listener::{NodeFacts, hello_for_peer};
 use crate::peer::noise::{self, Handshake, KEY_BYTES};
 
 /// How many invites may be outstanding at once.
@@ -407,9 +407,9 @@ impl JoinToken {
         let bytes = decode_bytes(body)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context(
-            "peer join: a v3 key is not a whole run of base32 bytes, which is what a paste cut \
+                "peer join: a v3 key is not a whole run of base32 bytes, which is what a paste cut \
              short looks like",
-        )?;
+            )?;
         let min_len = TOKEN_V3_MAGIC.len() + 1 + 1 + 32 + 32;
         if bytes.len() < min_len {
             bail!(
@@ -422,7 +422,9 @@ impl JoinToken {
         }
         let version = bytes[TOKEN_V3_MAGIC.len()];
         if version != TOKEN_V3_VERSION {
-            bail!("peer join: this v3 key names format version {version}, which this build does not know");
+            bail!(
+                "peer join: this v3 key names format version {version}, which this build does not know"
+            );
         }
         let rest = &bytes[TOKEN_V3_MAGIC.len() + 1..];
         Self::from_v3_body(rest)
@@ -998,7 +1000,7 @@ pub async fn join_as(
         Err(err) => {
             return Err(err).context(
                 "peer join: the registrar's answer to the enrolment is not a control message",
-            )
+            );
         }
     }
 
@@ -1277,7 +1279,7 @@ pub async fn pair(_store: &PeerStore, addr: SocketAddr) -> Result<PendingPair> {
                 return Ok(PendingPair {
                     peer: session.peer,
                     code: session.code,
-                })
+                });
             }
             Err(err) => err,
         };
@@ -1986,12 +1988,14 @@ mod tests {
     /// A listener with no port yet cannot produce a key at all.
     #[test]
     fn a_listener_with_no_port_yields_nothing() {
-        assert!(dial_addresses(
-            SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
-            &[host("en0", "192.0.2.10")],
-            None,
-        )
-        .is_empty());
+        assert!(
+            dial_addresses(
+                SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
+                &[host("en0", "192.0.2.10")],
+                None,
+            )
+            .is_empty()
+        );
     }
 
     /// One address twice on two interfaces is one address in the key: a

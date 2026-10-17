@@ -37,15 +37,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
 use tcr::peer::config as peer_config;
 use tcr::peer::drop::{
-    self, seal, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
+    self, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore, seal,
 };
 use tcr::peer::serve;
 use tcr_peer_wire::PeerId;

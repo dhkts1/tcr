@@ -2067,7 +2067,7 @@ impl FileLock {
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(err) => {
                     return Err(err)
-                        .with_context(|| format!("peers file lock: creating {}", path.display()))
+                        .with_context(|| format!("peers file lock: creating {}", path.display()));
                 }
             }
 
@@ -2075,19 +2075,19 @@ impl FileLock {
             // listener. Age is measured on the lockfile itself, so a live
             // holder that is simply slow is never broken in under
             // LOCK_STALE_MS.
-            if let Ok(age) = std::fs::metadata(&path).and_then(|m| m.modified()) {
-                if age.elapsed().map_or(0, |e| e.as_millis()) > u128::from(LOCK_STALE_MS) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        stale_ms = LOCK_STALE_MS,
-                        "peers file lock: breaking a lock older than the stale bound; \
-                         its holder is gone"
-                    );
-                    std::fs::remove_file(&path).with_context(|| {
-                        format!("peers file lock: breaking stale {}", path.display())
-                    })?;
-                    continue;
-                }
+            if let Ok(age) = std::fs::metadata(&path).and_then(|m| m.modified())
+                && age.elapsed().map_or(0, |e| e.as_millis()) > u128::from(LOCK_STALE_MS)
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    stale_ms = LOCK_STALE_MS,
+                    "peers file lock: breaking a lock older than the stale bound; \
+                     its holder is gone"
+                );
+                std::fs::remove_file(&path).with_context(|| {
+                    format!("peers file lock: breaking stale {}", path.display())
+                })?;
+                continue;
             }
 
             if started.elapsed().as_millis() > u128::from(LOCK_WAIT_MS) {
@@ -2489,8 +2489,8 @@ mod tests {
     /// [`endpoints_and_connection_from_hello`] and always pushing the
     /// connection's address: both entries for `198.51.100.7` come back.
     #[test]
-    fn endpoints_and_connection_from_hello_drops_the_connections_own_source_port_once_a_listen_port_is_named(
-    ) {
+    fn endpoints_and_connection_from_hello_drops_the_connections_own_source_port_once_a_listen_port_is_named()
+     {
         let learned = endpoints_and_connection_from_hello(
             &["198.51.100.7:7766".to_string()],
             "198.51.100.7:50254".parse().unwrap(),
@@ -2515,8 +2515,8 @@ mod tests {
     /// connection's whole socket either way. The test below is the same case
     /// from the other end of the exchange, where it is not.
     #[test]
-    fn endpoints_and_connection_from_hello_keeps_the_connection_address_when_the_hello_named_nothing(
-    ) {
+    fn endpoints_and_connection_from_hello_keeps_the_connection_address_when_the_hello_named_nothing()
+     {
         let learned = endpoints_and_connection_from_hello(
             &["0.0.0.0:7766".to_string()],
             "198.51.100.7:7766".parse().unwrap(),

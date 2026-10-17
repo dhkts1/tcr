@@ -1164,52 +1164,50 @@ impl Manager {
                     // (the ordinary gate — no disabled-bypass here, unlike
                     // control preference). `tried` still excludes an account
                     // that already failed THIS request.
-                    if let Some(k) = conn_key {
-                        if let Some(idx) = self.conn_affinity_get(k, now_ms) {
-                            if !tried.contains(&idx) {
-                                let usable = {
-                                    let accounts =
-                                        self.accounts.read().expect("accounts lock poisoned");
-                                    accounts.get(idx).is_some_and(|a| {
-                                        Self::eligible(
-                                            a,
-                                            self.global_threshold,
-                                            self.fable_weekly_threshold,
-                                            &self.pacing,
-                                            true,
-                                            now,
-                                            now_ms,
-                                            is_fable,
-                                            provider,
-                                            // `strict_group`, not `None`: a GROUP-scoped lease
-                                            // carries no `tried` seeding the way an account-set
-                                            // scope does, so for it `strict_group` is the whole
-                                            // enforcement, a connection-affinity account outside
-                                            // it must never be followed onto.
-                                            strict_group,
-                                            group, // reservation is not a preference, real ask
-                                            &reserved_groups,
-                                            &parked_groups,
-                                        )
-                                    })
-                                };
-                                if usable {
-                                    let mut accounts =
-                                        self.accounts.write().expect("accounts lock poisoned");
-                                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(account) = accounts.get_mut(idx) {
-                                        account.last_selected_seq = tick;
-                                        tracing::info!(
-                                            account = %account.name,
-                                            conn = k,
-                                            "control: noise request follows its connection's account"
-                                        );
-                                    }
-                                    drop(accounts);
-                                    self.conn_affinity_record(k, idx, now_ms);
-                                    return Some(idx);
-                                }
+                    if let Some(k) = conn_key
+                        && let Some(idx) = self.conn_affinity_get(k, now_ms)
+                        && !tried.contains(&idx)
+                    {
+                        let usable = {
+                            let accounts = self.accounts.read().expect("accounts lock poisoned");
+                            accounts.get(idx).is_some_and(|a| {
+                                Self::eligible(
+                                    a,
+                                    self.global_threshold,
+                                    self.fable_weekly_threshold,
+                                    &self.pacing,
+                                    true,
+                                    now,
+                                    now_ms,
+                                    is_fable,
+                                    provider,
+                                    // `strict_group`, not `None`: a GROUP-scoped lease
+                                    // carries no `tried` seeding the way an account-set
+                                    // scope does, so for it `strict_group` is the whole
+                                    // enforcement, a connection-affinity account outside
+                                    // it must never be followed onto.
+                                    strict_group,
+                                    group, // reservation is not a preference, real ask
+                                    &reserved_groups,
+                                    &parked_groups,
+                                )
+                            })
+                        };
+                        if usable {
+                            let mut accounts =
+                                self.accounts.write().expect("accounts lock poisoned");
+                            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                            if let Some(account) = accounts.get_mut(idx) {
+                                account.last_selected_seq = tick;
+                                tracing::info!(
+                                    account = %account.name,
+                                    conn = k,
+                                    "control: noise request follows its connection's account"
+                                );
                             }
+                            drop(accounts);
+                            self.conn_affinity_record(k, idx, now_ms);
+                            return Some(idx);
                         }
                     }
                     // No usable connection-pinned account — fall through to the
@@ -1217,46 +1215,44 @@ impl Manager {
                     // it settles on a winner.
                 }
                 RequestClass::ControlPreferred => {
-                    if let Some(control_idx) = self.control() {
-                        if !tried.contains(&control_idx) {
-                            let usable = {
-                                let accounts =
-                                    self.accounts.read().expect("accounts lock poisoned");
-                                accounts.get(control_idx).is_some_and(|a| {
-                                    // `control_eligible` deliberately bypasses `disabled` and
-                                    // every other narrowing gate (see its own doc), it is NOT
-                                    // a substitute for the group scope. A STRICT ask (an
-                                    // operator's `--group`, or a lease's scope) is not a
-                                    // preference this designated-identity route may ignore: a
-                                    // GROUP-scoped lease carries no `tried` seeding, so this is
-                                    // the whole enforcement for it, same reasoning as the
-                                    // connection-affinity overlay just above.
-                                    //
-                                    // Nor is it a substitute for the provider, asked first:
-                                    // the control account is an Anthropic identity
-                                    // (`assemble` ignores a Codex one), and every
-                                    // `/backend-api/` path but the inference one classifies
-                                    // as control-preferred.
-                                    a.provider == provider
-                                        && Self::control_eligible(a, now_ms)
-                                        && strict_group.is_none_or(|g| {
-                                            a.groups.iter().any(|carried| carried == g)
-                                        })
-                                })
-                            };
-                            if usable {
-                                let mut accounts =
-                                    self.accounts.write().expect("accounts lock poisoned");
-                                let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                                if let Some(account) = accounts.get_mut(control_idx) {
-                                    account.last_selected_seq = tick;
-                                    tracing::info!(
-                                        account = %account.name,
-                                        "control: routing unpinned identity-plane request to the control account"
-                                    );
-                                }
-                                return Some(control_idx);
+                    if let Some(control_idx) = self.control()
+                        && !tried.contains(&control_idx)
+                    {
+                        let usable = {
+                            let accounts = self.accounts.read().expect("accounts lock poisoned");
+                            accounts.get(control_idx).is_some_and(|a| {
+                                // `control_eligible` deliberately bypasses `disabled` and
+                                // every other narrowing gate (see its own doc), it is NOT
+                                // a substitute for the group scope. A STRICT ask (an
+                                // operator's `--group`, or a lease's scope) is not a
+                                // preference this designated-identity route may ignore: a
+                                // GROUP-scoped lease carries no `tried` seeding, so this is
+                                // the whole enforcement for it, same reasoning as the
+                                // connection-affinity overlay just above.
+                                //
+                                // Nor is it a substitute for the provider, asked first:
+                                // the control account is an Anthropic identity
+                                // (`assemble` ignores a Codex one), and every
+                                // `/backend-api/` path but the inference one classifies
+                                // as control-preferred.
+                                a.provider == provider
+                                    && Self::control_eligible(a, now_ms)
+                                    && strict_group
+                                        .is_none_or(|g| a.groups.iter().any(|carried| carried == g))
+                            })
+                        };
+                        if usable {
+                            let mut accounts =
+                                self.accounts.write().expect("accounts lock poisoned");
+                            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                            if let Some(account) = accounts.get_mut(control_idx) {
+                                account.last_selected_seq = tick;
+                                tracing::info!(
+                                    account = %account.name,
+                                    "control: routing unpinned identity-plane request to the control account"
+                                );
                             }
+                            return Some(control_idx);
                         }
                     }
                     // Control unset, held, errored, rejected, or already tried —
@@ -1542,23 +1538,23 @@ impl Manager {
             // once every other option is exhausted, so on a healthy fleet this
             // path costs nothing (identical to today) and on a mispredicted one it
             // spends one real request to convert the guess into a fact.
-            if best.is_none() && is_fable && strict_group.is_none() {
-                if let Some(idx) =
+            if best.is_none()
+                && is_fable
+                && strict_group.is_none()
+                && let Some(idx) =
                     self.pick_fable_last_resort(&accounts, pool_tried, now, now_ms, provider)
-                {
-                    if let Some(account) = accounts.get(idx) {
-                        let seven_day_oi =
-                            account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
-                        tracing::info!(
-                            account = %account.name,
-                            seven_day_oi,
-                            "fable: last resort — every account is over the predicted \
-                             Fable-weekly threshold and none was rejected upstream; \
-                             trying the freshest"
-                        );
-                    }
-                    best = Some(idx);
+            {
+                if let Some(account) = accounts.get(idx) {
+                    let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
+                    tracing::info!(
+                        account = %account.name,
+                        seven_day_oi,
+                        "fable: last resort — every account is over the predicted \
+                         Fable-weekly threshold and none was rejected upstream; \
+                         trying the freshest"
+                    );
                 }
+                best = Some(idx);
             }
 
             // Stamp the chosen account so the next select prefers a different one.
@@ -1601,12 +1597,11 @@ impl Manager {
                 // pins survive reconnects, so this size cap — not a disconnect hook — is
                 // what keeps a long-lived proxy from growing the map without limit.
                 const AFFINITY_CAP: usize = 1024;
-                if pins.len() > AFFINITY_CAP {
-                    if let Some((&oldest, _)) = pins.iter().min_by_key(|(_, &(_, touch))| touch) {
-                        if oldest != key {
-                            pins.remove(&oldest);
-                        }
-                    }
+                if pins.len() > AFFINITY_CAP
+                    && let Some((&oldest, _)) = pins.iter().min_by_key(|&(_, &(_, touch))| touch)
+                    && oldest != key
+                {
+                    pins.remove(&oldest);
                 }
                 // Only a real change is worth a line: `None` on an initial pin, and on
                 // a soft divert (where `pin_idx` is the unchanged old index).
@@ -1669,10 +1664,10 @@ impl Manager {
         // affinity itself is off). A direct hit already returned early via
         // `conn_affinity_record` in the overlay; this is the "otherwise normal
         // rotation, and re-record" half of §2. Never touches `self.affinity`.
-        if request_class == RequestClass::Noise {
-            if let (Some(k), Some(idx)) = (conn_key, best) {
-                self.conn_affinity_record(k, idx, now_ms);
-            }
+        if request_class == RequestClass::Noise
+            && let (Some(k), Some(idx)) = (conn_key, best)
+        {
+            self.conn_affinity_record(k, idx, now_ms);
         }
         best
     }
@@ -2360,10 +2355,10 @@ impl Manager {
         if account.quota.status.as_deref() == Some("rejected") {
             return false;
         }
-        if let Some(until) = account.rate_limited_until_ms {
-            if now_ms < until {
-                return false;
-            }
+        if let Some(until) = account.rate_limited_until_ms
+            && now_ms < until
+        {
+            return false;
         }
         true
     }
@@ -2515,10 +2510,10 @@ impl Manager {
         }
         // A rate-limit hold blocks the account only while it is still in the
         // future — a past hold is treated as expired (live), no mutation needed.
-        if let Some(until) = account.rate_limited_until_ms {
-            if now_ms < until {
-                return false;
-            }
+        if let Some(until) = account.rate_limited_until_ms
+            && now_ms < until
+        {
+            return false;
         }
         let threshold = account.switch_threshold.unwrap_or(global_threshold);
         if account.quota.is_near(threshold, now) {
@@ -2554,10 +2549,10 @@ impl Manager {
         // filters exactly like a hard gate WITHIN one pass. `account_gate` /
         // `account_hard_ok` are untouched — Phase 1 never reports a group as the
         // reason an account is hard-blocked.
-        if let Some(g) = group {
-            if !account.groups.iter().any(|acct_group| acct_group == g) {
-                return false;
-            }
+        if let Some(g) = group
+            && !account.groups.iter().any(|acct_group| acct_group == g)
+        {
+            return false;
         }
         // SOFT pacing gate, evaluated LAST so it only ever narrows an already-healthy
         // account. When `respect_pacing` is false (the fallback pass) or pacing is
@@ -2586,15 +2581,15 @@ impl Manager {
         if !pacing.is_active() {
             return false;
         }
-        if let Some(cap) = pacing.effective_max_in_flight() {
-            if account.in_flight >= cap {
-                return true;
-            }
+        if let Some(cap) = pacing.effective_max_in_flight()
+            && account.in_flight >= cap
+        {
+            return true;
         }
-        if let Some(gap) = pacing.min_spacing_ms {
-            if now_ms.saturating_sub(account.last_served_ms) < gap as i64 {
-                return true;
-            }
+        if let Some(gap) = pacing.min_spacing_ms
+            && now_ms.saturating_sub(account.last_served_ms) < gap as i64
+        {
+            return true;
         }
         false
     }
@@ -2662,32 +2657,30 @@ impl Manager {
         if Self::reserved_blocks(account, group, reserved) {
             gates.push((GateReason::Reserved, None));
         }
-        if let Some(until) = account.rate_limited_until_ms {
-            if now_ms < until {
-                let reason = match account.hold_cause {
-                    HoldCause::RateLimit => GateReason::Hold,
-                    HoldCause::Refused => GateReason::Refused,
-                };
-                gates.push((reason, ms_to_odt(until)));
-            }
+        if let Some(until) = account.rate_limited_until_ms
+            && now_ms < until
+        {
+            let reason = match account.hold_cause {
+                HoldCause::RateLimit => GateReason::Hold,
+                HoldCause::Refused => GateReason::Refused,
+            };
+            gates.push((reason, ms_to_odt(until)));
         }
-        if let Some(window) = account.quota.five_hour {
-            if window.effective(now) >= threshold {
-                gates.push((GateReason::FiveHour, window.live_reset(now)));
-            }
+        if let Some(window) = account.quota.five_hour
+            && window.effective(now) >= threshold
+        {
+            gates.push((GateReason::FiveHour, window.live_reset(now)));
         }
-        if let Some(window) = account.quota.seven_day {
-            if window.effective(now) >= threshold {
-                gates.push((GateReason::SevenDay, window.live_reset(now)));
-            }
+        if let Some(window) = account.quota.seven_day
+            && window.effective(now) >= threshold
+        {
+            gates.push((GateReason::SevenDay, window.live_reset(now)));
         }
         // The model-scoped weekly gates Fable requests ONLY — mirror `eligible`.
-        if is_fable {
-            if let Some(window) = account.quota.seven_day_oi {
-                let fable_threshold = effective_fable_threshold(fable_weekly_threshold, threshold);
-                if window.effective(now) >= fable_threshold {
-                    gates.push((GateReason::FableWeekly, window.live_reset(now)));
-                }
+        if is_fable && let Some(window) = account.quota.seven_day_oi {
+            let fable_threshold = effective_fable_threshold(fable_weekly_threshold, threshold);
+            if window.effective(now) >= fable_threshold {
+                gates.push((GateReason::FableWeekly, window.live_reset(now)));
             }
         }
         // Standard (API-key) token/request limits — mirror `Quota::is_near`
@@ -3015,10 +3008,10 @@ impl Manager {
             if Self::parked_blocks(account, &parked_groups) {
                 continue;
             }
-            if let Some(until) = account.rate_limited_until_ms {
-                if now_ms < until {
-                    continue;
-                }
+            if let Some(until) = account.rate_limited_until_ms
+                && now_ms < until
+            {
+                continue;
             }
             let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
             // The shared (non-Fable) gates still apply in full — this pass
@@ -3091,12 +3084,11 @@ impl Manager {
             .lock()
             .expect("conn affinity lock poisoned");
         map.insert(conn_key, (idx, now_ms));
-        if map.len() > CONN_AFFINITY_CAP {
-            if let Some((&oldest, _)) = map.iter().min_by_key(|(_, &(_, touch))| touch) {
-                if oldest != conn_key {
-                    map.remove(&oldest);
-                }
-            }
+        if map.len() > CONN_AFFINITY_CAP
+            && let Some((&oldest, _)) = map.iter().min_by_key(|&(_, &(_, touch))| touch)
+            && oldest != conn_key
+        {
+            map.remove(&oldest);
         }
     }
 
@@ -3162,12 +3154,11 @@ impl Manager {
         }
         entry.destinations |= bit;
 
-        if ledger.len() > DIVERT_LEDGER_CAP {
-            if let Some((&oldest, _)) = ledger.iter().min_by_key(|(_, e)| e.until_ms) {
-                if oldest != session_key {
-                    ledger.remove(&oldest);
-                }
-            }
+        if ledger.len() > DIVERT_LEDGER_CAP
+            && let Some((&oldest, _)) = ledger.iter().min_by_key(|(_, e)| e.until_ms)
+            && oldest != session_key
+        {
+            ledger.remove(&oldest);
         }
     }
 }

@@ -323,10 +323,10 @@ pub fn codex_child_path(codex: &Path, inherited: Option<&str>, fixed: &[PathBuf]
     let own = std::path::absolute(codex)
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
-    if let Some(own) = own {
-        if !inherited_dirs.contains(&own) {
-            dirs.push(own);
-        }
+    if let Some(own) = own
+        && !inherited_dirs.contains(&own)
+    {
+        dirs.push(own);
     }
     dirs.extend(inherited_dirs.iter().cloned());
     for dir in fixed {
@@ -564,7 +564,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -572,7 +572,7 @@ mod tests {
         move |key| map.get(key).cloned()
     }
 
-    fn present(paths: &[&str]) -> impl Fn(&Path) -> bool {
+    fn present(paths: &[&str]) -> impl Fn(&Path) -> bool + use<> {
         let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
         move |path| set.contains(path)
     }
@@ -857,7 +857,9 @@ mod tests {
     }
 
     /// An answer per path and per command, for [`older_tcrs_from`].
-    fn answers(table: &[(&str, &str, Option<&str>)]) -> impl Fn(&Path, &[&str]) -> Option<String> {
+    fn answers(
+        table: &[(&str, &str, Option<&str>)],
+    ) -> impl Fn(&Path, &[&str]) -> Option<String> + use<> {
         let table: Vec<(PathBuf, String, Option<String>)> = table
             .iter()
             .map(|(path, version, help)| {

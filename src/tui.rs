@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::io::{self};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // Everything crossterm-shaped comes from `ratatui::crossterm` so it is the SAME
@@ -31,7 +31,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -116,13 +116,13 @@ fn repaint<B: ratatui::backend::Backend>(
     dirty: &AtomicBool,
     render_frame: impl FnOnce(&mut Frame),
 ) {
-    if dirty.swap(false, Ordering::SeqCst) {
-        if let Err(err) = repair_screen(terminal) {
-            // The repair did not land either. Stay dirty and retry on the next tick
-            // rather than dropping it on the floor.
-            tracing::warn!(error = %err, "could not clear a dirty screen");
-            dirty.store(true, Ordering::SeqCst);
-        }
+    if dirty.swap(false, Ordering::SeqCst)
+        && let Err(err) = repair_screen(terminal)
+    {
+        // The repair did not land either. Stay dirty and retry on the next tick
+        // rather than dropping it on the floor.
+        tracing::warn!(error = %err, "could not clear a dirty screen");
+        dirty.store(true, Ordering::SeqCst);
     }
     if let Err(err) = terminal.draw(render_frame) {
         tracing::warn!(error = %err, "tui repaint failed; forcing a full redraw");
@@ -1835,7 +1835,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
     let rows: Vec<Row> = if snapshot.sessions.is_empty() {
         // Empty pane reads clearly when affinity is off / nothing served yet.
         vec![Row::new(vec![
-            Cell::from("(no active sessions)").style(Style::default().fg(Color::DarkGray))
+            Cell::from("(no active sessions)").style(Style::default().fg(Color::DarkGray)),
         ])]
     } else {
         session_tree(&snapshot.sessions)

@@ -778,10 +778,12 @@ async fn a_carry_delivers_the_canned_messages_body_through_a_gateway() {
         carried[0].fields.get("peer").map(String::as_str),
         Some(requester.id.display().as_str())
     );
-    assert!(!carried[0]
-        .fields
-        .values()
-        .any(|value| value.contains(&requester.id.to_wire())));
+    assert!(
+        !carried[0]
+            .fields
+            .values()
+            .any(|value| value.contains(&requester.id.to_wire()))
+    );
 }
 
 /// A gateway refuses a host that is not on the allow-list, and refuses it

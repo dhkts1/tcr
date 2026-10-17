@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::doctor::{routes_to_port, BASE_URL_VAR};
+use crate::doctor::{BASE_URL_VAR, routes_to_port};
 
 /// The first line of tcr's block, matched as a line PREFIX so the hint after
 /// it can change without stranding blocks written by an older build.
@@ -1709,13 +1709,17 @@ mod tests {
         let homes = homes(dir.path());
         install_shell(Shell::Zsh, &homes, "tcr").expect("install");
         let link = dir.path().join(".zshrc");
-        assert!(std::fs::symlink_metadata(&link)
-            .expect("meta")
-            .file_type()
-            .is_symlink());
-        assert!(std::fs::read_to_string(&real)
-            .expect("read")
-            .contains(START_MARKER));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("read")
+                .contains(START_MARKER)
+        );
         remove_shell(&homes).expect("remove");
         assert_eq!(
             std::fs::read_to_string(&real).expect("read"),
@@ -1728,9 +1732,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("scratch");
         let homes = homes(dir.path());
         install_shell(Shell::Zsh, &homes, "tcr").expect("install");
-        assert!(shell_conflicts(Shell::Zsh, &homes)
-            .expect("scan")
-            .is_empty());
+        assert!(
+            shell_conflicts(Shell::Zsh, &homes)
+                .expect("scan")
+                .is_empty()
+        );
         install_shell(Shell::Zsh, &homes, "tcr").expect("re-install is not refused by itself");
     }
 }

@@ -22,7 +22,7 @@ use std::time::Duration;
 use tcr::config::Config;
 use tcr::proxy::STATUS_PATH;
 use tcr::server::{
-    serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup, WireSessionsFlush,
+    AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup, WireSessionsFlush, serve,
 };
 use tcr::singleton::{ProxyHost, ProxyOwner};
 use tcr::usage::LedgerShutdown;

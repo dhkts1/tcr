@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context as _};
-use serde_json::{json, Value};
-use tcr::bound_tokens::{self, BoundTokenKind, Snapshot, StoredAccount, BOUND_TOKEN_CAP};
+use anyhow::{Context as _, bail};
+use serde_json::{Value, json};
+use tcr::bound_tokens::{self, BOUND_TOKEN_CAP, BoundTokenKind, Snapshot, StoredAccount};
 use tcr::paths::{self, Roots};
 
 /// How many fake accounts the scratch config holds: the size of the fleet the throttle
@@ -569,9 +569,11 @@ tcr 1 u 14u IPv4 0x6 0t0 TCP 127.0.0.1:7755 (LISTEN)
         assert_eq!(c["warmupSeconds"], 0);
         assert_eq!(c["accountThrottle"], json!({}));
         assert_eq!(c["accounts"].as_array().map(Vec::len), Some(ACCOUNTS));
-        assert!(c["accounts"][0]["name"]
-            .as_str()
-            .is_some_and(|n| n.ends_with("@example.com")));
+        assert!(
+            c["accounts"][0]["name"]
+                .as_str()
+                .is_some_and(|n| n.ends_with("@example.com"))
+        );
         let throttled = config_json(4321, false, 0);
         assert!(
             throttled.get("accountThrottle").is_none(),

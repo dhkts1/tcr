@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use time::OffsetDateTime;
 
 use crate::build_info::{self, BuildInfo};
@@ -32,7 +32,7 @@ use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, ProbeStatus, UsageProber};
 use crate::provider::Provider;
 use crate::stats::{AccountSnapshot, CodexFacts, QuotaState, StatsSnapshot};
-use crate::status::{StatusPayload, STATUS_KIND};
+use crate::status::{STATUS_KIND, StatusPayload};
 
 /// Reject a group label whose CONTENT could corrupt header composition
 /// (`main.rs`'s `compose_group_header`) or a config write — a literal newline,
@@ -413,14 +413,15 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     if let Some(err) = failed {
         // The proxy parked it a moment ago and the delete did not happen: put
         // it back the way it was, so a failed delete changes nothing.
-        if parked_live && target.disabled != Some(true) {
-            if let Err(undo) = post_set_disabled(&config, &name, false).await {
-                return Err(err.context(format!(
+        if parked_live
+            && target.disabled != Some(true)
+            && let Err(undo) = post_set_disabled(&config, &name, false).await
+        {
+            return Err(err.context(format!(
                     "the delete failed after the proxy on :{} had parked '{name}', and un-parking it failed too ({}), so it stays parked",
                     config.proxy.port,
                     undo.why()
                 )));
-            }
         }
         return Err(err);
     }
@@ -431,15 +432,14 @@ pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<(
     // reads the file, which a status request does first. Ask it once, so a
     // proxy built before it could do that is NAMED here, on the stderr TcrBar
     // shows on the row, rather than leaving the row listed with no reason.
-    if parked_live {
-        if let Ok(payload) = fetch_live_status(&config).await {
-            if payload.accounts.iter().any(|a| a.name == name) {
-                eprintln!(
-                    "[tcr] the proxy running on :{} stopped routing to '{name}', but it predates live removal and keeps listing it as disabled until it restarts. {}",
-                    config.proxy.port, RESTART_HINT,
-                );
-            }
-        }
+    if parked_live
+        && let Ok(payload) = fetch_live_status(&config).await
+        && payload.accounts.iter().any(|a| a.name == name)
+    {
+        eprintln!(
+            "[tcr] the proxy running on :{} stopped routing to '{name}', but it predates live removal and keeps listing it as disabled until it restarts. {}",
+            config.proxy.port, RESTART_HINT,
+        );
     }
     println!("Removed account '{name}'.");
     Ok(())
@@ -620,8 +620,7 @@ pub fn print_access_token(config_path: &Path, query: &str) -> anyhow::Result<()>
 /// are still two separate processes with no synchronous handshake, so
 /// "already applied" is still not quite true either — this says what IS true
 /// without over-promising instant propagation.
-const GROUP_LIVE_RELOAD_NOTE: &str =
-    "note: the running proxy picks this up automatically (next request or status check) — no restart needed";
+const GROUP_LIVE_RELOAD_NOTE: &str = "note: the running proxy picks this up automatically (next request or status check) — no restart needed";
 
 /// Resolve `name` to exactly one configured account by EXACT match on
 /// `Account.name`.
@@ -1099,7 +1098,9 @@ pub fn park_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
             println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupParkWrite::Unchanged => {
-            println!("group '{group}' is already parked; nothing changed. {members} account(s) held out of rotation.");
+            println!(
+                "group '{group}' is already parked; nothing changed. {members} account(s) held out of rotation."
+            );
         }
     }
     Ok(())
@@ -1211,7 +1212,9 @@ pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> an
     let existing = config.all_group_names();
     if !existing.contains(group) {
         if existing.is_empty() {
-            bail!("group {group:?}: no account in the config carries any group label — nothing to color");
+            bail!(
+                "group {group:?}: no account in the config carries any group label — nothing to color"
+            );
         }
         bail!(
             "group {group:?}: not a configured group. Configured groups: {}",
@@ -1252,10 +1255,10 @@ pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> an
     // `--clear`d/set color: a `Derived` color always clears the floor by
     // construction (`derive_group_color`'s own worst-case-≥60 test), so
     // checking it here would be dead code, never firing.
-    if source == config::ColorSource::Set {
-        if let Some(warning) = low_contrast_color_warning(&resolved, group) {
-            eprintln!("{warning}");
-        }
+    if source == config::ColorSource::Set
+        && let Some(warning) = low_contrast_color_warning(&resolved, group)
+    {
+        eprintln!("{warning}");
     }
     Ok(())
 }
@@ -1398,7 +1401,10 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
                     crate::proxy::CONFIG_PATH,
                     RESTART_HINT,
                 );
-                println!("{}", saved_line(write == crate::config_set::SettingWrite::Updated));
+                println!(
+                    "{}",
+                    saved_line(write == crate::config_set::SettingWrite::Updated)
+                );
                 return Ok(());
             }
             Err(other) => {
@@ -1408,7 +1414,10 @@ pub async fn set_config(config_path: &Path, key: &str, value: &str) -> anyhow::R
                     config.proxy.port,
                     other.why(),
                 );
-                println!("{}", saved_line(write == crate::config_set::SettingWrite::Updated));
+                println!(
+                    "{}",
+                    saved_line(write == crate::config_set::SettingWrite::Updated)
+                );
                 return Ok(());
             }
         }
@@ -1822,7 +1831,7 @@ async fn post_set_disabled(
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
-            ))
+            ));
         }
         Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
@@ -1944,7 +1953,7 @@ async fn post_add_account_reading(
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
-            ))
+            ));
         }
         Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
@@ -1959,14 +1968,13 @@ async fn post_add_account_reading(
         .get(crate::proxy::ENDPOINT_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
-    if from_route {
-        if let Some(advertised) = response
+    if from_route
+        && let Some(advertised) = response
             .headers()
             .get(crate::proxy::PROVIDERS_HEADER)
             .and_then(|v| v.to_str().ok())
-        {
-            *providers = crate::proxy::providers_in_header(advertised);
-        }
+    {
+        *providers = crate::proxy::providers_in_header(advertised);
     }
     let body = response.text().await.unwrap_or_default();
 
@@ -2034,7 +2042,7 @@ async fn post_set_control(
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
-            ))
+            ));
         }
         Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
@@ -2105,7 +2113,7 @@ async fn post_set_priority(
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
-            ))
+            ));
         }
         Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
@@ -2167,7 +2175,7 @@ async fn config_route_call<T: serde::de::DeserializeOwned>(
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
-            ))
+            ));
         }
         Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
@@ -2320,16 +2328,15 @@ pub fn set_account_egress(
     strict: Option<bool>,
 ) -> anyhow::Result<(String, config::EgressPin)> {
     let pins_away = matches!(egress, Some(config::Egress::Via(_))) || strict == Some(true);
-    if pins_away {
-        if let Ok(config) = load_config(config_path) {
-            if let Ok(idx) = resolve_account(&config.accounts, query) {
-                crate::provider_guard::provider_guard(
-                    &config.accounts[idx],
-                    crate::provider_guard::ClaudeOnlyVerb::ExitFromPeer,
-                )
-                .map_err(anyhow::Error::msg)?;
-            }
-        }
+    if pins_away
+        && let Ok(config) = load_config(config_path)
+        && let Ok(idx) = resolve_account(&config.accounts, query)
+    {
+        crate::provider_guard::provider_guard(
+            &config.accounts[idx],
+            crate::provider_guard::ClaudeOnlyVerb::ExitFromPeer,
+        )
+        .map_err(anyhow::Error::msg)?;
     }
     edit_account(config_path, query, |config, idx| {
         if let Some(egress) = egress {
@@ -2568,10 +2575,10 @@ fn held_windows(a: &AccountSnapshot, threshold: f64) -> Vec<HeldWindow> {
             a.seven_day_reset,
         ),
     ] {
-        if let (Some(u), Some(reset)) = (util, reset) {
-            if u >= threshold {
-                held.push(HeldWindow { label, reset });
-            }
+        if let (Some(u), Some(reset)) = (util, reset)
+            && u >= threshold
+        {
+            held.push(HeldWindow { label, reset });
         }
     }
     held
@@ -3672,7 +3679,7 @@ async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusErr
         Err(e) if e.is_timeout() => {
             return Err(LiveStatusError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
-            ))
+            ));
         }
         // No response object came back, and it was neither a refused connect nor
         // the deadline: a reset or a truncated read. Nothing was served.
@@ -4123,11 +4130,11 @@ pub async fn status(config_path: &Path, json: bool, check: bool) -> anyhow::Resu
         }
         // What tcr did with codex lately goes to stderr, below the account lines it points at,
         // and only for a fleet that holds a Codex account.
-        if holds_provider(&snapshot, Provider::Codex) {
-            if let Some(traffic) = &wire_traffic {
-                for line in codex_traffic_notes(traffic) {
-                    eprintln!("{line}");
-                }
+        if holds_provider(&snapshot, Provider::Codex)
+            && let Some(traffic) = &wire_traffic
+        {
+            for line in codex_traffic_notes(traffic) {
+                eprintln!("{line}");
             }
         }
     }
@@ -4237,11 +4244,11 @@ pub(crate) fn render_status_text(text: &StatusText<'_>) -> String {
     // Claude's route is this fleet's question only while it holds a Claude account, or none
     // at all (the empty fleet keeps the verdict it always had). A Codex-only fleet is not
     // told about a route none of its accounts use.
-    if holds_claude || text.snapshot.accounts.is_empty() {
-        if let Some(verdict) = &text.claude_verdict {
-            out.push_str(verdict);
-            out.push('\n');
-        }
+    if (holds_claude || text.snapshot.accounts.is_empty())
+        && let Some(verdict) = &text.claude_verdict
+    {
+        out.push_str(verdict);
+        out.push('\n');
     }
     // Codex's route second, so Claude's verdict keeps the first line. Keyed `verdict:` in a
     // Codex-only fleet, where it is the only verdict there is.
@@ -4380,7 +4387,7 @@ async fn render_list_v1(config_path: &Path, prober: Arc<dyn UsageProber>) -> (St
             return (
                 ErrorV1::new(ErrorKind::ConfigUnreadable, format!("{e:#}")).render(),
                 1,
-            )
+            );
         }
     };
     let live = fetch_live_status(&config).await;
@@ -7420,9 +7427,11 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&document).expect("one JSON document");
         assert_eq!(doc["schemaVersion"], 1);
         assert_eq!(doc["error"]["type"], "config_unreadable");
-        assert!(doc["error"]["message"]
-            .as_str()
-            .is_some_and(|m| !m.is_empty()));
+        assert!(
+            doc["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty())
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -10347,8 +10356,8 @@ mod tests {
     /// The fleet-wide Codex facts every canonical Codex row repeats: codex is pooled, and
     /// in the last ten minutes tcr refused twelve requests itself and relayed three on the
     /// client's own credential.
-    fn canonical_codex_route_and_traffic(
-    ) -> (tcr_status_wire::CodexRoute, tcr_status_wire::CodexTraffic) {
+    fn canonical_codex_route_and_traffic()
+    -> (tcr_status_wire::CodexRoute, tcr_status_wire::CodexTraffic) {
         (
             tcr_status_wire::CodexRoute {
                 pooled: true,
@@ -12254,11 +12263,13 @@ mod tests {
             no_accounts_lines(&load_from(r#"{"accounts": []}"#), None),
             vec!["no accounts configured — run `tcr login` to add one"]
         );
-        assert!(no_accounts_lines(
-            &load_from(TWO_ACCOUNTS),
-            Some(Path::new("/Users/example/.codex/auth.json"))
-        )
-        .is_empty());
+        assert!(
+            no_accounts_lines(
+                &load_from(TWO_ACCOUNTS),
+                Some(Path::new("/Users/example/.codex/auth.json"))
+            )
+            .is_empty()
+        );
     }
 
     /// An empty fleet on a machine where codex holds a login gets one more line: the two

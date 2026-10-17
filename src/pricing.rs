@@ -222,11 +222,7 @@ pub fn cost_nanos(
         + dim(cache_1h, price.cache_write_1h)
         + dim(cache_read, price.cache_read)
         + dim(output, price.output);
-    if total <= 0.0 {
-        0
-    } else {
-        total as u64
-    }
+    if total <= 0.0 { 0 } else { total as u64 }
 }
 
 #[cfg(test)]

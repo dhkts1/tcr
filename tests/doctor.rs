@@ -185,11 +185,13 @@ fn fake_status_endpoint(served: u16) -> u16 {
     let body = format!(
         "{{\"kind\":\"tcr.status.v1\",\"accounts\":[],\"sessions\":[{{\"sessionId\":\"11111111-1111-1111-1111-111111111111\",\"firstSeenMs\":0,\"lastSeenMs\":0,\"reqPerMinute\":{sparkline:?}}}]}}"
     );
-    std::thread::spawn(move || loop {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        serve_one(stream, &body);
+    std::thread::spawn(move || {
+        loop {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            serve_one(stream, &body);
+        }
     });
     port
 }
@@ -328,11 +330,9 @@ fn the_json_form_carries_the_verdict_and_the_exit_code() {
     assert_eq!(document["baseUrl"], "https://gateway.example.com");
     assert_eq!(document["baseUrlSource"]["kind"], "userSettings");
     assert_eq!(document["requestsInWindow"], serde_json::Value::Null);
-    assert!(
-        document["verdict"].as_str().is_some_and(
-            |verdict| verdict.starts_with("verdict: this proxy is not on Claude's route")
-        )
-    );
+    assert!(document["verdict"].as_str().is_some_and(|verdict| {
+        verdict.starts_with("verdict: this proxy is not on Claude's route")
+    }));
 }
 
 /// A `tcr status` glance shows the route problem, first
@@ -480,11 +480,13 @@ fn serve_status(body: serde_json::Value) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a scratch port");
     let port = listener.local_addr().expect("local addr").port();
     let body = body.to_string();
-    std::thread::spawn(move || loop {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        serve_one(stream, &body);
+    std::thread::spawn(move || {
+        loop {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            serve_one(stream, &body);
+        }
     });
     port
 }

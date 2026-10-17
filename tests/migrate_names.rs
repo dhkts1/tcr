@@ -298,10 +298,12 @@ fn after_a_migrate_a_server_reads_the_new_names_and_lists_its_accounts() {
         std::fs::read_to_string(new_cache(home.path()).join("marker")).expect("the marker moved"),
         "kept"
     );
-    assert!(new_cache(home.path())
-        .join("logs")
-        .join(format!("{}.2026-10-01", paths::LOG_PREFIX))
-        .is_file());
+    assert!(
+        new_cache(home.path())
+            .join("logs")
+            .join(format!("{}.2026-10-01", paths::LOG_PREFIX))
+            .is_file()
+    );
 
     let second = tcr(home.path(), &["migrate", "--json"]);
     assert_eq!(second.code, Some(0), "{}", second.says());

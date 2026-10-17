@@ -12,16 +12,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
 use proptest::prelude::*;
 
 use tcr::peer::reach::MapProtocol;
 use tcr::peer::reach_upnp::{
-    self, DiscoveredGateway, Discoverer, LocationPolicy, UpnpClient, UpnpError, MX_SECONDS,
-    SERVICE_TYPES,
+    self, DiscoveredGateway, Discoverer, LocationPolicy, MX_SECONDS, SERVICE_TYPES, UpnpClient,
+    UpnpError,
 };
 
 /// The loopback address every fake in this file answers from, and the one a
@@ -128,27 +128,29 @@ fn spawn_ssdp_responder(calls: CallLog, location: String) -> SocketAddr {
         .expect("the fake responder's own address");
     let logged = Arc::new(AtomicUsize::new(0));
 
-    std::thread::spawn(move || loop {
-        let mut buffer = [0_u8; 1024];
-        let Ok((_read, from)) = socket.recv_from(&mut buffer) else {
-            return;
-        };
-        if logged.fetch_add(1, Ordering::SeqCst) == 0 {
-            calls
-                .lock()
-                .expect("the call log is never poisoned")
-                .push("discover".to_string());
-        }
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
+    std::thread::spawn(move || {
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let Ok((_read, from)) = socket.recv_from(&mut buffer) else {
+                return;
+            };
+            if logged.fetch_add(1, Ordering::SeqCst) == 0 {
+                calls
+                    .lock()
+                    .expect("the call log is never poisoned")
+                    .push("discover".to_string());
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
              CACHE-CONTROL: max-age=1800\r\n\
              LOCATION: {location}\r\n\
              SERVER: fake-router/1.0 UPnP/1.1\r\n\
              ST: {}\r\n\
              USN: uuid:fake-router::{}\r\n\r\n",
-            SERVICE_TYPES[0], SERVICE_TYPES[0]
-        );
-        let _sent = socket.send_to(response.as_bytes(), from);
+                SERVICE_TYPES[0], SERVICE_TYPES[0]
+            );
+            let _sent = socket.send_to(response.as_bytes(), from);
+        }
     });
 
     addr

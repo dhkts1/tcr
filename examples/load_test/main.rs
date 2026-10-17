@@ -20,11 +20,11 @@ mod stub;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 

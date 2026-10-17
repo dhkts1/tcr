@@ -20,7 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use crate::probe::OAUTH_USAGE_BETA;

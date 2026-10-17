@@ -56,15 +56,15 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use bytes::Bytes;
-use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserializer as _;
-use serde_json::value::RawValue;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
-use crate::cache_ttl::{extend_cache_control, offset_in, Splice};
+use crate::cache_ttl::{Splice, extend_cache_control, offset_in};
 use crate::session_wire::{
-    content_mentions_timeout, extract_session_id, tool_use_event_from_block, BoundHistory,
-    ToolResultEvent, ToolUseEvent, BOUND_TOKEN_SCAN_CAP, TAIL_SCAN_CAP,
+    BOUND_TOKEN_SCAN_CAP, BoundHistory, TAIL_SCAN_CAP, ToolResultEvent, ToolUseEvent,
+    content_mentions_timeout, extract_session_id, tool_use_event_from_block,
 };
 
 /// A request body and every answer the proxy reads from it, built once by

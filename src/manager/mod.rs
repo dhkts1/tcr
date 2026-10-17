@@ -74,7 +74,7 @@ mod wire_sessions;
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
 // the divert-budget design notes §6. Import path: `tcr::manager::{divert_verdict, DivertVerdict}`.
-pub use select::{divert_verdict, effective_fable_threshold, DivertVerdict};
+pub use select::{DivertVerdict, divert_verdict, effective_fable_threshold};
 
 /// How long the session-affinity flusher waits after a change before it saves, so a burst of
 /// changes is one write. It is also the most of a new or moved pin a SIGKILL can lose: a
@@ -2123,10 +2123,8 @@ impl Manager {
                 soonest = Some((at, reason));
             }
         }
-        if every_one_rejected {
-            if let Some(at) = rejected_codex_soonest {
-                soonest = Some((at, GateReason::Rejected));
-            }
+        if every_one_rejected && let Some(at) = rejected_codex_soonest {
+            soonest = Some((at, GateReason::Rejected));
         }
         match soonest {
             Some((at, reason)) => ExhaustionHint {
@@ -2605,27 +2603,27 @@ impl Manager {
             // record — overwriting a single-use refresh token that is then dead.
             // An unbreakable tie writes nothing and says so.
             let placement = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
-            if let crate::identity::Resolved::One(position) = placement {
-                if let Some(account) = config.accounts.get_mut(position) {
-                    account.access_token = tokens.access_token.clone();
-                    // THE TRAP: same invariant as `apply_refresh` in
-                    // `manager/refresh.rs` — `tokens.refresh_token` must be
-                    // `Some(...)` on every reachable refresh success.
-                    account.refresh_token = tokens.refresh_token.clone();
-                    account.expires_at = Some(tokens.expires_at_ms);
-                    match provider {
-                        crate::provider::Provider::Anthropic => {}
-                        crate::provider::Provider::Codex => match sync_pending {
-                            Some(value) => {
-                                account
-                                    .extra
-                                    .insert(config::CODEX_SYNC_PENDING_KEY.to_string(), value);
-                            }
-                            None => {
-                                account.extra.remove(config::CODEX_SYNC_PENDING_KEY);
-                            }
-                        },
-                    }
+            if let crate::identity::Resolved::One(position) = placement
+                && let Some(account) = config.accounts.get_mut(position)
+            {
+                account.access_token = tokens.access_token.clone();
+                // THE TRAP: same invariant as `apply_refresh` in
+                // `manager/refresh.rs` — `tokens.refresh_token` must be
+                // `Some(...)` on every reachable refresh success.
+                account.refresh_token = tokens.refresh_token.clone();
+                account.expires_at = Some(tokens.expires_at_ms);
+                match provider {
+                    crate::provider::Provider::Anthropic => {}
+                    crate::provider::Provider::Codex => match sync_pending {
+                        Some(value) => {
+                            account
+                                .extra
+                                .insert(config::CODEX_SYNC_PENDING_KEY.to_string(), value);
+                        }
+                        None => {
+                            account.extra.remove(config::CODEX_SYNC_PENDING_KEY);
+                        }
+                    },
                 }
             }
             (config.clone(), placement)
@@ -3081,10 +3079,9 @@ impl Manager {
             // memory must not drift onto a record the file was not allowed to touch.
             if let crate::identity::Resolved::One(position) =
                 crate::identity::resolve(config.accounts.iter().enumerate(), target)
+                && let Some(account) = config.accounts.get_mut(position)
             {
-                if let Some(account) = config.accounts.get_mut(position) {
-                    account.disabled = if disabled { Some(true) } else { None };
-                }
+                account.disabled = if disabled { Some(true) } else { None };
             }
         }
         match outcome {
@@ -3219,7 +3216,7 @@ impl Manager {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
-                    return SetDisabledOutcome::Ambiguous(names)
+                    return SetDisabledOutcome::Ambiguous(names);
                 }
             }
         };
@@ -3245,7 +3242,7 @@ impl Manager {
             crate::identity::Match::One(idx) => idx,
             crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
             crate::identity::Match::Ambiguous(names) => {
-                return SetPriorityOutcome::Ambiguous(names)
+                return SetPriorityOutcome::Ambiguous(names);
             }
         };
         let account = &mut accounts[idx];
@@ -3474,12 +3471,12 @@ impl Manager {
                 crate::identity::Match::One(idx) => match accounts[idx].provider {
                     crate::provider::Provider::Anthropic => (idx, accounts[idx].name.clone()),
                     crate::provider::Provider::Codex => {
-                        return SetControlOutcome::CodexAccount(accounts[idx].name.clone())
+                        return SetControlOutcome::CodexAccount(accounts[idx].name.clone());
                     }
                 },
                 crate::identity::Match::None => return SetControlOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
-                    return SetControlOutcome::Ambiguous(names)
+                    return SetControlOutcome::Ambiguous(names);
                 }
             }
         };
@@ -6582,7 +6579,7 @@ mod tests {
     #[test]
     fn a_codex_refusal_clears_when_a_probe_reads_it_allowed() {
         use crate::codex_probe::usage_from_payload;
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
         let manager = build_manager(
             config_with(vec![
                 Account {
@@ -7165,10 +7162,10 @@ mod tests {
         );
         manager.mark_rate_limited(0, 600); // the group's member
         manager.mark_rate_limited(1, 60); // an unrelated account, free much sooner
-                                          // AFTER the marks: each `mark_rate_limited` reads its own clock, so a
-                                          // `now` taken before them is a few microseconds earlier than the
-                                          // holds' anchor and the 60 s hint rounds up to 61 — which failed the
-                                          // `<= 60` control on CI (#189) with nothing wrong in the code.
+        // AFTER the marks: each `mark_rate_limited` reads its own clock, so a
+        // `now` taken before them is a few microseconds earlier than the
+        // holds' anchor and the 60 s hint rounds up to 61 — which failed the
+        // `<= 60` control on CI (#189) with nothing wrong in the code.
         let now = OffsetDateTime::now_utc();
 
         let fleet = manager.retry_after_hint(now, false, crate::provider::Provider::Anthropic);
@@ -10250,9 +10247,11 @@ mod tests {
             "a fresh probe reads as recent: {fresh} not in [{before}, now]"
         );
         // A FAILED probe is not a reading: `lastProbeMs` moves, this does not.
-        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
-            .last_probe
-            .is_some());
+        assert!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[1]
+                .last_probe
+                .is_some()
+        );
         assert_eq!(
             wire_value(&manager, 1),
             None,
@@ -15468,7 +15467,7 @@ mod tests {
         );
         mark_all_probed(&manager); // isolate from the never-probed boot gate
         set_5h(&manager, 0, "0.10", 3); // live: low util, reset 3h out → already warm
-                                        // account 1 (cold): no 5h data at all
+        // account 1 (cold): no 5h data at all
         set_5h(&manager, 2, "0.10", -1); // past: reset 1h ago → window elapsed
 
         assert_eq!(
@@ -15613,7 +15612,7 @@ mod tests {
         let manager =
             build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
         mark_all_probed(&manager); // isolate from the never-probed boot gate
-                                   // Before: no 5h window, so this account is a target.
+        // Before: no 5h window, so this account is a target.
         assert_eq!(manager.warm_targets(), vec![0]);
 
         manager.warm_account(0).await;
@@ -16179,12 +16178,14 @@ mod tests {
         );
         assert_eq!(manager.probe_interval_seconds(), 0);
         // Nothing has been (or ever will be) probed, so no quota is known.
-        assert!(manager
-            .accounts
-            .read()
-            .unwrap()
-            .iter()
-            .all(|a| !a.quota_known));
+        assert!(
+            manager
+                .accounts
+                .read()
+                .unwrap()
+                .iter()
+                .all(|a| !a.quota_known)
+        );
 
         assert_eq!(
             manager.warm_targets(),

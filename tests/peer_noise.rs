@@ -31,14 +31,14 @@
 //! that has stopped measuring, so it goes at the same time as the blocker.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use tcr::peer::config::{Allow, ControlGrants, PeerRow};
 use tcr::peer::listener::{
-    self, hello_for_peer, peer_stream_gate_hop, peer_stream_gate_rows, NodeFacts, RequestDedup,
-    StreamRefusal,
+    self, NodeFacts, RequestDedup, StreamRefusal, hello_for_peer, peer_stream_gate_hop,
+    peer_stream_gate_rows,
 };
 use tcr::peer::noise::{self, Handshake, PinRefusal};
 use tcr::peer::pair::{self, PairingWindow};

@@ -49,11 +49,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tcr_peer_wire::{decode_bytes, encode_bytes, PeerId};
+use tcr_peer_wire::{PeerId, decode_bytes, encode_bytes};
 
 use crate::peer::drop::{
-    expand, open_payload, seal_payload, OpenFailure, SealFailure, MAX_CLOCK_SKEW,
-    MAX_RECORD_ENDPOINTS, NONCE_BYTES, TAG_BYTES,
+    MAX_CLOCK_SKEW, MAX_RECORD_ENDPOINTS, NONCE_BYTES, OpenFailure, SealFailure, TAG_BYTES, expand,
+    open_payload, seal_payload,
 };
 
 // ---------------------------------------------------------------------------

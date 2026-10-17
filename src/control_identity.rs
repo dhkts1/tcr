@@ -29,8 +29,8 @@
 //! a new bearer — see [`UNRESOLVABLE_TTL_MS`].
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, OnceCell};
@@ -364,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_fetches_once_per_bearer_and_never_caches_a_failure() {
-        use axum::{extract::State, routing::get, Json, Router};
+        use axum::{Json, Router, extract::State, routing::get};
         use std::sync::atomic::AtomicUsize;
 
         #[derive(Clone)]
@@ -442,7 +442,7 @@ mod tests {
     /// after it; a transport-class failure (here a 500) is never remembered.
     #[tokio::test]
     async fn a_refused_bearer_is_remembered_for_the_ttl_then_asked_again() {
-        use axum::{extract::State, routing::get, Router};
+        use axum::{Router, extract::State, routing::get};
         use std::sync::atomic::AtomicUsize;
 
         #[derive(Clone)]

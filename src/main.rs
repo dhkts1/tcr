@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
-use tcr::cli::{self, validate_group_label_chars, PriorityArg};
+use tcr::cli::{self, PriorityArg, validate_group_label_chars};
 use tcr::config::{self, Config, ConfigError};
 use tcr::doctor::{no_proxy_entry_exempts, points_at_tcr};
 use tcr::peer;
@@ -4043,12 +4043,12 @@ async fn serve_peer_graph(
     this_label: String,
     addr: &str,
 ) -> anyhow::Result<()> {
+    use axum::Router;
     use axum::extract::{Request, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::middleware::{self, Next};
     use axum::response::{Html, IntoResponse, Json, Response};
     use axum::routing::get;
-    use axum::Router;
 
     let socket: std::net::SocketAddr = addr
         .parse()
@@ -4784,8 +4784,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
 
 /// Why `tcr peer reach` prints no derived port, in the one wording both the
 /// text and the JSON use.
-const PORT_SECRET_NOT_PERSISTED: &str =
-    "the pair's handshake secret is not stored, and deriving a port from public key \
+const PORT_SECRET_NOT_PERSISTED: &str = "the pair's handshake secret is not stored, and deriving a port from public key \
      material instead would give every scanner the same number";
 
 /// Seconds since the unix epoch, for the port slot.
@@ -4996,7 +4995,7 @@ const MAX_LEND_FRACTION: f64 = tcr::peer::config::MAX_LEND_FRACTION;
 
 #[cfg(test)]
 mod peer_lend_fraction_tests {
-    use super::{peer_lend_grant, MAX_LEND_FRACTION};
+    use super::{MAX_LEND_FRACTION, peer_lend_grant};
     use tcr::peer::config::LendGrant;
 
     /// **A fraction that is not a number is refused at the flag**, and the
@@ -6474,10 +6473,10 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         })?;
         // Pooled, but the pool may have no account free: say so before the banner, from the
         // same read, so a session that will be refused is not a surprise.
-        if let (CodexLaunch::SeeThrough { .. }, Ok(payload)) = (&launch, &live) {
-            if let Some(line) = codex_pool_preflight(payload, time::OffsetDateTime::now_utc()) {
-                eprintln!("{line}");
-            }
+        if let (CodexLaunch::SeeThrough { .. }, Ok(payload)) = (&launch, &live)
+            && let Some(line) = codex_pool_preflight(payload, time::OffsetDateTime::now_utc())
+        {
+            eprintln!("{line}");
         }
         // The same read decides the request key: sent only to a server that
         // reports `requestKeyMode`.
@@ -6544,12 +6543,11 @@ async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
         // only to a server that reports `requestKeyMode`), and, for a config that holds Codex
         // accounts and no Claude one, whether the proxy will refuse this whole session.
         let live = cli::fetch_live_status(&config).await;
-        if holds_only_codex(&config) {
-            if let Ok(payload) = &live {
-                if let Some(warning) = no_claude_account_warning(port, payload) {
-                    eprintln!("{warning}");
-                }
-            }
+        if holds_only_codex(&config)
+            && let Ok(payload) = &live
+            && let Some(warning) = no_claude_account_warning(port, payload)
+        {
+            eprintln!("{warning}");
         }
         let launch_key = LaunchKey::decide(config.proxy.request_key.as_deref(), &live);
         if let Some(notice) = withheld_api_key_notice(
@@ -6710,7 +6708,7 @@ fn codex_launch(
                 return Ok(CodexLaunch::Direct {
                     reason,
                     unset: proxy_vars_at(port, inherited),
-                })
+                });
             }
         };
         return Ok(CodexLaunch::SeeThrough {
@@ -7832,10 +7830,12 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
         // that miss the grace are aborted and counted in
         // `report.tasks_aborted`, warned about just below.
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).ok();
         if sigterm.is_none() {
-            tracing::warn!("could not install SIGTERM handler; a supervised stop will kill this process without draining");
+            tracing::warn!(
+                "could not install SIGTERM handler; a supervised stop will kill this process without draining"
+            );
         }
         tracing::info!("tcr listening on http://{bound} (headless)");
         // Block until Ctrl-C, SIGTERM, or the server task exits.
@@ -7861,7 +7861,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // drops the TUI future, and dropping it runs `TerminalGuard`'s destructor,
         // which restores the terminal (the same restore path as a clean quit or a
         // panic) BEFORE the shutdown/flush below and any SIGKILL fallback.
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).ok();
         if sigterm.is_none() {
             tracing::warn!("could not install SIGTERM handler; terminal may not restore if killed");
@@ -8269,8 +8269,8 @@ where
 /// The TUI writes through the same queue for the same reason as headless: its
 /// file was behind the same lock, on the same tokio workers.
 fn init_tracing(headless: bool) -> Option<tcr::file_log::FileLog> {
-    use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::util::SubscriberInitExt as _;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (log_dir, log_prefix) = log_location();
     let (queue, file_log) = match open_log_appender(&log_dir, log_prefix) {
@@ -9269,7 +9269,7 @@ mod tests {
     }
 
     /// An inherited environment holding exactly `vars`.
-    fn inherited(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn inherited(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let vars: std::collections::HashMap<String, String> = vars
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))

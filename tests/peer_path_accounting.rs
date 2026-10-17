@@ -42,8 +42,8 @@ use tcr::peer::lease::Ledger;
 use tcr::peer::listener;
 use tcr::peer::noise::{self, Handshake};
 use tcr::peer::tunnel::{
-    self, path_meter, Carry, Forward, NoiseStream, OriginRoute, PathMeter, TunnelBudget,
-    BUDGET_WINDOW_MS,
+    self, BUDGET_WINDOW_MS, Carry, Forward, NoiseStream, OriginRoute, PathMeter, TunnelBudget,
+    path_meter,
 };
 use tcr::peer::{serve, state};
 use tcr_peer_wire::{

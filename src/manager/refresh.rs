@@ -204,17 +204,16 @@ impl Manager {
             let mut config = self.config.lock().expect("config lock poisoned");
             if let crate::identity::Resolved::One(index) =
                 crate::identity::resolve(config.accounts.iter().enumerate(), &target)
+                && config.accounts[index].refresh_token.as_deref() == Some(refresh.as_str())
             {
-                if config.accounts[index].refresh_token.as_deref() == Some(refresh.as_str()) {
-                    match &pending {
-                        Some(record) => {
-                            config.accounts[index]
-                                .extra
-                                .insert(CODEX_SYNC_PENDING_KEY.to_string(), record.clone());
-                        }
-                        None => {
-                            config.accounts[index].extra.remove(CODEX_SYNC_PENDING_KEY);
-                        }
+                match &pending {
+                    Some(record) => {
+                        config.accounts[index]
+                            .extra
+                            .insert(CODEX_SYNC_PENDING_KEY.to_string(), record.clone());
+                    }
+                    None => {
+                        config.accounts[index].extra.remove(CODEX_SYNC_PENDING_KEY);
                     }
                 }
             }
@@ -401,10 +400,10 @@ impl Manager {
         // self-clears by time, so a later sequential retry is not suppressed.
         {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            if let Some(until) = accounts.get(idx).and_then(|a| a.refresh_retry_after_ms) {
-                if crate::now_ms() < until {
-                    return false;
-                }
+            if let Some(until) = accounts.get(idx).and_then(|a| a.refresh_retry_after_ms)
+                && crate::now_ms() < until
+            {
+                return false;
             }
         }
         let (name, account_uuid, org_uuid, org_name, provider, codex_home) = {
@@ -544,31 +543,28 @@ impl Manager {
                         if matches!(
                             self.flush_codex_writeback_locked(idx).await,
                             Some(Ok(false))
-                        ) {
-                            if let Some(newer) = newer_in_file(loaded_refresh_ms, false)
-                                .await
-                                .filter(|candidate| candidate.expires_at_ms > crate::now_ms())
+                        ) && let Some(newer) = newer_in_file(loaded_refresh_ms, false)
+                            .await
+                            .filter(|candidate| candidate.expires_at_ms > crate::now_ms())
+                        {
+                            tokens = newer;
+                            if let Some(account) = self
+                                .accounts
+                                .write()
+                                .expect("accounts lock poisoned")
+                                .get_mut(idx)
                             {
-                                tokens = newer;
-                                if let Some(account) = self
-                                    .accounts
-                                    .write()
-                                    .expect("accounts lock poisoned")
-                                    .get_mut(idx)
-                                {
-                                    account.pending_codex_writeback = None;
-                                }
+                                account.pending_codex_writeback = None;
                             }
                         }
-                    } else if !needs_publication {
-                        if let Some(account) = self
+                    } else if !needs_publication
+                        && let Some(account) = self
                             .accounts
                             .write()
                             .expect("accounts lock poisoned")
                             .get_mut(idx)
-                        {
-                            account.pending_codex_writeback = None;
-                        }
+                    {
+                        account.pending_codex_writeback = None;
                     }
                     Ok(tokens)
                 }
@@ -787,7 +783,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1145,7 +1141,10 @@ mod tests {
                             Some(code),
                         );
 
-                        assert!(manager.ensure_fresh_force(0).await, "a rejected stale refresh must recover the changed live file pair (during_post={changed_during_post}, same_timestamp={same_timestamp}, {issuance:?}, {code})");
+                        assert!(
+                            manager.ensure_fresh_force(0).await,
+                            "a rejected stale refresh must recover the changed live file pair (during_post={changed_during_post}, same_timestamp={same_timestamp}, {issuance:?}, {code})"
+                        );
                         assert_eq!(
                             calls.load(Ordering::SeqCst),
                             1,
@@ -1301,11 +1300,13 @@ mod tests {
         use std::io::Write as _;
         let home = tempfile::tempdir().unwrap();
         let auth_path = home.path().join("auth.json");
-        assert!(std::process::Command::new("/usr/bin/mkfifo")
-            .arg(&auth_path)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&auth_path)
+                .status()
+                .unwrap()
+                .success()
+        );
         let (manager, _) = imported_manager(home.path(), None, false);
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1629,8 +1630,11 @@ mod tests {
         }
         assert!(manager.ensure_fresh_force(0).await);
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(read_auth(home.path())["tokens"]["refresh_token"], "rt-tcr-4",
-            "the file token used by the successful POST must be replaced, even with a stale pending entry");
+        assert_eq!(
+            read_auth(home.path())["tokens"]["refresh_token"],
+            "rt-tcr-4",
+            "the file token used by the successful POST must be replaced, even with a stale pending entry"
+        );
     }
 
     #[tokio::test]
@@ -1675,9 +1679,11 @@ mod tests {
         );
         let stored = config::load(&path).unwrap();
         let pending = &stored.accounts[0].extra["codexTokenSyncPending"];
-        assert!(pending["expectedRefreshSha256"]
-            .as_str()
-            .is_some_and(|hash| hash.len() == 64));
+        assert!(
+            pending["expectedRefreshSha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
         assert!(
             !pending.to_string().contains("rt-old"),
             "persist a source digest rather than a spent refresh token"
@@ -1697,9 +1703,11 @@ mod tests {
             1,
             "restart recovery publishes without another refresh POST"
         );
-        assert!(!config::load(&path).unwrap().accounts[0]
-            .extra
-            .contains_key("codexTokenSyncPending"));
+        assert!(
+            !config::load(&path).unwrap().accounts[0]
+                .extra
+                .contains_key("codexTokenSyncPending")
+        );
     }
     #[tokio::test]
     async fn a_dead_codex_refresh_discards_its_pending_publication_durably() {
@@ -1742,9 +1750,11 @@ mod tests {
         );
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
         assert!(manager.ensure_fresh_force(0).await);
-        assert!(manager.accounts.read().unwrap()[0]
-            .pending_codex_writeback
-            .is_some());
+        assert!(
+            manager.accounts.read().unwrap()[0]
+                .pending_codex_writeback
+                .is_some()
+        );
         manager.accounts.write().unwrap()[0].refresh_retry_after_ms = None;
         assert!(!manager.ensure_fresh_force(0).await);
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();

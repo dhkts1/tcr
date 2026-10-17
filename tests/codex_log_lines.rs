@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tcr::config::Config;
 use tcr::manager::Manager;
 use tcr::proxy::ClientAddr;
@@ -91,8 +91,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
 fn capture() -> &'static SharedBuf {
     static SINK: OnceLock<SharedBuf> = OnceLock::new();
     SINK.get_or_init(|| {
-        use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
         let sink = SharedBuf::default();
         let in_a_capture_span = tracing_subscriber::filter::dynamic_filter_fn(
             |meta: &tracing::Metadata<'_>,

@@ -1713,7 +1713,10 @@ mod tests {
             codex_home: None,
             extra: serde_json::Map::new(),
         });
-        assert!(intercepts_now(&m, "chatgpt.com", true), "an imported account enables interception; a disabled pool gets an immediate configuration error");
+        assert!(
+            intercepts_now(&m, "chatgpt.com", true),
+            "an imported account enables interception; a disabled pool gets an immediate configuration error"
+        );
     }
 
     #[test]

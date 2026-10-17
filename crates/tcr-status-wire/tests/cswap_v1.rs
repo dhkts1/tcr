@@ -16,10 +16,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
-use tcr_status_wire::cswap_v1::{from_rows, UsageStatus};
 use tcr_status_wire::AccountStatusRow;
-use time::format_description::well_known::Rfc3339;
+use tcr_status_wire::cswap_v1::{UsageStatus, from_rows};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// The ported guards, in the parser's order. `Err` names the guard and the
 /// parser's own message, so a failure says which CodexBar check would fire.
@@ -48,10 +48,10 @@ fn codexbar_parse(doc: &Value) -> Result<(), String> {
         .get("activeAccountNumber")
         .ok_or("3: missing activeAccountNumber")?;
     // 4. `supportsAccountSwitching`, when present, is a boolean (193-198).
-    if let Some(switching) = object.get("supportsAccountSwitching") {
-        if !switching.is_boolean() {
-            return Err("4: supportsAccountSwitching is not a boolean".into());
-        }
+    if let Some(switching) = object.get("supportsAccountSwitching")
+        && !switching.is_boolean()
+    {
+        return Err("4: supportsAccountSwitching is not a boolean".into());
     }
     // 3, second half. `activeAccountNumber` is a positive slot or null (199-204).
     let active_number: Option<i64> = match raw_active {
@@ -359,10 +359,11 @@ fn an_offline_row_is_unavailable_whatever_else_it_says() {
         ..base("bob@example.com")
     };
     let list = from_rows(&[offline, login]);
-    assert!(list
-        .accounts
-        .iter()
-        .all(|a| a.usage_status == UsageStatus::Unavailable));
+    assert!(
+        list.accounts
+            .iter()
+            .all(|a| a.usage_status == UsageStatus::Unavailable)
+    );
 }
 
 #[test]

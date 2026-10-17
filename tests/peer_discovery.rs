@@ -10,7 +10,7 @@
 
 use tcr::peer::config::NetworkKey;
 use tcr::peer::discovery::{self, Discovered, FoundList};
-use tcr_peer_wire::{InstanceId, PeerId, INSTANCE_ID_BYTES};
+use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, PeerId};
 
 /// An instance id distinctive enough that a fragment of it could not appear by
 /// chance in a TXT record.

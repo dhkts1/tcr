@@ -38,9 +38,9 @@ use std::sync::{Arc, Mutex};
 use tcr::fallback::Ask;
 use tcr::peer::config::LendMode;
 use tcr::peer::lease::{
-    bearer_fingerprint, handed_tokens, handoff_for, handoff_push_is_due, handoff_renewal_due,
-    lease_has_ended, serve_on_handed_bearer, usage_hint, HandedBearer, HandedTokens, Ledger,
-    HANDOFF_RENEW_LEAD_MS,
+    HANDOFF_RENEW_LEAD_MS, HandedBearer, HandedTokens, Ledger, bearer_fingerprint, handed_tokens,
+    handoff_for, handoff_push_is_due, handoff_renewal_due, lease_has_ended, serve_on_handed_bearer,
+    usage_hint,
 };
 use tcr_peer_wire::{Control, Lease, LeaseUnit, Window};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

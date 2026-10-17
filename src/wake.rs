@@ -154,14 +154,14 @@ impl<T> SleepAwareClient<T> {
     pub fn get(&self) -> Option<Arc<T>> {
         let slept = self.detector.observe();
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(slept) = slept {
-            if current.take().is_some() {
-                tracing::debug!(
-                    client = self.what,
-                    slept_secs = slept.as_secs(),
-                    "the machine slept; retiring this client's pooled connections"
-                );
-            }
+        if let Some(slept) = slept
+            && current.take().is_some()
+        {
+            tracing::debug!(
+                client = self.what,
+                slept_secs = slept.as_secs(),
+                "the machine slept; retiring this client's pooled connections"
+            );
         }
         if current.is_none() {
             *current = (self.build)().map(Arc::new);

@@ -26,13 +26,13 @@
 //! The one other socket is a stand-in lender on a kernel port that accepts a
 //! connection and closes it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tcr::config::Config;
 use tcr::peer::config as peer_config;
-use tcr::server::{serve, IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup};
+use tcr::server::{IncumbentPolicy, ServeOptions, ServeOutcome, TlsSetup, serve};
 use tcr::singleton::ProxyHost;
 
 /// The port `tcr` uses by default. Named so the assertion below says what it is

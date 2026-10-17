@@ -92,7 +92,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use axum::http::{HeaderMap, Method};
 use axum::response::IntoResponse as _;
 use tcr_peer_wire::{PeerId, StreamHeader, StreamKind, TunnelTarget};
@@ -780,7 +780,7 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> ViaCarry {
                 return ViaCarry::TakenAndFailed(format!(
                     "{} took this request through its own route and the carry then failed.",
                     candidate.row.node.display()
-                ))
+                ));
             }
         }
     }

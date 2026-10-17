@@ -563,8 +563,11 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("login_hint=alice%40example.com"));
         // The out-of-band redirect, percent-encoded by oauth2.
-        assert!(url
-            .contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"));
+        assert!(
+            url.contains(
+                "redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+            )
+        );
 
         // Decode the `scope` param rather than substring-matching the raw URL:
         // `:` and the space between scopes are both percent-encoded, so a raw

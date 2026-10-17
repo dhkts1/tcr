@@ -50,7 +50,7 @@ use tcr::peer::listener::{self, Admission, SessionContext};
 use tcr::peer::noise;
 use tcr::peer::pair;
 use tcr::peer::state::{self, PeerState};
-use tcr_peer_wire::{InstanceId, Knock, PeerId, INSTANCE_ID_BYTES, PROTO_VERSION};
+use tcr_peer_wire::{INSTANCE_ID_BYTES, InstanceId, Knock, PROTO_VERSION, PeerId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 

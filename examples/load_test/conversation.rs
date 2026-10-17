@@ -3,7 +3,7 @@
 //! hundreds of turns of thinking, tool calls and tool output, a breakpoint on the newest
 //! message), at a chosen size. Every word is generated; nothing is copied from a real session.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::stats::Rng;
 
