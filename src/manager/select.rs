@@ -2,9 +2,14 @@
 
 use super::*;
 
+/// Bound on [`Manager::affinity`] and on its side set
+/// [`Manager::affinity_extended`]. Stable pins survive reconnects, so this size
+/// cap, not a disconnect hook, is what keeps a long-lived proxy from growing
+/// the map without limit.
+pub(super) const AFFINITY_CAP: usize = 1024;
 /// Bound on [`Manager::conn_affinity`] — see its doc-comment for why the map is
 /// memory-only and never persisted.
-const CONN_AFFINITY_CAP: usize = 256;
+pub(super) const CONN_AFFINITY_CAP: usize = 256;
 /// Idle TTL for a [`Manager::conn_affinity`] entry: an entry older than this is
 /// treated as absent (the connection is presumed gone). Short on purpose — this
 /// map exists only to keep NOISE traffic (`/api/event_logging`, `/mcp-registry`)
@@ -186,14 +191,14 @@ pub(super) fn classify_request(path: &str) -> RequestClass {
     }
 }
 
-/// Bound on [`Manager::divert_ledger`] — same cap `select()`'s `AFFINITY_CAP`
-/// applies to `self.affinity` (`:664-675`). [`DivertEpisode`] carries no
+/// Bound on [`Manager::divert_ledger`] — the same figure as [`AFFINITY_CAP`].
+/// [`DivertEpisode`] carries no
 /// separate last-touch stamp (§4.1's struct is quoted verbatim from the
 /// design doc), so `until_ms` is the eviction sort key here — the closest
 /// available recency proxy, not a perfect one. A session that never diverts
 /// again after arming a short hold ages out of this bound the same way a
 /// long-idle `affinity` entry does.
-const DIVERT_LEDGER_CAP: usize = 1024;
+pub(super) const DIVERT_LEDGER_CAP: usize = 1024;
 
 /// The three-way verdict [`divert_verdict`] hands back for one divert
 /// decision. `Fresh` and `Sticky` are consulted every divert regardless of
@@ -1622,7 +1627,7 @@ impl Manager {
             // `tried`) diverted THIS request only: re-insert the OLD index, not the
             // account we are about to serve. The insert still has to happen — this
             // `now_ms` is one of only two writers of the last-touch stamp that the
-            // AFFINITY_CAP eviction below sorts on, so skipping it would make a
+            // AFFINITY_CAP eviction sorts on, so skipping it would make a
             // heavily-diverted session the eviction victim.
             let pin_idx = keep_pin.unwrap_or(idx);
             let moved_off = {
@@ -1631,19 +1636,10 @@ impl Manager {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let previous = pins.get(&key).map(|&(i, _)| i);
+                // Capped at AFFINITY_CAP: an insert over it evicts the oldest-last-touch
+                // entry other than this one.
                 pins.insert(key, (pin_idx, now_ms));
                 self.mark_affinity_dirty();
-                // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
-                // the single oldest-last-touch entry (not the one we just inserted). Stable
-                // pins survive reconnects, so this size cap — not a disconnect hook — is
-                // what keeps a long-lived proxy from growing the map without limit.
-                const AFFINITY_CAP: usize = 1024;
-                if pins.len() > AFFINITY_CAP
-                    && let Some((&oldest, _)) = pins.iter().min_by_key(|&(_, &(_, touch))| touch)
-                    && oldest != key
-                {
-                    pins.remove(&oldest);
-                }
                 // Only a real change is worth a line: `None` on an initial pin, and on
                 // a soft divert (where `pin_idx` is the unchanged old index).
                 previous.filter(|&p| p != pin_idx)
@@ -3135,9 +3131,8 @@ impl Manager {
 
     /// Write half of [`Manager::conn_affinity`]: record (or refresh) which
     /// account served connection `conn_key`, then evict the single
-    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`] —
-    /// mirrors `select()`'s `AFFINITY_CAP` eviction for `self.affinity`, but on
-    /// this SEPARATE, never-persisted map. Never touches `self.affinity` and
+    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`]
+    /// ([`CappedMap::insert`]), on this SEPARATE, never-persisted map. Never touches `self.affinity` and
     /// never marks it dirty.
     pub(super) fn conn_affinity_record(&self, conn_key: u64, idx: usize, now_ms: i64) {
         let mut map = self
@@ -3145,12 +3140,6 @@ impl Manager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(conn_key, (idx, now_ms));
-        if map.len() > CONN_AFFINITY_CAP
-            && let Some((&oldest, _)) = map.iter().min_by_key(|&(_, &(_, touch))| touch)
-            && oldest != conn_key
-        {
-            map.remove(&oldest);
-        }
     }
 
     /// Write half of [`Manager::divert_ledger`] (§4.1/§4.2): record `dest` as
@@ -3168,9 +3157,8 @@ impl Manager {
     /// by design (§4.1: "so the sticky overlay has a single preferred index
     /// without scanning the mask").
     ///
-    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction, mirroring
-    /// `select()`'s `AFFINITY_CAP` pattern (`:664-675`) on this separate,
-    /// never-persisted map.
+    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction
+    /// ([`CappedMap::evict_sparing`]) on this separate, never-persisted map.
     pub(super) fn record_divert(
         &self,
         session_key: u64,
@@ -3214,13 +3202,7 @@ impl Manager {
             entry.sticky = dest;
         }
         entry.destinations |= bit;
-
-        if ledger.len() > DIVERT_LEDGER_CAP
-            && let Some((&oldest, _)) = ledger.iter().min_by_key(|(_, e)| e.until_ms)
-            && oldest != session_key
-        {
-            ledger.remove(&oldest);
-        }
+        ledger.evict_sparing(session_key);
     }
 }
 

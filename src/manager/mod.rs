@@ -46,6 +46,8 @@ use crate::stats::{
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
 mod bound_tokens;
+mod capped_map;
+use capped_map::{CappedMap, CappedSet};
 mod groups;
 use groups::GroupPolicy;
 // The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
@@ -1356,7 +1358,7 @@ pub struct Manager {
     /// there is no disconnect-release. Kept a plain `std::sync::Mutex` and **never**
     /// held while the accounts lock is taken (read the pin, drop this lock, then do
     /// eligibility) so the two can never deadlock.
-    affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    affinity: Mutex<CappedMap<u64, (usize, i64)>>,
     /// Session keys whose MOST RECENT request carried Anthropic's extended
     /// `"cache_control": {"ttl": "1h"}` (see [`crate::cache_ttl`]), so
     /// [`crate::manager::pins::affinity_pin_snapshot`] knows which persisted
@@ -1367,9 +1369,11 @@ pub struct Manager {
     /// widening the hot map's value type for every read site there would be
     /// blast radius this doesn't need. Written directly from the request path
     /// (`crate::proxy`, alongside where `session_key` is computed) rather than
-    /// through `select()`, guarded and pruned the same way `affinity` is —
-    /// never held while the accounts lock is taken.
-    affinity_extended: Mutex<HashSet<u64>>,
+    /// through `select()`, guarded the same way `affinity` is — never held
+    /// while the accounts lock is taken. Capped at `AFFINITY_CAP` on its own,
+    /// because the pin flush that prunes it to the live pins never runs when
+    /// affinity is off or there is no affinity file.
+    affinity_extended: Mutex<CappedSet<u64>>,
     /// Set whenever `affinity` is mutated, cleared by the flusher task that
     /// writes the map to disk (see [`Manager::mark_affinity_dirty`] and
     /// [`crate::affinity`]). A relaxed atomic rather than a channel because the
@@ -1420,7 +1424,7 @@ pub struct Manager {
     /// Per-session serving stats (session key → account/count/last-seen), for
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
-    sessions: Mutex<HashMap<u64, SessionStat>>,
+    sessions: Mutex<CappedMap<u64, SessionStat>>,
     /// The Claude Code `session_id`-keyed table with tool-call timing (F1,
     /// `docs/design/panel-tabs.md`), on a different grain from [`Self::sessions`] above — see
     /// [`crate::session_wire`] for the tracker itself and [`crate::stats::StatsSnapshot::wire_sessions`]
@@ -1463,7 +1467,7 @@ pub struct Manager {
     /// dead connection's entry ages out rather than persisting as a ghost.
     /// Guarded the same way as `affinity` — never held while the accounts lock
     /// is taken.
-    conn_affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    conn_affinity: Mutex<CappedMap<u64, (usize, i64)>>,
     /// One [`DivertEpisode`] per session currently mid-hold, session key ->
     /// episode. See the divert-budget design notes §4.1/§4.2.
     ///
@@ -1473,9 +1477,8 @@ pub struct Manager {
     /// a restart the pins are restored but no hold is, so every session
     /// legitimately starts a fresh episode) and bounded the same way `affinity`
     /// is — a size cap + LRU-by-last-touch eviction, keyed on `until_ms` as the
-    /// episode's own last-touch (see [`select`]'s `AFFINITY_CAP` eviction for the
-    /// pattern this mirrors).
-    pub(super) divert_ledger: Mutex<HashMap<u64, DivertEpisode>>,
+    /// episode's own last-touch.
+    divert_ledger: Mutex<CappedMap<u64, DivertEpisode>>,
     /// Per-account quota headroom reserved for the control account (§3, part 2
     /// of the control-account feature) — `switchThreshold`/`global_threshold`
     /// minus this, applied ONLY when a general (non-control-preferred) pick
@@ -1771,8 +1774,8 @@ impl Manager {
             current: Mutex::new(None),
             current_by_provider: Mutex::new(crate::stats::CurrentByProvider::default()),
             select_seq: AtomicU64::new(1),
-            affinity: Mutex::new(HashMap::new()),
-            affinity_extended: Mutex::new(HashSet::new()),
+            affinity: Mutex::new(CappedMap::new(select::AFFINITY_CAP, |&(_, touch)| touch)),
+            affinity_extended: Mutex::new(CappedSet::new(select::AFFINITY_CAP)),
             affinity_dirty: AtomicBool::new(false),
             affinity_wake: Notify::new(),
             affinity_save: crate::save_gate::SaveGate::new(AFFINITY_TOUCH_REFRESH),
@@ -1782,7 +1785,7 @@ impl Manager {
             bound_tokens_save: crate::save_gate::SaveGate::new(std::time::Duration::ZERO),
             bound_history_logged: Mutex::new(HashSet::new()),
             bound_switch_warned: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(CappedMap::new(snapshot::SESSION_CAP, |s| s.last_seen_ms)),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             wire_sessions_dirty: AtomicBool::new(false),
             wire_sessions_wake: Notify::new(),
@@ -1790,8 +1793,10 @@ impl Manager {
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             next_codex_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
-            conn_affinity: Mutex::new(HashMap::new()),
-            divert_ledger: Mutex::new(HashMap::new()),
+            conn_affinity: Mutex::new(CappedMap::new(select::CONN_AFFINITY_CAP, |&(_, touch)| {
+                touch
+            })),
+            divert_ledger: Mutex::new(CappedMap::new(select::DIVERT_LEDGER_CAP, |e| e.until_ms)),
             control_reserve,
             control_pooled,
             control_identity,
@@ -16729,6 +16734,31 @@ mod tests {
         assert_eq!(manager.codex_traffic(t0 + 599_000).unpooled_10m, 3);
         assert_eq!(manager.codex_traffic(t0 + 600_000).unpooled_10m, 0);
         assert_eq!(manager.codex_traffic(t0 + 599_000).refused_10m, 0);
+    }
+
+    /// The extended-cache set stays bounded with no pin flush to prune it: with affinity off
+    /// (no file, no flusher) every keyed request that asked for the 1h cache used to add a
+    /// key for good. Over the cap the least recently noted key goes, and the newest stays.
+    #[test]
+    fn the_extended_cache_set_is_capped_without_a_pin_flush() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let noted = select::AFFINITY_CAP as u64 * 2;
+        for key in 0..noted {
+            manager.note_affinity_ttl(key, true);
+        }
+        let held = manager
+            .affinity_extended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert_eq!(held, select::AFFINITY_CAP);
+        assert_eq!(manager.warm_window(Some(noted - 1)), WarmWindow::EXTENDED);
+        assert_eq!(manager.warm_window(Some(0)), WarmWindow::DEFAULT);
     }
 
     /// `group` settings as `(reserved, spill_to_pool)` for the one group `g`.

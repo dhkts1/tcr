@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Bound on [`Manager::sessions`], so a long-lived proxy can't grow it without
+/// limit. Personal use has a handful of sessions; this is a backstop.
+pub(super) const SESSION_CAP: usize = 128;
+
 impl Manager {
     /// Count exactly one served client request against account `idx` (the true
     /// serving account) and stamp its last-used time. Called once per client
@@ -52,16 +56,7 @@ impl Manager {
             stat.requests += 1;
             stat.last_seen_ms = now_ms;
             stat.kind = kind;
-            // Bound the map so a long-lived proxy can't grow it without limit: once over
-            // SESSION_CAP, evict the single oldest-last-seen entry (not the one we just
-            // touched). Personal use has a handful of sessions; this is a backstop.
-            const SESSION_CAP: usize = 128;
-            if sessions.len() > SESSION_CAP
-                && let Some((&oldest, _)) = sessions.iter().min_by_key(|(_, s)| s.last_seen_ms)
-                && oldest != key
-            {
-                sessions.remove(&oldest);
-            }
+            sessions.evict_sparing(key);
         }
         self.set_current(idx);
     }
