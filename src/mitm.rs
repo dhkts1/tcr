@@ -356,7 +356,12 @@ pub fn existing_ca_path_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// `ServerConfig::builder()` panic when no default is set; installing one first
 /// (ignoring "already installed") makes the builder deterministic.
 fn ensure_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!("a rustls crypto provider was already installed");
+    }
 }
 
 /// The CA + leaf tcr mints for itself. Named in exactly one place so the loader

@@ -121,9 +121,9 @@ impl Ask {
             return Err(AskRefusal::UnknownVersion { version });
         }
         let key_start = ASK_MAGIC.len() + 1;
-        let key: [u8; KEY_BYTES] = bytes[key_start..key_start + KEY_BYTES]
-            .try_into()
-            .expect("checked length");
+        let Ok(key) = <[u8; KEY_BYTES]>::try_from(&bytes[key_start..key_start + KEY_BYTES]) else {
+            return Err(AskRefusal::CutShort);
+        };
         Ok(Self { key })
     }
 }

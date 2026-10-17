@@ -69,7 +69,7 @@ impl Manager {
     pub fn throttle_exempt_noise_enabled(&self) -> bool {
         self.config
             .lock()
-            .expect("config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extra
             .get("throttleExemptNoise")
             .and_then(|v| v.as_bool())
@@ -98,7 +98,10 @@ impl Manager {
     /// Accepted deliberately: pinning the key at first use would instead hold a
     /// WRONG key forever in the case where the backfill is what corrects it.
     fn throttle_bucket_key(&self, idx: usize) -> String {
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self
+            .accounts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let account = accounts.get(idx);
         let identity = bucket_key_for(
             account.and_then(|a| a.org_uuid.as_deref()),
