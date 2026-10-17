@@ -13950,10 +13950,7 @@ mod tests {
     /// Submit `submission` and assert it replaced the credential on row 0.
     fn assert_it_updates_the_first_row(manager: &Manager, submission: Account) {
         let outcome = manager.add_or_update_account(submission);
-        assert!(
-            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
-            "{outcome:?}"
-        );
+        std::assert_matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. });
     }
 
     /// A manager whose in-memory config AND on-disk file both start out equal
@@ -14652,16 +14649,13 @@ mod tests {
             ..stored
         };
         let outcome = manager.add_or_update_account(submission);
-        assert!(
-            matches!(
-                outcome,
-                AddAccountOutcome::Updated {
-                    idx: 0,
-                    persist: AddPersist::Persisted,
-                    ..
-                }
-            ),
-            "{outcome:?}"
+        std::assert_matches!(
+            outcome,
+            AddAccountOutcome::Updated {
+                idx: 0,
+                persist: AddPersist::Persisted,
+                ..
+            }
         );
 
         let after = read_config_json(&path);

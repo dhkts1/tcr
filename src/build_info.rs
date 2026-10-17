@@ -541,9 +541,10 @@ mod tests {
     fn the_build_stamped_every_field() {
         assert!(!SHA.is_empty(), "TCR_BUILD_SHA is stamped");
         assert!(!BUILT_AT.is_empty(), "TCR_BUILD_TIME is stamped");
-        assert!(
-            matches!(DIRTY, "true" | "false" | "unknown"),
-            "TCR_BUILD_DIRTY is a tri-state token, got {DIRTY:?}"
+        std::assert_matches!(
+            DIRTY,
+            "true" | "false" | "unknown",
+            "TCR_BUILD_DIRTY is a tri-state token"
         );
         // Whatever git said, the current stamp round-trips into a BuildInfo.
         let current = BuildInfo::current();
@@ -678,9 +679,10 @@ mod tests {
             ("zzzzzzz", "cd146ce"), // not hex
         ] {
             let skew = compare(&build(running, None), &checkout(head, None, None));
-            assert!(
-                matches!(skew, Skew::Indeterminate { .. }),
-                "{running:?} vs {head:?} is not comparable, got {skew:?}"
+            std::assert_matches!(
+                skew,
+                Skew::Indeterminate { .. },
+                "{running:?} vs {head:?} is not comparable"
             );
             let line = skew.report_line().expect("says so out loud");
             assert!(line.contains("build-skew-unknown"), "{line}");

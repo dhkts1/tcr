@@ -406,20 +406,16 @@ impl<S> Metered<S> {
     /// Spend `n` bytes, reporting whether the allowance covered them.
     fn spend(&self, n: usize) -> bool {
         let n = n as u64;
-        loop {
-            let left = self.remaining.load(Ordering::Acquire);
-            if left < n {
-                self.remaining.store(0, Ordering::Release);
-                return false;
-            }
-            if self
-                .remaining
-                .compare_exchange(left, left - n, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
+        let covered = self
+            .remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(n)
+            })
+            .is_ok();
+        if !covered {
+            self.remaining.store(0, Ordering::Release);
         }
+        covered
     }
 }
 
@@ -720,9 +716,7 @@ impl TunnelBudget {
     /// Drop everything older than one window, so the hour rolls.
     fn trim(&mut self, now_ms: i64) {
         let floor = now_ms - BUDGET_WINDOW_MS;
-        while self.spent.front().is_some_and(|(at, _, _)| *at < floor) {
-            self.spent.pop_front();
-        }
+        while self.spent.pop_front_if(|(at, _, _)| *at < floor).is_some() {}
     }
 
     /// What `peer` has spent inside the rolling hour ending at `now_ms`.
@@ -878,9 +872,7 @@ impl PathMeter {
     /// different hours.
     fn trim(&mut self, now_ms: i64) {
         let floor = now_ms - BUDGET_WINDOW_MS;
-        while self.charges.front().is_some_and(|row| row.at_ms < floor) {
-            self.charges.pop_front();
-        }
+        while self.charges.pop_front_if(|row| row.at_ms < floor).is_some() {}
     }
 
     /// Charge bytes carried over one path.

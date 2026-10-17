@@ -3483,7 +3483,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
                 .await
                 .expect("answer");
-            String::from_utf8_lossy(&head).into_owned()
+            String::from_utf8_lossy_owned(head)
         });
         let request = ServeRequest {
             lease_id: 1,

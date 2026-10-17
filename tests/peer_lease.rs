@@ -2770,9 +2770,10 @@ mod mesh {
                             let control: Control = serve::recv_control(&mut stream, &mut session)
                                 .await
                                 .expect("the control frame");
-                            assert!(
-                                matches!(control, Control::LeaseRequest(_)),
-                                "this lender answers lease asks and nothing else, got {control:?}"
+                            std::assert_matches!(
+                                control,
+                                Control::LeaseRequest(_),
+                                "this lender answers lease asks and nothing else"
                             );
                             asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(answer_delay).await;

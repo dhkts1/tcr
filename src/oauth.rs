@@ -8138,7 +8138,7 @@ mod tests {
             )
             .await
             .expect_err("NoRefresh never refreshes");
-        assert!(matches!(err, OAuthError::Transient(_)), "{err:?}");
+        std::assert_matches!(err, OAuthError::Transient(_));
         assert_eq!(
             err.to_string(),
             format!("token refresh failed transiently: {NO_REFRESH_CODEX_MESSAGE}")

@@ -6819,9 +6819,10 @@ mod tests {
         let err = post_add_account(&config, &blank_account())
             .await
             .expect_err("a blank name/token must be refused by the route's own validation");
-        assert!(
-            matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("required")),
-            "a stamped 400 is a structural Rejected, not a guess from status alone: {err:?}"
+        std::assert_matches!(
+            err,
+            LiveControlError::Rejected(ref msg) if msg.contains("required"),
+            "a stamped 400 is a structural Rejected, not a guess from status alone"
         );
     }
 
@@ -6835,9 +6836,10 @@ mod tests {
         crate::test_support::live_proxy::serve(listener, config.clone(), None);
 
         let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
-        assert!(
-            matches!(answer, Err(LiveControlError::Rejected(_))),
-            "the blank probe is still the route's own stamped 400: {answer:?}"
+        std::assert_matches!(
+            answer,
+            Err(LiveControlError::Rejected(_)),
+            "the blank probe is still the route's own stamped 400"
         );
         assert_eq!(providers, vec![Provider::Anthropic, Provider::Codex]);
 
@@ -6856,10 +6858,7 @@ mod tests {
         });
         let config = add_route_config(port);
         let (answer, providers) = post_add_account_with_providers(&config, &blank_account()).await;
-        assert!(
-            matches!(answer, Err(LiveControlError::NoRoute)),
-            "{answer:?}"
-        );
+        std::assert_matches!(answer, Err(LiveControlError::NoRoute));
         assert!(
             providers.is_empty(),
             "an unstamped answer names no providers, whatever its headers say: {providers:?}"
@@ -6882,9 +6881,10 @@ mod tests {
         let err = post_add_account(&config, &blank_account())
             .await
             .expect_err("nothing is registered at this path");
-        assert!(
-            matches!(err, LiveControlError::NoRoute),
-            "an unstamped 404 must read as NoRoute, never Rejected: {err:?}"
+        std::assert_matches!(
+            err,
+            LiveControlError::NoRoute,
+            "an unstamped 404 must read as NoRoute, never Rejected"
         );
     }
 
@@ -6904,9 +6904,10 @@ mod tests {
         let err = post_add_account(&client_config, &blank_account())
             .await
             .expect_err("a wrong api-key must be refused");
-        assert!(
-            matches!(err, LiveControlError::Unauthorized),
-            "must surface as Unauthorized, never NoRoute: {err:?}"
+        std::assert_matches!(
+            err,
+            LiveControlError::Unauthorized,
+            "must surface as Unauthorized, never NoRoute"
         );
     }
 
@@ -6969,10 +6970,7 @@ mod tests {
         let err = post_add_account(&config, &account)
             .await
             .expect_err("an ambiguous identity must be refused, not guessed");
-        assert!(
-            matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("ambiguous")),
-            "{err:?}"
-        );
+        std::assert_matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("ambiguous"));
     }
 
     // --- resolve_account ---------------------------------------------------
