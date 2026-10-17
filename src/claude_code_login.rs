@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use crate::log_err::LogErr as _;
 use anyhow::Context;
 use serde::Deserialize;
