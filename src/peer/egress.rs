@@ -1226,13 +1226,10 @@ pub struct PinnedAttempt<'a> {
     pub path_and_query: &'a str,
     /// The upstream headers, already built and already scrubbed.
     pub headers: HeaderMap,
-    /// The request body as it arrived, before the account-uuid patch.
-    ///
-    /// Pristine rather than patched, because the patch is per ACCOUNT and this
-    /// function is the one that knows which account is serving: it applies the
-    /// same rewrite the direct attempt applies, from the same pristine bytes,
-    /// so a carried request is the same request the origin would have seen.
-    pub body: bytes::Bytes,
+    /// The body this account sends, account-uuid patch applied, or `None` for a GET or a
+    /// HEAD: the one value the proxy also hands the direct send and the blind carry, so a
+    /// carried request is the same request the origin would have seen.
+    pub body: Option<bytes::Bytes>,
     /// Where `tcr-peers.json` is.
     pub peers_path: &'a Path,
     /// The client's session key, for the served counter.
@@ -1459,27 +1456,11 @@ async fn pinned_carry(
             peer: peer.display(),
         }
     })?;
-    // The account-uuid patch, from the pristine bytes, exactly as the direct
-    // attempt applies it: rotation changes which account serves, the body names
-    // the account, and a carried request that skipped this would be a DIFFERENT
-    // request from the one the direct path would have sent. The patch is
-    // same-length, so no header changes with it.
-    let body = (attempt.method != Method::GET && attempt.method != Method::HEAD).then(|| {
-        match attempt.manager.account_uuid(attempt.account_idx) {
-            Some(uuid) if uuid.len() == 36 => {
-                match crate::account_uuid::patch_account_uuid(&attempt.body, &uuid) {
-                    std::borrow::Cow::Owned(patched) => bytes::Bytes::from(patched),
-                    std::borrow::Cow::Borrowed(_) => attempt.body.clone(),
-                }
-            }
-            _ => attempt.body.clone(),
-        }
-    });
     let request = CarriedRequest {
         url,
         method: attempt.method,
         headers: attempt.headers.clone(),
-        body,
+        body: attempt.body.clone(),
         peers_path: attempt.peers_path,
     };
     // The MACHINE's `via` timeout, because it is the operator's answer to "how

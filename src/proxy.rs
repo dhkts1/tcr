@@ -4486,6 +4486,27 @@ async fn handle_request(
                 build_codex_upstream_headers(&req_headers, &token, id.as_deref())
             }
         };
+        // The body THIS account sends, built once beside its headers and for the same reason:
+        // the exit lock, the direct send and the blind carry all take this one value, so a
+        // carried request is the same request the direct path would have sent.
+        //
+        // `None` for a GET or a HEAD, which carry no body. Anthropic: the body's
+        // `metadata.user_id.account_uuid` is rewritten to the serving account's own UUID
+        // (rotation changes the account each attempt, so this is recomputed from the pristine
+        // `body_bytes` per attempt), at the splice point the one parse found; the patch is
+        // same-length, so content-length is unaffected, and `build_upstream_headers` strips
+        // content-length regardless. Absent a configured 36-char UUID, the body is sent
+        // unchanged. Codex: the identity is the header set above; the body is opaque (usually
+        // zstd). Every no-change path forwards the buffered `Bytes` handle by O(1) refcount
+        // clone; only a genuine differing-UUID rewrite allocates.
+        let upstream_body: Option<Bytes> =
+            (method != Method::GET && method != Method::HEAD).then(|| match provider {
+                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
+                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
+                    _ => body_bytes.clone(),
+                },
+                crate::provider::Provider::Codex => body_bytes.clone(),
+            });
         // **The exit lock, before the direct attempt and not inside its failure
         // arm.** An account the operator locked to one Mac leaves from that Mac
         // on EVERY request, working direct path or not: the whole point is that
@@ -4510,7 +4531,7 @@ async fn handle_request(
                 method: &method,
                 path_and_query: &path_and_query,
                 headers: upstream_headers.clone(),
-                body: body_bytes.clone(),
+                body: upstream_body.clone(),
                 peers_path: &crate::peer::egress::peers_path(),
                 session_key,
                 session_kind,
@@ -4548,29 +4569,9 @@ async fn handle_request(
         let mut builder = http
             .request(method.clone(), &url)
             .headers(upstream_headers.clone());
-        if method != Method::GET && method != Method::HEAD {
-            // Rewrite the body's metadata.user_id.account_uuid to the serving
-            // account's own UUID (rotation changes the account each attempt, so
-            // this is recomputed from the pristine `body_bytes` per attempt). The
-            // patch is same-length, so content-length is unaffected — and
-            // `build_upstream_headers` strips content-length regardless. Absent a
-            // configured 36-char UUID, the body is sent unchanged.
-            // Forward the buffered `Bytes` handle by O(1) refcount clone on every
-            // no-change path; only a genuine differing-UUID rewrite allocates (it
-            // already owns a fresh Vec). `body_bytes` is immutable and re-read
-            // pristine each rotation attempt, so cloning the handle is correct, and
-            // reqwest's `Body: From<Bytes>` is O(1) — no full-body copy per request.
-            let out_body: bytes::Bytes = match provider {
-                // Anthropic: the existing metadata.user_id.account_uuid splice, unchanged.
-                crate::provider::Provider::Anthropic => match manager.account_uuid(idx) {
-                    // The splice point was found by the one parse; nothing re-reads the body.
-                    Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
-                    _ => body_bytes.clone(),
-                },
-                // Codex: the identity is the header set above; the body is opaque (usually zstd).
-                crate::provider::Provider::Codex => body_bytes.clone(),
-            };
-            builder = builder.body(out_body);
+        // reqwest's `Body: From<Bytes>` is O(1): no full-body copy per attempt.
+        if let Some(body) = upstream_body.clone() {
+            builder = builder.body(body);
         }
 
         // Fetch the serving account's name once per iteration — reused by the
@@ -4689,26 +4690,13 @@ async fn handle_request(
                     }
                 {
                     peer_egress_tried = true;
-                    // The body is rebuilt here rather than shared with the
-                    // direct attempt's `out_body` above, because the two hunks
-                    // are built separately. The
-                    // two must agree: a carried request is the SAME request,
-                    // and the account-uuid patch is part of what the upstream
-                    // sees.
-                    let carried_body =
-                        (method != Method::GET && method != Method::HEAD).then(|| {
-                            match manager.account_uuid(idx) {
-                                Some(uuid) if uuid.len() == 36 => request.for_account(&uuid),
-                                _ => body_bytes.clone(),
-                            }
-                        });
                     let peers_path = crate::peer::egress::peers_path();
                     let carry = crate::peer::egress::retry_through_peer(
                         crate::peer::egress::CarriedRequest {
                             url: &url,
                             method: &method,
                             headers: upstream_headers.clone(),
-                            body: carried_body,
+                            body: upstream_body.clone(),
                             peers_path: &peers_path,
                         },
                     )
