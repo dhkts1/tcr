@@ -246,8 +246,7 @@ impl Manager {
     ) -> T {
         self.reload_groups_if_changed();
         let unsupported = self.codex_accounts_with_unsupported_exit();
-        let parked = self.parked_groups();
-        let reserved = self.reserved_groups();
+        let groups = self.groups();
         let locked = self.locked_account_for(crate::provider::Provider::Codex);
         self.accounts
             .read()
@@ -263,8 +262,8 @@ impl Manager {
                         && group.is_none_or(|group| account.groups.iter().any(|g| g == group))
                         && !account.disabled
                         && account.status != AccountStatus::Error
-                        && !Self::parked_blocks(account, &parked)
-                        && !Self::reserved_blocks(account, group, &reserved)
+                        && !Self::parked_blocks(account, &groups.parked)
+                        && !Self::reserved_blocks(account, group, &groups.reserved)
                         && !unsupported.contains(idx)
                 }
             })

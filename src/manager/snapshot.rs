@@ -152,10 +152,7 @@ impl Manager {
     /// `tcr group color` write is picked up on this process's next natural
     /// check, no restart required.
     pub fn group_colors(&self) -> BTreeMap<String, String> {
-        self.group_colors
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.groups().colors.clone()
     }
 
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
@@ -165,9 +162,7 @@ impl Manager {
         // — see `Self::reload_groups_if_changed`'s doc. Cheap no-op when the
         // config file's mtime has not moved.
         self.reload_groups_if_changed();
-        let reserved = self.reserved_groups();
-        let parked = self.parked_groups();
-        let control_allowed = self.control_allowed_groups();
+        let groups = self.groups();
         let now_ms = odt_to_ms(now);
         // (1) UNDER THE AFFINITY LOCK ONLY: copy every session's PIN out into a
         // local, then DROP the lock before the accounts lock below is taken — the
@@ -247,8 +242,8 @@ impl Manager {
                     now_ms,
                     false,
                     None,
-                    &reserved,
-                    &parked,
+                    &groups.reserved,
+                    &groups.parked,
                 );
                 // A Codex account at its usage limit reports the window that refused it, and
                 // when that window rolls, instead of a `Rejected` with no time. Display only:
@@ -257,27 +252,10 @@ impl Manager {
                 // `limit_reached_type` instead (`schedule::ProbeUrgency::of`). See
                 // `Manager::codex_refusal_gate`.
                 let (gate, free_at) = Self::codex_refusal_gate(a, threshold, now, gate, free_at);
-                let mut reserved_groups: Vec<String> = a
-                    .groups
-                    .iter()
-                    .filter(|g| reserved.contains(*g))
-                    .cloned()
-                    .collect();
-                reserved_groups.sort();
-                let mut parked_groups: Vec<String> = a
-                    .groups
-                    .iter()
-                    .filter(|g| parked.contains(*g))
-                    .cloned()
-                    .collect();
-                parked_groups.sort();
-                let mut control_allowed_groups: Vec<String> = a
-                    .groups
-                    .iter()
-                    .filter(|g| control_allowed.contains(*g))
-                    .cloned()
-                    .collect();
-                control_allowed_groups.sort();
+                let reserved_groups = super::groups::carried_in(&a.groups, &groups.reserved);
+                let parked_groups = super::groups::carried_in(&a.groups, &groups.parked);
+                let control_allowed_groups =
+                    super::groups::carried_in(&a.groups, &groups.control_allowed);
                 let codex = codex_snapshot_facts(a);
                 // A Codex row's weekly window: its live weekly reset, and the length its plan
                 // reported, or a week when it reported none. `None` on an Anthropic row, which

@@ -453,14 +453,14 @@ impl Manager {
     /// hot-reloaded cache, so a `groupSettings` edit takes effect on the next
     /// request.
     pub fn is_group_spill(&self, group: &str) -> bool {
-        self.spill_groups().contains(group)
+        self.groups().spill.contains(group)
     }
 
     /// **Whether a request asking for `group` is held STRICTLY inside it**,
     /// the one answer, for every reader.
     ///
-    /// `reserved || !spill`, which is verbatim the expression
-    /// [`Self::select_with_group`] computes for its own `strict_group`. A
+    /// `reserved || !spill` ([`GroupPolicy::is_strict`]), the same call
+    /// [`Self::select_with_group`] makes for its own `strict_group`. A
     /// measurement found two readers outside the picker asking
     /// [`Self::is_group_reserved`] ALONE, `src/proxy.rs`'s refusal arm and its
     /// mirror on the exhausted path, so for a group that is neither reserved
@@ -475,7 +475,7 @@ impl Manager {
     /// rule the picker and the refusal disagree about is a request held in a
     /// group and refused about a pool.
     pub fn is_group_strict(&self, group: &str) -> bool {
-        self.is_group_reserved(group) || !self.is_group_spill(group)
+        self.groups().is_strict(group)
     }
 
     /// [`Self::select`], with an optional PREFER-semantics group (`tcr run
@@ -524,24 +524,16 @@ impl Manager {
         // file's mtime has not moved since the last check.
         self.reload_groups_if_changed();
 
-        // A single point-in-time snapshot for the whole call — see
-        // `Self::reserved_groups`'s doc for why this clones rather than holding
+        // One version of the group settings for the whole call — see
+        // `Self::groups`'s doc for why this clones an `Arc` rather than holding
         // the lock across the accounts/affinity locks taken below.
-        let reserved_groups = self.reserved_groups();
-        // Same point-in-time-snapshot reasoning as `reserved_groups` above — see
-        // `Self::parked_groups`'s and `Self::control_allowed_groups`'s docs.
-        let parked_groups = self.parked_groups();
-        let control_allowed_groups = self.control_allowed_groups();
-        // Same point-in-time-snapshot reasoning as `reserved_groups` above —
-        // see `Self::spill_groups`'s doc.
-        let spill_groups = self.spill_groups();
+        let groups = self.groups();
         // THE GROUP ASK THIS CALL WILL HOLD STRICTLY, computed once here rather
         // than at the pool pick alone, because the affinity fast-path below has
         // to ask the same question and used to have no way to. See the pool
         // pick's own comment for what strictness means and for the two
-        // carve-outs; this is the identical expression, hoisted.
-        let strict_group =
-            group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
+        // carve-outs.
+        let strict_group = group.filter(|g| groups.is_strict(g));
         // THE PROVIDER THIS REQUEST BELONGS TO, decided by its path (see
         // `crate::provider`'s module doc for why path and not host). Computed
         // here, above the hard lock, for the same reason `strict_group` is: the
@@ -769,8 +761,8 @@ impl Manager {
                             a,
                             now_ms,
                             group,
-                            &reserved_groups,
-                            &parked_groups,
+                            &groups.reserved,
+                            &groups.parked,
                             warm,
                         )
                     }) {
@@ -820,8 +812,8 @@ impl Manager {
                                 provider,
                                 None,  // no group PREFERENCE — honouring an existing pin
                                 group, // but reservation is not a preference — real ask
-                                &reserved_groups,
-                                &parked_groups,
+                                &groups.reserved,
+                                &groups.parked,
                             )
                         });
                         if !x_usable {
@@ -896,8 +888,8 @@ impl Manager {
                                     a,
                                     now_ms,
                                     group,
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                     warm,
                                 )
                             });
@@ -975,8 +967,8 @@ impl Manager {
                                                 provider,
                                                 None,
                                                 group,
-                                                &reserved_groups,
-                                                &parked_groups,
+                                                &groups.reserved,
+                                                &groups.parked,
                                             )
                                     });
                                 if idle_ms >= warm.ms() && has_eligible_alternative {
@@ -1072,8 +1064,8 @@ impl Manager {
                                         // function already is.
                                         strict_group,
                                         group, // reservation is not a preference, real ask
-                                        &reserved_groups,
-                                        &parked_groups,
+                                        &groups.reserved,
+                                        &groups.parked,
                                     ) {
                                         continue;
                                     }
@@ -1218,8 +1210,8 @@ impl Manager {
                                     // it must never be followed onto.
                                     strict_group,
                                     group, // reservation is not a preference, real ask
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                 )
                             })
                         };
@@ -1352,8 +1344,8 @@ impl Manager {
                             // divert later.
                             strict_group,
                             group, // reservation is not a preference, real ask
-                            &reserved_groups,
-                            &parked_groups,
+                            &groups.reserved,
+                            &groups.parked,
                         )
                     });
                     usable.then_some(sticky)
@@ -1425,7 +1417,7 @@ impl Manager {
                 if request_class == RequestClass::Inference && !self.control_pooled {
                     self.control().filter(|&idx| {
                         let opted_in = group.is_some_and(|g| {
-                            control_allowed_groups.contains(g)
+                            groups.control_allowed.contains(g)
                                 && accounts
                                     .get(idx)
                                     .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
@@ -1515,8 +1507,8 @@ impl Manager {
                         is_fable,
                         provider,
                         g,
-                        &reserved_groups,
-                        &parked_groups,
+                        &groups.reserved,
+                        &groups.parked,
                     );
                     tracing::info!(
                         group = g,
@@ -1549,8 +1541,8 @@ impl Manager {
                                     is_fable,
                                     provider,
                                     g,
-                                    &reserved_groups,
-                                    &parked_groups,
+                                    &groups.reserved,
+                                    &groups.parked,
                                 );
                                 tracing::info!(
                                     account = %account.name,
@@ -1790,8 +1782,7 @@ impl Manager {
         // saturates. The pin-honor path is never throttled here.
         const REVALIDATION_MIN_SPACING_MS: i64 = 2000;
 
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let now_ms = odt_to_ms(now);
         // Derived exactly as `select_with_group` derives them.
         let provider = crate::provider::Provider::of_path(path);
@@ -1825,8 +1816,8 @@ impl Manager {
                     now_ms,
                     is_fable,
                     None,
-                    &reserved_groups,
-                    &parked_groups,
+                    &groups.reserved,
+                    &groups.parked,
                     warm,
                 )
         };
@@ -1896,7 +1887,7 @@ impl Manager {
                 // the opposite decision on the identical fact and documents why
                 // (see its affinity fast-path); the two now agree.
                 if accounts.get(idx).is_some_and(|a| {
-                    Self::account_hard_ok(a, now_ms, None, &reserved_groups, &parked_groups, warm)
+                    Self::account_hard_ok(a, now_ms, None, &groups.reserved, &groups.parked, warm)
                 }) {
                     keep_pin = Some(idx);
                     pin_until_ms = accounts
@@ -2888,8 +2879,7 @@ impl Manager {
         respect_pacing: bool,
         group: Option<&str>,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -2908,8 +2898,8 @@ impl Manager {
                 provider,
                 group,
                 group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             ) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
                 // ineligibility (disabled/error/quota) so the log names only the former.
@@ -2927,8 +2917,8 @@ impl Manager {
                         provider,
                         group,
                         group,
-                        &reserved_groups,
-                        &parked_groups,
+                        &groups.reserved,
+                        &groups.parked,
                     )
                 {
                     tracing::info!(
@@ -2983,8 +2973,7 @@ impl Manager {
         provider: crate::provider::Provider,
         group: Option<&str>,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -3003,8 +2992,8 @@ impl Manager {
                 provider,
                 group,
                 group,
-                &reserved_groups,
-                &parked_groups,
+                &groups.reserved,
+                &groups.parked,
             ) {
                 continue;
             }
@@ -3057,8 +3046,7 @@ impl Manager {
         now_ms: i64,
         provider: crate::provider::Provider,
     ) -> Option<usize> {
-        let reserved_groups = self.reserved_groups();
-        let parked_groups = self.parked_groups();
+        let groups = self.groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -3078,7 +3066,7 @@ impl Manager {
             // Parked is an account-level block like `disabled` above, and this
             // last-resort pass relaxes only the Fable `7d_oi` prediction — never
             // an operator's own decision to hold a group out.
-            if Self::parked_blocks(account, &parked_groups) {
+            if Self::parked_blocks(account, &groups.parked) {
                 continue;
             }
             if let Some(until) = account.rate_limited_until_ms
@@ -3098,7 +3086,7 @@ impl Manager {
             if account.quota.model_weekly_rejected(now) {
                 continue;
             }
-            if Self::reserved_blocks(account, None, &reserved_groups) {
+            if Self::reserved_blocks(account, None, &groups.reserved) {
                 continue;
             }
             if !self.pool_pick_respects_control_reserve(idx, account, now) {
