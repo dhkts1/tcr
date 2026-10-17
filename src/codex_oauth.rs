@@ -849,7 +849,10 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
-            let _ = socket.read(&mut request).await;
+            crate::log_err::LogErr::log_debug(
+                socket.read(&mut request).await,
+                "reading the stalled request",
+            );
             socket
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\

@@ -1521,7 +1521,10 @@ mod tests {
             "ignoring a stale claim must fall through to command-line recognition"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// The case the whole phase exists for: a proxy inside a host application is
@@ -1553,7 +1556,10 @@ mod tests {
         // what made `tcr login` stop refusing to run beside a live server.
         assert!(replaceable_incumbents(&[5150], 1, command).is_empty());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// `host: "cli"` is a plain [`ProxyKind::Tcr`] — the claim adds identity, not a
@@ -1567,7 +1573,10 @@ mod tests {
             Some(tcr(1234)),
             "a CLI-hosted claim is the same kind the name matcher would produce"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// THE SECOND FALSE-POSITIVE CONTROL, and the one that stands between a stale
@@ -1617,7 +1626,10 @@ mod tests {
             "an unrelated listener on the port must never become a replaceable incumbent"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// BACKWARD COMPATIBILITY, and the reason this phase needs no restart: the
@@ -1659,7 +1671,10 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// (b) An EMBEDDED incumbent stands the caller down even under `--replace`.
@@ -1815,7 +1830,10 @@ mod tests {
         // (4) Withdrawing twice (a re-issued shutdown) is quiet and harmless.
         remove_owner_file_if_owned(&ours, 5150, 3457);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// The claim file is named after the PORT, so two proxies on two ports never
@@ -1875,7 +1893,10 @@ mod tests {
             "and --replace still cannot signal it"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::log_err::LogErr::log_debug(
+            std::fs::remove_dir_all(&dir),
+            "removing a test temp dir",
+        );
     }
 
     /// The on-disk shape is a cross-process contract: the file a proxy writes is

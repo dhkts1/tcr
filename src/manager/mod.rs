@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use time::OffsetDateTime;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -670,6 +670,14 @@ pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
         // one request on that connection instead of every stream sharing it.
         builder = builder.http1_only();
     }
+    // A client that cannot be built (the TLS backend failed to initialise) leaves
+    // the process unable to make any upstream request, and this function has no
+    // error channel: its callers are the constructor, `from_runtimes` and the
+    // post-sleep rebuild.
+    #[expect(
+        clippy::expect_used,
+        reason = "no upstream request is possible without a client, and the signature has no error channel"
+    )]
     Arc::new(builder.build().expect("build reqwest client"))
 }
 
@@ -1570,7 +1578,7 @@ impl Drop for InFlightGuard {
             .manager
             .accounts
             .write()
-            .expect("accounts lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(account) = accounts.get_mut(self.idx) {
             // saturating_sub so a double-drop / underflow can never wrap to u32::MAX
             // and pin the account out forever.
@@ -1841,7 +1849,9 @@ impl Manager {
         });
         // Hand the manager its own `Arc` (weakly) now that one exists — see the
         // `me` field. Infallible: this is the only write, on a just-built value.
-        let _ = manager.me.set(Arc::downgrade(&manager));
+        if manager.me.set(Arc::downgrade(&manager)).is_err() {
+            tracing::warn!("manager self-reference was already set");
+        }
 
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
             tracing::warn!(
@@ -1872,6 +1882,10 @@ impl Manager {
     /// no token, probe, or network I/O ever happens. `config_path = None` makes
     /// every persist a no-op, so nothing can be written to disk.
     pub fn from_runtimes(accounts: Vec<AccountRuntime>) -> Arc<Self> {
+        #[expect(
+            clippy::expect_used,
+            reason = "Config has no Default; an empty JSON object parses by construction and the signature has no error channel"
+        )]
         let config: Config = serde_json::from_str("{}")
             .expect("an empty JSON object is always a valid default config");
         let prober = LiveUsageProber::new().with_codex_base(config.codex_upstream.clone());
@@ -1897,7 +1911,7 @@ impl Manager {
         last_seen_ms: i64,
         kind: SessionKind,
     ) {
-        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         sessions.insert(
             key,
             SessionStat {
@@ -1914,7 +1928,7 @@ impl Manager {
     pub fn account_status(&self, idx: usize) -> Option<AccountStatus> {
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
             .map(|a| a.status)
     }
@@ -2068,7 +2082,7 @@ impl Manager {
         };
         let reserved_groups = self.reserved_groups();
         let parked_groups = self.parked_groups();
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
         let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
         let mut soonest: Option<(i64, GateReason)> = None;
         // The all-rejected Codex fold (see `exhaustion_hint`): whether every account
@@ -2332,7 +2346,10 @@ impl Manager {
             self.retire_every_client_after_sleep(slept);
         }
         let claimed_recycle = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             match accounts.get_mut(idx) {
                 Some(account) => {
                     account.in_flight = account.in_flight.saturating_add(1);
@@ -2378,13 +2395,20 @@ impl Manager {
     ///
     /// The one INFO line per wake is here; nothing logs per request.
     fn retire_every_client_after_sleep(&self, slept: std::time::Duration) {
-        let count = self.accounts.read().expect("accounts lock poisoned").len();
+        let count = self
+            .accounts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
         let http1_only = self.http1_only();
         let fresh: Vec<_> = (0..count)
             .map(|_| build_serving_client(http1_only))
             .collect();
         let retired = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut retired = 0usize;
             for (account, http) in accounts.iter_mut().zip(fresh) {
                 account.http = http;
@@ -2439,7 +2463,10 @@ impl Manager {
     /// the stream-reset one.
     fn recycle_client(&self, idx: usize, reason: RecycleReason) {
         let fresh = build_serving_client(self.http1_only());
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(account) = accounts.get_mut(idx) else {
             // Stale index: accounts are appended, never removed, so this is not
             // reachable on the live path — same rationale as `http_client`.
@@ -2515,10 +2542,14 @@ impl Manager {
         let _writing = self
             .config_write
             .lock()
-            .expect("config write lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         // INV2 — clone inside a short critical section so the config lock is
         // released on this line, before any file I/O below runs.
-        let snapshot = self.config.lock().expect("config lock poisoned").clone();
+        let snapshot = self
+            .config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Err(err) = config::save_tokens(path, &snapshot) {
             tracing::error!(error = %err, "failed to flush config on shutdown");
         }
@@ -2559,7 +2590,7 @@ impl Manager {
         let sync_pending = match provider {
             crate::provider::Provider::Anthropic => None,
             crate::provider::Provider::Codex => {
-                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
                 accounts
                     .iter()
                     .find(|a| {
@@ -2582,7 +2613,7 @@ impl Manager {
         let _writing = self
             .config_write
             .lock()
-            .expect("config write lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         // INV2 — the config lock is taken ONLY for this block: apply the rotation to
         // the snapshot and clone it out. The guard drops at the closing brace, so
         // `save_tokens` below runs with `self.config` free and a per-connection
@@ -2596,7 +2627,7 @@ impl Manager {
         // token still sits in the snapshot for `persist_now` to flush at shutdown;
         // rolling memory back on failure would lose it for good.
         let (snapshot, placement) = {
-            let mut config = self.config.lock().expect("config lock poisoned");
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             // Resolved, never first-match: `same_identity` treats an unknown org as
             // a match, so with the legacy two-org shape in the file a first-match
             // search lands THIS account's rotated credential on the OTHER account's
@@ -2671,7 +2702,7 @@ impl Manager {
     fn reserved_groups(&self) -> HashSet<String> {
         self.reserved_groups
             .read()
-            .expect("reserved_groups lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -2680,7 +2711,7 @@ impl Manager {
     pub(super) fn parked_groups(&self) -> HashSet<String> {
         self.parked_groups
             .read()
-            .expect("parked_groups lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -2696,7 +2727,7 @@ impl Manager {
     pub fn is_group_reserved(&self, group: &str) -> bool {
         self.reserved_groups
             .read()
-            .expect("reserved_groups lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .contains(group)
     }
 
@@ -2705,7 +2736,7 @@ impl Manager {
     fn control_allowed_groups(&self) -> HashSet<String> {
         self.control_allowed_groups
             .read()
-            .expect("control_allowed_groups lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -2715,7 +2746,7 @@ impl Manager {
     pub(super) fn spill_groups(&self) -> HashSet<String> {
         self.spill_groups
             .read()
-            .expect("spill_groups lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -2770,7 +2801,7 @@ impl Manager {
         if *self
             .groups_reload_mtime
             .lock()
-            .expect("groups reload mtime lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             == Some(mtime)
         {
             return;
@@ -2786,7 +2817,7 @@ impl Manager {
         if *self
             .groups_reload_mtime
             .lock()
-            .expect("groups reload mtime lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             == Some(mtime)
         {
             return;
@@ -2797,7 +2828,7 @@ impl Manager {
                 *self
                     .groups_reload_mtime
                     .lock()
-                    .expect("groups reload mtime lock poisoned") = Some(mtime);
+                    .unwrap_or_else(PoisonError::into_inner) = Some(mtime);
             }
             Err(err) => {
                 tracing::warn!(
@@ -2843,7 +2874,7 @@ impl Manager {
             let mut reserved = self
                 .reserved_groups
                 .write()
-                .expect("reserved_groups lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if *reserved != new_reserved {
                 changed.push(format!(
                     "reserved groups: {:?} -> {:?}",
@@ -2857,7 +2888,7 @@ impl Manager {
             let mut parked = self
                 .parked_groups
                 .write()
-                .expect("parked_groups lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if *parked != new_parked {
                 changed.push(format!(
                     "parked groups: {:?} -> {:?}",
@@ -2871,7 +2902,7 @@ impl Manager {
             let mut control_allowed = self
                 .control_allowed_groups
                 .write()
-                .expect("control_allowed_groups lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if *control_allowed != new_control_allowed {
                 changed.push(format!(
                     "control-allowed groups: {:?} -> {:?}",
@@ -2885,7 +2916,7 @@ impl Manager {
             let mut spill = self
                 .spill_groups
                 .write()
-                .expect("spill_groups lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if *spill != new_spill {
                 changed.push(format!(
                     "spill-to-pool groups: {:?} -> {:?}",
@@ -2899,14 +2930,17 @@ impl Manager {
             let mut colors = self
                 .group_colors
                 .write()
-                .expect("group_colors lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if *colors != new_colors {
                 changed.push(format!("group colors: {:?} -> {:?}", *colors, new_colors));
                 *colors = new_colors;
             }
         }
         {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             let fresh_control = fresh.control_account.as_ref().map(|c| c.name().to_string());
             for (idx, account) in accounts.iter_mut().enumerate() {
                 let probe = crate::identity::probe(
@@ -2934,7 +2968,10 @@ impl Manager {
                         // index would keep control traffic on the deleted row.
                         // Same lock order as `probeable_indices`: accounts, then
                         // control.
-                        let mut control = self.control_idx.write().expect("control lock poisoned");
+                        let mut control = self
+                            .control_idx
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner);
                         if *control == Some(idx) {
                             *control = None;
                             changed
@@ -2957,7 +2994,10 @@ impl Manager {
                     account.codex_home = matched.codex_home.clone();
                     changed.push(format!("{}: back in the config", account.name));
                     if fresh_control.as_deref() == Some(account.name.as_str()) {
-                        let mut control = self.control_idx.write().expect("control lock poisoned");
+                        let mut control = self
+                            .control_idx
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner);
                         if control.is_none() {
                             *control = Some(idx);
                         }
@@ -2992,7 +3032,7 @@ impl Manager {
             // from the admitted account onward: a strict pin on any of them
             // silently failed open (`account_egress` returns `None` on an
             // out-of-range `idx`, and callers read `None` as "no pin").
-            let mut config = self.config.lock().expect("config lock poisoned");
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             let http1_only = config.http1_only;
             for candidate in &fresh.accounts {
                 let already_known = accounts.iter().any(|existing| {
@@ -3058,7 +3098,7 @@ impl Manager {
         let _writing = self
             .config_write
             .lock()
-            .expect("config write lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         // INV2 — no `self.config` guard is alive on this line, so the file I/O
         // cannot block a per-connection config read.
         let outcome = config::save_disabled(path, target, disabled);
@@ -3070,7 +3110,7 @@ impl Manager {
             outcome,
             Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
         ) {
-            let mut config = self.config.lock().expect("config lock poisoned");
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             // Resolved by identity, through the one `identity::resolve` that
             // `persist_tokens` and `save_disabled` resolve through, with the provider
             // riding on `target` (`set_disabled` builds it from the row), so all three
@@ -3138,7 +3178,10 @@ impl Manager {
     /// with it, so even a hand-sidelined row is re-probed rather than stuck forever.
     pub fn mark_error(&self, idx: usize) {
         {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(account) = accounts.get_mut(idx) {
                 account.status = AccountStatus::Error;
             }
@@ -3163,7 +3206,10 @@ impl Manager {
         // both at once here would invert the order `warm_targets` reads them in
         // (config, then accounts) — the shape a deadlock is made of.
         let target = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             // A row deleted from the config keeps its slot, parked and unlisted, and
             // `disabled` is all that keeps it out of rotation (`eligible` never reads
             // `removed`), so it answers as a row that no longer exists: enabling it would
@@ -3211,7 +3257,7 @@ impl Manager {
     /// `RwLock` is not reentrant, so holding it across the call would deadlock.
     pub fn set_disabled_by_query(&self, query: &str, disabled: bool) -> SetDisabledOutcome {
         let (idx, name) = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             match match_listed(&accounts[..], query) {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
@@ -3237,7 +3283,10 @@ impl Manager {
     /// [`crate::identity::match_one`] over the rotation slots that
     /// [`Self::set_disabled_by_query`] uses, for the same reason.
     pub fn set_priority_by_query(&self, query: &str, priority: i64) -> SetPriorityOutcome {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let mut accounts = self
+            .accounts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let idx = match match_listed(&accounts[..], query) {
             crate::identity::Match::One(idx) => idx,
             crate::identity::Match::None => return SetPriorityOutcome::NoMatch,
@@ -3254,7 +3303,10 @@ impl Manager {
 
     /// The current control account's rotation index, or `None` when unset.
     pub fn control(&self) -> Option<usize> {
-        *self.control_idx.read().expect("control lock poisoned")
+        *self
+            .control_idx
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The current control account's name, or `None` when unset / the index no
@@ -3266,7 +3318,7 @@ impl Manager {
         let idx = self.control()?;
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
             .map(|a| a.name.clone())
     }
@@ -3291,7 +3343,7 @@ impl Manager {
         let idx = self.control()?;
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
             .map(|a| crate::control_identity::ControlIdentity {
                 name: a.name.clone(),
@@ -3314,7 +3366,7 @@ impl Manager {
         let idx = self.locked_idx?;
         self.accounts
             .read()
-            .expect("accounts lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(idx)
             .filter(|a| !a.removed)
             .map(|a| a.name.clone())
@@ -3369,7 +3421,7 @@ impl Manager {
         let _writing = self
             .config_write
             .lock()
-            .expect("config write lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         // INV2 — no `self.config` guard is alive on this line.
         let outcome = config::save_control_account(path, target.as_ref());
         // INV3 — memory is touched only on the arms where the FILE now carries
@@ -3378,7 +3430,7 @@ impl Manager {
             outcome,
             Ok(config::ControlWrite::Updated) | Ok(config::ControlWrite::Unchanged)
         ) {
-            let mut config = self.config.lock().expect("config lock poisoned");
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             config.control_account = target.as_ref().map(config::ControlAccountRef::from);
         }
         let name = target.as_ref().map(|a| a.name.as_str());
@@ -3427,7 +3479,7 @@ impl Manager {
         let target = idx.and_then(|i| {
             self.accounts
                 .read()
-                .expect("accounts lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(i)
                 .map(|a| {
                     // Carries the account's provider for the reason
@@ -3443,7 +3495,10 @@ impl Manager {
                 })
         });
         {
-            let mut control = self.control_idx.write().expect("control lock poisoned");
+            let mut control = self
+                .control_idx
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             *control = idx;
         }
         self.persist_control(target)
@@ -3464,7 +3519,7 @@ impl Manager {
             };
         };
         let (idx, name) = {
-            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let accounts = self.accounts.read().unwrap_or_else(PoisonError::into_inner);
             match match_listed(&accounts[..], query) {
                 // Refused here as boot ignores it (see `assemble`): a `match`, so a third
                 // provider decides this too instead of inheriting an answer.
@@ -3509,7 +3564,7 @@ impl Manager {
         let _writing = self
             .config_write
             .lock()
-            .expect("config write lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         crate::config_set::save_setting(path, setting).map_err(|err| {
             tracing::error!(
                 error = %err,
@@ -3527,7 +3582,7 @@ impl Manager {
     /// equal on both sides exactly when the running value is the saved one.
     pub fn running_settings(&self) -> crate::config_show::ConfigSettings {
         let path = self.config_path.clone().unwrap_or_default();
-        let config = self.config.lock().expect("config lock poisoned");
+        let config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
         crate::config_show::ConfigSettings::from_config(&config, &path)
     }
 
@@ -3540,11 +3595,11 @@ impl Manager {
     /// taking the accounts lock would be the two orders a deadlock is made of.
     pub fn set_current(&self, idx: usize) {
         let provider = self.provider(idx);
-        *self.current.lock().expect("current lock poisoned") = Some(idx);
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(idx);
         if let Some(provider) = provider {
             self.current_by_provider
                 .lock()
-                .expect("current_by_provider lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .set(provider, idx);
         }
     }
@@ -3571,15 +3626,22 @@ impl Manager {
     /// an appended account gets its own `refresh_lock` for free — there is no
     /// longer a parallel structure to keep in sync.
     pub fn add_account(&self, account: config::Account) -> usize {
-        let http1_only = self.config.lock().expect("config lock poisoned").http1_only;
+        let http1_only = self
+            .config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .http1_only;
         let runtime = AccountRuntime::from_config(&account, http1_only);
         let idx = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let mut accounts = self
+                .accounts
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             accounts.push(runtime);
             accounts.len() - 1
         };
         {
-            let mut config = self.config.lock().expect("config lock poisoned");
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             config.accounts.push(account);
         }
         idx
@@ -3715,10 +3777,13 @@ impl Manager {
             let _writing = self
                 .config_write
                 .lock()
-                .expect("config write lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
 
             let resolution = {
-                let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+                let mut accounts = self
+                    .accounts
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
 
                 let probes: Vec<(usize, config::Account)> = accounts
                     .iter()
@@ -3765,11 +3830,8 @@ impl Manager {
                         crate::identity::Resolved::None => None,
                     };
 
-                match matched {
-                    Some(idx) => {
-                        let row = accounts
-                            .get_mut(idx)
-                            .expect("idx was just resolved against this same vec");
+                match matched.and_then(|idx| accounts.get_mut(idx).map(|row| (idx, row))) {
+                    Some((idx, row)) => {
                         row.access_token = account.access_token.clone();
                         row.refresh_token = account.refresh_token.clone();
                         row.expires_at_ms = account.expires_at.map(oauth::normalize_expires_at);
@@ -3859,7 +3921,7 @@ impl Manager {
                         // (runtime) index and is not guaranteed to line up with
                         // `self.config.accounts`.
                         let existing_pin = {
-                            let config = self.config.lock().expect("config lock poisoned");
+                            let config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
                             match crate::identity::resolve(
                                 config.accounts.iter().enumerate(),
                                 &target,
@@ -3982,7 +4044,11 @@ impl Manager {
                     // attempt is guaranteed to have a runtime ready, so it
                     // cannot hit this arm again.
                     drop(_writing);
-                    let http1_only = self.config.lock().expect("config lock poisoned").http1_only;
+                    let http1_only = self
+                        .config
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .http1_only;
                     speculative_runtime = Some(AccountRuntime::from_config(&account, http1_only));
                     continue;
                 }
@@ -3995,7 +4061,7 @@ impl Manager {
                     // doc-comment above), which is what makes this whole arm
                     // atomic with respect to another concurrent call.
                     {
-                        let mut config = self.config.lock().expect("config lock poisoned");
+                        let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
                         config.accounts.push(account.clone());
                     }
                     let name = account.name.clone();
@@ -4116,7 +4182,7 @@ impl Manager {
             outcome,
             Ok(config::AccountWrite::Updated) | Ok(config::AccountWrite::Added)
         ) {
-            let mut config = self.config.lock().expect("config lock poisoned");
+            let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             match crate::identity::resolve(config.accounts.iter().enumerate(), target) {
                 crate::identity::Resolved::One(position) => {
                     if let Some(entry) = config.accounts.get_mut(position) {
@@ -4230,7 +4296,7 @@ impl Manager {
         let mut refused = self
             .codex_refused
             .lock()
-            .expect("codex_refused lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         refused.ring.bump(now_ms);
         refused.last = Some((kind, now_ms));
     }
@@ -4240,7 +4306,7 @@ impl Manager {
     pub fn note_codex_unpooled(&self, now_ms: i64) {
         self.codex_unpooled
             .lock()
-            .expect("codex_unpooled lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .bump(now_ms);
     }
 
@@ -4256,14 +4322,14 @@ impl Manager {
             let refused = self
                 .codex_refused
                 .lock()
-                .expect("codex_refused lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             let count = refused.ring.count(now_ms);
             (count, refused.last.filter(|_| count > 0))
         };
         let unpooled_10m = self
             .codex_unpooled
             .lock()
-            .expect("codex_unpooled lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .count(now_ms);
         let (last_refusal, last_refusal_at_ms) = match last {
             Some((error_type, at_ms)) => (Some(error_type), Some(at_ms)),
@@ -6048,7 +6114,10 @@ mod tests {
             .expect("bind the usage stub");
         let codex_upstream = format!("http://{}", listener.local_addr().expect("stub address"));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, usage_endpoint).await;
+            crate::log_err::LogErr::log_debug(
+                axum::serve(listener, usage_endpoint).await,
+                "serving the usage stub",
+            );
         });
 
         let mut config = config_with(vec![Account {
@@ -9662,7 +9731,7 @@ mod tests {
         let caller = tokio::spawn(async move { m.ensure_fresh_force(0).await });
         started.notified().await; // the POST is in flight upstream
         caller.abort(); // the client hung up
-        let _ = caller.await;
+        crate::log_err::LogErr::log_debug(caller.await, "joining the aborted caller");
         release.notify_one(); // upstream answers, as it would have anyway
 
         // The answer must still be applied. Polled, because the refresh now runs on

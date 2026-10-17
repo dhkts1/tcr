@@ -166,7 +166,7 @@ mod tests {
     fn scratch(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("tcr-handoff-{tag}-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        crate::log_err::LogErr::log_debug(std::fs::remove_file(&p), "removing a test temp file");
         p
     }
 
@@ -211,7 +211,7 @@ mod tests {
             "the peer received a different socket than the one handed over"
         );
 
-        let _ = std::fs::remove_file(&path);
+        crate::log_err::LogErr::log_debug(std::fs::remove_file(&path), "removing a test temp file");
     }
 
     /// The requirement string must PARSE, or every handoff fails at runtime
@@ -269,7 +269,7 @@ mod tests {
              that same single-use token and its copy is now dead"
         );
 
-        let _ = std::fs::remove_file(&path);
+        crate::log_err::LogErr::log_debug(std::fs::remove_file(&path), "removing a test temp file");
     }
 
     /// A non-macOS build refuses rather than proceeding unauthenticated. Stated
