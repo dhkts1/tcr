@@ -3,6 +3,8 @@
 //! A test writes only the fields it changes (`Account { priority: Some(2), ..Account::fixture(n) }`),
 //! so a field added to either type is added here once instead of in every literal.
 
+pub(crate) mod stub_upstream;
+
 use std::collections::HashMap;
 
 use crate::config::{

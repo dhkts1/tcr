@@ -8723,6 +8723,47 @@ mod tests {
     use super::*;
     use crate::config::{Account, Config, ProxyConfig};
     use crate::log_err::LogErr;
+    use crate::test_support::stub_upstream::{self as stub, StubAddr};
+
+    /// A request to the proxy as reqwest puts it on the wire: a loopback `host`, `accept: */*`,
+    /// and a `content-length` when there is a body. For a test that wants the proxy's answer
+    /// and not its listener, so it is driven in-process by [`send_to_proxy`]: no port, no
+    /// connection. A test whose subject IS the socket (hyper's request-line parser, the
+    /// production `mitm::serve` stack) keeps a real listener and says so.
+    fn client_request(method: Method, path: &str, body: impl Into<Bytes>) -> Request {
+        let body: Bytes = body.into();
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HOST, "127.0.0.1")
+            .header(ACCEPT, "*/*");
+        if !body.is_empty() {
+            builder = builder.header(axum::http::header::CONTENT_LENGTH, body.len());
+        }
+        builder.body(Body::from(body)).expect("build request")
+    }
+
+    /// [`client_request`] carrying a JSON body, as reqwest's `.json(..)` sends it.
+    fn client_json(path: &str, value: &serde_json::Value) -> Request {
+        let mut req = client_request(Method::POST, path, value.to_string());
+        req.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        req
+    }
+
+    /// Answer `req` with `router` in-process.
+    async fn send_to_proxy(router: Router, req: Request) -> Response {
+        use tower::ServiceExt as _;
+        router.oneshot(req).await.expect("router response")
+    }
+
+    /// The whole body of `response`, as text.
+    async fn body_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 
     /// **This Mac's own routing marker never leaves it.**
     ///
@@ -9721,7 +9762,6 @@ mod tests {
     /// attached is what actually pins the wiring, not just the function.
     #[tokio::test]
     async fn real_request_through_app_pins_on_prefix_for_loopback_v1_messages() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tower::ServiceExt as _;
 
         struct NoRefresh;
@@ -9735,28 +9775,9 @@ mod tests {
             }
         }
 
-        // Fake upstream: one connection, one 200 with a minimal usage body.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((mut sock, _)) = upstream.accept().await {
-                let mut buf = [0u8; 4096];
-                sock.read(&mut buf)
-                    .await
-                    .log_debug("reading a test request");
-                let body = br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                sock.write_all(head.as_bytes())
-                    .await
-                    .log_debug("writing a test response");
-                sock.write_all(body)
-                    .await
-                    .log_debug("writing a test response");
-            }
-        });
+        // Fake upstream: one 200 with a minimal usage body (the test sends one request).
+        let body = r#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
+        let up_addr = stub::canned(stub::reply("200 OK", "application/json", body));
 
         let config = dummy_config(None, &format!("http://{up_addr}"));
         let manager = Manager::new(
@@ -10658,11 +10679,7 @@ mod tests {
     async fn a_codex_request_tcr_answers_itself_closes_no_call() {
         let anthropic_echo = CapturingUpstream::spawn().await;
         let auth_body = r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#;
-        let auth_response = format!(
-            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            auth_body.len(),
-            auth_body
-        );
+        let auth_response = stub::reply("403 Forbidden", "application/json", auth_body);
         let (codex_origin, attempts) = spawn_counted_upstream(vec![Some(auth_response)]).await;
         let manager = Manager::with_live_refresher(
             codex_fleet(&anthropic_echo.url, &format!("http://{codex_origin}")),
@@ -11444,8 +11461,8 @@ mod tests {
         );
     }
 
-    /// Boot smoke test on a FREE port (never 3456): driven through `axum::serve`
-    /// directly, so no `ClientAddr` extension is injected and the client is
+    /// Boot smoke test, driven at `app()` in-process (as plain `axum::serve` would
+    /// serve it), so no `ClientAddr` extension is injected and the client is
     /// treated as remote (fail-closed) — a keyless request is 401, a keyed one
     /// proceeds upstream. The loopback exemption (the production path via
     /// `mitm::serve`) is covered separately by `loopback_client_is_exempt`.
@@ -11460,29 +11477,19 @@ mod tests {
             dummy_config(Some("test-key"), "http://127.0.0.1:1"),
             None,
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::new();
-
-        let no_key = client.get(format!("http://{addr}/")).send().await.unwrap();
+        let router = app(manager);
+        let no_key = send_to_proxy(router.clone(), client_request(Method::GET, "/", "")).await;
         assert_eq!(
             no_key.status().as_u16(),
             401,
             "keyless request must be rejected"
         );
 
-        let with_key = client
-            .get(format!("http://{addr}/"))
-            .header("x-api-key", "test-key")
-            .send()
-            .await
-            .unwrap();
+        let mut keyed = client_request(Method::GET, "/", "");
+        keyed
+            .headers_mut()
+            .insert("x-api-key", HeaderValue::from_static("test-key"));
+        let with_key = send_to_proxy(router, keyed).await;
         assert_eq!(
             with_key.status().as_u16(),
             503,
@@ -14554,16 +14561,7 @@ mod tests {
                 })
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind echo upstream");
-        let addr = listener.local_addr().expect("echo upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), hits)
+        (stub::http(upstream).url(), hits)
     }
 
     /// Drive the proxy router with a peer we control, as `mitm::serve_http` would,
@@ -14856,18 +14854,13 @@ mod tests {
         }
 
         let seen = Seen::default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = listener.local_addr().unwrap();
-        let fake = Router::new()
-            .route("/api/oauth/profile", get(profile))
-            .route("/v1/messages", post(messages))
-            .route("/api/claude_cli/bootstrap", get(bootstrap))
-            .with_state(seen.clone());
-        tokio::spawn(async move {
-            axum::serve(listener, fake)
-                .await
-                .log_debug("serving a test server");
-        });
+        let up_addr = stub::http(
+            Router::new()
+                .route("/api/oauth/profile", get(profile))
+                .route("/v1/messages", post(messages))
+                .route("/api/claude_cli/bootstrap", get(bootstrap))
+                .with_state(seen.clone()),
+        );
 
         let manager_with = |mode: crate::config::ControlIdentityMode| {
             let mut config = dummy_config(None, &format!("http://{up_addr}"));
@@ -15727,16 +15720,7 @@ mod tests {
                 ([(CONTENT_TYPE, "application/json")], body)
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind advisor upstream");
-        let addr = listener.local_addr().expect("advisor upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), hits, seen)
+        (stub::http(upstream).url(), hits, seen)
     }
 
     /// Two accounts over `upstream`, `disabled` applied by position.
@@ -16222,16 +16206,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind upstream");
-        let addr = listener.local_addr().expect("upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
-        (format!("http://{addr}"), hits_first, hits_other)
+        (stub::http(upstream).url(), hits_first, hits_other)
     }
 
     /// `/v1/messages` with NO `SessionKey` extension, so the request has no session key: the
@@ -16675,15 +16650,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind upstream");
-        let addr = listener.local_addr().expect("upstream addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(upstream);
         let manager =
             Manager::with_live_refresher(two_orgs_over(&format!("http://{addr}"), false), None);
         manager.record_bound_tokens(
@@ -17227,23 +17194,7 @@ mod tests {
         }
 
         // A canned upstream that answers every connection with a bare 401.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(raw_401());
 
         // No proxy api-key configured → the keyless test request is accepted.
         let manager = Manager::new(
@@ -17254,22 +17205,13 @@ mod tests {
             None,
         );
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", "{}"),
+            )
+            .await,
+        );
 
         assert_eq!(
             manager.account_status(0),
@@ -17299,23 +17241,7 @@ mod tests {
             }
         }
 
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(raw_401());
 
         let mut config = dummy_config(None, &format!("http://{up_addr}"));
         config.accounts[0].refresh_token = None;
@@ -17327,22 +17253,13 @@ mod tests {
             None,
         );
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", "{}"),
+            )
+            .await,
+        );
 
         assert_eq!(
             manager.account_status(0),
@@ -17384,23 +17301,7 @@ mod tests {
         }
 
         // A canned upstream that answers every connection with a bare 401.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",).await.log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(raw_401());
 
         let manager = Manager::new(
             dummy_config(None, &format!("http://{up_addr}")),
@@ -17410,22 +17311,13 @@ mod tests {
             None,
         );
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", "{}"),
+            )
+            .await,
+        );
 
         assert_eq!(
             manager.account_status(0),
@@ -17462,57 +17354,21 @@ mod tests {
     /// `_ => {}` and nothing was recorded.
     #[tokio::test]
     async fn sse_error_event_is_observed_not_counted_as_clean_serve() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: error\n",
-                        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        let up_addr = stub::canned(stub::reply("200 OK", "text/event-stream", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         // Read the body to completion FIRST — the client can see EOF before the
         // detached tee task has finished parsing (see `poll_stream_error_count`).
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -17577,45 +17433,13 @@ mod tests {
     /// point in the request, including the buffered-arm log call in `handle`.
     #[tokio::test]
     async fn buffered_request_logs_usage_line_with_real_token_counts() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(body)
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = r#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
+        let up_addr = stub::canned(stub::reply("200 OK", "application/json", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
         let sink = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
@@ -17624,15 +17448,9 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = sink.contents();
         assert!(
@@ -17660,45 +17478,13 @@ mod tests {
     /// own greppable fields.
     #[tokio::test]
     async fn buffered_request_logs_upstream_error_type_and_message_on_non_2xx() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: unexpected field wombat"}}"#;
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(body)
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: unexpected field wombat"}}"#;
+        let up_addr = stub::canned(stub::reply("400 Bad Request", "application/json", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
         let sink = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
@@ -17707,15 +17493,9 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 400);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = sink.contents();
         assert!(
@@ -17735,42 +17515,15 @@ mod tests {
 
     /// A fake upstream that reads the request, waits [`HEADER_DELAY_MS`], then
     /// writes `response` (status line, headers and body) and closes.
-    async fn spawn_header_delayed_upstream(response: String) -> SocketAddr {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                let response = response.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 4096];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    tokio::time::sleep(Duration::from_millis(HEADER_DELAY_MS)).await;
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
-        up_addr
+    async fn spawn_header_delayed_upstream(response: String) -> StubAddr {
+        stub::delayed(response, Duration::from_millis(HEADER_DELAY_MS))
     }
 
-    /// Serves `manager` on a fresh loopback port, as the usage-line tests above do.
-    async fn serve_on_loopback(manager: &Arc<Manager>) -> SocketAddr {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-        proxy_addr
+    /// Sends one `method path` (a `{}` body on a POST) to `manager`'s router, as the usage-line
+    /// tests above do, in-process.
+    async fn send_one(manager: &Arc<Manager>, method: Method, path: &str) -> Response {
+        let body = if method == Method::POST { "{}" } else { "" };
+        send_to_proxy(app(Arc::clone(manager)), client_request(method, path, body)).await
     }
 
     /// Every line of `log` whose message is `message`.
@@ -17841,25 +17594,16 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
-        let up_addr = spawn_header_delayed_upstream(format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
+        let up_addr =
+            spawn_header_delayed_upstream(stub::reply("200 OK", "text/event-stream", body)).await;
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
-        let proxy_addr = serve_on_loopback(&manager).await;
+        let proxy = app(Arc::clone(&manager));
         let (sink, _guard) = debug_sink();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = wait_for_line(&sink, "request usage").await;
         let usage = lines_with(&log, "request usage");
@@ -17914,25 +17658,16 @@ mod tests {
     #[tokio::test]
     async fn buffered_request_usage_line_carries_timing() {
         let body = r#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
-        let up_addr = spawn_header_delayed_upstream(format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
+        let up_addr =
+            spawn_header_delayed_upstream(stub::reply("200 OK", "application/json", body)).await;
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
-        let proxy_addr = serve_on_loopback(&manager).await;
+        let proxy = app(Arc::clone(&manager));
         let (sink, _guard) = debug_sink();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = sink.contents();
         let usage = lines_with(&log, "request usage");
@@ -17983,27 +17718,17 @@ mod tests {
             ("text/event-stream", stream_body),
             ("application/json", buffered_body),
         ] {
-            let up_addr = spawn_header_delayed_upstream(format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            ))
-            .await;
+            let up_addr =
+                spawn_header_delayed_upstream(stub::reply("200 OK", content_type, body)).await;
             let manager = Manager::with_live_refresher(
                 dummy_config(None, &format!("http://{up_addr}")),
                 None,
             );
-            let proxy_addr = serve_on_loopback(&manager).await;
             let (sink, _guard) = info_sink();
 
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let resp = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
+            let resp = send_one(&manager, Method::POST, "/v1/messages").await;
             assert_eq!(resp.status().as_u16(), 200);
-            let _ = resp.bytes().await.unwrap();
+            let _ = body_text(resp).await;
 
             let log = wait_for_line(&sink, "request usage").await;
             let info = info_lines(&log);
@@ -18045,25 +17770,21 @@ mod tests {
                 true,
             ),
         ] {
-            let up_addr = spawn_header_delayed_upstream(format!(
-                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            ))
-            .await;
+            let up_addr =
+                spawn_header_delayed_upstream(stub::reply(status_line, "application/json", body))
+                    .await;
             let manager = Manager::with_live_refresher(
                 dummy_config(None, &format!("http://{up_addr}")),
                 None,
             );
-            let proxy_addr = serve_on_loopback(&manager).await;
             let (sink, _guard) = info_sink();
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let request = if path == "/v1/messages" {
-                client.post(format!("http://{proxy_addr}{path}")).body("{}")
+            let method = if path == "/v1/messages" {
+                Method::POST
             } else {
-                client.get(format!("http://{proxy_addr}{path}"))
+                Method::GET
             };
-            let resp = request.send().await.unwrap();
-            let _ = resp.bytes().await.unwrap();
+            let resp = send_one(&manager, method, path).await;
+            let _ = body_text(resp).await;
             // The relayed body logs its timing on drop; give that a moment to land.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let log = sink.contents();
@@ -18082,32 +17803,22 @@ mod tests {
     #[tokio::test]
     async fn request_without_usage_logs_timing_at_debug_only() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#;
-        let response = format!(
-            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
+        let response = stub::reply("400 Bad Request", "application/json", body);
         for level in [tracing::Level::DEBUG, tracing::Level::INFO] {
             let up_addr = spawn_header_delayed_upstream(response.clone()).await;
             let manager = Manager::with_live_refresher(
                 dummy_config(None, &format!("http://{up_addr}")),
                 None,
             );
-            let proxy_addr = serve_on_loopback(&manager).await;
             let (sink, _guard) = if level == tracing::Level::DEBUG {
                 debug_sink()
             } else {
                 info_sink()
             };
 
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let resp = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
+            let resp = send_one(&manager, Method::POST, "/v1/messages").await;
             assert_eq!(resp.status().as_u16(), 400);
-            let _ = resp.bytes().await.unwrap();
+            let _ = body_text(resp).await;
 
             let log = sink.contents();
             let timing = lines_with(&log, "request timing");
@@ -18132,35 +17843,14 @@ mod tests {
     /// counts), with `total_ms` at the walk-away rather than never.
     #[tokio::test]
     async fn abandoned_stream_reports_completed_false() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let event = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                    );
-                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
-                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
-                    sock.write_all(headers.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(chunk.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                });
-            }
-        });
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+        );
+        let up_addr = stub::stalled(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+            event.len()
+        ));
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
         let (sink, _guard) = info_sink();
@@ -18199,24 +17889,15 @@ mod tests {
     #[tokio::test]
     async fn relayed_request_logs_relay_timing_at_debug() {
         let body = "{}";
-        let up_addr = spawn_header_delayed_upstream(format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
+        let up_addr =
+            spawn_header_delayed_upstream(stub::reply("200 OK", "application/json", body)).await;
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
-        let proxy_addr = serve_on_loopback(&manager).await;
         let (sink, _guard) = debug_sink();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .get(format!("http://{proxy_addr}/v1/code/sessions"))
-            .send()
-            .await
-            .unwrap();
+        let resp = send_one(&manager, Method::GET, "/v1/code/sessions").await;
         assert_eq!(resp.status().as_u16(), 200);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let log = wait_for_line(&sink, "relay timing").await;
         let relay = lines_with(&log, "relay timing");
@@ -18316,57 +17997,21 @@ mod tests {
     /// assert the truncation IS detected.
     #[tokio::test]
     async fn sse_stream_without_message_stop_is_recorded_as_truncated() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                        "event: message_delta\n",
-                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+        );
+        let up_addr = stub::canned(stub::reply("200 OK", "text/event-stream", body));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        let _ = resp.bytes().await.unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -18395,59 +18040,26 @@ mod tests {
     /// terminator rather than on the mere absence of an in-band `error` event.
     #[tokio::test]
     async fn sse_stream_with_message_stop_records_no_stream_error() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                        "event: message_delta\n",
-                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
-                        "event: message_stop\n",
-                        "data: {\"type\":\"message_stop\"}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(stub::reply(
+            "200 OK",
+            "text/event-stream",
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        let _ = resp.bytes().await.unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
+        let _ = body_text(resp).await;
 
         // Poll for the USAGE to land (a positive, waitable signal that the tee
         // task has finished), then assert the error count is absent — never a
@@ -18491,42 +18103,21 @@ mod tests {
     /// erased real evidence of the account being `overloaded_error`.
     #[tokio::test]
     async fn client_abort_mid_stream_records_no_stream_error() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let event = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                    );
-                    // Chunked, not content-length: a real Messages turn's
-                    // length isn't known up front. One chunk, then HANG —
-                    // never a terminating "0\r\n\r\n" chunk, never a close.
-                    // If the client does not abandon this connection, this
-                    // handler simply blocks forever and the test times out —
-                    // which is the point: nothing here ever produces
-                    // `message_stop` or EOF on its own.
-                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
-                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
-                    sock.write_all(headers.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(chunk.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                });
-            }
-        });
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+        );
+        // Chunked, not content-length: a real Messages turn's
+        // length isn't known up front. One chunk, then HANG —
+        // never a terminating "0\r\n\r\n" chunk, never a close.
+        // If the client does not abandon this connection, this
+        // handler simply blocks forever and the test times out —
+        // which is the point: nothing here ever produces
+        // `message_stop` or EOF on its own.
+        let up_addr = stub::stalled(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+            event.len()
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
@@ -18534,24 +18125,12 @@ mod tests {
         // overwrite-on-abandonment bug would clobber this.
         manager.record_stream_error(0, "overloaded_error");
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
         tokio::time::timeout(Duration::from_secs(10), async {
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let resp = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
-            let mut body = resp.bytes_stream();
+            let resp =
+                send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
+            let mut body = resp.into_body().into_data_stream();
             // Read the ONE chunk the fake upstream ever sends, proving the
             // tee actually started, THEN abandon — mirrors a client that
             // received partial output before the user hit Esc.
@@ -18609,56 +18188,23 @@ mod tests {
     /// — not the message_start gate above — is what suppresses it here.
     #[tokio::test]
     async fn non_2xx_sse_body_records_no_stream_error() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: message_start\n",
-                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(stub::reply(
+            "400 Bad Request",
+            "text/event-stream",
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            ),
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         // record_served fires on the terminal outcome regardless of status
         // (same as the in-band-error test above) — a waitable positive
@@ -18699,51 +18245,21 @@ mod tests {
     /// the account looked perfectly healthy.
     #[tokio::test]
     async fn sse_stream_severed_before_message_start_is_recorded_as_truncated_e2e() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    // Headers claim an SSE body, then the connection closes
-                    // having sent NOT ONE byte of it — severed before the
-                    // stream could ever produce its first parseable event.
-                    let response = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        // Headers claim an SSE body, then the connection closes
+        // having sent NOT ONE byte of it — severed before the
+        // stream could ever produce its first parseable event.
+        let up_addr = stub::canned(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        );
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -18771,56 +18287,23 @@ mod tests {
     /// case.
     #[tokio::test]
     async fn in_band_error_on_non_2xx_is_recorded_regardless_of_status() {
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = concat!(
-                        "event: error\n",
-                        "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n",
-                    );
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let up_addr = stub::canned(stub::reply(
+            "400 Bad Request",
+            "text/event-stream",
+            concat!(
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n",
+            ),
+        ));
 
         let manager =
             Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
 
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = Arc::clone(&manager);
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
+        let proxy = app(Arc::clone(&manager));
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(proxy, client_request(Method::POST, "/v1/messages", "{}")).await;
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-        let _ = resp.bytes().await.unwrap();
+        let _ = body_text(resp).await;
 
         let (seen, polls) = poll_stream_error_count(&manager, 1).await;
         assert_eq!(
@@ -18868,19 +18351,16 @@ mod tests {
 
         // Echo upstream: capture the full forwarded request (headers + Content-Length
         // body), then answer 200.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let cap = captured.clone();
-        tokio::spawn(async move {
-            if let Ok((mut sock, _)) = upstream.accept().await {
-                let mut buf = Vec::new();
+        let up_addr = stub::raw(move |conn| {
+            let cap = cap.clone();
+            async move {
+                let mut sock = conn.stream;
+                // What the shared listener already read to route the request.
+                let mut buf = conn.head;
                 let mut tmp = [0u8; 4096];
                 loop {
-                    match sock.read(&mut tmp).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                    }
                     if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         let headers = String::from_utf8_lossy(&buf[..h]).to_lowercase();
                         let cl = headers
@@ -18891,6 +18371,10 @@ mod tests {
                         if buf.len() >= h + 4 + cl {
                             break;
                         }
+                    }
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
                     }
                 }
                 *cap.lock().await = buf;
@@ -18911,31 +18395,22 @@ mod tests {
             Arc::new(crate::warmer::LiveWarmer::new()),
             None,
         );
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        let served = manager.clone();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(served))
-                .await
-                .log_debug("serving a test server");
-        });
-
         let inner = format!(r#"{{"account_uuid":"{CLIENT_UUID}","subscriptionType":"pro"}}"#);
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "model": "claude-x",
             "metadata": { "user_id": inner },
             "messages": [],
-        }))
-        .unwrap();
+        })
+        .to_string();
         let sent_len = body.len();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let _ = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap();
+        drop(
+            send_to_proxy(
+                app(manager.clone()),
+                client_request(Method::POST, "/v1/messages", body),
+            )
+            .await,
+        );
 
         let received = captured.lock().await.clone();
         assert!(
@@ -18973,8 +18448,6 @@ mod tests {
     /// connection — `app()` alone injects none, so without it affinity is inert.
     #[tokio::test]
     async fn same_user_id_pins_one_account_and_surfaces_cache_read() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
             fn refresh(
@@ -18989,32 +18462,8 @@ mod tests {
         // Fake upstream: every connection gets a 200 whose JSON `usage` carries a
         // non-zero `cache_read_input_tokens` (a warm-cache turn). Loops so BOTH
         // forwarded requests are answered.
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let up_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = upstream.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    let body = br#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":20}}"#;
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    sock.write_all(head.as_bytes())
-                        .await
-                        .log_debug("writing a test response");
-                    sock.write_all(body)
-                        .await
-                        .log_debug("writing a test response");
-                });
-            }
-        });
+        let body = r#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":20}}"#;
+        let up_addr = stub::canned(stub::reply("200 OK", "application/json", body));
 
         // A 2-account fleet pointed at the one fake upstream.
         let mut config = dummy_config(None, &format!("http://{up_addr}"));
@@ -19050,29 +18499,21 @@ mod tests {
                 }
             },
         ));
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, affinity_app)
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "model": "claude-x",
             "metadata": { "user_id": "cache-affinity-user" },
             "messages": [],
-        }))
-        .unwrap();
+        })
+        .to_string();
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         for _ in 0..2 {
-            let _ = client
-                .post(format!("http://{proxy_addr}/v1/messages"))
-                .body(body.clone())
-                .send()
-                .await
-                .unwrap();
+            drop(
+                send_to_proxy(
+                    affinity_app.clone(),
+                    client_request(Method::POST, "/v1/messages", body.clone()),
+                )
+                .await,
+            );
         }
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -19110,61 +18551,28 @@ mod tests {
     /// Connections past the end of the script reuse the last entry. Every scripted
     /// reply must send `connection: close` so the client pool cannot reuse a socket
     /// and attempt N is always connection N.
-    async fn spawn_scripted_upstream(script: Vec<Option<String>>) -> SocketAddr {
-        spawn_counted_upstream(script).await.0
+    ///
+    /// A route on the binary's shared raw listener ([`stub::scripted`]), not a port of its own.
+    async fn spawn_scripted_upstream(script: Vec<Option<String>>) -> StubAddr {
+        stub::scripted(script).0
     }
 
-    /// [`spawn_scripted_upstream`] plus a live count of accepted connections —
+    /// [`spawn_scripted_upstream`] plus a live count of the connections it was handed —
     /// i.e. of upstream ATTEMPTS. Retries are invisible in the account stats (only
     /// the terminal outcome is recorded), so a test that must pin the exact number
     /// of sends reads it here instead of inferring it from the client's status.
     async fn spawn_counted_upstream(
         script: Vec<Option<String>>,
-    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = attempts.clone();
-        tokio::spawn(async move {
-            let mut n = 0usize;
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                // Ordinal is assigned in ACCEPT order, before the per-connection task
-                // is spawned, so it cannot race with a concurrent handler.
-                let reply = script.get(n).or_else(|| script.last()).cloned().flatten();
-                n += 1;
-                counter.store(n, std::sync::atomic::Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    sock.read(&mut buf)
-                        .await
-                        .log_debug("reading a test request");
-                    match reply {
-                        Some(raw) => {
-                            sock.write_all(raw.as_bytes())
-                                .await
-                                .log_debug("writing a test response");
-                        }
-                        // Drop with no reply: "connection closed before message
-                        // completed" on the client side — a transport error.
-                        None => drop(sock),
-                    }
-                });
-            }
-        });
-        (addr, attempts)
+    ) -> (StubAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        stub::scripted(script)
     }
 
     /// A `200 OK` with a minimal JSON usage body.
     fn raw_200() -> String {
-        let body = br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            String::from_utf8_lossy(body)
+        stub::reply(
+            "200 OK",
+            "application/json",
+            r#"{"usage":{"input_tokens":1,"output_tokens":1}}"#,
         )
     }
 
@@ -19283,24 +18691,22 @@ mod tests {
     /// exists for. Carries NO `retry-after` (the live captures do not), so the
     /// backoff comes from the ladder alone and the test's timing is deterministic.
     fn raw_529() -> String {
-        let body =
-            br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
-        format!(
-            "HTTP/1.1 529 \r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            String::from_utf8_lossy(body)
+        stub::reply(
+            "529 ",
+            "application/json",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
         )
     }
 
     /// Boot an N-account fleet (all cloned from `dummy`) pointed at `upstream`.
-    fn fleet(upstream: SocketAddr, names: &[&str]) -> Arc<Manager> {
+    fn fleet(upstream: impl std::fmt::Display, names: &[&str]) -> Arc<Manager> {
         fleet_configured(upstream, names, |_| {})
     }
 
     /// [`fleet`] with a hook to edit the config before the manager boots — for a
     /// test that needs an unmodelled top-level key (`revalidationServe`) set.
     fn fleet_configured(
-        upstream: SocketAddr,
+        upstream: impl std::fmt::Display,
         names: &[&str],
         configure: impl FnOnce(&mut Config),
     ) -> Arc<Manager> {
@@ -19334,71 +18740,35 @@ mod tests {
     /// [`post_one`] plus the client-visible BODY — for asserting that a status the
     /// proxy gives up on is forwarded verbatim, not replaced by a synthesized one.
     async fn post_one_with_body(manager: Arc<Manager>) -> (u16, String) {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
-            .unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        (status, resp.text().await.unwrap())
+        let (status, _, body) = post_one_full(manager).await;
+        (status, body)
     }
 
     /// [`post_one_with_body`] plus the response HEADERS — for asserting what a
     /// synthesized 429 tells a client that reads headers, not only its body.
     async fn post_one_full(manager: Arc<Manager>) -> (u16, HeaderMap, String) {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
-            .unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap();
+        let body = serde_json::json!({ "model": "claude-x", "messages": [] }).to_string();
+        let resp = send_to_proxy(
+            app(manager),
+            client_request(Method::POST, "/v1/messages", body),
+        )
+        .await;
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
-        (status, headers, resp.text().await.unwrap())
+        (status, headers, body_text(resp).await)
     }
 
-    /// Serve `manager` on a fresh loopback listener and POST one `/v1/messages`,
-    /// returning the client-visible status.
+    /// POST one `/v1/messages` naming `model` to `manager`'s router, returning the
+    /// client-visible status.
     async fn post_model(manager: Arc<Manager>, model: &str) -> u16 {
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-        let body =
-            serde_json::to_vec(&serde_json::json!({ "model": model, "messages": [] })).unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .as_u16()
+        let body = serde_json::json!({ "model": model, "messages": [] }).to_string();
+        send_to_proxy(
+            app(manager),
+            client_request(Method::POST, "/v1/messages", body),
+        )
+        .await
+        .status()
+        .as_u16()
     }
 
     async fn post_one(manager: Arc<Manager>) -> u16 {
@@ -19414,7 +18784,7 @@ mod tests {
     /// request must carry a stable identity for [`stable_session_key`] to hash —
     /// hence `metadata.user_id` in the body. The pin lives in the MANAGER, so two
     /// calls with the same `user_id` are two requests of ONE session even though each
-    /// call serves the app on a fresh listener.
+    /// call drives a fresh router.
     async fn post_one_pinned(manager: Arc<Manager>, user_id: &str) -> u16 {
         let affinity_app = app(manager).layer(axum::middleware::from_fn(
             move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -19425,28 +18795,19 @@ mod tests {
                 next.run(req).await
             },
         ));
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy, affinity_app)
-                .await
-                .log_debug("serving a test server");
-        });
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "model": "claude-x",
             "metadata": { "user_id": user_id },
             "messages": [],
-        }))
-        .unwrap();
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        client
-            .post(format!("http://{proxy_addr}/v1/messages"))
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .as_u16()
+        })
+        .to_string();
+        send_to_proxy(
+            affinity_app,
+            client_request(Method::POST, "/v1/messages", body),
+        )
+        .await
+        .status()
+        .as_u16()
     }
 
     /// The every-account-scoped header block the upstream in these tests sends, by
@@ -19865,11 +19226,10 @@ mod tests {
     /// header) and upstream's own error body. A direct API client draws this shape
     /// on `/v1/messages` without `?beta=true`.
     fn raw_429_no_guidance() -> String {
-        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"upstream-own-words"}}"#;
-        format!(
-            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
+        stub::reply(
+            "429 Too Many Requests",
+            "application/json",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"upstream-own-words"}}"#,
         )
     }
 
@@ -21596,20 +20956,14 @@ mod tests {
     async fn an_unresolvable_upstream_answers_503_with_retry_after_not_502() {
         let manager =
             Manager::with_live_refresher(dummy_config(None, "http://offline-probe.invalid"), None);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app(manager))
-                .await
-                .log_debug("serving a test server");
-        });
-
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/messages"))
-            .json(&serde_json::json!({"model": "claude-3-5-sonnet", "messages": []}))
-            .send()
-            .await
-            .expect("the proxy itself is reachable");
+        let resp = send_to_proxy(
+            app(manager),
+            client_json(
+                "/v1/messages",
+                &serde_json::json!({"model": "claude-3-5-sonnet", "messages": []}),
+            ),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -21696,22 +21050,9 @@ mod tests {
     /// decided here.
     #[tokio::test]
     async fn a_relay_dropped_after_connect_still_answers_502() {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                // Read the request so it has provably left the client, then
-                // hang up without answering.
-                let mut buf = [0u8; 1024];
-                if sock.read(&mut buf).await.is_err() {
-                    continue;
-                }
-                drop(sock);
-            }
-        });
+        // Read the request so it has provably left the client, then hang up
+        // without answering.
+        let addr = spawn_scripted_upstream(vec![None]).await;
 
         let resp = relay_to(&format!("http://{addr}")).await;
         assert_eq!(
@@ -21738,6 +21079,17 @@ mod tests {
         );
     }
 
+    /// A manager over a DEAD upstream (127.0.0.1:1, reliably connection-refused) and
+    /// no proxy key: what [`spawn_dead_upstream_proxy`] serves.
+    fn dead_upstream_manager() -> Arc<Manager> {
+        let config = dummy_config(None, "http://127.0.0.1:1");
+        assert_eq!(
+            config.codex_upstream, "http://127.0.0.1:0",
+            "an unspecified test origin must fail closed"
+        );
+        Manager::with_live_refresher(config, None)
+    }
+
     /// Boot the proxy over a fresh loopback listener with a DEAD upstream
     /// (127.0.0.1:1, reliably connection-refused) and no proxy key, returning its
     /// address. A request the host guard lets THROUGH reaches the rotation loop
@@ -21745,13 +21097,12 @@ mod tests {
     /// failure — see [`bad_gateway`] — so it is the safe-to-retry shape, not a
     /// 502); a request the guard REJECTS returns its local status (421) with no
     /// egress. The 421-vs-503 split is what proves whether the guard fired.
+    ///
+    /// Keeps a real listener on purpose: these tests write the request line byte for
+    /// byte, and what they prove is that hyper's own request-line parser hands the
+    /// guard the shapes they name.
     async fn spawn_dead_upstream_proxy() -> SocketAddr {
-        let config = dummy_config(None, "http://127.0.0.1:1");
-        assert_eq!(
-            config.codex_upstream, "http://127.0.0.1:0",
-            "an unspecified test origin must fail closed"
-        );
-        let manager = Manager::with_live_refresher(config, None);
+        let manager = dead_upstream_manager();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -21840,14 +21191,11 @@ mod tests {
     /// Anthropic traffic.
     #[tokio::test]
     async fn base_url_loopback_proceeds_not_rejected_503() {
-        let addr = spawn_dead_upstream_proxy().await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let resp = client
-            .post(format!("http://{addr}/v1/messages"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
+        let resp = send_to_proxy(
+            app(dead_upstream_manager()),
+            client_request(Method::POST, "/v1/messages", "{}"),
+        )
+        .await;
         assert_eq!(
             resp.status().as_u16(),
             503,
@@ -22197,17 +21545,8 @@ mod tests {
                     ([(CONTENT_TYPE, "application/json")], "{}")
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind capturing upstream");
-            let addr = listener.local_addr().expect("capturing upstream addr");
-            tokio::spawn(async move {
-                axum::serve(listener, upstream)
-                    .await
-                    .log_debug("serving a test server");
-            });
             Self {
-                url: format!("http://{addr}"),
+                url: stub::http(upstream).url(),
                 seen,
             }
         }
@@ -23039,16 +22378,7 @@ mod tests {
     async fn spawn_fixed_origin(content_type: &'static str, body: &'static str) -> String {
         let origin =
             Router::new().fallback(move || async move { ([(CONTENT_TYPE, content_type)], body) });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fixed origin");
-        let addr = listener.local_addr().expect("fixed origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
-        format!("http://{addr}")
+        stub::http(origin).url()
     }
 
     /// **A streamed turn is filed under the model its REQUEST named, and a Codex turn whose
@@ -23396,15 +22726,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         (format!("http://{addr}"), refused, served)
     }
 
@@ -23579,15 +22901,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         (format!("http://{addr}"), refused, served)
     }
 
@@ -23830,9 +23144,7 @@ mod tests {
                 }
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let base = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet_with_carol(&anthropic.url, &base), None);
         let started = tokio::time::Instant::now();
@@ -23882,18 +23194,7 @@ mod tests {
                     .expect("200 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let codex_url = format!(
-            "http://{}",
-            listener.local_addr().expect("Codex origin addr")
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let codex_url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet(&anthropic_echo.url, &codex_url), None);
 
@@ -23970,18 +23271,7 @@ mod tests {
                     .expect("Codex response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let codex_url = format!(
-            "http://{}",
-            listener.local_addr().expect("Codex origin addr")
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let codex_url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
         let header = |response: &Response, name: &str| {
@@ -24083,18 +23373,7 @@ mod tests {
                 response.body(Body::from("{}")).expect("Codex response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let codex_url = format!(
-            "http://{}",
-            listener.local_addr().expect("Codex origin addr")
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let codex_url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &codex_url), None);
 
@@ -25246,15 +24525,7 @@ mod tests {
             }
             response.body(Body::from(body)).expect("403 response")
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         let anthropic_echo = CapturingUpstream::spawn().await;
         let manager = Manager::with_live_refresher(
             codex_fleet(&anthropic_echo.url, &format!("http://{addr}")),
@@ -25340,9 +24611,7 @@ mod tests {
             Response::builder().header(CONTENT_TYPE, "text/event-stream")
                 .body(Body::from("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n")).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let upstream = stub::http(origin).url();
         let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
         config.accounts[1].priority = Some(0);
         config.accounts[2].priority = Some(1);
@@ -25371,7 +24640,6 @@ mod tests {
             ms_field(line, "first_byte_ms") >= HEADER_DELAY_MS,
             "first byte must come from the served stream, not the rejected body: {line}"
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -25397,9 +24665,7 @@ mod tests {
                     } else { Response::new(Body::from("{}")) }
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let upstream = stub::http(origin).url();
             let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
             config.accounts[1].priority = Some(0);
             config.accounts[2].priority = Some(1);
@@ -25432,7 +24698,6 @@ mod tests {
             assert_eq!(snapshot.accounts[1].gate, GateReason::Ok);
             assert_eq!(snapshot.accounts[1].codex.login_error, None);
             assert_eq!(snapshot.accounts[1].rate_limited_until, None);
-            server.abort();
         }
     }
 
@@ -25453,9 +24718,7 @@ mod tests {
                     Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(Body::from(body)).unwrap()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let upstream = stub::http(origin).url();
             let mut config = codex_fleet_with_carol("http://127.0.0.1:0", &upstream);
             config.accounts[1].priority = Some(0);
             config.accounts[2].priority = Some(1);
@@ -25499,7 +24762,6 @@ mod tests {
                 manager.snapshot(OffsetDateTime::now_utc()).accounts[1].gate,
                 GateReason::Ok
             );
-            server.abort();
         }
     }
 
@@ -25514,9 +24776,7 @@ mod tests {
                 .body(Body::from(body))
                 .unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let upstream = stub::http(origin).url();
         let manager = Manager::with_live_refresher(
             codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
             None,
@@ -25537,7 +24797,6 @@ mod tests {
                 .iter()
                 .all(|row| row.gate == GateReason::Ok)
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -25577,9 +24836,7 @@ mod tests {
                         .unwrap()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let upstream = stub::http(origin).url();
             let manager = Manager::with_live_refresher(
                 codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
                 None,
@@ -25601,7 +24858,6 @@ mod tests {
             );
             assert_ne!(row.gate, GateReason::Refused);
             assert_eq!(row.codex.login_error, None);
-            server.abort();
         }
     }
 
@@ -25616,9 +24872,7 @@ mod tests {
             Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
                 .body(Body::from(body)).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let upstream = stub::http(origin).url();
         let manager = Manager::with_live_refresher(
             codex_fleet_with_carol("http://127.0.0.1:0", &upstream),
             None,
@@ -25634,7 +24888,6 @@ mod tests {
             message.contains("tcr login --codex --account bob@example.com"),
             "{message}"
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -25652,9 +24905,7 @@ mod tests {
                 } else { Response::new(Body::from("{}")) }
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet_with_carol("http://127.0.0.1:9", &url), None);
         assert_eq!(send_codex_turn(&manager).await.status(), StatusCode::OK);
@@ -25662,7 +24913,6 @@ mod tests {
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         assert_eq!(snap.accounts[blocked].codex.login_error, None);
         assert_eq!(snap.accounts[blocked].gate, GateReason::Refused);
-        server.abort();
     }
 
     #[test]
@@ -25689,9 +24939,7 @@ mod tests {
             Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let manager =
             Manager::with_live_refresher(codex_fleet_with_carol("http://127.0.0.1:9", &url), None);
         for attempt in 0..2 {
@@ -25718,7 +24966,6 @@ mod tests {
             assert_eq!(account.gate, GateReason::Refused);
             assert_eq!(account.codex.login_error, None);
         }
-        server.abort();
     }
 
     #[tokio::test]
@@ -25740,9 +24987,7 @@ mod tests {
                         .unwrap()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+            let url = stub::http(origin).url();
             let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
             config.accounts[2].disabled = Some(true);
             let manager = Manager::with_live_refresher(config, None);
@@ -25798,7 +25043,6 @@ mod tests {
                 1,
                 "requests during the refusal hold never reach the origin"
             );
-            server.abort();
         }
     }
 
@@ -25808,9 +25052,7 @@ mod tests {
             Response::builder().status(StatusCode::FORBIDDEN).header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"error":{"code":"workspace_deactivated","message":"Workspace deactivated"}}"#)).unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
         config.accounts[2].disabled = Some(true);
         let manager = Manager::with_live_refresher(config, None);
@@ -25840,7 +25082,6 @@ mod tests {
             assert_eq!(account.gate, GateReason::Refused);
             assert_eq!(account.codex.login_error, None);
         }
-        server.abort();
     }
 
     /// A Codex origin that refuses EVERY request with a 403, recording each bearer in order.
@@ -25869,15 +25110,7 @@ mod tests {
                     .expect("403 response")
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind Codex origin");
-        let addr = listener.local_addr().expect("Codex origin addr");
-        tokio::spawn(async move {
-            axum::serve(listener, origin)
-                .await
-                .log_debug("serving a test server");
-        });
+        let addr = stub::http(origin);
         (format!("http://{addr}"), refused)
     }
 
@@ -26039,10 +25272,7 @@ mod tests {
                             .body(Body::from(body)).unwrap()
                     }
                 });
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let url = format!("http://{}", listener.local_addr().unwrap());
-                let server =
-                    tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+                let url = stub::http(origin).url();
                 let manager = Manager::with_live_refresher(
                     codex_fleet_with_carol("http://127.0.0.1:9", &url),
                     None,
@@ -26125,7 +25355,6 @@ mod tests {
                         "{event}/{code} must move a pinned conversation"
                     );
                 }
-                server.abort();
             }
         }
     }
@@ -26244,9 +25473,7 @@ mod tests {
                 .body(Body::from(r#"{"error":{"type":"insufficient_quota"}}"#))
                 .unwrap()
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let manager = Manager::with_live_refresher(codex_fleet("http://127.0.0.1:9", &url), None);
         assert_eq!(
             send_codex_turn(&manager).await.status(),
@@ -26260,7 +25487,6 @@ mod tests {
             (1..=3600).contains(&remaining.whole_seconds()),
             "hold is {remaining}"
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -26346,9 +25572,7 @@ mod tests {
                 response.body(Body::from(reply)).unwrap()
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let mut config = codex_fleet("http://127.0.0.1:9", &url);
         config
             .extra
@@ -26384,7 +25608,6 @@ mod tests {
                 "{body}"
             );
         }
-        server.abort();
     }
 
     #[tokio::test]
@@ -26480,9 +25703,7 @@ mod tests {
                     .unwrap()
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = stub::http(origin).url();
         let mut config = codex_fleet_with_carol("http://127.0.0.1:9", &url);
         // Bob is refused first; Carol, refused second, has the earlier reset.
         config.accounts[1].priority = Some(0);
@@ -26507,6 +25728,5 @@ mod tests {
             (body["error"]["resets_at"].as_i64().unwrap() - earliest).abs() <= 2,
             "{body}"
         );
-        server.abort();
     }
 }
