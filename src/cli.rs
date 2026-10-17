@@ -1459,47 +1459,80 @@ fn group_route_block(config: &Config, group: &str, members: &[&str]) -> Option<&
     (!routes).then_some(ROUTE_BLOCK_CONTROL_ONLY)
 }
 
+/// One group as `tcr group ls` reports it. Both renderers read these rows, so
+/// the text line and the JSON object are computed once and cannot disagree.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupRow<'a> {
+    group: &'a str,
+    accounts: usize,
+    members: Vec<&'a str>,
+    reserved: bool,
+    parked: bool,
+    allows_control: bool,
+    routes: bool,
+    route_block: Option<&'static str>,
+    color: String,
+    color_source: &'static str,
+    /// Only when there is one, so a group with no Codex member, which is every
+    /// group of a fleet with no Codex account, carries no new key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_members: Option<usize>,
+}
+
+/// Every group's row, in name order, and the count of accounts in no group.
+fn group_rows(config: &Config) -> (Vec<GroupRow<'_>>, usize) {
+    let (groups, ungrouped) = group_membership(config);
+    let rows = groups
+        .into_iter()
+        .map(|(group, members)| {
+            let (color, source) = config.group_color(group);
+            let route_block = group_route_block(config, group, &members);
+            let codex_members = codex_member_count(config, &members);
+            GroupRow {
+                group,
+                accounts: members.len(),
+                reserved: config.is_group_reserved(group),
+                parked: config.is_group_parked(group),
+                allows_control: config.group_allows_control(group),
+                routes: route_block.is_none(),
+                route_block,
+                color,
+                color_source: source.as_str(),
+                codex_members: (codex_members > 0).then_some(codex_members),
+                members,
+            }
+        })
+        .collect();
+    (rows, ungrouped)
+}
+
 /// `tcr group ls` text: one greppable line per group, then `ungrouped`.
 fn render_groups_text(config: &Config) -> String {
     use std::fmt::Write as _;
-    let (groups, ungrouped) = group_membership(config);
-    let width = groups.keys().map(|g| g.len()).max().unwrap_or(0);
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let (rows, ungrouped) = group_rows(config);
+    let width = rows.iter().map(|r| r.group.len()).max().unwrap_or(0);
     let mut out = String::new();
-    for (group, members) in &groups {
-        let (color, source) = config.group_color(group);
-        let route_block = group_route_block(config, group, members);
-        let codex_members = codex_member_count(config, members);
+    for row in &rows {
         writeln!(
             out,
-            "group {group:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
-            members.len(),
-            members.join(","),
-            if codex_members > 0 {
-                format!(" codex_members={codex_members}")
-            } else {
-                String::new()
-            },
-            if config.is_group_reserved(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if config.is_group_parked(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if config.group_allows_control(group) {
-                "yes"
-            } else {
-                "no"
-            },
-            if route_block.is_none() { "yes" } else { "no" },
-            match route_block {
-                None => String::new(),
-                Some(block) => format!(" route_block={block}"),
-            },
-            source.as_str(),
+            "group {:width$} accounts={} members={}{} reserved={} parked={} allows_control={} routes={}{} color={} color_source={}",
+            row.group,
+            row.accounts,
+            row.members.join(","),
+            row.codex_members
+                .map(|n| format!(" codex_members={n}"))
+                .unwrap_or_default(),
+            yes_no(row.reserved),
+            yes_no(row.parked),
+            yes_no(row.allows_control),
+            yes_no(row.routes),
+            row.route_block
+                .map(|block| format!(" route_block={block}"))
+                .unwrap_or_default(),
+            row.color,
+            row.color_source,
         )
         .log_warn("rendering a group line");
     }
@@ -1510,37 +1543,10 @@ fn render_groups_text(config: &Config) -> String {
 /// `tcr group ls --json`: the structured equivalent of [`render_groups_text`]
 /// for the TcrBar panel.
 fn render_groups_json(config: &Config) -> anyhow::Result<String> {
-    let (groups, ungrouped) = group_membership(config);
-    let rows: Vec<serde_json::Value> = groups
-        .iter()
-        .map(|(group, members)| {
-            let (color, source) = config.group_color(group);
-            let route_block = group_route_block(config, group, members);
-            let mut row = serde_json::json!({
-                "group": group,
-                "accounts": members.len(),
-                "members": members,
-                "reserved": config.is_group_reserved(group),
-                "parked": config.is_group_parked(group),
-                "allowsControl": config.group_allows_control(group),
-                "routes": route_block.is_none(),
-                "routeBlock": match route_block {
-                    None => serde_json::Value::Null,
-                    Some(block) => serde_json::Value::String(block.to_string()),
-                },
-                "color": color,
-                "colorSource": source.as_str(),
-            });
-            // Only when there is one, so a group with no Codex member, which is
-            // every group of a fleet with no Codex account, carries no new key.
-            let codex_members = codex_member_count(config, members);
-            if codex_members > 0 {
-                row["codexMembers"] = serde_json::json!(codex_members);
-            }
-            row
-        })
-        .collect();
-    let out = serde_json::json!({ "groups": rows, "ungrouped": ungrouped });
+    let (rows, ungrouped) = group_rows(config);
+    // Through `Value`, so the keys come out in the order the JSON map keeps
+    // them, as they always have, rather than in field order.
+    let out = serde_json::json!({ "groups": serde_json::to_value(&rows)?, "ungrouped": ungrouped });
     Ok(serde_json::to_string_pretty(&out)?)
 }
 

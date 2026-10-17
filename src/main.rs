@@ -42,6 +42,22 @@ struct Cli {
     server: ServerArgs,
 }
 
+/// `--config` on every verb that takes it with the stock help line, resolved
+/// in one place.
+#[derive(clap::Args, Clone, Debug)]
+struct ConfigFile {
+    /// Path to the config file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+impl ConfigFile {
+    /// The path given, or the default config path.
+    fn path(&self) -> PathBuf {
+        self.config.clone().unwrap_or_else(config::default_path)
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the proxy server (the default when no subcommand is given).
@@ -184,9 +200,8 @@ struct SetupSettingsArgs {
     /// Replace an ANTHROPIC_BASE_URL that points somewhere else.
     #[arg(long, conflicts_with = "remove")]
     force: bool,
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
 }
 
 #[derive(clap::Args)]
@@ -197,9 +212,8 @@ struct SetupStatusArgs {
     /// The shell to check: zsh, bash or fish (default: $SHELL).
     #[arg(long, value_parser = parse_shell)]
     shell: Option<tcr::setup::Shell>,
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
 }
 
 /// `tcr peer …`, the argument shape for the LAN peer mesh.
@@ -227,6 +241,24 @@ mod peer_cli {
     use std::path::PathBuf;
 
     use clap::Subcommand;
+
+    /// `--peers` on every peer verb that takes it with the stock help line,
+    /// resolved in one place.
+    #[derive(clap::Args, Clone, Debug)]
+    pub struct PeersFile {
+        /// Path to the peers file (default: ~/.config/tcr-peers.json).
+        #[arg(long)]
+        pub peers: Option<PathBuf>,
+    }
+
+    impl PeersFile {
+        /// The path given, or the default peers file.
+        pub fn path(&self) -> PathBuf {
+            self.peers
+                .clone()
+                .unwrap_or_else(tcr::peer::config::default_path)
+        }
+    }
 
     #[derive(clap::Args)]
     pub struct PeerArgs {
@@ -480,18 +512,16 @@ mod peer_cli {
     /// nobody discovers until they block the wrong Mac.
     #[derive(clap::Args)]
     pub struct PeerDecideArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The instance id or the address, as `tcr peer pending` prints them.
         pub target: String,
     }
 
     #[derive(clap::Args)]
     pub struct PeerUnblockArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The address to unblock, as `tcr peer ls --json` lists it under
         /// `blocked`.
         pub addr: String,
@@ -509,9 +539,8 @@ mod peer_cli {
     /// silently.
     #[derive(clap::Args)]
     pub struct PeerNetworkKeyArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// What to do: mint one, paste one in, clear it, or say whether one is
         /// set.
         #[arg(value_enum)]
@@ -548,9 +577,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerLinkArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// Also mint a one-use join key and carry it in the link, so the other
         /// Mac enrols with this one on opening it. **The link is then a live
         /// bearer secret with ten minutes on it**, without this flag it
@@ -694,9 +722,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerLsArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// Emit a machine-readable JSON object instead of greppable text.
         ///
         /// A SIBLING document, never an addition to `tcr status --json`: that
@@ -725,9 +752,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerSwitchArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// `on` or `off`.
         #[arg(value_enum)]
         pub state: Switch,
@@ -794,9 +820,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerLendArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The peer id to change, in its full wire form, the `node` field of
         /// `tcr peer ls --json`, never the `tcr-…` short form the text output
         /// prints. See [`PeerAllowArgs::peer`].
@@ -875,9 +900,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerFindArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// `on` or `off`.
         #[arg(value_enum)]
         pub state: Switch,
@@ -897,9 +921,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerNameArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The name to show. Omit to print the current one, which is the host
         /// name until you set something else. Refused if it carries an `@`, a
         /// uuid shape, or an organization name: a name reaches other machines.
@@ -908,9 +931,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerPairArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// `host:port` of the Mac to pair with.
         pub addr: String,
         /// The six digits the other screen is showing. Omit to start the
@@ -930,9 +952,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerInviteArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// A name for the joining Mac. Refused if it carries an `@`, a uuid
         /// shape, or an organization name: a label reaches every trusted peer.
         #[arg(long)]
@@ -974,9 +995,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerJoinArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The `tcr-join:…` key or the `tcr://peer/join?…` link the other
         /// Mac printed.
         ///
@@ -1009,9 +1029,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerForgetArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The peer id to forget, as `tcr peer ls` prints it.
         pub peer: String,
     }
@@ -1029,9 +1048,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerAllowArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// The peer id to change, in its full wire form, the `node` field of
         /// `tcr peer ls --json`.
         ///
@@ -1050,9 +1068,8 @@ mod peer_cli {
 
     #[derive(clap::Args)]
     pub struct PeerViaArgs {
-        /// Path to the peers file (default: ~/.config/tcr-peers.json).
-        #[arg(long)]
-        pub peers: Option<PathBuf>,
+        #[command(flatten)]
+        pub peers: PeersFile,
         /// `auto` to use a trusted Mac whenever the direct path is dead, `off`
         /// to never route out through a peer, or a peer id to pin one.
         pub target: String,
@@ -1067,9 +1084,8 @@ mod peer_cli {
 
 #[derive(clap::Args)]
 struct AccountsArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Refresh each account's live quota before listing (network probe).
     #[arg(long)]
     probe: bool,
@@ -1077,9 +1093,8 @@ struct AccountsArgs {
 
 #[derive(clap::Args)]
 struct RemoveArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Account name — exact and case-sensitive, not a substring. Names are
     /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
@@ -1087,16 +1102,14 @@ struct RemoveArgs {
 
 #[derive(clap::Args)]
 struct RequestKeyArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
 }
 
 #[derive(clap::Args)]
 struct TokenArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Account name — exact and case-sensitive, not a substring. Names are
     /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
@@ -1104,9 +1117,8 @@ struct TokenArgs {
 
 #[derive(clap::Args)]
 struct PriorityArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Account name — exact and case-sensitive, not a substring. Names are
     /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
@@ -1123,9 +1135,8 @@ struct PriorityArgs {
 
 #[derive(clap::Args)]
 struct EnableArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Account name — exact and case-sensitive, not a substring. Names are
     /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
@@ -1133,9 +1144,8 @@ struct EnableArgs {
 
 #[derive(clap::Args)]
 struct DisableArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Account name — exact and case-sensitive, not a substring. Names are
     /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
@@ -1143,9 +1153,8 @@ struct DisableArgs {
 
 #[derive(clap::Args)]
 struct ControlArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Account name — exact and case-sensitive, not a substring. Omit with
     /// `--clear` or `--show`.
     #[arg(conflicts_with_all = ["clear", "show"])]
@@ -1186,9 +1195,8 @@ enum ConfigAction {
 
 #[derive(clap::Args)]
 struct ConfigSetArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The key as the config file spells it, e.g. switchThreshold.
     key: String,
     /// The value; a throttle takes two words, `350 24`.
@@ -1201,9 +1209,8 @@ struct ConfigSetArgs {
 
 #[derive(clap::Args)]
 struct ConfigShowArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Emit one JSON object instead of the table.
     #[arg(long)]
     json: bool,
@@ -1252,9 +1259,8 @@ enum GroupAction {
 
 #[derive(clap::Args)]
 struct GroupLsArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Emit a machine-readable JSON equivalent instead of greppable text.
     #[arg(long)]
     json: bool,
@@ -1262,9 +1268,8 @@ struct GroupLsArgs {
 
 #[derive(clap::Args)]
 struct GroupAddArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to add.
     group: String,
     /// Account name — exact and case-sensitive.
@@ -1273,9 +1278,8 @@ struct GroupAddArgs {
 
 #[derive(clap::Args)]
 struct GroupRmArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to remove.
     group: String,
     /// Account name to drop from the group. Required unless `--all` is given;
@@ -1292,9 +1296,8 @@ struct GroupRmArgs {
 
 #[derive(clap::Args)]
 struct GroupReserveArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to reserve.
     group: String,
     /// Reserve the group even though it holds Codex accounts, which then serve nothing while it stays reserved.
@@ -1304,54 +1307,48 @@ struct GroupReserveArgs {
 
 #[derive(clap::Args)]
 struct GroupUnreserveArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to unreserve.
     group: String,
 }
 
 #[derive(clap::Args)]
 struct GroupParkArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to park.
     group: String,
 }
 
 #[derive(clap::Args)]
 struct GroupUnparkArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to unpark.
     group: String,
 }
 
 #[derive(clap::Args)]
 struct GroupAllowControlArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to opt in.
     group: String,
 }
 
 #[derive(clap::Args)]
 struct GroupDisallowControlArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to opt out.
     group: String,
 }
 
 #[derive(clap::Args)]
 struct GroupColorArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// The group label to color.
     group: String,
     /// The color, as `#RGB` or `#RRGGBB` (case-insensitive). Required unless
@@ -1367,9 +1364,8 @@ struct GroupColorArgs {
 
 #[derive(clap::Args)]
 struct StatusArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Emit the fleet status as a JSON array instead of greppable text.
     #[arg(long)]
     json: bool,
@@ -1391,9 +1387,8 @@ struct StatusArgs {
 /// configuration, so there is nothing to select.
 #[derive(clap::Args)]
 struct DoctorArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Emit one JSON object instead of greppable `key: value` lines.
     #[arg(long)]
     json: bool,
@@ -1406,9 +1401,8 @@ struct DoctorArgs {
 /// only output there is.
 #[derive(clap::Args)]
 struct ListArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Emit claude-swap's list schema v1 (required: there is no text form).
     #[arg(long)]
     json: bool,
@@ -1416,9 +1410,8 @@ struct ListArgs {
 
 #[derive(clap::Args)]
 struct SessionsArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Emit `{"supported": bool, "sessions": [...]}` instead of greppable text.
     #[arg(long)]
     json: bool,
@@ -1454,9 +1447,8 @@ struct UpdateArgs {
 
 #[derive(clap::Args)]
 struct LoginArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Skip the refusal a running proxy would otherwise trigger, and write the
     /// login to the config file directly. Still probes the proxy first and still
     /// prefers its live account-add route when one is confirmed and safe — this
@@ -1551,9 +1543,8 @@ struct LoginArgs {
 
 #[derive(clap::Args)]
 struct MintArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Mint a long-lived token for one existing account — exact name, not a
     /// substring (see `resolve_account`). Exactly one of `--account` /
     /// `--group` is required.
@@ -1566,9 +1557,8 @@ struct MintArgs {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Serve this session from accounts labelled with this group. Strict by
     /// default: when no member can serve, the request waits for one or gets a
     /// 429, and is never sent to an account outside the group, even one the
@@ -1592,9 +1582,8 @@ struct ServerArgs {
     /// Port to bind (overrides `proxy.port` from the config).
     #[arg(long)]
     port: Option<u16>,
-    /// Path to the config file.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigFile,
     /// Run without the TUI, logging to stdout.
     #[arg(long)]
     headless: bool,
@@ -1742,26 +1731,26 @@ fn run_migrate(args: MigrateArgs) -> anyhow::Result<()> {
 
 /// `tcr accounts [--probe]` — list the configured accounts (offline).
 async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     cli::list_accounts(&config_path, args.probe).await
 }
 
 /// `tcr remove <query>` — delete an account from the config, applying
 /// a live disable through the RUNNING proxy first where there is one.
 async fn run_remove(args: RemoveArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     cli::remove_account(&config_path, &args.query).await
 }
 
 /// `tcr token <query>` — print the account's access token.
 fn run_token(args: TokenArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     cli::print_access_token(&config_path, &args.query)
 }
 
 /// `tcr request-key`: print the request key the server wrote to the config.
 fn run_request_key(args: RequestKeyArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     println!("{}", cli::request_key(&config_path)?);
     Ok(())
 }
@@ -1769,7 +1758,7 @@ fn run_request_key(args: RequestKeyArgs) -> anyhow::Result<()> {
 /// `tcr priority <query> [N|--first|--last]` — set rotation priority, in the
 /// RUNNING proxy where there is one.
 async fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let priority = if args.first {
         PriorityArg::First
     } else if args.last {
@@ -1785,21 +1774,21 @@ async fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
 /// `tcr enable <query>` — clear an account's `disabled` flag, in the
 /// RUNNING proxy where there is one (async for that reason alone).
 async fn run_enable(args: EnableArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     cli::set_enabled(&config_path, &args.query, false).await
 }
 
 /// `tcr disable <query>` — hold an account out of rotation, in the RUNNING
 /// proxy where there is one.
 async fn run_disable(args: DisableArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     cli::set_enabled(&config_path, &args.query, true).await
 }
 
 /// `tcr control <query> | --clear | --show` — set, clear, or show the
 /// identity-bound control account, in the RUNNING proxy where there is one.
 async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     if args.show {
         return cli::show_control(&config_path).await;
     }
@@ -2133,7 +2122,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
 
     match args.action {
         PeerAction::Id(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let config_dir = peers_path
                 .parent()
                 .map(Path::to_path_buf)
@@ -2177,7 +2166,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Ls(a) => {
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             // A peers file that exists but does not parse is reported IN the
             // JSON document (`peers_error`) rather than as a command failure:
             // the same reasoning `status::peers_block` gives for why an
@@ -2388,7 +2377,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Find(a) => run_peer_find(a).await,
         PeerAction::Name(a) => {
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             // THE LOCK, and the review's M3. `FileLock`'s own doc says it
             // "stops two `tcr` processes racing the same file, which is the real
             // case (a listener enrolling a joiner while the operator runs
@@ -2413,7 +2402,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Share(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let _lock = peer::config::FileLock::acquire(&peers_path)?;
             let mut file = peer::config::read_or_default(&peers_path)?;
             if file.peers.is_empty() {
@@ -2621,10 +2610,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 Ok(())
             }
 
-            let path = a
-                .peers
-                .clone()
-                .unwrap_or_else(tcr::peer::config::default_path);
+            let path = a.peers.path();
             let store = tcr::peer::config::PeerStore::open(&path)?;
             // A bare host is taken too, and defaulted: see `peer_dial_addr`.
             // `tcr peer pending` prints a bare address for a knock that named
@@ -2751,10 +2737,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Invite(a) => {
-            let path = a
-                .peers
-                .clone()
-                .unwrap_or_else(tcr::peer::config::default_path);
+            let path = a.peers.path();
             let store = tcr::peer::config::PeerStore::open(&path)?;
             if let Some(id) = a.revoke {
                 let removed = tcr::peer::pair::revoke_invite(&store, id)?;
@@ -2883,10 +2866,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Join(a) => {
-            let path = a
-                .peers
-                .clone()
-                .unwrap_or_else(tcr::peer::config::default_path);
+            let path = a.peers.path();
             let store = tcr::peer::config::PeerStore::open(&path)?;
             // Parsed once into one typed value, so no later line here has to
             // ask "link or key?" with a different test. Nothing below prints
@@ -3007,10 +2987,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Forget(a) => {
-            let path = a
-                .peers
-                .clone()
-                .unwrap_or_else(tcr::peer::config::default_path);
+            let path = a.peers.path();
             let store = tcr::peer::config::PeerStore::open(&path)?;
             let peer = tcr_peer_wire::PeerId::parse(&a.peer)
                 .map_err(|refusal| anyhow::anyhow!("peer forget: {refusal}"))?;
@@ -3044,10 +3021,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Hello(a) => {
-            let path = a
-                .peers
-                .clone()
-                .unwrap_or_else(tcr::peer::config::default_path);
+            let path = a.peers.unwrap_or_else(tcr::peer::config::default_path);
             let store = tcr::peer::config::PeerStore::open(&path)?;
             let peer = tcr_peer_wire::PeerId::parse(&a.peer)
                 .map_err(|refusal| anyhow::anyhow!("peer hello: {refusal}"))?;
@@ -3061,7 +3035,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Allow(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let _lock = peer::config::FileLock::acquire(&peers_path)?;
             let mut file = peer::config::read_or_default(&peers_path)?;
             let peer_id = tcr_peer_wire::PeerId::parse(&a.peer)
@@ -3131,7 +3105,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Lend(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let _lock = peer::config::FileLock::acquire(&peers_path)?;
             let mut file = peer::config::read_or_default(&peers_path)?;
             let peer_id = tcr_peer_wire::PeerId::parse(&a.peer)
@@ -3411,7 +3385,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // typo is refused before anything else happens, and a peer id is
             // checked against the pinned rows so `via <peer>` cannot name a
             // Mac this one has never trusted.
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             // The lock is taken BEFORE the read, because this is a
             // read-modify-write of the same file `tcr peer allow` and the
             // listener's enrolment write also round-trip: without it the last
@@ -3548,7 +3522,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Accept(a) => {
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let state_path = peer_state_path(&peers_path);
             let now = peer::pair::now_ms();
             let _lock = peer::config::FileLock::acquire(&state_path)?;
@@ -3574,7 +3548,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Ignore(a) => {
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let state_path = peer_state_path(&peers_path);
             let now = peer::pair::now_ms();
             let _lock = peer::config::FileLock::acquire(&state_path)?;
@@ -3608,7 +3582,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Block(a) => {
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let state_path = peer_state_path(&peers_path);
             let now = peer::pair::now_ms();
             let _lock = peer::config::FileLock::acquire(&state_path)?;
@@ -3653,7 +3627,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Unblock(a) => {
-            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let state_path = peer_state_path(&peers_path);
             let now = peer::pair::now_ms();
             let _lock = peer::config::FileLock::acquire(&state_path)?;
@@ -3668,7 +3642,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::NetworkKey(a) => run_peer_network_key(a),
         PeerAction::Link(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.path();
             let file = peer::config::read_or_default(&peers_path)?;
             let Some(network_key) = file.network_key else {
                 anyhow::bail!(
@@ -3767,7 +3741,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Drop(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let _lock = peer::config::FileLock::acquire(&peers_path)?;
             let mut file = peer::config::read_or_default(&peers_path)?;
             let on = matches!(a.state, peer_cli::Switch::On);
@@ -3796,7 +3770,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::DropStore(a) => {
-            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let _lock = peer::config::FileLock::acquire(&peers_path)?;
             let mut file = peer::config::read_or_default(&peers_path)?;
             match a.action {
@@ -3950,10 +3924,7 @@ async fn run_peer_status(args: peer_cli::PeerStatusArgs) -> anyhow::Result<()> {
 /// for a picture of the mesh cannot change it. `--serve` is the one exception
 /// that opens a socket at all, and it is a LISTENING one, on loopback only.
 async fn run_peer_graph(args: peer_cli::PeerGraphArgs) -> anyhow::Result<()> {
-    let peers_path = args
-        .peers
-        .clone()
-        .unwrap_or_else(peer::config::default_path);
+    let peers_path = args.peers.unwrap_or_else(peer::config::default_path);
     let config_dir = peers_path
         .parent()
         .map(Path::to_path_buf)
@@ -4825,10 +4796,7 @@ fn peer_state_path(peers_path: &Path) -> PathBuf {
 fn run_peer_network_key(args: peer_cli::PeerNetworkKeyArgs) -> anyhow::Result<()> {
     use tcr::peer;
 
-    let peers_path = args
-        .peers
-        .clone()
-        .unwrap_or_else(peer::config::default_path);
+    let peers_path = args.peers.path();
     let _lock = peer::config::FileLock::acquire(&peers_path)?;
     let mut file = peer::config::read_or_default(&peers_path)?;
 
@@ -5312,7 +5280,7 @@ async fn run_peer_find_with(
     args: peer_cli::PeerFindArgs,
     finder: &impl PeerFinder,
 ) -> anyhow::Result<()> {
-    let peers_path = args.peers.unwrap_or_else(peer::config::default_path);
+    let peers_path = args.peers.path();
     let _lock = peer::config::FileLock::acquire(&peers_path)?;
     let mut file = peer::config::read_or_default(&peers_path)?;
 
@@ -5410,7 +5378,9 @@ mod peer_find_tests {
         let finder = FakePeerFinder::default();
         run_peer_find_with(
             peer_cli::PeerFindArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 state: peer_cli::Switch::On,
                 announce_name: None,
             },
@@ -5442,7 +5412,9 @@ mod peer_find_tests {
         let finder = FakePeerFinder::default();
         run_peer_find_with(
             peer_cli::PeerFindArgs {
-                peers: Some(peers_path),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path),
+                },
                 state: peer_cli::Switch::Off,
                 announce_name: None,
             },
@@ -5523,7 +5495,9 @@ mod peer_grant_tests {
 
         run_peer(peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Share(peer_cli::PeerSwitchArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 state: peer_cli::Switch::On,
                 window: peer_cli::PeerWindow::SevenDay,
                 fraction: 0.10,
@@ -5551,7 +5525,9 @@ mod peer_grant_tests {
 
         run_peer(peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Share(peer_cli::PeerSwitchArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 state: peer_cli::Switch::Off,
                 window: peer_cli::PeerWindow::SevenDay,
                 fraction: 0.10,
@@ -5611,7 +5587,7 @@ mod peer_grant_tests {
 
         let share_on = |path: PathBuf| peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Share(peer_cli::PeerSwitchArgs {
-                peers: Some(path),
+                peers: peer_cli::PeersFile { peers: Some(path) },
                 state: peer_cli::Switch::On,
                 window: peer_cli::PeerWindow::SevenDay,
                 fraction: 0.10,
@@ -5695,7 +5671,9 @@ mod peer_grant_tests {
 
         run_peer(peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Allow(peer_cli::PeerAllowArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 peer: peer_id.clone(),
                 grant: peer_cli::PeerGrant::Disclose,
                 state: peer_cli::Switch::On,
@@ -5714,7 +5692,9 @@ mod peer_grant_tests {
 
         run_peer(peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Allow(peer_cli::PeerAllowArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 peer: peer_id,
                 grant: peer_cli::PeerGrant::Disclose,
                 state: peer_cli::Switch::Off,
@@ -5732,7 +5712,9 @@ mod peer_grant_tests {
         let stranger = tcr_peer_wire::PeerId([9_u8; 32]).to_wire();
         let refused = run_peer(peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Allow(peer_cli::PeerAllowArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 peer: stranger,
                 grant: peer_cli::PeerGrant::Disclose,
                 state: peer_cli::Switch::On,
@@ -5795,7 +5777,9 @@ mod peer_grant_tests {
 
         let lend = |fraction: f64, mode: Option<peer_cli::PeerLendMode>| peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Lend(peer_cli::PeerLendArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 peer: peer_id.clone(),
                 window: peer_cli::PeerWindow::SevenDay,
                 fraction,
@@ -5889,7 +5873,9 @@ mod peer_grant_tests {
 
         let lend_against = |config_path: PathBuf| peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Lend(peer_cli::PeerLendArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 peer: peer_id.clone(),
                 window: peer_cli::PeerWindow::SevenDay,
                 fraction: 0.20,
@@ -5966,7 +5952,9 @@ mod peer_grant_tests {
 
         let lend = |fraction: f64, window: peer_cli::PeerWindow| peer_cli::PeerArgs {
             action: peer_cli::PeerAction::Lend(peer_cli::PeerLendArgs {
-                peers: Some(peers_path.clone()),
+                peers: peer_cli::PeersFile {
+                    peers: Some(peers_path.clone()),
+                },
                 peer: peer_id.clone(),
                 window,
                 fraction,
@@ -6036,11 +6024,11 @@ mod peer_grant_tests {
 async fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
     match args.action {
         ConfigAction::Show(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::show_config(&config_path, a.json).await
         }
         ConfigAction::Set(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::set_config(&config_path, &a.key, &a.value.join(" ")).await
         }
     }
@@ -6051,43 +6039,43 @@ async fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
 fn run_group(args: GroupArgs) -> anyhow::Result<()> {
     match args.action {
         GroupAction::Ls(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::list_groups(&config_path, a.json)
         }
         GroupAction::Add(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::add_to_group(&config_path, &a.group, &a.account)
         }
         GroupAction::Rm(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::remove_from_group(&config_path, &a.group, a.account.as_deref(), a.all)
         }
         GroupAction::Reserve(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::reserve_group_with(&config_path, &a.group, a.force)
         }
         GroupAction::Unreserve(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::unreserve_group(&config_path, &a.group)
         }
         GroupAction::Park(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::park_group(&config_path, &a.group)
         }
         GroupAction::Unpark(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::unpark_group(&config_path, &a.group)
         }
         GroupAction::AllowControl(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::allow_control_group(&config_path, &a.group)
         }
         GroupAction::DisallowControl(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             cli::disallow_control_group(&config_path, &a.group)
         }
         GroupAction::Color(a) => {
-            let config_path = a.config.unwrap_or_else(config::default_path);
+            let config_path = a.config.path();
             // clap's `conflicts_with`/`required_unless_present` on
             // `GroupColorArgs` guarantee exactly one of `hex`/`--clear`.
             cli::set_group_color(&config_path, &a.group, a.hex.as_deref())
@@ -6101,7 +6089,7 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
 /// shape as [`run_doctor`]: it is non-zero only under `--check`, after the
 /// output is printed.
 async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let code = cli::status(&config_path, args.json, args.check).await?;
     if code != 0 {
         std::process::exit(code);
@@ -6145,7 +6133,7 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
             let change = if args.remove {
                 setup::remove_settings(&homes)?
             } else {
-                let config_path = args.config.unwrap_or_else(config::default_path);
+                let config_path = args.config.path();
                 let port = setup::configured_port(&config_path)?;
                 setup::install_settings(&homes, port, args.force)?
             };
@@ -6191,7 +6179,7 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
             );
         }
         SetupAction::Status(args) => {
-            let config_path = args.config.unwrap_or_else(config::default_path);
+            let config_path = args.config.path();
             let port = setup::configured_port(&config_path)?;
             let status = setup::status(setup::chosen_shell(args.shell), &homes, port)?;
             if args.json {
@@ -6205,7 +6193,7 @@ fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
 }
 
 async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let code = cli::doctor(&config_path, args.json, args.codex).await?;
     if code != 0 {
         std::process::exit(code);
@@ -6215,7 +6203,7 @@ async fn run_doctor(args: DoctorArgs) -> anyhow::Result<()> {
 
 /// `tcr sessions [--json]` — the running proxy's live sessions.
 async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     cli::sessions(&config_path, args.json).await
 }
 
@@ -6235,7 +6223,7 @@ async fn run_list(args: ListArgs) -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let code = cli::list_v1(&config_path).await;
     if code != 0 {
         std::process::exit(code);
@@ -6455,7 +6443,7 @@ fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
 /// pool is announced on stderr with the reason, never a silent bypass. Which of
 /// the two it gets is the RUNNING proxy's answer — see [`codex_launch`].
 async fn run_harness(args: RunArgs) -> anyhow::Result<()> {
-    let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let (config, _) = load_config(&config_path)?;
     let port = config.proxy.port;
 
@@ -7531,7 +7519,7 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 /// in [`oauth::login`] / [`oauth::login_with_token`]; this just resolves the
 /// config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
-    let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let ui = if args.non_interactive {
         oauth::LoginUi::Machine
     } else {
@@ -7630,7 +7618,7 @@ fn finish_login(result: anyhow::Result<String>, non_interactive: bool) -> anyhow
 /// clipboard. Exits non-zero when any targeted account failed or mismatched,
 /// so a UI driving this (the TcrBar menu item) can surface the failure.
 async fn run_mint(args: MintArgs) -> anyhow::Result<()> {
-    let config_path = args.config.unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let all_ok = mint::run_mint(&config_path, args.account.as_deref(), args.group.as_deref())
         .await
         .context("mint failed")?;
@@ -7690,7 +7678,7 @@ fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDown
 /// stand-down diagnosis, turn that stand-down into a process exit code, and pick
 /// how to wait (the TUI, or a headless block on Ctrl-C).
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
-    let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let config_path = args.config.path();
     let (config, persist_path) = load_config(&config_path)?;
 
     // A first boot with an empty fleet imports this machine's Claude Code
