@@ -202,8 +202,8 @@ final class ProcessStatsTests: XCTestCase {
             "Kill cargo test --release")
         XCTAssertEqual(
             ProcessStatsLabel.killConfirmation(
-                subject: "cargo test --release", session: "teamclaude-rs-c7"),
-            "cargo test --release in teamclaude-rs-c7."
+                subject: "cargo test --release", session: "tcr-c7"),
+            "cargo test --release in tcr-c7."
                 + " The session gets a tool error and continues.")
     }
 

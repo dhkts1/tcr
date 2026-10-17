@@ -11,7 +11,7 @@ import Foundation
 ///
 ///  1. **This app never writes the tcr config.** Every change is a subprocess —
 ///     `tcr control <query>` / `tcr control --clear` — never a direct edit of
-///     `~/.config/teamclaude.json`.
+///     `~/.config/tcr.json`.
 ///  2. **This app never depends on `tcr status --json` for this fact.** The
 ///     brief for this feature is explicit that whether that payload carries a
 ///     `control` field is a separate, undecided question; reading it here would

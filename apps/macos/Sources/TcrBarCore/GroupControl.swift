@@ -58,7 +58,7 @@ public enum GroupRouting {
 ///  1. **This app never writes the tcr config.** Every change is a
 ///     subprocess — `tcr group add <group> <account>`,
 ///     `tcr group rm <group> <account>`, `tcr group rm <group> --all` —
-///     never a direct edit of `~/.config/teamclaude.json`. There is also no
+///     never a direct edit of `~/.config/tcr.json`. There is also no
 ///     live config reload: a successful call here changes nothing until the
 ///     proxy restarts, which the view surfaces, and this type never claims
 ///     otherwise.

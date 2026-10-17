@@ -6,7 +6,7 @@ import Foundation
 /// `run_remove`). Same shape as ``AccountCommand``/``GroupCommand``, and for
 /// the same reasons:
 ///
-///  1. **This app never writes the tcr config.** `~/.config/teamclaude.json`
+///  1. **This app never writes the tcr config.** `~/.config/tcr.json`
 ///     holds OAuth access and refresh tokens; deleting an account is a
 ///     subprocess, never a direct edit.
 ///  2. **This is not reversible from the UI.** `remove_account` deletes the
