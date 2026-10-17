@@ -37,7 +37,7 @@ then `2497125`, a difference of exactly 30. So the deadline is fixed at roughly 
 from the browser login, and no amount of refreshing moves it.
 
 That is the treadmill: every account needs a browser re-login about monthly, for ever.
-`~/.cache/teamclaude/logs` recorded 59 `refresh token rejected - re-login needed` lines
+`~/.cache/tcr/logs` recorded 59 `refresh token rejected - re-login needed` lines
 over three days, concentrated on three of the eighteen accounts (26, 24 and 9 rejections).
 
 A one-year access token obtained at login removes the need to refresh at all, which makes

@@ -1,15 +1,11 @@
 # Configuration reference
 
 Everything `tcr` reads out of its config file, with the real default for each key. The file
-is `~/.config/tcr.json`. An older install's `~/.config/teamclaude.json` is moved there by the
-update (TcrBar's, or `tcr update`), and is read where it is until then; see
-[`tcr migrate`](cli.md#tcr-migrate).
+is `~/.config/tcr.json`.
 Back to [the README](../README.md); the command-line surface is in [cli.md](cli.md).
 
-Cache paths below use `~/.cache/tcr/`. When only the older `~/.cache/teamclaude/` directory
-exists, tcr keeps using it; when both exist, `tcr/` wins. `XDG_CACHE_HOME` replaces `~/.cache`
-when set. The usage ledger, session snapshots, peer state and logs follow the same directory;
-nothing is moved or copied.
+Cache paths below use `~/.cache/tcr/`. `XDG_CACHE_HOME` replaces `~/.cache`
+when set. The usage ledger, session snapshots, peer state and logs follow the same directory.
 
 Every default here was derived from the Rust source, not from a live config file. If you
 want to check one, start from `src/config.rs`.
@@ -235,8 +231,7 @@ row's ChatGPT login, never API keys, so an `"apikey"` row is quarantined at load
 warning, and the rest of the config loads. Any other string is treated as a static key and
 written back exactly as it was; a `type` that is not a string quarantines its row.
 
-Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
-from the older Node proxy) parse fine and survive a load→save round trip untouched, but
+Per-account keys the proxy does not model (`models`, `upstream`, `sx`, any other key) parse fine and survive a load→save round trip untouched, but
 nothing reads them.
 
 **An account with no `refreshToken` is not broken, but it is on a clock.** It serves

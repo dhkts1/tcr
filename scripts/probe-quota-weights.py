@@ -45,10 +45,7 @@ VOCAB = ["alpha", "bravo", "cedar", "delta", "ember", "fjord", "gamma", "haze",
 
 
 def config_path():
-    # The same rule as src/paths.rs: tcr.json if it exists, else the pre-rename name.
-    new = os.path.expanduser("~/.config/tcr.json")
-    old = os.path.expanduser("~/.config/teamclaude.json")
-    return old if not os.path.exists(new) and os.path.exists(old) else new
+    return os.path.expanduser("~/.config/tcr.json")
 
 
 def token_for(name):

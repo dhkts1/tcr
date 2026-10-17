@@ -12,14 +12,12 @@ and each one was derived from the source, so start from `src/main.rs` to check a
 
 ## Conventions
 
-`--config <path>` appears on every subcommand except `update`, `migrate`, `demo` and `ui`. Unset,
-it resolves to `~/.config/tcr.json`, or to `~/.config/teamclaude.json` on an install that has
-only that file, which the update moves to the new name ([`tcr migrate`](#tcr-migrate)). The tables below write the default as `~/.config/tcr.json` and mean this rule.
+`--config <path>` appears on every subcommand except `update`, `demo` and `ui`. Unset,
+it resolves to `~/.config/tcr.json`.
 
-Cache paths below use `~/.cache/tcr/` for a fresh install. If only the older
-`~/.cache/teamclaude/` exists, tcr keeps using it; when both exist, `tcr/` wins. Usage,
+Cache paths below use `~/.cache/tcr/`. Usage,
 session snapshots, peer state and logs all follow that one directory. `XDG_CACHE_HOME`
-replaces `~/.cache` when set. Existing files are never moved or copied.
+replaces `~/.cache` when set.
 
 **A config file that does not exist yet is created, not an error.** The first command you run
 on a new machine writes the defaults to that path (`0600`, an empty `accounts` array), prints
@@ -102,8 +100,7 @@ Codex account draws exactly the dashboard it always did.
   (`CODEX 0/2 eligible · next free carol@example.com in 3d`). A fleet of one provider keeps one
   segment.
 - **What tcr knows about codex, on the CODEX segment.** `· not pooled: <why>`, in yellow, while
-  this process does not pool codex (`JS leaf covers api.anthropic.com only`,
-  `no readable CA at <path>`, …); `· <n> refused in 10m`, in yellow, for the Codex requests tcr
+  this process does not pool codex (`no readable CA at <path>`, …); `· <n> refused in 10m`, in yellow, for the Codex requests tcr
   refused in the last ten minutes; and `· <n> unpooled in 10m`, dim, for those it relayed
   without the pool. When the line is too long for the terminal, the unpooled count drops first,
   then the refused count, then the account names in the next-free tails, then the tails. Last,
@@ -340,10 +337,6 @@ Each reason, verbatim, and what it needs:
   then run `tcr run --codex` again: the restarted proxy reports what it intercepts, and if that
   is one of the cases below, its entry applies. If TcrBar runs the proxy, update TcrBar first
   ([why](troubleshooting.md#the-fix-is-in-main-and-the-fix-is-in-the-process-serving-traffic-are-different-facts)).
-- `the proxy on :<port> is serving the JS teamclaude leaf, which covers api.anthropic.com only
-  and is never re-minted — a restart will not change this; see docs/troubleshooting.md`. A
-  restart alone never fixes this one; what does is in
-  [troubleshooting.md](troubleshooting.md#tcr-run---codex-says-it-is-launching-codex-directly-not-pooled).
 - `the proxy on :<port> is running without MITM: its TLS material failed to load at boot — see
   its log`. The proxy could not load or mint its TLS material when it started, so it decrypts
   nothing and tunnels every `CONNECT`. Its log has a `MITM disabled: could not load/generate
@@ -633,8 +626,8 @@ TcrBar started from Finder has neither directory on its `PATH`.
 
 | notice | when |
 |---|---|
-| `tcr pools marked Codex connections to chatgpt.com: …` | the config held no Codex account before this one, and the proxy can intercept marked `chatgpt.com` connections: the running proxy serves a leaf it minted that covers it, or none is running and the JS teamclaude leaf (`teamclaude-leaf.pem` and `.key` beside the config) is not on disk, so the next one mints such a leaf. The leaf files are checked for existence, never read |
-| `codex is not pooled: <reason>` | the config held no Codex account before this one, and the proxy cannot intercept marked `chatgpt.com` connections. The reason is the one `tcr run --codex` prints ([the reasons](#--codex-launching-codex-through-the-pool)): what the running proxy reported, that its status could not be read, or that no proxy answered and the JS leaf on disk is what the next one will serve |
+| `tcr pools marked Codex connections to chatgpt.com: …` | the config held no Codex account before this one, and the proxy can intercept marked `chatgpt.com` connections: the running proxy serves a leaf it minted that covers it, or none is running, so the next one mints such a leaf |
+| `codex is not pooled: <reason>` | the config held no Codex account before this one, and the proxy cannot intercept marked `chatgpt.com` connections. The reason is the one `tcr run --codex` prints ([the reasons](#--codex-launching-codex-through-the-pool)): what the running proxy reported, or that its status could not be read |
 | `codex needs a login of its own to start, even when pooled, and none is at <path>: …` | there is no `auth.json` under `$CODEX_HOME`, or under `~/.codex` when `CODEX_HOME` is unset. Checked for existence, never read |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it before it next starts — …` | a `tcr` at 0.2.45 or older is in reach: it would read this login as a Claude account and send its token to Anthropic |
 | `warning: the tcr at <path> (<version>) predates Codex accounts: update it — until then it refuses this config, …` | a `tcr` from 0.2.46 on whose `login --help` lacks `--from-codex` is in reach: it refuses the whole config |
@@ -1338,7 +1331,7 @@ Claude's first:
 
 ```
 verdict: this proxy is not on Claude's route: /Users/example/.claude/settings.json sets https://gateway.example.com
-codexVerdict: codex is not pooled: the proxy on :3456 is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md
+codexVerdict: codex is not pooled: the proxy on :3456 is running without MITM: its TLS material failed to load at boot — see its log
 ```
 
 - **Claude's `verdict:`** prints when Claude Code is routed elsewhere, or routed here with
@@ -1595,7 +1588,6 @@ launch prints, verbatim:
 | `no-proxy` | `no proxy answered on 127.0.0.1:<port>` |
 | `status-unreadable` | `could not read the running proxy's status (<why>)` |
 | `predates` | `the proxy on :<port> (build <sha>) predates Codex interception — restart it on this build at a quiet moment` |
-| `js-leaf` | `the proxy on :<port> is serving the JS teamclaude leaf, which covers api.anthropic.com only and is never re-minted — a restart will not change this; see docs/troubleshooting.md` |
 | `mitm-off` | `the proxy on :<port> is running without MITM: its TLS material failed to load at boot — see its log` |
 | `leaf-missing-host` | `the proxy on :<port> serves a leaf it minted but does not intercept chatgpt.com (it intercepts [<hosts>])` |
 | `unknown-leaf` | `the proxy on :<port> (build <sha>) reports a leaf this build does not know ("<leaf>") — run tcr run --codex from the same build as the proxy` |
@@ -1746,8 +1738,7 @@ Also on the raw `/_tcr/status` document only, never in `tcr status --json`'s arr
 serving process's forward-proxy listener can intercept, decided once at boot from its policy and
 the TLS material that process loaded. `interceptedHosts` lists the hosts that policy and leaf let
 it terminate TLS for, and `leaf` names the certificate it presents: `minted` (a leaf tcr minted
-under `~/.config/tcr-ca.pem`), `js` (the JS teamclaude proxy's `teamclaude-leaf.pem`, which tcr
-takes to cover `api.anthropic.com` only) or `none` (MITM off: the TLS material failed to load,
+under `~/.config/tcr-ca.pem`) or `none` (MITM off: the TLS material failed to load,
 and every `CONNECT` is tunnelled). `chatgpt.com` in `interceptedHosts` says what the leaf allows,
 not what happens on every tunnel: the listener requires the Codex marker on CONNECT and a Codex
 account in the pool, counted on every connection, and tunnels it untouched otherwise. The same document's
@@ -1914,8 +1905,7 @@ In `--json` the same list is `unknownKeys`, an array that is `[]` when every key
 
 `nearest` is `null` when no known key is close enough to be a likely typo. A key counts as known when
 it is a field tcr models, one of the keys read from the unmodelled map
-([configuration](configuration.md#keys-read-from-the-unmodelled-map)), a key teamclaude writes
-(`routes`, `sx`, `logDir`, `autoUpdate`), or the legacy `throttle`. The list is reported and never
+([configuration](configuration.md#keys-read-from-the-unmodelled-map)), or the legacy `throttle`. The list is reported and never
 enforced: the file is not changed, the exit code above still describes routing alone, and the server
 logs the same keys once at boot. Only top-level keys are checked; per-account and `proxy` keys are
 not.
@@ -2375,44 +2365,6 @@ manual instructions when that handoff cannot be made.
 Updating the binary does not update a running proxy. The process that is serving traffic
 keeps its own image until it is restarted, and `tcr status --json` reports the running
 build's SHA if you need to know which one is live.
-
-After a successful install or rebuild it runs [`tcr migrate`](#tcr-migrate). When a tcr
-server is running it moves nothing and prints one line saying the files move at the next
-update, or now with `tcr migrate` once the proxy is stopped. It never stops the proxy.
-
----
-
-## `tcr migrate`
-
-Moves an older install's files to the `tcr` names: `~/.config/teamclaude.json` becomes
-`~/.config/tcr.json`, and `~/.cache/teamclaude/` becomes `~/.cache/tcr/` (under
-`$XDG_CACHE_HOME` when that is set). Inside the moved cache directory the old-prefix logs
-(`teamclaude-rs.log*`) are renamed to `tcr.log*`, so log pruning keeps covering them. You
-rarely run it yourself: TcrBar runs it at launch, before it starts its server, whenever old
-names are still there, and `tcr update` runs it after a successful install or rebuild.
-
-Each of the two (the config file, and the cache directory as a whole) follows one rule:
-
-| On disk | What happens |
-|---|---|
-| Only the old name | Renamed to the new name, one `rename(2)` in the same directory |
-| Both names | Nothing moves; a warning names both paths. The new one is the one in use |
-| Only the new name, or neither | Nothing |
-| The rename fails | An error names both paths and the OS error. The old one stays and is still read |
-
-Nothing is copied, and the certificate files are not touched. A second run moves nothing and
-says so.
-
-It refuses, with exit code 3 and one line, while a tcr server is running on the port the
-config names, because that server resolved its paths at boot and would keep writing the old
-file. The check is the one `tcr login` uses. A server started with `--port` on another port is
-not seen, so stop it first.
-
-`--json` prints one object instead of lines, always with the same four keys: `outcome`
-(`moved`, `nothing_to_move`, `failed` or `refused`), `refusal` (`port`, `pid`, `message`, or
-`null`), `units` (one entry per unit: `unit`, `result`, and the paths that apply) and `logs`
-(one entry per renamed log). Exit codes: 0 when nothing failed, 1 when a rename failed, 3 when
-it refused.
 
 ---
 

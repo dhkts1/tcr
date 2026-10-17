@@ -3,8 +3,7 @@
 
 Joins the proxy log's `quota-sample` lines (one per successful usage probe,
 written by Manager::apply_usage) with the usage ledger
-(~/.cache/tcr/usage/*.jsonl and, for a closed day, *.jsonl.gz, or
-~/.cache/teamclaude/usage/ on an install that has not moved yet: t, a, i, c5, c1,
+(~/.cache/tcr/usage/*.jsonl and, for a closed day, *.jsonl.gz: t, a, i, c5, c1,
 r, o). For every pair of
 consecutive samples of one account inside one 5h window (same reset instant)
 whose utilization ROSE, the rise is the dependent variable and the ledger tokens
