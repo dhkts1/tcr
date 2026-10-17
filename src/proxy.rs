@@ -1728,23 +1728,27 @@ fn local_endpoint_gate(
         .get::<ClientAddr>()
         .is_some_and(|a| a.0.ip().is_loopback());
     if !client_is_loopback {
-        return Some(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("The tcr {endpoint} endpoint is loopback-only."),
-            None,
-        ));
+        return Some(
+            ClientError::new(
+                StatusCode::FORBIDDEN,
+                ErrorKind::Permission,
+                format!("The tcr {endpoint} endpoint is loopback-only."),
+            )
+            .respond_local(),
+        );
     }
 
     if let Some(expected) = manager.proxy_api_key() {
         let provided = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok());
         if !key_matches(provided, expected) {
-            return Some(error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "Missing or invalid x-api-key.",
-                None,
-            ));
+            return Some(
+                ClientError::new(
+                    StatusCode::UNAUTHORIZED,
+                    ErrorKind::Authentication,
+                    "Missing or invalid x-api-key.",
+                )
+                .respond_local(),
+            );
         }
     }
 
@@ -1756,24 +1760,28 @@ fn local_endpoint_gate(
             endpoint,
             "refused a tcr endpoint request addressed to a non-loopback host"
         );
-        return Some(error_response(
-            StatusCode::MISDIRECTED_REQUEST,
-            "invalid_request_error",
-            &format!(
-                "The tcr {endpoint} endpoint answers only to a loopback host, \
+        return Some(
+            ClientError::new(
+                StatusCode::MISDIRECTED_REQUEST,
+                ErrorKind::InvalidRequest,
+                format!(
+                    "The tcr {endpoint} endpoint answers only to a loopback host, \
                      not to '{host}'."
-            ),
-            None,
-        ));
+                ),
+            )
+            .respond_local(),
+        );
     }
 
     if is_cross_site_request(&parts.headers) {
-        return Some(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("The tcr {endpoint} endpoint does not serve cross-site requests."),
-            None,
-        ));
+        return Some(
+            ClientError::new(
+                StatusCode::FORBIDDEN,
+                ErrorKind::Permission,
+                format!("The tcr {endpoint} endpoint does not serve cross-site requests."),
+            )
+            .respond_local(),
+        );
     }
 
     None
@@ -1783,12 +1791,12 @@ fn local_endpoint_gate(
 /// neither forwarded upstream nor able to mutate anything — the endpoint is a
 /// pure read, and there is no verb on it that is not.
 async fn status_method_not_allowed() -> Response {
-    error_response(
+    ClientError::new(
         StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
+        ErrorKind::InvalidRequest,
         "The tcr status endpoint is read-only: GET.",
-        None,
     )
+    .respond_local()
 }
 
 /// `GET /_tcr/status` — the live fleet snapshot, for `tcr status`.
@@ -1864,12 +1872,12 @@ async fn status_handler(
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
-        return error_response(
+        return ClientError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorKind::Api,
             "Could not serialize the status snapshot.",
-            None,
-        );
+        )
+        .respond_local();
     };
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
@@ -1883,12 +1891,12 @@ async fn status_handler(
 /// A non-`GET` on [`QUOTA_PATH`]. A local 405, for the reasons
 /// [`status_method_not_allowed`] gives.
 async fn quota_method_not_allowed() -> Response {
-    error_response(
+    ClientError::new(
         StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
+        ErrorKind::InvalidRequest,
         "The tcr quota endpoint is read-only: GET.",
-        None,
     )
+    .respond_local()
 }
 
 /// `GET /_tcr/quota`: per account its gate and its 5-hour and weekly
@@ -1911,12 +1919,12 @@ async fn quota_handler(
     let payload =
         crate::status::QuotaPayload::from_snapshot(&manager.snapshot(OffsetDateTime::now_utc()));
     let Ok(body) = serde_json::to_string(&payload) else {
-        return error_response(
+        return ClientError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorKind::Api,
             "Could not serialize the quota snapshot.",
-            None,
-        );
+        )
+        .respond_local();
     };
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
@@ -1991,13 +1999,11 @@ fn stamp(route: &LocalRoute, mut response: Response) -> Response {
 }
 
 /// A stamped error answer from `route`.
-fn route_error(
-    route: &LocalRoute,
-    status: StatusCode,
-    kind: &'static str,
-    message: &str,
-) -> Response {
-    stamp(route, error_response(status, kind, message, None))
+fn route_error(route: &LocalRoute, status: StatusCode, kind: ErrorKind, message: &str) -> Response {
+    stamp(
+        route,
+        ClientError::new(status, kind, message).respond_local(),
+    )
 }
 
 /// A stamped JSON 200 from `route`, marked `no-store`.
@@ -2006,7 +2012,7 @@ fn json_ok<T: serde::Serialize>(route: &LocalRoute, payload: &T) -> Response {
         return route_error(
             route,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorKind::Api,
             &format!("Could not serialize the {} result.", route.name),
         );
     };
@@ -2024,7 +2030,7 @@ fn method_not_allowed(route: &LocalRoute) -> Response {
     route_error(
         route,
         StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
+        ErrorKind::InvalidRequest,
         &format!("The tcr {} endpoint takes {}.", route.name, route.verbs),
     )
 }
@@ -2059,7 +2065,7 @@ async fn read_command<T: serde::de::DeserializeOwned>(
         return Err(Box::new(route_error(
             route,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &format!(
                 "The tcr {} endpoint requires Content-Type: application/json.",
                 route.name
@@ -2070,7 +2076,7 @@ async fn read_command<T: serde::de::DeserializeOwned>(
         return Err(Box::new(route_error(
             route,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Could not read the request body.",
         )));
     };
@@ -2078,7 +2084,7 @@ async fn read_command<T: serde::de::DeserializeOwned>(
         Box::new(route_error(
             route,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             shape,
         ))
     })
@@ -2169,7 +2175,7 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
         return route_error(
             &DISABLED_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Both \"query\" (string) and \"disabled\" (bool) are required.",
         );
     };
@@ -2177,7 +2183,7 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
         return route_error(
             &DISABLED_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"query\" must not be empty.",
         );
     }
@@ -2186,13 +2192,13 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
         SetDisabledOutcome::NoMatch => route_error(
             &DISABLED_ROUTE,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             &format!("No account in the live rotation matches '{query}'."),
         ),
         SetDisabledOutcome::Ambiguous(names) => route_error(
             &DISABLED_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&query, &names),
         ),
         SetDisabledOutcome::Applied { name, persist } => json_ok(
@@ -2288,7 +2294,7 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
         return route_error(
             &PRIORITY_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "Both \"query\" (string) and \"priority\" (integer) are required.",
         );
     };
@@ -2296,7 +2302,7 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
         return route_error(
             &PRIORITY_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"query\" must not be empty.",
         );
     }
@@ -2305,13 +2311,13 @@ async fn set_priority_handler(State(manager): State<Arc<Manager>>, req: Request)
         SetPriorityOutcome::NoMatch => route_error(
             &PRIORITY_ROUTE,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             &format!("No account in the live rotation matches '{query}'."),
         ),
         SetPriorityOutcome::Ambiguous(names) => route_error(
             &PRIORITY_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&query, &names),
         ),
         SetPriorityOutcome::Applied { name } => {
@@ -2382,7 +2388,7 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
             return route_error(
                 &CONFIG_ROUTE,
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                ErrorKind::InvalidRequest,
                 &refusal.to_string(),
             );
         }
@@ -2399,13 +2405,13 @@ async fn config_set_handler(State(manager): State<Arc<Manager>>, req: Request) -
         Err(crate::manager::SettingPersistError::NoConfigFile) => route_error(
             &CONFIG_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "This proxy was started without a config file, so it has nowhere to save a setting. Nothing was changed.",
         ),
         Err(crate::manager::SettingPersistError::WriteFailed(why)) => route_error(
             &CONFIG_ROUTE,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorKind::Api,
             &format!("The proxy could not write its config file: {why}"),
         ),
     }
@@ -2435,7 +2441,7 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
         return route_error(
             &CONTROL_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"query\" must not be empty; omit it or send null to clear.",
         );
     }
@@ -2445,7 +2451,7 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
         SetControlOutcome::NoMatch => route_error(
             &CONTROL_ROUTE,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            ErrorKind::NotFound,
             &format!(
                 "No account in the live rotation matches '{}'.",
                 parsed.query.unwrap_or_default()
@@ -2454,7 +2460,7 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
         SetControlOutcome::Ambiguous(names) => route_error(
             &CONTROL_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
         ),
         // 409, like the tie above: every `tcr control` client reads a stamped 404 or 409
@@ -2463,7 +2469,7 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
         SetControlOutcome::CodexAccount(name) => route_error(
             &CONTROL_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::manager::codex_control_refusal(&name),
         ),
         SetControlOutcome::Applied { name, persist } => json_ok(
@@ -2684,7 +2690,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         return route_error(
             &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"name\" (string) is required and must not be empty.",
         );
     };
@@ -2696,7 +2702,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         return route_error(
             &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "\"accessToken\" (string) is required and must not be empty.",
         );
     };
@@ -2708,7 +2714,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         return route_error(
             &ADD_ACCOUNT_ROUTE,
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             "tcr does not serve API-key accounts; add a Claude login instead.",
         );
     }
@@ -2745,7 +2751,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         AddAccountOutcome::Ambiguous(names) => route_error(
             &ADD_ACCOUNT_ROUTE,
             StatusCode::CONFLICT,
-            "invalid_request_error",
+            ErrorKind::InvalidRequest,
             &crate::cli::ambiguous_query_message(&query_name, &names),
         ),
         // The provider comes off the stored row, not the request: the echo is the
