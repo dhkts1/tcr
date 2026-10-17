@@ -37,7 +37,7 @@ private struct SectionHeader: View {
     let title: String
     let timing: SettingsRowTiming
     /// Stated ONCE for a section where every row shares it — "Edit in
-    /// ~/.config/teamclaude.json" no longer repeats under each of a
+    /// ~/.config/tcr.json" no longer repeats under each of a
     /// section's read-only values (review #30): four copies of one
     /// sentence out-inked the four numbers they annotated.
     var hint: String? = nil
@@ -80,9 +80,8 @@ private func rowTag(_ timing: SettingsRowTiming, inSection section: SettingsRowT
 /// Every read-only row's hint (bridge, § Panes): "a key with no write path
 /// today gets a read-only row and a hint", never a hand-rolled rewrite of the
 /// live config, which holds real credentials (`CLAUDE.md`). Names the file this
-/// Mac's `tcr` reads, `tcr.json` or an older install's `teamclaude.json`
-/// (``ConfigFileName``), resolved once when the window first draws a hint.
-private let readOnlyHint = "Edit in \(ConfigFileName.displayPath())"
+/// Mac's `tcr` reads.
+private let readOnlyHint = "Edit in ~/.config/tcr.json"
 
 /// `"1 account"` / `"2 accounts"` — this window's one plural count.
 private func pluralizedAccounts(_ count: Int) -> String {

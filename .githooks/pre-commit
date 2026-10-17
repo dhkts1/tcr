@@ -27,7 +27,7 @@ printf '%s\n' \
 #   - A missing formatter costs a red CI job. Recoverable, and visible.
 #   - A missing secret scanner costs a PUBLISHED credential. This repository is
 #     public, and the machine it is developed on holds live OAuth tokens in
-#     ~/.config/teamclaude.json. Once a token is pushed it is public forever;
+#     ~/.config/tcr.json. Once a token is pushed it is public forever;
 #     forks and clones keep their own copies of the history you rewrite.
 #
 # The warning also made README's promise — that this hook means no secret

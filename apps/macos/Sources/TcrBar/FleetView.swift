@@ -2021,7 +2021,7 @@ struct FleetView: View {
         }
     }
 
-    /// "teamclaude-rs · fable-5" — project and model on the session's title
+    /// "tcr · fable-5" — project and model on the session's title
     /// row, `docs/design/panel-tabs-mockup.html`'s `.sub`. Neither, one, or
     /// both may be missing (no session file, no reported model); this joins
     /// only what's present rather than drawing a bare "·". The model goes
@@ -2579,7 +2579,7 @@ struct FleetView: View {
         let subject: String
         let sessionName: String
 
-        /// "`cargo build --release` in teamclaude-rs-c7. The session gets a
+        /// "`cargo build --release` in tcr-c7. The session gets a
         /// tool error and continues."
         ///
         /// The second sentence is the one that decides the click: an operator
@@ -2868,7 +2868,7 @@ struct FleetView: View {
 
     /// Whose session a pooled tool call belongs to — the name every item on
     /// this tab leads with, through ``toolItem(entry:trailing:)``.
-    /// `docs/design/panel-tabs-mockup.html`'s "Bash · teamclaude-rs-c7" — the
+    /// `docs/design/panel-tabs-mockup.html`'s "Bash · tcr-c7" — the
     /// same ``JoinedSession/displayName`` the Sessions tab already draws for
     /// this session id, read off ``sessionFiles`` directly: `Fleet.toolsRunning`/
     /// `toolsSlowest` are pooled at the MODEL layer from the bare wire
@@ -4601,7 +4601,7 @@ extension View {
 /// One account.
 ///
 /// The enable/disable control is a `tcr` subprocess and nothing else: this app
-/// never touches `~/.config/teamclaude.json`, which holds credentials. The row
+/// never touches `~/.config/tcr.json`, which holds credentials. The row
 /// does not optimistically flip its own `disabled` — on success it asks for a
 /// fresh poll and renders whatever `tcr status` then reports, so a call that
 /// resolved to some other account shows up as the wrong row changing rather than

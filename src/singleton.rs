@@ -1,7 +1,7 @@
 //! Port-takeover singleton: only one proxy may own the configured port.
 //!
-//! The recurring failure is two proxies — a leftover JS `teamclaude` and/or a
-//! `tcr` — both refreshing the same accounts. Each holds its own in-memory copy of
+//! The recurring failure is two proxies on one port, both refreshing the same
+//! accounts. Each holds its own in-memory copy of
 //! the SINGLE-USE OAuth refresh tokens, so the first refresh by either revokes the
 //! other's copy and accounts flap to `error` (the "token war"). On startup we
 //! resolve the configured port down to exactly ONE proxy.
@@ -24,7 +24,7 @@
 //!   anything else) on another PORT is never touched, and a test server on an
 //!   ephemeral port is safe.
 //! - **Command-verified.** A candidate is signalled only if its command line is an
-//!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone rather
+//!   actual `tcr` *server*. A non-proxy holder is left alone rather
 //!   than killed — the bind then fails loudly with EADDRINUSE if that holder
 //!   shares our bind address (in practice, loopback), but not necessarily
 //!   otherwise; see [`port_listeners`]'s doc for the measured gap. This is what
@@ -55,9 +55,8 @@
 //!   so "command-verified" above still holds on the claim path; a pid the OS
 //!   recycled onto an unrelated listener is not signalled. See [`verified_owner`].
 //! - **The name matcher is RETAINED as the fallback**, so a `tcr` that predates
-//!   the owner file (including one serving right now) and a `LegacyJs` proxy —
-//!   which will never write one — are recognized exactly as before. Nothing has
-//!   to restart for this change to be safe.
+//!   the owner file (including one serving right now) is recognized exactly as
+//!   before. Nothing has to restart for this change to be safe.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -69,14 +68,12 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, Update
 
 /// Which proxy a recognized incumbent is. The distinction is load-bearing for
 /// [`takeover_decision`], not cosmetic: a `tcr` peer is a program that is doing
-/// this program's job and whose session pins cost real money to discard, while a
-/// leftover JS `teamclaude` is the thing this module was written to displace.
+/// this program's job and whose session pins cost real money to discard, while an
+/// embedded one belongs to a host application that must never be signalled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyKind {
     /// The Rust proxy running as its own process — a peer of ours.
     Tcr,
-    /// The legacy JS proxy (`node …/teamclaude server`).
-    LegacyJs,
     /// The Rust proxy running **inside another program** (the menu-bar app),
     /// which said so in its owner file ([`ProxyHost::Embedded`]).
     ///
@@ -367,11 +364,10 @@ pub struct Incumbent {
     pub kind: ProxyKind,
 }
 
-/// Does this argv look like a teamclaude/tcr *server* — a process safe to
-/// replace as a proxy incumbent on the port? Recognizes the JS proxy
-/// (`node …/teamclaude server`) and the Rust proxy (`…/tcr` at argv0, with the
-/// `server` subcommand, no subcommand, or a flag — since bare `tcr` defaults to the
-/// server). Never matches a bare `grep`/editor/`tcr run`/`teamclaude run`/etc.
+/// Does this argv look like a `tcr` *server* — a process safe to replace as a
+/// proxy incumbent on the port? Recognizes `…/tcr` at argv0, with the `server`
+/// subcommand, no subcommand, or a flag — since bare `tcr` defaults to the
+/// server. Never matches a bare `grep`/editor/`tcr run`/etc.
 ///
 /// Takes pre-split argv (`&[String]`, as [`sysinfo::Process::cmd`] returns it —
 /// kernel-tokenized from `/proc/<pid>/cmdline` on Linux, `libproc` argv on macOS),
@@ -394,22 +390,9 @@ pub fn classify_proxy_server(argv: &[String]) -> Option<ProxyKind> {
     if argv.is_empty() {
         return None;
     }
-    let is_node = |t: &str| t == "node" || t.ends_with("/node");
-    let js_bin = crate::legacy_names::JS_PROXY_BIN;
-    let is_js_proxy =
-        |t: &str| t == js_bin || t.strip_suffix(js_bin).is_some_and(|dir| dir.ends_with('/'));
     let is_tcr = |t: &str| t == "tcr" || t.ends_with("/tcr");
 
-    // JS proxy: the teamclaude bin must be the executed program (argv0, or the arg
-    // right after `node`) AND the subcommand must be `server`.
-    if let Some(i) = argv.iter().position(|t| is_js_proxy(t)) {
-        let is_program = i == 0 || is_node(&argv[i - 1]);
-        if is_program && argv.get(i + 1).map(String::as_str) == Some("server") {
-            return Some(ProxyKind::LegacyJs);
-        }
-    }
-
-    // Rust proxy: `tcr` at argv0. A server unless the subcommand is a recognized
+    // `tcr` at argv0. A server unless the subcommand is a recognized
     // NON-server verb; bare `tcr`, `tcr server`, and `tcr --flag` are all servers.
     if is_tcr(&argv[0]) {
         return match argv.get(1).map(String::as_str) {
@@ -478,8 +461,7 @@ fn process_command(pid: u32) -> Vec<String> {
 /// still true and load-bearing throughout — but "no takeover" is not a
 /// consequence of it, and where a bind fails to actually refuse depends on
 /// the incumbent's address AND the platform, not merely on the port being
-/// held. Whether the legacy JS proxy actually binds wildcard is a separate,
-/// unmeasured claim about node's defaults. `oauth::login`'s
+/// held. `oauth::login`'s
 /// guard binds nothing at all, so no backstop of any strength applies to it:
 /// on an enumeration failure it proceeds beside a live server it failed to
 /// detect, and the server's next `persist_tokens` writes its boot-time tokens
@@ -532,8 +514,7 @@ fn process_command(pid: u32) -> Vec<String> {
 /// **Dedup, order-preserving.** One process can hold several LISTEN sockets on
 /// the same port at once — the common case is a dual-stack bind,
 /// `127.0.0.1:<port>` plus `[::1]:<port>` from one `bind(0.0.0.0)`/`bind(::)`
-/// call, which is how a Node HTTP server (including the legacy JS proxy this
-/// module exists to migrate off of) listens by default. [`listeners::Listener`]
+/// call, which is how a Node HTTP server listens by default. [`listeners::Listener`]
 /// derives `Hash`/`Eq` over `{process, socket, protocol, state}`, and `socket` is
 /// part of that key, so `get_all()`'s internal `HashSet` keeps both sockets as
 /// separate entries — the same pid then appears twice in this function's output.
@@ -615,7 +596,7 @@ pub fn replaceable_incumbents_with_owner(
         .collect()
 }
 
-/// Detection-only: the PID of a live teamclaude/tcr *server* currently holding
+/// Detection-only: the PID of a live `tcr` *server* currently holding
 /// `port`, if any. Reuses the exact port-scoped, command-verified decision as
 /// [`takeover_port`] ([`replaceable_incumbents`]) but signals NOTHING — `tcr login` uses
 /// it to REFUSE to run beside a live server (the server reads config only at boot,
@@ -663,7 +644,7 @@ fn is_alive(pid: u32) -> bool {
 /// a second of refused connections even when the incumbent had already exited.
 /// Measured 2026-09-13 across three restarts, the port sat unbound for 1.124s,
 /// 0.976s and 1.020s (`no longer accepting` to `server started` in
-/// `~/.cache/teamclaude/logs/`), nearly all of it spent sleeping out this
+/// the server's own log), nearly all of it spent sleeping out this
 /// window after the incumbent was already gone.
 const TERM_GRACE: Duration = Duration::from_millis(800);
 
@@ -766,10 +747,6 @@ pub enum Takeover {
 ///
 /// A [`ProxyKind::Tcr`] incumbent is the one that is protected by default: it is
 /// doing this program's job, and replacing it wipes its session→account pin map.
-/// A [`ProxyKind::LegacyJs`] incumbent is NOT protected, because displacing it is
-/// the reason this module exists. Standing down for it would leave the JS proxy
-/// serving forever and make `tcr` unable to complete the migration it was
-/// installed for — and the two would token-war the moment tcr did bind elsewhere.
 ///
 /// A [`ProxyKind::TcrEmbedded`] incumbent is checked BEFORE `replace`, and is the
 /// one kind `--replace` cannot override: the pid on the port belongs to the host
@@ -802,13 +779,11 @@ pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
 ///
 /// Gated on [`takeover_decision`] rather than reimplementing its reasoning, so
 /// "we proceeded" and "we signalled exactly these" cannot drift apart: a
-/// stand-down signals NOTHING, including a legacy JS proxy sharing the port with
-/// the `tcr` peer we are standing down for. Half-killing there would leave the
-/// port held by the survivor and this process refusing to bind anyway — all cost,
-/// no benefit.
+/// stand-down signals NOTHING. Half-killing there would leave the port held by
+/// the survivor and this process refusing to bind anyway — all cost, no benefit.
 ///
-/// Past that gate: with `--replace`, every incumbent. Without it, only the legacy
-/// JS proxy, which is the one case that reaches `Proceed` unasked.
+/// Past that gate: with `--replace`, every incumbent. Without it, none: a run
+/// that reaches `Proceed` unasked found no incumbent to signal.
 ///
 /// A [`ProxyKind::TcrEmbedded`] incumbent is filtered out unconditionally, on top
 /// of the stand-down gate that already covers it. Both, deliberately: signalling
@@ -818,34 +793,34 @@ pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
 ///
 /// # The one stand-down that is not "touch nothing": `--replace` past an embedded
 ///
-/// `port_listeners` filters by port, not by address, so a legacy JS
-/// `teamclaude server` on `[::1]:3456` and an embedded tcr on `127.0.0.1:3456`
-/// are both holders. Reading the embedded stand-down as "signal nothing" made
-/// that JS proxy undisplaceable on EVERY path — `--replace` included, since the
-/// embedded check precedes it — and the two proxies then token-war over the same
+/// `port_listeners` filters by port, not by address, so a `tcr server` on
+/// `[::1]:3456` and an embedded tcr on `127.0.0.1:3456` are both holders.
+/// Reading the embedded stand-down as "signal nothing" would make that second
+/// proxy undisplaceable on EVERY path — `--replace` included, since the embedded
+/// check precedes it — and the two proxies would then token-war over the same
 /// single-use refresh tokens forever, which is the failure this module exists to
 /// end. So the kinds are partitioned rather than collapsed: the embedded
 /// incumbent is never signalled and still stands us down, while an explicit
 /// `--replace` still reaches the NON-embedded incumbents beside it. That is the
-/// escape hatch `takeover_decision`'s doc-comment promises for a `LegacyJs`
-/// incumbent, and it is the only way to honour both rules at once.
+/// only way to honour both rules at once.
 ///
-/// Without `--replace` a stand-down still signals nothing at all, embedded or
-/// not: the operator did not ask for a kill, and killing half the port's holders
-/// while refusing to bind is all cost and no benefit.
+/// Without `--replace` nothing is signalled at all, embedded or not: the
+/// operator did not ask for a kill.
 fn incumbents_to_signal(replaceable: &[Incumbent], replace: bool) -> Vec<Incumbent> {
+    if !replace {
+        return Vec::new();
+    }
     let embedded_present = replaceable
         .iter()
         .any(|incumbent| incumbent.kind == ProxyKind::TcrEmbedded);
     let stood_down = takeover_decision(replaceable, replace) != Takeover::Proceed;
-    if stood_down && !(embedded_present && replace) {
+    if stood_down && !embedded_present {
         return Vec::new();
     }
     replaceable
         .iter()
         .copied()
         .filter(|incumbent| incumbent.kind != ProxyKind::TcrEmbedded)
-        .filter(|incumbent| replace || incumbent.kind == ProxyKind::LegacyJs)
         .collect()
 }
 
@@ -901,8 +876,7 @@ fn embedded_stand_down_message(port: u16, pid: u32) -> String {
 /// With `replace`, a recognized proxy incumbent is terminated (SIGTERM, then
 /// SIGKILL a survivor after a grace) so this instance can bind. Without it — the
 /// DEFAULT — a `tcr` incumbent is reported and left running, and the caller is
-/// told to exit rather than bind; a LEGACY JS incumbent is still replaced, since
-/// displacing it is what this module is for. A non-proxy holder is reported and
+/// told to exit rather than bind. A non-proxy holder is reported and
 /// LEFT ALONE in every case — the bind then fails loudly with EADDRINUSE if
 /// that holder shares our bind address (in practice, loopback); against a
 /// wildcard-bound holder the bind is not guaranteed to refuse, see
@@ -946,7 +920,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 
     // Not `else`: standing down for an EMBEDDED incumbent still lets an explicit
     // `--replace` displace the non-embedded proxies sharing the port. See
-    // `incumbents_to_signal`; without it a legacy JS proxy co-resident with an
+    // `incumbents_to_signal`; without it a second proxy co-resident with an
     // embedded tcr is undisplaceable on every path.
     for Incumbent { pid, kind } in incumbents_to_signal(&replaceable, replace) {
         match kind {
@@ -962,10 +936,6 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
                 );
                 continue;
             }
-            ProxyKind::LegacyJs => eprintln!(
-                "[tcr] replacing the legacy JS {} proxy on :{port} (pid {pid}) — migrating the port to tcr; leaving it running would token-war over the same single-use refresh tokens.",
-                crate::legacy_names::JS_PROXY_BIN
-            ),
             ProxyKind::Tcr => eprintln!(
                 "[tcr] replacing existing proxy on :{port} (pid {pid}) — one proxy per port, or the two mutually invalidate each other's single-use refresh tokens (token war)."
             ),
@@ -1061,8 +1031,7 @@ mod tests {
     /// The real defect, end to end, not just the pure dedup helper in isolation:
     /// bind `0.0.0.0:0` to get an OS-assigned port, then bind `[::]:<that same
     /// port>` in the SAME process — the dual-stack pattern a default-configured
-    /// Node HTTP server (including the legacy JS proxy this module migrates off
-    /// of) produces from one `listen()` call. Both are genuine LISTEN sockets on
+    /// Node HTTP server produces from one `listen()` call. Both are genuine LISTEN sockets on
     /// the same pid and port, so without the dedup this reports `[pid, pid]` and
     /// callers that read the first element still get the right pid — but the
     /// `takeover_port` signal loop iterates the WHOLE list, so the SIGTERM ->
@@ -1344,37 +1313,14 @@ mod tests {
     /// [`sysinfo::Process::cmd`] returns (pre-tokenized, no shell/whitespace
     /// splitting involved). Test-only stand-in for a real process's argv, kept
     /// tight so no test has to hand-expand every literal into a `Vec`.
-    ///
-    /// `{js}` in a part becomes [`crate::legacy_names::JS_PROXY_BIN`], so a
-    /// test can spell a JS-proxy path like `/opt/nvm/bin/{js}` without writing
-    /// the old name outside `legacy_names.rs`.
     fn argv(parts: &[&str]) -> Vec<String> {
-        parts
-            .iter()
-            .map(|s| s.replace("{js}", crate::legacy_names::JS_PROXY_BIN))
-            .collect()
-    }
-
-    #[test]
-    fn recognizes_js_proxy_server() {
-        assert!(is_proxy_server(&argv(&[
-            "node",
-            "/opt/nvm/bin/{js}",
-            "server"
-        ])));
-        assert!(is_proxy_server(&argv(&[
-            "node",
-            "/path/{js}",
-            "server",
-            "-r"
-        ])));
-        assert!(is_proxy_server(&argv(&["/path/{js}", "server"]))); // shebang exec
+        parts.iter().map(|s| (*s).to_string()).collect()
     }
 
     #[test]
     fn recognizes_tcr_server() {
         assert!(is_proxy_server(&argv(&[
-            "/opt/{js}-rs/target/release/tcr",
+            "/opt/tcr/target/release/tcr",
             "server"
         ])));
         assert!(is_proxy_server(&argv(&["tcr"]))); // bare = default server
@@ -1384,23 +1330,12 @@ mod tests {
 
     #[test]
     fn rejects_non_servers() {
-        assert!(!is_proxy_server(&argv(&["node", "/path/{js}", "run"])));
-        assert!(!is_proxy_server(&argv(&[
-            "node",
-            "/path/{js}",
-            "run",
-            "-r"
-        ])));
         assert!(!is_proxy_server(&argv(&["/x/tcr", "run"])));
         assert!(!is_proxy_server(&argv(&["/x/tcr", "status"])));
         assert!(!is_proxy_server(&argv(&["/x/tcr", "accounts"])));
-        assert!(!is_proxy_server(&argv(&[
-            "grep",
-            crate::legacy_names::JS_PROXY_BIN,
-            "server"
-        ]))); // teamclaude is a search term
         assert!(!is_proxy_server(&argv(&["rg", "tcr", "server"])));
-        assert!(!is_proxy_server(&argv(&["vim", "{js}-server.md"])));
+        assert!(!is_proxy_server(&argv(&["vim", "tcr-server.md"])));
+        assert!(!is_proxy_server(&argv(&["node", "/path/tcr", "server"])));
         assert!(!is_proxy_server(&argv(&[])));
         assert!(!is_proxy_server(&argv(&["node", "/path/other", "server"])));
     }
@@ -1409,13 +1344,6 @@ mod tests {
         Incumbent {
             pid,
             kind: ProxyKind::Tcr,
-        }
-    }
-
-    fn legacy_js(pid: u32) -> Incumbent {
-        Incumbent {
-            pid,
-            kind: ProxyKind::LegacyJs,
         }
     }
 
@@ -1693,13 +1621,10 @@ mod tests {
                 "replace={replace} must not be able to take over an embedded proxy"
             );
         }
-        // And it wins over a legacy JS proxy sharing the port, in either order:
-        // proceeding for the JS proxy means SIGNALLING it, and this process would
+        // And it wins over a `tcr` peer sharing the port, in either order:
+        // proceeding for the peer means SIGNALLING it, and this process would
         // still refuse to bind afterwards.
-        for holders in [
-            vec![legacy_js(111), embedded(777)],
-            vec![embedded(777), legacy_js(111)],
-        ] {
+        for holders in [vec![tcr(111), embedded(777)], vec![embedded(777), tcr(111)]] {
             assert_eq!(
                 takeover_decision(&holders, true),
                 Takeover::IncumbentPresent(embedded(777)),
@@ -1719,7 +1644,7 @@ mod tests {
                 "replace={replace}: an embedded proxy must never be signalled"
             );
             assert!(
-                !incumbents_to_signal(&[embedded(777), legacy_js(111)], replace)
+                !incumbents_to_signal(&[embedded(777), tcr(111)], replace)
                     .iter()
                     .any(|incumbent| incumbent.kind == ProxyKind::TcrEmbedded),
                 "replace={replace}: not even beside another incumbent on the port"
@@ -1728,31 +1653,27 @@ mod tests {
         // Without --replace nothing at all is signalled: the operator asked for no
         // kill, and half-killing while refusing to bind is all cost, no benefit.
         assert_eq!(
-            incumbents_to_signal(&[embedded(777), legacy_js(111)], false),
+            incumbents_to_signal(&[embedded(777), tcr(111)], false),
             vec![]
         );
     }
 
     /// THE ESCAPE HATCH, and the reason the embedded stand-down is not read as
-    /// "touch nothing": a legacy JS proxy sharing the port with an embedded tcr
+    /// "touch nothing": a `tcr server` sharing the port with an embedded tcr
     /// must still be displaceable with `--replace`.
     ///
-    /// `port_listeners` filters by port and not by address, so `node …/teamclaude
-    /// server` on `[::1]:3456` and an embedded tcr on `127.0.0.1:3456` are both
-    /// holders. Collapsing that to one kind-blind stand-down left the JS proxy
-    /// serving forever on every path — and `takeover_decision`'s own doc-comment
-    /// says that outcome is unacceptable, because the two then token-war over the
-    /// same single-use refresh tokens with no way out.
+    /// `port_listeners` filters by port and not by address, so `tcr server` on
+    /// `[::1]:3456` and an embedded tcr on `127.0.0.1:3456` are both holders.
+    /// Collapsing that to one kind-blind stand-down would leave the second proxy
+    /// serving forever on every path, and the two would token-war over the same
+    /// single-use refresh tokens with no way out.
     #[test]
-    fn replace_still_displaces_a_legacy_js_proxy_beside_an_embedded_incumbent() {
-        for holders in [
-            vec![legacy_js(111), embedded(777)],
-            vec![embedded(777), legacy_js(111)],
-        ] {
+    fn replace_still_displaces_a_tcr_peer_beside_an_embedded_incumbent() {
+        for holders in [vec![tcr(111), embedded(777)], vec![embedded(777), tcr(111)]] {
             assert_eq!(
                 incumbents_to_signal(&holders, true),
-                vec![legacy_js(111)],
-                "--replace must still reach the JS proxy, and ONLY it: {holders:?}"
+                vec![tcr(111)],
+                "--replace must still reach the peer, and ONLY it: {holders:?}"
             );
             // We still do not bind: the embedded proxy legitimately holds the port
             // and the stand-down is unchanged. Ending the token war and taking the
@@ -1946,11 +1867,7 @@ mod tests {
     #[test]
     fn classify_names_which_proxy_it_found() {
         assert_eq!(
-            classify_proxy_server(&argv(&["node", "/opt/nvm/bin/{js}", "server"])),
-            Some(ProxyKind::LegacyJs)
-        );
-        assert_eq!(
-            classify_proxy_server(&argv(&["/opt/{js}-rs/target/release/tcr", "server"])),
+            classify_proxy_server(&argv(&["/opt/tcr/target/release/tcr", "server"])),
             Some(ProxyKind::Tcr)
         );
         assert_eq!(classify_proxy_server(&argv(&["tcr"])), Some(ProxyKind::Tcr));
@@ -1961,17 +1878,17 @@ mod tests {
     fn replaceable_incumbents_filters_self_and_non_proxies() {
         let command = |pid: u32| -> Vec<String> {
             match pid {
-                111 => argv(&["node", "/x/{js}", "server"]),
+                111 => argv(&["/usr/local/bin/tcr"]),
                 222 => argv(&["/x/tcr", "server"]),
-                333 => argv(&["grep", crate::legacy_names::JS_PROXY_BIN, "server"]), // non-proxy on the port
+                333 => argv(&["grep", "tcr", "server"]), // non-proxy on the port
                 444 => argv(&["/x/tcr", "run"]),
                 _ => Vec::new(),
             }
         };
         // 999 is self; 333/444 are non-proxies → only 111 and 222 survive, each
-        // carrying WHICH proxy it is, because the default treats them differently.
+        // carrying WHICH proxy it is.
         let replace = replaceable_incumbents(&[111, 222, 333, 444, 999], 999, command);
-        assert_eq!(replace, vec![legacy_js(111), tcr(222)]);
+        assert_eq!(replace, vec![tcr(111), tcr(222)]);
     }
 
     #[test]
@@ -2004,30 +1921,6 @@ mod tests {
             incumbents_to_signal(&[tcr(4242)], true),
             vec![tcr(4242)],
             "and it is the incumbent that gets signalled"
-        );
-    }
-
-    /// THE MIGRATION CASE. `classify_proxy_server` recognizes the JS proxy
-    /// precisely so the port can be RECLAIMED from it — the failure this module's
-    /// doc-comment names. Standing down for it would leave `node …/teamclaude
-    /// server` serving every request forever, and a user who installed tcr to
-    /// replace it would never get the port without a flag nothing tells them
-    /// about. It is not a peer whose prompt cache we are protecting; it is the
-    /// other half of the token war.
-    #[test]
-    fn a_legacy_js_incumbent_is_replaced_by_default() {
-        assert_eq!(
-            takeover_decision(&[legacy_js(111)], false),
-            Takeover::Proceed,
-            "the JS proxy is the incumbent this module exists to displace"
-        );
-        assert_eq!(
-            incumbents_to_signal(&[legacy_js(111)], false),
-            vec![legacy_js(111)],
-            "proceeding past a JS incumbent means SIGNALLING it — leaving it \
-             running risks the two proxies token-warring instead, not \
-             necessarily a loud EADDRINUSE; see `port_listeners`' doc on the \
-             wildcard gap"
         );
     }
 
@@ -2074,19 +1967,15 @@ mod tests {
         );
     }
 
-    /// Several incumbents at once (a leftover JS `teamclaude` beside a `tcr`):
-    /// the `tcr` peer wins the protection whatever order `lsof` returned them in,
+    /// Several `tcr` peers at once: the first one listed wins the protection,
     /// and standing down signals NOTHING — a half-kill would leave the port held
     /// by the survivor and this process refusing to bind anyway.
     #[test]
-    fn a_tcr_peer_protects_the_port_even_beside_a_legacy_js_incumbent() {
-        for holders in [
-            vec![legacy_js(111), tcr(222)],
-            vec![tcr(222), legacy_js(111)],
-        ] {
+    fn several_tcr_peers_stand_us_down_and_none_is_signalled() {
+        for holders in [vec![tcr(111), tcr(222)], vec![tcr(222), tcr(111)]] {
             assert_eq!(
                 takeover_decision(&holders, false),
-                Takeover::IncumbentPresent(tcr(222)),
+                Takeover::IncumbentPresent(holders[0]),
                 "the protected peer is the one named: {holders:?}"
             );
             assert_eq!(

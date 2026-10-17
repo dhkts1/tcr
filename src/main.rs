@@ -1,6 +1,6 @@
 //! `tcr` — the command-line binary.
 //!
-//! Boot sequence (DESIGN §main): load the drop-in config → hand it to
+//! Boot sequence (DESIGN §main): load the config → hand it to
 //! [`tcr::server::serve`], which builds the [`Manager`], spawns the
 //! axum proxy task and the background loops, and binds → run the TUI (or block
 //! in `--headless`) → shut the handle down, which flushes on exit.
@@ -122,11 +122,6 @@ enum Command {
     Wrap(WrapArgs),
     /// Self-update: `git pull --ff-only` + `cargo build --release` in the checkout.
     Update(UpdateArgs),
-    /// Move an existing install's `teamclaude` config file and cache directory
-    /// to the `tcr` names. Refuses (exit 3) while a tcr server is running.
-    /// TcrBar runs it at launch, before it starts its server, whenever old names
-    /// are still there; `tcr update` runs it after updating.
-    Migrate(MigrateArgs),
     /// Render the TUI against fake accounts (for a sanitized README screenshot).
     Demo,
     /// Open TcrBar, the macOS menu-bar app (macOS only).
@@ -1436,13 +1431,6 @@ struct WrapArgs {
 }
 
 #[derive(clap::Args)]
-struct MigrateArgs {
-    /// Print one JSON object saying what moved, what was left and why.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(clap::Args)]
 struct UpdateArgs {
     /// Rebuild even when `git pull` reports the checkout is already up to date.
     #[arg(long)]
@@ -1713,23 +1701,11 @@ async fn run_main() -> anyhow::Result<()> {
         Some(Command::List(args)) => run_list(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),
-        Some(Command::Migrate(args)) => run_migrate(args),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
         Some(Command::Ui) => run_ui(),
         Some(Command::Doctor(args)) => run_doctor(args).await,
         Some(Command::Setup(args)) => run_setup(args),
         None => run_server(cli.server).await,
-    }
-}
-
-/// `tcr migrate [--json]`: move the old-name files ([`tcr::migrate`]), exiting
-/// non-zero when it refused or a rename failed.
-fn run_migrate(args: MigrateArgs) -> anyhow::Result<()> {
-    let run = tcr::migrate::run();
-    tcr::migrate::print(&run, args.json);
-    match run.exit_code() {
-        0 => Ok(()),
-        code => std::process::exit(code),
     }
 }
 
@@ -6432,8 +6408,7 @@ fn codex_command() -> anyhow::Result<(std::process::Command, PathBuf)> {
 /// `tcr run [--codex] [-- args…]` — launch Claude Code, or `codex` with
 /// `--codex`, already pointed at this proxy.
 ///
-/// Mirrors the JS `teamclaude run` passthrough contract: if the proxy is not
-/// listening we launch `claude` untouched, so a stopped proxy never breaks the
+/// If the proxy is not listening we launch `claude` untouched, so a stopped proxy never breaks the
 /// shell alias.
 ///
 /// `codex` is routed in see-through mode or not at all: tcr has no base-URL
@@ -6663,8 +6638,7 @@ impl CodexLaunch {
 ///   account (in any state, as the proxy counts them), and its CA is on disk.
 ///   `tcr status` words the same decision, so the two never disagree.
 /// * Direct otherwise, with the route's reason. Only a proxy that predates the
-///   status key is told to restart: a JS leaf, or MITM off, survives any
-///   restart.
+///   status key is told to restart: MITM off survives any restart.
 ///
 /// Every direct launch also drops the inherited proxy variables that point at
 /// this tcr ([`proxy_vars_at`]), so a tcr that is down, or not intercepting,
@@ -7445,7 +7419,7 @@ fn apply_base_url_env(cmd: &mut std::process::Command, port: u16, key: &LaunchKe
         );
     }
     // Here we speak plain HTTP on loopback and present NO leaf. An ambient
-    // HTTPS_PROXY (e.g. the JS teamclaude on :3456) would hijack claude's traffic
+    // HTTPS_PROXY (e.g. another proxy on :3456) would hijack claude's traffic
     // away from us, and its NODE_EXTRA_CA_CERTS would be verifying a cert we never
     // send. Strip both so `tcr run` is self-contained and can't be captured by a
     // stale env. See-through mode does the opposite — it SETS these two, which is
@@ -7512,7 +7486,7 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 }
 
 /// `tcr login` — browser OAuth PKCE flow that authenticates a Claude account
-/// and appends (or updates) it in the drop-in config, OR (`--token`) a
+/// and appends (or updates) it in the config, OR (`--token`) a
 /// `claude setup-token` credential read from stdin. The heavy lifting lives
 /// in [`oauth::login`] / [`oauth::login_with_token`]; this just resolves the
 /// config path and reports.
@@ -7706,8 +7680,8 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let file_log = init_tracing(args.headless);
 
     // A misspelled key is kept in the file and has no effect, so say so once
-    // at boot. Never fatal: the file is shared with teamclaude and its
-    // unmodelled keys are kept on purpose (see `config_keys`).
+    // at boot. Never fatal: unmodelled keys are kept on purpose (see
+    // `config_keys`).
     if let Some(line) = config_keys::boot_line(&config_keys::unknown_keys(
         &serde_json::Value::Object(config.extra.clone()),
     )) {
@@ -7758,7 +7732,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         incumbent: if args.replace {
             server::IncumbentPolicy::kill_the_incumbent_proxy()
         } else {
-            server::IncumbentPolicy::replace_legacy_js_only()
+            server::IncumbentPolicy::report_and_stand_down()
         },
         affinity_path: Some(affinity::default_path()),
         // The Sessions/Tools panel cache, a binary-only side effect exactly like the
@@ -7955,7 +7929,7 @@ const fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
              normal shutdown, losing the session→account pin map. Quit the host application and \
              start it again to recover a wedged embedded proxy."
         }
-        singleton::ProxyKind::Tcr | singleton::ProxyKind::LegacyJs => {
+        singleton::ProxyKind::Tcr => {
             "Run `tcr --replace` to take the port over; that is the recovery for a wedged proxy, \
              and it is not being done automatically because it also wipes the pin map of a proxy \
              that was merely slow to answer."
@@ -8069,10 +8043,8 @@ fn default_config() -> Config {
 }
 
 /// The one shared, well-known, non-private directory both modes log into:
-/// `logs/` in the cache directory, `~/.cache/tcr/logs/` on a fresh install and
-/// `~/.cache/teamclaude/logs/` on one that has only the old directory
-/// (`tcr::paths::cache_dir`), with the log file prefix that goes
-/// with that directory.
+/// `logs/` in the cache directory, `~/.cache/tcr/logs/`
+/// (`tcr::paths::cache_dir`), with the log file prefix `tcr.log`.
 ///
 /// The path is fixed for **human discoverability** — so `rg 'server started'
 /// ~/.cache/tcr/logs/*` always finds the right directory — not because any code
@@ -8083,12 +8055,11 @@ fn default_config() -> Config {
 ///
 /// This used to compute the cache base separately from
 /// `affinity::default_path`, so a log-path bug could not brush the pin file.
-/// It now shares `paths::cache_dir` with it on purpose: two resolutions of
-/// "old directory or new" could disagree, and an install would split its cache
-/// across two folders.
+/// It now shares `paths::cache_dir` with it on purpose: two resolutions of the
+/// cache directory could disagree, and an install would split its cache across
+/// two folders.
 fn log_location() -> (PathBuf, &'static str) {
-    let cache = tcr::paths::cache_dir();
-    (cache.log_dir(), cache.log_prefix())
+    (tcr::paths::cache_dir().log_dir(), tcr::paths::LOG_PREFIX)
 }
 
 /// Open the durable, rotating log directory, injectable for tests so they never
@@ -8101,7 +8072,7 @@ fn log_location() -> (PathBuf, &'static str) {
 /// `OpenOptions::append(true).create(true)` only), so a rotating file cannot be
 /// made owner-only the way the old single file was. Confidentiality is enforced
 /// on the *directory* instead, and it is load-bearing on Linux CI targets, not
-/// belt-and-braces: the parent cache directory (`~/.cache/tcr/`, or `~/.cache/teamclaude/` on an install that has it) is `0755` (protects its
+/// belt-and-braces: the parent cache directory (`~/.cache/tcr/`) is `0755` (protects its
 /// existing contents by *file* mode — `session-affinity.json` is `0600`), so
 /// without an owner-only `logs/` subdirectory, files landing at the crate's
 /// default `0644` would be world-readable on any multi-user box. The mode is
@@ -8133,8 +8104,7 @@ fn log_location() -> (PathBuf, &'static str) {
 /// `.recursive(true)` creates every missing path component, parents included,
 /// **carrying the same `0700` mode** — this is not confined to `logs/` itself.
 /// On a fresh install or in a container where the cache directory
-/// (`~/.cache/tcr/`, or `~/.cache/teamclaude/` on an install that has it, or
-/// even `~/.cache/`) does not yet exist, this call creates it at `0700`, changing a
+/// (`~/.cache/tcr/`, or even `~/.cache/`) does not yet exist, this call creates it at `0700`, changing a
 /// directory shared with every other application on the machine. That is
 /// invisible on a dev box where both already exist at `0755`, but it is real,
 /// measured behaviour of `DirBuilder::recursive`, not a hypothetical.
@@ -8142,12 +8112,7 @@ fn log_location() -> (PathBuf, &'static str) {
 /// Rotation is `DAILY` with `max_log_files(5)`: measured against the live log
 /// (2026-08-08) at ~13.5 MiB/day, this bounds this directory's steady-state
 /// disk use to roughly 65-70 MiB instead of genuinely unbounded growth. That
-/// is **not** a wash against the old file: the pre-upgrade
-/// `$TMPDIR/teamclaude-rs.log` (~62 MiB, measured 2026-08-08) is left in
-/// place deliberately (deprecate, don't delete — nothing here removes an
-/// operator's existing evidence), so the true post-upgrade footprint is that
-/// ~62 MiB orphan **plus** the new 65-70 MiB, until an operator cleans the
-/// orphan up by hand. It is a wall-clock bound, not a byte-size bound: a single unusually
+/// is a wall-clock bound, not a byte-size bound: a single unusually
 /// verbose day can still exceed the per-file average before the next
 /// rotation, so this is a soft cap, not a hard one. Rotation also rolls on
 /// `Rotation::DAILY`'s UTC clock (`rolling.rs` uses `OffsetDateTime::now_utc`),
@@ -8867,16 +8832,14 @@ mod tests {
             embedded.contains("Quit the host application"),
             "must name the recovery that works: {embedded}"
         );
-        // The control: for the kinds `--replace` CAN take over, the prescription is
+        // The control: for the kind `--replace` CAN take over, the prescription is
         // unchanged — so the assertions above are about the kind, not about the
         // advice having been dropped for everyone.
-        for kind in [singleton::ProxyKind::Tcr, singleton::ProxyKind::LegacyJs] {
-            let advice = wedged_incumbent_recovery(kind);
-            assert!(
-                advice.contains("Run `tcr --replace`"),
-                "{kind:?} is recoverable by --replace: {advice}"
-            );
-        }
+        let advice = wedged_incumbent_recovery(singleton::ProxyKind::Tcr);
+        assert!(
+            advice.contains("Run `tcr --replace`"),
+            "Tcr is recoverable by --replace: {advice}"
+        );
     }
 
     /// The ordinary stand-down: a peer is serving this binary's commit. Exit 0,
@@ -9019,9 +8982,9 @@ mod tests {
     }
 
     /// Every `--config` flag, on every verb, says the default once and the same
-    /// way: the new file, and that an existing old one is still used.
+    /// way.
     #[test]
-    fn every_config_flag_states_both_default_files() {
+    fn every_config_flag_states_the_default_file() {
         fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, String)>) {
             for arg in cmd.get_arguments() {
                 if arg.get_long() == Some("config") {
@@ -9073,8 +9036,7 @@ mod tests {
             .render_help()
             .to_string();
         assert!(
-            rendered.contains(&format!("~/.config/{}", tcr::paths::CONFIG_FILE))
-                && rendered.contains(tcr::legacy_names::CONFIG_FILE),
+            rendered.contains(&format!("~/.config/{}", tcr::paths::CONFIG_FILE)),
             "{rendered}"
         );
     }
@@ -9462,8 +9424,8 @@ mod tests {
     /// "not listening" one included: a dead tcr behind that variable refuses the
     /// connection rather than launching anything.
     ///
-    /// Only the "key absent" row may tell the user to restart. A JS leaf and MITM
-    /// off both survive any restart, and saying otherwise sends the user to pay a
+    /// Only the "key absent" row may tell the user to restart. MITM off survives
+    /// any restart, and saying otherwise sends the user to pay a
     /// cold prompt cache for nothing.
     ///
     /// Mismatches are collected rather than asserted one at a time, so a
@@ -9546,21 +9508,6 @@ mod tests {
                     "the proxy on :3999 (build abc1234) predates Codex interception — restart \
                      it on this build at a quiet moment",
                 ),
-            ),
-            (
-                "the JS leaf",
-                CODEX_RUN,
-                live_status(Some(serde_json::json!({
-                    "interceptedHosts": ["api.anthropic.com"],
-                    "leaf": "js",
-                }))),
-                true,
-                direct(&format!(
-                    "the proxy on :3999 is serving the JS {} leaf, which covers \
-                     api.anthropic.com only and is never re-minted — a restart will not change \
-                     this; see docs/troubleshooting.md",
-                    tcr::legacy_names::JS_PROXY_BIN
-                )),
             ),
             (
                 "MITM off",
@@ -10542,7 +10489,7 @@ mod tests {
     /// not a private/generated path — so a human running the documented
     /// `rg 'server started' <cache dir>/logs/*` recipe can always find
     /// it. This is **not** because any code reads it back (a census —
-    /// `rg -n 'teamclaude-rs\.log|log_file_path|log_dir_path' src/ scripts/
+    /// `rg -n 'log_file_path|log_dir_path' src/ scripts/
     /// apps/`, repo-relevant scope, not `src/` alone: a `src/`-only census once
     /// missed `scripts/validate-cache.sh`'s own copy of the old fixed path —
     /// found no programmatic reader anywhere outside this module; the previous
@@ -10561,11 +10508,7 @@ mod tests {
             affinity::default_path().parent(),
             "logs and the pin file share one cache directory"
         );
-        let expected = match cache.generation() {
-            tcr::paths::Generation::Current => tcr::paths::LOG_PREFIX,
-            tcr::paths::Generation::Legacy => tcr::legacy_names::LOG_PREFIX,
-        };
-        assert_eq!(prefix, expected, "the prefix follows the directory");
+        assert_eq!(prefix, tcr::paths::LOG_PREFIX);
     }
 
     /// `max_log_files` pruning is real, not merely configured, AND it is the
@@ -10597,13 +10540,6 @@ mod tests {
     #[test]
     fn old_log_files_are_pruned_at_max_log_files() {
         assert_old_log_files_are_pruned(tcr::paths::LOG_PREFIX, "pruning");
-    }
-
-    /// The same pruning in an install that kept the old cache directory, whose
-    /// logs carry the old prefix: a new prefix there would never prune them.
-    #[test]
-    fn old_log_files_are_pruned_under_the_legacy_prefix() {
-        assert_old_log_files_are_pruned(tcr::legacy_names::LOG_PREFIX, "pruning-legacy");
     }
 
     fn assert_old_log_files_are_pruned(prefix: &str, tag: &str) {
@@ -11258,7 +11194,7 @@ mod tests {
     #[test]
     fn see_through_ca_keeps_a_running_legacy_proxys_chain_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path;
         std::fs::remove_file(dir.path().join("tcr-ca.key")).unwrap();
         std::fs::write(
             dir.path().join("tcr-leaf.sans"),
@@ -11287,7 +11223,7 @@ mod tests {
     #[test]
     fn see_through_ca_reuses_a_fresh_servers_ca() {
         let dir = tempfile::tempdir().unwrap();
-        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path.unwrap();
+        let ca = mitm::load_tls_in(dir.path()).unwrap().ca_path;
         let before = persisted_tls_files(dir.path());
         assert_eq!(see_through_ca_in(dir.path()), Some(ca));
         assert_eq!(persisted_tls_files(dir.path()), before);

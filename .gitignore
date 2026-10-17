@@ -4,15 +4,11 @@
 
 # ── Secrets: real account tokens & config (NEVER commit) ──────
 # The live config holds OAuth access/refresh tokens for real accounts.
-# Default path is ~/.config/tcr.json, or ~/.config/teamclaude.json on an
-# install from before the rename (both outside the repo); these patterns fail
+# Default path is ~/.config/tcr.json (outside the repo); these patterns fail
 # closed against any copy placed inside it.
 tcr.json
 tcr*.json
 .tcr.json
-teamclaude.json
-teamclaude*.json
-.teamclaude.json
 config.json
 config.local.json
 *.local.json
@@ -42,10 +38,8 @@ ca.*
 # continue PAST `.log` (the rotated date suffixes) and leaves the bare
 # `tcr.log` to the pre-existing `*.log` rule above — a bare `*` here would
 # also swallow an unrelated future source file like `tcr.logic.rs`, which
-# must never be silently ignored. `teamclaude-rs.log.*` is the same rule for
-# the name installs from before the rename keep writing.
+# must never be silently ignored.
 tcr.log.*
-teamclaude-rs.log.*
 *.jsonl
 tcr-capture*
 /tmp-capture/

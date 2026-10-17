@@ -59,7 +59,7 @@ fn tcr_command(home: &std::path::Path) -> std::process::Command {
     let codex_home = home.join("codex");
     std::fs::create_dir_all(&config_dir).expect("create the fixture's config directory");
     std::fs::create_dir_all(&codex_home).expect("create the fixture's Codex directory");
-    let default_config = config_dir.join("teamclaude.json");
+    let default_config = config_dir.join("tcr.json");
     if !default_config.exists() {
         std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
             .expect("write the fixture's offline default config");

@@ -1,6 +1,5 @@
 //! Proves first-run file creation through status and offline accounts, plus status
-//! output through an existing empty config on an isolated port. Fresh installs use `~/.config/tcr.json`;
-//! an install that already has `~/.config/teamclaude.json` keeps using it.
+//! output through an existing empty config on an isolated port. Fresh installs use `~/.config/tcr.json`.
 //!
 //! This is an end-to-end test of the BUILT BINARY rather than a unit test of
 //! `config::load_or_init`, because the defect it guards was never in the load
@@ -19,7 +18,7 @@
 //! Same rules as `tests/headless_sigterm.rs`: `HOME` points at a fresh
 //! [`tempfile::TempDir`] and `XDG_CACHE_HOME` is removed, both set on the
 //! spawned [`Command`] rather than on this test process, so the real
-//! `~/.config/teamclaude.json` — which holds working credentials — and the live
+//! `~/.config/tcr.json` — which holds working credentials — and the live
 //! proxy reading it are never touched. A test-only libc guard rejects port 3456 and
 //! non-loopback connections before they leave the child, and records attempts without
 //! account data. Its positive control uses only an owned ephemeral listener. Status
@@ -33,11 +32,6 @@ use std::process::Command;
 /// (`config::default_path`).
 fn config_path_in(home: &std::path::Path) -> PathBuf {
     home.join(".config").join(tcr::paths::CONFIG_FILE)
-}
-
-/// The config an install from before the rename has.
-fn legacy_config_path_in(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join(tcr::legacy_names::CONFIG_FILE)
 }
 
 /// Run `tcr <args…>` against a scratch `HOME`, returning (exit code, stdout, stderr).
@@ -170,33 +164,6 @@ fn a_first_run_text_status_still_explains_claudes_route() {
     );
 }
 
-/// An install from before the rename keeps its config where it is: the binary
-/// reads `teamclaude.json`, and creates no `tcr.json` beside it, which would
-/// silently take over on the next run with an empty account list.
-#[test]
-fn an_existing_legacy_config_is_used_in_place() {
-    let home = tempfile::tempdir().expect("a scratch HOME must be creatable");
-    let legacy = legacy_config_path_in(home.path());
-    std::fs::create_dir_all(legacy.parent().expect("a parent")).expect("mkdir .config");
-    let body = r#"{"accounts":[{"name":"alice@example.com","accessToken":"at-fake"}]}"#;
-    std::fs::write(&legacy, body).expect("write the legacy config");
-
-    let (code, stdout, stderr) = run_tcr(home.path(), &["accounts"]);
-    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
-    assert!(
-        stdout.contains("alice@example.com"),
-        "the account in the legacy config must be listed: {stdout}"
-    );
-    assert!(
-        !stderr.contains("created"),
-        "an existing legacy config is not a first run: {stderr}"
-    );
-    assert!(
-        !config_path_in(home.path()).exists(),
-        "no new-name config may appear beside the legacy one"
-    );
-}
-
 /// `tcr accounts` is the offline half of the same first run: no port probe, so
 /// its empty table and its exit code are this tempdir's alone.
 #[test]
@@ -223,10 +190,6 @@ fn accounts_with_no_config_exits_zero_with_an_empty_table() {
     assert!(
         stderr.contains("created") && stderr.contains(tcr::paths::CONFIG_FILE),
         "creating the config must say so once, got: {stderr}"
-    );
-    assert!(
-        !legacy_config_path_in(home.path()).exists(),
-        "a fresh install gets only the new name"
     );
 }
 

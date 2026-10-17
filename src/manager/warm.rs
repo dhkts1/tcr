@@ -280,7 +280,7 @@ impl Manager {
     /// rather than from a cadence — the periodic path is per-account and random,
     /// via [`Self::warm_one`].
     pub async fn warm_all(&self) {
-        // Skip if a sweep is already running (mirrors the JS `_running` guard).
+        // Skip if a sweep is already running.
         if self.warm_in_flight.swap(true, Ordering::SeqCst) {
             return;
         }

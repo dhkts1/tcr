@@ -4,7 +4,7 @@ import Foundation
 /// assuming.
 ///
 /// The defect this exists to close, measured on the live fleet: `tcr disable
-/// <name>` rewrites `~/.config/teamclaude.json` and exits 0, but a running proxy
+/// <name>` rewrites `~/.config/tcr.json` and exits 0, but a running proxy
 /// read `disabled` into memory once at boot and `tcr status` prefers the live
 /// server — so the row re-polled, got the OLD value back, and changed nothing.
 /// Exit 0 meant ``AccountController/failures`` stayed empty, so the row said

@@ -5,7 +5,7 @@ import Foundation
 ///
 /// Two rules shape everything here.
 ///
-///  1. **This app never writes the tcr config.** `~/.config/teamclaude.json` holds
+///  1. **This app never writes the tcr config.** `~/.config/tcr.json` holds
 ///     OAuth access and refresh tokens; `tcr` owns that file and is the only thing
 ///     that edits it. So the toggle is a subprocess — `tcr enable <name>` /
 ///     `tcr disable <name>` — exactly like the server control, and this process

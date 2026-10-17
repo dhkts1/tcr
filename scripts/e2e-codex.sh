@@ -189,7 +189,7 @@ export HOME="$E2E_HOME"
 unset XDG_CONFIG_HOME XDG_CACHE_HOME TCR_CODEX_AUTH \
   HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy || true
 export TCR_CLAUDE_CODE_CREDENTIALS="$E2E_HOME/no-claude-login"
-CONFIG="$HOME/.config/teamclaude.json"
+CONFIG="$HOME/.config/tcr.json"
 WORK="$E2E_HOME/work" # codex's working directory: empty, so a turn reads no repository
 mkdir -p "$(dirname "$CONFIG")" "$WORK"
 if [ -n "$CODEX_UPSTREAM" ]; then

@@ -23,10 +23,10 @@ final class SessionSectionsTests: XCTestCase {
         let sessions = [
             joined(id: "s1", account: "acct-a", cwd: "/Users/alice/token", costUsd: 5),
             joined(id: "s2", account: "acct-a", cwd: "/Users/alice/token", costUsd: 3),
-            joined(id: "s3", account: "acct-a", cwd: "/Users/alice/teamclaude-rs", costUsd: 1),
+            joined(id: "s3", account: "acct-a", cwd: "/Users/alice/tcr", costUsd: 1),
         ]
         let sections = SessionSections.byProject(sessions)
-        XCTAssertEqual(sections.map(\.key), [.named("token"), .named("teamclaude-rs")])
+        XCTAssertEqual(sections.map(\.key), [.named("token"), .named("tcr")])
         XCTAssertEqual(sections[0].rows.map(\.id), ["s1", "s2"])
     }
 
@@ -119,7 +119,7 @@ final class SessionSectionsTests: XCTestCase {
     /// beside the Claude session working in the same folder, under one header.
     func testACodexSessionGroupsByItsRolloutProject() throws {
         let sessions = try canonicalSessions()
-        let cwd = "/Users/example/git/teamclaude-rs"
+        let cwd = "/Users/example/git/tcr"
         let rows = [
             JoinedSession(
                 session: sessions[0],
@@ -129,7 +129,7 @@ final class SessionSectionsTests: XCTestCase {
                 file: SessionFile(sessionId: "019a3c5e-0000-7000-8000-000000000002", cwd: cwd)),
         ]
         let sections = SessionSections.byProject(rows)
-        XCTAssertEqual(sections.map(\.key), [.named("teamclaude-rs")])
+        XCTAssertEqual(sections.map(\.key), [.named("tcr")])
         XCTAssertEqual(sections.first?.rows.map(\.id), sessions.map(\.sessionId))
         XCTAssertEqual(sections.first?.hasHeader, true)
     }

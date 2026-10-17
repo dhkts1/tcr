@@ -69,11 +69,11 @@ final class SessionFilesTests: XCTestCase {
     /// activity from the file's `status`.
     func testJoinedSessionReadsNameProjectAndActivityFromTheFile() {
         let file = SessionFile(
-            sessionId: "11111111-aaaa-bbbb", cwd: "/Users/alice/git/teamclaude-rs",
-            name: "teamclaude-rs-c7", status: "busy")
+            sessionId: "11111111-aaaa-bbbb", cwd: "/Users/alice/git/tcr",
+            name: "tcr-c7", status: "busy")
         let joined = JoinedSession(session: session(id: "11111111-aaaa-bbbb"), file: file)
-        XCTAssertEqual(joined.displayName, "teamclaude-rs-c7")
-        XCTAssertEqual(joined.project, "teamclaude-rs")
+        XCTAssertEqual(joined.displayName, "tcr-c7")
+        XCTAssertEqual(joined.project, "tcr")
         XCTAssertEqual(joined.activity, .busy)
     }
 
@@ -142,7 +142,7 @@ final class SessionFilesTests: XCTestCase {
 
     /// codex's line 1 for a rollout: its `session_meta` record, naming the thread and its
     /// working folder.
-    private func metaLine(id: String, cwd: String = "/Users/example/git/teamclaude-rs") -> String {
+    private func metaLine(id: String, cwd: String = "/Users/example/git/tcr") -> String {
         #"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"\#(id)","cwd":"\#(cwd)"}}"#
     }
 
@@ -172,7 +172,7 @@ final class SessionFilesTests: XCTestCase {
         XCTAssertEqual(Array(files.keys), [codexId])
         let file = try XCTUnwrap(files[codexId])
         XCTAssertEqual(file.sessionId, codexId)
-        XCTAssertEqual(file.cwd, "/Users/example/git/teamclaude-rs")
+        XCTAssertEqual(file.cwd, "/Users/example/git/tcr")
         XCTAssertNil(file.name)
         XCTAssertNil(file.status)
         XCTAssertNil(file.pid)
@@ -180,7 +180,7 @@ final class SessionFilesTests: XCTestCase {
         let bob = try XCTUnwrap(
             Fleet.decodeSessions(CanonicalFixtures.data("codex-sessions.json")).sessions.last)
         let joined = JoinedSession(session: bob, file: file)
-        XCTAssertEqual(joined.project, "teamclaude-rs")
+        XCTAssertEqual(joined.project, "tcr")
         XCTAssertEqual(joined.displayName, "019a3c5e")
 
         let unknown = "019a3c5e-0000-7000-8000-000000000099"

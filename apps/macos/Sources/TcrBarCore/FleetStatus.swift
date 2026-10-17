@@ -1482,7 +1482,7 @@ public struct SessionTools: Decodable, Equatable, Sendable {
 
 /// One entry of ``Fleet/sessions`` — a session the proxy has seen in the
 /// last hour, field-for-field the merged F1 wire's `SessionRow`
-/// (`crates/tcr-status-wire/src/lib.rs` on `teamclaude-rs#232`).
+/// (`crates/tcr-status-wire/src/lib.rs` on `tcr#232`).
 ///
 /// Lives on the proxy's `/_tcr/status` HTTP response (`StatusPayload.sessions`),
 /// not on `tcr status --json`'s bare account array — see ``Fleet/sessions``'s
@@ -3238,9 +3238,9 @@ public struct Fleet: Equatable, Sendable {
     ///
     /// `sessions` does not ride `tcr status --json`, which is a bare array of
     /// accounts and has clients that depend on being exactly that. The merged
-    /// F1 work (`teamclaude-rs#232`) put the rows on the PROXY's own
+    /// F1 work (`tcr#232`) put the rows on the PROXY's own
     /// `/_tcr/status` HTTP response, behind the proxy api-key, and this app
-    /// may never read that key or `~/.config/teamclaude.json` — see
+    /// may never read that key or `~/.config/tcr.json` — see
     /// `CLAUDE.md`'s "No credentials, ever". So the channel is a second
     /// SHELL-OUT, the way every other fact in this app arrives: `tcr sessions
     /// --json` (`sessions()`, `src/cli.rs`) prints `{"supported", "sessions"}`

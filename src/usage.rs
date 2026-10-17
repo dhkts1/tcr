@@ -39,7 +39,7 @@
 //!
 //! In-memory buckets die with the process, and this proxy is restarted for every
 //! TcrBar update. One JSON line per served request goes to
-//! `~/.cache/teamclaude/usage/<UTC-date>.jsonl` (directory `0700`, files `0600`
+//! `~/.cache/tcr/usage/<UTC-date>.jsonl` (directory `0700`, files `0600`
 //! — the same posture as the session-affinity pin file and the log directory),
 //! and boot replays today's and yesterday's files back through the same
 //! recording path, and the seven days before today when the fleet holds a Codex
@@ -1145,7 +1145,7 @@ fn compress_ledger(rx: &Receiver<LedgerMsg>, ledger: &mut Ledger, today: Date) {
 
 /// Create the ledger directory `0700` and open (or create) one day's file
 /// `0600`, append-only. Same confidentiality posture as the log directory and
-/// the pin file: the parent `~/.cache/teamclaude/` is `0755`, so an owner-only
+/// the pin file: the parent `~/.cache/tcr/` is `0755`, so an owner-only
 /// mode has to be asserted here or these files are world-readable on a
 /// multi-user box. The mode is requested at creation time rather than
 /// `chmod`-ed afterwards, so there is no window in which the file exists at the
@@ -1178,8 +1178,7 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// `usage/` in the cache directory ([`crate::paths::cache_dir`]:
-/// `~/.cache/tcr/`, or `~/.cache/teamclaude/` on an install that has only
-/// that one) — a cache dir for the same reason the pin file is one:
+/// `~/.cache/tcr/`) — a cache dir for the same reason the pin file is one:
 /// regenerable-ish state written at high frequency has no business next to
 /// live OAuth credentials.
 pub fn default_dir() -> PathBuf {

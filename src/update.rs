@@ -1,7 +1,7 @@
 //! `tcr update` — self-update, by rebuilding a checkout or by re-running the
 //! published release installer.
 //!
-//! The act-how split mirrors the JS `updater.js`: when we can locate the git
+//! The act-how split: when we can locate the git
 //! checkout that `tcr` was built from (walk up from the running executable to
 //! the first ancestor holding BOTH `.git` and `Cargo.toml`) we
 //! `git -C <root> pull --ff-only` and, if that moved HEAD,
@@ -10,11 +10,6 @@
 //! newest GitHub release and run it against the directory the running binary
 //! actually lives in. Only the `.app`-bundled copy is notify-only: it is a copy
 //! that its own installer owns.
-//!
-//! After a successful install or rebuild it moves an older install's
-//! `teamclaude` config and cache to the `tcr` names
-//! ([`crate::migrate::after_update`]), unless a server is running, in which
-//! case it says when they will move. It never stops the proxy for that.
 //!
 //! Two invariants, both from Principle 9 (don't clobber in-flight work):
 //!   * `--ff-only` — NEVER `git reset --hard`. A dirty or diverged tree makes
@@ -718,7 +713,6 @@ fn update_installed(force: bool) -> anyhow::Result<()> {
          tcr: this process is still running {current} — restart tcr to run the new build.",
         binary.display()
     );
-    crate::migrate::after_update();
     Ok(())
 }
 
@@ -1060,7 +1054,6 @@ fn update_checkout(root: &Path, force: bool) -> anyhow::Result<()> {
     println!(
         "tcr: this process is still running the OLD binary — restart tcr to run the new build."
     );
-    crate::migrate::after_update();
     Ok(())
 }
 

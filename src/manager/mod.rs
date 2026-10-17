@@ -22,8 +22,7 @@
 //!
 //! Token refresh is **coalesced per account**: a `tokio::sync::Mutex` per account
 //! plus a re-check under the guard means N concurrent requests on the same
-//! hard-expired account trigger exactly one upstream refresh (bug the JS avoided
-//! with a shared `_refreshPromise`).
+//! hard-expired account trigger exactly one upstream refresh.
 //!
 //! Usage/request counters increment on the **actual serving index** passed by the
 //! proxy, never a mutated "current" pointer — that is bug #3 designed out.
@@ -644,9 +643,9 @@ pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
         "build reqwest client (test-injected failure)"
     );
     // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
-    // proxy — routing our upstream through an ambient proxy (e.g. the JS
-    // teamclaude on :3456) loops us through the thing we replace and every
-    // request dies as "upstream unreachable". Always reach Anthropic directly.
+    // proxy — routing our upstream through an ambient proxy (e.g. one on
+    // :3456) loops us back through a proxy and every request dies as
+    // "upstream unreachable". Always reach Anthropic directly.
     let mut builder = crate::http_client::builder()
         .no_proxy()
         // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
@@ -1157,7 +1156,7 @@ pub struct Manager {
     plan_prober: RwLock<Arc<dyn PlanProber>>,
     /// Warms idle accounts to keep their 5h window live (opt-in; see [`Self::warm_all`]).
     warmer: Arc<dyn AccountWarmer>,
-    /// Ensures two keep-warm sweeps never overlap (mirrors the JS `_running` flag).
+    /// Ensures two keep-warm sweeps never overlap.
     warm_in_flight: AtomicBool,
     /// Wakes the keep-warm loop the moment an account's quota is first READ, so the
     /// boot gate on [`Self::warm_targets`] costs a probe cycle rather than a full
@@ -1507,7 +1506,7 @@ pub struct Manager {
 }
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
-/// still clears the guard (mirrors the JS `finally { _running = false }`).
+/// still clears the guard.
 struct WarmInFlightGuard<'a>(&'a AtomicBool);
 
 impl Drop for WarmInFlightGuard<'_> {
@@ -11850,7 +11849,7 @@ mod tests {
 
     /// Like [`config_with`] but with the (default-OFF) load-balancing migration
     /// explicitly enabled — every test that exercises the migration scan itself
-    /// must opt in, exactly as an operator would via `~/.config/teamclaude.json`.
+    /// must opt in, exactly as an operator would via `~/.config/tcr.json`.
     fn config_with_migration(accounts: Vec<Account>) -> Config {
         let mut config = config_with(accounts);
         config.extra.insert(

@@ -67,7 +67,7 @@ async fn boot_after(
     assert_ne!(port, 3456, "never the live proxy's port");
     let dir = home.path().join(".config");
     std::fs::create_dir_all(&dir).expect("config dir");
-    let config = dir.join("teamclaude.json");
+    let config = dir.join("tcr.json");
     std::fs::write(
         &config,
         format!(r#"{{ "proxy": {{ "port": {port} }}, "upstream": "http://127.0.0.1:0", "codexUpstream": "http://127.0.0.1:0", {extra} "accounts": [{accounts}] }}"#),
@@ -770,7 +770,7 @@ async fn with_no_server_running_the_file_edit_is_the_delete() {
     let port = tcr::test_support::loopback::unused_port();
     let dir = home.path().join(".config");
     std::fs::create_dir_all(&dir).unwrap();
-    let config = dir.join("teamclaude.json");
+    let config = dir.join("tcr.json");
     std::fs::write(
         &config,
         format!(

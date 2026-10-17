@@ -30,8 +30,8 @@ loopback bind: both are live, and which one a client reaches depends on the kern
 most-specific-match, not on anything we control. That is the two-proxies/token-war
 outcome, and on macOS it is reachable. On Linux it is not — the second bind fails.
 
-The remaining premise is about node, not about the kernel: this only matters if the legacy
-JS proxy binds a wildcard. `server.listen(port)` with no host binds `::` dual-stack — that
+The remaining premise is about node, not about the kernel: this only matters if a Node
+incumbent binds a wildcard. `server.listen(port)` with no host binds `::` dual-stack — that
 is a claim about node's default and should be stated as one, not folded into the measured
 rows above.
 

@@ -256,7 +256,7 @@ impl Mac {
             ""
         };
         std::fs::write(
-            config_dir.join("teamclaude.json"),
+            config_dir.join("tcr.json"),
             format!(
                 r#"{{
   "proxy": {{ "port": 0 }},
@@ -2229,7 +2229,7 @@ fn boot_cost_once(with_peers: bool) -> f64 {
     let config_dir = home.path().join(".config");
     std::fs::create_dir_all(&config_dir).expect("the scratch .config");
     std::fs::write(
-        config_dir.join("teamclaude.json"),
+        config_dir.join("tcr.json"),
         r#"{"proxy": {"port": 0}, "accounts": []}"#,
     )
     .expect("the scratch config writes");

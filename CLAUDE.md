@@ -16,8 +16,7 @@ first commit".
 - **No credentials, ever.** OAuth access and refresh tokens, and the proxy API key, are secrets. They do
   not belong in code, tests, logs you paste, or a PR description. A pre-commit `gitleaks` hook is the
   backstop, not the plan.
-- The live config at `~/.config/tcr.json` (`~/.config/teamclaude.json` on an install no update has moved
-  yet, see `tcr migrate`) holds **working credentials for real accounts**. Never
+- The live config at `~/.config/tcr.json` holds **working credentials for real accounts**. Never
   copy it into the repo, never commit it, never paste its contents anywhere. Tests write their own
   temp-file configs; do the same.
 
@@ -29,7 +28,7 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
   so a session that comes back on a different account pays a full cold prefix. It is still the most
   expensive event in this system.
   A restart is no longer *automatic* total loss, though, and this line used to say it was. Session
-  affinity persists its pins to `~/.cache/teamclaude/session-affinity.json` and restores them at
+  affinity persists its pins to `~/.cache/tcr/session-affinity.json` and restores them at
   boot: measured 2026-08-09, three restarts restored 7, 5 and 7 pins. The real limit is the TTL
   (`affinity::PIN_TTL_MS`, 15 minutes) — a restart inside it keeps most sessions warm, and one after
   it restores nothing at all (`restored=0 expired=27`, same log). None of that applies with

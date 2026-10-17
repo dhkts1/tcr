@@ -7,7 +7,7 @@
 //! Pinned on the spawned [`Command`], never on this test process (whose tests run on parallel
 //! threads that share one environment):
 //!
-//! * `HOME` → a fresh [`tempfile::TempDir`], so the real `~/.config/teamclaude.json` (working
+//! * `HOME` → a fresh [`tempfile::TempDir`], so the real `~/.config/tcr.json` (working
 //!   credentials for real accounts) and the real `~/.codex` are never read or written.
 //! * `TCR_CODEX_AUTH` → a fake `auth.json` inside that tempdir, or a path that does not exist. It
 //!   wins over every other place a Codex login is looked for, so the developer's REAL Codex login

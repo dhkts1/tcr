@@ -25,7 +25,7 @@ FIND="${FIND:-off}"
 ANNOUNCE_NAME="${ANNOUNCE_NAME:-off}"
 BOOT_LOG="${BOOT_LOG:-/scratch/boot.log}"
 
-CONFIG=/scratch/.config/teamclaude.json
+CONFIG=/scratch/.config/tcr.json
 PEERS=/scratch/.config/tcr-peers.json
 
 mkdir -p /scratch/.config /scratch/.cache

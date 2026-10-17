@@ -2159,7 +2159,7 @@ fn via_writes_the_choice_and_refuses_a_mac_this_one_never_pinned() {
 fn peer_account_writes_the_exit_lock_by_id_by_name_and_leaves_a_pin_alone() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let peers = dir.path().join("tcr-peers.json");
-    let config = dir.path().join("teamclaude.json");
+    let config = dir.path().join("tcr.json");
     let peer = node().id;
     let file = PeerFile {
         peers: vec![row(&peer, "attic-nuc", Vec::new(), true)],
@@ -2298,7 +2298,7 @@ fn run_tcr_peer(peers: &std::path::Path, args: &[&str]) -> (String, String, bool
     let codex_home = home.join("codex");
     std::fs::create_dir_all(&config_dir).expect("create the fixture's config directory");
     std::fs::create_dir_all(&codex_home).expect("create the fixture's Codex directory");
-    let default_config = config_dir.join("teamclaude.json");
+    let default_config = config_dir.join("tcr.json");
     if !default_config.exists() {
         std::fs::write(&default_config, r#"{"proxy":{"port":9},"accounts":[]}"#)
             .expect("write the fixture's offline default config");
