@@ -4,11 +4,12 @@
 
 # tcr
 
-tcr (Team Capacity Router) is a local proxy that runs Claude Code across multiple Claude accounts.
+tcr (Team Capacity Router) is a local proxy that runs Claude Code and Codex across multiple subscription accounts.
 
-Point Claude Code (or any Anthropic API client) at it. For each request it picks an account by
-looking at what every account has left in every quota window. It keeps a conversation on the
-account whose prompt cache is already warm, and it shows you what the traffic would have cost.
+Point Claude Code, OpenAI's `codex` CLI, or a tool built on them such as OpenClaw, at it. For each
+request it picks an account by looking at what every account has left in every quota window. It
+keeps a conversation on the account whose prompt cache is already warm, and it shows you what the
+Claude traffic would have cost.
 
 [![Latest release](https://img.shields.io/github/v/release/dhkts1/tcr)](https://github.com/dhkts1/tcr/releases/latest)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
