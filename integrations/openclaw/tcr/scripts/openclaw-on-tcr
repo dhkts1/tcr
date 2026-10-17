@@ -20,6 +20,12 @@ else
 fi
 unset key
 
+cat >&2 <<EOF
+openclaw-on-tcr: routing this OpenClaw process's HTTPS through tcr on 127.0.0.1:${port}
+openclaw-on-tcr: trusting tcr's CA ($ca); tcr can read the Claude and ChatGPT traffic it pools
+openclaw-on-tcr: see "What tcr sees" in this skill's SKILL.md
+EOF
+
 export HTTPS_PROXY="$proxy" https_proxy="$proxy"
 export NODE_EXTRA_CA_CERTS="$ca"
 export NODE_USE_ENV_PROXY=1
